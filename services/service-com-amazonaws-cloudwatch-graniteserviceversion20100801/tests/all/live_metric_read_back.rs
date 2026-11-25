@@ -18,10 +18,9 @@
 //! the window of the second it was published at.**
 //!
 //! The ONE period that resolves detail a regular-resolution series holds none of is the one-second
-//! period, and the whole-minute aggregate it would have to be answered from is complete only once
-//! that minute has closed — the half of the rule `metric_open_span_reads` tables over spans the
-//! clock has and has not left; here it is the one row whose outcome the clock decides, and both of
-//! its outcomes are asserted.
+//! period, and it too is answered with the whole-minute aggregate the series holds, at that
+//! minute's own boundary, whether or not the clock has left the minute — the half of the rule
+//! `metric_open_span_reads` tables over spans the clock has and has not left.
 //!
 //! The rows differ along what the rule generalises over: the period the read asks for (every
 //! sub-minute value `MetricStat$Period` admits, plus the minute itself), and the storage
@@ -49,13 +48,11 @@ const VALUE: f64 = 42.0;
 /// stored at: the divisions of a minute a read's windows are laid on — "If you set Period to 5,
 /// 10, 20, or 30, the start time of your request is rounded down to the nearest time that
 /// corresponds to even 5-, 10-, 20-, or 30-second divisions of a minute."
-/// (`GetMetricStatisticsInput$StartTime`) — and the minute itself, the period a
-/// regular-resolution series is stored at.
-const SERVED_PERIODS: [i64; 5] = [5, 10, 20, 30, 60];
-
-/// The one period below those divisions, which resolves the per-second detail only
-/// high-resolution storage keeps (`MetricDatum$StorageResolution`).
-const PER_SECOND_PERIOD: i64 = 1;
+/// (`GetMetricStatisticsInput$StartTime`) — the minute itself, the period a regular-resolution
+/// series is stored at, and the one period below those divisions, which resolves the per-second
+/// detail only high-resolution storage keeps (`MetricDatum$StorageResolution`) and is answered
+/// from a regular-resolution series at the minute it is stored at all the same.
+const SERVED_PERIODS: [i64; 6] = [1, 5, 10, 20, 30, 60];
 
 /// The two spellings of regular resolution, which "if you omit this, the default of 60 is used"
 /// makes one class: `StorageResolution` 60, and the member left out.
@@ -232,39 +229,6 @@ async fn a_datapoint_published_now_is_read_back_now_at_every_served_period() {
                  second ({expected}), got {answered:?}"
             );
         }
-
-        // The one-second period resolves detail a regular-resolution series holds none of, and
-        // the whole minute it would be answered from is complete only once that minute has
-        // closed — which of the two outcomes applies is decided by the clock the read is served
-        // at, never by how fast the host runs.
-        let got = datapoints(&router, &metric, start, end, PER_SECOND_PERIOD).await;
-        let read_at = now_secs();
-        if !got.is_empty() {
-            assert!(
-                read_at >= minute + MINUTE,
-                "case {case:?} at Period {PER_SECOND_PERIOD}: the minute {minute} was still \
-                 running at {read_at}, so a read of the per-second detail it holds none of must \
-                 answer with no datapoint, got {got:?}"
-            );
-            assert_eq!(
-                got,
-                vec![(minute, VALUE)],
-                "case {case:?} at Period {PER_SECOND_PERIOD}: the minute closed before the read, \
-                 so its complete aggregate must be answered at the minute's own boundary, got \
-                 {got:?}"
-            );
-        }
-        // The high-resolution twin stores exactly the detail that period asks for, so it is
-        // answered whatever the clock has done.
-        let second = window_of(published_at, 1.0);
-        let answered = datapoints(&router, &high_resolution, start, end, PER_SECOND_PERIOD).await;
-        assert_eq!(
-            answered,
-            vec![(second, VALUE)],
-            "case {case:?} at Period {PER_SECOND_PERIOD}: the high-resolution twin stores the \
-             second it was published in, so it must be answered at that second ({second}), got \
-             {answered:?}"
-        );
     }
 }
 

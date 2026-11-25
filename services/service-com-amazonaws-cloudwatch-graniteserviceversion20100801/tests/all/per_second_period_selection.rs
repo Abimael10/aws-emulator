@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH data a one-second `Period` selects, end to end over the wire.
+//! WHICH data a one-second `Period` selects, and where each of them is reported, end to end over
+//! the wire.
 //!
-//! ONE rule, asserted over a table: **a read at the one-second period resolves per-second detail,
-//! which only high-resolution storage keeps, so it is answered from the data stored AT that
-//! resolution and from nothing else — "Setting this to 1 specifies this metric as a
-//! high-resolution metric, so that CloudWatch stores the metric with sub-minute resolution down to
-//! one second. Setting this to 60 specifies this metric as a regular-resolution metric, which
-//! CloudWatch stores at 1-minute resolution… This field is optional, if you do not specify it the
-//! default of 60 is used."
-//! (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`) against
-//! "High-resolution metrics are those metrics stored by a PutMetricData call that includes a
-//! StorageResolution of 1 second."
-//! (`smithy_query(query="doc",shape="GetMetricStatisticsInput",member="Period")`). Every period at
-//! or above the divisions of a minute a read's windows are laid on (5, 10, 20, 30, the minute
-//! itself and its multiples) answers from a datum of EITHER storage class, at the span that class
-//! stores it in.**
+//! ONE rule, asserted over a table: **a read is answered from every datum its range holds, at the
+//! span the datum's own storage class stores it in, whatever period it asked for — "Setting this to
+//! 1 specifies this metric as a high-resolution metric, so that CloudWatch stores the metric with
+//! sub-minute resolution down to one second. Setting this to 60 specifies this metric as a
+//! regular-resolution metric, which CloudWatch stores at 1-minute resolution… This field is
+//! optional, if you do not specify it the default of 60 is used."
+//! (`smithy_query(query="doc",shape="MetricDatum",member="StorageResolution")`) against "For
+//! metrics with regular resolution, a period can be as short as one minute (60 seconds) and must be
+//! a multiple of 60. For high-resolution metrics that are collected at intervals of less than one
+//! minute, the period can be 1, 5, 10, 20, 30, 60, or any multiple of 60."
+//! (`smithy_query(query="doc",shape="GetMetricStatisticsInput",member="Period")`). A read at the
+//! one-second period resolves per-second detail, which only high-resolution storage keeps, so that
+//! class is reported at the second it was published in while a regular-resolution datum is reported
+//! at the whole minute it is stored in — the aggregate the store actually holds for it. The
+//! one-second period selects NEITHER class out of the answer: a caller cannot tell a range with no
+//! data from one answered at a granularity coarser than it asked for.**
 //!
-//! So the storage class a datum was published with decides whether a sub-second-resolving read can
-//! see it at all, and it is a property of the DATUM rather than of the series or of the call: two
-//! data published by one `PutMetricData` differ in what a one-second read answers from, which is
-//! the recorded shape this suite opens with.
+//! So the storage class a datum was published with decides WHERE a sub-second-resolving read
+//! reports it, and it is a property of the DATUM rather than of the series or of the call: two data
+//! published by one `PutMetricData` are reported at different instants by one read, which is the
+//! recorded shape this suite opens with.
 //!
 //! The rows differ along what the rule generalises over: the storage class published (1, 60, and
 //! the omitted member that is documented to read as 60), the period the read asks for (every
@@ -66,18 +69,19 @@ const PUBLISHED_CLASSES: [(&str, Option<i64>, bool); 3] = [
     ("an omitted StorageResolution", None, false),
 ];
 
-/// The period a read asks for, and whether it resolves the per-second detail only high-resolution
-/// storage keeps: every sub-minute value `MetricStat$Period` admits ("the period can be 1, 5, 10,
-/// 20, 30, 60, or any multiple of 60"), the minute itself and a multiple of it.
-const PERIODS: [(i64, bool); 7] = [
-    (1, true),
-    (5, false),
-    (10, false),
-    (20, false),
-    (30, false),
-    (60, false),
-    (300, false),
-];
+/// The periods a read asks for, each asserted down to the instant the datum is reported at: every
+/// sub-minute value `MetricStat$Period` admits ("the period can be 1, 5, 10, 20, 30, 60, or any
+/// multiple of 60") and the minute itself. Each divides a minute, so the window grid of each is
+/// laid on the boundaries both storage classes store their data at.
+const PERIODS: [i64; 6] = [1, 5, 10, 20, 30, 60];
+
+/// A period COARSER than the minute, where what is asserted is that the datum is answered at all:
+/// which window a period wider than the range the caller named folds it into is the business of
+/// each reader's own window grid (`metric_range_selection`), not of this rule.
+const COARSER_PERIOD: i64 = 300;
+
+/// The one period that resolves the per-second detail only high-resolution storage keeps.
+const PER_SECOND_PERIOD: i64 = 1;
 
 /// Publish one datum per storage class, all at `timestamp` and all in ONE `PutMetricData` call —
 /// the recorded shape — each under a metric name of its own so a read answers from one of them.
@@ -110,15 +114,20 @@ fn metric_name(prefix: &str, resolution: Option<i64>) -> String {
     format!("{prefix}Res{}", resolution.unwrap_or(0))
 }
 
-/// The `Sum` values `GetMetricStatistics` answers with for `metric` over `[start, end)` at
-/// `period`, oldest datapoint first.
-async fn statistics_sums(
+/// The start of the `span`-wide clock window `instant` falls in.
+fn window_of(instant: f64, span: f64) -> f64 {
+    (instant / span).floor() * span
+}
+
+/// The `(Timestamp, Sum)` pairs `GetMetricStatistics` answers with for `metric` over
+/// `[start, end)` at `period`, oldest datapoint first.
+async fn statistics_points(
     router: &MultiServiceRouter,
     metric: &str,
     start: f64,
     end: f64,
     period: i64,
-) -> Vec<f64> {
+) -> Vec<(f64, f64)> {
     let body = ok(
         router,
         "GetMetricStatistics",
@@ -132,23 +141,30 @@ async fn statistics_sums(
         }),
     )
     .await;
-    body["Datapoints"]
+    let mut points: Vec<(f64, f64)> = body["Datapoints"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .iter()
-        .filter_map(|point| point["Sum"].as_f64())
-        .collect()
+        .map(|point| {
+            (
+                point["Timestamp"].as_f64().unwrap_or_default(),
+                point["Sum"].as_f64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    points.sort_by(|left, right| left.0.total_cmp(&right.0));
+    points
 }
 
 /// The same read through `GetMetricData`, whose fold is the same one.
-async fn metric_data_sums(
+async fn metric_data_points(
     router: &MultiServiceRouter,
     metric: &str,
     start: f64,
     end: f64,
     period: i64,
-) -> Vec<f64> {
+) -> Vec<(f64, f64)> {
     let body = ok(
         router,
         "GetMetricData",
@@ -167,21 +183,32 @@ async fn metric_data_sums(
         }),
     )
     .await;
-    body["MetricDataResults"][0]["Values"]
+    let result = &body["MetricDataResults"][0];
+    let stamps: Vec<f64> = result["Timestamps"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .iter()
         .filter_map(Value::as_f64)
-        .collect()
+        .collect();
+    let values: Vec<f64> = result["Values"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    let mut points: Vec<(f64, f64)> = stamps.into_iter().zip(values).collect();
+    points.sort_by(|left, right| left.0.total_cmp(&right.0));
+    points
 }
 
-/// RULE: a one-second read answers from the data stored at that resolution and from no other,
-/// while every coarser period answers from either storage class.
+/// RULE: every period answers from every storage class, each datum reported at the span its own
+/// class stores it in — the second for high resolution, the whole minute for regular resolution.
 #[tokio::test]
-async fn a_per_second_read_answers_only_from_per_second_storage() {
+async fn a_per_second_read_answers_from_either_class_at_the_span_it_stores_it_in() {
     let router = build_router();
-    let this_minute = (now_secs() / MINUTE).floor() * MINUTE;
+    let this_minute = window_of(now_secs(), MINUTE);
 
     // (case, the instant the data is published at) — this instant, the minute that closed well
     // before this run, and a minute still ahead of it.
@@ -204,23 +231,28 @@ async fn a_per_second_read_answers_only_from_per_second_storage() {
 
         for (class, resolution, high_resolution) in PUBLISHED_CLASSES {
             let metric = metric_name(&prefix, resolution);
-            for (period, resolves_per_second) in PERIODS {
-                // The datum is answered unless the read resolves detail its storage class keeps
-                // none of; where it is answered, the one observation's value is its `Sum`.
-                let expected: Vec<f64> = if resolves_per_second && !high_resolution {
-                    Vec::new()
-                } else {
-                    vec![VALUE]
-                };
+            // The instant the datum is STORED at, which decides the window every read reports it
+            // under: its own second where that detail is kept, and the whole minute where it is
+            // not.
+            let stored_at = if high_resolution {
+                window_of(stamped, 1.0)
+            } else {
+                window_of(stamped, MINUTE)
+            };
+            for period in PERIODS {
+                // Every period is answered from the datum, in the window of that period the span
+                // it is stored in begins in.
+                #[allow(clippy::cast_precision_loss)]
+                let expected = vec![(window_of(stored_at, period as f64), VALUE)];
                 let case = format!("{class} {phase}, read at Period {period}");
                 for (reader, got) in [
                     (
                         "GetMetricStatistics",
-                        statistics_sums(&router, &metric, start, end, period).await,
+                        statistics_points(&router, &metric, start, end, period).await,
                     ),
                     (
                         "GetMetricData",
-                        metric_data_sums(&router, &metric, start, end, period).await,
+                        metric_data_points(&router, &metric, start, end, period).await,
                     ),
                 ] {
                     assert_eq!(
@@ -228,6 +260,27 @@ async fn a_per_second_read_answers_only_from_per_second_storage() {
                         "case {case:?}: expected {reader} to answer {expected:?}, got {got:?}"
                     );
                 }
+            }
+            // A period wider than the whole range is answered from the datum too, with the one
+            // observation's value as its `Sum`.
+            let case = format!("{class} {phase}, read at Period {COARSER_PERIOD}");
+            for (reader, got) in [
+                (
+                    "GetMetricStatistics",
+                    statistics_points(&router, &metric, start, end, COARSER_PERIOD).await,
+                ),
+                (
+                    "GetMetricData",
+                    metric_data_points(&router, &metric, start, end, COARSER_PERIOD).await,
+                ),
+            ] {
+                let sums: Vec<f64> = got.iter().map(|(_, sum)| *sum).collect();
+                assert_eq!(
+                    sums,
+                    vec![VALUE],
+                    "case {case:?}: expected {reader} to answer the one observation's value, got \
+                     {got:?}"
+                );
             }
         }
     }
@@ -237,7 +290,7 @@ async fn a_per_second_read_answers_only_from_per_second_storage() {
 /// by the call: the recorded shape, read at the one period that tells them apart and at the period
 /// a regular-resolution series is stored at.
 #[tokio::test]
-async fn one_call_can_publish_data_of_both_classes_and_a_per_second_read_sees_one() {
+async fn one_call_can_publish_data_of_both_classes_and_a_per_second_read_sees_both() {
     let router = build_router();
     let stamped = now_secs();
     let prefix = "Pair";
@@ -248,27 +301,34 @@ async fn one_call_can_publish_data_of_both_classes_and_a_per_second_read_sees_on
     let regular = metric_name(prefix, Some(60));
     let defaulted = metric_name(prefix, None);
 
-    // At the per-second period only the high-resolution datum of that call is answered.
+    // At the per-second period the high-resolution datum of that call is reported at the second it
+    // was published in, and the regular-resolution ones at the minute they are stored in — the one
+    // read tells the two classes apart by the instant each is answered at, not by answering one of
+    // them with nothing.
     assert_eq!(
-        statistics_sums(&router, &high, start, end, 1).await,
-        vec![VALUE],
-        "case {high:?}: the high-resolution datum of the call must answer a per-second read"
+        statistics_points(&router, &high, start, end, PER_SECOND_PERIOD).await,
+        vec![(window_of(stamped, 1.0), VALUE)],
+        "case {high:?}: the high-resolution datum of the call is reported at the second it was \
+         published in"
     );
     for metric in [&regular, &defaulted] {
-        let got = statistics_sums(&router, metric, start, end, 1).await;
-        assert!(
-            got.is_empty(),
+        let got = statistics_points(&router, metric, start, end, PER_SECOND_PERIOD).await;
+        assert_eq!(
+            got,
+            vec![(window_of(stamped, MINUTE), VALUE)],
             "case {metric:?}: a regular-resolution datum of the same call keeps no per-second \
-             detail, so a per-second read must answer with no datapoint, got {got:?}"
+             detail, so a per-second read is answered with the whole minute it is stored in, got \
+             {got:?}"
         );
     }
 
-    // At the minute a regular-resolution datum IS stored at, every datum of the call answers.
+    // At the minute a regular-resolution datum IS stored at, every datum of the call answers under
+    // that same minute.
     for metric in [&high, &regular, &defaulted] {
-        let got = statistics_sums(&router, metric, start, end, 60).await;
+        let got = statistics_points(&router, metric, start, end, 60).await;
         assert_eq!(
             got,
-            vec![VALUE],
+            vec![(window_of(stamped, MINUTE), VALUE)],
             "case {metric:?}: every datum of the call is answered at the minute, got {got:?}"
         );
     }

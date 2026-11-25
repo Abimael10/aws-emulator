@@ -1213,17 +1213,18 @@ pub fn retention_secs_at_period(period: i32) -> f64 {
 /// 60. High-resolution metrics are those metrics stored by a `PutMetricData` call that includes a
 /// `StorageResolution` of 1 second." (`GetMetricStatisticsInput$Period`) — a read asking for a
 /// granularity the series does not hold is answered at the granularity it DOES hold rather than
-/// with nothing, so a regular-resolution datapoint is reported to a read at any of the
-/// sub-minute divisions of a minute a read's windows are laid on
-/// ([`FINEST_WINDOW_DIVISION_SECS`]) exactly as it is reported at the minute it is stored at.
+/// with nothing, so a regular-resolution datapoint is reported to a read at EVERY period finer
+/// than the minute it is stored at — the one-second period included — exactly as it is reported
+/// at that minute itself.
 ///
-/// The ONE period that asks for detail no regular-resolution span holds at all is the
-/// one-second period, which resolves the per-second detail only high-resolution storage keeps
-/// ("CloudWatch stores the metric with sub-minute resolution down to one second",
-/// `MetricDatum$StorageResolution`): such a read is answered from the data stored AT that
-/// granularity and from no other, so a coarser-stored span has no datapoint there at all —
-/// "High-resolution metrics are those metrics stored by a `PutMetricData` call that includes a
-/// `StorageResolution` of 1 second." is what a one-second period selects.
+/// No period withholds a datapoint for being asked at a granularity the series does not keep,
+/// and neither does a span the clock has not yet left: a read answers from the aggregate the
+/// store holds at the instant it is served ("CloudWatch stores the metric with sub-minute
+/// resolution down to one second" only where the publisher asked for it,
+/// `MetricDatum$StorageResolution`), and a later observation published into the same span is
+/// answered by a later read. A client cannot tell a series with no data in a window from a
+/// window answered at a period the store aggregates coarser, so the datapoint the store holds
+/// is always reported.
 ///
 /// A window holding no datapoint is never inserted, so what this allocates is bounded by the
 /// datapoints the series holds in the range rather than by the range the request spans. A
@@ -1267,16 +1268,10 @@ pub fn windows_by_unit<'a>(
         }
         // A period FINER than the span the datapoint is stored as can only be answered with
         // that WHOLE span's aggregate, and that is what such a read is answered with, at the
-        // start of the span the datapoint is stored in — a read at a granularity the series
-        // does not hold is answered at the granularity it does hold rather than with nothing.
-        // The ONE period that asks for detail a coarser-stored span holds none of at all is the
-        // one-second period ([`FINEST_WINDOW_DIVISION_SECS`]), which selects the data stored at
-        // THAT granularity and no other: "High-resolution metrics are those metrics stored by a
-        // `PutMetricData` call that includes a `StorageResolution` of 1 second."
-        // (`GetMetricStatisticsInput$Period`).
-        if stored_span > span && span < FINEST_WINDOW_DIVISION_SECS {
-            continue;
-        }
+        // start of the span the datapoint is stored in — at every period a read may ask for,
+        // and whether or not the clock has left that span. A read at a granularity the series
+        // does not hold is answered at the granularity it does hold rather than with nothing,
+        // so no gate on the requested period selects a stored datapoint out of a window.
         if unit.is_some_and(|wanted| datum.unit() != wanted) {
             continue;
         }
@@ -1363,21 +1358,6 @@ const SIXTY_THREE_DAYS_SECS: f64 = 63.0 * 24.0 * 60.0 * 60.0;
 /// minute." (`GetMetricDataInput$StartTime`) — four of the five sub-minute periods
 /// [`SUB_MINUTE_PERIODS`] admits.
 const START_TIME_ROUNDING_PERIODS: [i32; 4] = [5, 10, 20, 30];
-
-/// The FINEST division of a minute a read's own window grid is laid on, in seconds: "If you set
-/// Period to 5, 10, 20, or 30, the start time of your request is rounded down to the nearest time
-/// that corresponds to even 5-, 10-, 20-, or 30-second divisions of a minute."
-/// (`GetMetricDataInput$StartTime`, in the same words as `GetMetricStatisticsInput$StartTime`) —
-/// the smallest of [`START_TIME_ROUNDING_PERIODS`].
-///
-/// A period at or above it reads a series at one of those divisions, and is answered from every
-/// datapoint the range holds at the granularity that datapoint is STORED at. The one period
-/// BELOW it — the one second [`SUB_MINUTE_PERIODS`] also admits — resolves the per-second detail
-/// only high-resolution storage keeps ("CloudWatch stores the metric with sub-minute resolution
-/// down to one second", `MetricDatum$StorageResolution`), which is what makes it the one period
-/// that selects ONLY the data stored at that granularity and reports nothing of a span stored
-/// coarser than it ([`windows_by_unit`]).
-const FINEST_WINDOW_DIVISION_SECS: f64 = 5.0;
 
 /// The start of the first window a read searches: the requested start time rounded DOWN to the
 /// boundary its age and its period put it on.
