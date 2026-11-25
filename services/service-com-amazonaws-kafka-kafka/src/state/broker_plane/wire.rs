@@ -972,15 +972,6 @@ impl Broker {
             .collect()
     }
 
-    /// The authority this broker node is published at for this access method, which is
-    /// the address a client on this connection reached it at.
-    fn authority(&self) -> String {
-        self.state
-            .lock()
-            .broker_authority(&self.region, &self.cluster_arn, self.path)
-            .unwrap_or_default()
-    }
-
     /// `SaslHandshake`: the mechanisms this path offers, and whether the one the
     /// client named is among them.
     ///
@@ -1552,11 +1543,12 @@ impl Broker {
     /// `Metadata`: the brokers a client reaches this cluster at, and the topics it
     /// asked about.
     ///
-    /// Every broker node the cluster holds is reported, each at the address this access
-    /// method is served at — the one socket its nodes share, on the port the method is
-    /// served on — so a client that sizes its connection pool from the broker list, or
-    /// re-resolves the cluster from its metadata, reaches this emulator's own socket for
-    /// each of them rather than a name nothing serves. Each partition is placed on as
+    /// Every broker node the cluster holds is reported, each at the address it is PUBLISHED
+    /// at for this access method — the one interface this emulator answers on, on the port
+    /// the core assigned THAT node's own socket — so a client that sizes its connection
+    /// pool from the broker list, or re-resolves the cluster from its metadata, reaches this
+    /// emulator's own socket for each of them rather than a name nothing serves. Each
+    /// partition is placed on as
     /// many of those nodes as the topic's replication factor, starting at the node its
     /// own index falls on, and led by the first of them — the placement Apache Kafka lays
     /// a topic out with, so a client reads back the replication the topic was created
@@ -1566,14 +1558,19 @@ impl Broker {
         let (held, brokers) = {
             let mut store = self.state.lock();
             let ids = store.broker_node_ids(&self.region, &self.cluster_arn);
-            // The address this access method is served at, which is where every node of
-            // the cluster is reached: a client is told the node ids the cluster holds, and
-            // the one address that serves them.
-            let own = store
-                .broker_authority(&self.region, &self.cluster_arn, self.path)
-                .unwrap_or_default();
-            let brokers: Vec<(i32, String)> =
-                ids.iter().map(|node_id| (*node_id, own.clone())).collect();
+            // The address each node of the cluster is published at: a client is told the
+            // node ids the cluster holds and where each of them answers. A cluster that
+            // publishes no endpoint yet reports its nodes at the address this connection
+            // reached, which is the one address the client already has.
+            let brokers: Vec<(i32, String)> = store
+                .broker_authorities(&self.region, &self.cluster_arn, self.path)
+                .filter(|published| !published.is_empty())
+                .unwrap_or_else(|| {
+                    let own = store
+                        .broker_authority(&self.region, &self.cluster_arn, self.path)
+                        .unwrap_or_default();
+                    ids.iter().map(|node_id| (*node_id, own.clone())).collect()
+                });
             (store.data_plane_topics(&self.cluster_arn, now), brokers)
         };
         let broker_ids: Vec<i32> = brokers.iter().map(|(node_id, _)| *node_id).collect();
@@ -2007,21 +2004,54 @@ impl Broker {
         DescribeConfigsResponse::default().with_results(results)
     }
 
+    /// The broker that COORDINATES the group or transaction `key` of this cluster, and the
+    /// address it is published at for this access method.
+    ///
+    /// Apache Kafka coordinates a group on the broker that LEADS the partition of the
+    /// internal offsets topic the group's id hashes to, so a group has exactly ONE
+    /// coordinator and every broker of the cluster names the same one — which is what lets
+    /// a client ask whichever broker it already has a connection to and then follow the
+    /// answer. Read the same way here: the key picks a partition of that topic
+    /// ([`OFFSETS_TOPIC_PARTITIONS`]), and the node that partition falls on is the one
+    /// leading it, as this plane places every partition ([`topic_metadata`]).
+    ///
+    /// The coordinator is reported at ITS OWN published address for the method the client
+    /// dialled, so the client reaches that broker over the method it is already using. A
+    /// node whose socket is not open yet leaves the answer at an address the cluster does
+    /// publish rather than at none.
+    fn coordinator_of(&self, key: &str) -> (i32, String) {
+        let store = self.state.lock();
+        let nodes = store.broker_node_ids(&self.region, &self.cluster_arn);
+        let leading = coordinating_node(key, &nodes).unwrap_or(self.node_id);
+        let authority = store
+            .broker_authority_of_node(&self.region, &self.cluster_arn, self.path, leading)
+            .or_else(|| {
+                store.broker_authority_of_node(
+                    &self.region,
+                    &self.cluster_arn,
+                    self.path,
+                    self.node_id,
+                )
+            })
+            .or_else(|| store.broker_authority(&self.region, &self.cluster_arn, self.path))
+            .unwrap_or_default();
+        (leading, authority)
+    }
+
     /// `FindCoordinator`: the broker that coordinates the group or transaction a client
-    /// named — this broker node, which holds the group; every node of the cluster reads
-    /// the same group state, so the node a client already has a connection to is the one
-    /// it is sent back to.
+    /// named — ONE node of the cluster per key, chosen from the key alone
+    /// ([`Self::coordinator_of`]), so two clients that ask two different brokers about one
+    /// group are sent to the same broker.
     ///
     /// Answered in the shape the NEGOTIATED version has: the single coordinator a request
     /// up to version 3 asks about, carried in the response's own members, and from
-    /// version 4 on the per-key list, which is the only place those versions carry it.
+    /// version 4 on the per-key list, which is the only place those versions carry it —
+    /// and there each key is answered with the coordinator of THAT key.
     fn find_coordinator(
         &self,
         request: &FindCoordinatorRequest,
         api_version: i16,
     ) -> FindCoordinatorResponse {
-        let (host, port) = split_authority(&self.authority());
-        let node_id = self.node_id;
         if api_version >= 4 {
             return FindCoordinatorResponse::default().with_coordinators(
                 request
@@ -2029,20 +2059,51 @@ impl Broker {
                     .iter()
                     .take(MAX_REQUEST_ENTRIES)
                     .map(|key| {
+                        let (node_id, authority) = self.coordinator_of(key.as_str());
+                        let (host, port) = split_authority(&authority);
                         ::kafka_protocol::messages::find_coordinator_response::Coordinator::default()
                             .with_key(key.clone())
                             .with_node_id(BrokerId(node_id))
-                            .with_host(StrBytes::from_string(host.clone()))
+                            .with_host(StrBytes::from_string(host))
                             .with_port(port)
                     })
                     .collect(),
             );
         }
+        let (node_id, authority) = self.coordinator_of(request.key.as_str());
+        let (host, port) = split_authority(&authority);
         FindCoordinatorResponse::default()
             .with_node_id(BrokerId(node_id))
             .with_host(StrBytes::from_string(host))
             .with_port(port)
     }
+}
+
+/// How many partitions Apache Kafka's internal offsets topic holds when nothing narrows
+/// it: the documented default of `offsets.topic.num.partitions` ("Broker Configs", Apache
+/// Kafka documentation). A group's coordinator is the broker leading the partition of that
+/// topic the group's id maps to, so the count is part of that reading.
+const OFFSETS_TOPIC_PARTITIONS: u64 = 50;
+
+/// The broker node of `nodes` that coordinates the group or transaction `key`: the node
+/// leading the partition of the offsets topic the key maps to, which is the index that
+/// partition falls on among the cluster's nodes.
+///
+/// `None` for a cluster with no nodes to choose from. The mapping from the key to a
+/// partition is an arbitrary but STABLE one (the hasher the standard library ships, used
+/// the way this service already derives a value from a name) — what the rule needs is that
+/// every broker of the cluster, and every later call, pick the same node for one key.
+fn coordinating_node(key: &str, nodes: &[i32]) -> Option<i32> {
+    use ::std::hash::{Hash, Hasher};
+
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut hasher = ::std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let partition = hasher.finish() % OFFSETS_TOPIC_PARTITIONS;
+    let index = usize::try_from(partition).unwrap_or_default() % nodes.len();
+    nodes.get(index).copied()
 }
 
 /// The error a group call is answered with when this endpoint will not hold the group

@@ -5,17 +5,16 @@
 //! `tests/all/kafka_harness.rs`.
 //!
 //! RULE under test: every bootstrap string a cluster publishes is "a string containing one
-//! or more hostname:port pairs" that "doesn't necessarily include all of the brokers in
-//! the cluster" (`GetBootstrapBrokers` output members and documentation), and every pair
-//! of it is an address THIS emulator answers the Apache Kafka wire protocol on — named
-//! once, on the port its access method is served on. The nodes of one access method share
-//! that socket here, so what a client learns the cluster's whole broker list from is the
-//! `Metadata` the broker behind a published pair answers: one entry per broker node the
-//! cluster was provisioned with.
+//! or more hostname:port pairs" (`GetBootstrapBrokers` output members and documentation)
+//! carrying ONE PAIR PER BROKER NODE the cluster was provisioned with, and every pair of it
+//! is an address THIS emulator answers the Apache Kafka wire protocol on as that very node
+//! — named once, on the port the core assigned that node's own socket. So the `Metadata`
+//! the broker behind any published pair answers reports the same addresses: one entry per
+//! broker node, each where the string publishes it.
 //!
 //! So a client that splits the string to bootstrap, and then sizes its connection pool,
-//! pins a replication factor to the broker count or fails over to another broker from the
-//! metadata it reads there, reaches a broker for every address it took.
+//! pins a replication factor to the broker count or fans out per broker, reaches a broker
+//! of its own for every address it took.
 //!
 //! The rows differ along what the rule generalises over: the number of broker nodes (the
 //! published minimum, two, three, and a count above the subnets it is spread over), the
@@ -184,9 +183,13 @@ async fn every_bootstrap_string_names_each_served_address_once() {
         );
         for (member, pairs) in &members {
             let probe = format!("{case} / {member}");
-            assert!(
-                !pairs.is_empty(),
-                "case {probe:?}: a published member must carry a hostname:port pair"
+            // ONE PAIR PER BROKER NODE: what a client that splits the string counts is the
+            // cluster's broker nodes.
+            assert_eq!(
+                pairs.len(),
+                row.brokers,
+                "case {probe:?}: expected one hostname:port pair per broker node, got \
+                 {pairs:?}"
             );
             // Each address is named ONCE: a string that repeats one address names one
             // endpoint however many times it names it.
@@ -206,11 +209,13 @@ async fn every_bootstrap_string_names_each_served_address_once() {
                 );
                 ports.insert(port);
             }
-            // And every pair of one string carries that access method's own port.
+            // And every pair of one string carries the port the core assigned THAT broker
+            // node's own socket, so no two of them name one endpoint.
             assert_eq!(
                 ports.len(),
-                1,
-                "case {probe:?}: one access method is served on one port, got {ports:?}"
+                pairs.len(),
+                "case {probe:?}: every broker node answers on a port of its own, got \
+                 {ports:?} in {pairs:?}"
             );
         }
     }
@@ -287,8 +292,8 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                 negotiated.error_code
             );
             // And the broker list it reports is the cluster's whole membership — one entry
-            // per broker node — every one of them at an address the string publishes: the
-            // brokers are one cluster, whichever of them the client reached.
+            // per broker node — every one of them at the address the string publishes it
+            // at: the brokers are one cluster, whichever of them the client reached.
             let metadata = client.metadata(&probe).await;
             let reported: Vec<String> = metadata
                 .brokers
@@ -301,17 +306,16 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                 "case {probe:?}: expected Metadata to report the cluster's {brokers} broker \
                  nodes, got {reported:?}"
             );
-            assert!(
-                reported.iter().all(|address| pairs.contains(address)),
+            assert_eq!(
+                reported.iter().collect::<BTreeSet<&String>>(),
+                pairs.iter().collect::<BTreeSet<&String>>(),
                 "case {probe:?}: expected Metadata to report the published addresses \
                  {pairs:?}, got {reported:?}"
             );
             // The coordinator of a group a client asks for is a broker OF THIS CLUSTER, at
-            // an address the string publishes and on the port of the access method the
-            // client dialled — so the client follows the answer to a broker it already
-            // knows, over the method it is already using, rather than to an address nothing
-            // serves. It is the SAME broker whichever pair of the string the client asked
-            // on: one group has one coordinator.
+            // an address the string publishes — and it is the SAME broker whichever pair of
+            // the string the client asked on, since a group has exactly one coordinator and
+            // every broker of the cluster names it.
             let coordinator: ::kafka_protocol::messages::FindCoordinatorResponse = client
                 .call(
                     &probe,
@@ -327,13 +331,6 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                 pairs.contains(&answered),
                 "case {probe:?}: the coordinator must be one of the cluster's published \
                  brokers {pairs:?}, got {answered:?}"
-            );
-            let (_dialled_host, dialled_port) = split(pair, &probe);
-            assert_eq!(
-                coordinator.port,
-                i32::from(dialled_port),
-                "case {probe:?}: the coordinator must be reached on the access method the \
-                 client dialled, got {answered:?}"
             );
             coordinators.insert(answered);
         }

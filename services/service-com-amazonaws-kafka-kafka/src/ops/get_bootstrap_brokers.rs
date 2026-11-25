@@ -3,16 +3,14 @@
 //! @op GetBootstrapBrokers
 //! Renders the cluster's bootstrap-broker strings from its persisted access settings:
 //! one string per ACCESS METHOD the cluster actually enables, each carrying the
-//! `hostname:port` THIS emulator accepts an Apache Kafka connection on for that method —
-//! "a list of brokers that a client application can use to bootstrap", which "doesn't
-//! necessarily include all of the brokers in the cluster", so what every pair of it has to
-//! be is an address a client can really reach. Every pair of ONE string carries the SAME
-//! port, the one that method is served on — Amazon MSK's listener model, where a port
-//! identifies the access method — so two methods never share a port and a client that
-//! writes a rule per port writes it per method. The cluster's whole broker list is what
-//! the `Metadata` the broker behind the published address answers reports, so a client
-//! that sizes its connection pool or pins a replication factor to the broker count reads
-//! the cluster `DescribeCluster` reports.
+//! `hostname:port` pairs THIS emulator accepts an Apache Kafka connection on for that
+//! method — "a list of brokers that a client application can use to bootstrap", so what
+//! every pair of it has to be is an address a client can really reach. ONE PAIR PER BROKER
+//! NODE the cluster holds, which is what a client that splits the string to size its
+//! connection pool, fan out per broker or pin a replication factor counts — each pair the
+//! address the core bound THAT node's own socket for THAT method at, so no two pairs of the
+//! cluster name one endpoint and a client that dials any of them reaches the broker it
+//! was published for.
 //! A method the
 //! cluster does not enable has no string at all — a member is populated exactly when
 //! the cluster's encryption-in-transit setting AND its client authentication admit a
@@ -24,8 +22,8 @@
 //! is refused with `BadRequestException` rather than answered with endpoints nothing
 //! serves on.
 //!
-//! The address is a socket the CORE owns, opened per ACCESS METHOD of the cluster on the
-//! first read of its endpoints and kept for as long as the store lives
+//! The address is a socket the CORE owns, opened per BROKER NODE of each ACCESS METHOD of
+//! the cluster on the first read of its endpoints and kept for as long as the store lives
 //! ([`crate::state::broker_plane::ensure_cluster_endpoints`]) — so every later read
 //! answers the same addresses, and the broker behind each of them serves the protocol a
 //! client takes the string to: the SASL exchange the method requires, the topic
@@ -354,17 +352,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The ADDRESSES each access method is announced at are the ones the emulator
-        // ANSWERS Apache Kafka connections on: the core binds ONE socket per method on
-        // this emulator's own interface and this service serves the Kafka wire protocol
-        // there for every broker node of the cluster ([`crate::state::broker_plane`]), so
-        // a client that takes any pair of a bootstrap string verbatim reaches a broker,
-        // and every pair of one string carries that method's own port. A method whose
+        // ANSWERS Apache Kafka connections on: the core binds a socket per BROKER NODE of
+        // the method on this emulator's own interface and this service serves the Kafka wire
+        // protocol there as that node ([`crate::state::broker_plane`]), so
+        // a client that takes any pair of a bootstrap string verbatim reaches the broker it
+        // names. A method whose
         // socket could not be opened is reported as a server fault rather than announced
         // as an address nothing serves.
         type Method = state::broker_plane::AccessPath;
         // Each access method is published exactly when the cluster entitles the member it
-        // serves, so one port is opened per member a client may use and none for a member
-        // the answer leaves out.
+        // serves, so a socket is opened per broker node of each member a client may use and
+        // none for a member the answer leaves out.
         let methods: [(Method, bool); 10] = [
             (Method::Plaintext, plaintext_offered && !serverless),
             (Method::Tls, tls_offered && !serverless),
@@ -408,9 +406,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             // "A string containing one or more hostname:port pairs", comma-separated:
-            // every address this emulator serves that method's brokers at, which is what
-            // a client splits the string into to bootstrap against them — each of them on
-            // this method's single port.
+            // every address this emulator serves that method's brokers at — one per broker
+            // node the cluster holds, which is what a client splits the string into to
+            // bootstrap against them.
             announced.push((path, Some(authorities.join(","))));
         }
         let endpoint = |path: Method| -> Option<String> {
@@ -429,7 +427,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One string per access method the cluster enables, each naming every broker
-        // node's address on that method's own port. A method the cluster does not enable
+        // node's own address on that method. A method the cluster does not enable
         // has no endpoint at all, so its member is absent rather than empty.
         let when = |enabled: bool, path: Method| enabled.then(|| endpoint(path)).flatten();
 
@@ -445,10 +443,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             bootstrap_broker_string_vpc_connectivity_sasl_scram: endpoint(Method::VpcSaslScram),
             bootstrap_broker_string_vpc_connectivity_sasl_iam: endpoint(Method::VpcSaslIam),
             // A dual-stack cluster answers on the same ports over IPv6, through
-            // the SAME broker endpoint: an MSK broker endpoint is one address whose
+            // the SAME broker endpoints: an MSK broker endpoint is one address whose
             // record set gains AAAA entries on a `DUAL` cluster, so these members
-            // repeat the IPv4 strings by design — the access method is the same one, and
-            // an access method has one port. An IPv4-only cluster (the model's default
+            // repeat the IPv4 strings by design — the access method is the same one. An
+            // IPv4-only cluster (the model's default
             // `NetworkType`) has no IPv6 path at all.
             bootstrap_broker_string_ipv6: when(dual_stack, Method::Plaintext),
             bootstrap_broker_string_tls_ipv6: when(dual_stack, Method::Tls),

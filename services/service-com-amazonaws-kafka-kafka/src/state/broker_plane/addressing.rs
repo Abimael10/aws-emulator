@@ -6,16 +6,18 @@
 //! Amazon MSK gives each broker node a host of its OWN —
 //! `b-<id>.<cluster>.<suffix>.kafka.<region>.…`, the name `ListNodes` reports under
 //! `BrokerNodeInfo$Endpoints` — and publishes the whole cluster's brokers for one ACCESS
-//! METHOD on a single PORT: a bootstrap string lists `host:port` pairs that all carry the
-//! port that method is served on ([`super::AccessPath`]).
+//! METHOD on a single PORT: a bootstrap string lists one `host:port` pair per broker node
+//! ([`super::AccessPath`]).
 //!
 //! What this emulator may PUBLISH for a client to dial is narrower than what AWS names.
 //! An address a service hands a client is an address the client then connects to, so it has
-//! to lead back to this process: it is the `host:port` the CORE bound the broker socket at
+//! to lead back to this process: it is the `host:port` the CORE bound a broker socket at
 //! — the loopback interface unless the operator named another — and never a name of AWS's
 //! own, nor a name composed under some zone, which resolves to nothing a client on this
-//! machine can reach. Every broker node of one access method is reached at that one
-//! address, and `Metadata` reports each of them there.
+//! machine can reach. This emulator is reached at ONE host, so what tells one broker node's
+//! published address from another's is the PORT the core assigned that node's socket: a
+//! node is published at the address of its own socket, and `Metadata` reports each node
+//! there.
 
 /// The host Amazon MSK names the broker node `id` of a cluster by:
 /// `b-<id>.<cluster>.<suffix>.kafka.<region>.amazonaws.com`, where `dns_suffix` is the
@@ -24,14 +26,14 @@
 /// The ONE statement of that form: a node's stored endpoint host
 /// ([`crate::state::BrokerNode::endpoint_host`]), which `ListNodes` reports, is composed
 /// here. It is the name AWS gives the node, not an address this emulator serves — what a
-/// client dials is [`served_broker_host`] on the access method's port.
+/// client dials is [`served_broker_host`] on the port the core assigned that node's socket.
 #[must_use]
 pub fn broker_endpoint_host(region: &str, name: &str, dns_suffix: &str, id: i32) -> String {
     format!("b-{id}.{name}.{dns_suffix}.kafka.{region}.amazonaws.com")
 }
 
 /// The host this emulator publishes a cluster's brokers at, read off the `host:port` the
-/// core bound the broker socket at: the address a client that takes a published pair then
+/// core bound a broker socket at: the address a client that takes a published pair then
 /// dials, which is the interface the core is accepting on.
 ///
 /// Read through the one shared reading of a listener's address

@@ -13,11 +13,11 @@
 //! lifetime hangs off ([`ClusterEndpoint`]) together with the state the protocol
 //! answers from.
 //!
-//! ONE socket per ACCESS METHOD a cluster enables, shared by every BROKER NODE of the
-//! cluster: Amazon MSK publishes one port per access method, so a bootstrap string carries
-//! that method's own port, and the address it names is the one the core bound the socket at
-//! ([`addressing`]) — the `Metadata` answer reports every node of the cluster there, since
-//! that one socket is where each of them is reached. A
+//! ONE socket per BROKER NODE of each ACCESS METHOD a cluster enables: Amazon MSK gives
+//! every broker node an address of its own for each method, and this emulator is reached at
+//! ONE host, so each node answers that method on a socket of its own and is published at
+//! the address the core bound it at ([`addressing`]) — which is what a bootstrap string
+//! names one pair per node of, and where the `Metadata` answer reports each of them. A
 //! Kafka request frame begins with its length, so its first byte is never the `0x16` a TLS
 //! record opens with: the connection's first byte says whether the client dialled the
 //! encrypted half or the plaintext one ([`::service_common::in_band_tls`]), which is how
@@ -454,11 +454,11 @@ pub fn max_message_bytes(configuration: &BTreeMap<String, String>) -> usize {
 ///
 /// Amazon MSK publishes ONE PORT per access method, shared by every broker node of the
 /// cluster ([`super::PORT_PLAINTEXT`], [`super::PORT_TLS`], [`super::PORT_SASL_SCRAM`],
-/// [`super::PORT_SASL_IAM`] and their public and multi-VPC siblings), so each method is
-/// served here on a socket of its OWN and every node of the cluster is published on
-/// that socket's port: a bootstrap string's port says which method a client is
-/// reaching, and its host which broker — an address of the bound interface apiece
-/// ([`addressing::published_broker_host`]). What a method requires of
+/// [`super::PORT_SASL_IAM`] and their public and multi-VPC siblings), and tells its nodes
+/// apart by the host each of them carries. This emulator is reached at ONE host, so what
+/// tells two published addresses apart here is the PORT: each broker node answers each
+/// method it enables on a socket of its own, and the pair published for it is that socket's
+/// address ([`addressing::served_broker_host`]). What a method requires of
 /// a client is its scheme's: the plaintext one encrypts nothing, the TLS one encrypts
 /// and authenticates no client, and each SASL one requires the exchange its mechanism
 /// defines before anything else is served. The PORT a client dials is the core's, not
@@ -510,20 +510,21 @@ impl AccessPath {
     }
 }
 
-/// The ONE socket a cluster's brokers answer one ACCESS METHOD's connections on, and the
-/// address that socket is published at.
+/// The socket ONE BROKER NODE of a cluster answers one ACCESS METHOD's connections on, and
+/// the address that socket is published at.
 ///
-/// One socket per method, shared by every node, is Amazon MSK's own listener model: a
-/// method has one port. So the record holds the port the core assigned and the HOST the
-/// core bound it on — together the address a client dials to reach this cluster's brokers
-/// over this method ([`addressing`]).
+/// One socket per node and method: Amazon MSK gives every broker node an address of its own
+/// for each method, and this emulator is reached at ONE host, so what tells one node's
+/// published address from another's here is the PORT the core assigned its socket. The
+/// record holds that port and the HOST the core bound it on — together the address a client
+/// dials to reach THAT broker over THAT method ([`addressing`]).
 ///
 /// The store OWNS the listener: dropping it closes the port and severs every
 /// connection on it, so it must outlive every bootstrap string handed out — which is
 /// as long as the cluster is in the registry.
 pub struct ClusterEndpoint {
-    /// The port every broker node of the cluster answers this method on — the one the
-    /// core assigned this socket.
+    /// The port this broker node answers this method on — the one the core assigned this
+    /// socket.
     port: u16,
     /// The host this socket is dialled at, read off the address the CORE bound it on
     /// ([`addressing::served_broker_host`]). Kept with the socket, so every later read of
@@ -553,14 +554,14 @@ impl std::fmt::Debug for ClusterEndpoint {
 }
 
 impl ClusterEndpoint {
-    /// The port every broker node of the cluster answers this access method on.
+    /// The port this broker node answers this access method on.
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// The `host:port` every broker node of the cluster answers this access method on:
-    /// the address the CORE bound this socket at, which is what a client dials.
+    /// The `host:port` this broker node answers this access method on: the address the CORE
+    /// bound this socket at, which is what a client dials to reach that node.
     #[must_use]
     pub fn authority(&self) -> String {
         ::service_common::data_plane_addressing::host_port_authority(&self.host, self.port)
@@ -573,12 +574,17 @@ impl ClusterEndpoint {
 /// A bootstrap string "contains one or more hostname:port pairs" and "doesn't necessarily
 /// include all of the brokers in the cluster" (`GetBootstrapBrokers`) — what a client
 /// takes from it is WHERE TO BOOTSTRAP, so every pair of it has to be an address this
-/// emulator really answers the Apache Kafka wire protocol on. The nodes of one access
-/// method share its socket here, so that is one pair, carrying the port the method is
-/// served on; the whole broker list a client sizes its pool from is what the `Metadata`
-/// the broker behind it answers reports.
+/// emulator really answers the Apache Kafka wire protocol on. ONE PAIR PER BROKER NODE of
+/// the cluster, each the address of THAT node's own socket — so a client that sizes its
+/// connection pool, pins a replication factor or fans out per broker from the string it
+/// split reads as many entries as the cluster holds nodes, and reaches that very broker at
+/// every one of them.
 ///
-/// `None` when the socket could not be opened — the caller then answers with a modelled
+/// A node's socket is opened on the first read of the cluster's endpoints and kept, so a
+/// cluster that GREW since that read has the new nodes' sockets opened here and keeps the
+/// addresses it already published.
+///
+/// `None` when no socket could be opened — the caller then answers with a modelled
 /// error rather than announcing a broker list with an address nothing serves in it.
 pub async fn ensure_cluster_endpoints<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -588,69 +594,72 @@ pub async fn ensure_cluster_endpoints<Eng: Send + Sync + 'static>(
     path: AccessPath,
 ) -> Option<Vec<String>> {
     let state = super::service_state(engine)?;
-    let key = (cluster_arn.to_string(), path);
     // Everything read off the store is read under ONE guard, taken and dropped before
-    // the await below: a lock held across an await would make this future non-`Send`.
-    let (open, admitted) = {
+    // the awaits below: a lock held across an await would make this future non-`Send`.
+    let (nodes, held, admitted) = {
         let store = state.lock();
         (
-            store.cluster_endpoints.contains_key(&key),
+            store.broker_node_ids(region, cluster_arn),
+            store.cluster_endpoints.len(),
             // A socket is bound for a cluster this endpoint HOLDS, and for no other ARN:
             // the key comes from the request, so binding on a name nothing resolves would
             // let one caller grow the process's port and descriptor use without end.
-            store.cluster_in(region, cluster_arn).is_some()
-                && store.cluster_endpoints.len() < MAX_CLUSTER_ENDPOINTS,
+            store.cluster_in(region, cluster_arn).is_some(),
         )
     };
-    if !open {
-        if !admitted {
-            return None;
-        }
-        open_access_method(engine, ctx, region, cluster_arn, path, &state).await?;
+    if !admitted || held >= MAX_CLUSTER_ENDPOINTS {
+        return None;
     }
-    // Read with the socket already open, so the address answered is one already being
-    // served when the caller publishes it.
+    for node_id in nodes {
+        let open = state
+            .lock()
+            .cluster_endpoints
+            .contains_key(&(cluster_arn.to_string(), path, node_id));
+        if open {
+            continue;
+        }
+        open_broker_node(engine, ctx, region, cluster_arn, path, node_id, &state).await?;
+    }
+    // Read with the sockets already open, so the addresses answered are ones already being
+    // served when the caller publishes them: one pair per broker node the cluster holds.
     let announced = state
         .lock()
-        .broker_authority(region, cluster_arn, path)
-        .map(|authority| vec![authority]);
+        .broker_authorities(region, cluster_arn, path)
+        .filter(|published| !published.is_empty())
+        .map(|published| published.into_iter().map(|(_node, pair)| pair).collect());
     announced
 }
 
-/// Open the ONE socket the cluster `cluster_arn` answers `path` connections on, and
-/// record it.
+/// Open the socket the broker node `node_id` of the cluster `cluster_arn` answers `path`
+/// connections on, and record it.
 ///
 /// `None` when this service was mounted on an engine with no listener surface, when this
 /// emulator already holds [`MAX_CLUSTER_ENDPOINTS`] endpoints, or when the core could not
 /// bind — the caller then answers with a modelled error rather than announcing an address
 /// nothing serves.
 ///
-/// Idempotent: the first socket opened for an access method of a cluster is kept, so every
+/// Idempotent: the first socket opened for a node's access method is kept, so every
 /// later `GetBootstrapBrokers` answers the same port and a client may key a connection on
 /// it. It is released when the cluster leaves the registry
 /// ([`ComAmazonawsKafkaKafkaState::unregister_cluster`]), which closes the port.
-async fn open_access_method<Eng: Send + Sync + 'static>(
+async fn open_broker_node<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     cluster_arn: &str,
     path: AccessPath,
+    node_id: i32,
     state: &::engine::ServiceState<ComAmazonawsKafkaKafkaState>,
 ) -> Option<()> {
-    let key = (cluster_arn.to_string(), path);
+    let key = (cluster_arn.to_string(), path, node_id);
     let listeners = (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()?
         .listeners();
-    // The node a client that dialled the METHOD's port lands on: the first broker node of
-    // the cluster, which is the node a bootstrap connection reaches. Every node of the
-    // cluster reads and writes the same log, so which one a connection is answered as
-    // decides only the identity it is answered with.
-    let bootstrap_node = state
-        .lock()
-        .broker_node_ids(region, cluster_arn)
-        .first()
-        .copied()?;
-    let served = broker_of_node(engine, ctx, region, cluster_arn, path, bootstrap_node, state);
+    // The node a client that dialled THIS address lands on: every node of the cluster reads
+    // and writes the same log, so which one a connection is answered as decides the identity
+    // it is answered with — the broker id it reports in `Metadata` and as the coordinator of
+    // a group it holds.
+    let served = broker_of_node(engine, ctx, region, cluster_arn, path, node_id, state);
     let listener = listeners
         .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
             ::std::sync::Arc::clone(&served),
@@ -696,8 +705,9 @@ async fn open_access_method<Eng: Send + Sync + 'static>(
         %cluster_arn,
         %authority,
         ?path,
+        node_id,
         port,
-        "opened an access method's Apache Kafka endpoint"
+        "opened a broker node's Apache Kafka endpoint"
     );
     Some(())
 }
@@ -749,14 +759,20 @@ fn broker_of_node<Eng: Send + Sync + 'static>(
 }
 
 /// The most Apache Kafka endpoints this emulator holds open at once, across every
-/// cluster and access method.
+/// cluster, access method and broker node.
 ///
 /// CHOSEN as a process-safety bound, not an Amazon MSK limit: each endpoint owns a
 /// listening socket and its file descriptor for as long as its cluster is in the
 /// registry, and how many clusters a caller creates is the caller's choice. One is opened
-/// per ACCESS METHOD a cluster enables — ten at the very most, however many broker nodes
-/// the cluster holds, since the nodes of one method share its socket — so it is sized well
-/// above the clusters an emulator is driven with.
+/// per BROKER NODE per ACCESS METHOD a cluster enables, so ONE cluster can hold up to 150
+/// of them — the ten methods at the very most, times the fifteen broker nodes
+/// `__integerMin1Max15` admits — while a cluster of the shape an emulator is driven with
+/// (a handful of nodes on one or two methods) holds a few. The ceiling is sized for many
+/// clusters of the second kind rather than for several of the first: past it the reader
+/// answers a server fault instead of opening more descriptors, which is the bound doing its
+/// job. It is deliberately NOT raised with the per-node endpoints: a process-wide descriptor
+/// budget is commonly 1024 in total, so a higher ceiling here would spend the host's
+/// descriptors rather than this emulator's own.
 pub const MAX_CLUSTER_ENDPOINTS: usize = 512;
 
 impl ComAmazonawsKafkaKafkaState {
@@ -776,11 +792,61 @@ impl ComAmazonawsKafkaKafkaState {
     }
 
     /// The `host:port` the brokers of the cluster `cluster_arn` are published at for
-    /// `path`: the address the core bound that access method's socket at, which every
-    /// broker node of the cluster answers on.
+    /// `path`: ONE pair per broker node the cluster holds whose socket is open, in node-id
+    /// order, each the address the core bound THAT node's own socket at
+    /// ([`ClusterEndpoint::authority`]).
     ///
-    /// `None` for a cluster this Region holds no record of, or an access method whose
-    /// socket has not been opened — there is no address to report for either.
+    /// Empty — rather than `None` — for a cluster whose nodes have no socket open yet: the
+    /// cluster is in the registry, it simply publishes nothing so far.
+    ///
+    /// `None` for a cluster this Region holds no record of: there is no address to report
+    /// for an ARN it does not hold, even while the socket of a cluster of that name
+    /// elsewhere is open.
+    #[must_use]
+    pub fn broker_authorities(
+        &self,
+        region: &str,
+        cluster_arn: &str,
+        path: AccessPath,
+    ) -> Option<Vec<(i32, String)>> {
+        self.cluster_in(region, cluster_arn)?;
+        Some(
+            self.broker_node_ids(region, cluster_arn)
+                .into_iter()
+                .filter_map(|node_id| {
+                    self.cluster_endpoints
+                        .get(&(cluster_arn.to_string(), path, node_id))
+                        .map(|endpoint| (node_id, endpoint.authority()))
+                })
+                .collect(),
+        )
+    }
+
+    /// The `host:port` the broker node `node_id` of the cluster `cluster_arn` is published
+    /// at for `path` — the address a client talking to THAT node reached it at.
+    ///
+    /// `None` for a node whose socket is not open, or a cluster this Region holds no record
+    /// of ([`Self::broker_authorities`]).
+    #[must_use]
+    pub fn broker_authority_of_node(
+        &self,
+        region: &str,
+        cluster_arn: &str,
+        path: AccessPath,
+        node_id: i32,
+    ) -> Option<String> {
+        self.cluster_in(region, cluster_arn)?;
+        self.cluster_endpoints
+            .get(&(cluster_arn.to_string(), path, node_id))
+            .map(ClusterEndpoint::authority)
+    }
+
+    /// The `host:port` a client BOOTSTRAPS the access method `path` of the cluster
+    /// `cluster_arn` at: the address of the first broker node of it that is published,
+    /// which is the one a client that reads a single pair dials.
+    ///
+    /// `None` for a cluster this Region holds no record of, or an access method no node of
+    /// which has a socket open — there is no address to report for either.
     #[must_use]
     pub fn broker_authority(
         &self,
@@ -788,13 +854,10 @@ impl ComAmazonawsKafkaKafkaState {
         cluster_arn: &str,
         path: AccessPath,
     ) -> Option<String> {
-        let endpoint = self
-            .cluster_endpoints
-            .get(&(cluster_arn.to_string(), path))?;
-        // A cluster this Region no longer holds has no published address, even while the
-        // socket of a cluster of that name elsewhere is open.
-        self.cluster_in(region, cluster_arn)?;
-        Some(endpoint.authority())
+        self.broker_authorities(region, cluster_arn, path)?
+            .into_iter()
+            .next()
+            .map(|(_node, authority)| authority)
     }
 }
 

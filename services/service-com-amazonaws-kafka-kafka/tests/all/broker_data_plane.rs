@@ -931,8 +931,11 @@ async fn metadata_reports_every_broker_node_the_cluster_holds() {
 
 /// The `ConfigResource.Type` a `DescribeConfigs` request names a topic by, and the one
 /// it names a broker by (Apache Kafka protocol).
+///
+/// `RESOURCE_TYPE_BROKER` is `pub(crate)` so the suites that read a BROKER's own
+/// configuration share this one reading of the protocol's resource types.
 const RESOURCE_TYPE_TOPIC: i8 = 2;
-const RESOURCE_TYPE_BROKER: i8 = 4;
+pub(crate) const RESOURCE_TYPE_BROKER: i8 = 4;
 
 /// The timestamps a `ListOffsets` request asks the earliest and the latest offset with.
 const OFFSET_EARLIEST: i64 = -2;
@@ -941,7 +944,10 @@ const OFFSET_LATEST: i64 = -1;
 impl Client {
     /// `DescribeConfigs` for one resource, answering the entries it reports as
     /// `name -> value`.
-    async fn configs(
+    ///
+    /// `pub(crate)` because every suite that reads a topic's or a broker's configuration
+    /// over the protocol shares this one reading of the answer rather than keeping a copy.
+    pub(crate) async fn configs(
         &mut self,
         case: &str,
         resource_type: i8,
@@ -1918,8 +1924,8 @@ async fn the_acl_bindings_a_client_creates_are_held_and_decide_a_refusal() {
     );
 }
 
-/// RULE: the group a consuming client joins is coordinated by the broker it was sent
-/// to — the member is admitted with an id and a generation, told the assignment the
+/// RULE: the group a consuming client joins is coordinated by a broker of the cluster —
+/// the member is admitted with an id and a generation, told the assignment the
 /// group's leader computed for it, and the offset it commits is the offset a later
 /// `OffsetFetch` reports — so a client that consumes as part of a group makes progress
 /// and resumes where it left off.
@@ -1933,8 +1939,9 @@ async fn the_group_a_consumer_joins_is_coordinated_by_the_broker() {
     let mut client = Client::plaintext(case, &authority).await;
     client.api_versions(case).await;
 
-    // The coordinator of a group is the broker that answers for it, at the address the
-    // client dialled.
+    // The coordinator of a group is a broker OF THIS CLUSTER, named at an address the
+    // cluster publishes: a group has one coordinator, so the answer is the same broker
+    // whichever of them the client asked, and the client follows it there.
     let coordinator: ::kafka_protocol::messages::FindCoordinatorResponse = client
         .call(
             case,
@@ -1945,10 +1952,16 @@ async fn the_group_a_consumer_joins_is_coordinated_by_the_broker() {
                 .with_key_type(0),
         )
         .await;
-    assert_eq!(
-        format!("{}:{}", coordinator.host.as_str(), coordinator.port),
-        authority,
-        "case {case:?}: the coordinator must be the broker the client dialled"
+    let named = format!("{}:{}", coordinator.host.as_str(), coordinator.port);
+    let brokers = published_pairs(&emulator, &cluster, case)
+        .await
+        .get("bootstrapBrokerString")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        brokers.contains(&named),
+        "case {case:?}: the coordinator must be one of the cluster's brokers {brokers:?}, got \
+         {named:?}"
     );
 
     // Joining admits the member, names it and hands it the group's generation.
