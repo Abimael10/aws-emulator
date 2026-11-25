@@ -6,9 +6,11 @@
 //! The rule under test: **`CreateTransformJob` LISTS the Amazon S3 location
 //! `TransformInput.DataSource.S3DataSource.S3Uri` names before it creates anything.** A
 //! location Amazon S3 answers holds no object is refused HTTP 400 `ValidationException`
-//! stating that of that location — and no job of that name exists afterwards, because the
-//! refusal is pre-creation — while the same call against a location that holds objects is
-//! accepted and the job it created runs to a status that is not `Failed`.
+//! carrying the diagnosis AWS words for an input data source it found nothing under — the S3
+//! URL, the Region the call addressed, the execution role of the model the job would run and
+//! the bucket that role has to be allowed to list — and no job of that name exists afterwards,
+//! because the refusal is pre-creation, while the same call against a location that holds
+//! objects is accepted and the job it created runs to a status that is not `Failed`.
 //!
 //! The rule spans three services over ONE engine — Amazon S3 for the dataset, IAM for the
 //! role the job reads under, and the SageMaker control plane — so neither crate's own test
@@ -26,7 +28,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::sagemaker_endpoint_serves_a_trained_model::{
-    control, emulator, iam, image, send, settled, ACCOUNT,
+    control, emulator, iam, image, send, settled, ACCOUNT, REGION,
 };
 
 /// The bucket the dataset and the model artifact live in.
@@ -355,10 +357,20 @@ async fn create_transform_job_lists_the_location_its_input_names() {
             row.case
         );
         let message = error_message(&answered);
-        let expected = format!("The S3 location \"{s3_uri}\" does not exist or has no objects.");
+        let bucket = row.bucket.unwrap_or(BUCKET);
+        // The refusal AWS words for an input data source it found no object under: the S3 URL
+        // the request named, the Region it addressed, the execution role of the model the job
+        // would run and the bucket that role has to be allowed to list.
+        let expected = format!(
+            "No S3 objects found under S3 URL \"{s3_uri}\" given in input data source. Please \
+             ensure that the bucket exists in the selected region ({REGION}), that objects \
+             exist under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
+             permissions on bucket \"{bucket}\"."
+        );
         assert_eq!(
             message, expected,
-            "case {:?}: expected the no-objects refusal naming {s3_uri:?}, got {message:?}",
+            "case {:?}: expected the no-objects refusal naming {s3_uri:?}, the Region, the role \
+             and the bucket, got {message:?}",
             row.case
         );
         // The refusal is PRE-CREATION, so it leaves nothing behind: the name is not taken.

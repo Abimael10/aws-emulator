@@ -53,7 +53,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::form_encode;
 
 /// The Region every call below is signed for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account the emulator serves.
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;

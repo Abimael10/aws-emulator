@@ -10,7 +10,7 @@
 //! * the execution role the resource would RUN AS ([`execution_role_is_unassumable`]);
 //! * the Amazon S3 location its work would READ, asked through [`crate::state::s3_access`]
 //!   and worded per resource family ([`could_not_access_model_data`] for the hosting
-//!   creates, [`no_s3_objects_found`] for the training ones);
+//!   creates, [`no_s3_objects_found`] for the ones that resolve an input data source);
 //! * the network placement it asks for ([`SECURITY_GROUPS_NOT_SPECIFIED`]).
 //!
 //! One QUESTION about the role, several SENTENCES: the recorded refusals word an
@@ -140,32 +140,23 @@ pub fn failed_to_download_model_data(location: &crate::state::S3Location) -> Str
     )
 }
 
-/// How a create whose resource's work would READ an Amazon S3 location words one that holds
-/// no object at all: the location AS THE CALLER SENT IT, and the two facts that make it name
-/// nothing — there is no such location, or there is nothing under it.
+/// How a create whose resource's work READS an Amazon S3 input data source words one that
+/// names no object it could read: the S3 URL AS THE CALLER SENT IT, the Region the request
+/// addressed, the role the resource runs as and the bucket that role has to be allowed to
+/// list — the three things that can make the location answer nothing.
 ///
-/// A DIFFERENT fact from a location whose listing was withheld from the role
-/// ([`no_s3_objects_found`], whose sentence names the permission the listing needs): here
-/// Amazon S3 ANSWERED, and what it answered is that the location holds nothing, so there is no
-/// permission to name. `CreateTransformJob` tells its caller the two apart, the way the hosting
-/// creates tell "could not find" and "could not access" apart
-/// ([`could_not_find_model_data`], [`could_not_access_model_data`]).
-#[must_use]
-pub fn s3_location_holds_no_objects(s3_url: &str) -> String {
-    format!("The S3 location \"{s3_url}\" does not exist or has no objects.")
-}
-
-/// How `CreateTrainingJob` words an input data source it found no object under: the S3 URL AS
-/// THE CALLER SENT IT, the Region the request addressed, the role it supplied and the bucket
-/// that role has to be allowed to list — the three things that can make the location answer
-/// nothing.
+/// ONE sentence for both of the conditions that produce it, because the service itself cannot
+/// tell them apart: a prefix that holds nothing and a listing the documents in force withheld
+/// look the same from the service's side, so the caller is handed every fact needed to tell
+/// them apart rather than a verdict on which it was. A SECOND clause carries what Amazon S3
+/// itself answered when the listing was refused by AUTHORIZATION ([`s3_listing_refusal`]),
+/// which is the one hint distinguishing "the prefix is empty" from "this role may not list the
+/// bucket"; a listing that answered and held nothing carries no such clause, because Amazon S3
+/// refused nothing.
 ///
-/// One sentence for the location, and a SECOND one for what Amazon S3 itself answered when
-/// the listing was refused by AUTHORIZATION rather than merely coming back empty
-/// ([`s3_listing_refusal`]): the two conditions are told apart by whether the sentence
-/// naming the Amazon S3 answer is there, which is how a client distinguishes "the prefix is
-/// empty" from "this role may not list the bucket". A listing that answered and held nothing
-/// carries no such clause, because Amazon S3 refused nothing.
+/// Every create that resolves an input data source words the refusal this way — the training
+/// creates through [`crate::state::absent_input_objects`], `CreateTransformJob` on its
+/// `TransformInput` — so no two of them tell a caller different things about the same fact.
 #[must_use]
 pub fn no_s3_objects_found(
     s3_url: &str,

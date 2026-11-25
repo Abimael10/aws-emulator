@@ -165,7 +165,7 @@ pub mod admission;
 pub use admission::{
     could_not_access_model_data, could_not_assume_role, could_not_find_model_data,
     execution_role_failure_reason, execution_role_is_unassumable, failed_to_download_model_data,
-    no_s3_objects_found, s3_listing_refusal, s3_location_holds_no_objects, vpc_placement_refusal,
+    no_s3_objects_found, s3_listing_refusal, vpc_placement_refusal,
     SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
 };
 

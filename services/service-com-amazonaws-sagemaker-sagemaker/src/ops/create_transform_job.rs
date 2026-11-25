@@ -302,30 +302,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused for it rather than admitted with no input (see `crate::state::s3_access`). A
         // model that assumes no role has none to read as.
         //
-        // Two conditions, two sentences, because they are different facts and a caller acts on
-        // them differently: a location Amazon S3 ANSWERED holds nothing has no permission to
-        // name (`crate::state::s3_location_holds_no_objects`), while a read a document
-        // withholds is the one the listing permission is named for
-        // (`crate::state::no_s3_objects_found`). The hosting creates word the same pair apart
-        // the same way (`create_model`).
+        // ONE sentence for both conditions, because the service itself cannot tell them apart
+        // and says so: a listing that came back empty and a listing the documents in force
+        // withheld are indistinguishable from the service's side, so the refusal states the
+        // whole diagnosis — the S3 URL given in the input data source, the Region the call
+        // addressed, the execution role of the model the job runs and the bucket that role has
+        // to be allowed to list (`crate::state::no_s3_objects_found`). `CreateTrainingJob`,
+        // the other create that resolves an input data source, words it the same way
+        // (`crate::state::absent_input_objects`).
         let input_uri = input.transform_input.data_source.s3_data_source.s3_uri.clone();
         if let Some(role_arn) = execution_role_arn.as_deref() {
             if let Some(unreadable) =
                 crate::state::first_unreadable_location(ctx, &region, role_arn, [input_uri.as_str()])
                     .await
             {
-                let refusal = match unreadable {
-                    crate::state::UnreadableLocation::NoObject(uri) => {
-                        crate::state::s3_location_holds_no_objects(uri)
-                    }
-                    crate::state::UnreadableLocation::Denied(uri) => {
-                        let bucket = crate::state::S3Location::parse(uri)
-                            .map(|location| location.bucket)
-                            .unwrap_or_default();
-                        crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket, None)
-                    }
-                };
-                return Err(crate::scaffolded::Scaffolded::validation(refusal));
+                let uri = unreadable.uri();
+                let bucket = crate::state::S3Location::parse(uri)
+                    .map(|location| location.bucket)
+                    .unwrap_or_default();
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket, None),
+                ));
             }
         }
 

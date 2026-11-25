@@ -682,8 +682,10 @@ async fn a_bucket_policy_that_withholds_the_read_refuses_the_model() {
 }
 
 /// RULE: `CreateTransformJob` is refused, with nothing stored, when the input location its
-/// `TransformInput` names holds no object — the job would have nothing to transform, which is
-/// what the refusal states about that location — and accepted when it holds one.
+/// `TransformInput` names holds no object — the job would have nothing to transform, and the
+/// refusal hands back every fact needed to diagnose it: the S3 URL, the Region, the model's
+/// execution role and the bucket that role has to be allowed to list — and accepted when it
+/// holds one.
 #[tokio::test]
 async fn a_transform_job_whose_input_holds_no_object_is_refused() {
     let emulator = Emulator::new();
@@ -778,10 +780,20 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
             "case {case:?}: an input holding no object must be refused, got {status} with \
              {answered}"
         );
+        let bucket = uri
+            .strip_prefix("s3://")
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default();
         assert_eq!(
             message(&answered),
-            format!("The S3 location \"{uri}\" does not exist or has no objects."),
-            "case {case:?}: the refusal must state that the location holds no object, got {:?}",
+            format!(
+                "No S3 objects found under S3 URL \"{uri}\" given in input data source. Please \
+                 ensure that the bucket exists in the selected region ({REGION}), that objects \
+                 exist under that S3 prefix, and that the role \"{role}\" has \"s3:ListBucket\" \
+                 permissions on bucket \"{bucket}\"."
+            ),
+            "case {case:?}: the refusal must name the location, the Region, the role and the \
+             bucket, got {:?}",
             message(&answered)
         );
         assert_eq!(
