@@ -4403,29 +4403,6 @@ pub fn invalid_wildcard_semantic_version_message(member: &str) -> String {
     )
 }
 
-/// The member an instance profile name arrives in, as the API addresses it.
-pub const INSTANCE_PROFILE_NAME_MEMBER: &str = "instanceProfileName";
-
-/// Why a create or an update naming an instance profile this account does not hold is
-/// refused.
-///
-/// `instanceProfileName` is "the instance profile to associate with the instance used to
-/// customize your Amazon EC2 AMI" — an IAM resource of the caller's account, which the model
-/// can only constrain the SHAPE of, so whether it exists is resolved against IAM itself
-/// ([`instance_profile_named`]). The refusal is stated in the ONE sentence this service
-/// refuses a parameter value in, whatever established the value is not one it admits
-/// (`service_common::validation_message::parameter_value_mismatch`): the member as the API
-/// addresses it, then the requirement — here that an instance profile of that name has to
-/// exist. Nothing of the value is echoed.
-#[must_use]
-pub fn missing_instance_profile_message(member: &str) -> String {
-    ::service_common::validation_message::parameter_value_mismatch(
-        member,
-        "The provided instance profile does not exist. Please specify a different instance \
-         profile and try again.",
-    )
-}
-
 /// Why a `CreateComponent` naming neither a document nor a URI, or both, is refused.
 ///
 /// The rule is the operation's own: the component "is based on a YAML document that you

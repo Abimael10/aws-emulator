@@ -21,7 +21,9 @@
 //! them is about the value the request carried:
 //!
 //! * IAM ANSWERED that this account holds no profile of that name (`NoSuchEntity`) — a fact
-//!   about `instanceProfileName`, so the create is refused as that parameter's value;
+//!   about `instanceProfileName`, so the create is refused as that parameter's value, in the
+//!   words the recorded refusal of this class states
+//!   ([`missing_instance_profile_message`]);
 //! * nothing answered the lookup at all — this emulator was assembled with no IAM to ask —
 //!   so nothing about the profile is established and the create proceeds rather than
 //!   refusing a value no answer placed.
@@ -29,6 +31,38 @@
 use ::aws_sdk_iam::error::SdkError;
 use ::aws_sdk_iam::operation::get_instance_profile::GetInstanceProfileError;
 use ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+
+/// The member an instance profile name arrives in, as the API addresses it — the parameter a
+/// refusal of such a value names.
+pub const INSTANCE_PROFILE_NAME_MEMBER: &str = "instanceProfileName";
+
+/// Why a create or an update naming an instance profile this account holds none of is
+/// refused.
+///
+/// The recorded refusal of this class is NOT stated in the sentence this service states for
+/// a value a modelled constraint, a parse or a page token placed
+/// (`service_common::validation_message::parameter_value_mismatch`): it is stated in the
+/// envelope [`invalid_parameter_value`] renders, over the requirement that an instance
+/// profile of that name exists. The member the value arrived in is the only variable part —
+/// nothing of the name the request carried, and no id, ARN or timestamp, appears in it.
+#[must_use]
+pub fn missing_instance_profile_message(member: &str) -> String {
+    invalid_parameter_value(
+        member,
+        "The provided instance profile does not exist. Please specify a different instance \
+         profile and try again.",
+    )
+}
+
+/// The envelope the recorded refusal of a value this service resolved against IAM states:
+/// the member the refused value arrived in, then why that value is not one the service
+/// admits.
+///
+/// The value itself is WITHHELD, as in every other refusal this service states: the
+/// requirement is what the parameter admits, not the one value that missed it.
+fn invalid_parameter_value(member: &str, requirement: &str) -> String {
+    format!("Invalid parameter value for {member}: {requirement}")
+}
 
 /// What a lookup of the instance profile a request named established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
