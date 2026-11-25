@@ -188,14 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let members = group.linked_account_ids.clone();
 
         // One request may not name the same account twice — the `DUPLICATE_ACCOUNT`
-        // reason `ValidationExceptionReason` enumerates, refused the same way
-        // `AssociateAccounts` and `CreateBillingGroup` refuse it.
+        // reason `ValidationExceptionReason` enumerates, refused through the shared
+        // constructor `AssociateAccounts` and `CreateBillingGroup` refuse it with, so
+        // the three cannot drift apart.
         if let Some(duplicate) = crate::state::first_duplicate(&input.account_ids) {
-            return Err(validation(
-                "DUPLICATE_ACCOUNT",
-                "AccountIds",
-                format!("account {duplicate} is listed more than once"),
-            ));
+            return Err(DisassociateAccountsErrorModeled::ValidationException(
+                crate::state::duplicate_account("AccountIds", duplicate),
+            )
+            .into());
         }
 
         // The group's primary account is the account the group's charges are billed

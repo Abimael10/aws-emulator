@@ -120,14 +120,6 @@ impl From<AssociateAccountsErrorModeled> for AssociateAccountsError {
     }
 }
 
-/// Refuse the request with this operation's modelled 400 `ValidationException`.
-fn validation(reason: &str, field: &str, message: String) -> AssociateAccountsError {
-    AssociateAccountsErrorModeled::ValidationException(crate::state::validation_exception(
-        reason, field, message,
-    ))
-    .into()
-}
-
 /// The `AssociateAccounts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -192,13 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // One request may not name the same account twice.
+        // One request may not name the same account twice — the refusal every
+        // operation that takes account ids shares, built in one place beside the
+        // other faults an account list can carry.
         if let Some(duplicate) = crate::state::first_duplicate(&input.account_ids) {
-            return Err(validation(
-                "DUPLICATE_ACCOUNT",
-                "AccountIds",
-                format!("account {duplicate} is listed more than once"),
-            ));
+            return Err(AssociateAccountsErrorModeled::ValidationException(
+                crate::state::duplicate_account("AccountIds", duplicate),
+            )
+            .into());
         }
 
         // "The account IDs must be a part of the consolidated billing family during the

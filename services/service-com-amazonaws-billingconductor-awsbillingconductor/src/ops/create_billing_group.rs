@@ -285,13 +285,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_default();
 
-        // One request may not name the same account twice.
+        // One request may not name the same account twice — the refusal every
+        // operation that takes account ids shares, built in one place beside the
+        // other faults an account list can carry.
         if let Some(duplicate) = crate::state::first_duplicate(&linked_account_ids) {
-            return Err(validation(
-                "DUPLICATE_ACCOUNT",
-                "AccountGrouping.LinkedAccountIds",
-                format!("account {duplicate} is listed more than once"),
-            ));
+            return Err(CreateBillingGroupErrorModeled::ValidationException(
+                crate::state::duplicate_account("AccountGrouping.LinkedAccountIds", duplicate),
+            )
+            .into());
         }
 
         // "Account IDs must be a part of the consolidated billing family" — the first

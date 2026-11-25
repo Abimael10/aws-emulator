@@ -82,6 +82,28 @@ pub fn account_not_in_billing_family(
     )
 }
 
+/// The modelled refusal a request earns when its account list names the SAME account
+/// id more than once.
+///
+/// An account belongs to at most one billing group and is either in a group or not, so
+/// naming it twice in one list says nothing a single mention does not: the list is a
+/// fault in the INPUT, which `ValidationExceptionReason` enumerates by name
+/// (`DUPLICATE_ACCOUNT`,
+/// `smithy_query(query="shape",shape="ValidationExceptionReason")`), so the answer is
+/// the 400 `ValidationException` with that reason — built here so every operation that
+/// takes account ids answers it the same way, beside the
+/// [`account_not_in_billing_family`] and [`accounts_already_associated`] refusals the
+/// other faults an account list can carry earn; `field` names the input member that
+/// carried the list (`AccountIds`, `AccountGrouping.LinkedAccountIds`, …), which is
+/// what goes in `Fields`.
+pub fn duplicate_account(field: &str, account_id: &str) -> crate::ops::types::ValidationException {
+    validation_exception(
+        "DUPLICATE_ACCOUNT",
+        field,
+        format!("account {account_id} is listed more than once"),
+    )
+}
+
 /// The modelled refusal a request earns when the billing group name it claims is
 /// already occupied in the CURRENT billing period by a group that was deleted during
 /// it.
