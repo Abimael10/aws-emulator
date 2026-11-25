@@ -19,7 +19,10 @@
 //!   operation", so a cluster runs at most one at a time: a start while the stored
 //!   refresh is still `IN_PROGRESS` is `InvalidRequestException` too — the state of
 //!   the cluster's associated operations — and the refresh already running is left
-//!   untouched.
+//!   untouched. The refresh is work the internal cluster-insights plane runs, so
+//!   that refusal reaches the caller in that plane's own wrapped shape
+//!   ([`crate::state::insights_refresh_in_progress_message`]), the way every refusal
+//!   this service relays from that plane does.
 //!
 //! The refresh starts `IN_PROGRESS` and the clock owes it `COMPLETED`
 //! [`crate::state::INSIGHTS_REFRESH_DURATION`] later, so a caller that polls straight
@@ -218,16 +221,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // At most one on-demand refresh at a time: the API exposes exactly one, "the
         // latest", so a second start while the stored one is still running is refused
         // and the running refresh keeps its own `startedAt` and due completion.
+        //
+        // The refresh is run by the internal plane the cluster's insights are served
+        // out of, so what reaches the caller is THAT plane's own refusal carried
+        // through wrapped — its fixed sentence followed by the tail naming the call
+        // behind it ([`state::insights_refresh_in_progress_message`]), the same shape
+        // a read that plane could not serve comes back in. Nothing of the request is
+        // interpolated into it.
         if cluster
             .insights_refresh
             .as_ref()
             .is_some_and(InsightsRefreshRecord::is_in_progress)
         {
-            return Err(invalid_request(format!(
-                "An insights refresh is already in progress for cluster {}; wait for it to \
-                 complete before starting another.",
-                input.cluster_name
-            )));
+            return Err(invalid_request(
+                state::insights_refresh_in_progress_message(),
+            ));
         }
 
         let refresh = InsightsRefreshRecord::started(now);
