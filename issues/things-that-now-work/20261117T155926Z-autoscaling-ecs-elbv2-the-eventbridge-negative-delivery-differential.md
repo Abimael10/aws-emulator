@@ -37,3 +37,24 @@ Actual (emulator): `Error: Check timed out after 60.0s`. The check is killed at 
 7. sqs set-queue-attributes --attributes Policy='{"Version":"2012-10-17","Statement":[{"Sid":"AllowEventBridgeSend","Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Action":"sqs:SendMessage","Resource":"<queue arn>"}]}'.
 8. ecs run-task + stop-task again; poll sqs receive-message -> AWS: an envelope arrives with source aws.ecs, detail-type 'ECS Task State Change' and detail.taskArn == the second task. Emulator: nothing arrives in step 6 or step 8 and the check is cut at the 60 s budget.
 Replay autoscaling__ecs__elbv2.eventbridge-rule-without-target-permission-no-invocation.
+
+## Resolution
+
+The behaviour this report asks for is served, and is now covered end to end by
+`core/router/tests/all/ecs_task_event_sqs_target_permission.rs`: with Amazon ECS, EventBridge,
+Amazon SQS and IAM on one engine, a FARGATE/awsvpc task placed with an IAM-created execution
+role publishes `aws.ecs` / `ECS Task State Change` for every status it moves into; `PutTargets`
+accepts an SQS target whose queue carries no resource policy; the delivery is withheld while the
+queue's policy does not admit it (no policy at all, or a grant conditioned on another rule); and
+the next matching envelope is delivered, naming that task, once the policy a client writes is
+installed. The publication lives in the ECS crate's task-event state module and the delivery-time
+decision in the EventBridge crate's queue-target handover, both of which postdate the commit this
+report was filed against.
+
+The recorded check still ends `Check timed out after 60.0s` on replay, and that is not an
+emulator divergence: the check's own negative control polls `ReceiveMessage` for 60 s of wall
+clock before it may assert non-delivery (and its positive control for a further 90 s), while the
+replay harness caps a check at 60.0 s, so the budget is spent inside the first poll whatever the
+emulator answers. The emulator's own share is under a second per task — the suite above drives
+six complete run/stop/publish/deliver cycles in about six seconds.
+
