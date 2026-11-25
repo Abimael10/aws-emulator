@@ -30,10 +30,17 @@
 //! than for one recorded shape: the rows span the status a record starts in, the status it
 //! is moved to, the reason text carried with it, the identifier form each label is given
 //! in (bare id and full ARN), and which of the two resources is absent.
+//!
+//! The rule is also an INVARIANT over a sequence of calls — a record reaches a status only
+//! through steps the lifecycle holds, and a refused step writes nothing — so the last suite
+//! here walks drawn sequences of curation steps and submissions over one record and checks
+//! every answer against the status the PREVIOUS steps left, from seeds it owns.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
 use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as control;
 use smithy_server_runtime::MultiServiceRouter;
@@ -61,39 +68,70 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// DEPRECATED, DRAFT, PENDING_APPROVAL, REJECTED, UPDATE_FAILED, UPDATING).
 const ASYNCHRONOUS_STATUSES: [&str; 4] = ["CREATING", "UPDATING", "CREATE_FAILED", "UPDATE_FAILED"];
 
-/// The statuses the record lifecycle allows a record in each status to move to, as the
-/// service states them in the refusal of a transition it does not hold — written out here
-/// rather than read from the crate, so the wording and the order are pinned by the test.
-/// Source: the transition table the service states for a status, whose `DRAFT` row AWS
+/// The statuses the record lifecycle allows a record in each status to move to, in the
+/// order the service states them in the refusal of a transition it does not hold — written
+/// out here rather than read from the crate, so the set and its order are pinned by the
+/// test. Source: the transition table the service states for a status, whose `DRAFT` row AWS
 /// states as `PENDING_APPROVAL, DEPRECATED, DRAFT, UPDATING, UPDATE_PENDING_AUTH`.
-const VALID_TRANSITIONS: [(&str, &str); 5] = [
+const VALID_TRANSITIONS: [(&str, &[&str]); 5] = [
     (
         "DRAFT",
-        "PENDING_APPROVAL, DEPRECATED, DRAFT, UPDATING, UPDATE_PENDING_AUTH",
+        &[
+            "PENDING_APPROVAL",
+            "DEPRECATED",
+            "DRAFT",
+            "UPDATING",
+            "UPDATE_PENDING_AUTH",
+        ],
     ),
     (
         "PENDING_APPROVAL",
-        "APPROVED, REJECTED, DEPRECATED, PENDING_APPROVAL, UPDATING, UPDATE_PENDING_AUTH",
+        &[
+            "APPROVED",
+            "REJECTED",
+            "DEPRECATED",
+            "PENDING_APPROVAL",
+            "UPDATING",
+            "UPDATE_PENDING_AUTH",
+        ],
     ),
     (
         "APPROVED",
-        "REJECTED, DEPRECATED, APPROVED, UPDATING, UPDATE_PENDING_AUTH",
+        &[
+            "REJECTED",
+            "DEPRECATED",
+            "APPROVED",
+            "UPDATING",
+            "UPDATE_PENDING_AUTH",
+        ],
     ),
     (
         "REJECTED",
-        "DRAFT, DEPRECATED, REJECTED, UPDATING, UPDATE_PENDING_AUTH",
+        &[
+            "DRAFT",
+            "DEPRECATED",
+            "REJECTED",
+            "UPDATING",
+            "UPDATE_PENDING_AUTH",
+        ],
     ),
-    ("CREATING", "DRAFT, CREATE_FAILED"),
+    ("CREATING", &["DRAFT", "CREATE_FAILED"]),
 ];
+
+/// The statuses [`VALID_TRANSITIONS`] lists for `current`, as the set a step a caller asks
+/// for is checked against.
+fn valid_targets(current: &str) -> &'static [&'static str] {
+    VALID_TRANSITIONS
+        .iter()
+        .find(|(status, _)| *status == current)
+        .map(|(_, valid)| *valid)
+        .unwrap_or_default()
+}
 
 /// The sentence this service refuses a transition its lifecycle does not hold with, built
 /// from [`VALID_TRANSITIONS`] so the test states the expected text itself.
 fn expected_transition_refusal(current: &str, target: &str) -> String {
-    let valid = VALID_TRANSITIONS
-        .iter()
-        .find(|(status, _)| *status == current)
-        .map(|(_, valid)| *valid)
-        .unwrap_or_default();
+    let valid = valid_targets(current).join(", ");
     format!(
         "Invalid status transition from {current} to {target}. \
          Valid transitions from {current}: {valid}"
@@ -986,6 +1024,270 @@ async fn a_resource_this_service_does_not_hold_is_not_found() {
              ({expected:?}), got {} {:?}",
             refused.status,
             refused.body
+        );
+    }
+}
+
+/// Every member of `RegistryRecordStatus`, so a drawn step can name any status the model
+/// admits as this operation's `status`. Source: that member's own enum (APPROVED |
+/// CREATE_FAILED | CREATING | DEPRECATED | DRAFT | PENDING_APPROVAL | REJECTED |
+/// UPDATE_FAILED | UPDATING), the catalogue
+/// `crate::ops::types::REGISTRY_RECORD_STATUS_VALUES` holds.
+const RECORD_STATUSES: [&str; 9] = [
+    "APPROVED",
+    "CREATE_FAILED",
+    "CREATING",
+    "DEPRECATED",
+    "DRAFT",
+    "PENDING_APPROVAL",
+    "REJECTED",
+    "UPDATE_FAILED",
+    "UPDATING",
+];
+
+/// The statuses a caller may name as the TARGET of a curation step. Every other member of
+/// the enum is one the SERVICE reaches by itself — `PENDING_APPROVAL` by a submission, and
+/// the four asynchronous ones by this service's own create and update work.
+const CURATION_TARGETS: [&str; 4] = ["DRAFT", "APPROVED", "REJECTED", "DEPRECATED"];
+
+/// The record lifecycle's terminal status: a retired record admits no later change.
+const TERMINAL_STATUS: &str = "DEPRECATED";
+
+/// The status a submission a registry does not auto-approve settles the record at.
+const SUBMITTED_STATUS: &str = "PENDING_APPROVAL";
+
+/// The status a record is created in and returns to, and the only one a submission is made
+/// from.
+const DRAFT_STATUS: &str = "DRAFT";
+
+/// The sentence this service refuses EVERY change to a retired record with, written out
+/// here so the test states the expected text itself.
+fn expected_terminal_refusal(status: &str) -> String {
+    format!("Cannot update registry record in {status} status (terminal state)")
+}
+
+/// The sentence a submission is refused with when the record is in a status a submission
+/// cannot be made from but can still leave.
+fn expected_submission_refusal(status: &str) -> String {
+    format!("Cannot submit the record for approval in current status: {status}")
+}
+
+/// One drawn step of the curation workflow: a status change naming a target, or a
+/// submission for approval.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Status(&'static str),
+    Submit,
+}
+
+/// What the record lifecycle answers `step` with for a record STORED in `current`: the
+/// status the record settles at, or the sentence the service refuses the step with.
+///
+/// Computed from the stored status alone and in the order the service states its rules — a
+/// target no caller may name, then the terminal status, then the transition table for a
+/// status change and the submission's own precondition for a submission — so the expectation
+/// is the rule rather than a transcript of one sequence.
+fn expected_outcome(current: &str, step: Step) -> Result<&'static str, String> {
+    match step {
+        Step::Status(target) => {
+            if !CURATION_TARGETS.contains(&target) {
+                Err(format!("Invalid target status: {target}"))
+            } else if current == TERMINAL_STATUS {
+                Err(expected_terminal_refusal(current))
+            } else if valid_targets(current).contains(&target) {
+                Ok(target)
+            } else {
+                Err(expected_transition_refusal(current, target))
+            }
+        }
+        Step::Submit => {
+            if current == TERMINAL_STATUS {
+                Err(expected_terminal_refusal(current))
+            } else if current == DRAFT_STATUS {
+                Ok(SUBMITTED_STATUS)
+            } else {
+                Err(expected_submission_refusal(current))
+            }
+        }
+    }
+}
+
+/// The seeds the drawn walk below runs from: a fixed set the suite owns, so the case count
+/// is bounded and every run walks the same sequences, or the single seed
+/// [`WALK_SEED_OVERRIDE`] names for an exploratory run. Every assertion carries its seed and
+/// its step index, so a failure names the walk that produced it and `WALK_SEED_OVERRIDE`
+/// replays exactly that one.
+const WALK_SEEDS: [u64; 4] = [0x5eed_0001, 0x5eed_0002, 0x5eed_0003, 0x5eed_0004];
+
+/// The environment variable that replaces [`WALK_SEEDS`] with one named seed.
+const WALK_SEED_OVERRIDE: &str = "AGENT_REGISTRY_CURATION_WALK_SEED";
+
+/// How many steps one walk takes. Bounded, and long enough that a walk reaches the statuses
+/// past review and the terminal one and keeps asking for changes afterwards.
+const WALK_STEPS: usize = 14;
+
+#[tokio::test]
+async fn a_drawn_walk_of_the_workflow_reaches_only_a_status_the_lifecycle_allows() {
+    let (router, _engine) = router();
+
+    let seeds = match std::env::var(WALK_SEED_OVERRIDE) {
+        Ok(named) => vec![named.trim().parse::<u64>().unwrap_or_else(|error| {
+            panic!("{WALK_SEED_OVERRIDE}={named:?} is not a u64 seed: {error}")
+        })],
+        Err(_) => WALK_SEEDS.to_vec(),
+    };
+
+    for seed in seeds {
+        let case = format!("walk from seed {seed}");
+        let (registry_id, _registry_arn, record_id, _record_arn) =
+            record_in_status(&router, &case, DRAFT_STATUS).await;
+        let mut generator = StdRng::seed_from_u64(seed);
+
+        // The status and the reason the record is STORED with, tracked beside the service so
+        // every step is judged against what the steps before it left rather than against the
+        // request that was just sent.
+        let mut current = DRAFT_STATUS;
+        let mut reason = String::new();
+
+        for index in 0..WALK_STEPS {
+            // One extra draw past the status catalogue stands for a submission, so a walk
+            // mixes the two ways a record moves through the workflow.
+            let drawn = generator.random_range(0..=RECORD_STATUSES.len());
+            let step = if drawn == RECORD_STATUSES.len() {
+                Step::Submit
+            } else {
+                Step::Status(RECORD_STATUSES[drawn])
+            };
+            let row = format!("{case}, step {index}: {step:?} on a {current} record");
+            let given = format!("drawn step {index} of seed {seed}");
+
+            let reply = match step {
+                Step::Status(target) => {
+                    update_status(
+                        &router,
+                        &registry_id,
+                        &record_id,
+                        json!({ "status": target, "statusReason": given.clone() }),
+                    )
+                    .await
+                }
+                Step::Submit => {
+                    call(
+                        &router,
+                        "POST",
+                        &format!(
+                            "/registries/{}/records/{}/submit-for-approval",
+                            encode_label(&registry_id),
+                            encode_label(&record_id)
+                        ),
+                        None,
+                    )
+                    .await
+                }
+            };
+
+            match expected_outcome(current, step) {
+                Ok(settled) => {
+                    assert_eq!(
+                        (reply.status, reply.str_field("status")),
+                        (202, settled),
+                        "case {row:?}: a step the lifecycle allows answers 202 with the status \
+                         it settles the record at, got {} {:?}",
+                        reply.status,
+                        reply.body
+                    );
+                    current = settled;
+                    // A status change carries the reason it was given; a submission decides
+                    // nothing about the status it enters, so it leaves no reason behind.
+                    reason = match step {
+                        Step::Status(_) => given,
+                        Step::Submit => String::new(),
+                    };
+                }
+                Err(expected) => {
+                    assert_eq!(
+                        (
+                            reply.status,
+                            reply.error_code.as_deref(),
+                            reply.message()
+                        ),
+                        (400, Some("ValidationException"), expected.clone()),
+                        "case {row:?}: expected the modelled 400 ValidationException with \
+                         {expected:?}, got {} {:?}",
+                        reply.status,
+                        reply.body
+                    );
+                }
+            }
+
+            // What the walk left is what a later read serves: a step that was taken is
+            // stored with its reason, and a step that was refused wrote nothing at all.
+            let read_back = get_record(&router, &registry_id, &record_id).await;
+            assert_eq!(
+                (
+                    read_back.status,
+                    read_back.str_field("status"),
+                    read_back.str_field("statusReason")
+                ),
+                (200, current, reason.as_str()),
+                "case {row:?}: the stored record must carry the status and the reason the \
+                 walk left it with, got {} {:?}",
+                read_back.status,
+                read_back.body
+            );
+        }
+
+        // Every walk ends the same way, wherever it was left: retirement is a step the table
+        // allows out of every status a walk can stand in, and a retired record is past the
+        // lifecycle but still one its owner can remove.
+        if current != TERMINAL_STATUS {
+            let retired = update_status(
+                &router,
+                &registry_id,
+                &record_id,
+                json!({
+                    "status": TERMINAL_STATUS,
+                    "statusReason": "retired at the end of the walk",
+                }),
+            )
+            .await;
+            assert_eq!(
+                (retired.status, retired.str_field("status")),
+                (202, TERMINAL_STATUS),
+                "case {case:?}: retiring a {current} record is a step the lifecycle allows, \
+                 got {} {:?}",
+                retired.status,
+                retired.body
+            );
+        }
+
+        let deleted = call(
+            &router,
+            "DELETE",
+            &format!(
+                "/registries/{}/records/{}",
+                encode_label(&registry_id),
+                encode_label(&record_id)
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: DeleteRegistryRecord removes a retired record, got {} {:?}",
+            deleted.status, deleted.body
+        );
+        let gone = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (gone.status, gone.error_code.as_deref(), gone.message()),
+            (
+                404,
+                Some("ResourceNotFoundException"),
+                control::record_not_found_message(&record_id)
+            ),
+            "case {case:?}: the removed record is gone from every later read, got {} {:?}",
+            gone.status,
+            gone.body
         );
     }
 }

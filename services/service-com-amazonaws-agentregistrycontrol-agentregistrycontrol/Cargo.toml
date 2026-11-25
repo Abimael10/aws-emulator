@@ -36,6 +36,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# `rand`: the generator the property-based curation-workflow suite draws its walks over the
+# record lifecycle from, seeded so a run is reproducible. Test-only: nothing in `src/` draws
+# random values.
+rand = "0.9"
 # `time` is for the integration tests' wait past a clock-owed transition; the workspace
 # tokio feature set covers only `#[tokio::test]` itself.
 tokio = { workspace = true, features = ["time"] }
