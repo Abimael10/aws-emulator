@@ -39,7 +39,10 @@
 //! ([`crate::state::secret_resources`]). A request failing either is refused with the
 //! modelled `ValidationException` naming `secretIdentifier` and the stored connector is
 //! left exactly as it was, so no connector is ever pointed at credentials that are not
-//! there.
+//! there. The precondition is on a NEW secret only, where the create evaluates it too: a
+//! request naming the secret the connector already carries re-establishes no connection,
+//! so it needs no credentials for one and is served from the stored record — as the
+//! create's idempotent repeat is.
 //!
 //! ## Shape of an operation
 //!
@@ -321,35 +324,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 identifier: secret_identifier,
                 arn: secret_arn,
             } => {
-                // A connector is only ever pointed at credentials it can really connect
-                // with, exactly as at a create: the new secret is one the account holds
-                // and stores the fields the connector's own type requires. The type is
-                // the STORED connector's — an update reconfigures the appliance it
-                // connects to, never which type of appliance it is.
-                //
-                // LOCK ORDER. This reads Secrets Manager's store while this service's
-                // guard is held, which is the one order either lock is ever taken in.
-                let credential_failures =
-                    crate::state::secret_resources::credential_secret_failures(
-                        &*self.engine,
-                        &region,
-                        "secretIdentifier",
-                        secret_identifier,
-                        &connector.connector_type,
-                    );
-                if !credential_failures.is_empty() {
-                    return Err(UpdateEnvironmentConnectorErrorModeled::ValidationException(
-                        crate::state::aggregate_validation_error(credential_failures),
-                    )
-                    .into());
-                }
                 // "The ARN or name of" the secret on input, "The Amazon Resource Name
                 // (ARN) of" it on output: the new identifier is resolved to that
                 // secret's ARN, so a connector reconfigured by NAME still reports an
                 // ARN, and naming the secret it already carries in the other form is
-                // not a change.
+                // not a change. Decided FIRST, because what follows applies to the
+                // secret this call really points the connector at.
                 let changed = connector.secret_arn != secret_arn;
-                connector.secret_arn = secret_arn;
+                if changed {
+                    // A connector is only ever pointed at credentials it can really
+                    // connect with, exactly as at a create: the new secret is one the
+                    // account holds and stores the fields the connector's own type
+                    // requires. The type is the STORED connector's — an update
+                    // reconfigures the appliance it connects to, never which type of
+                    // appliance it is.
+                    //
+                    // Evaluated here, where the connector is really about to be pointed
+                    // at another secret, which is where the create evaluates it too: a
+                    // call that names the secret the connector already carries
+                    // reconfigures nothing, so it needs no credentials for a connection
+                    // it does not re-establish.
+                    //
+                    // LOCK ORDER. This reads Secrets Manager's store while this
+                    // service's guard is held, which is the one order either lock is
+                    // ever taken in.
+                    let credential_failures =
+                        crate::state::secret_resources::credential_secret_failures(
+                            &*self.engine,
+                            &region,
+                            "secretIdentifier",
+                            secret_identifier,
+                            &connector.connector_type,
+                        );
+                    if !credential_failures.is_empty() {
+                        return Err(
+                            UpdateEnvironmentConnectorErrorModeled::ValidationException(
+                                crate::state::aggregate_validation_error(credential_failures),
+                            )
+                            .into(),
+                        );
+                    }
+                    connector.secret_arn = secret_arn;
+                }
                 changed
             }
         };

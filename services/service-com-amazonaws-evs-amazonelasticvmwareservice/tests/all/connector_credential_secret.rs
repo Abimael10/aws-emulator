@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager as secretsmanager;
 
 use crate::environment_lifecycle::{
-    call, create_settled, emulator, error_type, register_credential_secret,
+    call, create_settled, emulator, error_type, poll_connector_active, register_credential_secret,
     register_secret_storing, secret_arn_of, secret_region_of, settle, Emulator,
 };
 
@@ -493,6 +493,207 @@ async fn a_secret_of_the_account_is_resolved_wherever_the_identifier_names_it() 
             body["connector"]["secretArn"],
             json!(secret_arn_of(&secret_identifier)),
             "case {case:?}: the connector must report the secret's ARN, got {body}"
+        );
+    }
+}
+
+/// Remove the secret `secret_identifier` names from the account's store altogether — the
+/// state a secret deleted without recovery leaves behind, where not even a record of it is
+/// left.
+fn forget_secret(engine: &engine::InMemoryEngine, secret_identifier: &str) {
+    let state = secretsmanager::state::service_state(engine)
+        .expect("the in-memory engine carries the account's Secrets Manager store");
+    let mut store = state.lock();
+    let key = store
+        .resolve(secret_region_of(secret_identifier), secret_identifier)
+        .expect("the secret was registered before it was removed");
+    store
+        .remove(&key)
+        .expect("the key resolved above names a secret the store holds");
+}
+
+/// What became of the credential secret in Secrets Manager AFTER the connector was
+/// created against it and already carries it.
+///
+/// Each variant is a reason the precondition on a NEW secret would not hold any more: the
+/// account no longer holds usable credentials under that identifier, or — [`Afterwards::
+/// Held`] — it still does, which is the plain repeat.
+#[derive(Clone, Copy, Debug)]
+enum Afterwards {
+    /// Still held, still storing the fields the connector's type requires.
+    Held,
+    /// Marked for deletion, the state `DeleteSecret` leaves a secret in: its value is no
+    /// longer one a retrieval returns.
+    MarkedForDeletion,
+    /// Gone from the account's Secrets Manager store.
+    Removed,
+    /// Still held, but its value rotated to one that no longer states the fields an
+    /// `OPERATIONS_MANAGER` or `VCENTER` connector requires.
+    RotatedToOtherFields,
+}
+
+/// Put the secret `secret_identifier` names into the state `afterwards` describes.
+fn become_afterwards(
+    engine: &engine::InMemoryEngine,
+    secret_identifier: &str,
+    afterwards: Afterwards,
+) {
+    match afterwards {
+        Afterwards::Held => {}
+        Afterwards::MarkedForDeletion => schedule_secret_deletion(engine, secret_identifier),
+        Afterwards::Removed => forget_secret(engine, secret_identifier),
+        Afterwards::RotatedToOtherFields => {
+            register_secret_storing(engine, secret_identifier, &json!({ "apiKey": "fixture" }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_update_naming_the_secret_the_connector_already_carries_reconfigures_nothing() {
+    let router = emulator();
+
+    // The precondition is on the secret a call really points a connector AT: a request
+    // naming the secret the stored connector already carries re-establishes no connection,
+    // so it needs no credentials for one — exactly as the sibling create's idempotent
+    // repeat needs none — and the stored record is reported untouched.
+    //
+    // Each row: the case, the connector type, the identifier the connector is created
+    // against, the form the repeat names that SAME secret in, and what became of the
+    // secret in between. The rows differ along what the rule generalises over: the
+    // connector TYPE whose field requirement would apply, the FORM the secret is named in
+    // (a bare name, the ARN that name resolves to, the full ARN Secrets Manager minted, an
+    // ARN of another Region), and WHY the credentials would now fail the precondition a
+    // new secret has to pass (nothing at all, marked for deletion, gone from the store,
+    // rotated to other fields).
+    let rows: Vec<(&str, &str, String, String, Afterwards)> = vec![
+        (
+            "the bare name of a secret the account still holds",
+            "VCENTER",
+            "evs/carried-held".to_string(),
+            "evs/carried-held".to_string(),
+            Afterwards::Held,
+        ),
+        (
+            "the bare name of a secret since marked for deletion",
+            "SDDC_MANAGER",
+            "evs/carried-on-the-way-out".to_string(),
+            "evs/carried-on-the-way-out".to_string(),
+            Afterwards::MarkedForDeletion,
+        ),
+        (
+            "the ARN of a secret since removed from the account",
+            "OPERATIONS_MANAGER",
+            "evs/carried-removed".to_string(),
+            secret_arn_of("evs/carried-removed"),
+            Afterwards::Removed,
+        ),
+        (
+            "the full ARN of a secret since rotated to other fields",
+            "VCENTER",
+            "arn:aws:secretsmanager:us-west-2:000000000000:secret:evs/carried-minted-AbCd12"
+                .to_string(),
+            "arn:aws:secretsmanager:us-west-2:000000000000:secret:evs/carried-minted-AbCd12"
+                .to_string(),
+            Afterwards::RotatedToOtherFields,
+        ),
+        (
+            "an ARN of another Region, whose secret is since marked for deletion",
+            "OPERATIONS_MANAGER",
+            "arn:aws:secretsmanager:eu-central-1:000000000000:secret:evs/carried-elsewhere-ZyXw98"
+                .to_string(),
+            "arn:aws:secretsmanager:eu-central-1:000000000000:secret:evs/carried-elsewhere-ZyXw98"
+                .to_string(),
+            Afterwards::MarkedForDeletion,
+        ),
+    ];
+
+    for (case, connector_type, created_identifier, repeat_identifier, afterwards) in rows {
+        register_credential_secret(&router.engine, &created_identifier);
+        let environment = create_settled(&router, None).await;
+        let (status, body) = call(
+            &router,
+            "CreateEnvironmentConnector",
+            &create_request(&environment, connector_type, &created_identifier),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the create expected 200, got {status} {body}"
+        );
+        let connector_id = body["connector"]["connectorId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // The connector carries those credentials once it has connected with them: the
+        // test waits for the connector to BE ACTIVE, not for a span of wall clock.
+        settle(&router);
+        let before = poll_connector_active(&router, case, &environment, &connector_id).await;
+
+        // What became of the secret the stored connector points at.
+        become_afterwards(&router.engine, &created_identifier, afterwards);
+
+        // The sibling create, repeated: the stored record, with no credentials asked for.
+        let (status, body) = call(
+            &router,
+            "CreateEnvironmentConnector",
+            &create_request(&environment, connector_type, &repeat_identifier),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the repeated create expected 200, got {status} {body}"
+        );
+        assert_eq!(
+            body["connector"], before,
+            "case {case:?}: the repeated create must report the stored connector, got {body}"
+        );
+
+        // And the update naming that same secret, which reconfigures nothing either: the
+        // record keeps its state and its modifiedAt, so the answer is the stored record.
+        let (status, body) = call(
+            &router,
+            "UpdateEnvironmentConnector",
+            &json!({
+                "environmentId": environment,
+                "connectorId": connector_id,
+                "secretIdentifier": repeat_identifier,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the no-change update expected 200, got {status} {body}"
+        );
+        assert_eq!(
+            body["connector"], before,
+            "case {case:?}: an update naming the secret the connector already carries must \
+             change nothing, got {body}"
+        );
+        let listed = connectors_of(&router, case, &environment).await;
+        assert_eq!(
+            listed,
+            vec![before.clone()],
+            "case {case:?}: the stored record must be left exactly as it was, got {listed:?}"
+        );
+
+        // The precondition still holds where the call really points the connector at
+        // ANOTHER secret: one the account holds none of is refused and writes nothing.
+        let (status, body) = call(
+            &router,
+            "UpdateEnvironmentConnector",
+            &json!({
+                "environmentId": environment,
+                "connectorId": connector_id,
+                "secretIdentifier": UNHELD_NAME,
+            }),
+        )
+        .await;
+        assert_refused_naming_the_secret(case, status, &body);
+        let listed = connectors_of(&router, case, &environment).await;
+        assert_eq!(
+            listed,
+            vec![before.clone()],
+            "case {case:?}: a refused update must leave the connector as it was, got {listed:?}"
         );
     }
 }
