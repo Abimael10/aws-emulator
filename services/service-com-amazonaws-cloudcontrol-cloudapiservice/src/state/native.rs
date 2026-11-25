@@ -63,15 +63,18 @@ use ::std::time::{SystemTime, UNIX_EPOCH};
 /// ([`Self::handler_error_code`]) and, where the owning service states one in its own
 /// terms, its diagnostic ([`Self::detail`]).
 ///
-/// WHICH verdict a refusal is reported under follows WHO judged the call, which is what
-/// the two catch-all codes of the model's own `HandlerErrorCode` enum say: a handler
-/// returns `InvalidRequest` when "invalid input from the user has generated a generic
-/// exception" — the handler itself judged the resource model against the type's schema —
-/// and `GeneralServiceException` when "the downstream service generated an error that
-/// doesn't map to any other handler error code". So a rule the OWNING service enforces,
-/// whose call its own API would have refused the same way, is that service's error rather
-/// than the handler's verdict about the model, whichever of them the break is spotted by
-/// here ([`Self::Rejected`] against [`Self::Invalid`]).
+/// WHICH verdict a refusal is reported under follows WHAT the refusal names as the fault,
+/// which is what the two catch-all codes of the model's own `HandlerErrorCode` enum say: a
+/// handler returns `InvalidRequest` when "invalid input from the user has generated a generic
+/// exception" and `GeneralServiceException` when "the downstream service generated an error
+/// that doesn't map to any other handler error code". So a value the desired state supplies
+/// that lies outside the DOMAIN the type's schema publishes for that property — the range of
+/// a count, the two values of a flag, a set stated with the property itself — is invalid
+/// input from the user whichever side spots it ([`Self::Invalid`]): no resource of the type
+/// could carry it, and that is settled by the one value with nothing of the store in it. A
+/// refusal that one value does NOT settle — a rule over two properties, a name the owning
+/// service holds to a charset or keeps for itself, a value set only that service publishes,
+/// the resource's own state — is that service's error ([`Self::Rejected`]).
 ///
 /// A catch-all code is for a verdict that falls under no OTHER member of that enum, so a
 /// refusal the enum does name a member for carries that member instead: an AUTHORIZATION
@@ -90,14 +93,16 @@ pub enum NativeRefusal {
     /// The resource MODEL is at fault against the type's registry schema, which the
     /// handler itself judges: a property the schema does not declare, one it declares and
     /// this path does not apply, a required property the model names no value for, a value
-    /// of a form or outside a value set that schema declares, or an identifier the resource
-    /// does not answer to. Nothing downstream was asked.
+    /// outside the form, the range or the value set that schema publishes for the property
+    /// it carries, or an identifier the resource does not answer to. Nothing the store holds
+    /// decides it.
     Invalid(String),
     /// The OWNING service raised an error of its own that this type's handler maps to no
-    /// other verdict: a model well formed against that schema whose call that service's own
-    /// API would refuse — a rule only it holds the value to, a value set only it publishes, a
-    /// combination it will not take, the resource's own state, a call the credentials the
-    /// handler ran with may not make. Carries that service's own diagnostic.
+    /// other verdict: a model whose every value is within what the type's schema publishes
+    /// for its property, whose call that service's own API would still refuse — a name it
+    /// holds to a charset of its own or keeps for itself, a value set only it publishes, a
+    /// combination of properties it will not take, the resource's own state. Carries that
+    /// service's own diagnostic.
     Rejected(String),
     /// The call the handler had to make was not AUTHORIZED: the policies in force on the
     /// identity the handler ran as do not allow it, so the owning service would have refused
@@ -127,9 +132,9 @@ impl NativeRefusal {
 /// The `HandlerErrorCode` for work an owning service has no room for.
 pub const HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceeded";
 
-/// The `HandlerErrorCode` for a fault the type's handler itself judges in the resource model
-/// against that type's registry schema, which is what this code is for: invalid input from
-/// the user, rather than anything the owning service was asked and answered
+/// The `HandlerErrorCode` for a fault in the resource model against what that type's
+/// registry schema publishes, which is what this code is for: invalid input from the user,
+/// rather than a refusal the model's own values do not settle
 /// ([`HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION`]).
 pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 

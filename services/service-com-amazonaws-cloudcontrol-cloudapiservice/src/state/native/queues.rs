@@ -604,13 +604,25 @@ impl DesiredModel {
     }
 }
 
-/// The owning service's refusal of an attribute map, as this path reports it: that
-/// service's own diagnostic, whichever half of its attribute rules the map broke.
+/// The refusal of an attribute map, as this path reports it — under the verdict that
+/// follows from WHICH half of the attribute rules the map broke.
+///
+/// * A VALUE outside what the attribute accepts is a fault in the DESIRED STATE: this
+///   type's schema publishes the values each of its attribute properties admits — the range
+///   of a count, the two values of a flag, the set of a choice — in that property's own
+///   documentation, which is the sentence this provider's catalogue of attributes carries
+///   beside each one ([`sqs::SETTABLE_ATTRIBUTES`]). A value outside it describes no queue
+///   of the type at all, decided from that one value with nothing of the store in it, so it
+///   is the handler's own judgement of the model ([`NativeRefusal::Invalid`], reported as
+///   `InvalidRequest`), stated in the sentence that names the property at fault.
+/// * A NAME the call does not have for the queue it addresses is not about a value: whether
+///   a queue HAS the attribute follows from the kind of queue it is, which is the owning
+///   service's own answer about that queue ([`NativeRefusal::Rejected`]).
 fn refusal(refused: sqs::AttributeRefusal) -> NativeRefusal {
-    NativeRefusal::Rejected(match refused {
-        sqs::AttributeRefusal::Name(error) => detail(error.message),
-        sqs::AttributeRefusal::Value(error) => detail(error.message),
-    })
+    match refused {
+        sqs::AttributeRefusal::Name(error) => NativeRefusal::Rejected(detail(error.message)),
+        sqs::AttributeRefusal::Value(error) => NativeRefusal::Invalid(detail(error.message)),
+    }
 }
 
 /// The sentence a modelled refusal of the owning service carries. Every one of them states

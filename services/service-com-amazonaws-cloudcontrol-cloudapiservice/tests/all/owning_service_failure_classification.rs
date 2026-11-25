@@ -3,17 +3,20 @@
 //! WHICH `HandlerErrorCode` a resource operation reports a refusal under.
 //!
 //! The rule every case here holds the service to: **a refusal the resource type's OWNING
-//! service raised — a well-formed resource model whose call that service's own API would
-//! refuse under a rule only it holds the value to — is reported under the handler code for a
-//! downstream error, `GeneralServiceException`, because that is the code for "the downstream
-//! service generated an error that doesn't map to any other handler error code"
+//! service raised that the model's own values do not settle — a name it holds to a charset of
+//! its own or keeps for itself, a name and a flag that contradict each other, an attribute no
+//! queue of that kind has — is reported under the handler code for a downstream error,
+//! `GeneralServiceException`, because that is the code for "the downstream service generated
+//! an error that doesn't map to any other handler error code"
 //! (`smithy_query(query="doc",shape="GeneralServiceException")`), and its `StatusMessage` is
 //! the handler's own sentence about the CALL it was making rather than the downstream
 //! service's diagnosis, which the handler does not relay; `InvalidRequest`, which is
 //! the code for "invalid input from the user has generated a generic exception"
-//! (`smithy_query(query="doc",shape="InvalidRequestException")`), is reserved for a fault the
-//! handler itself judges in the model against the type's registry schema — a property that
-//! schema declares which this handler does not apply — and states in its own words.**
+//! (`smithy_query(query="doc",shape="InvalidRequestException")`), is the code for a fault in
+//! the model against what the type's schema publishes — a property that schema declares which
+//! this handler does not apply, and a value outside the domain it publishes for the property
+//! carrying it (`property_value_domain_refusals`) — and is stated in the sentence naming what
+//! is at fault.**
 //!
 //! A fault the SCHEMA itself states — a property it does not declare, one it declares
 //! `required` that the model leaves out, a value outside a constraint or the JSON type it
@@ -22,7 +25,7 @@
 //!
 //! The rows differ along what the rule generalises over: which owning service answers for the
 //! type, which kind of rule the model breaks (a name's charset, a name and a flag that
-//! contradict each other, a value outside a range, an attribute that does not apply), and
+//! contradict each other, an attribute that does not apply), and
 //! whether the refusal arises on a create or on an update. The controls are the refusals that
 //! DO map to a verdict of their own — a resource already there, one that is not there — which
 //! keep those codes, and the consistent model of each refused pair, which is accepted.
@@ -84,14 +87,16 @@ async fn failed_create(
 #[tokio::test]
 async fn a_create_the_owning_service_refuses_carries_the_downstream_handler_code() {
     let emulator = Emulator::with_sqs();
-    // The rows differ along the kind of rule the model breaks. The first four are rules only
-    // Amazon SQS holds the value to — the FIFO suffix a name must or must not carry, the
-    // character set a queue name admits, the range an attribute's integer lies in — and the
-    // last two are properties the type's schema does not declare, which this type's handler
-    // judges itself: Amazon SQS has no row in the model-validation catalogue, so its schema
-    // is read where its model is ([`crate::state::native`]). The diagnostic is the sentence
-    // whichever of the two worded it, which every row pins.
-    let rows: [(&str, Value, &str, &str); 6] = [
+    // The rows differ along the kind of rule the model breaks. The first three are rules the
+    // model's own values do not settle — the FIFO suffix a name must or must not carry, the
+    // character set a queue name admits — and the last two are properties the type's schema
+    // does not declare, which this type's handler judges itself: Amazon SQS has no row in the
+    // model-validation catalogue, so its schema is read where its model is
+    // ([`crate::state::native`]). The diagnostic is the sentence whichever of the two worded
+    // it, which every row pins. A value outside the domain the schema publishes for its
+    // property is the third kind, and has its own suite
+    // (`property_value_domain_refusals`).
+    let rows: [(&str, Value, &str, &str); 5] = [
         (
             "a name ending in the FIFO suffix on a queue that is not one",
             json!({ "QueueName": "classified-standard.fifo", "FifoQueue": false }),
@@ -109,13 +114,6 @@ async fn a_create_the_owning_service_refuses_carries_the_downstream_handler_code
         (
             "a name carrying a character the owning service's charset excludes",
             json!({ "QueueName": "classified queue!" }),
-            DOWNSTREAM,
-            DOWNSTREAM_CREATE,
-        ),
-        (
-            "an attribute value one past the range the owning service admits",
-            // "Valid values: An integer from 0 to 43,200 (12 hours)" (`VisibilityTimeout`).
-            json!({ "QueueName": "classified-timeout", "VisibilityTimeout": 43_201 }),
             DOWNSTREAM,
             DOWNSTREAM_CREATE,
         ),
@@ -306,15 +304,10 @@ async fn an_update_the_owning_service_refuses_carries_the_downstream_handler_cod
         .await;
     let before = emulator.properties(QUEUE, &identifier).await;
 
-    // The same classification on the UPDATE path: a value only the owning service holds the
-    // rule for against a property the type's schema does not declare.
-    let rows: [(&str, Value, &str, &str); 3] = [
-        (
-            "an attribute value one past the range the owning service admits",
-            json!([{ "op": "replace", "path": "/VisibilityTimeout", "value": 43_201 }]),
-            DOWNSTREAM,
-            DOWNSTREAM_UPDATE,
-        ),
+    // The same classification on the UPDATE path: an attribute no queue of this kind has,
+    // which is the owning service's own answer about that queue, against a property the
+    // type's schema does not declare.
+    let rows: [(&str, Value, &str, &str); 2] = [
         (
             "an attribute that applies to no queue of this kind",
             // `ContentBasedDeduplication` "applies only to FIFO (first-in-first-out)
