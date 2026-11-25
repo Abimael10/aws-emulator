@@ -36,8 +36,7 @@ use crate::ops::types::{
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
-    CaptureConfiguration, CaptureLimitsConfig, CodeCaptureConfiguration, CodeLocation,
-    InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
+    CodeLocation, InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
     InstrumentationStatusEvent, Location, LocationIdentifier,
 };
 // The shapes the audit read projects, on their own `use` for the same reason.

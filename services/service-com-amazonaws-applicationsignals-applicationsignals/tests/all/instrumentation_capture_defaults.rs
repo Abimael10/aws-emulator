@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! One rule, over the whole capture structure: `CreateInstrumentationConfiguration` stores a
-//! capture setting the request LEFT OUT at the value the model documents the service applies
-//! for an omission, so the stored record — and every read that projects it — reports the
-//! setting in force rather than an absence.
+//! One rule, over the whole capture structure: a stored instrumentation configuration carries
+//! the `CaptureConfiguration` the request supplied member for member — a member the request
+//! omitted is stored absent and is absent from every read that projects the record, because no
+//! optional member of `CodeCaptureConfiguration` or of `CaptureLimitsConfig` is modelled with a
+//! `@default` (`smithy_query(query="shape",shape="CodeCaptureConfiguration,CaptureLimitsConfig")`).
+//! The "Defaults to …" sentence those members' docs carry describes what the instrumentation
+//! agent captures when a member is unset; it is not a value the control plane writes into the
+//! resource. The modelled counter-example is `MaxResults` on the list, which IS declared
+//! `@default: 50` and is settled — the suite `defaulted_page_bound` owns that one.
 //!
-//! The rows differ along what the rule generalises over: WHICH member is omitted (each limit
-//! alone, every limit at once, each boolean alone, the lists), the VALUE a supplied member
-//! carries (each published bound of each limit's own `@range`, and a value equal to the
-//! documented default), and the COUNT of members supplied (none beyond the required structure,
-//! one, several, all of them).
+//! The rows differ along what the rule generalises over: WHICH members are supplied (each limit
+//! alone, every limit at once, each boolean alone, each list, all of them), the VALUE a supplied
+//! member carries (each published bound of each limit's own `@range`, and the value the member's
+//! doc names as the capture-time default — a caller that spells it must get it back, and a
+//! caller that omits it must get nothing back), and the COUNT of members supplied (none beyond
+//! the required structure, one, two, all of them).
 //!
-//! The catalogue of members, their documented defaults and their ranges comes from the model
-//! (`smithy_query(query="shape",shape="CaptureLimitsConfig,CodeCaptureConfiguration")`); the
-//! second test drives each range on both published bounds and one step past either. The two
-//! LIST members are the ones the rule does not reach — their docs state no value the service
-//! writes back for an omission — so the rows that carry them assert the complement: each is
-//! reported exactly when the request sent it.
+//! The second test drives each limit's `@range` one step past either published bound, so a limit
+//! the model does not admit is refused rather than stored.
 //!
-//! Every test drives the real `restJson1` surface through the router that production mounts,
-//! so the routes, the status codes and the JSON bodies are the ones a client sees.
+//! Every test drives the real `restJson1` surface through the router that production mounts, so
+//! the routes, the status codes and the JSON bodies are the ones a client sees.
 
 use std::sync::Arc;
 
@@ -39,10 +41,9 @@ const REGION: &str = "eu-west-2";
 /// (`smithy_query(query="shape",shape="DynamicInstrumentationSignalType")` -> `["SNAPSHOT"]`).
 const SNAPSHOT: &str = "SNAPSHOT";
 
-/// The instrumentation type these configurations are created under
+/// The instrumentation types these configurations are created under
 /// (`smithy_query(query="shape",shape="InstrumentationType")` -> `["BREAKPOINT", "PROBE"]`).
-/// The capture rule is the same for both, so one type carries the table and the other is
-/// covered by the row below that creates the same settings under it.
+/// The capture rule is the same for both, so the table carries rows of each.
 const BREAKPOINT: &str = "BREAKPOINT";
 const PROBE: &str = "PROBE";
 
@@ -50,90 +51,78 @@ const PROBE: &str = "PROBE";
 const SERVICE: &str = "checkout";
 const ENVIRONMENT: &str = "eks:cluster-prod/namespace";
 
-/// One member of `CaptureLimitsConfig`: its name, the value its doc states the service uses
-/// when the member is omitted, and the bounds its `@range` publishes.
+/// One member of `CaptureLimitsConfig`: its name, the bounds its own `@range` publishes, and
+/// the value its doc sentence names as the capture-time default — a value a caller may spell
+/// like any other, and the one the emulator must NOT invent for an omission.
 struct Limit {
     member: &'static str,
-    default: i64,
+    documented: i64,
     min: i64,
     max: i64,
 }
 
 /// Every member of `CaptureLimitsConfig`, from
-/// `smithy_query(query="shape",shape="CaptureLimitsConfig")`: the doc sentence of each states
-/// its default, and each carries its own `@range`.
-///
-/// These values are read from the MODEL, not from the service's own constants, deliberately:
-/// the table is this suite's oracle, so pointing it at the implementation would leave it
-/// asserting that the code equals itself. Should the model's documented defaults ever change,
-/// BOTH this table and the service's `DEFAULT_MAX_*` / `DEFAULT_CAPTURE_*` constants in
-/// `src/state.rs` have to be re-derived from it — the disagreement is what this suite reports.
+/// `smithy_query(query="shape",shape="CaptureLimitsConfig")`: each carries its own `@range` and
+/// a doc sentence naming the value the agent captures with when the member is unset. None of
+/// them carries a modelled `@default`, which is what this suite asserts the consequence of.
 const LIMITS: &[Limit] = &[
     // "Defaults to 100", range 1..1000.
     Limit {
         member: "MaxHits",
-        default: 100,
+        documented: 100,
         min: 1,
         max: 1000,
     },
     // "Defaults to 128", range 1..255.
     Limit {
         member: "MaxStringLength",
-        default: 128,
+        documented: 128,
         min: 1,
         max: 255,
     },
     // "Defaults to 10", range 1..20.
     Limit {
         member: "MaxCollectionWidth",
-        default: 10,
+        documented: 10,
         min: 1,
         max: 20,
     },
     // "Defaults to 3", range 1..5.
     Limit {
         member: "MaxCollectionDepth",
-        default: 3,
+        documented: 3,
         min: 1,
         max: 5,
     },
     // "Defaults to 2", range 1..20.
     Limit {
         member: "MaxStackFrames",
-        default: 2,
+        documented: 2,
         min: 1,
         max: 20,
     },
     // "Defaults to 1000", range 1..1000.
     Limit {
         member: "MaxStackTraceSize",
-        default: 1000,
+        documented: 1000,
         min: 1,
         max: 1000,
     },
     // "Defaults to 3", range 1..5.
     Limit {
         member: "MaxObjectDepth",
-        default: 3,
+        documented: 3,
         min: 1,
         max: 5,
     },
     // "Defaults to 10", range 1..20.
     Limit {
         member: "MaxFieldsPerObject",
-        default: 10,
+        documented: 10,
         min: 1,
         max: 20,
     },
 ];
-
-/// `CodeCaptureConfiguration.CaptureReturn` when omitted: "Whether to capture the return
-/// value. Defaults to false."
-const DEFAULT_CAPTURE_RETURN: bool = false;
-
-/// `CodeCaptureConfiguration.CaptureStackTrace` when omitted: "Whether to capture a stack
-/// trace when the instrumentation point is hit. Defaults to true."
-const DEFAULT_CAPTURE_STACK_TRACE: bool = true;
 
 /// A router with just this service mounted on a fresh engine.
 fn router() -> MultiServiceRouter {
@@ -190,14 +179,15 @@ fn limits(entries: &[(&str, i64)]) -> Value {
 fn cases() -> Vec<Case> {
     let mut cases = vec![Case {
         // The minimum the model admits: `CaptureLimits` is the only `@required` member of
-        // `CodeCaptureConfiguration` and every member of its own target is optional.
+        // `CodeCaptureConfiguration` and every member of its own target is optional, so this
+        // row is the one where EVERY defaultable member is absent.
         label: "nothing beyond the required and empty CaptureLimits".to_string(),
         capture: json!({ "CaptureLimits": {} }),
         instrumentation_type: BREAKPOINT,
     }];
 
-    // Each limit ALONE, at each published bound of its own range: the one named keeps its
-    // value and all seven others are settled.
+    // Each limit ALONE, at each published bound of its own range: the one named comes back and
+    // the seven others stay absent.
     for limit in LIMITS {
         for (edge, value) in [("minimum", limit.min), ("maximum", limit.max)] {
             cases.push(Case {
@@ -206,11 +196,11 @@ fn cases() -> Vec<Case> {
                 instrumentation_type: BREAKPOINT,
             });
         }
-        // A limit supplied at exactly its documented default is kept, not re-settled: the
-        // stored value must not depend on whether the caller spelled it.
+        // A limit supplied at exactly the value its doc names is kept as a value the CALLER
+        // chose, so a read reports that member and still reports none of its siblings.
         cases.push(Case {
-            label: format!("only {} at its documented default", limit.member),
-            capture: limits(&[(limit.member, limit.default)]),
+            label: format!("only {} at the value its doc names", limit.member),
+            capture: limits(&[(limit.member, limit.documented)]),
             instrumentation_type: PROBE,
         });
     }
@@ -229,8 +219,8 @@ fn cases() -> Vec<Case> {
         instrumentation_type: PROBE,
     });
 
-    // The two booleans, each alone and each spelled both ways, including the value that
-    // equals its documented default.
+    // The two booleans, each alone and each spelled both ways, including the value the doc
+    // names: a boolean sent comes back, and its sibling stays absent.
     for value in [false, true] {
         cases.push(Case {
             label: format!("only CaptureReturn, sent as {value}"),
@@ -244,10 +234,8 @@ fn cases() -> Vec<Case> {
         });
     }
 
-    // The two lists, whose docs state no value the service writes back for an omission, so
-    // these rows carry each of them present, empty and absent: an omitted list must come back
-    // omitted, and an EMPTY one must come back empty rather than either being turned into the
-    // other.
+    // The two lists, present, empty and absent: an omitted list comes back omitted and an
+    // EMPTY one comes back empty, rather than either being turned into the other.
     cases.push(Case {
         label: "every argument captured, no locals named".to_string(),
         capture: json!({ "CaptureArguments": ["*"], "CaptureLimits": {} }),
@@ -294,40 +282,6 @@ fn cases() -> Vec<Case> {
     cases
 }
 
-/// The `CodeCapture` the service must have STORED for the body `sent`: every member whose doc
-/// states the value applied to an omission settled to it, and every member `sent` named kept
-/// exactly as it was sent.
-///
-/// Shared with `instrumentation_configurations`, so the create suite and this one state the
-/// same expectation of one record.
-pub(crate) fn settled(sent: &Value) -> Value {
-    let mut limits = Map::new();
-    for limit in LIMITS {
-        let value = sent["CaptureLimits"][limit.member]
-            .as_i64()
-            .unwrap_or(limit.default);
-        limits.insert(limit.member.to_string(), json!(value));
-    }
-    let mut expected = json!({
-        "CaptureReturn": sent["CaptureReturn"].as_bool().unwrap_or(DEFAULT_CAPTURE_RETURN),
-        "CaptureStackTrace": sent["CaptureStackTrace"]
-            .as_bool()
-            .unwrap_or(DEFAULT_CAPTURE_STACK_TRACE),
-        "CaptureLimits": Value::Object(limits),
-    });
-    // The two lists are the members whose docs state no value the service writes back for an
-    // omission — `CaptureArguments` names none at all ("Omit to capture defaults, use an empty
-    // list to capture none, use ["*"] to capture all arguments") and `CaptureLocals` states
-    // only an equivalence of effect ("Omit or pass an empty list to capture none") — so each
-    // is stored exactly when the request sent it, empty list included.
-    for member in ["CaptureArguments", "CaptureLocals"] {
-        if let Some(list) = sent.get(member) {
-            expected[member] = list.clone();
-        }
-    }
-    expected
-}
-
 /// The create body for one row, at a location of its own so no two rows conflict.
 fn create_body(case: &Case, index: usize) -> Value {
     json!({
@@ -357,10 +311,54 @@ fn get_body(case: &Case, hash: &str) -> Value {
     })
 }
 
-/// A create settles every documented capture default, and the get and the list report the
-/// settled record.
+/// The member names an object states, for a message that names the members a response invented
+/// or dropped rather than only the two whole structures.
+///
+/// Sorted, so the comparison is of the member SETS: a request states its members in the order
+/// it was written and a response in the order the schema serialises them.
+pub(crate) fn member_names(value: &Value) -> Vec<String> {
+    let mut names: Vec<String> = value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Assert that `reported` is the capture configuration `sent` supplied: the same members, with
+/// the same values, and no member `sent` left out.
+///
+/// Shared with `instrumentation_capture_fidelity`, so the table here and the re-apply suite
+/// state one expectation of one record.
+pub(crate) fn assert_as_supplied(label: &str, where_from: &str, sent: &Value, reported: &Value) {
+    let expected = json!({ "CodeCapture": sent.clone() });
+    assert_eq!(
+        member_names(&reported["CodeCapture"]),
+        member_names(sent),
+        "case {label:?}: expected {where_from} to state exactly the CodeCapture members the \
+         request supplied ({:?}), got {:?}",
+        member_names(sent),
+        member_names(&reported["CodeCapture"])
+    );
+    assert_eq!(
+        member_names(&reported["CodeCapture"]["CaptureLimits"]),
+        member_names(&sent["CaptureLimits"]),
+        "case {label:?}: expected {where_from} to state exactly the CaptureLimits members the \
+         request supplied ({:?}), got {:?}",
+        member_names(&sent["CaptureLimits"]),
+        member_names(&reported["CodeCapture"]["CaptureLimits"])
+    );
+    assert_eq!(
+        reported, &expected,
+        "case {label:?}: expected {where_from} to report the supplied capture configuration \
+         {expected}, got {reported:?}"
+    );
+}
+
+/// A create stores the capture configuration the request supplied and nothing besides, and the
+/// get and the list report that same structure.
 #[tokio::test]
-async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
+async fn an_omitted_capture_member_is_stored_and_reported_absent() {
     let router = router();
     let cases = cases();
     let mut created: Vec<(usize, String)> = Vec::new();
@@ -368,17 +366,17 @@ async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
     for (index, case) in cases.iter().enumerate() {
         let label = &case.label;
         let body = create_body(case, index);
-        let expected = json!({ "CodeCapture": settled(&case.capture) });
 
         let (status, answer) = post(&router, "/create-instrumentation-configuration", &body).await;
         assert_eq!(
             status, 200,
             "case {label:?}: expected HTTP 200 from the create, got {status} with {answer}"
         );
-        assert_eq!(
-            answer["CaptureConfiguration"], expected,
-            "case {label:?}: expected the settled capture configuration {expected}, got {:?}",
-            answer["CaptureConfiguration"]
+        assert_as_supplied(
+            label,
+            "the create",
+            &case.capture,
+            &answer["CaptureConfiguration"],
         );
 
         let hash = answer["LocationHash"]
@@ -390,8 +388,8 @@ async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
             "case {label:?}: expected a LocationHash on the create answer, got {answer}"
         );
 
-        // The record a read projects is the one the create wrote, so the get reports the same
-        // settled structure — twice, because a read must not change what a later caller sees.
+        // The record a read projects is the one the create wrote — twice, because a read must
+        // not change what a later caller sees.
         for attempt in 1..=2 {
             let (status, fetched) = post(
                 &router,
@@ -404,18 +402,19 @@ async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
                 "case {label:?} attempt {attempt}: expected HTTP 200 from the get, got {status} \
                  with {fetched}"
             );
-            assert_eq!(
-                fetched["Configuration"]["CaptureConfiguration"], expected,
-                "case {label:?} attempt {attempt}: expected the get to report {expected}, got {:?}",
-                fetched["Configuration"]["CaptureConfiguration"]
+            assert_as_supplied(
+                label,
+                &format!("the get on attempt {attempt}"),
+                &case.capture,
+                &fetched["Configuration"]["CaptureConfiguration"],
             );
         }
 
         created.push((index, hash));
     }
 
-    // The list projects the same records, so every row appears in its scope's page carrying
-    // the settled structure.
+    // The list projects the same records, so every row appears in its scope's page carrying the
+    // structure its request supplied.
     for instrumentation_type in [BREAKPOINT, PROBE] {
         let mut listed: Vec<Value> = Vec::new();
         let mut next_token: Option<String> = None;
@@ -452,7 +451,6 @@ async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
             if case.instrumentation_type != instrumentation_type {
                 continue;
             }
-            let expected = json!({ "CodeCapture": settled(&case.capture) });
             let entry = listed
                 .iter()
                 .find(|entry| entry["LocationHash"].as_str() == Some(hash.as_str()));
@@ -462,10 +460,11 @@ async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
                     case.label, listed
                 )
             });
-            assert_eq!(
-                entry["CaptureConfiguration"], expected,
-                "case {:?}: expected the list to report {expected}, got {:?}",
-                case.label, entry["CaptureConfiguration"]
+            assert_as_supplied(
+                &case.label,
+                "the list",
+                &case.capture,
+                &entry["CaptureConfiguration"],
             );
         }
     }
@@ -473,8 +472,7 @@ async fn omitted_capture_settings_are_stored_at_their_documented_defaults() {
 
 /// A limit one step outside its own published `@range` is refused with the modelled
 /// `ValidationException` (400) and nothing is stored, so no record ever carries a limit the
-/// model does not admit — while both published bounds are served (asserted by the table
-/// above).
+/// model does not admit — while both published bounds are served (asserted by the table above).
 #[tokio::test]
 async fn a_capture_limit_outside_its_published_range_is_refused() {
     let router = router();
@@ -516,13 +514,12 @@ async fn a_capture_limit_outside_its_published_range_is_refused() {
             );
 
             // The refused create stored nothing, so a create at that same location is served
-            // rather than refused as a conflict — and it carries the settled defaults.
+            // rather than refused as a conflict — and it carries what it supplied.
             let accepted = Case {
                 label: label.clone(),
                 capture: limits(&[(limit.member, limit.min)]),
                 instrumentation_type: BREAKPOINT,
             };
-            let expected = json!({ "CodeCapture": settled(&accepted.capture) });
             let (status, answer) = post(
                 &router,
                 "/create-instrumentation-configuration",
@@ -534,10 +531,11 @@ async fn a_capture_limit_outside_its_published_range_is_refused() {
                 "case {label:?}: expected the refused create to have stored nothing, so the next \
                  create at that location answers 200, got {status} with {answer}"
             );
-            assert_eq!(
-                answer["CaptureConfiguration"], expected,
-                "case {label:?}: expected the settled capture configuration {expected}, got {:?}",
-                answer["CaptureConfiguration"]
+            assert_as_supplied(
+                &label,
+                "the create",
+                &accepted.capture,
+                &answer["CaptureConfiguration"],
             );
         }
     }

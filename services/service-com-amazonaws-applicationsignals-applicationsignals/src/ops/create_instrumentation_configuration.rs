@@ -191,8 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// the stable hash of the location, `ARN` is built from this service's namespace, the
     /// request's region and the identity, `CreatedAt` comes from the clock, `ExpiresAt`
     /// is the lifetime the type documents (24 hours by default for BREAKPOINT, absent for
-    /// PROBE), and the capture settings carry every member the model documents a default for
-    /// settled to that default. A second create at the same identity — service,
+    /// PROBE), and the capture settings are the ones the request supplied, with every member
+    /// it left out left out. A second create at the same identity — service,
     /// environment, signal type and location, the four parts the ARN spells — is a
     /// `ConflictException`, because "configurations are immutable after creation"; the
     /// instrumentation type is not part of that identity, so a create of the OTHER type at
@@ -296,13 +296,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             expires_at,
             attribute_filters: input.attribute_filters.clone(),
-            // The capture settings are stored with every member the model documents a default
-            // for settled, like the `ExpiresAt` above: a limit the request left out is applied
-            // by the service all the same, so the record — and every read that projects it —
-            // reports the value in force rather than an absence.
-            capture_configuration: crate::state::stored_capture_configuration(
-                &input.capture_configuration,
-            ),
+            // The capture settings are stored member for member as the request sent them.
+            // Every optional member of `CodeCaptureConfiguration` and of `CaptureLimitsConfig`
+            // is declared WITHOUT a `@default`, so a member the request omitted has no value
+            // to settle and stays absent in the record and in every read that projects it; the
+            // "Defaults to …" sentence those members' docs carry describes what the
+            // instrumentation agent captures for an unset member, not a value this control
+            // plane writes into the resource (contrast `MaxResults` on the list, which IS
+            // modelled `@default: 50`, and the `ExpiresAt` above, whose value the service
+            // computes). Keeping the absence is what lets a client that round-trips a
+            // configuration tell a value it chose from one the service applied.
+            capture_configuration: input.capture_configuration.clone(),
             created_at: now,
             arn: crate::state::instrumentation_configuration_arn(
                 &region,
