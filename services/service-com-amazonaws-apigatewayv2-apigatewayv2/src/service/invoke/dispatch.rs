@@ -85,6 +85,12 @@
 //! response parameters to transform the HTTP response from a backend integration before
 //! returning the response to clients" — which is why that step is applied where a backend
 //! answered and not to a refusal the gateway itself decided.
+//!
+//! The REQUEST a backend receives is transformed the same way, by the integration's own
+//! `RequestParameters` ([`request_parameters`]) — "a key-value map specifying how to transform
+//! HTTP requests before sending them to the backend" — applied once, here, so the event a
+//! Lambda proxy integration is handed and the message an `HTTP_PROXY` integration forwards
+//! both state the mapped request.
 
 /// The serving stage's throttle, metered around the answer this step produces.
 mod throttle;
@@ -99,6 +105,7 @@ use super::lambda::{self, Unreached};
 use super::proxy_event::{self, Invocation, ProxyRequest};
 use super::proxy_response;
 use super::request_authorizer::{self, Outcome};
+use super::request_parameters;
 use super::response_parameters;
 use super::service_action::{self, Unperformed};
 use super::{http_proxy, INTERNAL_MESSAGE};
@@ -259,6 +266,18 @@ async fn answered<Eng: Send + Sync + 'static>(
     let Some(upstream) = resolved_uri(&dispatch, &integration) else {
         return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
     };
+    // The request the BACKEND receives is this integration's own `RequestParameters` applied
+    // to the one that arrived — "a key-value map specifying how to transform HTTP requests
+    // before sending them to the backend" ([`request_parameters`]) — so both legs below state
+    // the mapped request: the event a Lambda proxy integration is handed, and the message an
+    // `HTTP_PROXY` integration forwards. The route was matched above, on the path the CLIENT
+    // sent, so no mapping of it can change which route serves the request; a subtype
+    // integration's parameters are a different language and were reached above.
+    let mapped_path = request_parameters::transformed(
+        &mut dispatch.request,
+        &integration.request_parameters,
+        &dispatch.invocation,
+    );
     if crate::state::is_lambda_proxy_integration(
         &integration.integration_type,
         integration.integration_subtype.as_deref(),
@@ -272,6 +291,7 @@ async fn answered<Eng: Send + Sync + 'static>(
             &dispatch,
             &integration,
             &upstream,
+            mapped_path.as_deref(),
             hop,
             integration_latency,
         )
@@ -376,21 +396,28 @@ pub(super) const MAX_FORWARDED_HOPS: u8 = 4;
 /// upstream's own records produced, and the integration's `ResponseParameters` transform it
 /// like any other backend's answer.
 ///
+/// `mapped_path` is the path an `overwrite:path` entry of the integration's own
+/// `RequestParameters` put on the request ([`request_parameters`]), which is the path the
+/// forwarded message is addressed at in place of the one the upstream names.
+///
 /// Every OTHER upstream is a URI the CALLER can reach and this emulator makes no request of
 /// its own to one, so the caller is sent there instead ([`http_proxy::sent_to_the_upstream`]).
 /// The same answer covers a stored upstream that names no address a request can be made at,
 /// where there is no hop to perform at all.
+#[allow(clippy::too_many_arguments)]
 async fn http_proxy_hop<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
     dispatch: &Dispatch,
     integration: &Integration,
     upstream: &str,
+    mapped_path: Option<&str>,
     hop: u8,
     integration_latency: &mut Option<Duration>,
 ) -> RtResponse {
-    let Some(forwarded) = http_proxy::forwarded_request(&dispatch.request, integration, upstream)
-        .filter(|forwarded| super::serves_this_plane(engine, forwarded))
+    let Some(forwarded) =
+        http_proxy::forwarded_request(&dispatch.request, integration, upstream, mapped_path)
+            .filter(|forwarded| super::serves_this_plane(engine, forwarded))
     else {
         ::tracing::info!(
             api_id = %dispatch.request.api_id,

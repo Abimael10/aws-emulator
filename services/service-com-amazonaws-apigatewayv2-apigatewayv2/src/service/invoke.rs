@@ -205,6 +205,9 @@ pub(crate) mod lambda;
 pub(crate) mod proxy_event;
 pub(crate) mod proxy_response;
 pub(crate) mod request_authorizer;
+/// How an integration's own `RequestParameters` transform the request, before the backend it
+/// fronts receives it.
+mod request_parameters;
 /// How an integration's own `ResponseParameters` transform the response its backend
 /// answered, before the client reads it.
 mod response_parameters;

@@ -27,7 +27,9 @@
 //! Both are the difference between a backend that can tell which peer called it and one a
 //! caller can lie to. Everything else the client sent travels on, which is what "passed
 //! through as-is" means — except the fields [`HEADERS_NOT_FORWARDED`] withholds, whose values
-//! belong to the connection the gateway terminated rather than to the one it opens.
+//! belong to the connection the gateway terminated rather than to the one it opens, and except
+//! what the integration's own `RequestParameters` transformed before the message was built
+//! (`super::request_parameters`), which is the api's own configuration of this hop.
 //!
 //! The REQUEST a Lambda proxy integration makes is not such a hop: the function is handed an
 //! EVENT rather than an HTTP message ([`super::proxy_event`]), so the client's own fields
@@ -138,15 +140,22 @@ const SIGNED_QUERY_PARAMETERS: &[&str] = &[
 /// "specifies the integration's HTTP method type" (`Integration$IntegrationMethod`), which for
 /// this type is the backend's — and the client's where the integration names none, or names
 /// the [`ANY_METHOD`] stand-in.
+///
+/// `request` is the request as the integration's own `RequestParameters` left it
+/// (`super::request_parameters`), so a header, a query parameter or a path those mapped is
+/// what the upstream reads; `path` is the one such an `overwrite:path` entry mapped, which
+/// replaces the path the upstream's own URI names ([`addressed_at`]).
 pub fn forwarded_request(
     request: &ProxyRequest,
     integration: &Integration,
     upstream: &str,
+    path: Option<&str>,
 ) -> Option<RtRequest> {
     let host = ::service_common::data_plane_addressing::addressed_authority(upstream, None)?;
+    let addressed = addressed_at(upstream, path);
     let mut forwarded = RtRequest::new(SdkBody::from(request.body.clone()));
     forwarded
-        .set_uri(forwarded_target(upstream, &request.raw_query_string))
+        .set_uri(forwarded_target(&addressed, &request.raw_query_string))
         .ok()?;
     let method = integration
         .integration_method
@@ -189,6 +198,36 @@ pub fn forwarded_request(
         .try_insert(VIA_HEADER, GATEWAY_VIA)
         .ok()?;
     Some(forwarded)
+}
+
+/// The address the hop is made at: the integration's resolved `upstream`, with its PATH
+/// replaced by the one an `overwrite:path` entry of the integration's `RequestParameters`
+/// mapped, for a mapping that states one.
+///
+/// Only the path is replaced: the endpoint — the scheme and the authority — is the api's own
+/// configuration, which a mapping of the request does not move, and the upstream's own query
+/// string travels on as it does for every other hop. The URL is read by the maintained parser
+/// this crate already holds the caller-supplied URLs of this service to, rather than by a
+/// second reading of RFC 3986 here; an upstream it cannot read is left exactly as stored,
+/// which is the same answer as for an upstream naming no address a request is made at.
+fn addressed_at(upstream: &str, path: Option<&str>) -> String {
+    let Some(path) = path else {
+        return upstream.to_string();
+    };
+    match ::url::Url::parse(upstream) {
+        Ok(mut parsed) => {
+            parsed.set_path(path);
+            parsed.to_string()
+        }
+        Err(unreadable) => {
+            ::tracing::debug!(
+                error = %unreadable,
+                "this route's HTTP_PROXY upstream is not a URL the mapped path can be written \
+                 onto, so the hop is addressed where the integration names it"
+            );
+            upstream.to_string()
+        }
+    }
 }
 
 /// The request target the hop is made at: the resolved `upstream`, carrying the client's own
@@ -415,7 +454,7 @@ mod tests {
         for row in cases {
             let case = row.case;
             let request = client_request(row.method, row.query, row.headers);
-            let forwarded = forwarded_request(&request, &http_proxy(row.integration_method), upstream)
+            let forwarded = forwarded_request(&request, &http_proxy(row.integration_method), upstream, None)
                 .unwrap_or_else(|| panic!("case {case:?}: the upstream is one a request is made at"));
             assert_eq!(
                 forwarded.method(),
@@ -489,11 +528,71 @@ mod tests {
         ];
         for (case, upstream) in cases {
             let request = client_request("GET", "", &[]);
-            let forwarded = forwarded_request(&request, &http_proxy(Some("GET")), upstream);
+            let forwarded = forwarded_request(&request, &http_proxy(Some("GET")), upstream, None);
             assert!(
                 forwarded.is_none(),
                 "case {case:?}: expected no hop to be built, got one addressed at {:?}",
                 forwarded.map(|built| built.uri().to_string())
+            );
+        }
+    }
+
+    /// RULE: an `overwrite:path` entry of the integration's `RequestParameters` replaces the
+    /// PATH the hop is addressed at and nothing else about the endpoint — the scheme, the
+    /// authority and the upstream's own query string are the api's configuration.
+    #[test]
+    fn a_mapped_path_replaces_the_path_the_hop_is_addressed_at() {
+        // The rows differ along what the upstream carries (a path, a path and a query string,
+        // no path at all) and along how the mapped path is written (with and without its
+        // leading separator), against the control of a mapping that states none.
+        let cases: [(&str, &str, Option<&str>, &str); 6] = [
+            (
+                "an upstream with a path, and no mapping",
+                "https://origin.example.test/echo",
+                None,
+                "https://origin.example.test/echo",
+            ),
+            (
+                "an upstream with a path, mapped to another",
+                "https://origin.example.test/echo",
+                Some("/elsewhere"),
+                "https://origin.example.test/elsewhere",
+            ),
+            (
+                "a mapped path written with no leading separator",
+                "https://origin.example.test/echo",
+                Some("elsewhere"),
+                "https://origin.example.test/elsewhere",
+            ),
+            (
+                "an upstream carrying its own query string",
+                "https://origin.example.test/echo?tenant=a",
+                Some("/elsewhere"),
+                "https://origin.example.test/elsewhere?tenant=a",
+            ),
+            (
+                "an upstream naming no path at all",
+                "https://origin.example.test",
+                Some("/elsewhere"),
+                "https://origin.example.test/elsewhere",
+            ),
+            (
+                "a nested mapped path",
+                "https://origin.example.test/echo",
+                Some("/orders/7/items"),
+                "https://origin.example.test/orders/7/items",
+            ),
+        ];
+        for (case, upstream, path, expected) in cases {
+            let request = client_request("GET", "", &[]);
+            let forwarded =
+                forwarded_request(&request, &http_proxy(Some("GET")), upstream, path)
+                    .unwrap_or_else(|| panic!("case {case:?}: the upstream is one a request is made at"));
+            assert_eq!(
+                forwarded.uri(),
+                expected,
+                "case {case:?}: expected the hop addressed at {expected:?}, got {:?}",
+                forwarded.uri()
             );
         }
     }

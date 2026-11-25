@@ -32,7 +32,8 @@
 //!
 //! What a mapping KEY names is read here for both of its readers: the write, which refuses a
 //! mapping on a header the gateway owns, and the data plane, which carries the mapping out
-//! ([`mapping_key`], [`mapped_header`], and the one operand that names the response's own
+//! ([`mapping_key`], [`mapped_header`], [`mapped_query_parameter`], the operand that names
+//! the request's own path, [`PATH_OPERAND`], and the one that names the response's own
 //! status, [`STATUS_CODE_OPERAND`]). The VALUE half of the language is
 //! `crate::service::invoke::service_action::parameters`, the one reading of what an
 //! expression selects.
@@ -85,6 +86,14 @@ const MAPPING_ACTIONS: &[&str] = &[APPEND_ACTION, OVERWRITE_ACTION, REMOVE_ACTIO
 /// The operand prefix that makes a mapping key name a HEADER — the `header` of
 /// `<action>:<header|querystring|path>.<location>`.
 const HEADER_OPERAND: &str = "header.";
+
+/// The operand prefix that makes a mapping key name a QUERY STRING parameter — the
+/// `querystring` of the same pattern.
+const QUERY_STRING_OPERAND: &str = "querystring.";
+
+/// The operand that makes a key name the request's own PATH — the `path` of the same
+/// pattern, which names no field of its own and so carries no `.<location>` after it.
+pub const PATH_OPERAND: &str = "path";
 
 /// The operand that makes a key name the RESPONSE's own status — the `statuscode` of
 /// `overwrite.statuscode`, the one key of this language that operates on something other
@@ -211,14 +220,31 @@ pub fn mapping_key(key: &str) -> Option<(&str, &str)> {
 /// the header name is carried through as written: it is what a refusal echoes back, and the
 /// message matches a field name case-insensitively itself.
 pub fn mapped_header(operand: &str) -> Option<&str> {
-    let prefix = operand.get(..HEADER_OPERAND.len())?;
-    if !prefix.eq_ignore_ascii_case(HEADER_OPERAND) {
+    named_operand(operand, HEADER_OPERAND)
+}
+
+/// The query-string parameter an OPERAND operates on — the `<location>` of
+/// `querystring.<location>` — or `None` for an operand that names something else.
+///
+/// The prefix is read exactly as [`mapped_header`] reads its own, and for the same reason;
+/// the parameter name is carried through as written, because a query-string parameter name
+/// is case-SENSITIVE (RFC 3986 says nothing that folds it).
+pub fn mapped_query_parameter(operand: &str) -> Option<&str> {
+    named_operand(operand, QUERY_STRING_OPERAND)
+}
+
+/// The `<location>` an operand carries behind `prefix`, or `None` when the operand does not
+/// begin with that prefix or names nothing behind it — the one reading both the header and
+/// the query-string operand are read by.
+fn named_operand<'o>(operand: &'o str, prefix: &str) -> Option<&'o str> {
+    let carried = operand.get(..prefix.len())?;
+    if !carried.eq_ignore_ascii_case(prefix) {
         return None;
     }
     operand
-        .get(HEADER_OPERAND.len()..)
+        .get(prefix.len()..)
         .map(str::trim)
-        .filter(|header| !header.is_empty())
+        .filter(|location| !location.is_empty())
 }
 
 /// The header a mapping KEY operates on, or `None` for a key that operates on something else.
@@ -395,6 +421,46 @@ mod tests {
             assert_eq!(
                 read, *expected,
                 "case {key:?}: expected the mapped header {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_operand_names_the_part_of_the_request_its_action_operates_on() {
+        // The rows span the three operands the pattern names
+        // (`<action>:<header|querystring|path>.<location>`): each of them, the casing an
+        // operand may be written in, an operand naming nothing behind its prefix, and the
+        // operands of the OTHER half of the language (the response's own status).
+        let cases: &[(&str, Option<&str>, Option<&str>, bool)] = &[
+            ("header.x-trace", Some("x-trace"), None, false),
+            ("HEADER.X-Trace", Some("X-Trace"), None, false),
+            ("querystring.page", None, Some("page"), false),
+            ("QUERYSTRING.Page", None, Some("Page"), false),
+            // A query-string parameter name is case-sensitive, so two spellings are two
+            // parameters; the operand prefix itself is not.
+            ("querystring.PAGE", None, Some("PAGE"), false),
+            ("path", None, None, true),
+            ("PATH", None, None, true),
+            ("header.", None, None, false),
+            ("querystring.", None, None, false),
+            ("statuscode", None, None, false),
+        ];
+        for (operand, header, parameter, is_path) in cases {
+            let read_header = mapped_header(operand);
+            assert_eq!(
+                read_header, *header,
+                "case {operand:?}: expected the mapped header {header:?}, got {read_header:?}"
+            );
+            let read_parameter = mapped_query_parameter(operand);
+            assert_eq!(
+                read_parameter, *parameter,
+                "case {operand:?}: expected the mapped query parameter {parameter:?}, got \
+                 {read_parameter:?}"
+            );
+            let names_path = operand.eq_ignore_ascii_case(PATH_OPERAND);
+            assert_eq!(
+                names_path, *is_path,
+                "case {operand:?}: expected it to name the path {is_path}, got {names_path}"
             );
         }
     }

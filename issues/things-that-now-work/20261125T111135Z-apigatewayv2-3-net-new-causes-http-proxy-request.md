@@ -82,3 +82,46 @@ Cause 3 (disabled default endpoint):
 3. GET the target URL repeatedly: expect a settled HTTP 404 with body {"message":"Not Found"} and no backend invocation, while the twin still serves 200.
 4. UpdateApi(ApiId=target, DisableExecuteApiEndpoint=False) and GET again: expect a settled 200 with the marker and the request visible in the backend log.
 5. Re-replay apigatewayv2.deep-apigatewayv2-2-enforce-disable-execute-api-endpoint-404-and-restore.
+
+## Resolution
+
+Cause 1: FIXED. An integration's `RequestParameters` were stored and reported but never
+evaluated on the forwarding path: only the response leg had a transform
+(`src/service/invoke/response_parameters.rs`), so the request every backend received was the
+one that arrived. The request leg is now the same shape as the response leg —
+`src/service/invoke/request_parameters.rs`, applied once in `src/service/invoke/dispatch.rs`
+where the route's integration is performed, so BOTH backends of this plane state the mapped
+request: the event a Lambda proxy integration is handed and the message an `HTTP_PROXY`
+integration forwards. Every action the key grammar names is carried out over every operand it
+names (`append`/`overwrite`/`remove` over a header and a query-string parameter,
+`overwrite:path` for the path the backend is addressed at), with the key read by the one
+reading of that grammar (`src/state/parameter_mapping.rs`, which gained
+`mapped_query_parameter` and `PATH_OPERAND` beside `mapped_header`) and the value by the one
+reading of the value language (`service_action::parameters::Mapping`). Covered by
+`tests/all/http_api_integration_request_mapping.rs` (the origin api echoes the request it
+received) and the module's own table. The check
+`apigatewayv2.parameter-mapping-rewrites-a-real-request-and-response` now passes.
+
+Causes 2 and 3: DECLINED — not a defect in this tree, and NOT a re-worded refusal: nothing
+about how either leg is refused was changed by this fix, and every leg both causes name is
+already answered as they state it. A route the serving stage's `RouteSettings` meter sheds part
+of an interleaved burst with `429` `{"message":"Too Many Requests"}` without reaching its
+integration, keeps serving a caller that waits for the rate to refill, sheds nothing on its
+twin under the stage's `DefaultRouteSettings` in the same instant, and returns to those
+defaults on `DeleteRouteSettings`; an api whose `DisableExecuteApiEndpoint` is set answers
+`404` `{"message":"Not Found"}` to every request of a run with nothing of the integration in
+it, while a twin api over the same function is served in the same instant, and clearing the
+member restores serving on the same address. Both were already pinned in process
+(`tests/all/http_api_throttle_burst.rs`, `tests/all/http_api_published_endpoint_throttled_stage.rs`,
+`tests/all/disabled_execute_api_endpoint.rs`, `tests/all/disabled_execute_api_endpoint_backend.rs`)
+and at the address the control plane publishes, over a real connection
+(`tests/all/published_invoke_socket_front_door.rs`); this change adds the dimension the two
+checks stall on — a RUN of requests through each transition, with the function actually
+running — as `tests/all/http_api_metered_route_run.rs` and
+`tests/all/http_api_disabled_endpoint_run.rs`, both of which pass in seconds. Both checks still
+end as `Check timed out after 60.0s` with no frame and no verdict, so the replay is evidence
+for nothing either way about them; the same two causes were investigated the same way by the
+fixes for `issues/things-that-now-work/20261114T024946Z-apigatewayv2-3-net-new-causes-a-disabled-execute.md`
+and `issues/things-that-now-work/20261123T183958Z-apigatewayv2-3-net-new-execute-api-front-door.md`,
+which reached the same conclusion. A later reader should treat the two checks as ungraded
+rather than as passing.
