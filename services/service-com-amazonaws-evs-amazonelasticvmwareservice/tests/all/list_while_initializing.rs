@@ -24,7 +24,7 @@
 //! has settled the SAME request reports the whole inventory, unchanged by having been
 //! refused.
 //!
-//! The harness (`emulator`, `call`, `create`, `settle`) is the one
+//! The harness (`emulator`, `call`, `call_in_region`, `create`, `settle`) is the one
 //! `environment_lifecycle` already owns, so every test drives the service the way a
 //! client does: `POST /` with `X-Amz-Target: AmazonElasticVMwareService.<Operation>`.
 
@@ -32,7 +32,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 
 use crate::entitlement_connector::connector_in;
-use crate::environment_lifecycle::{call, create, emulator, error_type, settle, Emulator};
+use crate::environment_lifecycle::{
+    call, call_in_region, create, emulator, error_type, settle, Emulator, REGION,
+};
 
 /// A well-formed `connectorId` no connector was ever minted at: it satisfies the
 /// modelled `^(cnctr-[a-zA-Z0-9]{10})$`, which is all a row needs where the environment
@@ -65,6 +67,19 @@ const ENVIRONMENT_STATES: [(&str, bool); 5] = [
     ("DELETED", false),
     ("CREATE_FAILED", false),
 ];
+
+/// A Region other than [`REGION`], so a request signed for it reaches another endpoint
+/// of this service — one that holds no record of an environment created in [`REGION`],
+/// whatever state that record has reached.
+const OTHER_REGION: &str = "eu-central-1";
+
+/// A well-formed `environmentId` no environment was ever minted at: it satisfies the
+/// modelled `^(env-[a-zA-Z0-9]{10})$`, so it reaches the handler's own lookup rather
+/// than the boundary validator.
+const ABSENT_ENVIRONMENT_ID: &str = "env-0000000000";
+
+/// The `resourceType` this service's not-found refusal names for an environment.
+const ENVIRONMENT_RESOURCE_TYPE: &str = "environment";
 
 /// The number of VLAN subnets an environment is built with: `InitialVlans` declares ten
 /// members, so a complete `ListEnvironmentVlans` answer reports ten.
@@ -158,6 +173,94 @@ fn assert_initializing_refusal(case: &str, status: u16, body: &Value) {
         message.contains("still initializing"),
         "case {case:?}: the refusal must say why the list was not performed, got {message:?}"
     );
+}
+
+/// Assert that `body` is this service's answer for an environment the request addresses
+/// no record of: a `ResourceNotFoundException` naming the environment that was asked
+/// for.
+fn assert_environment_not_found(case: &str, status: u16, body: &Value, environment_id: &str) {
+    // Every modeled CLIENT error of this awsJson1_0 service goes on the wire as a 400 —
+    // see `tests/all/error_wire_status.rs`, which owns that rule.
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_type(body).rsplit(['#', '/']).next().unwrap_or(""),
+        "ResourceNotFoundException",
+        "case {case:?}: expected a ResourceNotFoundException, got {}",
+        error_type(body)
+    );
+    assert_eq!(
+        body["resourceId"].as_str().unwrap_or_default(),
+        environment_id,
+        "case {case:?}: resourceId must echo the environment the request named, got {body}"
+    );
+    assert_eq!(
+        body["resourceType"].as_str().unwrap_or_default(),
+        ENVIRONMENT_RESOURCE_TYPE,
+        "case {case:?}: unexpected resourceType, got {body}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(environment_id),
+        "case {case:?}: the refusal must name the environment asked for, got {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_environment_scoped_list_resolves_its_environment_the_same_way() {
+    // The lookup and the initializing refusal are ONE step every list addressed to an
+    // environment applies, so the four operations answer alike at each of its outcomes:
+    // the record is addressed at the endpoint of its own Region and nowhere else, an id
+    // that names no record is reported absent, an addressed record that is still
+    // initializing refuses the list, and a settled one is reported.
+    let router = emulator();
+    let id = create(&router, Some("shared-lookup-env")).await;
+    // A connector of that environment, so the `ListVmEntitlements` rows carry a handle
+    // that resolves and the outcome under test is the environment's.
+    let connector = connector_in(&router, "shared-lookup-env", &id, VCENTER).await;
+
+    for (operation, request, _) in list_requests(&id, &connector) {
+        let case = format!("{operation} while CREATING, at the environment's own endpoint");
+        let (status, body) = call_in_region(&router, REGION, operation, &request).await;
+        assert_initializing_refusal(&case, status, &body);
+
+        // At another Region's endpoint the lookup half answers first: there is no record
+        // there to be initializing.
+        let case = format!("{operation} while CREATING, at {OTHER_REGION}");
+        let (status, body) = call_in_region(&router, OTHER_REGION, operation, &request).await;
+        assert_environment_not_found(&case, status, &body, &id);
+    }
+
+    settle(&router);
+
+    for (operation, request, member) in list_requests(&id, &connector) {
+        let case = format!("{operation} once CREATED, at the environment's own endpoint");
+        let (status, body) = call_in_region(&router, REGION, operation, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: both halves of the step are satisfied, so the page is \
+             reported; got {status} {body}"
+        );
+        assert!(
+            body[member].is_array(),
+            "case {case:?}: expected a page in {member}, got {body}"
+        );
+
+        // The Region half is not relaxed by the environment having settled.
+        let case = format!("{operation} once CREATED, at {OTHER_REGION}");
+        let (status, body) = call_in_region(&router, OTHER_REGION, operation, &request).await;
+        assert_environment_not_found(&case, status, &body, &id);
+    }
+
+    // An id this service holds no record of at any endpoint, with the store non-empty:
+    // the same not-found answer from all four.
+    for (operation, request, _) in list_requests(ABSENT_ENVIRONMENT_ID, UNKNOWN_CONNECTOR_ID) {
+        let case = format!("{operation} against an id no environment was minted at");
+        let (status, body) = call_in_region(&router, REGION, operation, &request).await;
+        assert_environment_not_found(&case, status, &body, ABSENT_ENVIRONMENT_ID);
+    }
 }
 
 #[tokio::test]

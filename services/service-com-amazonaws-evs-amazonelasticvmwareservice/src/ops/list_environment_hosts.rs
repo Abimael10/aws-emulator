@@ -197,23 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::page_cursor(&page_token_key, &scope, input.next_token.as_deref())
                 .map_err(ListEnvironmentHostsErrorModeled::ValidationException)?;
 
-        // Regional resource: the hosts of an environment are only listable at the
-        // endpoint of the Region that environment was created in.
+        // The environment this list reports the hosts of, resolved by the one two-step
+        // every environment-scoped list of this service applies
+        // ([`crate::state::ComAmazonawsEvsAmazonelasticvmwareserviceState::listed_environment`]):
+        // a regional resource is only listable at the endpoint of the Region it was
+        // created in, and a list is refused while the environment it addresses is still
+        // being built. All this operation adds is which of ITS modelled errors carries
+        // each outcome.
         let environment = state
-            .environment_in_region(&region, &input.environment_id)
-            .ok_or_else(|| {
-                ListEnvironmentHostsErrorModeled::ResourceNotFoundException(
-                    crate::state::environment_not_found(&input.environment_id),
-                )
+            .listed_environment(&region, &input.environment_id)
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentListRefusal::NotFound(absent) => {
+                    ListEnvironmentHostsErrorModeled::ResourceNotFoundException(absent)
+                }
+                crate::state::EnvironmentListRefusal::Initializing(initializing) => {
+                    ListEnvironmentHostsErrorModeled::ValidationException(initializing)
+                }
             })?;
-
-        // "You will see this exception ... if a list operation is performed on an
-        // environment resource that is still initializing" (`ValidationException` doc):
-        // a list is refused while the environment it addresses is still being built,
-        // rather than reporting the hosts of a half-built environment.
-        if let Some(refusal) = crate::state::list_refused_while_initializing(environment) {
-            return Err(ListEnvironmentHostsErrorModeled::ValidationException(refusal).into());
-        }
 
         let mut matching = environment
             .hosts

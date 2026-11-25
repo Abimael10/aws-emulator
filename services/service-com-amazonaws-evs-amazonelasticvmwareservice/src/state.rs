@@ -653,6 +653,24 @@ pub fn list_refused_while_initializing(
     ))
 }
 
+/// What an environment-scoped LIST answers instead of a page, when the environment its
+/// request addresses cannot be listed.
+///
+/// The two outcomes of
+/// [`ComAmazonawsEvsAmazonelasticvmwareserviceState::listed_environment`], each carrying
+/// the modelled body this service words that outcome with. Which modelled error of an
+/// operation carries it is the only part of the step that differs between the operations
+/// that apply it, so that — and nothing else — is what a handler supplies.
+#[derive(Debug)]
+pub enum EnvironmentListRefusal {
+    /// The request addresses no environment this service holds at the endpoint it was
+    /// sent to ([`environment_not_found`]).
+    NotFound(ResourceNotFoundException),
+    /// It addresses an environment that is still initializing
+    /// ([`list_refused_while_initializing`]).
+    Initializing(ValidationException),
+}
+
 /// The `ResourceNotFoundException` every operation answers for a connector id the
 /// addressed environment holds no record of.
 ///
@@ -3278,6 +3296,34 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         self.environments
             .get_mut(environment_id)
             .filter(|environment| environment.region == region)
+    }
+
+    /// The environment an environment-scoped LIST operation reports from, or the refusal
+    /// that read answers instead of a page.
+    ///
+    /// The whole two-step every list addressed to ONE environment applies, stated once:
+    /// the addressed record is resolved at the endpoint of the Region it was created in
+    /// ([`Self::environment_in_region`]) and an id this service holds no such record for
+    /// is reported absent ([`environment_not_found`]); a record that is still being built
+    /// refuses the list rather than reporting the half-built inventory of one
+    /// ([`list_refused_while_initializing`]). It lives beside the two halves it joins, so
+    /// no two environment-scoped listings of this service can disagree about which
+    /// records a list resolves or about which states refuse one; a handler lifts the
+    /// refusal into its own modelled errors with one `map_err`.
+    pub fn listed_environment(
+        &self,
+        region: &str,
+        environment_id: &str,
+    ) -> Result<&StoredEnvironment, EnvironmentListRefusal> {
+        let environment = self
+            .environment_in_region(region, environment_id)
+            .ok_or_else(|| {
+                EnvironmentListRefusal::NotFound(environment_not_found(environment_id))
+            })?;
+        match list_refused_while_initializing(environment) {
+            Some(refusal) => Err(EnvironmentListRefusal::Initializing(refusal)),
+            None => Ok(environment),
+        }
     }
 
     /// The environment an ARN names, if this service holds it IN `region`. The tag
