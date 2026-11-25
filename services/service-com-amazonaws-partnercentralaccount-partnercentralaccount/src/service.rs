@@ -64,15 +64,16 @@
 //! so they cannot disagree.
 //!
 //! What this service chooses about an ENUM clause is two things, both properties of the
-//! CLASS rather than of a member or an operation: the ORDER the admissible values are
-//! listed in — the [`enum_value_set`] module, which owns that rule — and that such a
-//! clause states NO value at all. A recorded refusal of a value outside an enumerated
-//! type reads `Value at '<member path>' failed to satisfy constraint: Member must
-//! satisfy enum value set: [ … ]`: the member and the admissible set, with the value the
-//! request carried withheld, where a `@length` clause of the same message still echoes
-//! the value it refused. The choice is keyed on the violation's CLASS, so every member
-//! targeting any enumerated type of this model is stated alike, at whatever depth and in
-//! whatever binding the value arrived.
+//! enumerated TYPE rather than of a member or an operation, and both owned by the
+//! [`enum_value_set`] module: the ORDER the admissible values are listed in, and whether
+//! the clause states the value it refused. A refusal of a value outside an enumerated type
+//! reads `Value '<supplied value>' at '<member path>' failed to satisfy constraint: Member
+//! must satisfy enum value set: [ … ]` — the value half a `@length`, a `@range` and a
+//! `@pattern` clause of the same message state too — while the types whose recorded
+//! refusals state no value at all are worded `Value at '<member path>' …`, naming the
+//! member and the admissible set alone. Both choices are decided from the value SET the
+//! clause lists, so every member targeting one type is stated alike, at whatever depth and
+//! in whatever binding the value arrived.
 
 mod enum_value_set;
 
@@ -329,11 +330,11 @@ fn validation_exception(
 ///
 /// The envelope, the clauses and the `@pattern` quoting are the shared home's and the
 /// framework's, so a constraint class added upstream cannot arrive with a sentence of
-/// its own. This service chooses two things, both about the ENUM class: the order such a
-/// clause lists the admissible values in ([`enum_value_set`]), and that it states no
-/// value — the member and the set it had to come from, and nothing of what the request
-/// carried. Every other class keeps the value half the framework's own walk wrote for
-/// it, a `@sensitive` member's withheld value included.
+/// its own. This service chooses two things, both about the enumerated TYPE a clause
+/// lists the set of ([`enum_value_set`]): the order it lists the admissible values in,
+/// and whether it states the value that missed them. Every other class — and every
+/// enumerated type whose refusals do state their value — keeps the value half the
+/// framework's own walk wrote for it, a `@sensitive` member's withheld value included.
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     // The order is applied to each violation BEFORE the envelope words it, so only the
     // values inside an enum clause move and every other violation reaches the shared
@@ -342,7 +343,7 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     Some(
         service_common::validation_message::aws_validation_refusal_withholding_violations(
             &stated,
-            |violation| matches!(violation.kind, ViolationKind::EnumValue(_)),
+            enum_value_set::withholds_value,
         )?
         .message,
     )

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a constraint refusal of a value outside an enumerated type STATES: which values
-//! that type admits, and in which order.
+//! that type admits, in which order, and whether the refused value is stated with them.
 //!
-//! ONE thing about such a clause is this service's rather than the framework's, and it
-//! belongs to the enum CLASS rather than to a member or an operation: the values are
+//! The first of those is this service's rather than the framework's, and it belongs to the
+//! enumerated TYPE rather than to a member or an operation: the values are
 //! listed in the order the front door's own TABLE of the admissible values is walked —
 //! the table's buckets in ascending order, each bucket being the low bits of the value's
 //! own string hash ([`service_common::validation_message::in_hashed_enum_order`]) — and
@@ -13,13 +13,16 @@
 //! operation targeting one enum is listed alike, at whatever depth and in whatever binding
 //! the value arrived, and a type the model gains needs nothing added here.
 //!
-//! The VALUE half of the clause belongs to the same CLASS: a refusal of a value outside an
-//! enumerated type states no value at all — `Value at '<member path>' failed to satisfy
-//! constraint: Member must satisfy enum value set: [ … ]` — where a `@length`, a `@range`
-//! and a `@pattern` clause of the same message still echo the value they refused. That
-//! choice is taken where the clauses are worded (`super::constraint_envelope`), by the
-//! violation's class, so this module only re-orders the set and leaves every half of the
-//! clause to the one layer that writes them.
+//! The VALUE half of the clause belongs to the enumerated TYPE as well. A refusal of a
+//! value outside an enumerated type echoes the value the request carried — `Value
+//! '<supplied value>' at '<member path>' failed to satisfy constraint: Member must satisfy
+//! enum value set: [ … ]`, the same value half a `@length`, a `@range` and a `@pattern`
+//! clause of the message state — except for the types whose recorded refusals state no
+//! value at all ([`TYPES_STATING_NO_VALUE`]), whose clause names the member and the
+//! admissible set alone. Which it is, is decided from the value SET a clause lists, so
+//! every member targeting one type is stated alike, at whatever depth and in whatever
+//! binding the value arrived; the decision is applied where the clauses are worded
+//! (`super::constraint_envelope`), which is the one layer that writes either half.
 //!
 //! Nothing about the SENTENCE is this module's: the counted envelope, the clause, the
 //! member path and the requirement each constraint class states live in the shared home for
@@ -28,12 +31,47 @@
 //! state the same sentence.
 
 use ::service_common::validation_message::in_hashed_enum_order;
-use ::smithy_server_runtime::Violation;
+use ::smithy_server_runtime::{Violation, ViolationKind};
+
+/// Every enumerated type of this model whose refusals state NO value at all, each as the
+/// WHOLE set of values the model declares for that type — the invitation status a
+/// connection invitation is filtered by (`smithy_query(query="shape",
+/// shape="InvitationStatus")`, carried here as the model-derived constant rather than
+/// written out, so a value the model gains reaches this rule).
+///
+/// A clause is matched to an entry by the value SET it lists rather than by the member it
+/// is stated at, because a violation carries the set and not the shape that declared it:
+/// every member targeting one of these types is stated alike, in any operation, at any
+/// depth and in any binding. A type absent from here echoes the refused value, which is
+/// the form every other constraint class of the same message states.
+const TYPES_STATING_NO_VALUE: &[&[&str]] = &[crate::ops::types::INVITATION_STATUS_VALUES];
 
 /// One violation as this service states it: an enumerated type's admissible values listed
 /// in the order the table of them is walked, and every other violation unchanged.
 pub(super) fn as_stated(violation: &Violation) -> Violation {
     in_hashed_enum_order(violation)
+}
+
+/// Whether the clause stating `violation` withholds the value the request carried: a value
+/// outside one of the enumerated types whose refusals state none
+/// ([`TYPES_STATING_NO_VALUE`]). Every other violation — a value outside any other
+/// enumerated type, and every class that is not an enumerated one — keeps the value half
+/// the framework's own walk wrote for it.
+pub(super) fn withholds_value(violation: &Violation) -> bool {
+    let ViolationKind::EnumValue(listed) = &violation.kind else {
+        return false;
+    };
+    TYPES_STATING_NO_VALUE
+        .iter()
+        .any(|stated| is_the_same_set(stated, listed))
+}
+
+/// Whether `listed` holds exactly the values `declared` does, in any order.
+fn is_the_same_set(declared: &[&str], listed: &[String]) -> bool {
+    declared.len() == listed.len()
+        && declared
+            .iter()
+            .all(|value| listed.iter().any(|held| held == value))
 }
 
 #[cfg(test)]
@@ -196,6 +234,86 @@ mod tests {
                 (&stated.path, &stated.value, stated.sensitive),
                 (&violation.path, &violation.value, violation.sensitive),
                 "case {case:?}: expected the path and value half of {violation:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// Whether the value is withheld follows the enumerated TYPE: the types whose
+    /// refusals state none withhold it and every other type of this model echoes it,
+    /// whichever member, operation or binding the value arrived in — the decision reads
+    /// the value set alone, and nothing of the path or the value.
+    #[test]
+    fn only_the_types_stating_no_value_withhold_it() {
+        // (case, the type's modelled value set)
+        let rows: &[(&str, &[&str])] = &[
+            ("InvitationStatus", crate::ops::types::INVITATION_STATUS_VALUES),
+            (
+                "PrimarySolutionType",
+                crate::ops::types::PRIMARY_SOLUTION_TYPE_VALUES,
+            ),
+            ("ConnectionType", crate::ops::types::CONNECTION_TYPE_VALUES),
+            ("ParticipantType", crate::ops::types::PARTICIPANT_TYPE_VALUES),
+            (
+                "ProfileVisibility",
+                crate::ops::types::PROFILE_VISIBILITY_VALUES,
+            ),
+            ("AccessType", crate::ops::types::ACCESS_TYPE_VALUES),
+            ("IndustrySegment", crate::ops::types::INDUSTRY_SEGMENT_VALUES),
+            ("VerificationType", crate::ops::types::VERIFICATION_TYPE_VALUES),
+        ];
+
+        for (case, declared) in rows {
+            let withholds = TYPES_STATING_NO_VALUE
+                .iter()
+                .any(|stated| stated == declared);
+            for path in ["status", "taskDetails.primarySolutionType"] {
+                let violation = Violation {
+                    path: path.to_string(),
+                    ..enum_violation(declared)
+                };
+                assert_eq!(
+                    withholds_value(&violation),
+                    withholds,
+                    "case {case:?} at {path:?}: expected withholding to be {withholds}, got \
+                     {violation:?}"
+                );
+                // The set reaches the clause re-ordered, which must not change the answer.
+                assert_eq!(
+                    withholds_value(&as_stated(&violation)),
+                    withholds,
+                    "case {case:?} at {path:?}: the re-ordered set is the same set, got \
+                     {violation:?}"
+                );
+            }
+        }
+    }
+
+    /// Every OTHER constraint class keeps the value half the walk wrote for it, whatever
+    /// member it broke — including a member of a type whose enum refusals state no value.
+    #[test]
+    fn no_other_class_withholds_its_value() {
+        let refused = enum_violation(crate::ops::types::INVITATION_STATUS_VALUES);
+        let rows = [
+            ("a length maximum", ViolationKind::MaxLength(64)),
+            ("a length minimum", ViolationKind::MinLength(1)),
+            ("a range maximum", ViolationKind::MaxValue("100".to_string())),
+            ("a range minimum", ViolationKind::MinValue("1".to_string())),
+            (
+                "a pattern",
+                ViolationKind::Pattern("^[a-zA-Z0-9-]+$".to_string()),
+            ),
+            ("an absent required member", ViolationKind::MissingRequiredMember),
+        ];
+
+        for (case, kind) in rows {
+            let violation = Violation {
+                kind,
+                ..refused.clone()
+            };
+            assert!(
+                !withholds_value(&violation),
+                "case {case:?}: expected the walk's own value half, got a withheld one for \
+                 {violation:?}"
             );
         }
     }

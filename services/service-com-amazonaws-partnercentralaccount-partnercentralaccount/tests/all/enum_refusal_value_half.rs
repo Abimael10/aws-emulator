@@ -1,29 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What an enum-constraint refusal states about the value it REFUSED: nothing.
+//! What an enum-constraint refusal states about the value it REFUSED.
 //!
-//! The rule under test: a clause refusing a value outside an enumerated type states the
-//! member and the set that value had to come from and WITHHOLDS the value itself — `Value
-//! at '<member path>' failed to satisfy constraint: Member must satisfy enum value set:
-//! [ … ]` — where a `@length` clause of the very same message still quotes the value it
-//! refused. The rule is keyed on the constraint CLASS, so it holds for every member
-//! targeting any enumerated type of this model, at whatever depth and in whatever binding
-//! the value arrived; and because the clause says nothing of the request, two requests
-//! refusing one member for two different inadmissible values state the SAME message.
+//! The rule under test: a clause refusing a value outside an enumerated type echoes that
+//! value — `Value '<supplied value>' at '<member path>' failed to satisfy constraint: Member
+//! must satisfy enum value set: [ … ]`, the same value half a `@length`, a `@range` and a
+//! `@pattern` clause of the very same message state — except for the enumerated types whose
+//! refusals state no value at all, whose clause names the member and the admissible set
+//! alone (`Value at '<member path>' …`). Which it is belongs to the enumerated TYPE rather
+//! than to a member, an operation or a request, so one type is stated the same way at
+//! whatever depth and in whatever binding its value arrived; and where a clause echoes, it
+//! echoes what the request actually sent, so two requests refusing one member for two
+//! different inadmissible values state two different messages.
 //!
 //! The rows differ along what the rule generalises over: which enumerated type carried the
 //! refused value (seven of this model's, of two, three, five, eight and thirty-seven
-//! values), which operation and member carried it (nine members over seven operations, one
-//! of them nested inside a structure member), the BINDING the refused value arrived in (a
-//! top-level member, a member nested in a structure member, and an element of a list of an
-//! enumerated type, at the list's first, middle and last admissible position), how the
-//! refused value was spelled (a name no value carries, an admitted value miscased, padded,
-//! the empty string, a long value, a value carrying a quote, a value carrying the set's own
-//! text, an admitted value of another type), and how many constraint violations one request
-//! carries (one; an enum together with another class; and two enum violations, of one type
-//! and of two). The value SET's order is not pinned here — it is `enum_value_set_order.rs`'s
-//! rule; this suite reads the set out of the message and holds it to being the modelled set
-//! re-ordered.
+//! values, including the one type that states no value), which operation and member carried
+//! it (nine members over seven operations, one of them nested inside a structure member),
+//! the BINDING the refused value arrived in (a top-level member, a member nested in a
+//! structure member, and an element of a list of an enumerated type, at the list's first,
+//! middle and last admissible position), how the refused value was spelled (a name no value
+//! carries, an admitted value miscased, padded, the empty string, a value carrying a quote,
+//! a value carrying the set's own text, an admitted value of another type), and how many
+//! constraint violations one request carries (one; an enum together with another class —
+//! including a class on a `@sensitive` member, whose value stays withheld either way; and
+//! two enum violations, of one type and of two — including two types whose value halves
+//! differ inside one message). The value SET's order is not pinned here — it is
+//! `enum_value_set_order.rs`'s rule; this suite reads the set out of the message and holds
+//! it to being the modelled set re-ordered.
 
 use serde_json::{json, Value};
 
@@ -49,21 +53,34 @@ const ADMITTED_SEGMENT: &str = "RETAIL";
 /// last position refuses an element the list may actually carry.
 const INDUSTRY_SEGMENTS_MAX: usize = 3;
 
-/// Everything ONE clause states before the value set it lists: the member path and the
-/// requirement — and no value.
-fn clause_before_the_set(member_path: &str) -> String {
+/// Whether a refusal of a value outside the type whose admissible values are `modelled`
+/// states that value: the invitation status a connection invitation is filtered by
+/// (`InvitationStatus`) is the one enumerated type of this model whose refusals state none,
+/// and every other type echoes what the request sent.
+fn withholds_the_value(modelled: &[&str]) -> bool {
+    modelled == INVITATION_STATUS_VALUES
+}
+
+/// Everything ONE clause states before the value set it lists: the value half the refused
+/// value's type gives it, the member path and the requirement.
+fn clause_before_the_set(member_path: &str, refused: &str, modelled: &[&str]) -> String {
+    let value_half = if withholds_the_value(modelled) {
+        "Value".to_string()
+    } else {
+        format!("Value '{refused}'")
+    };
     format!(
-        "Value at '{member_path}' failed to satisfy constraint: Member must satisfy enum \
+        "{value_half} at '{member_path}' failed to satisfy constraint: Member must satisfy enum \
          value set: ["
     )
 }
 
 /// Everything a message stating ONE clause says before the value set: the envelope's
 /// count, then the clause.
-fn clause_opening(member_path: &str) -> String {
+fn clause_opening(member_path: &str, refused: &str, modelled: &[&str]) -> String {
     format!(
         "1 validation error detected: {}",
-        clause_before_the_set(member_path)
+        clause_before_the_set(member_path, refused, modelled)
     )
 }
 
@@ -97,11 +114,11 @@ fn profile_update_task(solution_type: &str, segments: &[&str]) -> Value {
 /// The elements of an `IndustrySegments` list filled to its modelled maximum whose element
 /// at `position` (1-based, as a member path counts one) is outside the type and whose every
 /// other element is admitted.
-fn segments_refused_at(position: usize) -> Vec<&'static str> {
+fn segments_refused_at(position: usize, refused: &'static str) -> Vec<&'static str> {
     (1..=INDUSTRY_SEGMENTS_MAX)
         .map(|index| {
             if index == position {
-                "NOT_A_MODELLED_VALUE"
+                refused
             } else {
                 ADMITTED_SEGMENT
             }
@@ -110,10 +127,10 @@ fn segments_refused_at(position: usize) -> Vec<&'static str> {
 }
 
 /// Every enum-constrained input member of this service, each refused a value outside its
-/// type: one validation error, naming the member and the set it had to come from, quoting
-/// no value at all, and the set it lists is the modelled set re-ordered.
+/// type: one validation error, naming the member, the value half its type states and the
+/// set it had to come from — and the set it lists is the modelled set re-ordered.
 #[tokio::test]
-async fn an_enum_refusal_withholds_the_value_it_refused() {
+async fn an_enum_refusal_states_the_value_half_its_type_states() {
     let emulator = Emulator::new();
     let outside = "NOT_A_MODELLED_VALUE";
 
@@ -214,11 +231,12 @@ async fn an_enum_refusal_withholds_the_value_it_refused() {
             "case {case:?}: expected ValidationException, got {code:?}: {body}"
         );
         let message = string(&body, "Message", case);
-        assert!(
-            !message.contains(outside),
-            "case {case:?}: an enum clause states no value, got {message:?}"
+        assert_eq!(
+            message.contains(outside),
+            !withholds_the_value(modelled),
+            "case {case:?}: the clause states the value half its type states, got {message:?}"
         );
-        let listed = listed_set(&message, member_path, case);
+        let listed = listed_set(&message, member_path, outside, modelled, case);
         assert_modelled_set_re_ordered(&listed, modelled, case);
     }
 }
@@ -238,10 +256,16 @@ fn assert_modelled_set_re_ordered(listed: &[String], modelled: &[&str], case: &s
 }
 
 /// The values a refusal lists for `member_path`, with the whole clause around them held to
-/// the wording the rule states — so a clause that quotes the value it refused, at the member
+/// the wording the rule states — so a clause stating the wrong value half, at the member
 /// path or anywhere before it, fails here.
-fn listed_set(message: &str, member_path: &str, case: &str) -> Vec<String> {
-    let opening = clause_opening(member_path);
+fn listed_set(
+    message: &str,
+    member_path: &str,
+    refused: &str,
+    modelled: &[&str],
+    case: &str,
+) -> Vec<String> {
+    let opening = clause_opening(member_path, refused, modelled);
     let listed = message
         .strip_prefix(opening.as_str())
         .and_then(|tail| tail.strip_suffix(']'))
@@ -251,16 +275,68 @@ fn listed_set(message: &str, member_path: &str, case: &str) -> Vec<String> {
     listed.split(", ").map(str::to_string).collect()
 }
 
-/// The clause does NOT follow what the request sent: one member refused every spelling of
-/// an inadmissible value a caller can send states one and the same message, so nothing of
-/// the submitted value can be read back out of it.
+/// A clause that ECHOES follows what the request sent: one member refused every spelling of
+/// an inadmissible value a caller can send quotes that spelling back, so no two of them
+/// state one message.
 #[tokio::test]
-async fn the_clause_does_not_follow_what_the_request_sent() {
+async fn an_echoing_clause_quotes_back_what_the_request_sent() {
     let emulator = Emulator::new();
 
     // A long value, under the ceiling the framework's own walk elides a clause's echo at:
     // past it the clause quotes a prefix and the value's byte count, which is the
     // framework's rendering of a long value rather than this rule.
+    let long = "V".repeat(200);
+    let spellings = [
+        ("a name no value carries", "NOT_A_SOLUTION_TYPE"),
+        ("an admitted value miscased", "software_products"),
+        ("an admitted value padded", " SOFTWARE_PRODUCTS"),
+        ("the empty string", ""),
+        ("a value carrying a quote", "O'Brien"),
+        (
+            "a value carrying the set's own text",
+            "TRAINING_SERVICES, MANAGED_SERVICES",
+        ),
+        ("an admitted value of ANOTHER type", "PENDING"),
+        ("a long value", long.as_str()),
+    ];
+
+    let mut stated: Vec<(&str, String)> = Vec::new();
+    for (case, refused) in spellings {
+        let (status, body) = emulator
+            .call("CreatePartner", &create_partner(refused, "tok-spelling"))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a value outside the set is refused, got {status}: {body}"
+        );
+        let message = string(&body, "Message", case);
+        // The clause states the member, the value it refused and the set: `listed_set`
+        // holds the whole opening of the message.
+        listed_set(
+            &message,
+            "primarySolutionType",
+            refused,
+            PRIMARY_SOLUTION_TYPE_VALUES,
+            case,
+        );
+        for (earlier_case, earlier) in &stated {
+            assert_ne!(
+                &message, earlier,
+                "case {case:?}: a clause quoting what was sent differs from {earlier_case:?}'s, \
+                 got {message:?}"
+            );
+        }
+        stated.push((case, message));
+    }
+}
+
+/// A clause of the one type that WITHHOLDS says nothing of the request: that member refused
+/// every spelling of an inadmissible value states one and the same message, so nothing of
+/// the submitted value can be read back out of it.
+#[tokio::test]
+async fn a_withholding_clause_does_not_follow_what_the_request_sent() {
+    let emulator = Emulator::new();
+
     let long = "V".repeat(200);
     let spellings = [
         ("a name no value carries", "NOT_A_MODELLED_VALUE"),
@@ -288,7 +364,7 @@ async fn the_clause_does_not_follow_what_the_request_sent() {
         let message = string(&body, "Message", case);
         // The clause states the member and the set and nothing of the value: `listed_set`
         // holds the whole opening of the message.
-        listed_set(&message, "status", case);
+        listed_set(&message, "status", refused, INVITATION_STATUS_VALUES, case);
         match &first {
             None => first = Some((case, message)),
             Some((earlier_case, earlier)) => assert_eq!(
@@ -300,46 +376,107 @@ async fn the_clause_does_not_follow_what_the_request_sent() {
     }
 }
 
-/// The value half is decided per CLASS: a request that breaks an enum and a `@length`
-/// maximum together quotes the over-long value it sent in the length clause and states no
-/// value in the enum clause.
+/// Two classes in one message each state their own value half: a request that breaks an
+/// enum and a `@length` maximum together quotes the over-long value it sent in the length
+/// clause and the inadmissible value it sent in the enum clause — whatever either value
+/// was.
 #[tokio::test]
 async fn each_class_in_the_same_request_states_its_own_value_half() {
     let emulator = Emulator::new();
-    let over_long_token = "t".repeat(CLIENT_TOKEN_MAX + 1);
-    let refused = "NOT_A_SOLUTION_TYPE";
-    let case = "an over-long client token and a solution type outside its set";
 
-    let (status, body) = emulator
-        .call("CreatePartner", &create_partner(refused, &over_long_token))
-        .await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: two constraint violations are HTTP 400, got {status}: {body}"
-    );
-    let message = string(&body, "Message", case);
-    assert!(
-        message.starts_with("2 validation errors detected: "),
-        "case {case:?}: the envelope counts the violations, got {message:?}"
-    );
-    let token_clause = format!(
-        "Value '{over_long_token}' at 'clientToken' failed to satisfy constraint: Member must \
-         have length less than or equal to {CLIENT_TOKEN_MAX}"
-    );
-    assert!(
-        message.contains(&token_clause),
-        "case {case:?}: expected the length clause {token_clause:?}, got {message:?}"
-    );
-    let enum_clause = "Value at 'primarySolutionType' failed to satisfy constraint: Member must \
-                       satisfy enum value set: [";
-    assert!(
-        message.contains(enum_clause),
-        "case {case:?}: expected the enum clause {enum_clause:?}, got {message:?}"
-    );
-    assert!(
-        !message.contains(refused),
-        "case {case:?}: the enum clause states no value, got {message:?}"
-    );
+    // (case, the refused solution type, the over-long client token)
+    let rows = [
+        (
+            "a name no value carries, with a token one character over the maximum",
+            "NOT_A_SOLUTION_TYPE",
+            "t".repeat(CLIENT_TOKEN_MAX + 1),
+        ),
+        (
+            "an admitted value miscased, with a far longer token",
+            "managed_services",
+            format!("tok-{}", "a".repeat(CLIENT_TOKEN_MAX)),
+        ),
+    ];
+
+    for (case, refused, over_long_token) in rows {
+        let (status, body) = emulator
+            .call("CreatePartner", &create_partner(refused, &over_long_token))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: two constraint violations are HTTP 400, got {status}: {body}"
+        );
+        let message = string(&body, "Message", case);
+        assert!(
+            message.starts_with("2 validation errors detected: "),
+            "case {case:?}: the envelope counts the violations, got {message:?}"
+        );
+        let token_clause = format!(
+            "Value '{over_long_token}' at 'clientToken' failed to satisfy constraint: Member must \
+             have length less than or equal to {CLIENT_TOKEN_MAX}"
+        );
+        assert!(
+            message.contains(&token_clause),
+            "case {case:?}: expected the length clause {token_clause:?}, got {message:?}"
+        );
+        let enum_clause = clause_before_the_set(
+            "primarySolutionType",
+            refused,
+            PRIMARY_SOLUTION_TYPE_VALUES,
+        );
+        assert!(
+            message.contains(enum_clause.as_str()),
+            "case {case:?}: expected the enum clause {enum_clause:?}, got {message:?}"
+        );
+    }
+}
+
+/// What the model marks `@sensitive` stays withheld whatever the enum clause states: a
+/// request breaking a sensitive member's `@length` and an enumerated member's set together
+/// states the sensitive member with no value and the enumerated one with the value half its
+/// type gives it.
+#[tokio::test]
+async fn a_sensitive_member_keeps_its_value_withheld_beside_an_enum_clause() {
+    let emulator = Emulator::new();
+
+    // `EmailVerificationCode` is modelled `@sensitive` `@length(6, 6)` `@pattern(^[0-9]+$)`
+    // (source: `smithy_query(query="operation",operation="CreatePartner")`).
+    let rows = [
+        ("a code one digit over the length", "1234567"),
+        ("a far longer code", "9876543210"),
+    ];
+    let refused = "NOT_A_SOLUTION_TYPE";
+
+    for (case, code) in rows {
+        let mut request = create_partner(refused, "tok-sensitive");
+        request["EmailVerificationCode"] = json!(code);
+        let (status, body) = emulator.call("CreatePartner", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: two constraint violations are HTTP 400, got {status}: {body}"
+        );
+        let message = string(&body, "Message", case);
+        assert!(
+            !message.contains(code),
+            "case {case:?}: a sensitive member's value is never stated, got {message:?}"
+        );
+        let sensitive_clause = "Value at 'emailVerificationCode' failed to satisfy constraint: \
+                                Member must have length less than or equal to 6";
+        assert!(
+            message.contains(sensitive_clause),
+            "case {case:?}: expected the sensitive member's clause {sensitive_clause:?}, got \
+             {message:?}"
+        );
+        let enum_clause = clause_before_the_set(
+            "primarySolutionType",
+            refused,
+            PRIMARY_SOLUTION_TYPE_VALUES,
+        );
+        assert!(
+            message.contains(enum_clause.as_str()),
+            "case {case:?}: expected the enum clause {enum_clause:?}, got {message:?}"
+        );
+    }
 }
 
 /// The refusal is owed to a value OUTSIDE the set and to nothing else: every value the
@@ -367,9 +504,9 @@ async fn every_admitted_value_is_served() {
 
 /// The rule holds in the LIST binding too: an element of a list of an enumerated type
 /// outside that type is refused by the element's own member path, with the admissible set
-/// listed and no value stated — whichever position of the list carried it.
+/// listed and the element's own value echoed — whichever position of the list carried it.
 #[tokio::test]
-async fn an_element_of_a_list_of_the_type_states_no_value_either() {
+async fn an_element_of_a_list_of_the_type_states_its_own_value() {
     let emulator = Emulator::new();
     let outside = "NOT_A_MODELLED_VALUE";
 
@@ -380,7 +517,10 @@ async fn an_element_of_a_list_of_the_type_states_no_value_either() {
         let (status, body) = emulator
             .call(
                 "StartProfileUpdateTask",
-                &profile_update_task("SOFTWARE_PRODUCTS", &segments_refused_at(position)),
+                &profile_update_task(
+                    "SOFTWARE_PRODUCTS",
+                    &segments_refused_at(position, outside),
+                ),
             )
             .await;
         assert_eq!(
@@ -393,41 +533,48 @@ async fn an_element_of_a_list_of_the_type_states_no_value_either() {
             "case {case:?}: expected ValidationException, got {code:?}: {body}"
         );
         let message = string(&body, "Message", case);
-        assert!(
-            !message.contains(outside),
-            "case {case:?}: an enum clause states no value, got {message:?}"
-        );
         let member_path = format!("taskDetails.industrySegments.{position}.member");
-        let listed = listed_set(&message, &member_path, case);
+        let listed = listed_set(
+            &message,
+            &member_path,
+            outside,
+            INDUSTRY_SEGMENT_VALUES,
+            case,
+        );
         assert_modelled_set_re_ordered(&listed, INDUSTRY_SEGMENT_VALUES, case);
     }
 }
 
 /// One row of the two-violation table: the case, the operation, the request, and the two
-/// member paths each with the value set its clause must list.
+/// member paths each with the value it refused and the value set its clause must list.
 type TwoEnumViolations = (
     &'static str,
     &'static str,
     Value,
-    [(String, &'static [&'static str]); 2],
+    [(String, &'static str, &'static [&'static str]); 2],
 );
 
-/// TWO members outside their enumerated types in one request: the envelope counts both,
-/// each clause names its own member path and set, and neither states a value — whether the
-/// two members reach two enumerated types or one type at two positions of a list.
+/// TWO members outside their enumerated types in one request: the envelope counts both and
+/// each clause names its own member path, its own set and the value half its own type
+/// states — whether the two members reach two enumerated types whose value halves DIFFER,
+/// or one type at two positions of a list.
 #[tokio::test]
-async fn two_enum_violations_each_state_their_own_member_and_no_value() {
+async fn two_enum_violations_each_state_their_own_member_and_value_half() {
     let emulator = Emulator::new();
     let outside = "NOT_A_MODELLED_VALUE";
 
     let rows: Vec<TwoEnumViolations> = vec![
         (
-            "two filters of two different enumerated types",
+            "two filters of two different enumerated types, one stating its value and one not",
             "ListConnectionInvitations",
             json!({ "Catalog": "AWS", "Status": outside, "ParticipantType": outside }),
             [
-                ("status".to_string(), INVITATION_STATUS_VALUES),
-                ("participantType".to_string(), PARTICIPANT_TYPE_VALUES),
+                ("status".to_string(), outside, INVITATION_STATUS_VALUES),
+                (
+                    "participantType".to_string(),
+                    outside,
+                    PARTICIPANT_TYPE_VALUES,
+                ),
             ],
         ),
         (
@@ -437,10 +584,12 @@ async fn two_enum_violations_each_state_their_own_member_and_no_value() {
             [
                 (
                     "taskDetails.industrySegments.2.member".to_string(),
+                    outside,
                     INDUSTRY_SEGMENT_VALUES,
                 ),
                 (
                     "taskDetails.industrySegments.3.member".to_string(),
+                    outside,
                     INDUSTRY_SEGMENT_VALUES,
                 ),
             ],
@@ -458,15 +607,10 @@ async fn two_enum_violations_each_state_their_own_member_and_no_value() {
             message.starts_with("2 validation errors detected: "),
             "case {case:?}: the envelope counts both violations, got {message:?}"
         );
-        assert!(
-            !message.contains(outside),
-            "case {case:?}: an enum clause states no value, got {message:?}"
-        );
-        for (member_path, modelled) in expected {
+        for (member_path, refused, modelled) in expected {
             // The clause is read out of a message holding two of them, so only this
-            // clause's own wording — path, requirement and the absent value half — is
-            // held here.
-            let clause = clause_before_the_set(&member_path);
+            // clause's own wording — path, requirement and its value half — is held here.
+            let clause = clause_before_the_set(&member_path, refused, modelled);
             let listed = message
                 .split_once(clause.as_str())
                 .and_then(|(_, tail)| tail.split_once(']'))
@@ -479,9 +623,9 @@ async fn two_enum_violations_each_state_their_own_member_and_no_value() {
     }
 }
 
-/// The value half is decided per CLASS wherever the member sits: a nested member outside
-/// its `@pattern` echoes the value it refused in the same message whose enum clause states
-/// none.
+/// The value half is decided per TYPE wherever the member sits: a nested member outside its
+/// `@pattern` echoes the value it refused in the same message whose enum clause echoes its
+/// own.
 #[tokio::test]
 async fn a_pattern_clause_beside_an_enum_clause_keeps_its_own_value_half() {
     let emulator = Emulator::new();
@@ -513,21 +657,21 @@ async fn a_pattern_clause_beside_an_enum_clause_keeps_its_own_value_half() {
         message.contains(&pattern_clause),
         "case {case:?}: expected the pattern clause {pattern_clause:?}, got {message:?}"
     );
-    let enum_clause = clause_before_the_set("taskDetails.primarySolutionType");
+    let enum_clause = clause_before_the_set(
+        "taskDetails.primarySolutionType",
+        outside,
+        PRIMARY_SOLUTION_TYPE_VALUES,
+    );
     assert!(
         message.contains(enum_clause.as_str()),
         "case {case:?}: expected the enum clause {enum_clause:?}, got {message:?}"
     );
-    assert!(
-        !message.contains(outside),
-        "case {case:?}: the enum clause states no value, got {message:?}"
-    );
 }
 
-/// What a clause states belongs to the CLASS and the TYPE, not to the binding the value
-/// arrived in: one enumerated type refused through a top-level member and through a member
-/// nested in a structure states the same set the same way, the member path the only
-/// difference.
+/// What a clause states belongs to the TYPE, not to the binding the value arrived in: one
+/// enumerated type refused through a top-level member and through a member nested in a
+/// structure states the same set the same way, with the same value half, the member path
+/// the only difference.
 #[tokio::test]
 async fn one_type_is_stated_alike_through_two_bindings() {
     let emulator = Emulator::new();
@@ -557,7 +701,13 @@ async fn one_type_is_stated_alike_through_two_bindings() {
             "case {case:?}: a value outside the modelled set is refused, got {status}: {body}"
         );
         let message = string(&body, "Message", case);
-        let listed = listed_set(&message, member_path, case);
+        let listed = listed_set(
+            &message,
+            member_path,
+            outside,
+            PRIMARY_SOLUTION_TYPE_VALUES,
+            case,
+        );
         assert_modelled_set_re_ordered(&listed, PRIMARY_SOLUTION_TYPE_VALUES, case);
         match &stated {
             None => stated = Some((case, listed)),

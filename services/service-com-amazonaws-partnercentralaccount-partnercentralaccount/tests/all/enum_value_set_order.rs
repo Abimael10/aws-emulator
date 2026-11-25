@@ -49,8 +49,18 @@ const INVITATION_STATUS_SET: &str = "EXPIRED, ACCEPTED, PENDING, CANCELED, REJEC
 const CLIENT_TOKEN_MAX: usize = 64;
 
 /// The clause an enum-constraint violation states for the value the request carried at
-/// `member_path`: no value half, then the requirement and the set.
-fn enum_clause(member_path: &str, value_set: &str) -> String {
+/// `member_path`: the value it refused, then the requirement and the set.
+fn enum_clause(member_path: &str, refused: &str, value_set: &str) -> String {
+    format!(
+        "Value '{refused}' at '{member_path}' failed to satisfy constraint: Member must \
+         satisfy enum value set: [{value_set}]"
+    )
+}
+
+/// The same clause for the one enumerated type whose refusals state no value at all
+/// (`InvitationStatus`), which is `enum_refusal_value_half.rs`'s rule rather than this
+/// suite's: the member path, the requirement and the set, with no value half.
+fn withholding_enum_clause(member_path: &str, value_set: &str) -> String {
     format!(
         "Value at '{member_path}' failed to satisfy constraint: Member must \
          satisfy enum value set: [{value_set}]"
@@ -100,7 +110,11 @@ async fn a_known_enum_set_is_stated_in_the_order_the_refusals_state_it() {
             create_partner("NOT_A_SOLUTION_TYPE", "tok-enum"),
             format!(
                 "1 validation error detected: {}",
-                enum_clause("primarySolutionType", PRIMARY_SOLUTION_TYPE_SET)
+                enum_clause(
+                    "primarySolutionType",
+                    "NOT_A_SOLUTION_TYPE",
+                    PRIMARY_SOLUTION_TYPE_SET
+                )
             ),
         ),
         (
@@ -111,7 +125,11 @@ async fn a_known_enum_set_is_stated_in_the_order_the_refusals_state_it() {
                 "2 validation errors detected: Value '{over_long_token}' at 'clientToken' failed \
                  to satisfy constraint: Member must have length less than or equal to \
                  {CLIENT_TOKEN_MAX}; {}",
-                enum_clause("primarySolutionType", PRIMARY_SOLUTION_TYPE_SET)
+                enum_clause(
+                    "primarySolutionType",
+                    "NOT_A_SOLUTION_TYPE",
+                    PRIMARY_SOLUTION_TYPE_SET
+                )
             ),
         ),
     ];
@@ -148,7 +166,7 @@ async fn a_known_enum_set_is_stated_in_the_order_the_refusals_state_it() {
         "case {case:?}: a constraint violation is HTTP 400, got {status}: {body}"
     );
     let message = string(&body, "Message", case);
-    let expected = enum_clause("status", INVITATION_STATUS_SET);
+    let expected = withholding_enum_clause("status", INVITATION_STATUS_SET);
     assert!(
         message.contains(&expected),
         "case {case:?}: expected the clause {expected:?}, got {message:?}"
