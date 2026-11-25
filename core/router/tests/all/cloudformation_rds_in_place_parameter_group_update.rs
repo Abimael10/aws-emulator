@@ -9,10 +9,11 @@
 //! stack neither replaces the instance (its `DbiResourceId`, the identity Amazon RDS minted
 //! for it, is untouched) nor leaves the association unobservable. Amazon RDS then settles the
 //! membership as `ModifyDBInstance$DBParameterGroupName` documents: the group name changes at
-//! once and "if you modify dynamic parameters in the newly associated DB parameter group,
-//! these changes are applied immediately without a reboot", so a group carrying only dynamic
-//! values reaches `ParameterApplyStatus` `in-sync` with no reboot, and `DescribeDBParameters`
-//! on that group reports the template's value under `Source` `user`.
+//! once, but "the actual parameter changes are not applied until you reboot the instance
+//! without failover" and "the DB instance isn't rebooted automatically", so the newly
+//! associated group reports `ParameterApplyStatus` `pending-reboot` until the client reboots
+//! the instance and `in-sync` once that reboot has brought the engine up under it, while
+//! `DescribeDBParameters` on that group reports the template's value under `Source` `user`.
 //!
 //! Why it matters: managing RDS configuration through CloudFormation is the normal way to do
 //! it, and every client that waits on the instance's reported group — a CDK or Terraform
@@ -45,6 +46,9 @@ const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 /// `DBParameterGroupStatus$ParameterApplyStatus` of a group whose values the engine is
 /// running.
 const IN_SYNC: &str = "in-sync";
+
+/// The status of a group an association has attached and whose reboot is still outstanding.
+const PENDING_REBOOT: &str = "pending-reboot";
 
 /// `Parameter$Source` of a value a caller — here the template — set.
 const SOURCE_USER: &str = "user";
@@ -302,8 +306,35 @@ fn membership(body: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Rule: the update is applied to the live instance — the new group in sync, the instance's own
-/// identity unchanged — and the new group's values are the template's, under `Source` `user`.
+/// Poll Amazon RDS's own read until the instance reports `group` with `apply_status`, and
+/// answer the instance report it settled on.
+async fn awaited_membership(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    group: &str,
+    apply_status: &str,
+) -> String {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let (_, body) = described_instance(router, case, identifier).await;
+        if membership(&body)
+            .is_some_and(|(reported, status)| reported == group && status == apply_status)
+        {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: Amazon RDS never reported {group} {apply_status} on {identifier}; \
+             last answer: {body}"
+        );
+        tokio::time::sleep(LOOK).await;
+    }
+}
+
+/// Rule: the update is applied to the live instance — the new group attached and waiting for
+/// the reboot that puts it in force, the instance's own identity unchanged — and the new
+/// group's values are the template's, under `Source` `user`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cfn_parameter_group_switch_lands_on_the_live_db_instance() {
     for row in ROWS {
@@ -364,25 +395,10 @@ async fn a_cfn_parameter_group_switch_lands_on_the_live_db_instance() {
             "case {case:?}: the update points the instance at another group than the create did"
         );
 
-        // The association becomes observable on Amazon RDS's own read, and settles in sync
-        // because every value group B carries is one applied immediately.
-        let settled_instance = {
-            let deadline = Instant::now() + DEADLINE;
-            loop {
-                let (_, body) = described_instance(&router, case, &identifier).await;
-                if membership(&body)
-                    .is_some_and(|(group, status)| group == group_b && status == IN_SYNC)
-                {
-                    break body;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "case {case:?}: Amazon RDS never reported {group_b} in sync on \
-                     {identifier}; last answer: {body}"
-                );
-                tokio::time::sleep(LOOK).await;
-            }
-        };
+        // The association becomes observable on Amazon RDS's own read, where it waits for the
+        // reboot that applies it — the switch itself reboots nothing.
+        let settled_instance =
+            awaited_membership(&router, case, &identifier, &group_b, PENDING_REBOOT).await;
 
         // An in-place update, not a replacement: the identity Amazon RDS minted survives it.
         let updated_resource_id = element(&settled_instance, "DbiResourceId");
@@ -391,6 +407,21 @@ async fn a_cfn_parameter_group_switch_lands_on_the_live_db_instance() {
             "case {case:?}: an in-place parameter-group change must leave the instance's \
              resource id alone, got {updated_resource_id:?} after {created_resource_id:?}"
         );
+
+        // And the reboot the client issues is what puts the association in force, which is the
+        // convergence a deployment waits on.
+        let (status, rebooted) = rds(
+            &router,
+            "RebootDBInstance",
+            &[("DBInstanceIdentifier", &identifier)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected Amazon RDS to accept the reboot, got {status} with \
+             {rebooted}"
+        );
+        awaited_membership(&router, case, &identifier, &group_b, IN_SYNC).await;
 
         // And the group the instance now runs carries the values the template declared, under
         // the source of a value a caller set.

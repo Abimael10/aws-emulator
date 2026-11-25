@@ -251,7 +251,7 @@ pub struct DbInstanceRecord {
     /// `ModifyDBInstance$DBParameterGroupName` is the rule: "the parameter group name itself
     /// is changed immediately, but the actual parameter changes are not applied until you
     /// reboot the instance without failover" — so the switch is a change the group's
-    /// membership reports until that reboot happens
+    /// membership reports until the engine comes up again
     /// ([`Self::parameter_apply_status`]), and the attach itself takes the span every
     /// transition this service owes takes. `None` for an instance whose group nothing has
     /// switched since its engine last came up, which has no such change to apply.
@@ -456,8 +456,13 @@ impl DbInstanceRecord {
                 // service": the engine's new run begins when that outage is OVER, not when
                 // the reboot was accepted, so a parameter change the reboot applies is
                 // still waiting for it while the instance is out
-                // ([`Self::parameter_apply_status`]).
-                if self.status == DB_INSTANCE_STATUS_REBOOTING {
+                // ([`Self::parameter_apply_status`]). A STARTING instance is the same instant
+                // read the other way round — a stopped instance's engine was not running, and
+                // the run it starts begins when the instance is back in service — so both
+                // transitions bring the engine up here and nowhere else.
+                if self.status == DB_INSTANCE_STATUS_REBOOTING
+                    || self.status == DB_INSTANCE_STATUS_STARTING
+                {
                     self.restart_engine();
                 }
                 self.status = status;
@@ -545,6 +550,10 @@ impl DbInstanceRecord {
     /// is the group a modification switched the instance to — "the actual parameter changes
     /// are not applied until you reboot the instance without failover"
     /// ([`Self::parameter_apply_status`]), and this is that reboot having happened.
+    ///
+    /// Called where an instance comes back INTO SERVICE, which is the instant its engine is
+    /// running again: the settle that ends a reboot's momentary outage and the one that ends a
+    /// start ([`Self::settle`]), never when either call was merely accepted.
     pub fn restart_engine(&mut self) {
         self.engine_started_at = now_as_wire_timestamp();
         self.db_parameter_group_attached_at = None;
@@ -555,8 +564,8 @@ impl DbInstanceRecord {
     /// `ModifyDBInstance$DBParameterGroupName`: "The parameter group name itself is changed
     /// immediately, but the actual parameter changes are not applied until you reboot the
     /// instance without failover." So the attach is owed the span every transition this
-    /// service owes takes, and what the membership rests at after that is decided by the
-    /// values the new group carries ([`Self::parameter_apply_status`] reports both halves).
+    /// service owes takes, and the association then waits for the reboot that applies it,
+    /// whatever the new group holds ([`Self::parameter_apply_status`] reports both halves).
     pub fn switch_db_parameter_group(&mut self, name: String) {
         if self.db_parameter_group_name.as_deref() == Some(name.as_str()) {
             // The group the instance is already in: nothing is attached and nothing waits
@@ -704,11 +713,16 @@ impl DbInstanceRecord {
     /// `ModifyDBInstance$DBParameterGroupName` is the first rule: when a modification moves
     /// the instance to another group, "the parameter group name itself is changed immediately,
     /// but the actual parameter changes are not applied until you reboot the instance without
-    /// failover" — so while RDS is still attaching that group the membership is `applying`,
-    /// and what it rests at once attached is decided by what the newly associated group
-    /// carries over ([`Self::switch_waits_for_a_reboot`]): `in-sync` where every value it sets
-    /// is one applied immediately, `pending-reboot` otherwise, until the engine comes up again
-    /// ([`Self::switch_db_parameter_group`], [`Self::restart_engine`]).
+    /// failover. In this case, the DB instance isn't rebooted automatically, and the parameter
+    /// changes aren't applied during the next maintenance window" — so while RDS is attaching
+    /// that group the membership is `applying`, and once attached it is `pending-reboot` for
+    /// as long as the association is one this instance's engine has not come up under, WHATEVER
+    /// the newly associated group carries: the reboot is what puts the group in force, so
+    /// nothing short of one synchronizes the change ([`Self::switch_db_parameter_group`],
+    /// [`Self::restart_engine`]). The "however, if you modify dynamic parameters in the newly
+    /// associated DB parameter group, these changes are applied immediately without a reboot"
+    /// that follows is about a later change to a VALUE of that group, which is the second rule
+    /// below — it does not apply the association itself.
     ///
     /// `ModifyDBParameterGroup` is the second rule, for the group an instance is already in:
     /// "changes to dynamic parameters are applied immediately" while "changes to static
@@ -725,13 +739,10 @@ impl DbInstanceRecord {
         db_parameter_group: Option<&DbParameterGroupRecord>,
     ) -> &'static str {
         if let Some(attached_at) = self.db_parameter_group_attached_at {
-            if Instant::now() < attached_at {
-                return PARAMETER_APPLY_STATUS_APPLYING;
-            }
-            return if Self::switch_waits_for_a_reboot(db_parameter_group) {
-                PARAMETER_APPLY_STATUS_PENDING_REBOOT
+            return if Instant::now() < attached_at {
+                PARAMETER_APPLY_STATUS_APPLYING
             } else {
-                MEMBERSHIP_IN_SYNC
+                PARAMETER_APPLY_STATUS_PENDING_REBOOT
             };
         }
         let pending = db_parameter_group.is_some_and(|group| {
@@ -745,30 +756,6 @@ impl DbInstanceRecord {
         } else {
             MEMBERSHIP_IN_SYNC
         }
-    }
-
-    /// Whether the switch that attached the group `db_parameter_group` is still waiting for
-    /// the reboot documented for it.
-    ///
-    /// `ModifyDBInstance$DBParameterGroupName` states both halves: "the actual parameter
-    /// changes are not applied until you reboot the instance without failover", and then "if
-    /// you modify dynamic parameters in the newly associated DB parameter group, these changes
-    /// are applied immediately without a reboot". So what a switch carries over decides it: a
-    /// group whose values are ALL applied immediately has nothing left for a reboot to do and
-    /// the membership is in sync as soon as the group is attached, while a group holding a
-    /// value whose change needs one ([`setting_waits_for_a_reboot`]) waits for it. A group
-    /// that sets no value of its own carries no immediately applied change either: it leaves
-    /// the engine to read the group it has been moved to when it next starts, so that
-    /// membership waits as well.
-    fn switch_waits_for_a_reboot(db_parameter_group: Option<&DbParameterGroupRecord>) -> bool {
-        let Some(group) = db_parameter_group else {
-            return true;
-        };
-        group.parameters.is_empty()
-            || group
-                .parameters
-                .iter()
-                .any(|(name, setting)| setting_waits_for_a_reboot(group, name, setting))
     }
 
     /// `OptionGroupMembership$Status`: "the status of the DB instance's option group

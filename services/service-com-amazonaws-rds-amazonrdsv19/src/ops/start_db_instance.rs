@@ -337,9 +337,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
             DB_INSTANCE_STATUS_AVAILABLE,
         ));
-        // A stopped instance's engine was not running; starting it starts the engine's run
-        // again, which is what `pg_postmaster_start_time()` reports on the data plane.
-        record.engine_started_at = crate::state::now_as_wire_timestamp();
+        // A stopped instance's engine was not running, and the run that starts here begins
+        // when the instance is back IN SERVICE rather than when this call was accepted: the
+        // settle that makes it `available` is what brings the engine up, applying a parameter
+        // group association that was waiting for it
+        // ([`crate::state::DbInstanceRecord::restart_engine`]).
         // And the reservation the request named, resolved above, is the one the instance
         // uses from now on; a start that named none leaves the association it already had.
         if let Some(reservation) = capacity_reservation {

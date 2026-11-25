@@ -4,30 +4,28 @@
 //!
 //! The rule under test: `ModifyDBInstance$DBParameterGroupName` — "the parameter group name
 //! itself is changed immediately, but the actual parameter changes are not applied until you
-//! reboot the instance without failover. … However, if you modify dynamic parameters in the
-//! newly associated DB parameter group, these changes are applied immediately without a
-//! reboot". So a modification that moves an instance to ANOTHER group reports that group's
-//! membership `applying` while RDS attaches it, and where it rests once attached is decided by
-//! what the newly associated group carries over:
+//! reboot the instance without failover. In this case, the DB instance isn't rebooted
+//! automatically, and the parameter changes aren't applied during the next maintenance
+//! window". So a modification that moves an instance to ANOTHER group reports that group's
+//! membership `applying` while RDS attaches it and then `pending-reboot` for as long as the
+//! association is one the instance's engine has not come up under — whatever that group
+//! carries, since the reboot is what puts it in force:
 //!
-//! * every value it sets is one applied immediately (a dynamic parameter the caller asked no
-//!   reboot for) — nothing is left for a reboot to do, so the membership is `in-sync`;
-//! * it sets a value whose change needs a reboot — a static parameter, or one the caller asked
-//!   to apply `pending-reboot` — so the membership rests at `pending-reboot` until the engine
-//!   comes up again, the reboot response included, because the engine restarts when the
-//!   momentary outage is over and not when the reboot was accepted, and is `in-sync` once the
-//!   instance is back `available`;
-//! * it sets nothing at all, so the switch carries no immediately applied change either and
-//!   the membership waits for the engine to read the new group when it next starts.
+//! * the reboot response itself still reports `pending-reboot`, because the engine restarts
+//!   when the momentary outage is over and not when the reboot was accepted;
+//! * once the instance is back `available` the membership is `in-sync`.
 //!
 //! A modification that names the group the instance is ALREADY in changes nothing, so its
 //! membership stays in sync.
 //!
 //! The rows span what the rule generalises over: two engine families with their own parameter
-//! group families, a group created empty, a group carrying one dynamic value, two dynamic
-//! values, a static value, and a dynamic value the request asked to apply at the next reboot —
-//! and the no-op re-naming of the group already in effect. Every wait is a poll for the
-//! CONDITION the client waits on, through the shared poll loop.
+//! group families, and the contents of the group switched to — created empty, carrying one
+//! dynamic value, two dynamic values, a static value, a dynamic and a static value together,
+//! and a dynamic value the request asked to apply at the next reboot — none of which changes
+//! where the membership rests. Beside them, the no-op re-naming of the group already in
+//! effect, and a dynamic value modified in the newly associated group BEFORE the reboot, which
+//! "applied immediately without a reboot" does not synchronize the association. Every wait is
+//! a poll for the CONDITION the client waits on, through the shared poll loop.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so each assertion
 //! reads the XML this emulator itself answered with.
@@ -55,8 +53,9 @@ const SOURCE_USER: &str = "user";
 /// switch; the method is omitted where the row leaves it to the parameter's apply type.
 type Setting = (&'static str, &'static str, Option<&'static str>);
 
-/// One row: the instance, the group it is switched to, what that group holds, and where the
-/// membership rests once the group is attached.
+/// One row: the instance, the group it is switched to, and what that group holds — which is
+/// what the rule generalises over, since the switched association waits for the reboot either
+/// way.
 struct SwitchCase {
     case: &'static str,
     identifier: &'static str,
@@ -69,8 +68,6 @@ struct SwitchCase {
     family: &'static str,
     /// The values the group is given before the switch.
     settings: &'static [Setting],
-    /// The `ParameterApplyStatus` the membership rests at once the group is attached.
-    attached: &'static str,
 }
 
 const SWITCH_CASES: &[SwitchCase] = &[
@@ -82,7 +79,6 @@ const SWITCH_CASES: &[SwitchCase] = &[
         group: "emu-pgswitch-empty-group",
         family: "postgres18",
         settings: &[],
-        attached: PENDING_REBOOT,
     },
     SwitchCase {
         case: "a postgres instance switched to a group carrying a static parameter",
@@ -94,7 +90,6 @@ const SWITCH_CASES: &[SwitchCase] = &[
         // A static parameter: one that "requires a reboot ... before the change can take
         // effect", which is the change this switch carries over.
         settings: &[("shared_buffers", "16384", Some(PENDING_REBOOT))],
-        attached: PENDING_REBOOT,
     },
     SwitchCase {
         case: "a postgres instance switched to a group carrying one dynamic parameter",
@@ -104,12 +99,11 @@ const SWITCH_CASES: &[SwitchCase] = &[
         group: "emu-pgswitch-dynamic-group",
         family: "postgres18",
         // A dynamic parameter, left to its own apply type: "changes to dynamic parameters are
-        // applied immediately", so this switch leaves nothing for a reboot
-        // (`smithy_query(query="doc", shape="ModifyDBInstanceMessage",
-        // member="DBParameterGroupName")`; the apply type is the family's published one,
-        // `DescribeEngineDefaultParameters`).
+        // applied immediately" for a change made to the group an instance already runs, which
+        // is not what a SWITCH is (`smithy_query(query="doc",
+        // shape="ModifyDBInstanceMessage", member="DBParameterGroupName")`; the apply type is
+        // the family's published one, `DescribeEngineDefaultParameters`).
         settings: &[("log_min_duration_statement", "1000", None)],
-        attached: IN_SYNC,
     },
     SwitchCase {
         case: "a mysql instance switched to an empty group of its family",
@@ -119,7 +113,6 @@ const SWITCH_CASES: &[SwitchCase] = &[
         group: "emu-myswitch-empty-group",
         family: "mysql8.0",
         settings: &[],
-        attached: PENDING_REBOOT,
     },
     SwitchCase {
         case: "a mysql instance switched to a group carrying two dynamic parameters",
@@ -132,7 +125,6 @@ const SWITCH_CASES: &[SwitchCase] = &[
             ("auto_increment_increment", "2", None),
             ("autocommit", "0", None),
         ],
-        attached: IN_SYNC,
     },
     SwitchCase {
         case: "a mysql instance switched to a group carrying a dynamic and a static parameter",
@@ -147,7 +139,6 @@ const SWITCH_CASES: &[SwitchCase] = &[
             ("auto_increment_increment", "2", None),
             ("back_log", "1024", None),
         ],
-        attached: PENDING_REBOOT,
     },
     SwitchCase {
         case: "a mysql instance switched to a group whose dynamic value awaits a reboot",
@@ -159,7 +150,6 @@ const SWITCH_CASES: &[SwitchCase] = &[
         // A dynamic parameter the CALLER asked to apply at the next reboot, which is what
         // `Parameter$ApplyMethod` is for: the value waits whatever its apply type says.
         settings: &[("auto_increment_increment", "2", Some(PENDING_REBOOT))],
-        attached: PENDING_REBOOT,
     },
 ];
 
@@ -307,7 +297,7 @@ async fn assert_group_reports_its_values(router: &MultiServiceRouter, row: &Swit
 }
 
 #[tokio::test]
-async fn a_parameter_group_switch_rests_where_the_values_it_carries_put_it() {
+async fn a_parameter_group_switch_waits_for_the_reboot_that_applies_it() {
     let router = emulator();
 
     for row in SWITCH_CASES {
@@ -345,13 +335,15 @@ async fn a_parameter_group_switch_rests_where_the_values_it_carries_put_it() {
             row.case
         );
 
-        // Once attached, the membership rests where the values the group carries put it.
-        let settled = await_apply_status(&router, row, row.attached).await;
+        // Once attached, the association waits for the reboot that applies it, whatever the
+        // group carries.
+        let settled = await_apply_status(&router, row, PENDING_REBOOT).await;
         let status = apply_status(row.case, "describe", &settled);
         assert_eq!(
-            status, row.attached,
-            "case {:?}: expected the attached group to rest at {:?}, got {status:?}",
-            row.case, row.attached
+            status, PENDING_REBOOT,
+            "case {:?}: expected the attached group to rest at {PENDING_REBOOT:?}, got \
+             {status:?}",
+            row.case
         );
         let reported = optional_text(&settled, "DBParameterGroupName");
         assert_eq!(
@@ -371,10 +363,6 @@ async fn a_parameter_group_switch_rests_where_the_values_it_carries_put_it() {
         );
         // And the group reports the values the switch put the instance on.
         assert_group_reports_its_values(&router, row).await;
-
-        if row.attached != PENDING_REBOOT {
-            continue;
-        }
 
         // The reboot answers with the instance going out of service, still carrying the
         // change it is the reboot that applies.
@@ -449,5 +437,138 @@ async fn naming_the_group_an_instance_is_already_in_changes_nothing() {
         status, IN_SYNC,
         "case {case:?}: naming the group the instance is already in attaches nothing, so the \
          membership stays {IN_SYNC:?}, got {status:?}"
+    );
+}
+
+/// The row whose `case` is `named`, so a test that drives ONE row names the row it means rather
+/// than its position in the table.
+fn row_named(named: &str) -> &'static SwitchCase {
+    SWITCH_CASES
+        .iter()
+        .find(|row| row.case == named)
+        .unwrap_or_else(|| panic!("the table must carry the row {named:?}"))
+}
+
+/// Switch the row's instance to its group and wait until the association is attached and
+/// waiting for the reboot, which is where every switch rests.
+async fn switch_to_the_group(router: &MultiServiceRouter, row: &SwitchCase) {
+    expect_ok(
+        row.case,
+        call(
+            router,
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", row.identifier),
+                ("DBParameterGroupName", row.group),
+            ],
+        )
+        .await,
+    );
+    await_apply_status(router, row, PENDING_REBOOT).await;
+}
+
+#[tokio::test]
+async fn modifying_a_dynamic_value_of_the_newly_associated_group_does_not_apply_it() {
+    let router = emulator();
+    // The mysql row whose group carries two dynamic values, so the value modified below is
+    // one "applied immediately without a reboot" and the association around it is still not.
+    let row = row_named("a mysql instance switched to a group carrying two dynamic parameters");
+    let case = "a dynamic value modified in the newly associated group";
+    provision(&router, row).await;
+    switch_to_the_group(&router, row).await;
+
+    expect_ok(
+        case,
+        call(
+            &router,
+            "ModifyDBParameterGroup",
+            &[
+                ("DBParameterGroupName", row.group),
+                ("Parameters.Parameter.1.ParameterName", "autocommit"),
+                ("Parameters.Parameter.1.ParameterValue", "1"),
+                ("Parameters.Parameter.1.ApplyMethod", "immediate"),
+            ],
+        )
+        .await,
+    );
+    let (_, body) = read_instance(&router, row.identifier).await;
+    let status = apply_status(case, "describe", &the_instance(case, &body));
+    assert_eq!(
+        status, PENDING_REBOOT,
+        "case {case:?}: a value applied immediately does not apply the association itself, so \
+         the membership stays {PENDING_REBOOT:?}, got {status:?}"
+    );
+
+    // The reboot is still what applies it.
+    expect_ok(
+        case,
+        call(
+            &router,
+            "RebootDBInstance",
+            &[("DBInstanceIdentifier", row.identifier)],
+        )
+        .await,
+    );
+    let back = await_apply_status(&router, row, IN_SYNC).await;
+    let status = apply_status(case, "post-reboot describe", &back);
+    assert_eq!(
+        status, IN_SYNC,
+        "case {case:?}: the reboot applies the association, so the membership is in sync, got \
+         {status:?}"
+    );
+}
+
+#[tokio::test]
+async fn starting_a_stopped_instance_applies_the_group_a_switch_attached() {
+    let router = emulator();
+    // The postgres row switched to an empty group: the engine coming up is what reads the
+    // group it was moved to, whichever call brought it up.
+    let row = row_named("a postgres instance switched to an empty group of its family");
+    let case = "a switched group applied by the start of a stopped instance";
+    provision(&router, row).await;
+    switch_to_the_group(&router, row).await;
+
+    expect_ok(
+        case,
+        call(
+            &router,
+            "StopDBInstance",
+            &[("DBInstanceIdentifier", row.identifier)],
+        )
+        .await,
+    );
+    // A stop retains "the DB instance's metadata, including its endpoint, DB parameter group,
+    // and option group membership", and the association it stopped with is still unapplied.
+    let (stopped, _) = poll_until(
+        case,
+        "the instance reaching stopped",
+        || read_instance(&router, row.identifier),
+        |status, body| {
+            status == 200 && optional_text(body, "DBInstanceStatus").as_deref() == Some("stopped")
+        },
+    )
+    .await;
+    let status = apply_status(case, "stopped describe", &the_instance(case, &stopped));
+    assert_eq!(
+        status, PENDING_REBOOT,
+        "case {case:?}: a stop applies nothing, so the switched group still reports \
+         {PENDING_REBOOT:?}, got {status:?}"
+    );
+
+    expect_ok(
+        case,
+        call(
+            &router,
+            "StartDBInstance",
+            &[("DBInstanceIdentifier", row.identifier)],
+        )
+        .await,
+    );
+    let started = await_apply_status(&router, row, IN_SYNC).await;
+    let status = apply_status(case, "started describe", &started);
+    assert_eq!(
+        status, IN_SYNC,
+        "case {case:?}: the engine comes up under the group it was moved to, so the \
+         membership is {IN_SYNC:?}, got {status:?}"
     );
 }
