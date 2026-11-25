@@ -41,14 +41,28 @@ const MAX_LIMIT: usize = 50;
 const DESTINATION_TYPES: [&str; 4] = ["CWL", "FH", "S3", "XRAY"];
 
 /// The `OutputFormat`s the operation publishes for each destination type: a destination that
-/// receives log RECORDS takes the two per-record renderings, whether it stores one record for
-/// each delivered item or receives a stream of them, and a delivery that WRITES OBJECTS takes
-/// those plus the two file layouts — the headed text file and the columnar one, both properties
-/// of a file rather than of a record. The X-Ray trace destination receives spans as structured
-/// documents.
+/// STORES each delivered record as its own item takes the two per-record renderings, one that
+/// receives a STREAM of records takes those plus the record as the sender sent it, and a delivery
+/// that WRITES OBJECTS takes the per-record renderings plus the two file layouts — the headed
+/// text file and the columnar one, both properties of a file rather than of a record. The X-Ray
+/// trace destination is published no template at all, so it publishes no renderings either.
 const RECORD_DESTINATION_FORMATS: [&str; 2] = ["plain", "json"];
+const STREAM_DESTINATION_FORMATS: [&str; 3] = ["plain", "json", "raw"];
 const OBJECT_DESTINATION_FORMATS: [&str; 4] = ["plain", "json", "w3c", "parquet"];
-const TRACE_DESTINATION_FORMATS: [&str; 1] = ["json"];
+
+/// The destination type that receives TRACES rather than a record of fields, as the model's
+/// enum spells it.
+const TRACE_DESTINATION_TYPE: &str = "XRAY";
+
+/// The destination type that receives a stream of records, and the one that writes objects, as
+/// the model's `DeliveryDestinationType` enum spells them.
+const STREAM_DESTINATION_TYPE: &str = "FH";
+const OBJECT_DESTINATION_TYPE: &str = "S3";
+
+/// The log sources whose sender publishes NO COLUMNAR file layout for its delivered objects —
+/// (service, log type) — and the rendering such a sender's object template therefore leaves out.
+const SOURCES_WITHOUT_COLUMNAR_OBJECTS: [(&str, &str); 1] = [("codewhisperer", "EVENT_LOGS")];
+const COLUMNAR_FORMAT: &str = "parquet";
 
 /// The field delimiters the operation publishes for a delivery that delivers in a delimited
 /// format, and the one a template defaults to: `FieldDelimiter` is modelled `@length 0..5`, so
@@ -75,7 +89,25 @@ type Schema = &'static [(&'static str, bool)];
 /// that will be delivered when a list of record fields is not provided", so the default list is
 /// the allowed fields less these — except a mandatory one, which "must be present in the
 /// recordFields parameter" and so is always delivered.
+///
+/// Which of its fields a sender leaves out is published per log source, so a sender that
+/// publishes a list of its own is named beside it: the CodeWhisperer customization sender leaves
+/// out the identifier of the customization, the variable it also publishes for an S3 suffix path.
 const FIELDS_NOT_DELIVERED_BY_DEFAULT: [&str; 2] = ["timestamp", "resource_id"];
+const SOURCES_WITH_THEIR_OWN_UNDELIVERED_FIELDS: [(&str, &str, &[&str]); 1] = [(
+    "codewhisperer",
+    "EVENT_LOGS",
+    &["timestamp", "customization_id"],
+)];
+
+/// The fields a log source leaves out of its default record field list: the ones every sender
+/// does, unless that sender publishes a list of its own.
+fn undelivered_fields(service: &str, log_type: &str) -> &'static [&'static str] {
+    SOURCES_WITH_THEIR_OWN_UNDELIVERED_FIELDS
+        .iter()
+        .find(|(sender, sent, _fields)| *sender == service && *sent == log_type)
+        .map_or(&FIELDS_NOT_DELIVERED_BY_DEFAULT, |(_, _, fields)| *fields)
+}
 
 struct Row {
     service: &'static str,
@@ -105,20 +137,21 @@ const ROWS: &[Row] = &[
             ("message", true),
         ],
     },
-    // The same envelope, published by another sender of it: one kind of resource, one log type.
+    // A sender that publishes its OWN record rather than that envelope: the instant of the
+    // event, the sending resource, the severity and the message are the record a delivery may
+    // not drop, while the record's own ingestion timestamp and the identifier of the
+    // customization are allowed around it.
     Row {
         service: "codewhisperer",
         resource_type: "customization",
         log_type: "EVENT_LOGS",
         schema: &[
             ("timestamp", false),
-            ("resource_arn", false),
-            ("resource_id", false),
-            ("event_timestamp", false),
-            ("log_level", false),
-            ("operation", false),
-            ("request_id", false),
-            ("message", true),
+            ("event_timestamp", true),
+            ("resource_id", true),
+            ("customization_id", false),
+            ("log_level", true),
+            ("event_message", true),
         ],
     },
     Row {
@@ -184,7 +217,6 @@ const ROWS: &[Row] = &[
         schema: &[
             ("timestamp", false),
             ("resource_arn", false),
-            ("resource_id", false),
             ("message_timestamp_ms", false),
             ("subscriber_name", false),
             ("request_id", false),
@@ -248,13 +280,14 @@ const ROWS: &[Row] = &[
             ("spanId", false),
         ],
     },
-    // A fixed-shape load-balancer line.
+    // A fixed-shape load-balancer line: the connection-log entry format of an Application Load
+    // Balancer, every field mandatory.
     Row {
         service: "elasticloadbalancing",
         resource_type: "loadbalancer",
         log_type: "ALB_CONNECTION_LOGS",
         schema: &[
-            ("time", true),
+            ("timestamp", true),
             ("client_ip", true),
             ("client_port", true),
             ("listener_port", true),
@@ -265,6 +298,8 @@ const ROWS: &[Row] = &[
             ("leaf_client_cert_validity", true),
             ("leaf_client_cert_serial_number", true),
             ("tls_verify_status", true),
+            ("choosen_cert_serial", true),
+            ("choosen_cert_arn", true),
             ("conn_trace_id", true),
         ],
     },
@@ -404,11 +439,10 @@ async fn every_log_source_publishes_its_own_record_schema() {
                 .get("defaultDeliveryConfigValues")
                 .unwrap_or_else(|| panic!("case {case}: a template carries defaultDeliveryConfigValues, got {template}"));
             let default_fields = strings(defaults, "recordFields", &case);
+            let undelivered = undelivered_fields(row.service, row.log_type);
             let delivered: Vec<String> = expected
                 .iter()
-                .filter(|(name, mandatory)| {
-                    *mandatory || !FIELDS_NOT_DELIVERED_BY_DEFAULT.contains(&name.as_str())
-                })
+                .filter(|(name, mandatory)| *mandatory || !undelivered.contains(&name.as_str()))
                 .map(|(name, _mandatory)| name.clone())
                 .collect();
             assert_eq!(
@@ -483,13 +517,20 @@ async fn the_packaging_a_template_publishes_follows_from_its_destination_type() 
             .and_then(Value::as_array)
             .unwrap_or_else(|| panic!("the response carries configurationTemplates, got {response}"))
             .clone();
+        if destination_type == TRACE_DESTINATION_TYPE {
+            assert!(
+                page.is_empty(),
+                "case {destination_type}: the trace destination is published no template, got {page:?}"
+            );
+            continue;
+        }
         assert!(
             !page.is_empty(),
-            "case {destination_type}: every destination type the model names has templates, got none"
+            "case {destination_type}: every destination type that receives a record has templates, got none"
         );
         let expected_formats: Vec<String> = match destination_type {
-            "XRAY" => TRACE_DESTINATION_FORMATS.iter(),
-            "S3" => OBJECT_DESTINATION_FORMATS.iter(),
+            OBJECT_DESTINATION_TYPE => OBJECT_DESTINATION_FORMATS.iter(),
+            STREAM_DESTINATION_TYPE => STREAM_DESTINATION_FORMATS.iter(),
             _ => RECORD_DESTINATION_FORMATS.iter(),
         }
         .map(|format| (*format).to_string())
@@ -498,10 +539,6 @@ async fn the_packaging_a_template_publishes_follows_from_its_destination_type() 
             .iter()
             .map(|delimiter| (*delimiter).to_string())
             .collect();
-        // A delimited rendering is on offer at every destination that receives records and at
-        // the one that writes objects, so the delimiters to choose from are published there too;
-        // the trace destination takes the structured rendering alone.
-        let delimited = destination_type != "XRAY";
 
         for template in &page {
             let case = format!("{destination_type} template {template}");
@@ -521,6 +558,23 @@ async fn the_packaging_a_template_publishes_follows_from_its_destination_type() 
             ));
             let expected_formats: Vec<String> = if document_record {
                 vec![DOCUMENT_RECORD_FORMAT.to_string()]
+            } else if SOURCES_WITHOUT_COLUMNAR_OBJECTS.contains(&(
+                template
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                template
+                    .get("logType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )) {
+                // A sender that publishes no columnar file layout for its delivered objects:
+                // every other rendering its destination can store is on offer.
+                expected_formats
+                    .iter()
+                    .filter(|format| *format != COLUMNAR_FORMAT)
+                    .cloned()
+                    .collect()
             } else {
                 expected_formats.clone()
             };
@@ -537,26 +591,22 @@ async fn the_packaging_a_template_publishes_follows_from_its_destination_type() 
                 .and_then(|defaults| defaults.get("fieldDelimiter"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-            if delimited {
-                assert_eq!(
-                    delimiters.as_deref(),
-                    Some(expected_delimiters.as_slice()),
-                    "case {case}: expected the delimiters {expected_delimiters:?}, got {delimiters:?}"
-                );
-                // The DEFAULT is published with them, and it is the same for every template:
-                // no delimiter at all, which `FieldDelimiter` (`@length 0..5`) admits. A
-                // caller that wants one of the delimiters above states it on the delivery.
-                assert_eq!(
-                    default_delimiter.as_deref(),
-                    Some(DEFAULT_FIELD_DELIMITER),
-                    "case {case}: expected the default delimiter {DEFAULT_FIELD_DELIMITER:?}, got {default_delimiter:?}"
-                );
-            } else {
-                assert!(
-                    delimiters.is_none() && default_delimiter.is_none(),
-                    "case {case}: a destination that takes no delimited format publishes no delimiter to choose from and none to default to, got {delimiters:?} and {default_delimiter:?}"
-                );
-            }
+            // A delimited rendering is on offer at every destination that receives records and
+            // at the one that writes objects, so the delimiters to choose from are published
+            // there too.
+            assert_eq!(
+                delimiters.as_deref(),
+                Some(expected_delimiters.as_slice()),
+                "case {case}: expected the delimiters {expected_delimiters:?}, got {delimiters:?}"
+            );
+            // The DEFAULT is published with them, and it is the same for every template:
+            // no delimiter at all, which `FieldDelimiter` (`@length 0..5`) admits. A
+            // caller that wants one of the delimiters above states it on the delivery.
+            assert_eq!(
+                default_delimiter.as_deref(),
+                Some(DEFAULT_FIELD_DELIMITER),
+                "case {case}: expected the default delimiter {DEFAULT_FIELD_DELIMITER:?}, got {default_delimiter:?}"
+            );
         }
     }
 }

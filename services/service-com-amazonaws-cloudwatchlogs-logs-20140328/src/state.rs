@@ -1971,8 +1971,12 @@ pub use vended_log_templates::{
 ///
 /// One service sends the log types of EVERY row the catalogue holds for it — a service has one
 /// row per kind of resource, and a log type one of its resources sends is one that service
-/// sends — listed in the order the catalogue states them and without repeating a type two of
-/// its rows share.
+/// sends — without repeating a type two of its rows share, and listed in the order the `logType`
+/// member's own catalogue names them ([`VENDED_LOG_TYPES`], read as one list across every
+/// sender). That order is the member's rather than the order
+/// [`CONFIGURATION_TEMPLATE_SOURCES`] publishes this service's rows in, because this list is
+/// what a refusal states as the options a sending service supports, which is a statement about
+/// the member's catalogue.
 pub fn delivery_source_log_types(resource_arn: &str) -> Option<Vec<&'static str>> {
     let service = delivery_source_service(resource_arn)?;
     let mut published: Vec<&'static str> = Vec::new();
@@ -1986,6 +1990,12 @@ pub fn delivery_source_log_types(resource_arn: &str) -> Option<Vec<&'static str>
             }
         }
     }
+    published.sort_by_key(|log_type| {
+        VENDED_LOG_TYPES
+            .iter()
+            .position(|named| named == log_type)
+            .unwrap_or(VENDED_LOG_TYPES.len())
+    });
     (!published.is_empty()).then_some(published)
 }
 

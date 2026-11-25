@@ -36,11 +36,12 @@ const VALIDATION: &str = "ValidationException";
 
 /// The `DeliveryDestinationType`s the model's enum names
 /// (`smithy_query(query="shape",shape="DeliveryDestinationType")`), the one of them that
-/// receives traces rather than log records, and the order the enum DECLARES them in — which is
-/// the order one log type's templates are published in.
+/// receives traces rather than log records — which the catalogue publishes no template for,
+/// because a template states the valid and default values of a RECORD delivery — and the order
+/// the enum DECLARES the rest in, which is the order one log type's templates are published in.
 const DESTINATION_TYPES: [&str; 4] = ["CWL", "FH", "S3", "XRAY"];
 const TRACE_DESTINATION_TYPE: &str = "XRAY";
-const DESTINATION_TYPE_ORDER: [&str; 4] = ["S3", "CWL", "FH", "XRAY"];
+const DESTINATION_TYPE_ORDER: [&str; 3] = ["S3", "CWL", "FH"];
 
 /// The `OutputFormat`s the model's enum names
 /// (`smithy_query(query="shape",shape="OutputFormat")`).
@@ -75,7 +76,22 @@ const SUFFIX_PATH_TIME_FIELDS: [&str; 4] = ["yyyy", "MM", "dd", "HH"];
 /// that will be delivered when a list of record fields is not provided", so the default list is
 /// the allowed fields less these — except a mandatory one, which "must be present in the
 /// recordFields parameter" and so is always delivered.
+///
+/// Which of its fields a sender leaves out is published per log source, so a sender that
+/// publishes a list of its own is named beside it: the CodeWhisperer customization sender leaves
+/// out the identifier of the customization, the variable it also publishes for an S3 suffix
+/// path.
 const FIELDS_NOT_DELIVERED_BY_DEFAULT: [&str; 2] = ["timestamp", "resource_id"];
+const SOURCES_WITH_THEIR_OWN_UNDELIVERED_FIELDS: [(&str, &str, &[&str]); 1] = [(
+    "codewhisperer",
+    "EVENT_LOGS",
+    &["timestamp", "customization_id"],
+)];
+
+/// The log sources whose sender publishes NO COLUMNAR file layout for its delivered objects —
+/// (service, log type) — so an S3 template of theirs publishes every other rendering an object
+/// destination can store and not that one.
+const SOURCES_WITHOUT_COLUMNAR_OBJECTS: [(&str, &str); 1] = [("codewhisperer", "EVENT_LOGS")];
 
 /// The IAM action, without its service prefix, that a template names as the permission a
 /// caller needs "to be able to successfully create a delivery source on the desired resource
@@ -87,15 +103,15 @@ const VENDED_LOGS_DELIVERY_ACTION: &str = "AllowVendedLogDeliveryForResource";
 /// caught instead of agreed with. Each pinned row is
 /// `service|logType|resourceType|deliveryDestinationType`: a CloudFront access log delivered
 /// to S3, a WorkMail access-control log delivered to a log group, an Application Load
-/// Balancer access log delivered to Firehose, an AgentCore trace delivered to X-Ray, a
+/// Balancer access log delivered to Firehose, an AgentCore trace delivered to a stream, a
 /// Security Hub finding log delivered to S3 from each of the two hub resources that send one,
 /// and an Amazon Q Business event log delivered to a log group.
-const CATALOGUE_TEMPLATES: usize = 191;
+const CATALOGUE_TEMPLATES: usize = 180;
 const PINNED_TEMPLATES: [&str; 9] = [
     "cloudfront|ACCESS_LOGS|distribution|S3",
     "workmail|ACCESS_CONTROL_LOGS|organization|CWL",
     "elasticloadbalancing|ALB_ACCESS_LOGS|loadbalancer|FH",
-    "bedrock-agentcore|TRACES|runtime|XRAY",
+    "bedrock-agentcore|TRACES|runtime|FH",
     "apigateway|EXECUTION_LOGS|stages|S3",
     "eks|AUTO_MODE_LOAD_BALANCING_LOGS|cluster|FH",
     "securityhub|SECURITY_FINDING_LOGS|hub|S3",
@@ -145,24 +161,24 @@ fn key_of(template: &Value) -> String {
 ///
 /// DERIVED here from the catalogue data (`CONFIGURATION_TEMPLATE_SOURCES`, whose service and
 /// log-type pairings come from the `logType` member of `PutDeliverySourceRequest`) by the rule
-/// under test: one template per log type per delivery destination type it can be sent to — the
-/// X-Ray trace destination receives a TRACES log type and nothing else, while every log type,
-/// traces included, can be delivered to each destination type that receives records — taken in
-/// the order the model's enum declares the destination types.
+/// under test: one template per log type per delivery destination type that RECEIVES a record,
+/// taken in the order the model's enum declares those destination types. The X-Ray trace
+/// destination is published no template, because a template states the valid and default values
+/// of a record delivery.
 fn catalogue() -> Vec<(String, String)> {
     assert!(
-        DESTINATION_TYPE_ORDER.iter().all(|destination_type| DESTINATION_TYPES.contains(destination_type))
-            && DESTINATION_TYPE_ORDER.len() == DESTINATION_TYPES.len(),
-        "the published order names every destination type the model does, got {DESTINATION_TYPE_ORDER:?}"
+        DESTINATION_TYPE_ORDER
+            .iter()
+            .all(|destination_type| DESTINATION_TYPES.contains(destination_type)
+                && *destination_type != TRACE_DESTINATION_TYPE)
+            && DESTINATION_TYPE_ORDER.len() + 1 == DESTINATION_TYPES.len(),
+        "the published order names every destination type the model does but the trace one, got {DESTINATION_TYPE_ORDER:?}"
     );
     let mut templates: Vec<(String, String)> = Vec::new();
     for source in CONFIGURATION_TEMPLATE_SOURCES {
         for log_type in source.log_types {
             let log_type = log_type.log_type;
             for destination_type in DESTINATION_TYPE_ORDER {
-                if destination_type == TRACE_DESTINATION_TYPE && log_type != TRACE_LOG_TYPE {
-                    continue;
-                }
                 templates.push((
                     format!(
                         "{}|{log_type}|{}|{destination_type}",
@@ -347,8 +363,8 @@ async fn each_filter_selects_what_it_names_and_several_filters_narrow() {
         );
     }
 
-    // Each destination type selects the templates that can be delivered to it, and the trace
-    // destination carries the trace log type alone.
+    // Each destination type that receives a record selects the templates that can be delivered
+    // to it; the trace destination is published no template at all.
     for destination_type in DESTINATION_TYPES {
         let case = format!("destination type {destination_type}");
         let reported = walk(
@@ -358,9 +374,16 @@ async fn each_filter_selects_what_it_names_and_several_filters_narrow() {
             Some(MAX_LIMIT),
         )
         .await;
+        if destination_type == TRACE_DESTINATION_TYPE {
+            assert!(
+                reported.is_empty(),
+                "case {case}: the trace destination is published no template, got {reported:?}"
+            );
+            continue;
+        }
         assert!(
             !reported.is_empty(),
-            "case {case}: every destination type the model names has templates, got none"
+            "case {case}: every destination type that receives a record has templates, got none"
         );
         for template in &reported {
             let key = key_of(template);
@@ -369,13 +392,6 @@ async fn each_filter_selects_what_it_names_and_several_filters_narrow() {
                 destination_type,
                 "case {case}: every selected template is for that destination type, got {key}"
             );
-            if destination_type == TRACE_DESTINATION_TYPE {
-                assert_eq!(
-                    field(&key, 1),
-                    TRACE_LOG_TYPE,
-                    "case {case}: the trace destination receives traces alone, got {key}"
-                );
-            }
         }
     }
 }
@@ -417,32 +433,34 @@ async fn every_template_derives_its_allowed_values_from_its_destination_type() {
         );
 
         // The formats: every one the model names is allowed where the destination can store it
-        // and the record says something in it — the trace destination receives spans as
-        // structured documents, the file layouts apply only where the delivery writes objects,
-        // and a record that IS one document is on offer as that document alone.
+        // and the record says something in it — the file layouts apply only where the delivery
+        // writes objects and its sender publishes them, and a record that IS one document is on
+        // offer as that document alone.
         let formats = strings(template, "allowedOutputFormats", &case);
         assert!(
             !formats.is_empty() && formats.iter().all(|format| OUTPUT_FORMATS.contains(&format.as_str())),
             "case {case}: the allowed formats are a non-empty subset of {OUTPUT_FORMATS:?}, got {formats:?}"
         );
+        assert_ne!(
+            destination_type, TRACE_DESTINATION_TYPE,
+            "case {case}: the trace destination is published no template at all"
+        );
         let document_record = DOCUMENT_RECORD_SOURCES.contains(&(service.as_str(), field(&case, 1)));
-        if destination_type == TRACE_DESTINATION_TYPE {
-            assert_eq!(
-                formats,
-                vec!["json".to_string()],
-                "case {case}: the trace destination receives structured spans alone, got {formats:?}"
-            );
-        } else if document_record {
+        if document_record {
             assert_eq!(
                 formats,
                 vec![DOCUMENT_RECORD_FORMAT.to_string()],
                 "case {case}: a record that is one document is on offer as that document alone, got {formats:?}"
             );
         } else {
+            // The columnar FILE layout needs both an object destination to write the file and a
+            // sender that publishes it for this log type.
+            let columnar = destination_type == "S3"
+                && !SOURCES_WITHOUT_COLUMNAR_OBJECTS.contains(&(service.as_str(), field(&case, 1)));
             assert_eq!(
                 formats.contains(&"parquet".to_string()),
-                destination_type == "S3",
-                "case {case}: the columnar format applies exactly where the delivery writes objects, got {formats:?}"
+                columnar,
+                "case {case}: the columnar format applies where the delivery writes objects and its sender publishes it, got {formats:?}"
             );
             assert!(
                 formats.contains(&"plain".to_string()) && formats.contains(&"json".to_string()),
@@ -586,11 +604,19 @@ async fn every_template_derives_its_allowed_values_from_its_destination_type() {
             );
         }
         let default_fields = strings(defaults, "recordFields", &case);
+        // The fields this sender leaves out of its default list: the ones every sender does,
+        // unless it publishes a list of its own.
+        let undelivered: &[&str] = SOURCES_WITH_THEIR_OWN_UNDELIVERED_FIELDS
+            .iter()
+            .find(|(sender, log_type, _fields)| {
+                *sender == service.as_str() && *log_type == field(&case, 1)
+            })
+            .map_or(&FIELDS_NOT_DELIVERED_BY_DEFAULT, |(_, _, fields)| *fields);
         let expected_defaults: Vec<String> = allowed_fields
             .iter()
             .filter(|field| {
                 field.get("mandatory").and_then(Value::as_bool) == Some(true)
-                    || !FIELDS_NOT_DELIVERED_BY_DEFAULT.contains(&named(field).as_str())
+                    || !undelivered.contains(&named(field).as_str())
             })
             .map(named)
             .collect();

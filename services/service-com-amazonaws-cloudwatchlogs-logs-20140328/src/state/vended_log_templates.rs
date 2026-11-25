@@ -31,7 +31,9 @@
 //!   and its variables) applies. That part is DERIVED from the destination type — except that a
 //!   rendering is only on offer where it says something about the RECORD, so a log type whose
 //!   record is one document narrows them to the document itself
-//!   ([`ConfigurationTemplateLogType::document_record`]).
+//!   ([`ConfigurationTemplateLogType::document_record`]), and a log type whose delivered objects
+//!   the sender publishes no columnar file layout for narrows them by that layout
+//!   ([`ConfigurationTemplateLogType::columnar_objects`]).
 //!
 //! ## Where the rows come from
 //!
@@ -47,7 +49,9 @@
 //! ## The order they are published in
 //!
 //! The catalogue is reported in the order it is stated here — one row per kind of resource,
-//! each row's log types in turn, and for each log type one template per delivery destination
+//! each row's log types in turn — in the order the SENDER publishes them, which is published
+//! data like the rows themselves rather than an ordering of these strings — and for each log
+//! type one template per delivery destination
 //! type in the order the model's `DeliveryDestinationType` enum DECLARES its values
 //! ([`DELIVERY_DESTINATION_TYPE_ORDER`]), the object destination first. The order is published
 //! data rather than anything derived from a template's contents, and it is a total order over
@@ -122,6 +126,23 @@ const HEADED_FILE_OUTPUT_FORMAT: &str = "w3c";
 /// the delivered line, and the record as a structured document.
 const RECORD_OUTPUT_FORMATS: [&str; 2] = [PLAIN_OUTPUT_FORMAT, STRUCTURED_OUTPUT_FORMAT];
 
+/// The `OutputFormat` that carries the record EXACTLY AS THE SENDER SENT IT, rather than as
+/// fields this service names and orders. Spelled as the model's `OutputFormat` enum spells it
+/// ([`crate::ops::types::OUTPUT_FORMAT_VALUES`]); it is one of the renderings a field delimiter
+/// applies to (`allowedFieldDelimiters` is "the valid values that a caller can use as field
+/// delimiters [...] on a delivery that delivers in Plain, W3C, or Raw format").
+const RAW_OUTPUT_FORMAT: &str = "raw";
+
+/// The `OutputFormat`s a delivery to a destination that receives a STREAM of records can be
+/// written in: the two per-record renderings, plus the record as the sender sent it. A stream
+/// destination forwards what it receives, so a delivery to one can also be written as the raw
+/// record, which a destination that STORES each record as its own item cannot say anything in.
+const STREAM_OUTPUT_FORMATS: [&str; 3] = [
+    PLAIN_OUTPUT_FORMAT,
+    STRUCTURED_OUTPUT_FORMAT,
+    RAW_OUTPUT_FORMAT,
+];
+
 /// The `OutputFormat`s a delivery that WRITES OBJECTS can be written in: the per-record
 /// renderings every destination takes, plus the two FILE layouts — the headed text file and the
 /// columnar one. Both of those are properties of a FILE rather than of a record, so they apply
@@ -152,7 +173,12 @@ pub type TemplateField = (&'static str, bool);
 /// two are allowed without being delivered by default. A field a delivery may not drop is
 /// delivered whatever this says, because a mandatory field "must be present in the
 /// recordFields parameter".
-const FIELDS_NOT_DELIVERED_BY_DEFAULT: [&str; 2] = ["timestamp", "resource_id"];
+///
+/// It is the list of a sender that publishes no list of its own; which of its fields a sender
+/// leaves out of the default is published per log type
+/// ([`ConfigurationTemplateLogType::fields_not_delivered_by_default`]), because the sender
+/// decides its record and so also which parts of it a delivery carries by default.
+const FIELDS_NOT_DELIVERED_BY_DEFAULT: &[&str] = &["timestamp", "resource_id"];
 
 /// The fields of the VENDED-LOG ENVELOPE a sender attributes its records with: the record's own
 /// ingestion timestamp, the resource the record came from — its ARN, its bare id, or the
@@ -196,6 +222,29 @@ const VENDED_LOG_APPLICATION_FIELDS: &[TemplateField] = &[
     ("request_id", false),
     ("message", true),
 ];
+
+/// The record schema of a CodeWhisperer customization's event logs: the record's own ingestion
+/// timestamp, the instant of the event and the resource it came from, the customization the
+/// record belongs to, and the event itself — its severity and its message.
+///
+/// This sender publishes its OWN record rather than the generic envelope
+/// ([`VENDED_LOG_APPLICATION_FIELDS`]): the instant of the event, the sending resource, the
+/// severity and the message are the record, so a delivery may not drop them, while the record's
+/// own ingestion timestamp and the identifier of the customization are allowed around it.
+const CODEWHISPERER_EVENT_FIELDS: &[TemplateField] = &[
+    ("timestamp", false),
+    ("event_timestamp", true),
+    ("resource_id", true),
+    ("customization_id", false),
+    ("log_level", true),
+    ("event_message", true),
+];
+
+/// The allowed fields the CodeWhisperer customization sender does NOT deliver when a delivery
+/// names none: the record's own ingestion timestamp, and the identifier of the customization the
+/// record came from — the variable this sender also publishes for an S3 suffix path, so like the
+/// bare `resource_id` of the senders that publish one it is allowed without being delivered.
+const CODEWHISPERER_FIELDS_NOT_DELIVERED_BY_DEFAULT: &[&str] = &["timestamp", "customization_id"];
 
 /// The record schema of an API Gateway stage's execution logs: the vended-log envelope, the
 /// stage and request dimensions of the call being logged, and the logged line itself. The
@@ -314,10 +363,13 @@ const EKS_FIELDS: &[TemplateField] = &[
 /// envelope, whose instant is the millisecond the message was handled, plus the subscriber, the
 /// request, the event and the invocation the line belongs to, and the line — its detail and the
 /// error it reports.
+///
+/// This sender attributes its records with the resource ARN alone and publishes no bare
+/// `resource_id` beside it: the subscriber or event bus the line came from is named by that ARN
+/// and by the sender's own dimension below it.
 const EVENTS_FIELDS: &[TemplateField] = &[
     ("timestamp", false),
     ("resource_arn", false),
-    ("resource_id", false),
     ("message_timestamp_ms", false),
     ("subscriber_name", false),
     ("request_id", false),
@@ -369,9 +421,16 @@ const ALB_ACCESS_FIELDS: &[TemplateField] = &[
 ];
 
 /// The record schema of an Application Load Balancer's connection logs: the TLS handshake of
-/// one client connection, every field mandatory for the same reason as the access log.
+/// one client connection, every field mandatory for the same reason as the access log — the
+/// instant of the handshake, the client it came from, the listener it reached, the TLS
+/// parameters negotiated, the client certificate presented and how it verified, the certificate
+/// the load balancer chose, and the connection the handshake belongs to.
+///
+/// The fields and their order are the connection-log entry format the load balancer writes
+/// (Elastic Load Balancing's published connection-log entry fields), which is what a delivery of
+/// these logs restates in `recordFields`.
 const ALB_CONNECTION_FIELDS: &[TemplateField] = &[
-    ("time", true),
+    ("timestamp", true),
     ("client_ip", true),
     ("client_port", true),
     ("listener_port", true),
@@ -382,6 +441,8 @@ const ALB_CONNECTION_FIELDS: &[TemplateField] = &[
     ("leaf_client_cert_validity", true),
     ("leaf_client_cert_serial_number", true),
     ("tls_verify_status", true),
+    ("choosen_cert_serial", true),
+    ("choosen_cert_arn", true),
     ("conn_trace_id", true),
 ];
 
@@ -723,6 +784,24 @@ pub struct ConfigurationTemplateLogType {
     /// Tables integration for this log type, for the log types AWS publishes one for, and
     /// `None` for the rest.
     pub s3_tables_integration: Option<(&'static str, &'static str)>,
+    /// The allowed fields of this log type a delivery created WITHOUT a record field list does
+    /// not carry, as the SENDER publishes them
+    /// ([`FIELDS_NOT_DELIVERED_BY_DEFAULT`] where it publishes no list of its own).
+    ///
+    /// `recordFields` is "the default record fields that will be delivered when a list of record
+    /// fields is not provided" — a subset of `allowedFields`, because a field a caller MAY name
+    /// is not always one a delivery carries when it names none — and which fields that is, is
+    /// decided by the service that sends the record, so it is published per log type rather
+    /// than derived here. A mandatory field is delivered whatever this names.
+    pub fields_not_delivered_by_default: &'static [&'static str],
+    /// Whether a delivery of this log type that WRITES OBJECTS can be written in the columnar
+    /// file layout ([`COLUMNAR_OUTPUT_FORMAT`]).
+    ///
+    /// A file layout is a property of the destination that writes files, but the columnar one
+    /// also needs the sender's record to have a column schema to write, so whether it is on
+    /// offer is published per log type: a sender that publishes it offers every rendering its
+    /// object destination can store, and one that does not offers the rest of them.
+    pub columnar_objects: bool,
     /// Whether this log type's record is the SENDING SERVICE'S OWN DOCUMENT, delivered as the
     /// one field that carries it rather than as a row of named fields.
     ///
@@ -760,19 +839,22 @@ pub struct ConfigurationTemplateSource {
 }
 
 impl ConfigurationTemplateSource {
-    /// The delivery destination types a delivery of `log_type` can be sent to, in the order
-    /// the model's `DeliveryDestinationType` enum declares them
-    /// ([`DELIVERY_DESTINATION_TYPE_ORDER`]): the X-Ray trace delivery destination
-    /// ([`TRACE_DELIVERY_DESTINATION_TYPE`], the kind `PutDeliveryDestination` documents as
-    /// needing no destination configuration) receives TRACES and nothing else, while every log
-    /// type — traces included — can be delivered to each of the destination types that receive
-    /// records.
+    /// The delivery destination types the catalogue publishes a template of `log_type` for, in
+    /// the order the model's `DeliveryDestinationType` enum declares them
+    /// ([`DELIVERY_DESTINATION_TYPE_ORDER`]): the kinds of destination that RECEIVE the records
+    /// a delivery carries.
+    ///
+    /// The X-Ray trace destination ([`TRACE_DELIVERY_DESTINATION_TYPE`], the kind
+    /// `PutDeliveryDestination` documents as needing no destination configuration) receives
+    /// spans rather than a record of fields, and the catalogue publishes no template for it:
+    /// `allowedFields`, `allowedOutputFormats` and the rest of a template are the valid and
+    /// default values of a RECORD delivery, so there is nothing published to configure a trace
+    /// delivery with. Every log type — traces included — is published for each of the
+    /// destination types that receive records.
     pub fn delivery_destination_types(log_type: &str) -> Vec<String> {
+        let _ = log_type;
         DELIVERY_DESTINATION_TYPE_ORDER
             .iter()
-            .filter(|destination_type| {
-                **destination_type != TRACE_DELIVERY_DESTINATION_TYPE || log_type == TRACE_LOG_TYPE
-            })
             .map(|destination_type| (*destination_type).to_string())
             .collect()
     }
@@ -808,6 +890,7 @@ impl ConfigurationTemplateSource {
         let output_formats: Vec<String> = configuration_template_output_formats(destination_type)
             .into_iter()
             .filter(|format| !log_type.document_record || format == PLAIN_OUTPUT_FORMAT)
+            .filter(|format| log_type.columnar_objects || format != COLUMNAR_OUTPUT_FORMAT)
             .collect();
         let is_delimited = output_formats
             .iter()
@@ -836,7 +919,8 @@ impl ConfigurationTemplateSource {
                             .fields
                             .iter()
                             .filter(|(field, mandatory)| {
-                                *mandatory || !FIELDS_NOT_DELIVERED_BY_DEFAULT.contains(field)
+                                *mandatory
+                                    || !log_type.fields_not_delivered_by_default.contains(field)
                             })
                             .map(|(field, _mandatory)| (*field).to_string())
                             .collect(),
@@ -889,19 +973,22 @@ impl ConfigurationTemplateSource {
 }
 
 /// The `OutputFormat`s a delivery to `destination_type` can be written in, before the log
-/// type's own record narrows them ([`ConfigurationTemplateLogType::document_record`]).
+/// type's own record narrows them ([`ConfigurationTemplateLogType::document_record`],
+/// [`ConfigurationTemplateLogType::columnar_objects`]).
 ///
-/// DERIVED from what receives the delivery: a destination that receives log RECORDS takes the
-/// per-record renderings ([`RECORD_OUTPUT_FORMATS`]) — whether it stores one record for each
-/// delivered item or receives a stream of them, the rendering is of the record either way — a
-/// delivery that writes objects takes those plus the file layouts ([`OBJECT_OUTPUT_FORMATS`]),
-/// and the trace destination receives spans as structured documents
-/// ([`TRACE_OUTPUT_FORMATS`]).
+/// DERIVED from what receives the delivery: a destination that STORES each delivered record as
+/// its own item takes the per-record renderings ([`RECORD_OUTPUT_FORMATS`]), one that receives a
+/// STREAM of records takes those plus the record as the sender sent it
+/// ([`STREAM_OUTPUT_FORMATS`]), a delivery that writes objects takes the per-record renderings
+/// plus the file layouts ([`OBJECT_OUTPUT_FORMATS`]), and the trace destination receives spans as
+/// structured documents ([`TRACE_OUTPUT_FORMATS`]).
 pub fn configuration_template_output_formats(destination_type: &str) -> Vec<String> {
     let published: &[&str] = if destination_type == TRACE_DELIVERY_DESTINATION_TYPE {
         &TRACE_OUTPUT_FORMATS
     } else if destination_type == S3_DELIVERY_DESTINATION_TYPE {
         &OBJECT_OUTPUT_FORMATS
+    } else if destination_type == STREAM_DELIVERY_DESTINATION_TYPE {
+        &STREAM_OUTPUT_FORMATS
     } else {
         &RECORD_OUTPUT_FORMATS
     };
@@ -912,7 +999,9 @@ pub fn configuration_template_output_formats(destination_type: &str) -> Vec<Stri
 }
 
 /// One log type of a row whose record is a row of NAMED FIELDS, with no S3 Tables integration
-/// published for it.
+/// published for it, whose sender publishes the columnar file layout for its delivered objects
+/// and leaves out of a default record field list the fields every such sender does
+/// ([`FIELDS_NOT_DELIVERED_BY_DEFAULT`]).
 const fn log_type(
     log_type: &'static str,
     fields: &'static [TemplateField],
@@ -921,6 +1010,8 @@ const fn log_type(
         log_type,
         fields,
         s3_tables_integration: None,
+        fields_not_delivered_by_default: FIELDS_NOT_DELIVERED_BY_DEFAULT,
+        columnar_objects: true,
         document_record: false,
     }
 }
@@ -935,6 +1026,8 @@ const fn log_type_of_document_records(
         log_type,
         fields,
         s3_tables_integration: None,
+        fields_not_delivered_by_default: FIELDS_NOT_DELIVERED_BY_DEFAULT,
+        columnar_objects: true,
         document_record: true,
     }
 }
@@ -950,6 +1043,8 @@ const fn log_type_with_s3_tables(
         log_type,
         fields,
         s3_tables_integration: Some((datasource_name, datasource_type)),
+        fields_not_delivered_by_default: FIELDS_NOT_DELIVERED_BY_DEFAULT,
+        columnar_objects: true,
         document_record: false,
     }
 }
@@ -981,19 +1076,24 @@ const NO_SUFFIX_PATH: &str = "";
 /// the Region the delivery is made in, then the day the object covers.
 const DAILY_SUFFIX_PATH: &str = "{region}/{yyyy}/{MM}/{dd}/";
 
-/// The order one log type's templates are published in, one per delivery destination type: the
-/// order the model's `DeliveryDestinationType` enum DECLARES its values
-/// (`smithy_query(query="shape",shape="DeliveryDestinationType")` answers
+/// The order one log type's templates are published in, one per delivery destination type the
+/// catalogue publishes templates for: the order the model's `DeliveryDestinationType` enum
+/// DECLARES its values (`smithy_query(query="shape",shape="DeliveryDestinationType")` answers
 /// `[S3, CWL, FH, XRAY]`), so a slice of the catalogue opens with the template for the
 /// destination that writes objects rather than with whichever spelling sorts first.
 ///
+/// The destination types here are the ones that RECEIVE A RECORD a delivery carries — the
+/// bucket that writes objects, the log group that stores each record and the stream that
+/// forwards them. The trace destination ([`TRACE_DELIVERY_DESTINATION_TYPE`]) is the fourth
+/// value the enum declares and no template is published for it: see
+/// [`ConfigurationTemplateSource::delivery_destination_types`].
+///
 /// Every value is one the model names
 /// ([`crate::ops::types::DELIVERY_DESTINATION_TYPE_VALUES`]), never a string typed here.
-const DELIVERY_DESTINATION_TYPE_ORDER: [&str; 4] = [
+const DELIVERY_DESTINATION_TYPE_ORDER: [&str; 3] = [
     S3_DELIVERY_DESTINATION_TYPE,
     CWL_DELIVERY_DESTINATION_TYPE,
     STREAM_DELIVERY_DESTINATION_TYPE,
-    TRACE_DELIVERY_DESTINATION_TYPE,
 ];
 
 /// The resources that can send vended logs, the log types each of them sends and the record
@@ -1034,15 +1134,20 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         s3_suffix_path: DEFAULT_DELIVERY_SUFFIX_PATH,
         log_types: &[log_type("ERROR_LOGS", AUTOLOOP_FIELDS)],
     },
+    // Amazon Bedrock Agents sends the logs of an AGENT ALIAS, and the `logType` member's own
+    // catalogue names the types it sends ("For Amazon Bedrock Agents, the valid values are
+    // APPLICATION_LOGS and EVENT_LOGS",
+    // `smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`) — so this
+    // sender sends no TRACES, and the catalogue publishes no trace template for it, to any
+    // destination type. The event log is published FIRST, as this sender publishes it.
     ConfigurationTemplateSource {
         service: "bedrock",
         resource_type: "agent-alias",
         suffix_path_fields: RESOURCE_ID_SUFFIX_PATH_FIELDS,
         s3_suffix_path: DEFAULT_DELIVERY_SUFFIX_PATH,
         log_types: &[
-            log_type("APPLICATION_LOGS", BEDROCK_EVENT_FIELDS),
             log_type("EVENT_LOGS", BEDROCK_EVENT_FIELDS),
-            log_type(TRACE_LOG_TYPE, BEDROCK_EVENT_FIELDS),
+            log_type("APPLICATION_LOGS", BEDROCK_EVENT_FIELDS),
         ],
     },
     ConfigurationTemplateSource {
@@ -1053,6 +1158,28 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         log_types: &[
             log_type("APPLICATION_LOGS", BEDROCK_EVENT_FIELDS),
             log_type(TRACE_LOG_TYPE, BEDROCK_EVENT_FIELDS),
+        ],
+    },
+    // Amazon Bedrock AgentCore sends logs from each kind of resource the `logType` member's own
+    // catalogue names (Gateway, Identity, Memory, Payments, Runtime and Tools). The identity
+    // resource — the workload identity a call runs under — is published FIRST, as this sender
+    // publishes it.
+    ConfigurationTemplateSource {
+        service: "bedrock-agentcore",
+        resource_type: "workload-identity",
+        suffix_path_fields: &[
+            "accountid",
+            "region",
+            "workload_identity_id",
+            "yyyy",
+            "MM",
+            "dd",
+            "HH",
+        ],
+        s3_suffix_path: DEFAULT_DELIVERY_SUFFIX_PATH,
+        log_types: &[
+            log_type("APPLICATION_LOGS", AGENTCORE_FIELDS),
+            log_type(TRACE_LOG_TYPE, AGENTCORE_FIELDS),
         ],
     },
     ConfigurationTemplateSource {
@@ -1132,24 +1259,6 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         ],
     },
     ConfigurationTemplateSource {
-        service: "bedrock-agentcore",
-        resource_type: "workload-identity",
-        suffix_path_fields: &[
-            "accountid",
-            "region",
-            "workload_identity_id",
-            "yyyy",
-            "MM",
-            "dd",
-            "HH",
-        ],
-        s3_suffix_path: DEFAULT_DELIVERY_SUFFIX_PATH,
-        log_types: &[
-            log_type("APPLICATION_LOGS", AGENTCORE_FIELDS),
-            log_type(TRACE_LOG_TYPE, AGENTCORE_FIELDS),
-        ],
-    },
-    ConfigurationTemplateSource {
         service: "cloudfront",
         resource_type: "distribution",
         suffix_path_fields: &[
@@ -1168,7 +1277,9 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
     // catalogue names the one type it sends ("For Amazon CodeWhisperer, the valid value is
     // EVENT_LOGS", `smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
     // It publishes the identifier of that customization both as a suffix path variable and in
-    // the default object layout it partitions its delivered objects by.
+    // the default object layout it partitions its delivered objects by. Its record is its own
+    // ([`CODEWHISPERER_EVENT_FIELDS`]), it leaves that identifier out of a default record field
+    // list, and it publishes no columnar layout for its delivered objects.
     ConfigurationTemplateSource {
         service: "codewhisperer",
         resource_type: "customization",
@@ -1182,7 +1293,14 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
             "HH",
         ],
         s3_suffix_path: "{region}/{customization_id}/{yyyy}/{MM}/{dd}/{HH}/",
-        log_types: &[log_type("EVENT_LOGS", VENDED_LOG_APPLICATION_FIELDS)],
+        log_types: &[ConfigurationTemplateLogType {
+            log_type: "EVENT_LOGS",
+            fields: CODEWHISPERER_EVENT_FIELDS,
+            s3_tables_integration: None,
+            fields_not_delivered_by_default: CODEWHISPERER_FIELDS_NOT_DELIVERED_BY_DEFAULT,
+            columnar_objects: false,
+            document_record: false,
+        }],
     },
     ConfigurationTemplateSource {
         service: "eks",
@@ -1200,11 +1318,14 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         // delivery was made in: the cluster the logs came from is a variable a caller MAY write
         // into a suffix path of its own rather than part of the default this sender publishes.
         s3_suffix_path: DEFAULT_DELIVERY_SUFFIX_PATH,
+        // The Auto Mode load-balancing log is published FIRST, as this sender publishes it;
+        // the other Auto Mode logs and the capability logs follow, as the `logType` member's
+        // own catalogue names them.
         log_types: &[
+            log_type("AUTO_MODE_LOAD_BALANCING_LOGS", EKS_FIELDS),
             log_type("AUTO_MODE_BLOCK_STORAGE_LOGS", EKS_FIELDS),
             log_type("AUTO_MODE_COMPUTE_LOGS", EKS_FIELDS),
             log_type("AUTO_MODE_IPAM_LOGS", EKS_FIELDS),
-            log_type("AUTO_MODE_LOAD_BALANCING_LOGS", EKS_FIELDS),
             log_type("EKS_CAPABILITY_ACK_LOGS", EKS_FIELDS),
             log_type("EKS_CAPABILITY_ARGOCD_APPLICATION_LOGS", EKS_FIELDS),
             log_type("EKS_CAPABILITY_ARGOCD_APPLICATIONSET_LOGS", EKS_FIELDS),
@@ -1219,14 +1340,17 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         resource_type: "loadbalancer",
         suffix_path_fields: ACCOUNT_SUFFIX_PATH_FIELDS,
         s3_suffix_path: DAILY_SUFFIX_PATH,
+        // The connection log is published FIRST, as this sender publishes it, then the access
+        // log and the health-check log of an Application Load Balancer and the access log of a
+        // Network Load Balancer.
         log_types: &[
-            log_type_with_s3_tables("ALB_ACCESS_LOGS", ALB_ACCESS_FIELDS, "aws_alb", "access"),
             log_type_with_s3_tables(
                 "ALB_CONNECTION_LOGS",
                 ALB_CONNECTION_FIELDS,
                 "aws_alb",
                 "connection",
             ),
+            log_type_with_s3_tables("ALB_ACCESS_LOGS", ALB_ACCESS_FIELDS, "aws_alb", "access"),
             log_type("ALB_HEALTH_CHECK_LOGS", ALB_HEALTH_CHECK_FIELDS),
             log_type("NLB_ACCESS_LOGS", NLB_ACCESS_FIELDS),
         ],

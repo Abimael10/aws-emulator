@@ -7,13 +7,13 @@
 //!
 //! The rules under test:
 //!
-//! * one log type contributes one template per delivery destination type it can be delivered
-//!   to, published in the order the model's `DeliveryDestinationType` enum DECLARES its values
-//!   (`smithy_query(query="shape",shape="DeliveryDestinationType")` answers
+//! * one log type contributes one template per delivery destination type that RECEIVES A
+//!   RECORD, published in the order the model's `DeliveryDestinationType` enum DECLARES its
+//!   values (`smithy_query(query="shape",shape="DeliveryDestinationType")` answers
 //!   `[S3, CWL, FH, XRAY]`), so a slice opens with the template for the destination that writes
-//!   objects; the X-Ray trace destination receives a `TRACES` log type and nothing else, while
-//!   every log type — traces included — can be delivered to each destination that receives
-//!   records;
+//!   objects; the X-Ray trace destination is published NO template, because a template states
+//!   the valid and default values of a record delivery, while every log type — traces included —
+//!   is published for each destination that receives records;
 //! * `allowedFields` is "the allowed fields that a caller can use in the recordFields
 //!   parameter" and `defaultDeliveryConfigValues.recordFields` is "the default record fields
 //!   that will be delivered when a list of record fields is not provided", so the default list
@@ -58,15 +58,15 @@ const MAX_LIMIT: usize = 50;
 
 /// The `DeliveryDestinationType`s the model's enum names, in the order it DECLARES them
 /// (`smithy_query(query="shape",shape="DeliveryDestinationType")`), the one of them that
-/// receives traces, and the `logType` of a source that sends traces as the `logType` member's
-/// own catalogue spells it
+/// receives traces — which the catalogue publishes no template for — and the `logType` of a
+/// source that sends traces as the `logType` member's own catalogue spells it
 /// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
-const DESTINATION_TYPE_ORDER: [&str; 4] = ["S3", "CWL", "FH", "XRAY"];
 const TRACE_DESTINATION_TYPE: &str = "XRAY";
 const TRACE_LOG_TYPE: &str = "TRACES";
 
 /// The destination types that receive log RECORDS: every one the model names but the trace
-/// destination, in the order the enum declares them.
+/// destination, in the order the enum declares them — the destination types the catalogue
+/// publishes a template for.
 const RECORD_DESTINATION_TYPES: [&str; 3] = ["S3", "CWL", "FH"];
 
 /// The fields a template ALLOWS that a delivery created without a record field list does not
@@ -138,9 +138,9 @@ fn destination_types(templates: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// One log type contributes one template per destination type it can be delivered to, in the
-/// order the model's enum declares them — and over the whole catalogue the trace destination
-/// receives traces alone.
+/// One log type contributes one template per destination type that receives a record, in the
+/// order the model's enum declares them — and over the whole catalogue the trace destination is
+/// published no template.
 #[tokio::test]
 async fn a_log_types_templates_are_published_in_the_models_destination_type_order() {
     let logs = Logs::new();
@@ -178,19 +178,19 @@ async fn a_log_types_templates_are_published_in_the_models_destination_type_orde
             &RECORD_DESTINATION_TYPES,
         ),
         ("mediatailor", "TRANSCODE_LOGS", "playbackConfiguration", &RECORD_DESTINATION_TYPES),
-        // A source that sends traces: its templates reach the trace destination as well, so it
-        // is published for every destination type the model names.
+        // A source that sends traces: its records are published for the same destinations, and
+        // the trace destination is published no template for them either.
         (
             "bedrock-agentcore",
             TRACE_LOG_TYPE,
             "runtime",
-            &DESTINATION_TYPE_ORDER,
+            &RECORD_DESTINATION_TYPES,
         ),
         (
             "bedrock",
             TRACE_LOG_TYPE,
             "knowledge-base",
-            &DESTINATION_TYPE_ORDER,
+            &RECORD_DESTINATION_TYPES,
         ),
     ];
 
@@ -222,16 +222,13 @@ async fn a_log_types_templates_are_published_in_the_models_destination_type_orde
         );
         let destination_type = member(template, "deliveryDestinationType");
         assert!(
-            DESTINATION_TYPE_ORDER.contains(&destination_type.as_str()),
-            "case {case}: a template names a destination type the model declares, got {destination_type:?}"
+            RECORD_DESTINATION_TYPES.contains(&destination_type.as_str()),
+            "case {case}: a template names a destination type that receives a record, got {destination_type:?}"
         );
-        if destination_type == TRACE_DESTINATION_TYPE {
-            assert_eq!(
-                member(template, "logType"),
-                TRACE_LOG_TYPE,
-                "case {case}: the trace destination receives traces alone, got {destination_type:?}"
-            );
-        }
+        assert_ne!(
+            destination_type, TRACE_DESTINATION_TYPE,
+            "case {case}: the trace destination is published no template"
+        );
     }
     // Each destination that receives records serves the same log types as the object
     // destination, in the same order — so the groups of each are compared against the object
@@ -615,10 +612,10 @@ async fn the_catalogue_holds_one_row_per_kind_of_resource_a_service_sends_logs_f
         (
             "bedrock",
             &[
-                (
-                    "agent-alias",
-                    &["APPLICATION_LOGS", "EVENT_LOGS", TRACE_LOG_TYPE],
-                ),
+                // "For Amazon Bedrock Agents, the valid values are APPLICATION_LOGS and
+                // EVENT_LOGS" — this sender sends no traces, so no trace template is published
+                // for it; its knowledge base sends traces instead of event logs.
+                ("agent-alias", &["EVENT_LOGS", "APPLICATION_LOGS"]),
                 ("knowledge-base", &["APPLICATION_LOGS", TRACE_LOG_TYPE]),
             ],
         ),
@@ -647,11 +644,7 @@ async fn the_catalogue_holds_one_row_per_kind_of_resource_a_service_sends_logs_f
         for (resource_type, log_types) in rows {
             for log_type in *log_types {
                 expected.push(format!("{resource_type}|{log_type}"));
-                published += if *log_type == TRACE_LOG_TYPE {
-                    DESTINATION_TYPE_ORDER.len()
-                } else {
-                    RECORD_DESTINATION_TYPES.len()
-                };
+                published += RECORD_DESTINATION_TYPES.len();
             }
         }
         expected.sort_unstable();

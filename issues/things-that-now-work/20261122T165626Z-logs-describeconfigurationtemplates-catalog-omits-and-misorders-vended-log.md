@@ -62,3 +62,41 @@ Service names, field names and the allowed/record field lists above are the cata
 2. Cause 1: replay fixture logs-b2-delivery-source-destination-pipeline, step task#2 — DescribeConfigurationTemplates; compare configurationTemplates element count and the entry at index 24 against the recorded response (emulator serves an extra bedrock/TRACES/XRAY entry).
 3. Causes 2-10: replay fixture logs-catalog-describe-configuration-templates and compare the configurationTemplates list element-by-element with the recorded response for each step: task#1 (services absent entirely), task#2 (allowedOutputFormats missing 'raw'), task#3, task#4, task#5 (slice content/order), task#7 (placeholder allowedFields/recordFields), task#10 (missing EKS log type), task#11 (missing ALB_CONNECTION_LOGS and s3TablesIntegration), task#14 (extra resource_id in allowedFields).
 4. Equivalent by hand: aws logs describe-configuration-templates --service <service> (optionally --log-types / --resource-types / --delivery-destination-types) for each of the services named above and diff against AWS's published catalog.
+
+## Resolution (what was fixed, and the residue that was not)
+
+Fixed, as rules over the WHOLE catalogue rather than the cited rows:
+
+* A sender's templates are the log types THAT KIND OF RESOURCE sends, as the `logType` member of
+  `PutDeliverySourceRequest` publishes them per sender: Bedrock Agents sends `APPLICATION_LOGS` and
+  `EVENT_LOGS`, so the bedrock/agent-alias row no longer publishes a `TRACES` template at any
+  destination type (cause 1).
+* The catalogue publishes a template per log type for each destination type that RECEIVES A
+  RECORD — the bucket, the log group and the stream — and NONE for the X-Ray trace destination,
+  which receives spans rather than a record of fields (cause 1; confirmed by the
+  logs-b2-delivery-source-destination-pipeline fixture, which now replays clean end to end).
+* A delivery to the stream destination can be written as the record the sender sent it (`raw`),
+  which the destination that stores each record on its own cannot say anything in (cause 3).
+* The element order within a row is published data: a row's log types are stated in the order the
+  sender publishes them, so the bedrock slice opens with `EVENT_LOGS`, the eks slice with
+  `AUTO_MODE_LOAD_BALANCING_LOGS`, the elasticloadbalancing slice with `ALB_CONNECTION_LOGS` and the
+  bedrock-agentcore slice with its workload-identity row (causes 5, 6, 8, 9). The option list a
+  `PutDeliverySource` refusal states keeps the `logType` member's own order, which is a statement
+  about that member's catalogue rather than about this one's element order.
+* A sender's own record is published as that sender publishes it rather than as a generic envelope:
+  the CodeWhisperer customization schema, the fields it leaves out of a default record field list
+  and the absence of a columnar file layout for its objects (cause 7); the EventBridge
+  subscriber/event-bus schema, which publishes no bare `resource_id` beside the resource ARN
+  (cause 10); and the Application Load Balancer connection-log entry format, with the chosen
+  certificate fields it had been missing (cause 9).
+
+Residue, still diverging on replay (the key
+`logs|DescribeConfigurationTemplates|2xx->2xx|$.configurationTemplates[*]`, fixture
+logs-catalog-describe-configuration-templates): the ROWS AWS publishes that this report does not
+name — the second aidevops row and its 22-member `allowedFields` (cause 2, 6 templates where 3 are
+published), the autoloop rows beyond `ERROR_LOGS` (cause 4, 21 templates where 3 are published), the
+two AgentCore record fields that make its list 23 members (cause 6) — and the order of a row's log
+types after its first one (causes 8, 9). Each is catalogue CONTENT: neither the model's `logType`
+catalogue (which names no sender for autoloop at all) nor this report states the resource types, log
+types and field names involved, so publishing a row to reach a count would be inventing capability
+data rather than reporting it. A later report that carries those rows should reopen this one.

@@ -7,12 +7,13 @@
 //!
 //! * `allowedOutputFormats` is "the allowed output formats" of a delivery, so a rendering is
 //!   published where the DESTINATION can store it and the RECORD has something to say in it: a
-//!   destination that receives log records takes the two per-record renderings (the record as
-//!   the delivered line and the record as a structured document), a delivery that writes objects
-//!   takes those plus the two file layouts (the headed text file and the columnar one, both
-//!   properties of a file rather than of a record), the X-Ray trace destination receives spans
-//!   as structured documents, and a log type whose record IS one document is on offer as that
-//!   document alone. `allowedFieldDelimiters` — "the valid values that a caller can use as field
+//!   destination that stores each delivered record as its own item takes the two per-record
+//!   renderings (the record as the delivered line and the record as a structured document), one
+//!   that receives a stream of records takes those plus the record as the sender sent it, a
+//!   delivery that writes objects takes the per-record renderings plus the two file layouts (the
+//!   headed text file and the columnar one, both properties of a file rather than of a record),
+//!   and a log type whose record IS one document is on offer as that document alone.
+//!   `allowedFieldDelimiters` — "the valid values that a caller can use as field
 //!   delimiters" — and `defaultDeliveryConfigValues.fieldDelimiter` are published exactly where
 //!   one of the delimited renderings is.
 //! * `mandatory` says "the record field must be present in the recordFields parameter", which is
@@ -46,19 +47,26 @@ const DESCRIBE_SOURCES: &str = "DescribeDeliverySources";
 const MAX_LIMIT: usize = 50;
 
 /// The `DeliveryDestinationType`s the model's enum names, in the order it DECLARES them
-/// (`smithy_query(query="shape",shape="DeliveryDestinationType")`), and the one of them that
-/// receives traces rather than log records.
+/// (`smithy_query(query="shape",shape="DeliveryDestinationType")`), the one of them that
+/// receives traces rather than log records — which the catalogue publishes no template for — and
+/// the one that writes objects.
 const DESTINATION_TYPE_ORDER: [&str; 4] = ["S3", "CWL", "FH", "XRAY"];
 const TRACE_DESTINATION_TYPE: &str = "XRAY";
 const OBJECT_DESTINATION_TYPE: &str = "S3";
 
 /// The `OutputFormat`s the model's enum names
 /// (`smithy_query(query="shape",shape="OutputFormat")`), the two that are PER-RECORD renderings,
-/// the two that are FILE layouts, and the ones that write a record as a delimited line.
+/// the two that are FILE layouts, the one that carries the record as the sender sent it, and the
+/// ones that write a record as a delimited line.
 const PER_RECORD_FORMATS: [&str; 2] = ["plain", "json"];
 const FILE_FORMATS: [&str; 2] = ["w3c", "parquet"];
-const STRUCTURED_FORMAT: &str = "json";
+const RAW_FORMAT: &str = "raw";
 const DELIMITED_FORMATS: [&str; 3] = ["plain", "raw", "w3c"];
+
+/// The destination type that receives a STREAM of records, as the model's enum spells it: the
+/// one that forwards what it receives, so a delivery to it can also be written as the raw
+/// record.
+const STREAM_DESTINATION_TYPE: &str = "FH";
 
 /// What the operation publishes for a delivery that can be written in a delimited rendering, and
 /// the delimiter such a delivery is given when it names none: `FieldDelimiter` is modelled
@@ -235,14 +243,18 @@ async fn a_templates_renderings_are_its_destinations_narrowed_by_its_record() {
             let formats = strings(template, "allowedOutputFormats")
                 .unwrap_or_else(|| panic!("case {case}: a template carries allowedOutputFormats"));
 
-            let expected: Vec<String> = if destination_type == TRACE_DESTINATION_TYPE {
-                vec![STRUCTURED_FORMAT.to_string()]
-            } else if document_record {
+            let expected: Vec<String> = if document_record {
                 vec![PER_RECORD_FORMATS[0].to_string()]
             } else if destination_type == OBJECT_DESTINATION_TYPE {
                 PER_RECORD_FORMATS
                     .iter()
                     .chain(FILE_FORMATS.iter())
+                    .map(|format| (*format).to_string())
+                    .collect()
+            } else if destination_type == STREAM_DESTINATION_TYPE {
+                PER_RECORD_FORMATS
+                    .iter()
+                    .chain([RAW_FORMAT].iter())
                     .map(|format| (*format).to_string())
                     .collect()
             } else {
@@ -296,9 +308,16 @@ async fn every_destination_type_publishes_the_renderings_it_can_store() {
 
     for destination_type in DESTINATION_TYPE_ORDER {
         let templates = walk(&logs, &json!({"deliveryDestinationTypes": [destination_type]})).await;
+        if destination_type == TRACE_DESTINATION_TYPE {
+            assert!(
+                templates.is_empty(),
+                "case {destination_type}: the trace destination is published no template, got {templates:?}"
+            );
+            continue;
+        }
         assert!(
             !templates.is_empty(),
-            "case {destination_type}: every destination type the model names has templates, got none"
+            "case {destination_type}: every destination type that receives a record has templates, got none"
         );
         for template in &templates {
             let case = key_of(template);
@@ -315,12 +334,17 @@ async fn every_destination_type_publishes_the_renderings_it_can_store() {
                     "case {case}: the file layout {format:?} is published only where a delivery writes objects, got {formats:?}"
                 );
             }
-            if destination_type != TRACE_DESTINATION_TYPE {
-                assert!(
-                    formats.contains(&PER_RECORD_FORMATS[0].to_string()),
-                    "case {case}: a destination that receives records takes the record as the delivered line, got {formats:?}"
-                );
-            }
+            // The record as the sender sent it is on offer only where the destination forwards
+            // what it receives.
+            assert!(
+                !formats.contains(&RAW_FORMAT.to_string())
+                    || destination_type == STREAM_DESTINATION_TYPE,
+                "case {case}: the raw record is published only where a delivery streams records, got {formats:?}"
+            );
+            assert!(
+                formats.contains(&PER_RECORD_FORMATS[0].to_string()),
+                "case {case}: a destination that receives records takes the record as the delivered line, got {formats:?}"
+            );
         }
     }
 }
