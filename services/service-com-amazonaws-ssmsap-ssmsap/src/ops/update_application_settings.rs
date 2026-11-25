@@ -175,17 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `BackintMode` is an enum in the model, so the boundary validator has
             // already refused a value outside it; this re-states the refusal against the
             // model's own catalogue (`BACKINT_MODE_VALUES`) so the handler never stores a
-            // mode the API does not define.
-            if !BACKINT_MODE_VALUES.contains(&backint.backint_mode.as_str()) {
-                return Err(UpdateApplicationSettingsErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "BackintMode must be one of {}, but was {}",
-                        BACKINT_MODE_VALUES.join(", "),
-                        backint.backint_mode
-                    )),
-                )
-                .into());
-            }
+            // mode the API does not define. Worded in the ONE place this service refuses
+            // a value outside a catalogue.
+            crate::state::value_within_catalogue(
+                "BackintMode",
+                BACKINT_MODE_VALUES,
+                &backint.backint_mode,
+            )
+            .map_err(UpdateApplicationSettingsErrorModeled::ValidationException)?;
         }
 
         let Some(mut application) = state

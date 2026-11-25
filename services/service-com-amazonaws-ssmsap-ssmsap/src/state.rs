@@ -3269,6 +3269,34 @@ pub fn validation(message: impl Into<String>) -> ValidationException {
     }
 }
 
+/// Refuse a member carrying a value outside the catalogue that member admits.
+///
+/// `Ok(())` when `value` is one of `catalogue`. This is the ONE place this service
+/// refuses a value outside a catalogue, so every member checked this way is refused with
+/// the same sentence: `member` worded as the API spells it, then the values the request
+/// could have sent, then the one it did. A caller passes the catalogue the member is
+/// checked against — the model's own enum values for an enum member
+/// (`crate::ops::types::APPLICATION_TYPE_VALUES` and the other `*_VALUES` constants), or
+/// the names one listing filters by ([`validate_filters`]) — and lifts the refusal into
+/// its own modelled `ValidationException`.
+///
+/// An enum member is also walked by the boundary validator from the model, so for one of
+/// those this cannot normally fire; it is here so no handler stores a value the API does
+/// not define, whatever reaches it.
+pub fn value_within_catalogue(
+    member: &str,
+    catalogue: &[&str],
+    value: &str,
+) -> Result<(), ValidationException> {
+    if !catalogue.contains(&value) {
+        return Err(validation(format!(
+            "{member} must be one of {}, but was {value}",
+            catalogue.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// A `RegisterApplication` input member the model leaves optional but the service
 /// requires for SOME application types.
 ///
@@ -3996,16 +4024,13 @@ pub enum FilterOperators<'a> {
 }
 
 impl FilterOperators<'_> {
-    /// Refuse an operator this listing does not offer, naming what it does offer.
+    /// Refuse an operator this listing does not offer, naming what it does offer — a
+    /// listing offering the model's whole catalogue through the one place this service
+    /// refuses a value outside a catalogue ([`value_within_catalogue`]).
     fn accepts(&self, operator: &str) -> Result<(), ValidationException> {
         match self {
             Self::Modelled => {
-                if !FILTER_OPERATOR_VALUES.contains(&operator) {
-                    return Err(validation(format!(
-                        "Filter Operator must be one of {}, but was {operator}",
-                        FILTER_OPERATOR_VALUES.join(", ")
-                    )));
-                }
+                value_within_catalogue("Filter Operator", FILTER_OPERATOR_VALUES, operator)?;
             }
             Self::Only(only) => {
                 if operator != *only {
@@ -4029,7 +4054,8 @@ impl FilterOperators<'_> {
 /// [`filter_matches_attribute`] can then compare. A listing passes its own name
 /// catalogue ([`FILTER_NAMES`], [`CONFIGURATION_CHECK_FILTER_NAMES`],
 /// [`OPERATION_EVENT_FILTER_NAMES`]) and lifts the refusal into its own modelled
-/// `ValidationException`.
+/// `ValidationException`. The name is checked by [`value_within_catalogue`], the one
+/// place this service refuses a value outside a catalogue.
 pub fn validate_filters(
     filters: &[Filter],
     operators: FilterOperators<'_>,
@@ -4038,13 +4064,7 @@ pub fn validate_filters(
     filters_within_bounds(filters)?;
     for filter in filters {
         operators.accepts(&filter.operator)?;
-        if !allowed_names.contains(&filter.name.as_str()) {
-            return Err(validation(format!(
-                "Filter Name must be one of {}, but was {}",
-                allowed_names.join(", "),
-                filter.name
-            )));
-        }
+        value_within_catalogue("Filter Name", allowed_names, &filter.name)?;
     }
     Ok(())
 }

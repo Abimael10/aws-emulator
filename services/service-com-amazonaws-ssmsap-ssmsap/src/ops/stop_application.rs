@@ -258,16 +258,14 @@ fn record_stop(
     if let Some(entity) = stop_connected_entity {
         // `StopConnectedEntity` is an enum in the model, so the boundary validator
         // has already refused anything outside it; this re-states the refusal
-        // against the model's own catalogue.
-        if !CONNECTED_ENTITY_TYPE_VALUES.contains(&entity) {
-            return Err(StopApplicationErrorModeled::ValidationException(
-                crate::state::validation(format!(
-                    "StopConnectedEntity must be one of {}, but was {entity}",
-                    CONNECTED_ENTITY_TYPE_VALUES.join(", ")
-                )),
-            )
-            .into());
-        }
+        // against the model's own catalogue, in the ONE place this service refuses a
+        // value outside a catalogue.
+        crate::state::value_within_catalogue(
+            "StopConnectedEntity",
+            CONNECTED_ENTITY_TYPE_VALUES,
+            entity,
+        )
+        .map_err(StopApplicationErrorModeled::ValidationException)?;
     }
 
     let Some(mut application) = state

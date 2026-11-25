@@ -207,17 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ApplicationType` is an enum in the model, so the boundary validator has
         // already refused a value outside it; this re-states the refusal against the
         // model's own catalogue (`APPLICATION_TYPE_VALUES`) so the handler never stores
-        // a type the API does not define.
-        if !APPLICATION_TYPE_VALUES.contains(&input.application_type.as_str()) {
-            return Err(RegisterApplicationErrorModeled::ValidationException(
-                crate::state::validation(format!(
-                    "ApplicationType must be one of {}, but was {}",
-                    APPLICATION_TYPE_VALUES.join(", "),
-                    input.application_type
-                )),
-            )
-            .into());
-        }
+        // a type the API does not define. Worded in the ONE place this service refuses a
+        // value outside a catalogue.
+        crate::state::value_within_catalogue(
+            "ApplicationType",
+            APPLICATION_TYPE_VALUES,
+            &input.application_type,
+        )
+        .map_err(RegisterApplicationErrorModeled::ValidationException)?;
 
         // Some members the model leaves optional are required by the service for some
         // application types, and some describe an application another type is
