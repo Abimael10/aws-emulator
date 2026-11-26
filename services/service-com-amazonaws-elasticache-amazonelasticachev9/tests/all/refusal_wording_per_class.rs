@@ -30,7 +30,9 @@
 //! 6. IDENTIFIERS — the lead-in of the identifier-grammar refusal is per MEMBER: the members
 //!    AWS names by its own parameter label carry `The parameter <label> is not a valid
 //!    identifier. …`, and the members it names in prose keep `<prose> specified is not a
-//!    valid identifier. …`.
+//!    valid identifier. …`. The gate that words it runs BEFORE the identifier is resolved,
+//!    so a value the grammar admits is answered by what the operation does with the resource
+//!    it names — stored, reported absent, or selecting nothing from a page.
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
@@ -41,9 +43,13 @@ use crate::harness::{
 
 /// The grammar sentence every identifier refusal of this service ends with, whichever
 /// lead-in it carries.
-const GRAMMAR: &str = "Identifiers must begin with a letter; must contain only ASCII letters, \
-                       digits, and hyphens; and must not end with a hyphen or contain two \
-                       consecutive hyphens.";
+///
+/// `pub(crate)` so the suite about what such a refusal LEAVES BEHIND
+/// ([`crate::identifier_form_gate`]) reads the sentence from here rather than restating it.
+pub(crate) const GRAMMAR: &str =
+    "Identifiers must begin with a letter; must contain only ASCII letters, \
+     digits, and hyphens; and must not end with a hyphen or contain two \
+     consecutive hyphens.";
 
 /// Take a snapshot of `cluster` under `name` and look again until the clock has carried it
 /// to `available`, which is the only state a copy may be made from.
@@ -583,16 +589,60 @@ async fn a_cache_subnet_group_that_resolves_to_nothing_is_worded_per_operation()
     }
 }
 
+/// What an operation answers for a WELL-FORMED identifier: the gate let it through, so the
+/// answer is about the RESOURCE the value names rather than about the parameter — which is how
+/// the gate is shown to run BEFORE the identifier is resolved rather than instead of it.
+#[derive(Debug, Clone, Copy)]
+enum Admits {
+    /// The identifier was resolved and this account holds no such resource, reported with
+    /// this operation's own status and `awsQuery` code.
+    NotHeld(u16, &'static str),
+    /// The member only NARROWS a page, so an identifier owning no record selects none of the
+    /// records the same page reports when nothing narrows it.
+    EmptyPage,
+    /// The create STORES it, so the id reads back through the cluster lookup.
+    Stored,
+}
+
 /// One identifier row: the case name, the `Action`, the member the malformed value is sent
-/// as, the rest of a request that operation needs, and the LEAD-IN sentence the service
-/// words that member's identifier refusal with.
+/// as, the rest of a request that operation needs, the LEAD-IN sentence the service words
+/// that member's identifier refusal with, and what the same request is answered with once the
+/// value is well formed.
 struct IdentifierRow {
     case: &'static str,
     action: &'static str,
     member: &'static str,
     rest: &'static [(&'static str, &'static str)],
     lead_in: &'static str,
+    admits: Admits,
 }
+
+/// The cluster the snapshot below is taken from, so the narrowing row has a page with a
+/// record in it to narrow away.
+const SNAPSHOT_SOURCE: &str = "identifier-snapshot-source";
+
+/// That snapshot's name, as the store holds it ("stored as a lowercase string").
+const SNAPSHOT_TAKEN: &str = "identifier-snapshot";
+
+/// The lead-in `CacheClusterId`'s identifier refusal carries: AWS names that member by its
+/// own parameter label rather than by the wire member's name.
+///
+/// `pub(crate)` for the same reason as [`GRAMMAR`]: the suite about what such a refusal LEAVES
+/// BEHIND ([`crate::identifier_form_gate`]) reads it from here, so the two suites cannot
+/// disagree about the sentence.
+pub(crate) const CLUSTER_ID_LEAD_IN: &str =
+    "The parameter CacheClusterIdentifier is not a valid identifier.";
+
+/// The lead-in `CacheParameterGroupName`'s identifier refusal carries: AWS names that member
+/// by its own name. `pub(crate)` for the reason [`CLUSTER_ID_LEAD_IN`] gives.
+pub(crate) const PARAMETER_GROUP_NAME_LEAD_IN: &str =
+    "The parameter CacheParameterGroupName is not a valid identifier.";
+
+/// The lead-in `ReplicationGroupId`'s identifier refusal carries: AWS names that member in
+/// PROSE, over the identifier the request specified, which is the other of the service's two
+/// lead-ins.
+const REPLICATION_GROUP_ID_LEAD_IN: &str =
+    "Replication Group ID specified is not a valid identifier.";
 
 /// The lead-in of the identifier-grammar refusal is the MEMBER's: the members AWS names by
 /// its own parameter label carry that label, and the members it names in prose keep the
@@ -607,45 +657,66 @@ async fn an_identifier_refusal_names_the_member_the_way_aws_names_it() {
             case: "a cache cluster create",
             action: "CreateCacheCluster",
             member: "CacheClusterId",
-            rest: &[("Engine", "redis"), ("CacheNodeType", "cache.t3.micro")],
-            lead_in: "The parameter CacheClusterIdentifier is not a valid identifier.",
+            rest: &[
+                ("Engine", "redis"),
+                ("CacheNodeType", "cache.t3.micro"),
+                ("NumCacheNodes", "1"),
+            ],
+            lead_in: CLUSTER_ID_LEAD_IN,
+            admits: Admits::Stored,
         },
         IdentifierRow {
             case: "a cache cluster lookup",
             action: "DescribeCacheClusters",
             member: "CacheClusterId",
             rest: &[],
-            lead_in: "The parameter CacheClusterIdentifier is not a valid identifier.",
+            lead_in: CLUSTER_ID_LEAD_IN,
+            admits: Admits::NotHeld(404, "CacheClusterNotFound"),
         },
         IdentifierRow {
             case: "the same member on the snapshot describe",
             action: "DescribeSnapshots",
             member: "CacheClusterId",
             rest: &[],
-            lead_in: "The parameter CacheClusterIdentifier is not a valid identifier.",
+            lead_in: CLUSTER_ID_LEAD_IN,
+            admits: Admits::EmptyPage,
         },
         IdentifierRow {
             case: "a parameter group delete",
             action: "DeleteCacheParameterGroup",
             member: "CacheParameterGroupName",
             rest: &[],
-            lead_in: "The parameter CacheParameterGroupName is not a valid identifier.",
+            lead_in: PARAMETER_GROUP_NAME_LEAD_IN,
+            admits: Admits::NotHeld(404, "CacheParameterGroupNotFound"),
         },
         IdentifierRow {
             case: "a parameter group reset",
             action: "ResetCacheParameterGroup",
             member: "CacheParameterGroupName",
             rest: &[("ResetAllParameters", "true")],
-            lead_in: "The parameter CacheParameterGroupName is not a valid identifier.",
+            lead_in: PARAMETER_GROUP_NAME_LEAD_IN,
+            admits: Admits::NotHeld(404, "CacheParameterGroupNotFound"),
         },
         IdentifierRow {
             case: "a replication group lookup",
             action: "DescribeReplicationGroups",
             member: "ReplicationGroupId",
             rest: &[],
-            lead_in: "Replication Group ID specified is not a valid identifier.",
+            lead_in: REPLICATION_GROUP_ID_LEAD_IN,
+            admits: Admits::NotHeld(404, "ReplicationGroupNotFoundFault"),
         },
     ];
+
+    // One snapshot of a cluster this account DOES hold: a filter that selected nothing shows
+    // the member narrowed the page only if the page had a record to narrow away.
+    create_available_cluster(&emulator, SNAPSHOT_SOURCE, &[("Engine", "redis")]).await;
+    available_snapshot(
+        &emulator,
+        "the snapshot the narrowing row must not select",
+        SNAPSHOT_TAKEN,
+        SNAPSHOT_SOURCE,
+    )
+    .await;
 
     // Every way a value can miss the grammar: a leading digit, a leading hyphen, a trailing
     // hyphen, two consecutive hyphens, a character outside the set, and the '.' a family's
@@ -659,7 +730,7 @@ async fn an_identifier_refusal_names_the_member_the_way_aws_names_it() {
         "default.redis7",
     ];
 
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
         let case = row.case;
         let expected = format!("{} {GRAMMAR}", row.lead_in);
         for value in malformed {
@@ -675,8 +746,10 @@ async fn an_identifier_refusal_names_the_member_the_way_aws_names_it() {
             );
         }
         // A value the grammar ADMITS is judged by the resource instead, so the rows above
-        // are refused for their form rather than by an operation refusing everything.
-        let mut pairs = params(&[(row.member, "a-well-formed-name")]);
+        // are refused for their form rather than by an operation refusing everything. The id
+        // is this row's own, so a value one row STORES is not a value the next row finds.
+        let well_formed = format!("well-formed-{index}");
+        let mut pairs = params(&[(row.member, well_formed.as_str())]);
         pairs.extend(params(row.rest));
         let answered = emulator.call(row.action, &pairs).await;
         assert_ne!(
@@ -685,5 +758,57 @@ async fn an_identifier_refusal_names_the_member_the_way_aws_names_it() {
             "case {case:?}: a well-formed value must not be refused for its form, got {}",
             answered.body
         );
+        // WHICH answer it gets is what places the form gate ahead of the resolution: the
+        // identifier was resolved, or stored, or used to narrow a page.
+        match row.admits {
+            Admits::NotHeld(status, code) => assert_eq!(
+                (answered.status, answered.error_code()),
+                (status, code),
+                "case {case:?}: a well-formed value this account holds nothing for must answer \
+                 {status} {code}, got {} {}",
+                answered.status,
+                answered.body
+            ),
+            Admits::EmptyPage => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: a well-formed value selecting no record must answer 200, \
+                     got {} {}",
+                    answered.status, answered.body
+                );
+                assert!(
+                    answered.all("SnapshotName").is_empty(),
+                    "case {case:?}: a cluster owning no snapshot must select none, got {}",
+                    answered.body
+                );
+                let unnarrowed = emulator.call(row.action, &params(row.rest)).await;
+                assert!(
+                    unnarrowed.all("SnapshotName").contains(&SNAPSHOT_TAKEN),
+                    "case {case:?}: the same page must report {SNAPSHOT_TAKEN} when nothing \
+                     narrows it, got {}",
+                    unnarrowed.body
+                );
+            }
+            Admits::Stored => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: a well-formed id must be accepted, got {} {}",
+                    answered.status, answered.body
+                );
+                let described = emulator
+                    .call(
+                        "DescribeCacheClusters",
+                        &params(&[("CacheClusterId", well_formed.as_str())]),
+                    )
+                    .await;
+                assert_eq!(
+                    described.text("CacheCluster/CacheClusterId"),
+                    Some(well_formed.as_str()),
+                    "case {case:?}: the stored cluster must read back under {well_formed:?}, \
+                     got {}",
+                    described.body
+                );
+            }
+        }
     }
 }
