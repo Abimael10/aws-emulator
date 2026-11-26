@@ -208,93 +208,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = input.cluster_name.to_ascii_lowercase();
         let region = state::request_region(ctx.parts());
 
-        let mut guard = store.lock();
-        // The snapshot being restored is resolved FIRST, so a request naming a snapshot
-        // that does not exist is the snapshot not-found refusal rather than a name or
-        // quota refusal. Everything the restored cluster inherits is taken here.
-        let Some(snapshot) = guard.snapshots.get_mut(&input.snapshot_arn) else {
-            return Err(RestoreClusterFromSnapshotErrorModeled::ResourceNotFoundException(
-                state::not_found(state::ResourceKind::ClusterSnapshot, &input.snapshot_arn),
-            )
-            .into());
-        };
-        // Completes the transition the clock already made due on the snapshot being
-        // read, which was owed at this instant whether or not anybody called.
-        snapshot.settle_unless_in_flight();
-        let source = snapshot.source_config.clone();
-        let admin_user_name = snapshot.admin_user_name.clone();
-        let snapshot_kms_key_id = snapshot.kms_key_id.clone();
-        let snapshot_subnet_ids = snapshot.subnet_ids.clone();
-        let snapshot_vpc_security_group_ids = snapshot.vpc_security_group_ids.clone();
-
-        // The store lives for the life of the process and is reclaimed only by an
-        // explicit delete, so the record count is capped.
-        state::ensure_cluster_capacity(guard.clusters.len())
-            .map_err(RestoreClusterFromSnapshotErrorModeled::ServiceQuotaExceededException)?;
-        // A name already in use is refused as request validation here, not as a state
-        // conflict: the recorded refusal of a restore under an existing cluster's name
-        // is HTTP 400 `ValidationException`, where `CreateCluster` answers 409. The
-        // comparison is case-insensitive, which is the rule the refusal states, so it
-        // names both the name the request spelled and the stored name holding it.
-        if let Some(existing_arn) = guard.cluster_names.get(&cluster_name).cloned() {
-            let existing_name = guard
-                .clusters
-                .get(&existing_arn)
-                .map(|record| record.cluster_name.clone())
-                .unwrap_or_else(|| cluster_name.clone());
-            return Err(RestoreClusterFromSnapshotErrorModeled::ValidationException(
-                state::cluster_name_taken(&input.cluster_name, &existing_name),
-            )
-            .into());
-        }
-
         let cluster_id = state::new_resource_id();
         let cluster_arn = state::ResourceKind::Cluster.arn(&region, &cluster_id);
         let create_time = state::now_utc();
-        // Everything the request does not carry comes from the snapshot's record of the
-        // cluster it was taken from; the members `RestoreClusterFromSnapshot` models are
-        // the ones a restore may change.
-        let mut record = state::ClusterRecord {
-            cluster_name: cluster_name.clone(),
-            cluster_arn: cluster_arn.clone(),
-            // `begin_mint_transition` below sets the status and how long the transition
-            // it starts stays in flight.
-            status: String::new(),
-            change_in_flight_until: None,
-            cluster_endpoint: state::cluster_endpoint(&cluster_name, &cluster_id, &region),
-            create_time: create_time.clone(),
-            admin_user_name,
-            admin_user_password: source.admin_user_password,
-            auth_type: source.auth_type,
-            shard_capacity: input.shard_capacity.unwrap_or(source.shard_capacity),
-            shard_count: source.shard_count,
-            shard_instance_count: input
-                .shard_instance_count
-                .or(source.shard_instance_count),
-            vpc_security_group_ids: input
-                .vpc_security_group_ids
-                .unwrap_or(snapshot_vpc_security_group_ids),
-            subnet_ids: input.subnet_ids.unwrap_or(snapshot_subnet_ids),
-            preferred_maintenance_window: source.preferred_maintenance_window,
-            preferred_backup_window: source.preferred_backup_window,
-            backup_retention_period: source.backup_retention_period,
-            kms_key_id: input.kms_key_id.unwrap_or(snapshot_kms_key_id),
-            shards: state::shards_for(source.shard_count, &create_time, &[]),
-            // Tags are the restore request's own, as its `tags` member is "the tag names
-            // to be assigned to the restored elastic cluster".
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
-            // Nothing is pending for a cluster that has only just been restored.
-            pending_maintenance_actions: Vec::new(),
-        };
-        // This response reports the restored cluster CREATING; the clock owes it ACTIVE
-        // from the moment this call answers, so the next caller to look sees it settled.
-        record.begin_mint_transition(state::STATUS_CREATING);
+        // What the restored cluster inherits is read under this guard, which is released
+        // before the socket below is opened: opening one is asynchronous and this service
+        // holds its store across no await.
+        let (source, admin_user_name, snapshot_kms_key_id, snapshot_subnet_ids, snapshot_vpc_security_group_ids) = {
+            let mut guard = store.lock();
+            // The snapshot being restored is resolved FIRST, so a request naming a snapshot
+            // that does not exist is the snapshot not-found refusal rather than a name or
+            // quota refusal. Everything the restored cluster inherits is taken here.
+            let Some(snapshot) = guard.snapshots.get_mut(&input.snapshot_arn) else {
+                return Err(
+                    RestoreClusterFromSnapshotErrorModeled::ResourceNotFoundException(
+                        state::not_found(
+                            state::ResourceKind::ClusterSnapshot,
+                            &input.snapshot_arn,
+                        ),
+                    )
+                    .into(),
+                );
+            };
+            // Completes the transition the clock already made due on the snapshot being
+            // read, which was owed at this instant whether or not anybody called.
+            snapshot.settle_unless_in_flight();
+            let inherited = (
+                snapshot.source_config.clone(),
+                snapshot.admin_user_name.clone(),
+                snapshot.kms_key_id.clone(),
+                snapshot.subnet_ids.clone(),
+                snapshot.vpc_security_group_ids.clone(),
+            );
 
-        let cluster = record.as_cluster();
-        guard.cluster_names.insert(cluster_name, cluster_arn.clone());
-        guard.clusters.insert(cluster_arn, record);
-        drop(guard);
+            // The store lives for the life of the process and is reclaimed only by an
+            // explicit delete, so the record count is capped.
+            state::ensure_cluster_capacity(guard.clusters.len())
+                .map_err(RestoreClusterFromSnapshotErrorModeled::ServiceQuotaExceededException)?;
+            // A name already in use is refused as request validation here, not as a state
+            // conflict: the recorded refusal of a restore under an existing cluster's name
+            // is HTTP 400 `ValidationException`, where `CreateCluster` answers 409. The
+            // comparison is case-insensitive, which is the rule the refusal states, so it
+            // names both the name the request spelled and the stored name holding it.
+            name_is_free(&guard, &cluster_name, &input.cluster_name)?;
+            inherited
+        };
+
+        // The restored cluster's DATA PLANE, opened BEFORE its record is written and exactly
+        // as `CreateCluster` opens one: `clusterEndpoint` is the address a client afterwards
+        // dials with a MongoDB driver, so the stored record carries the `host:port` of the
+        // socket the core opened for this cluster (`state::cluster_data_plane`). A restored
+        // cluster is a cluster of its own, so it gets a socket and a volume of its own, and a
+        // restore that ends up minting nothing drops the plane unused, closing the port.
+        let opened = state::cluster_data_plane::open_cluster_plane(
+            &*self.engine,
+            &store,
+            &cluster_arn,
+            &source.auth_type,
+            &admin_user_name,
+            &source.admin_user_password,
+        )
+        .await;
+        // An emulator whose engine can open no socket at all cannot serve a cluster, so it
+        // restores none: the alternative is a cluster whose required endpoint names an address
+        // no MongoDB client could ever reach.
+        let Some(plane) = opened else {
+            return Err(
+                RestoreClusterFromSnapshotErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: state::DATA_PLANE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let cluster_endpoint = plane.endpoint().to_string();
+
+        let cluster = {
+            let mut guard = store.lock();
+            // The lock was released while the socket was opened, so the name is judged again:
+            // another call may have taken it in between, and exactly one of the two restores
+            // may hold it.
+            name_is_free(&guard, &cluster_name, &input.cluster_name)?;
+            // Everything the request does not carry comes from the snapshot's record of the
+            // cluster it was taken from; the members `RestoreClusterFromSnapshot` models are
+            // the ones a restore may change.
+            let mut record = state::ClusterRecord {
+                cluster_name: cluster_name.clone(),
+                cluster_arn: cluster_arn.clone(),
+                // `begin_mint_transition` below sets the status and how long the transition
+                // it starts stays in flight.
+                status: String::new(),
+                change_in_flight_until: None,
+                cluster_endpoint,
+                create_time: create_time.clone(),
+                admin_user_name,
+                admin_user_password: source.admin_user_password,
+                auth_type: source.auth_type,
+                shard_capacity: input.shard_capacity.unwrap_or(source.shard_capacity),
+                shard_count: source.shard_count,
+                shard_instance_count: input
+                    .shard_instance_count
+                    .or(source.shard_instance_count),
+                vpc_security_group_ids: input
+                    .vpc_security_group_ids
+                    .unwrap_or(snapshot_vpc_security_group_ids),
+                subnet_ids: input.subnet_ids.unwrap_or(snapshot_subnet_ids),
+                preferred_maintenance_window: source.preferred_maintenance_window,
+                preferred_backup_window: source.preferred_backup_window,
+                backup_retention_period: source.backup_retention_period,
+                kms_key_id: input.kms_key_id.unwrap_or(snapshot_kms_key_id),
+                shards: state::shards_for(source.shard_count, &create_time, &[]),
+                // Tags are the restore request's own, as its `tags` member is "the tag names
+                // to be assigned to the restored elastic cluster".
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                // Nothing is pending for a cluster that has only just been restored.
+                pending_maintenance_actions: Vec::new(),
+            };
+            // This response reports the restored cluster CREATING; the clock owes it ACTIVE
+            // from the moment this call answers, so the next caller to look sees it settled.
+            record.begin_mint_transition(state::STATUS_CREATING);
+
+            let cluster = record.as_cluster();
+            guard
+                .cluster_names
+                .insert(cluster_name, cluster_arn.clone());
+            guard.clusters.insert(cluster_arn.clone(), record);
+            // The socket is held beside the record, because dropping the handle closes the
+            // port: it lives exactly as long as the restored cluster does.
+            guard.cluster_planes.insert(&cluster_arn, plane);
+            cluster
+        };
 
         Ok(RestoreClusterFromSnapshotOutput { cluster })
     }
+}
+
+/// Refuse a restore under a name a cluster already holds.
+///
+/// `stored_name` is the name as this service stores it (lower-cased) and `requested` the name
+/// exactly as the request spelled it, which is what the refusal states beside the stored name
+/// of the cluster holding it ([`state::cluster_name_taken`]).
+fn name_is_free(
+    store: &crate::state::ComAmazonawsDocdbelasticChimeradblionfishservicelambdaState,
+    stored_name: &str,
+    requested: &str,
+) -> Result<(), RestoreClusterFromSnapshotError> {
+    let Some(existing_arn) = store.cluster_names.get(stored_name) else {
+        return Ok(());
+    };
+    let existing_name = store
+        .clusters
+        .get(existing_arn)
+        .map(|record| record.cluster_name.clone())
+        .unwrap_or_else(|| stored_name.to_string());
+    Err(RestoreClusterFromSnapshotErrorModeled::ValidationException(
+        crate::state::cluster_name_taken(requested, &existing_name),
+    )
+    .into())
 }

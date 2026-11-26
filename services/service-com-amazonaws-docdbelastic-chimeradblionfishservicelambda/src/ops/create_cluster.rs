@@ -249,60 +249,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = input.cluster_name.to_ascii_lowercase();
         let region = state::request_region(ctx.parts());
 
-        let mut guard = store.lock();
-        // The store lives for the life of the process and is reclaimed only by an
-        // explicit delete, so the record count is capped.
-        state::ensure_cluster_capacity(guard.clusters.len())
-            .map_err(CreateClusterErrorModeled::ServiceQuotaExceededException)?;
-        if let Some(existing_arn) = guard.cluster_names.get(&cluster_name) {
-            return Err(CreateClusterErrorModeled::ConflictException(
-                state::name_conflict(state::ResourceKind::Cluster, existing_arn),
-            )
-            .into());
-        }
-
         let cluster_id = state::new_resource_id();
         let cluster_arn = state::ResourceKind::Cluster.arn(&region, &cluster_id);
         let create_time = state::now_utc();
-        let mut record = state::ClusterRecord {
-            cluster_name: cluster_name.clone(),
-            cluster_arn: cluster_arn.clone(),
-            // `begin_mint_transition` below sets the status and how long the transition
-            // it starts stays in flight.
-            status: String::new(),
-            change_in_flight_until: None,
-            cluster_endpoint: state::cluster_endpoint(&cluster_name, &cluster_id, &region),
-            create_time: create_time.clone(),
-            admin_user_name: input.admin_user_name,
-            admin_user_password: input.admin_user_password,
-            auth_type: input.auth_type,
-            shard_capacity: input.shard_capacity,
-            shard_count: input.shard_count,
-            shard_instance_count: input.shard_instance_count,
-            vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
-            subnet_ids: input.subnet_ids.unwrap_or_default(),
-            preferred_maintenance_window: preferred_maintenance_window
-                .unwrap_or_else(|| state::default_maintenance_window(&cluster_name)),
-            preferred_backup_window: input.preferred_backup_window,
-            backup_retention_period: input.backup_retention_period,
-            kms_key_id: input
-                .kms_key_id
-                .unwrap_or_else(|| state::AWS_OWNED_KMS_KEY.to_string()),
-            shards: state::shards_for(input.shard_count, &create_time, &[]),
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
-            // Nothing is pending for a cluster the service has only just created: a
-            // maintenance action becomes pending when the service schedules an update
-            // for the cluster, which no request does.
-            pending_maintenance_actions: Vec::new(),
-        };
-        // This response reports the new cluster CREATING; the clock owes it ACTIVE from
-        // the moment this call answers, so the next caller to look sees it settled.
-        record.begin_mint_transition(state::STATUS_CREATING);
 
-        let cluster = record.as_cluster();
-        guard.cluster_names.insert(cluster_name, cluster_arn.clone());
-        guard.clusters.insert(cluster_arn, record);
-        drop(guard);
+        // The cluster's DATA PLANE, opened BEFORE any record is written and with the store NOT
+        // locked (opening a socket is asynchronous and this service holds its store across no
+        // await): `clusterEndpoint` is the address a client afterwards dials with a MongoDB
+        // driver, so what the stored record carries is the `host:port` of the socket the core
+        // opened for this cluster (`state::cluster_data_plane`) and no cluster is ever stored
+        // reporting an address nothing answers at. A create that ends up minting no cluster —
+        // a refusal below — drops the plane unused, which closes the port with it.
+        let opened = state::cluster_data_plane::open_cluster_plane(
+            &*self.engine,
+            &store,
+            &cluster_arn,
+            &input.auth_type,
+            &input.admin_user_name,
+            &input.admin_user_password,
+        )
+        .await;
+        // An emulator whose engine can open no socket at all cannot serve a cluster, so it
+        // creates none: the alternative is a cluster whose required endpoint names an address
+        // no MongoDB client could ever reach.
+        let Some(plane) = opened else {
+            return Err(CreateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::DATA_PLANE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+        let cluster_endpoint = plane.endpoint().to_string();
+
+        // The record is minted and stored under this one guard, which is released with the
+        // block.
+        let cluster = {
+            let mut guard = store.lock();
+            // The store lives for the life of the process and is reclaimed only by an
+            // explicit delete, so the record count is capped.
+            state::ensure_cluster_capacity(guard.clusters.len())
+                .map_err(CreateClusterErrorModeled::ServiceQuotaExceededException)?;
+            if let Some(existing_arn) = guard.cluster_names.get(&cluster_name) {
+                return Err(CreateClusterErrorModeled::ConflictException(
+                    state::name_conflict(state::ResourceKind::Cluster, existing_arn),
+                )
+                .into());
+            }
+
+            let mut record = state::ClusterRecord {
+                cluster_name: cluster_name.clone(),
+                cluster_arn: cluster_arn.clone(),
+                // `begin_mint_transition` below sets the status and how long the transition
+                // it starts stays in flight.
+                status: String::new(),
+                change_in_flight_until: None,
+                cluster_endpoint,
+                create_time: create_time.clone(),
+                admin_user_name: input.admin_user_name,
+                admin_user_password: input.admin_user_password,
+                auth_type: input.auth_type,
+                shard_capacity: input.shard_capacity,
+                shard_count: input.shard_count,
+                shard_instance_count: input.shard_instance_count,
+                vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+                subnet_ids: input.subnet_ids.unwrap_or_default(),
+                preferred_maintenance_window: preferred_maintenance_window
+                    .unwrap_or_else(|| state::default_maintenance_window(&cluster_name)),
+                preferred_backup_window: input.preferred_backup_window,
+                backup_retention_period: input.backup_retention_period,
+                kms_key_id: input
+                    .kms_key_id
+                    .unwrap_or_else(|| state::AWS_OWNED_KMS_KEY.to_string()),
+                shards: state::shards_for(input.shard_count, &create_time, &[]),
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                // Nothing is pending for a cluster the service has only just created: a
+                // maintenance action becomes pending when the service schedules an update
+                // for the cluster, which no request does.
+                pending_maintenance_actions: Vec::new(),
+            };
+            // This response reports the new cluster CREATING; the clock owes it ACTIVE from
+            // the moment this call answers, so the next caller to look sees it settled.
+            record.begin_mint_transition(state::STATUS_CREATING);
+
+            let cluster = record.as_cluster();
+            guard
+                .cluster_names
+                .insert(cluster_name, cluster_arn.clone());
+            guard.clusters.insert(cluster_arn.clone(), record);
+            // The socket is held beside the record, because dropping the handle closes the
+            // port: it lives exactly as long as the cluster does.
+            guard.cluster_planes.insert(&cluster_arn, plane);
+            cluster
+        };
 
         Ok(CreateClusterOutput { cluster })
     }

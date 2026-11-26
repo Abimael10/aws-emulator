@@ -27,15 +27,36 @@ service-common = { path = "../common" }
 hex = { workspace = true }
 # Digests the counter + clock seed a minted cluster / snapshot id is built from.
 sha2 = { workspace = true }
+# The MongoDB wire a client of an elastic cluster's `clusterEndpoint` speaks: the message
+# framing, the document engine, the query engine and the SCRAM exchange are the ones Amazon
+# DocumentDB's own clusters are served with, and an elastic cluster is an endpoint of that same
+# wire (`src/state/cluster_data_plane.rs`). Only that plane is used from it.
+service-com-amazonaws-docdb-amazonrdsv19 = { workspace = true }
+# The BSON codec of that wire: every command a client sends and every reply the endpoint
+# answers with is a BSON document, built and read by the format's own implementation.
+bson = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-# `tokio::time::sleep` in the lifecycle suite waits out a clock-owed transition.
-tokio = { workspace = true, features = ["time"] }
+# `tokio::time::sleep` in the lifecycle suite waits out a clock-owed transition; the data-plane
+# suite dials the cluster's own socket (`net`) and speaks the wire on it (`io-util`).
+tokio = { workspace = true, features = ["time", "net", "io-util"] }
 # Declares one module per suite file under `tests/all/`.
 automod = { workspace = true }
+# The data-plane suite drives a real client against a cluster's own socket in ONE process:
+# `rustls` / `tokio-rustls` run the client side of the TLS such an endpoint is served over,
+# which the core terminates. Both are the versions this workspace already builds.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
+# The client half of the SCRAM-SHA-1 exchange that suite authenticates with: PBKDF2 and HMAC
+# over SHA-1 are what RFC 5802 computes a proof with, and MD5 is how the engine's SCRAM-SHA-1
+# credential prepares a password.
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+md-5 = "0.10"
 
 [lints]
 workspace = true

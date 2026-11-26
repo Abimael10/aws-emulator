@@ -337,11 +337,23 @@ async fn a_created_cluster_round_trips_through_get_cluster() {
             created["preferredMaintenanceWindow"]
         );
         let endpoint = created["clusterEndpoint"].as_str().unwrap_or_default();
+        // `clusterEndpoint` is "The URL used to connect to the elastic cluster", so it is an
+        // address the cluster ANSWERS on: the `host:port` of the socket this emulator opened
+        // for it, never a name in Amazon DocumentDB's own DNS zone, which resolves to nothing
+        // on the machine this emulator runs on. What answers there is driven end to end in
+        // `tests/all/cluster_mongo_data_plane.rs`.
+        let (host, port) = endpoint
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("case {case}: clusterEndpoint must carry the port a client dials, got {endpoint:?}"));
         assert!(
-            endpoint.starts_with(&format!("{expected_name}."))
-                && endpoint.ends_with(&format!(".{REGION}.docdb-elastic.amazonaws.com")),
-            "case {case}: clusterEndpoint is not derived from the cluster's own identity, \
-             got {endpoint:?}"
+            !endpoint.contains("amazonaws.com")
+                && host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+                && port.parse::<u16>().is_ok(),
+            "case {case}: clusterEndpoint must be an address this emulator answers the \
+             cluster's wire on, got {endpoint:?}"
         );
         assert_eq!(
             created["shards"].as_array().map(Vec::len),
@@ -1245,10 +1257,11 @@ async fn deleting_a_snapshot_makes_it_unreachable_and_frees_its_name() {
 }
 
 #[tokio::test]
-async fn the_minted_arn_and_endpoint_follow_the_requests_region() {
-    // The ARN's and the endpoint's region segment come from the CALLER's SigV4
-    // credential scope, so the rows differ in the region the request is signed for —
-    // the rule is "whatever region the request names", not one value.
+async fn the_minted_arn_follows_the_requests_region() {
+    // The ARN's region segment comes from the CALLER's SigV4 credential scope, so the rows
+    // differ in the region the request is signed for — the rule is "whatever region the
+    // request names", not one value. The cluster's ENDPOINT follows no region, because it is
+    // the address this emulator answers the cluster's wire on.
     let router = emulator();
     for (index, region) in ["eu-west-2", "ap-south-1", "us-east-1", "sa-east-1"]
         .iter()
@@ -1286,9 +1299,19 @@ async fn the_minted_arn_and_endpoint_follow_the_requests_region() {
             fields[5]
         );
         let endpoint = created["clusterEndpoint"].as_str().unwrap_or_default();
+        // The ENDPOINT follows no region at all: it is the address this emulator answers the
+        // cluster's wire on, which is a property of this process rather than of the region
+        // the request was signed for.
         assert!(
-            endpoint.ends_with(&format!(".{region}.docdb-elastic.amazonaws.com")),
-            "case {region:?}: the endpoint must name the request's region, got {endpoint:?}"
+            !endpoint.contains("amazonaws.com")
+                && endpoint.rsplit_once(':').is_some_and(|(host, port)| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+                        && port.parse::<u16>().is_ok()
+                }),
+            "case {region:?}: the endpoint must be an address this emulator answers on, got \
+             {endpoint:?}"
         );
 
         // A snapshot of it is minted in the same region.
@@ -1740,10 +1763,27 @@ async fn a_flow_that_chains_three_mints_settles_with_one_read_each() {
         "case the restore flow: the restored cluster must carry its own ARN, got \
          {settled_restore}"
     );
+    // The restored cluster has a socket of its own, so its endpoint is an address of this
+    // emulator and not the one the source cluster answers on.
+    let restored_endpoint = settled_restore["clusterEndpoint"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        settled_restore["clusterEndpoint"]
-            .as_str()
-            .is_some_and(|endpoint| endpoint.starts_with("chainrestored.")),
+        !restored_endpoint.contains("amazonaws.com")
+            && restored_endpoint
+                .rsplit_once(':')
+                .is_some_and(|(host, port)| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+                        && port.parse::<u16>().is_ok()
+                }),
+        "case the restore flow: the restored cluster must carry an address this emulator \
+         answers on, got {settled_restore}"
+    );
+    assert_ne!(
+        Some(restored_endpoint),
+        source_cluster["clusterEndpoint"].as_str(),
         "case the restore flow: the restored cluster must carry its own endpoint, got \
          {settled_restore}"
     );

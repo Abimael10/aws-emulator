@@ -144,6 +144,28 @@ impl InstanceSocket {
     }
 }
 
+/// What a connection on ONE instance's socket is served from: a session of the command layer
+/// below ([`commands`]), and every command answered out of the cluster's documents with the
+/// endpoint's facts as they are at that instant.
+impl wire::WireEndpoint for InstanceSocket {
+    type Session = commands::Session;
+
+    fn open_session(&self) -> Self::Session {
+        commands::Session::new(self.take_connection_id())
+    }
+
+    fn answer(
+        &self,
+        session: &mut Self::Session,
+        database: &str,
+        command: &::bson::Document,
+    ) -> ::bson::Document {
+        let facts = self.facts();
+        let mut volume = self.lock_volume();
+        commands::execute(session, &facts, &mut volume, database, command)
+    }
+}
+
 /// The facts of an endpoint of the DocumentDB cluster the DOCDB store holds, read under that
 /// store's own lock and the shared cluster storage's.
 ///
@@ -433,9 +455,13 @@ pub async fn serve_instance<Eng: Send + Sync + 'static>(
     // The record publishes what the socket answers on, so every later read of the instance
     // reports the same address — and the handle is held beside it, because dropping it closes
     // the port.
-    if let Some(instance) = store.instances.get_mut(instance_identifier) {
-        instance.served_endpoint = Some(endpoint.clone());
-    }
+    //
+    // The lock was released while the socket was opened, so the record is read back fallibly: a
+    // delete that ran in between removed the instance and found no plane to close, so there is
+    // nothing to publish here and the socket closes with the plane as this returns rather than
+    // being held open under a key no record has.
+    let instance = store.instances.get_mut(instance_identifier)?;
+    instance.served_endpoint = Some(endpoint.clone());
     store
         .instance_data_planes
         .insert(instance_identifier, plane);

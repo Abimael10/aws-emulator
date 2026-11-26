@@ -186,6 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = record.cluster_name.clone();
         guard.clusters.remove(&input.cluster_arn);
         guard.cluster_names.remove(&cluster_name);
+        // The cluster's socket goes with the cluster: dropping the handle closes the port,
+        // severs every session on it and drops the documents that cluster held, which is what
+        // deleting an elastic cluster does.
+        guard.cluster_planes.close(&input.cluster_arn);
         drop(guard);
 
         Ok(DeleteClusterOutput { cluster })

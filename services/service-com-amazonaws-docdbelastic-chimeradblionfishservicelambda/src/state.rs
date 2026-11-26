@@ -16,6 +16,10 @@ use crate::ops::types::{
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
+/// The MongoDB-wire DATA PLANE of an elastic cluster: the socket the cluster answers on, the
+/// documents behind it, and the address `clusterEndpoint` publishes.
+pub mod cluster_data_plane;
+
 /// How long a change to a resource this store ALREADY holds — what `UpdateCluster`,
 /// `StopCluster` or `StartCluster` applies to a cluster that was already there — stays
 /// in flight for a further call that ACTS on that resource.
@@ -52,6 +56,14 @@ pub struct ComAmazonawsDocdbelasticChimeradblionfishservicelambdaState {
     /// `snapshotName` -> `snapshotArn`, so a duplicate snapshot name is refused
     /// without a linear scan of `snapshots`.
     pub snapshot_names: BTreeMap<String, String>,
+    /// The socket this emulator answers each cluster's MongoDB wire on, keyed by the
+    /// cluster's `clusterArn`, holding that cluster's documents with it
+    /// ([`cluster_data_plane`]).
+    ///
+    /// Kept beside the records rather than on them, because a record is a cloneable value
+    /// and a live socket is not. Dropping an entry closes the port, which is what deleting
+    /// the cluster does.
+    pub cluster_planes: cluster_data_plane::ClusterDataPlanes,
 }
 
 impl ComAmazonawsDocdbelasticChimeradblionfishservicelambdaState {
@@ -592,13 +604,17 @@ pub fn docdb_elastic_arn(region: &str, resource: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, resource)
 }
 
-/// The host name a client connects to this cluster on.
+/// What a cluster-minting operation answers when this emulator could open no socket for the
+/// cluster's data plane at all (an emulator driven on a runtime that binds none).
 ///
-/// Derived from the cluster's own identity, never from anything the caller passed as
-/// an endpoint: `<name>.<cluster id>.<region>.docdb-elastic.amazonaws.com`.
-pub fn cluster_endpoint(cluster_name: &str, cluster_id: &str, region: &str) -> String {
-    format!("{cluster_name}.{cluster_id}.{region}.{ARN_SERVICE}.amazonaws.com")
-}
+/// `clusterEndpoint` is "The URL used to connect to the elastic cluster", so a cluster this
+/// emulator cannot serve has no endpoint to publish: the create answers the modelled server
+/// failure rather than storing a cluster whose required endpoint names an address nothing
+/// answers the cluster's wire at — least of all a host under Amazon DocumentDB's own DNS zone,
+/// which resolves to nothing on the machine this emulator runs on or, worse, at genuine
+/// infrastructure.
+pub const DATA_PLANE_UNAVAILABLE: &str =
+    "The elastic cluster's connection endpoint could not be opened.";
 
 /// The tag this service stamps on every pagination cursor it issues, so a token it
 /// did not issue is rejected rather than read as an arbitrary start key.

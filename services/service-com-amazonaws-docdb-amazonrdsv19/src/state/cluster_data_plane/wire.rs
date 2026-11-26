@@ -3,9 +3,10 @@
 //! The WIRE one session on a cluster's endpoint runs on: the engine's own message framing.
 //!
 //! One of these runs per accepted connection. It reads messages off the connection, hands
-//! each command document to [`super::commands`], and writes the reply back in the form the
-//! message asked for. The core owns the socket, the TLS, the idle timeout and the connection
-//! caps; this owns only the protocol.
+//! each command document to the endpoint it serves ([`WireEndpoint`], which for an instance of
+//! a cluster this service holds answers out of [`super::commands`]), and writes the reply back
+//! in the form the message asked for. The core owns the socket, the TLS, the idle timeout and
+//! the connection caps; this owns only the protocol.
 //!
 //! Two message kinds carry a command, and a driver uses both: `OP_MSG` (opcode 2013), which
 //! is what every command of a current driver travels in, and `OP_QUERY` (opcode 2004) against
@@ -42,7 +43,7 @@ use ::bson::Document;
 use ::emulator_server::{ListenerConn, NativeHandler};
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::commands::{self, Session};
+use super::commands;
 use super::{fault, query, InstanceSocket};
 
 /// The message header every message starts with: its length, its id, what it answers and its
@@ -85,24 +86,63 @@ const COMMAND_COLLECTION_SUFFIX: &str = ".$cmd";
 /// so and the connection is closed.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The server one instance's endpoint answers with.
-pub struct MongoWire {
-    socket: InstanceSocket,
-}
+/// What ONE endpoint served on this wire answers FROM: the state a connection on it holds
+/// while it is open, and the reply to one command document.
+///
+/// The framing above is the engine's own and says nothing about which resource is behind the
+/// address — the same messages carry a command to an instance of a cluster this service holds
+/// ([`InstanceSocket`], the implementation beside it) and to any other resource of this
+/// emulator whose clients speak this wire. So what an endpoint serves is this one seam, and
+/// nothing of the protocol is written twice.
+pub trait WireEndpoint: Clone + Send + Sync + 'static {
+    /// The state ONE connection on this endpoint holds while it is open — who it has
+    /// authenticated as, the cursors it holds — which travels through every message it sends.
+    type Session: Send + 'static;
 
-impl MongoWire {
-    #[must_use]
-    pub fn new(socket: InstanceSocket) -> Self {
-        Self { socket }
+    /// A session for a connection just accepted.
+    fn open_session(&self) -> Self::Session;
+
+    /// Answer one command, as the reply document the client reads. `database` is the `$db` the
+    /// message named.
+    ///
+    /// Called on a BLOCKING task, so it may take the locks the answer needs; it never awaits.
+    fn answer(
+        &self,
+        session: &mut Self::Session,
+        database: &str,
+        command: &Document,
+    ) -> Document;
+
+    /// Whether the connection CARRIES ON once the reply just written is out.
+    ///
+    /// `true` for every endpoint that answers command after command on one connection, which
+    /// is what this answers unless an endpoint says otherwise. An endpoint whose engine ENDS a
+    /// session itself — one that closes the connection a failed authentication was attempted
+    /// on, rather than letting the client keep trying on it — says so here, and the connection
+    /// is closed after its refusal has been written.
+    fn carries_on(&self, session: &Self::Session) -> bool {
+        let _ = session;
+        true
     }
 }
 
-impl NativeHandler for MongoWire {
+/// The server one endpoint of this wire answers with.
+pub struct MongoWire<E = InstanceSocket> {
+    endpoint: E,
+}
+
+impl<E: WireEndpoint> MongoWire<E> {
+    #[must_use]
+    pub fn new(endpoint: E) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl<E: WireEndpoint> NativeHandler for MongoWire<E> {
     fn serve(&self, conn: ListenerConn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let socket = self.socket.clone();
+        let socket = self.endpoint.clone();
         Box::pin(async move {
-            let connection_id = socket.take_connection_id();
-            let mut session = Session::new(connection_id);
+            let mut session = socket.open_session();
             let mut conn = conn;
             // One message at a time, until the client goes away or sends something this
             // endpoint does not serve. The session travels THROUGH each message, because
@@ -116,11 +156,11 @@ impl NativeHandler for MongoWire {
 
 /// Read one message and answer it, handing back the session for the next one — and `None`
 /// where the connection does not carry on.
-async fn serve_one(
-    socket: &InstanceSocket,
-    session: Session,
+async fn serve_one<E: WireEndpoint>(
+    socket: &E,
+    session: E::Session,
     conn: &mut ListenerConn,
-) -> Option<Session> {
+) -> Option<E::Session> {
     let mut header = [0u8; HEADER_BYTES];
     conn.read_exact(&mut header).await.ok()?;
     let length = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
@@ -139,18 +179,20 @@ async fn serve_one(
             // A client that said it is not waiting for a reply gets none, which is what
             // makes an unacknowledged write one round trip.
             if flags & FLAG_MORE_TO_COME != 0 {
-                return Some(session);
+                return carries_on(socket, session);
             }
-            write_message(conn, request_id, OP_MSG, &op_msg_body(&reply))
-                .await
-                .then_some(session)
+            if !write_message(conn, request_id, OP_MSG, &op_msg_body(&reply)).await {
+                return None;
+            }
+            carries_on(socket, session)
         }
         OP_QUERY => {
             let (command, database) = read_op_query(&body)?;
             let (reply, session) = answer(socket, session, database, command, conn).await?;
-            write_message(conn, request_id, OP_REPLY, &op_reply_body(&reply))
-                .await
-                .then_some(session)
+            if !write_message(conn, request_id, OP_REPLY, &op_reply_body(&reply)).await {
+                return None;
+            }
+            carries_on(socket, session)
         }
         // Every other opcode is one this endpoint does not serve — the legacy write
         // messages, which carry no reply at all, and a compressed message, which this
@@ -159,6 +201,12 @@ async fn serve_one(
         // result of an operation nothing ran.
         _ => None,
     }
+}
+
+/// The session, for a connection the endpoint carries on serving ([`WireEndpoint::carries_on`])
+/// — and `None` for one it has ended, which closes the connection once its reply is out.
+fn carries_on<E: WireEndpoint>(socket: &E, session: E::Session) -> Option<E::Session> {
+    socket.carries_on(&session).then_some(session)
 }
 
 /// Answer one command out of the cluster's documents, with the endpoint's facts as they are
@@ -180,13 +228,13 @@ async fn serve_one(
 ///
 /// `None` where the connection does not carry on: a task that panicked, or a command that ran
 /// past the ceiling.
-async fn answer(
-    socket: &InstanceSocket,
-    session: Session,
+async fn answer<E: WireEndpoint>(
+    socket: &E,
+    session: E::Session,
     database: String,
     command: Document,
     conn: &mut ListenerConn,
-) -> Option<(Document, Session)> {
+) -> Option<(Document, E::Session)> {
     if !query::document_nests_within(&command, query::MAX_NESTING_DEPTH) {
         let refusal = fault::bad_value(format!(
             "the command exceeds the maximum nesting depth of {}",
@@ -198,10 +246,7 @@ async fn answer(
     let socket = socket.clone();
     let executing = ::tokio::task::spawn_blocking(move || {
         let mut session = session;
-        let facts = socket.facts();
-        let mut volume = socket.lock_volume();
-        let reply = commands::execute(&mut session, &facts, &mut volume, &database, &command);
-        drop(volume);
+        let reply = socket.answer(&mut session, &database, &command);
         (reply, session)
     });
     match ::tokio::time::timeout(COMMAND_TIMEOUT, executing).await {

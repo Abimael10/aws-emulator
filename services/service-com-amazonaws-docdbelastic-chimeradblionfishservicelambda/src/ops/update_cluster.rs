@@ -304,6 +304,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster = record.as_cluster();
+        // The credential the cluster's endpoint authenticates a session against is derived
+        // from the administrator's password and the authentication type, so an update that
+        // changed either is the credential a LATER session has to present
+        // (`state::cluster_data_plane`). Sessions already open are judged by it on their next
+        // command, because the facts a command is judged by are read per command.
+        if applied {
+            state::cluster_data_plane::refresh_credentials(&guard, &input.cluster_arn);
+        }
         drop(guard);
 
         Ok(UpdateClusterOutput { cluster })

@@ -43,6 +43,29 @@ const MAX_OPEN_CURSORS: usize = 64;
 /// bounds stages times documents.
 const MAX_PIPELINE_STAGES: usize = 32;
 
+/// How many documents one PIPELINE may visit: the stages it carries times the accumulators the
+/// widest of them names times the documents it reads, each of which every stage walks.
+///
+/// CHOSEN as a process bound on that PRODUCT, which no one factor bounds on its own — the
+/// same reading the write path applies ([`MAX_WRITE_DOCUMENT_VISITS`]) — and sized so a
+/// pipeline that reaches it is one no client sends rather than one a client has to split.
+const MAX_PIPELINE_DOCUMENT_VISITS: usize = 20_000_000;
+
+/// How many accumulator fields one `$group` stage may carry. CHOSEN as a process bound, for
+/// the same reason [`MAX_PIPELINE_STAGES`] exists: each accumulator is evaluated once per
+/// document of every group the stage forms, so the fields of one client-written stage document
+/// multiply the documents the pipeline reads.
+const MAX_GROUP_ACCUMULATORS: usize = 32;
+
+/// How many values ONE accumulator may retain — the values `$push` keeps and the distinct ones
+/// `$addToSet` keeps.
+///
+/// CHOSEN as a process bound on what one group's answer holds: a group is formed from the
+/// documents the pipeline read, which is itself capped
+/// ([`documents::MAX_DOCUMENTS_PER_COLLECTION`]), so this is the ceiling that keeps an
+/// accumulator from outgrowing the documents it accumulated.
+const MAX_ACCUMULATED_VALUES: usize = documents::MAX_DOCUMENTS_PER_COLLECTION;
+
 /// How many documents one WRITE command may visit: the statements it carries times the
 /// documents the collection holds, each of which it walks.
 ///
@@ -134,6 +157,23 @@ impl Session {
             next_cursor_id: 1,
             skip_empty_exchange: false,
             hello_ok: false,
+        }
+    }
+
+    /// A session on a connection an endpoint's OWN authentication layer has already admitted
+    /// as `username`.
+    ///
+    /// What it is for is an endpoint of this wire that runs the SASL exchange itself because
+    /// its service words the refusals and offers the mechanisms differently
+    /// (`wire::WireEndpoint`): the session it hands the command layer is one that has
+    /// authenticated, so the gate below is the same single rule for both — a command outside
+    /// the handshake is served only to a session that presented the endpoint's credential, and
+    /// no caller can produce one by any other route.
+    #[must_use]
+    pub fn authenticated_as(connection_id: i64, username: &str) -> Self {
+        Self {
+            authenticated: Some(username.to_string()),
+            ..Self::new(connection_id)
         }
     }
 }
@@ -816,6 +856,11 @@ fn distinct(
         .to_string();
     let filter = document_member(command, "query")?;
     let selected = volume.select(database, &collection, &filter, None, 0, None, None)?;
+    // WHETHER a value has already been seen is asked of an ordered set ([`ComparedValue`]), so
+    // one value costs a logarithmic number of comparisons rather than one per value already
+    // held — a command whose values are all distinct would otherwise cost the square of the
+    // documents it read.
+    let mut held: std::collections::BTreeSet<ComparedValue> = std::collections::BTreeSet::new();
     let mut values: Vec<Bson> = Vec::new();
     for document in &selected {
         let found = match query::value_at(document, &field) {
@@ -826,10 +871,7 @@ fn distinct(
             Some(value) => vec![value.clone()],
         };
         for value in found {
-            if !values
-                .iter()
-                .any(|held| query::compare(held, &value) == std::cmp::Ordering::Equal)
-            {
+            if held.insert(ComparedValue(value.clone())) {
                 values.push(value);
             }
         }
@@ -1068,7 +1110,16 @@ fn aggregate(
             stages.len()
         )));
     }
-    let mut documents = volume.select(database, &collection, &Document::new(), None, 0, None, None)?;
+    let mut documents =
+        volume.select(database, &collection, &Document::new(), None, 0, None, None)?;
+    // What the stages ASK FOR is read before any of them runs: a `$group` evaluates each of
+    // its accumulators once per document of every group, so the accumulators one stage carries
+    // multiply the documents the pipeline reads, exactly as the stages themselves do.
+    let accumulators = widest_accumulator_spec(stages)?;
+    // The WORK the pipeline drives is bounded before any of it is done: every stage walks the
+    // documents the stages before it produced and evaluates its accumulators over each, so
+    // what is capped is the PRODUCT of the three.
+    within_pipeline_work(stages.len(), accumulators, documents.len())?;
     for stage in stages {
         let Bson::Document(stage) = stage else {
             return Err(fault::failed_to_parse("every pipeline stage must be an object"));
@@ -1166,6 +1217,99 @@ fn number_argument(stage: &str, argument: &Bson) -> Result<usize, WireFault> {
     }
 }
 
+/// The MOST accumulators any one `$group` stage of a pipeline carries, refusing a stage that
+/// carries more than [`MAX_GROUP_ACCUMULATORS`] of them.
+///
+/// Read from the stages BEFORE any of them runs, because it is one of the factors the work of
+/// the pipeline is the product of ([`within_pipeline_work`]): a stage's accumulators are each
+/// evaluated once per document of every group it forms, and how many a client's stage document
+/// carries is bounded by nothing else — a 16 MB document holds a great many fields.
+fn widest_accumulator_spec(stages: &[Bson]) -> Result<usize, WireFault> {
+    let mut widest = 0_usize;
+    for stage in stages {
+        let Some(spec) = stage
+            .as_document()
+            .and_then(|stage| stage.get_document("$group").ok())
+        else {
+            continue;
+        };
+        let accumulators = accumulators_of(spec);
+        if accumulators > MAX_GROUP_ACCUMULATORS {
+            return Err(fault::over_capacity(format!(
+                "this emulator accumulates at most {MAX_GROUP_ACCUMULATORS} fields in one \
+                 $group stage, got {accumulators}"
+            )));
+        }
+        widest = widest.max(accumulators);
+    }
+    Ok(widest)
+}
+
+/// How many ACCUMULATORS a `$group` spec names: its fields but the key expression, which is
+/// evaluated once per document rather than once per document per field.
+fn accumulators_of(spec: &Document) -> usize {
+    spec.keys().filter(|field| *field != "_id").count()
+}
+
+/// Whether the WORK a pipeline drives is within [`MAX_PIPELINE_DOCUMENT_VISITS`]: every stage
+/// walks the documents the stages before it produced and evaluates each of its accumulators
+/// over every one of them, so what is bounded here is the product of the three rather than any
+/// of them on its own — the same reading [`within_write_work`] applies to a write command.
+fn within_pipeline_work(
+    stages: usize,
+    accumulators: usize,
+    documents: usize,
+) -> Result<(), WireFault> {
+    let visits = stages
+        .saturating_mul(accumulators.max(1))
+        .saturating_mul(documents.max(1));
+    if visits > MAX_PIPELINE_DOCUMENT_VISITS {
+        return Err(fault::over_capacity(format!(
+            "this emulator visits at most {MAX_PIPELINE_DOCUMENT_VISITS} documents in one \
+             command, and a pipeline of {stages} stages accumulating {accumulators} fields \
+             over {documents} documents would visit {visits}"
+        )));
+    }
+    Ok(())
+}
+
+/// One value a dedupe is keyed by — the `_id` of a `$group`, a value of an `$addToSet` or of a
+/// `distinct` — ORDERED by the engine's own comparison of two values ([`query::compare`]).
+///
+/// What it is for is the cost of that dedupe: a new value compared against every value already
+/// held costs one comparison per value, so a command whose values are all distinct would cost
+/// the square of however many documents it read. Held in an ordered set instead, each value
+/// finds its place in a logarithmic number of comparisons, so one request's dedupe stays
+/// within the documents it read rather than their square.
+///
+/// The ORDER a command answers in is not this type's: the caller keeps the order it owes (the
+/// order the groups of a `$group` were first seen, the engine's own order for `distinct`) in a
+/// list beside the set.
+#[derive(Clone, Debug)]
+struct ComparedValue(Bson);
+
+/// Two values are the same value exactly when the engine's own comparison says so, which is
+/// what makes the ordered sets below dedupe the way a scan with [`query::compare`] did.
+impl PartialEq for ComparedValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for ComparedValue {}
+
+impl Ord for ComparedValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        query::compare(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for ComparedValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// `$group`: one document per distinct `_id` expression, carrying the accumulators the stage
 /// names.
 fn group(spec: &Document, documents: Vec<Document>) -> Result<Vec<Document>, WireFault> {
@@ -1173,18 +1317,29 @@ fn group(spec: &Document, documents: Vec<Document>) -> Result<Vec<Document>, Wir
         .get("_id")
         .cloned()
         .ok_or_else(|| fault::failed_to_parse("$group needs an _id"))?;
+    // How many fields this stage accumulates is one of the factors the pipeline's work was
+    // bounded by before any stage ran ([`widest_accumulator_spec`]); it is asked again here, so
+    // the bound holds for every caller of this stage and not only for that one path.
+    let accumulators = accumulators_of(spec);
+    if accumulators > MAX_GROUP_ACCUMULATORS {
+        return Err(fault::over_capacity(format!(
+            "this emulator accumulates at most {MAX_GROUP_ACCUMULATORS} fields in one $group \
+             stage, got {accumulators}"
+        )));
+    }
     // The groups keep the order their keys were first seen, which is the order the engine
-    // produces them in for a pipeline with no sort after the group.
+    // produces them in for a pipeline with no sort after the group — and WHICH group a document
+    // belongs to is resolved through an ordered map ([`ComparedValue`]), so one document costs a
+    // logarithmic number of comparisons rather than one per group already seen.
+    let mut positions: BTreeMap<ComparedValue, usize> = BTreeMap::new();
     let mut keys: Vec<Bson> = Vec::new();
     let mut grouped: Vec<Vec<Document>> = Vec::new();
     for document in documents {
         let key = evaluate(&key_expression, &document)?;
-        match keys
-            .iter()
-            .position(|held| query::compare(held, &key) == std::cmp::Ordering::Equal)
-        {
-            Some(position) => grouped[position].push(document),
+        match positions.get(&ComparedValue(key.clone())) {
+            Some(position) => grouped[*position].push(document),
             None => {
+                positions.insert(ComparedValue(key.clone()), keys.len());
                 keys.push(key);
                 grouped.push(vec![document]);
             }
@@ -1256,14 +1411,20 @@ fn accumulate(operator: &str, values: &[Bson]) -> Result<Bson, WireFault> {
             .unwrap_or(Bson::Null)),
         "$first" => Ok(values.first().cloned().unwrap_or(Bson::Null)),
         "$last" => Ok(values.last().cloned().unwrap_or(Bson::Null)),
-        "$push" => Ok(Bson::Array(values.to_vec())),
+        "$push" => {
+            within_accumulated_values("$push", values.len())?;
+            Ok(Bson::Array(values.to_vec()))
+        }
         "$addToSet" => {
+            within_accumulated_values("$addToSet", values.len())?;
+            // The set keeps the order its values were first seen, and WHETHER a value is
+            // already held is asked of an ordered set ([`ComparedValue`]), so one value costs a
+            // logarithmic number of comparisons rather than one per value already held.
+            let mut held: std::collections::BTreeSet<ComparedValue> =
+                std::collections::BTreeSet::new();
             let mut set: Vec<Bson> = Vec::new();
             for value in values {
-                if !set
-                    .iter()
-                    .any(|held| query::compare(held, value) == std::cmp::Ordering::Equal)
-                {
+                if held.insert(ComparedValue(value.clone())) {
                     set.push(value.clone());
                 }
             }
@@ -1276,6 +1437,18 @@ fn accumulate(operator: &str, values: &[Bson]) -> Result<Bson, WireFault> {
             "unknown group operator '{other}'"
         ))),
     }
+}
+
+/// Whether an accumulator that RETAINS its values may retain this many
+/// ([`MAX_ACCUMULATED_VALUES`]), asked before the array is built.
+fn within_accumulated_values(operator: &str, values: usize) -> Result<(), WireFault> {
+    if values > MAX_ACCUMULATED_VALUES {
+        return Err(fault::over_capacity(format!(
+            "this emulator retains at most {MAX_ACCUMULATED_VALUES} values in one accumulator, \
+             and {operator} over this group would retain {values}"
+        )));
+    }
+    Ok(())
 }
 
 /// A whole number as an integer and anything else as a double, which is how the engine types
