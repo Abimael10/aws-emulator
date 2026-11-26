@@ -1037,8 +1037,8 @@ fn authorize_request(
         "with an explicit deny in a session policy".to_string()
     } else if capped == Decision::Denied {
         match &boundary {
-            Some(arn) => format!("with an explicit deny in a permissions boundary: {arn}"),
-            None => "with an explicit deny in a permissions boundary".to_string(),
+            Some(arn) => iam::permissions_boundary_explicit_deny(arn),
+            None => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
         }
     } else if !granted {
         format!("because no identity-based policy allows the {action} action")

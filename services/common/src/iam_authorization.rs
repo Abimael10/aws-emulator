@@ -1069,6 +1069,18 @@ pub const RESOURCE_POLICY_EXPLICIT_DENY: &str = "with an explicit deny in a reso
 pub const PERMISSIONS_BOUNDARY_EXPLICIT_DENY: &str =
     "with an explicit deny in a permissions boundary";
 
+/// The same clause with the boundary that carried the deny NAMED: the ARN of the managed
+/// policy in force as the principal's permissions boundary, appended after a colon.
+///
+/// It is the one reason clause of this family that names the document the deciding statement
+/// came from, because in an account carrying several boundaries that ARN is the only part of
+/// the message identifying which ceiling refused the call. A gate that cannot name the
+/// boundary states [`PERMISSIONS_BOUNDARY_EXPLICIT_DENY`] alone.
+#[must_use]
+pub fn permissions_boundary_explicit_deny(boundary_arn: &str) -> String {
+    format!("{PERMISSIONS_BOUNDARY_EXPLICIT_DENY}: {boundary_arn}")
+}
+
 /// The reason clause for a request an explicit `Deny` in one of the SESSION POLICIES the
 /// caller's temporary credential was minted with refuses — a fact about that document, so the
 /// sentence names it rather than the action.

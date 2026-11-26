@@ -39,6 +39,16 @@
 //!   least-privilege scoping a client builds such a role to establish, and the resource fails
 //!   with that service's own authorization refusal.
 //!
+//! A grant that is in force is then CAPPED by the permissions boundary attached to the role —
+//! "a permissions boundary sets the maximum permissions that an identity-based policy can
+//! grant" (IAM, permissions boundaries) — so a call the boundary does not admit is refused
+//! however wide the role's own policies are, and refused whatever this gate could establish
+//! about those policies: a ceiling this emulator can read in full bounds every grant the role
+//! might carry, including a grant it cannot read. It is asked of the same action and the same
+//! resource the grant beneath it is, because a ceiling caps exactly the request a grant would
+//! permit. A boundary whose document this emulator does not hold is a ceiling it cannot read,
+//! and so applies to nothing.
+//!
 //! Nothing else is judged: a stack with no `RoleARN` runs with the caller's own permissions
 //! ("CloudFormation uses a temporary session that's generated from your user credentials"), an
 //! ARN the IAM store holds no role for may belong to another account, a role carrying an
@@ -72,8 +82,9 @@
 //! ## Bounds
 //!
 //! One role's documents per deployment, at most [`MAX_ROLE_DOCUMENTS`] of them — a role
-//! carrying more is one this gate cannot read in full, so it decides nothing — cloned out of
-//! the IAM store once per deployment and shared by reference for every call of it.
+//! carrying more is one this gate cannot read in full, so it decides nothing — plus the one
+//! document of the boundary in force on it, cloned out of the IAM store once per deployment and
+//! shared by reference for every call of it.
 
 use std::sync::Arc;
 
@@ -123,6 +134,16 @@ pub struct ServiceRole {
     /// a grant is not refused on it ([`Self::refusal_without_a_grant`]); an explicit `Deny` in
     /// a document that CAN be read still refuses.
     unreadable_attachment: bool,
+    /// The permissions boundary attached to the role, when it carries one this emulator holds
+    /// the document of: the ARN of the managed policy that is the boundary, and that document.
+    ///
+    /// It is the CEILING on the role's calls rather than another grant — "a permissions
+    /// boundary sets the maximum permissions that an identity-based policy can grant" — so it
+    /// is read whatever the role's own documents say, including where there are none and where
+    /// an attachment's grant cannot be read: those make a GRANT unestablishable, and a ceiling
+    /// that can be read in full bounds every grant there might be. The ARN is kept because a
+    /// refusal an explicit `Deny` in the boundary explains NAMES the boundary that carried it.
+    boundary: Option<(String, String)>,
 }
 
 impl ServiceRole {
@@ -157,6 +178,11 @@ impl ServiceRole {
         // attachment that collection resolved no document for is a grant this gate cannot
         // read, which it has to know about rather than read as the absence of a grant.
         let carried = store.principal_policies(role_arn).unwrap_or_default();
+        // The ceiling in force on the role, read through IAM's OWN definition of it, which
+        // resolves the attached managed policy's document at the version in effect and answers
+        // `None` for a boundary whose document this emulator does not hold — a ceiling it
+        // cannot read, and so cannot apply.
+        let boundary = store.permissions_boundary_in_force(role_arn);
         drop(store);
         if carried.documents.len() > MAX_ROLE_DOCUMENTS {
             return Self::unspecified();
@@ -165,6 +191,7 @@ impl ServiceRole {
             principal: Some(session_principal(role_arn, &role_name)),
             documents: carried.documents,
             unreadable_attachment: !carried.uncarried.is_empty(),
+            boundary,
         })
     }
 
@@ -178,11 +205,13 @@ impl ServiceRole {
     /// asked of the action the called service would authorize the request under
     /// ([`reported_action`]).
     ///
-    /// A role carrying no readable document AT ALL is the one case this gate decides nothing
+    /// A role carrying no readable document AT ALL is the one case no GRANT can be established
     /// for: its permissions are not something this emulator holds any of, so refusing its
-    /// deployment's calls would refuse calls AWS permits. The same holds for a role carrying an
-    /// attachment whose document is not held, which [`Self::refusal_without_a_grant`] reads the
-    /// same way.
+    /// deployment's calls for want of a grant would refuse calls AWS permits. The same holds for
+    /// a role carrying an attachment whose document is not held, which
+    /// [`Self::refusal_without_a_grant`] reads the same way. Neither lifts the CEILING: the
+    /// permissions boundary in force on the role caps every grant it might carry, readable or
+    /// not ([`Self::outside_the_boundary`]).
     ///
     /// The wording is the one AWS answers an unauthorized call with — the principal, the
     /// action, the resource and why — every part of it read off the call and the account's own
@@ -191,10 +220,48 @@ impl ServiceRole {
     /// decision cannot word it differently, and naming the action the way the service that
     /// refuses it words its own refusals ([`reported_action`]).
     fn refusal(&self, signing_name: &str, operation: &str, resource: &str) -> Option<String> {
+        let action = reported_action(signing_name, operation);
         if self.documents.is_empty() {
-            return None;
+            // No grant can be established — but the ceiling in force on the role caps every
+            // grant it might carry, so a call the boundary refuses is still refused.
+            return self.outside_the_ceiling(&action, resource);
         }
-        self.refusal_without_a_grant(&reported_action(signing_name, operation), resource)
+        self.refusal_without_a_grant(&action, resource)
+    }
+
+    /// The sentence refusing `action` on `resource` because the role's permissions BOUNDARY
+    /// does not admit it, or `None` where it does — or where the role carries no boundary this
+    /// emulator holds the document of, and where there is no role to judge the call on.
+    fn outside_the_ceiling(&self, action: &str, resource: &str) -> Option<String> {
+        let principal = self.principal.as_deref()?;
+        let request = iam::Request::new(action, resource, &[]);
+        let reason = self.outside_the_boundary(action, &request)?;
+        Some(iam::not_authorized_by_identity_policy(
+            principal, action, resource, &reason,
+        ))
+    }
+
+    /// Why the role's permissions BOUNDARY withholds `action`, or `None` where it does not — or
+    /// where the role carries no boundary this emulator holds the document of.
+    ///
+    /// A boundary is a ceiling and never a grant: "a permissions boundary sets the maximum
+    /// permissions that an identity-based policy can grant" (IAM, permissions boundaries), so a
+    /// call it does not allow is refused however wide the role's own policies are — which is
+    /// the one reading [`super::calling_principal`] gives the same ceiling for a call made with
+    /// the caller's own credentials. It is asked of the same action and the same resource the
+    /// grant beneath it is, because a ceiling caps exactly the request a grant would permit.
+    ///
+    /// An explicit `Deny` in the boundary is reported with the boundary NAMED
+    /// ([`iam::permissions_boundary_explicit_deny`]): that ARN is the only part of the sentence
+    /// saying which ceiling refused the call, and it is the same value the role's own IAM read
+    /// reports under `PermissionsBoundary.PermissionsBoundaryArn`.
+    fn outside_the_boundary(&self, action: &str, request: &iam::Request<'_>) -> Option<String> {
+        let (boundary_arn, document) = self.boundary.as_ref()?;
+        match iam::identity_decision(::std::slice::from_ref(document), request) {
+            Decision::Allowed => None,
+            Decision::Denied => Some(iam::permissions_boundary_explicit_deny(boundary_arn)),
+            _ => Some(iam::no_permissions_boundary_allows(action)),
+        }
     }
 
     /// The sentence refusing `action` on `resource` for want of a GRANT: the decision IAM
@@ -202,21 +269,24 @@ impl ServiceRole {
     /// refuses it whatever else is in force.
     ///
     /// `None` where there is no role to judge — a deployment that named none, an ARN this
-    /// account holds no role for — where the role's documents allow the call, and where the
-    /// role carries a grant this emulator cannot read ([`Self::unreadable_attachment`]):
-    /// refusing for want of a grant whose document is not held would refuse a call AWS
-    /// permits, which is the reading [`super::calling_principal`] gives the same case. The
-    /// reason clause names which of IAM's rules withheld the grant, as the refusal AWS words
-    /// does.
+    /// account holds no role for — where the role's documents allow the call and its boundary
+    /// admits it, and where the role carries a grant this emulator cannot read
+    /// ([`Self::unreadable_attachment`]): refusing for want of a grant whose document is not
+    /// held would refuse a call AWS permits, which is the reading
+    /// [`super::calling_principal`] gives the same case. A grant that is in force is capped by
+    /// the role's permissions boundary, which for this call has to admit the action itself
+    /// ([`Self::outside_the_boundary`]). The reason clause names which of IAM's rules withheld
+    /// the call, as the refusal AWS words does.
     fn refusal_without_a_grant(&self, action: &str, resource: &str) -> Option<String> {
         let principal = self.principal.as_deref()?;
         let request = iam::Request::new(action, resource, &[]);
-        let reason = match iam::identity_decision(&self.documents, &request) {
-            Decision::Allowed => return None,
-            Decision::Denied => iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
-            Decision::NotStated if self.unreadable_attachment => return None,
-            Decision::NotStated => iam::no_identity_policy_allows(action),
+        let withheld = match iam::identity_decision(&self.documents, &request) {
+            Decision::Allowed => None,
+            Decision::Denied => Some(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string()),
+            Decision::NotStated if self.unreadable_attachment => None,
+            Decision::NotStated => Some(iam::no_identity_policy_allows(action)),
         };
+        let reason = withheld.or_else(|| self.outside_the_boundary(action, &request))?;
         Some(iam::not_authorized_by_identity_policy(
             principal, action, resource, &reason,
         ))
@@ -323,7 +393,8 @@ mod tests {
     const PROVIDER: &str = "arn:aws:lambda:us-east-1:000000000000:function:provider";
     const INVOKE: &str = "lambda:InvokeFunction";
 
-    /// A role whose session is named and whose documents are `documents`.
+    /// A role whose session is named and whose documents are `documents`, carrying no
+    /// permissions boundary.
     fn role(documents: &[String], unreadable_attachment: bool) -> ServiceRole {
         ServiceRole {
             principal: Some(session_principal(
@@ -332,8 +403,20 @@ mod tests {
             )),
             documents: documents.to_vec(),
             unreadable_attachment,
+            boundary: None,
         }
     }
+
+    /// The same role with `boundary` as the document of the permissions boundary attached to
+    /// it, under [`BOUNDARY_ARN`].
+    fn bounded_by(mut judged: ServiceRole, boundary: &str) -> ServiceRole {
+        judged.boundary = Some((BOUNDARY_ARN.to_string(), boundary.to_string()));
+        judged
+    }
+
+    /// The managed policy in force as that boundary, which a refusal an explicit `Deny` in it
+    /// explains names.
+    const BOUNDARY_ARN: &str = "arn:aws:iam::000000000000:policy/ceiling";
 
     /// One statement document, as IAM's own grammar writes it.
     fn document(effect: &str, action: &str, resource: &str) -> String {
@@ -568,6 +651,179 @@ mod tests {
                 )
             });
             let actual = judged.refusal(QUEUE_SERVICE, CREATE_QUEUE, QUEUE);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the permissions boundary attached to the role CAPS every grant it carries, so a
+    /// DEPLOYMENT's call the boundary does not admit is refused however wide the role's own
+    /// documents are — and refused whatever this gate could establish about those documents,
+    /// since a ceiling read in full bounds a grant it cannot read as much as one it can.
+    ///
+    /// The rows differ along what the ceiling says about the call (every action, the called
+    /// service, another action of it, the call's action on another resource, another service
+    /// only, every action but that service's, an explicit deny) and along what the role carries
+    /// beneath it (an allow of everything, no readable document, an attachment whose document is
+    /// not held).
+    #[test]
+    fn a_deployment_call_the_role_boundary_does_not_admit_is_refused() {
+        let action = reported_action(QUEUE_SERVICE, CREATE_QUEUE);
+        let allowed_everything = || role(&[document("Allow", "*", "*")], false);
+        // (case, the role, the expected reason clause or None for a call that is not refused)
+        let rows: Vec<(&str, ServiceRole, Option<String>)> = vec![
+            (
+                "a ceiling over every action, beneath an allow of everything",
+                bounded_by(allowed_everything(), &document("Allow", "*", "*")),
+                None,
+            ),
+            (
+                "a ceiling over the called service",
+                bounded_by(allowed_everything(), &document("Allow", "sqs:*", "*")),
+                None,
+            ),
+            // A ceiling is read over the same action and the same resource the grant beneath it
+            // is, so one admitting only ANOTHER action of the called service admits no call of
+            // this one — the least-privilege ceiling a client attaches a boundary to establish.
+            (
+                "a ceiling over another action of the called service",
+                bounded_by(
+                    allowed_everything(),
+                    &document("Allow", "sqs:DeleteQueue", "*"),
+                ),
+                Some(iam::no_permissions_boundary_allows(&action)),
+            ),
+            (
+                "a ceiling over the call's own action on ANOTHER resource",
+                bounded_by(
+                    allowed_everything(),
+                    &document(
+                        "Allow",
+                        "sqs:CreateQueue",
+                        "arn:aws:sqs:us-east-1:000000000000:someone-else",
+                    ),
+                ),
+                Some(iam::no_permissions_boundary_allows(&action)),
+            ),
+            (
+                "a ceiling naming only another service",
+                bounded_by(allowed_everything(), &document("Allow", "ssm:*", "*")),
+                Some(iam::no_permissions_boundary_allows(&action)),
+            ),
+            (
+                "a ceiling over every action but the called service's",
+                bounded_by(allowed_everything(), &excluding("Allow", "sqs:*", "*")),
+                Some(iam::no_permissions_boundary_allows(&action)),
+            ),
+            (
+                "a ceiling that explicitly denies the call",
+                bounded_by(
+                    allowed_everything(),
+                    &document("Deny", "sqs:CreateQueue", QUEUE),
+                ),
+                Some(iam::permissions_boundary_explicit_deny(BOUNDARY_ARN)),
+            ),
+            // A role whose GRANTS this gate cannot establish is still bounded by a ceiling it
+            // can read in full.
+            (
+                "a ceiling naming another service, over no readable document at all",
+                bounded_by(role(&[], false), &document("Allow", "ssm:*", "*")),
+                Some(iam::no_permissions_boundary_allows(&action)),
+            ),
+            (
+                "a ceiling naming another service, over an unreadable attachment",
+                bounded_by(role(&[], true), &document("Allow", "ssm:*", "*")),
+                Some(iam::no_permissions_boundary_allows(&action)),
+            ),
+            // CONTROLS: nothing changes for a role carrying no boundary, and none of this
+            // decides a call there is no role to judge.
+            (
+                "no boundary at all",
+                role(&[], true),
+                None,
+            ),
+            (
+                "no role to judge the call on",
+                ServiceRole::default(),
+                None,
+            ),
+        ];
+        for (case, judged, clause) in rows {
+            let expected = clause.map(|clause| {
+                iam::not_authorized_by_identity_policy(
+                    judged.principal.clone().unwrap_or_default().as_str(),
+                    &action,
+                    QUEUE,
+                    &clause,
+                )
+            });
+            let actual = judged.refusal(QUEUE_SERVICE, CREATE_QUEUE, QUEUE);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE (the same ceiling, for a call whose action is the documented one of the service
+    /// being emulated): the boundary has to admit THAT action on THAT resource, exactly as the
+    /// grant beneath it does.
+    #[test]
+    fn a_call_needing_a_grant_is_refused_unless_the_boundary_admits_its_action() {
+        let allowed = || role(&[document("Allow", "*", "*")], false);
+        // (case, the role, the expected reason clause or None for a call that is not refused)
+        let rows: Vec<(&str, ServiceRole, Option<String>)> = vec![
+            (
+                "a ceiling over the action itself",
+                bounded_by(allowed(), &document("Allow", INVOKE, PROVIDER)),
+                None,
+            ),
+            (
+                "a ceiling over another action of the same service",
+                bounded_by(allowed(), &document("Allow", "lambda:CreateAlias", "*")),
+                Some(iam::no_permissions_boundary_allows(INVOKE)),
+            ),
+            (
+                "a ceiling over the action on ANOTHER resource",
+                bounded_by(
+                    allowed(),
+                    &document(
+                        "Allow",
+                        INVOKE,
+                        "arn:aws:lambda:us-east-1:000000000000:function:someone-else",
+                    ),
+                ),
+                Some(iam::no_permissions_boundary_allows(INVOKE)),
+            ),
+            (
+                "a ceiling that explicitly denies the call",
+                bounded_by(allowed(), &document("Deny", INVOKE, "*")),
+                Some(iam::permissions_boundary_explicit_deny(BOUNDARY_ARN)),
+            ),
+            (
+                "a ceiling over every action, above an unreadable attachment",
+                bounded_by(role(&[], true), &document("Allow", "*", "*")),
+                None,
+            ),
+            (
+                "a ceiling naming another service, above an unreadable attachment",
+                bounded_by(role(&[], true), &document("Allow", "ssm:*", "*")),
+                Some(iam::no_permissions_boundary_allows(INVOKE)),
+            ),
+            ("no boundary at all", allowed(), None),
+        ];
+        for (case, judged, clause) in rows {
+            let expected = clause.map(|clause| {
+                iam::not_authorized_by_identity_policy(
+                    judged.principal.clone().unwrap_or_default().as_str(),
+                    INVOKE,
+                    PROVIDER,
+                    &clause,
+                )
+            });
+            let actual = judged.refusal_without_a_grant(INVOKE, PROVIDER);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"

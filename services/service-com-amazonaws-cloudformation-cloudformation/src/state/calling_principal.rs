@@ -22,7 +22,7 @@
 //!    signed with;
 //! 2. **what it may do** — the identity-based policy documents in force on that principal and
 //!    the permissions boundary that caps them, read through the IAM service's OWN accessors
-//!    (`principal_policies`, `permissions_boundary_document`), where the collection rule
+//!    (`principal_policies`, `permissions_boundary_in_force`), where the collection rule
 //!    lives — so a policy `iam:PutUserPolicy` wrote takes effect on the next request and
 //!    deleting it lifts it again;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the tree's ONE evaluation of
@@ -67,6 +67,10 @@ enum Refused {
     /// Nothing in force grants the call, and this principal is one whose grants this emulator
     /// can read in full.
     NoIdentityGrant,
+    /// A grant is in force, but an explicit `Deny` in the permissions boundary capping it
+    /// refuses the call — the one refusal of this family whose sentence NAMES the document the
+    /// deciding statement came from.
+    BoundaryExplicitDeny,
     /// A grant is in force, but the permissions boundary capping it does not allow the call.
     OutsideBoundary,
 }
@@ -81,8 +85,10 @@ pub struct Caller {
     /// The identity-based policy documents in force on the principal.
     documents: Vec<String>,
     /// The permissions boundary in force on it, when it carries one whose document this
-    /// emulator holds.
-    boundary: Option<String>,
+    /// emulator holds: the ARN of the managed policy that is the boundary, and that document.
+    /// The ARN is kept because a refusal an explicit `Deny` in the boundary explains names the
+    /// boundary that carried it.
+    boundary: Option<(String, String)>,
     /// Set when this request presents the account's own published credential, which holds no
     /// IAM policies (see the module docs).
     account_credential: bool,
@@ -128,6 +134,10 @@ impl Caller {
         let reason = match self.refused(action, resource)? {
             Refused::ExplicitDeny => iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
             Refused::NoIdentityGrant => iam::no_identity_policy_allows(action),
+            Refused::BoundaryExplicitDeny => match &self.boundary {
+                Some((boundary_arn, _)) => iam::permissions_boundary_explicit_deny(boundary_arn),
+                None => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
+            },
             Refused::OutsideBoundary => iam::no_permissions_boundary_allows(action),
         };
         Some(iam::not_authorized_by_identity_policy(
@@ -153,9 +163,12 @@ impl Caller {
         if !(iam::is_allowed(said, Decision::NotStated) || self.identity_is_unbounded()) {
             return Some(Refused::NoIdentityGrant);
         }
-        let boundary = self.boundary.as_ref()?;
-        (iam::identity_decision(::std::slice::from_ref(boundary), &request) != Decision::Allowed)
-            .then_some(Refused::OutsideBoundary)
+        let (_, document) = self.boundary.as_ref()?;
+        match iam::identity_decision(::std::slice::from_ref(document), &request) {
+            Decision::Allowed => None,
+            Decision::Denied => Some(Refused::BoundaryExplicitDeny),
+            _ => Some(Refused::OutsideBoundary),
+        }
     }
 
     /// The principal this request speaks for, with the identity-based policies in force on it.
@@ -229,7 +242,7 @@ impl Caller {
             // catalog this emulator does not carry: a grant it cannot read.
             caller.unreadable_attachment = !policies.uncarried.is_empty();
         }
-        caller.boundary = held.permissions_boundary_document(&policies_arn);
+        caller.boundary = held.permissions_boundary_in_force(&policies_arn);
         caller
     }
 }
