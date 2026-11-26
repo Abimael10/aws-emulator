@@ -65,7 +65,10 @@ const CLOUDFRONT_PRINCIPAL: &str = "cloudfront.amazonaws.com";
 
 /// The code Amazon S3 refuses a read nothing granted with (Amazon S3 "Error responses"), which
 /// is what a viewer sees when the signature was admitted and the ORIGIN refused the fetch.
-const ACCESS_DENIED: &str = "AccessDenied";
+///
+/// `pub(crate)`: a sibling suite that states what the viewer must NOT be handed in its place
+/// ([`super::edge_custom_error_page_over_a_private_origin`]) names the same code.
+pub(crate) const ACCESS_DENIED: &str = "AccessDenied";
 
 /// The `Message` that refusal carries, which is Amazon S3's own wording for it ("Access
 /// Denied") and NOT CloudFront's for the same code ("Access denied"): a viewer served this
@@ -75,7 +78,9 @@ const ORIGIN_ACCESS_DENIED_MESSAGE: &str = "<Message>Access Denied</Message>";
 /// A member Amazon S3's error document carries and CloudFront's own refusal body — `Code` and
 /// `Message` alone — does not, so a refusal carrying it came from the origin rather than from
 /// the edge.
-const ORIGIN_ENVELOPE_MEMBER: &str = "<RequestId>";
+///
+/// `pub(crate)`: the sibling suite above reads the same member for the same reason.
+pub(crate) const ORIGIN_ENVELOPE_MEMBER: &str = "<RequestId>";
 
 /// CloudFront's code for a request that names no key at all, and the one for a key the
 /// behaviour's trusted key groups do not hold.

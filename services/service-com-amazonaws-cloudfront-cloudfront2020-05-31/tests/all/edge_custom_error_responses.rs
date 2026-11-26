@@ -68,8 +68,11 @@ const CACHING_OPTIMIZED: &str = "658327ea-f89d-4fab-a63d-7e88639e58f6";
 /// reader may list the bucket and `403` when it may not (Amazon S3 "Error responses"). Which one
 /// this origin gives is read off the control distribution rather than fixed here, and the
 /// configuration under test names both.
-const FORBIDDEN: u16 = 403;
-const NOT_FOUND: u16 = 404;
+///
+/// `pub(crate)`: a sibling suite that states the same rule over a PRIVATE origin
+/// ([`super::edge_custom_error_page_over_a_private_origin`]) names the same two statuses.
+pub(crate) const FORBIDDEN: u16 = 403;
+pub(crate) const NOT_FOUND: u16 = 404;
 
 /// The `ResponseCode` each entry replaces its status with: a `200` for the forbidden page, which
 /// is the substitution `ResponseCode` documents ("you might want to return a 200 status code
@@ -202,7 +205,10 @@ async fn view(router: &MultiServiceRouter, host: &str, path: &str) -> Viewed {
 }
 
 /// One `CustomErrorResponse` element.
-fn entry(error_code: u16, page: &str, response_code: u16, caching_ttl: u64) -> String {
+///
+/// `pub(crate)`: every suite in this target that states a custom error response builds the
+/// element through this one builder rather than carrying a copy of it.
+pub(crate) fn entry(error_code: u16, page: &str, response_code: u16, caching_ttl: u64) -> String {
     format!(
         "<CustomErrorResponse><ErrorCode>{error_code}</ErrorCode>\
          <ResponsePagePath>/{page}</ResponsePagePath>\
