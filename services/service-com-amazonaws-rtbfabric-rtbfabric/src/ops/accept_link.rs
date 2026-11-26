@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request was put to, so the end that asked for the link has no
             // acceptance to give, whatever status the record is in.
             return Err(AcceptLinkErrorModeled::ConflictException(ConflictException {
-                message: link.opener_cannot_accept_message(&gateway_id),
+                message: link.opener_cannot_answer_message(&gateway_id, "accepted"),
             })
             .into());
         }

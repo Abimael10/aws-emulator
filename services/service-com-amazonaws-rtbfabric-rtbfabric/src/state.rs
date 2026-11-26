@@ -465,8 +465,9 @@ impl Link {
 
     /// Whether `gateway_id` is the end this link was opened FROM — the end that
     /// asked for the link rather than the end the request was put to. The
-    /// request is answered by the OTHER end, so an acceptance is never this
-    /// end's to give.
+    /// request is answered by the OTHER end, so neither answer to it — the
+    /// acceptance that establishes the link nor the decline that ends it — is
+    /// ever this end's to give.
     pub fn opened_from(&self, gateway_id: &str) -> bool {
         self.gateway_id == gateway_id
     }
@@ -491,12 +492,15 @@ impl Link {
     }
 
     /// The message this service's `ConflictException` carries when the end the
-    /// link was opened FROM asks to accept it: the acceptance is the answer of
-    /// the end the request was put to, and the record names which end that is.
-    pub fn opener_cannot_accept_message(&self, gateway_id: &str) -> String {
+    /// link was opened FROM asks to answer the request itself: an answer —
+    /// `answer` is the past participle of the one the call asked for, the
+    /// acceptance that establishes the link or the decline that ends it — is the
+    /// answer of the end the request was put to, and the record names which end
+    /// that is.
+    pub fn opener_cannot_answer_message(&self, gateway_id: &str, answer: &str) -> String {
         format!(
-            "link {} was requested by gateway {} and can be accepted only by gateway {}",
-            self.link_id, gateway_id, self.peer_gateway_id
+            "link {} was requested by gateway {} and can be {} only by gateway {}",
+            self.link_id, gateway_id, answer, self.peer_gateway_id
         )
     }
 }

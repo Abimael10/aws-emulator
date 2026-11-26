@@ -380,21 +380,26 @@ async fn every_link_reader_reports_the_addressed_end_and_its_peer() {
 async fn a_declined_link_is_described_as_addressed_by_the_reader_too() {
     // The decline is answered from the end that addressed it; the reader of the
     // same record from the OTHER end reports the opposite orientation, which is
-    // the rule, not the record's stored direction.
-    for from_peer in [true, false] {
-        let case = if from_peer {
-            "the peer declines the request"
+    // the rule, not the record's stored direction. The decline is addressed to
+    // the end the request was put to, the only end whose decline the service
+    // takes (`link_reject_end.rs` holds which end that is); the rows span which
+    // kind of gateway opened the link, so the orientation is driven on a
+    // `REQUEST` link and on a `RESPONSE` one alike.
+    for opened_by_requester in [true, false] {
+        let case = if opened_by_requester {
+            "the peer declines a requester-opened request"
         } else {
-            "the opener withdraws the request"
+            "the peer declines a responder-opened request"
         };
         let fabric = Fabric::new();
         let (requester_id, responder_id) = fabric.gateway_pair(case, "declined").await;
-        let link_id = fabric.open_link(case, &requester_id, &responder_id).await;
-        let (addressed, other) = if from_peer {
-            (&responder_id, &requester_id)
-        } else {
+        let (opener_id, peer_id) = if opened_by_requester {
             (&requester_id, &responder_id)
+        } else {
+            (&responder_id, &requester_id)
         };
+        let link_id = fabric.open_link(case, opener_id, peer_id).await;
+        let (addressed, other) = (peer_id, opener_id);
 
         let (status, rejected) = fabric
             .send(

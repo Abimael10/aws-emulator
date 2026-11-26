@@ -4,11 +4,14 @@
 //!
 //! Declines an outstanding link request: the stored link moves to the terminal
 //! `REJECTED` status, so every later reader reports `REJECTED` and no further
-//! transition is owed on it. A link whose request is no longer outstanding cannot
-//! be declined -> `ConflictException` (409), except a repeat of this same call,
-//! which this `@idempotent` operation answers with the record it already left in
-//! `REJECTED`. An id that names no link on the addressed gateway ->
-//! `ResourceNotFoundException` (404).
+//! transition is owed on it. The decline is the answer of the end the request
+//! was put to — a link is opened from one end and answered by the other — so a
+//! call addressed to the end the link was opened FROM is refused with
+//! `ConflictException` (409) in every status. A link whose request is no longer
+//! outstanding cannot be declined -> `ConflictException` (409), except a repeat
+//! of this same call, which this `@idempotent` operation answers with the record
+//! it already left in `REJECTED`. An id that names no link on the addressed
+//! gateway -> `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        if link.opened_from(&gateway_id) {
+            // A link is opened from one end and answered by the OTHER: the
+            // decline that ends the request is the answer of the end the
+            // request was put to, so the end that asked for the link has no
+            // decline to give, whatever status the record is in.
+            return Err(RejectLinkErrorModeled::ConflictException(ConflictException {
+                message: link.opener_cannot_answer_message(&gateway_id, "rejected"),
+            })
+            .into());
+        }
 
         if link.request_outstanding() {
             // Declining is the end of the link's life: terminal, so nothing

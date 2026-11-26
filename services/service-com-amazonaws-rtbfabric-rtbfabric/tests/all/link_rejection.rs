@@ -8,12 +8,12 @@
 //! accept to `ACCEPTED` and then to the `ACTIVE` the clock owes it, each status
 //! being what every later reader reports; a link in any other status cannot be
 //! answered at all, beyond a repeat of the call that already put it there. The
-//! tables span what the rules generalise over — which of the link's two ends
-//! addresses the decline, whether the request has settled yet, which of the
-//! accept's optional members the call states, and every member of the modelled
-//! `LinkStatus` enum. The accept is addressed to the end the request was put
-//! to, because that is the only end whose acceptance establishes the link;
-//! which end may accept at all is covered in `link_accept_end.rs`.
+//! tables span what the rules generalise over — whether the request has settled
+//! yet, which of the accept's optional members the call states, and every member
+//! of the modelled `LinkStatus` enum. Both answers are addressed to the end the
+//! request was put to, because that is the only end whose answer the service
+//! takes; which end may answer at all is covered in `link_accept_end.rs` and
+//! `link_reject_end.rs`.
 //!
 //! The decline's own consequence is covered here too: a link that has reached a
 //! terminal status occupies the gateway pair no longer, so the two gateways can
@@ -264,36 +264,24 @@ struct Pair {
     created_at: Value,
 }
 
-/// One row: which end addresses the reject, and whether the clock has settled
-/// `PENDING_REQUEST` -> `REQUESTED` first, so both outstanding statuses are
-/// covered from both ends.
+/// One row: whether the clock has settled `PENDING_REQUEST` -> `REQUESTED`
+/// before the decline, so both outstanding statuses are covered. Every row
+/// addresses the end the request was put to, the end the operation's
+/// documentation describes as declining it, because that is the only end whose
+/// decline the service takes; which end may decline at all is covered in
+/// `link_reject_end.rs`.
 struct Row {
     name: &'static str,
-    /// `true` for the gateway the request was put to (the end the operation's
-    /// documentation describes as declining it), `false` for the opener.
-    from_peer: bool,
     settle_first: bool,
 }
 
 const ROWS: &[Row] = &[
     Row {
         name: "the peer declines an unsettled request",
-        from_peer: true,
         settle_first: false,
     },
     Row {
         name: "the peer declines a settled request",
-        from_peer: true,
-        settle_first: true,
-    },
-    Row {
-        name: "the opener withdraws an unsettled request",
-        from_peer: false,
-        settle_first: false,
-    },
-    Row {
-        name: "the opener withdraws a settled request",
-        from_peer: false,
         settle_first: true,
     },
 ];
@@ -304,11 +292,8 @@ async fn rejecting_an_outstanding_request_moves_the_link_to_rejected_for_every_r
         let case = row.name;
         let fabric = Fabric::new();
         let pair = fabric.linked_pair("token").await;
-        let (addressed, other) = if row.from_peer {
-            (&pair.responder_id, &pair.requester_id)
-        } else {
-            (&pair.requester_id, &pair.responder_id)
-        };
+        // The decline is the answer of the end the request was put to.
+        let (addressed, other) = (&pair.responder_id, &pair.requester_id);
 
         let expected_before = if row.settle_first {
             // The move to REQUESTED is owed by the clock: poll for it rather
