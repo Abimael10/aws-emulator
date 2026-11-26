@@ -158,17 +158,25 @@ fn entity_collection(dataset: &DatasetRecord) -> Option<(ingestion::MetadataKind
     }
 }
 
-/// Merge the `properties` a record carries into `row`, DROPPING any whose name is one of
-/// the `derived` columns the row takes from the stored record itself.
+/// Merge the `properties` a record carries into `row`, DROPPING any whose name is a column
+/// the row ALREADY DERIVED from the stored record — the keys `row` holds when this is
+/// called.
 ///
 /// What identifies a record, and when its interaction happened, come from the record — the
 /// fields a schema of its dataset type requires (`crate::state::REQUIRED_SCHEMA_FIELDS`)
 /// plus the event's own value — so a property a caller happens to name the same as one of
-/// them cannot reshape the row's identity or its instant. Names are compared the way every
-/// field name in this crate is: case-insensitively.
-fn merge_properties(row: &mut Row, derived: &[&str], properties: Option<&::serde_json::Value>) {
+/// them cannot reshape the row's identity or its instant. A column the row derived NOTHING
+/// for, on the other hand, is not that row's identity to protect, and the property is kept
+/// like any other rather than lost. The derived keys are snapshotted first, so one property
+/// can never shadow another that differs from it only in case. Names are compared the way
+/// every field name in this crate is: case-insensitively.
+fn merge_properties(row: &mut Row, properties: Option<&::serde_json::Value>) {
+    let derived: Vec<String> = row.keys().cloned().collect();
     for (name, value) in columns_of(properties) {
-        if derived.iter().any(|column| column.eq_ignore_ascii_case(&name)) {
+        if derived
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(&name))
+        {
             continue;
         }
         row.insert(name, value);
@@ -188,7 +196,7 @@ fn entity_rows(
         .map(|(id, record)| {
             let mut row = Row::new();
             row.insert(id_column.to_string(), id.clone());
-            merge_properties(&mut row, &[id_column], record.properties.as_ref());
+            merge_properties(&mut row, record.properties.as_ref());
             row
         })
         .collect()
@@ -220,18 +228,7 @@ fn event_row(event: &ingestion::StoredEvent) -> Row {
     if let Some(event_value) = event.event_value {
         row.insert(EVENT_VALUE_COLUMN.to_string(), event_value.to_string());
     }
-    merge_properties(
-        &mut row,
-        &[
-            USER_ID_COLUMN,
-            ITEM_ID_COLUMN,
-            SESSION_ID_COLUMN,
-            TIMESTAMP_COLUMN,
-            EVENT_TYPE_COLUMN,
-            EVENT_VALUE_COLUMN,
-        ],
-        event.properties.as_ref(),
-    );
+    merge_properties(&mut row, event.properties.as_ref());
     row
 }
 
@@ -256,16 +253,6 @@ fn action_interaction_row(interaction: &ingestion::StoredActionInteraction) -> R
         EVENT_TYPE_COLUMN.to_string(),
         interaction.event_type.clone(),
     );
-    merge_properties(
-        &mut row,
-        &[
-            USER_ID_COLUMN,
-            ACTION_ID_COLUMN,
-            SESSION_ID_COLUMN,
-            TIMESTAMP_COLUMN,
-            EVENT_TYPE_COLUMN,
-        ],
-        interaction.properties.as_ref(),
-    );
+    merge_properties(&mut row, interaction.properties.as_ref());
     row
 }

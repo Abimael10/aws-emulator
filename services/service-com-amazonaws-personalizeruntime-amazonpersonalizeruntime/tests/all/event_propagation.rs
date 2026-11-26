@@ -1460,3 +1460,340 @@ async fn the_catalog_bound_keeps_the_most_interacted_with_added_entries() {
          single interaction, got {pre_fitted} against {single}"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// What an ingested `properties` entry contributes to the interaction row a filter reads:
+// a property is dropped only where the row DERIVED a column of that name from the stored
+// record itself, and kept otherwise.
+// ---------------------------------------------------------------------------------------
+
+/// The user every row of this section records its one interaction for.
+const PROPERTY_USER: &str = "user-1";
+/// The item that interaction is about, which the fitted Items catalog holds (`items`).
+const PROPERTY_ITEM: &str = "item-0";
+/// The action the action-interaction rows are about, which the fitted Actions catalog
+/// holds (`actions`).
+const PROPERTY_ACTION: &str = "action-0";
+/// An item id of the fitted catalog that is NOT the one the interaction is about, for the
+/// rows asserting that a property cannot reshape a column the row derived.
+const PROPERTY_OTHER_ITEM: &str = "item-5";
+/// The same for the Actions catalog.
+const PROPERTY_OTHER_ACTION: &str = "action-3";
+
+/// One row: the record the ingestion plane stores, and the filter expression a clause over
+/// the column that record's `properties` name.
+struct PropertyRow {
+    case: &'static str,
+    /// `Event$eventValue` the event carried, for the rows about the one column an item
+    /// interaction row derives only sometimes.
+    event_value: Option<f64>,
+    /// The record's own `properties` object, as the modelled JSON string map.
+    properties: Value,
+    /// The registered filter's expression.
+    expression: &'static str,
+    /// Whether the entry the interaction is about must survive the filter.
+    kept: bool,
+}
+
+/// An emulator holding the group's ingestion targets, its campaigns and ONE filter: a
+/// fresh one per row, so no row reads an interaction another row recorded.
+fn property_fixture(filter_arn: &str, expression: &str) -> Emulator {
+    let emulator = Emulator::with_ingestion();
+    let engine = &*emulator.engine;
+    register_ingestion_targets(engine);
+
+    // Everything was fitted before this row records anything, as in `seeded`.
+    let fitted_at = SystemTime::now();
+    for (arn, recipe_type) in [
+        (CAMPAIGN_USER, RecipeType::UserPersonalization),
+        (CAMPAIGN_RANKING, RecipeType::PersonalizedRanking),
+    ] {
+        assert!(
+            registry::register_campaign(
+                engine,
+                Campaign::new(arn, "propagation", recipe_type, items(CATALOG_SIZE))
+                    .fitted_to(GROUP, fitted_at)
+            ),
+            "case {arn}: the campaign seam must register the campaign"
+        );
+    }
+    assert!(
+        registry::register_campaign(
+            engine,
+            Campaign::new_actions(
+                CAMPAIGN_ACTIONS,
+                "propagation-actions",
+                actions(ACTION_CATALOG_SIZE)
+            )
+            .fitted_to(GROUP, fitted_at)
+        ),
+        "the campaign seam must register the action campaign"
+    );
+    assert_eq!(
+        registry::register_filter(engine, filter_arn, expression),
+        Ok(true),
+        "case {expression:?}: the filter seam must accept the expression"
+    );
+    emulator
+}
+
+/// The ARN of the one filter a row registers, kept distinct per row.
+fn property_filter_arn(index: usize) -> String {
+    format!("arn:aws:personalize:us-east-1:000000000000:filter/property-{index}")
+}
+
+/// Record ONE item interaction for [`PROPERTY_USER`] on [`PROPERTY_ITEM`] through
+/// `PutEvents`, carrying `properties` and, when the row names one, `eventValue`.
+async fn record_event_with_properties(
+    emulator: &Emulator,
+    event_value: Option<f64>,
+    properties: &Value,
+) {
+    let mut event = json!({
+        "eventType": "watch",
+        "sentAt": SENT_AT,
+        "itemId": PROPERTY_ITEM,
+        "eventId": "property-row",
+        "properties": properties.to_string(),
+    });
+    if let Some(event_value) = event_value {
+        event["eventValue"] = json!(event_value);
+    }
+    emulator
+        .ingest(
+            EVENTS,
+            json!({
+                "trackingId": TRACKING_ID,
+                "sessionId": format!("session-{PROPERTY_USER}"),
+                "userId": PROPERTY_USER,
+                "eventList": [event],
+            }),
+        )
+        .await;
+}
+
+/// The same through `PutActionInteractions`, for [`PROPERTY_ACTION`].
+async fn record_action_interaction_with_properties(emulator: &Emulator, properties: &Value) {
+    emulator
+        .ingest(
+            ACTION_INTERACTIONS,
+            json!({
+                "trackingId": TRACKING_ID,
+                "actionInteractions": [{
+                    "actionId": PROPERTY_ACTION,
+                    "sessionId": format!("session-{PROPERTY_USER}"),
+                    "userId": PROPERTY_USER,
+                    "timestamp": SENT_AT,
+                    "eventType": "Taken",
+                    "eventId": "property-action-row",
+                    "properties": properties.to_string(),
+                }],
+            }),
+        )
+        .await;
+}
+
+/// The ids a list member reports, sorted, for a response under a filter.
+fn sorted_ids(response: &Value, member: &str, id_member: &str) -> Vec<String> {
+    let mut returned = ids(response, member, id_member);
+    returned.sort();
+    returned
+}
+
+#[tokio::test]
+async fn an_event_property_reaches_every_interaction_column_the_row_did_not_derive() {
+    // Each row stores ONE item interaction and reads it back through a clause over the
+    // column its `properties` name. The rows differ along what the rule generalises over:
+    // which column the property names, whether the record derived a value for that column,
+    // the spelling of the property's name and the JSON form of its value.
+    let rows: Vec<PropertyRow> = vec![
+        PropertyRow {
+            case: "ACTION_ID, which an item interaction row never derives",
+            event_value: None,
+            properties: json!({ "ACTION_ID": "a1" }),
+            expression: "INCLUDE ItemID WHERE Interactions.ACTION_ID IN (\"a1\")",
+            kept: true,
+        },
+        PropertyRow {
+            case: "ACTION_ID carrying a JSON number rather than a string",
+            event_value: None,
+            properties: json!({ "ACTION_ID": 7 }),
+            expression: "INCLUDE ItemID WHERE Interactions.ACTION_ID = \"7\"",
+            kept: true,
+        },
+        PropertyRow {
+            case: "EVENT_VALUE, for an event that carried no eventValue",
+            event_value: None,
+            properties: json!({ "EVENT_VALUE": "42" }),
+            expression: "INCLUDE ItemID WHERE Interactions.EVENT_VALUE > 10",
+            kept: true,
+        },
+        PropertyRow {
+            case: "EVENT_VALUE, for an event whose own eventValue is below the bound",
+            event_value: Some(5.0),
+            properties: json!({ "EVENT_VALUE": "42" }),
+            expression: "INCLUDE ItemID WHERE Interactions.EVENT_VALUE > 10",
+            kept: false,
+        },
+        PropertyRow {
+            case: "event_value in lower case, for an event that carried one",
+            event_value: Some(5.0),
+            properties: json!({ "event_value": "42" }),
+            expression: "INCLUDE ItemID WHERE Interactions.event_value > 10",
+            kept: false,
+        },
+        PropertyRow {
+            case: "ITEM_ID, which the row derives, read against the property's value",
+            event_value: None,
+            properties: json!({ "ITEM_ID": PROPERTY_OTHER_ITEM }),
+            expression: "INCLUDE ItemID WHERE Interactions.ITEM_ID IN (\"item-5\")",
+            kept: false,
+        },
+        PropertyRow {
+            case: "ITEM_ID, which the row derives, read against the record's own value",
+            event_value: None,
+            properties: json!({ "ITEM_ID": PROPERTY_OTHER_ITEM }),
+            expression: "INCLUDE ItemID WHERE Interactions.ITEM_ID IN (\"item-0\")",
+            kept: true,
+        },
+        PropertyRow {
+            case: "a property naming no interaction column at all",
+            event_value: None,
+            properties: json!({ "DEVICE": "mobile" }),
+            expression: "INCLUDE ItemID WHERE Interactions.DEVICE IN (\"mobile\")",
+            kept: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let filter_arn = property_filter_arn(index);
+        let emulator = property_fixture(&filter_arn, row.expression);
+        record_event_with_properties(&emulator, row.event_value, &row.properties).await;
+
+        let expected: Vec<String> = if row.kept {
+            vec![PROPERTY_ITEM.to_string()]
+        } else {
+            Vec::new()
+        };
+
+        // The same recorded facts, read by the two operations that rank items: an INCLUDE
+        // expression over an interaction column keeps exactly the entries this user's
+        // interactions match, so it keeps the one item the interaction is about or nothing.
+        let ranked = sorted_ids(
+            &emulator
+                .ok(
+                    PERSONALIZE_RANKING,
+                    json!({
+                        "campaignArn": CAMPAIGN_RANKING,
+                        "userId": PROPERTY_USER,
+                        "inputList": [PROPERTY_ITEM, PROPERTY_OTHER_ITEM],
+                        "filterArn": filter_arn,
+                    }),
+                )
+                .await,
+            "personalizedRanking",
+            "itemId",
+        );
+        assert_eq!(
+            ranked, expected,
+            "case {:?}: GetPersonalizedRanking expected {expected:?}, got {ranked:?}",
+            row.case
+        );
+
+        let recommended = sorted_ids(
+            &emulator
+                .ok(
+                    RECOMMENDATIONS,
+                    json!({
+                        "campaignArn": CAMPAIGN_USER,
+                        "userId": PROPERTY_USER,
+                        "numResults": CATALOG_SIZE,
+                        "filterArn": filter_arn,
+                    }),
+                )
+                .await,
+            "itemList",
+            "itemId",
+        );
+        assert_eq!(
+            recommended, expected,
+            "case {:?}: GetRecommendations expected {expected:?}, got {recommended:?}",
+            row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_action_interaction_property_reaches_every_column_that_row_did_not_derive() {
+    // The same rule on the other interaction stream, whose row derives neither an item nor
+    // an event value — so a property naming either is the only value that column holds.
+    let rows: Vec<PropertyRow> = vec![
+        PropertyRow {
+            case: "ITEM_ID, which an action interaction row never derives",
+            event_value: None,
+            properties: json!({ "ITEM_ID": PROPERTY_ITEM }),
+            expression: "INCLUDE ActionID WHERE Action_Interactions.ITEM_ID IN (\"item-0\")",
+            kept: true,
+        },
+        PropertyRow {
+            case: "EVENT_VALUE, which an action interaction row never derives",
+            event_value: None,
+            properties: json!({ "EVENT_VALUE": "42" }),
+            expression: "INCLUDE ActionID WHERE Action_Interactions.EVENT_VALUE > 10",
+            kept: true,
+        },
+        PropertyRow {
+            case: "ACTION_ID, which the row derives, read against the property's value",
+            event_value: None,
+            properties: json!({ "ACTION_ID": PROPERTY_OTHER_ACTION }),
+            expression: "INCLUDE ActionID WHERE Action_Interactions.ACTION_ID IN (\"action-3\")",
+            kept: false,
+        },
+        PropertyRow {
+            case: "ACTION_ID, which the row derives, read against the record's own value",
+            event_value: None,
+            properties: json!({ "ACTION_ID": PROPERTY_OTHER_ACTION }),
+            expression: "INCLUDE ActionID WHERE Action_Interactions.ACTION_ID IN (\"action-0\")",
+            kept: true,
+        },
+        PropertyRow {
+            case: "a property naming no action interaction column at all",
+            event_value: None,
+            properties: json!({ "SURFACE": "email" }),
+            expression: "INCLUDE ActionID WHERE Action_Interactions.SURFACE IN (\"email\")",
+            kept: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let filter_arn = property_filter_arn(index);
+        let emulator = property_fixture(&filter_arn, row.expression);
+        record_action_interaction_with_properties(&emulator, &row.properties).await;
+
+        let expected: Vec<String> = if row.kept {
+            vec![PROPERTY_ACTION.to_string()]
+        } else {
+            Vec::new()
+        };
+        let returned = sorted_ids(
+            &emulator
+                .ok(
+                    ACTION_RECOMMENDATIONS,
+                    json!({
+                        "campaignArn": CAMPAIGN_ACTIONS,
+                        "userId": PROPERTY_USER,
+                        "numResults": ACTION_CATALOG_SIZE,
+                        "filterArn": filter_arn,
+                    }),
+                )
+                .await,
+            "actionList",
+            "actionId",
+        );
+        assert_eq!(
+            returned, expected,
+            "case {:?}: GetActionRecommendations expected {expected:?}, got {returned:?}",
+            row.case
+        );
+    }
+}

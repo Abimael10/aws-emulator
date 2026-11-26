@@ -82,18 +82,6 @@ pub const IMPRESSION_COLUMN: &str = "IMPRESSION";
 /// The interaction column carrying `Event$recommendationId`.
 pub const RECOMMENDATION_ID_COLUMN: &str = "RECOMMENDATION_ID";
 
-/// The columns an interaction row takes from the stored record itself, which a property
-/// of the same name therefore cannot reshape.
-const DERIVED_COLUMNS: [&str; 7] = [
-    USER_ID_COLUMN,
-    ITEM_ID_COLUMN,
-    ACTION_ID_COLUMN,
-    TIMESTAMP_COLUMN,
-    EVENT_TYPE_COLUMN,
-    EVENT_VALUE_COLUMN,
-    IMPRESSION_COLUMN,
-];
-
 /// The most interaction rows one inference call reads out of a dataset group's trackers,
 /// the most recent ones first to be kept.
 pub const MAX_LIVE_INTERACTIONS: usize = 10_000;
@@ -433,17 +421,25 @@ fn action_interaction_columns(
     columns
 }
 
-/// Merge a record's `properties` into `columns`, DROPPING any whose name is one of the
-/// columns the row takes from the record itself ([`DERIVED_COLUMNS`]): what identifies a
-/// row and when it happened come from the record, so a property a caller happens to name
-/// the same cannot reshape it. Names are compared case-insensitively, the way Personalize
-/// compares a schema field name.
+/// Merge a record's `properties` into `columns`, DROPPING any whose name is a column the
+/// row ALREADY DERIVED from the stored record — the keys `columns` holds when this is
+/// called: what identifies a row and when it happened come from the record, so a property
+/// a caller happens to name the same cannot reshape it.
+///
+/// A column the row derived NOTHING for — a name its own record carries no value under, so
+/// `columns` holds no key for it — is not that row's identity to protect, and the property
+/// is kept like any other: dropping it would lose a value the ingestion plane stored and
+/// leave the column absent, which no filter predicate can match. The derived keys are
+/// snapshotted first, so one property can never shadow another that differs from it only
+/// in case. Names are compared case-insensitively, the way Personalize compares a schema
+/// field name.
 fn merge_properties(
     columns: &mut BTreeMap<String, String>,
     raw: Option<&::serde_json::Value>,
 ) {
+    let derived: Vec<String> = columns.keys().cloned().collect();
     for (name, value) in properties(raw) {
-        if DERIVED_COLUMNS
+        if derived
             .iter()
             .any(|column| column.eq_ignore_ascii_case(&name))
         {
