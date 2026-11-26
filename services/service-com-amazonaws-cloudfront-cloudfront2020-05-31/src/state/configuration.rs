@@ -2042,17 +2042,20 @@ pub fn no_such_continuous_deployment_policy() -> crate::ops::types::NoSuchContin
     }
 }
 
-/// `ContinuousDeploymentPolicyInUse`'s message: the sentence the model states on the shape
-/// itself, worded as the operation documents the condition — the policy is attached to a
-/// primary distribution, and the caller is told to detach it first.
+/// `ContinuousDeploymentPolicyInUse`'s message, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. Like [`DISTRIBUTION_NOT_DISABLED_MESSAGE`] it differs from the sentence
+/// the MODEL's documentation of the error shape uses for the same condition ("You cannot
+/// delete a continuous deployment policy that is associated with a primary distribution."):
+/// that one documents the condition, this one is served. Do not "correct" this constant to the
+/// documentation sentence.
 ///
 /// A property of the CONDITION rather than of the request, so nothing from the request or
 /// from the store belongs in it and every refusal of it reads the same, exactly as
 /// [`CACHE_POLICY_IN_USE_MESSAGE`] words the same condition for a cache policy.
 pub const CONTINUOUS_DEPLOYMENT_POLICY_IN_USE_MESSAGE: &str =
-    "You cannot delete a continuous deployment policy that is associated with a primary \
-     distribution. First update your distribution to remove the continuous deployment \
-     policy, then you can delete the policy.";
+    "The specified continuous deployment policy is currently associated with a distribution.";
 
 /// The modelled `ContinuousDeploymentPolicyInUse` (HTTP 409) for a delete of a policy a
 /// stored distribution still attaches.
@@ -2234,9 +2237,9 @@ pub const PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE: &str =
     "The request failed because it didn't meet the preconditions for this operation.";
 
 /// `PreconditionFailed`'s message on the DISTRIBUTION-TENANT surface — the tenants, the
-/// connection groups and connection functions that route them, and the web-ACL associations
-/// of both — as CloudFront sends it: "Your request is missing requirements for this
-/// operation. Update your request and try again."
+/// connection groups and connection functions that route them, the web-ACL associations of
+/// both, and the mutual-TLS TRUST STORES — as CloudFront sends it: "Your request is missing
+/// requirements for this operation. Update your request and try again."
 ///
 /// The THIRD wording of the one condition, because CloudFront words this refusal per API
 /// FAMILY: this family reports the request as missing a requirement rather than reporting the
@@ -2338,7 +2341,8 @@ pub fn precondition_failed_for_this_operation() -> crate::ops::types::Preconditi
 
 /// The modelled `PreconditionFailed` for an `If-Match` that is a well-formed version token
 /// but not the current one, worded as the DISTRIBUTION-TENANT surface words it
-/// ([`PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE`]).
+/// ([`PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE`]) — the surface the trust stores
+/// belong to as well.
 pub fn precondition_failed_missing_requirements() -> crate::ops::types::PreconditionFailed {
     crate::ops::types::PreconditionFailed {
         message: Some(PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE.to_string()),

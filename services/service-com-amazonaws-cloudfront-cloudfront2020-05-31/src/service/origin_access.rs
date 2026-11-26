@@ -110,7 +110,12 @@ const ORIGIN_TYPE_SIGNING_NAMES: [(&str, &str); 5] = [
 
 /// The `OriginAccessControlOriginType` whose origin is an Amazon S3 bucket, and so the one
 /// whose resource policy is a BUCKET policy.
-const S3_ORIGIN_TYPE: &str = "s3";
+///
+/// `pub(crate)` because it is also the one type the PAIRING rule reads a configuration's own
+/// statement of its origin kind against
+/// (`crate::state::mismatched_origin_access_control`): an origin says whether it is a bucket
+/// by the configuration member it carries, and this is the type that fronts one.
+pub(crate) const S3_ORIGIN_TYPE: &str = "s3";
 
 /// The condition key naming the resource a cross-service call was made ON BEHALF OF — here
 /// the distribution the origin request is being made for, which is what an origin's own

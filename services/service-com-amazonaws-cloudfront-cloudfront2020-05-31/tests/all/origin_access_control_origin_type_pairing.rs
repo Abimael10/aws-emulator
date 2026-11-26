@@ -13,8 +13,10 @@
 //!   (`smithy_query(query="shape",shape="OriginAccessControlOriginTypes")`: `s3`,
 //!   `execute-api`, `mediastore`, `mediapackagev2`, `lambda`), and the control signs the origin
 //!   request CloudFront makes to THAT service — so every call that stores a
-//!   `DistributionConfig` admits a control on an origin only while the origin is addressed at
-//!   that service's endpoint, and refuses any other pairing with
+//!   `DistributionConfig` admits a control on an origin only while the origin is of the kind
+//!   that service's is: specified with the configuration member that names that kind
+//!   (`S3OriginConfig` for the one `s3` control, `CustomOriginConfig` for every other type's
+//!   origin) AND addressed at that service's endpoint. Every other pairing is refused with
 //!   `IllegalOriginAccessConfiguration` (HTTP 400), storing nothing;
 //! * the refusal is read on EVERY origin of the configuration, wherever the mismatched one
 //!   sits;
@@ -56,8 +58,9 @@ const CACHING_OPTIMIZED: &str = "658327ea-f89d-4fab-a63d-7e88639e58f6";
 // ---------------------------------------------------------------------------
 
 /// One `Origin$DomainName` form, and the `OriginAccessControlOriginType` whose service it
-/// addresses — `None` for an address that is nobody's service endpoint, which no control may
-/// front.
+/// addresses — `None` for an origin no control may front at all, either because the address is
+/// nobody's service endpoint or because the configuration member the origin is specified with
+/// names a kind no type's service answers for.
 ///
 /// The forms come from the endpoints the services the origin types name publish: the Amazon S3
 /// endpoint spellings of a bucket (Amazon S3 User Guide, *Amazon S3 endpoints*),
@@ -92,11 +95,16 @@ fn addresses() -> Vec<Address> {
             s3_origin_config: true,
             fronted_by: Some("s3"),
         },
+        // An Amazon S3 bucket's STATIC WEBSITE surface is specified as a CUSTOM origin ("if
+        // the Amazon S3 bucket is configured with static website hosting, use this type"), so
+        // the configuration states an origin that is not the bucket's REST API: what answers
+        // there is the website endpoint, and no origin type's service does, so no control may
+        // front it — the `s3` control included.
         Address {
             case: "an Amazon S3 bucket at its website endpoint",
             domain_name: "reports.s3-website-us-east-1.amazonaws.com",
             s3_origin_config: false,
-            fronted_by: Some("s3"),
+            fronted_by: None,
         },
         // The other endpoint spellings Amazon S3 publishes a bucket at (Amazon S3 User Guide,
         // *Amazon S3 endpoints*: the dual-stack and FIPS forms, and the S3 Express One Zone

@@ -288,9 +288,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// against nothing but that header, before any id is resolved — then the id has to name a
 /// stored trust store (`EntityNotFound` is what this operation models for an entity it
 /// cannot find), and then the token has to be that record's current one, where a well-formed
-/// token that is not the stored one is a failed precondition, worded as the resources a
-/// caller conditionally rewrites word it. The `If-Match` member is `@required`, so a request
-/// stating none is refused at the request boundary.
+/// token that is not the stored one is a failed precondition, worded as this resource's own API
+/// family words one (`crate::state::precondition_failed_missing_requirements`). The `If-Match`
+/// member is `@required`, so a request stating none is refused at the request boundary.
 ///
 /// ONE function, called both before and after the bundle read, so the request is judged by
 /// the same rule at the instant it is admitted and at the instant it is written.
@@ -319,7 +319,9 @@ fn admitted(
         )
         .into()),
         IfMatch::Stale => Err(UpdateTrustStoreErrorModeled::PreconditionFailed(
-            crate::state::precondition_failed(),
+            // Worded as the API family this resource belongs to words a failed precondition
+            // (`crate::state::precondition_failed_missing_requirements`).
+            crate::state::precondition_failed_missing_requirements(),
         )
         .into()),
     }

@@ -52,11 +52,12 @@ use crate::trust_store_lifecycle::{
 const INVALID_IF_MATCH_VERSION: &str =
     "The If-Match version is missing or not valid for the resource.";
 
-/// `PreconditionFailed` on the surface a trust store belongs to — the family of resources a
-/// caller conditionally rewrites, which is how the sibling delete of this very resource is
-/// worded.
-const PRECONDITION_FAILED: &str = "The request failed because it didn't meet the preconditions \
-     in one or more request-header fields.";
+/// `PreconditionFailed` on the surface a trust store belongs to — the entity surface the
+/// distribution tenants and the connection groups belong to, which is how the sibling delete of
+/// this very resource is worded.
+const PRECONDITION_FAILED: &str =
+    "Your request is missing requirements for this operation. Update your request and try \
+     again.";
 
 /// `EntityNotFound` for an id no trust store answers to.
 const TRUST_STORE_NOT_FOUND: &str = "The specified trust store does not exist.";

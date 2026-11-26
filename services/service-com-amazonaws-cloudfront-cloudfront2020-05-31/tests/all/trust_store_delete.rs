@@ -45,11 +45,13 @@ use crate::trust_store_lifecycle::{
 const INVALID_IF_MATCH_VERSION: &str =
     "The If-Match version is missing or not valid for the resource.";
 
-/// `PreconditionFailed` on the surface a trust store belongs to — the resource DOCUMENTS a
-/// caller conditionally rewrites, which is the family the key value stores, the functions and
-/// the distributions themselves are worded with.
-const PRECONDITION_FAILED: &str = "The request failed because it didn't meet the preconditions \
-     in one or more request-header fields.";
+/// `PreconditionFailed` on the surface a trust store belongs to — the entity surface the
+/// distribution tenants, the connection groups and the connection functions that route them
+/// belong to, which reports the request as missing a requirement rather than reporting the
+/// precondition of a header field.
+const PRECONDITION_FAILED: &str =
+    "Your request is missing requirements for this operation. Update your request and try \
+     again.";
 
 /// `EntityNotFound` for an identifier no trust store answers to.
 const TRUST_STORE_NOT_FOUND: &str = "The specified trust store does not exist.";

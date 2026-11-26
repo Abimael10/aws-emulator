@@ -20,9 +20,9 @@
 //!   no stored policy holds, since such an id has no current version for any header to
 //!   carry;
 //! * a policy a stored distribution still attaches — `ContinuousDeploymentPolicyInUse`
-//!   (HTTP 409), "You cannot delete a continuous deployment policy that is associated with
-//!   a primary distribution. First update your distribution to remove the continuous
-//!   deployment policy, then you can delete the policy"
+//!   (HTTP 409), "The specified continuous deployment policy is currently associated with a
+//!   distribution" ([`crate::state::CONTINUOUS_DEPLOYMENT_POLICY_IN_USE_MESSAGE`] is the wire
+//!   sentence, which differs from the model's documentation of the shape)
 //!   ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_continuous_deployment_policy`]).
 //!
 //! `PreconditionFailed` is modelled but not reachable here: the one precondition this

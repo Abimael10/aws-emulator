@@ -15,11 +15,22 @@
 //! that stores the configuration rather than left to surface as an origin error on the data
 //! plane.
 //!
-//! The kind an origin IS comes from the address it is reached at
-//! ([`crate::service::origin_access::addresses_an_origin_of_type`]), which is the one reading of
-//! an `Origin$DomainName` this crate has — including the address a service of THIS emulator
-//! published a resource's own data plane at, which is what a Lambda function URL origin of this
-//! emulator is addressed by.
+//! The kind an origin IS is read from BOTH halves of what the configuration says about it, and
+//! a disagreement with either half is the refusal:
+//!
+//! * the configuration member the origin is SPECIFIED with
+//!   ([`origin_configured_as_an_s3_bucket`]), which is the model's own statement of the kind:
+//!   `S3OriginConfig` is "an origin that is an Amazon S3 bucket that is not configured with
+//!   static website hosting", and `CustomOriginConfig` is "an origin that is not an Amazon S3
+//!   bucket" — the exception being a bucket's static-website surface, which is specified as a
+//!   custom origin and which no `s3` control may front either, because what answers there is
+//!   the website endpoint rather than the bucket's REST API. So an `s3` control pairs with an
+//!   `S3OriginConfig` origin and a control of any other type with one specified as a custom
+//!   origin;
+//! * the ADDRESS it is reached at ([`crate::service::origin_access::addresses_an_origin_of_type`]),
+//!   which is the one reading of an `Origin$DomainName` this crate has — including the address a
+//!   service of THIS emulator published a resource's own data plane at, which is what a Lambda
+//!   function URL origin of this emulator is addressed by.
 //!
 //! Checked on the way IN, by every call that stores a configuration its CALLER submitted —
 //! `CreateDistribution`, `CreateDistributionWithTags` and `UpdateDistribution` — so no stored
@@ -63,6 +74,16 @@ pub fn mismatched_origin_access_control<Eng: Send + Sync + 'static>(
             .as_deref()
             .filter(|id| !id.is_empty())?;
         let control = store.origin_access_control(id)?;
+        let origin_type = control.config.origin_access_control_origin_type.as_str();
+        // What the CONFIGURATION says the origin is: an `s3` control fronts the one kind
+        // specified as an Amazon S3 bucket, and a control of every other type fronts an origin
+        // specified as a custom one. An origin that states neither member says nothing about
+        // its kind, so only its address is read.
+        if let Some(bucket) = origin_configured_as_an_s3_bucket(origin) {
+            if bucket != (origin_type == crate::service::origin_access::S3_ORIGIN_TYPE) {
+                return Some(origin.domain_name.clone());
+            }
+        }
         // Which service answers at the address this origin is reached at, for an address this
         // emulator published one of its own resource's data planes at.
         let answering = published.as_ref().and_then(|published| {
@@ -71,12 +92,34 @@ pub fn mismatched_origin_access_control<Eng: Send + Sync + 'static>(
             ))
         });
         let fronts_this_origin = crate::service::origin_access::addresses_an_origin_of_type(
-            &control.config.origin_access_control_origin_type,
+            origin_type,
             &origin.domain_name,
             answering.as_deref(),
         )?;
         (!fronts_this_origin).then(|| origin.domain_name.clone())
     })
+}
+
+/// Whether the configuration member `origin` is SPECIFIED with says it is an Amazon S3 bucket
+/// — `Some(true)` — or says it is not — `Some(false)` — and `None` for an origin that states
+/// no such member and so says nothing about its kind.
+///
+/// The model lays the kinds out on the members themselves: "use `S3OriginConfig` to specify an
+/// Amazon S3 bucket that is not configured with static website hosting", "use
+/// `VpcOriginConfig` to specify a VPC origin", and "use `CustomOriginConfig` to specify all
+/// other kinds of origins, including an Amazon S3 bucket that is configured with static
+/// website hosting" — so the bucket's REST API is the one kind named by the first member, and
+/// everything reached over its own HTTP surface, that static-website surface included, is named
+/// by the other two.
+///
+/// `S3OriginConfig` decides it where a configuration states more than one of the three: it is
+/// the only member that names a BUCKET at all, so a configuration carrying it has stated the
+/// kind an `s3` control is for, whatever else it carries beside it.
+fn origin_configured_as_an_s3_bucket(origin: &Origin) -> Option<bool> {
+    if origin.s3_origin_config.is_some() {
+        return Some(true);
+    }
+    (origin.custom_origin_config.is_some() || origin.vpc_origin_config.is_some()).then_some(false)
 }
 
 /// The modelled `IllegalOriginAccessConfiguration` (HTTP 400) for a configuration whose origin

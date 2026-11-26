@@ -79,6 +79,13 @@
 //!    `Origin` the policy grants, the security and custom headers it configures, and the
 //!    headers its `RemoveHeadersConfig` takes off ([`response_headers`]).
 //!
+//! Two of those decisions are about the VIEWER'S OWN MESSAGE rather than about the
+//! distribution, so they hold for every request this plane serves. A request carrying content
+//! on a method whose semantics define none is refused `403` before the configuration is read
+//! at all ([`BODYLESS_VIEWER_METHODS`]); and every answer it serves NAMES the edge that served
+//! it, in the `Via` the one stamp every response passes through states beside the cache
+//! outcome and the request's identifier ([`stamp`], [`via`]).
+//!
 //! # What the origin fetch is, and what it is not
 //!
 //! The fetch is a real HTTP request to the origin's own `DomainName`, made through the
@@ -313,6 +320,43 @@ const SERVER: &str = "CloudFront";
 /// The name CloudFront's own `Via` carries.
 const VIA_CLOUDFRONT: &str = SERVER;
 
+/// The header naming the intermediaries a message travelled through (RFC 9110 §7.6.3), which
+/// CloudFront states on BOTH legs of the exchange it serves: on the origin request it makes
+/// ([`origin_request_headers`], where it is also the loop signal the inbound path reads —
+/// [`carries_cloudfront_via`]) and on the answer it serves the viewer ([`stamp`]).
+const VIA: &str = "via";
+
+/// The protocol half of the `Via` this edge states: the version of HTTP the exchange it is
+/// naming itself on was carried over.
+///
+/// `1.1`, because that is the version this edge speaks on both legs: a viewer reaches a
+/// distribution's address over HTTP/1.1 (`crate::state::edge_endpoint` serves
+/// `hyper::server::conn::http1` on the connections the core accepts there) and the in-process
+/// transport an origin fetch goes over carries an HTTP/1.1 message too. A `Via` element names
+/// the protocol the message was RECEIVED over, so it is this value rather than a value of the
+/// request.
+const VIA_PROTOCOL: &str = "1.1";
+
+/// The zone CloudFront's own `Via` pseudonym is a label under.
+const VIA_ZONE: &str = ".cloudfront.net";
+
+/// The `Via` element this edge states for the request `cf_id` identifies:
+/// `<protocol> <pseudonym>.cloudfront.net (CloudFront)`.
+///
+/// The pseudonym is the identifier the edge minted for the request it is serving
+/// ([`X_AMZ_CF_ID`], 32 lowercase hex characters) rather than a name of the distribution or of
+/// anything the request carried: `Via` names the INTERMEDIARY, and what identifies this one is
+/// the exchange it is handling — the same value the viewer reads back in `X-Amz-Cf-Id` and the
+/// origin reads in its own copy of this header, so one request is named once wherever it is
+/// reported. The comment `(CloudFront)` and the zone are fixed; the protocol and the pseudonym
+/// are values of the serving environment.
+///
+/// ONE function for both legs, so the value an origin is sent and the value a viewer reads
+/// cannot drift apart.
+fn via(cf_id: &str) -> String {
+    format!("{VIA_PROTOCOL} {cf_id}{VIA_ZONE} ({VIA_CLOUDFRONT})")
+}
+
 /// The `User-Agent` CloudFront sends an origin request with when the viewer's own is not
 /// forwarded to the origin.
 const ORIGIN_USER_AGENT: &str = "Amazon CloudFront";
@@ -432,6 +476,31 @@ const LAMBDA_FAILED_DETAIL: &str =
 /// The detail line CloudFront's generated page carries for a request it refused.
 const BAD_REQUEST_DETAIL: &str = "Bad request.";
 
+/// The viewer methods whose semantics define no request content, and which CloudFront
+/// therefore refuses a viewer request that carries content on.
+///
+/// `GET` and `HEAD`: "a client SHOULD NOT generate content in a GET request" and "a client
+/// MUST NOT generate content in a HEAD request" (RFC 9110 §9.3.1 and §9.3.2), because no
+/// defined semantics tell a server what such content would mean. CloudFront refuses one at the
+/// edge — recorded behaviour: `403`, carrying none of the origin's bytes — rather than relaying
+/// it, so an origin is never handed a message whose framing two hops could read differently.
+/// The methods that DO define content (`POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`) carry theirs
+/// to the origin as the behaviour's `AllowedMethods` allow.
+const BODYLESS_VIEWER_METHODS: [&str; 2] = ["GET", "HEAD"];
+
+/// Whether `req` carries content on a method whose semantics define none
+/// ([`BODYLESS_VIEWER_METHODS`]), which is a property of the viewer's own request rather than
+/// of any distribution it was addressed to.
+///
+/// `method` is the request's method already upper-cased, since a method name is
+/// case-sensitive on the wire and a viewer that lower-cased it still named that method. A body
+/// this plane cannot read at all (one that never arrived as bytes) is no stated content, so
+/// nothing is read into it.
+fn carries_content_its_method_defines_none_for(method: &str, req: &RtRequest) -> bool {
+    BODYLESS_VIEWER_METHODS.contains(&method)
+        && req.body().bytes().is_some_and(|content| !content.is_empty())
+}
+
 /// The status a viewer request gets when CloudFront will not forward it to the origin at all:
 /// the matched behaviour names a field-level encryption configuration whose own flags state
 /// that a request it cannot encrypt is not forwarded, so "an error is returned"
@@ -522,9 +591,12 @@ const HEADERS_NEVER_FORWARDED: [&str; 15] = [
 ///   viewer ([`compression`]) is a different length under a different coding, so the two the
 ///   edge restates per request are held on [`OriginAnswer`] itself and the length is left to
 ///   the connection that writes the body;
-/// * [`X_CACHE`] and [`X_AMZ_CF_ID`] are what the EDGE says about the request it just served
-///   ([`stamp`]), so a header an origin sent under those names describes a different request.
-const RESPONSE_HEADERS_NEVER_SERVED: [&str; 13] = [
+/// * [`X_CACHE`], [`X_AMZ_CF_ID`] and [`VIA`] are what the EDGE says about the request it just
+///   served ([`stamp`]), so a header an origin sent under those names describes a different
+///   exchange: an origin's own `Via` names the intermediaries of the leg the EDGE opened to it,
+///   which is not the leg the viewer reads the answer over, and the one this edge states for
+///   that leg is what it serves.
+const RESPONSE_HEADERS_NEVER_SERVED: [&str; 14] = [
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -538,6 +610,7 @@ const RESPONSE_HEADERS_NEVER_SERVED: [&str; 13] = [
     CONTENT_ENCODING,
     X_CACHE,
     X_AMZ_CF_ID,
+    VIA,
 ];
 
 /// Whether the origin's own `name` response header travels on to the viewer
@@ -2285,6 +2358,22 @@ fn plan_resolved(
             detail: BAD_REQUEST_DETAIL,
         };
     }
+    // Enforced HERE, by CloudFront, before anything about the request's path is read: a viewer
+    // request carrying content on a method whose semantics define none is refused at the edge
+    // and never relayed, whatever the distribution's behaviours allow and whichever behaviour
+    // its path would select — the fault is in the request, not in the configuration.
+    if carries_content_its_method_defines_none_for(&req.method().to_ascii_uppercase(), req) {
+        ::tracing::debug!(
+            distribution = %distribution_id,
+            method = %req.method(),
+            "this viewer request carries content on a method that defines none; the edge \
+             refuses it and makes no origin request"
+        );
+        return Plan::Generated {
+            status: FORBIDDEN,
+            detail: BAD_REQUEST_DETAIL,
+        };
+    }
     // Enforced HERE, by CloudFront, before the edge cache is read and before any origin
     // request exists: a viewer the distribution's geographic restriction refuses sees
     // CloudFront's own page and nothing of the origin — and nothing of a cached answer
@@ -2709,8 +2798,8 @@ fn keyed_values(
 /// decoration: a request that reaches the edge carrying it came from an edge.
 fn carries_cloudfront_via(req: &RtRequest) -> bool {
     req.headers()
-        .get("via")
-        .is_some_and(|via| via.contains(VIA_CLOUDFRONT))
+        .get(VIA)
+        .is_some_and(|stated| stated.contains(VIA_CLOUDFRONT))
 }
 
 /// Whether the origin an origin request is addressed at SERVES the scheme that request is
@@ -3125,10 +3214,7 @@ fn origin_request_headers(
         origin_request_host(origin, &keyed, &forwarded, viewer_host).to_string(),
     ));
     headers.push((X_AMZ_CF_ID.to_string(), cf_id.to_string()));
-    headers.push((
-        "via".to_string(),
-        format!("1.1 {cf_id}.cloudfront.net ({VIA_CLOUDFRONT})"),
-    ));
+    headers.push((VIA.to_string(), via(cf_id)));
     // CloudFront's OWN `User-Agent`, for a request whose viewer `User-Agent` the policies do
     // not forward: the origin is then told who is calling it, which is CloudFront. A behaviour
     // that DOES forward the header has already put the viewer's own value on the request
@@ -3788,8 +3874,14 @@ fn redirected(location: &str, cf_id: &str) -> RtResponse {
     response
 }
 
-/// Put the headers every edge answer carries on `response`: its cache outcome and the
-/// identifier of the request it answers.
+/// Put the headers every edge answer carries on `response`: its cache outcome, the identifier
+/// of the request it answers, and the `Via` naming the edge that served it.
+///
+/// ONE place every answer this plane serves passes through — the origin's and the cache's
+/// ([`served`]), the pages CloudFront generates itself ([`generated_page`]) and the redirect
+/// ([`redirected`]) — so a viewer reads these headers whatever produced the answer. The two
+/// that NAME the request are stated together: a request the edge minted no identifier for (a
+/// plane assembled with no store at all) is named by neither.
 fn stamp(response: &mut RtResponse, x_cache: &str, cf_id: &str) {
     let _ = response
         .headers_mut()
@@ -3798,6 +3890,7 @@ fn stamp(response: &mut RtResponse, x_cache: &str, cf_id: &str) {
         let _ = response
             .headers_mut()
             .try_insert(X_AMZ_CF_ID, cf_id.to_string());
+        let _ = response.headers_mut().try_insert(VIA, via(cf_id));
     }
 }
 
@@ -3868,7 +3961,7 @@ mod tests {
         // about the object, each class the exclusion list carries (a hop-by-hop header, the
         // three that describe the bytes being served, the two the edge states itself), the
         // same names spelled in another case, and a name that merely resembles one of them.
-        let cases: [(&str, &str, bool); 13] = [
+        let cases: [(&str, &str, bool); 14] = [
             ("the object's entity tag", "etag", true),
             ("a cache directive", "cache-control", true),
             ("user metadata", "x-amz-meta-note", true),
@@ -3881,6 +3974,7 @@ mod tests {
             ("the media type the edge restates", "content-type", false),
             ("the coding the edge restates", "content-encoding", false),
             ("the cache outcome the edge states", X_CACHE, false),
+            ("the Via the edge states for the leg it serves", VIA, false),
             ("a name that merely resembles one", "x-connection-note", true),
         ];
         for (case, name, expected) in cases {
