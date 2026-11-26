@@ -9,9 +9,9 @@
 //! numbers", "MariaDB … 1 to 16", "MySQL … 1 to 16", "Oracle … 1 to 30", "PostgreSQL … 1 to
 //! 63", "Microsoft SQL Server … 1 to 128") — so a name inside that engine's bound is accepted
 //! whatever a narrower engine's line says, a name one character past it is refused with
-//! `InvalidParameterValue` naming the member and the bound, and nothing is created for the
-//! refused request. An accepted name is stored and reported BYTE FOR BYTE, so its letter case
-//! survives the round trip.
+//! `InvalidParameterValue` and the sentence Amazon RDS words an invalid master user name
+//! with, and nothing is created for the refused request. An accepted name is stored and
+//! reported BYTE FOR BYTE, so its letter case survives the round trip.
 //!
 //! The table spans what the rule generalises over: the six engine families whose published
 //! bound differs (PostgreSQL, Microsoft SQL Server, Oracle, MySQL, MariaDB and Db2), the
@@ -22,7 +22,9 @@
 //! the production router mounts it, each request is a real awsQuery form POST, and every
 //! assertion reads the XML the emulator answered with.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::master_username_len;
+use service_com_amazonaws_rds_amazonrdsv19::state::{
+    master_username_len, INVALID_MASTER_USERNAME_MESSAGE,
+};
 
 use crate::db_instances::{call, emulator, expect_error, expect_ok, text, texts};
 
@@ -192,7 +194,8 @@ fn read_params(row: &Row, identifier: &str) -> (&'static str, (String, String), 
 
 /// RULE: a `MasterUsername` at the bound the engine named in the request publishes is
 /// accepted and round-trips byte for byte; one character past that bound is refused with
-/// `InvalidParameterValue` naming the member and the bound, and creates nothing.
+/// `InvalidParameterValue` and the service's fixed invalid-name sentence, and creates
+/// nothing.
 #[tokio::test]
 async fn a_master_username_is_held_to_the_bound_its_engine_publishes() {
     let router = emulator();
@@ -240,10 +243,10 @@ async fn a_master_username_is_held_to_the_bound_its_engine_publishes() {
             INVALID_PARAMETER_VALUE,
         );
         let message = text(&refused, "Message");
-        assert!(
-            message.contains("MasterUsername") && message.contains(&format!("1 to {}", row.longest)),
-            "case {case:?}: expected the refusal to name the member and the engine's bound \
-             of {}, got {message:?}",
+        assert_eq!(
+            message, INVALID_MASTER_USERNAME_MESSAGE,
+            "case {case:?}: expected the refusal {INVALID_MASTER_USERNAME_MESSAGE:?} for a \
+             name past the engine's bound of {}, got {message:?}",
             row.longest
         );
 
@@ -303,10 +306,9 @@ async fn one_name_is_accepted_or_refused_by_the_engine_alone() {
         INVALID_PARAMETER_VALUE,
     );
     let message = text(&refused, "Message");
-    assert!(
-        message.contains("MasterUsername") && message.contains("1 to 16"),
-        "case {:?}: expected the refusal to name the member and MySQL's bound, got \
-         {message:?}",
+    assert_eq!(
+        message, INVALID_MASTER_USERNAME_MESSAGE,
+        "case {:?}: expected the refusal {INVALID_MASTER_USERNAME_MESSAGE:?}, got {message:?}",
         refuses.case
     );
 }

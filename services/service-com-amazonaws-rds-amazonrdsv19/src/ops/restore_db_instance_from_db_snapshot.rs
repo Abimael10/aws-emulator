@@ -671,6 +671,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| {
                     crate::state::default_storage_type(input.iops.or(source.iops)).to_string()
                 });
+            // `AllocatedStorage` is bounded by the (engine, storage type) pair the restored
+            // instance ends up on, exactly as a create and a modification are; a request
+            // that names no type is held to the widest range the engine's types reach
+            // between them (`crate::ops::describe_orderable_db_instance_options`).
+            if let Some(allocated_storage) = input.allocated_storage {
+                crate::ops::describe_orderable_db_instance_options::
+                    check_requested_allocated_storage(
+                        &engine,
+                        input.storage_type.as_deref(),
+                        &storage_type,
+                        allocated_storage,
+                    )
+                    .map_err(RestoreDBInstanceFromDBSnapshotError::invalid_parameter_value)?;
+            }
             let db_parameter_group_name = input.db_parameter_group_name.clone().or_else(|| {
                 resolved_version.map(|entry| {
                     crate::state::default_db_parameter_group_name(entry.parameter_group_family)

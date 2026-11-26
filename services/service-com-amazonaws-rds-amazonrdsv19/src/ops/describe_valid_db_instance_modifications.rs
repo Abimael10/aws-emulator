@@ -87,8 +87,9 @@
 use super::types::*;
 use crate::ops::describe_db_engine_versions::is_cluster_engine;
 use crate::ops::describe_orderable_db_instance_options::{
-    available_processor_features, instance_class_profile, instance_classes, max_allocated_storage,
-    storage_bounds, storage_profiles, StorageProfile,
+    allocated_storage_range, available_processor_features, instance_class_profile,
+    instance_classes, invalid_storage_size_message, max_allocated_storage, storage_bounds,
+    storage_profiles, StorageProfile,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -341,11 +342,9 @@ fn valid_storage_options(
     profile: &StorageProfile,
     allocated_storage: Option<i32>,
 ) -> ValidStorageOptions {
-    // A type's published size range, its maximum capped by what the ENGINE accepts — the
-    // same cap an orderable option's `MaxStorageSize` carries.
-    let size_range = profile
-        .size_range
-        .map(|(min, max)| (min, max.min(max_allocated_storage(engine))));
+    // The sizes this (engine, storage type) pair publishes — the same range an orderable
+    // option's `MinStorageSize`/`MaxStorageSize` carries.
+    let size_range = allocated_storage_range(engine, profile.name);
     ValidStorageOptions {
         storage_type: Some(profile.name.to_string()),
         storage_size: size_range
@@ -528,28 +527,22 @@ pub fn check_storage_modification(requested: RequestedStorage<'_>) -> Result<(),
     let storage_type = profile.name;
 
     let engine_cap = max_allocated_storage(engine);
-    if let (Some((min, max)), Some(asked)) = (profile.size_range, requested.allocated_storage) {
+    if let (Some((min, max)), Some(asked)) = (
+        allocated_storage_range(engine, storage_type),
+        requested.allocated_storage,
+    ) {
         // The sizes this operation REPORTS for the instance are the sizes a modification
         // can set: the allocation it already has, and a growth from the minimum increase
         // up to the type's maximum. A value in neither — a reduction, a size past the
         // maximum, or a growth smaller than that increase — is refused.
-        let ranges = storage_size_ranges(
-            engine,
-            min,
-            max.min(engine_cap),
-            requested.current_allocated_storage,
-        );
+        let ranges = storage_size_ranges(engine, min, max, requested.current_allocated_storage);
         let admitted = ranges.iter().any(|range| {
             range.from.is_some_and(|from| from <= asked) && range.to.is_some_and(|to| asked <= to)
         });
         if !admitted {
             // RDS's own wording for a size it will not take, built from the request's
-            // engine, storage type and size: "Invalid storage size for engine name
-            // <engine> and storage type <type>: <size>".
-            return Err(format!(
-                "Invalid storage size for engine name {engine} and storage type \
-                 {storage_type}: {asked}"
-            ));
+            // engine, storage type and size.
+            return Err(invalid_storage_size_message(engine, storage_type, asked));
         }
     }
 

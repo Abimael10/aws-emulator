@@ -1350,12 +1350,17 @@ pub const LOCAL_WRITE_FORWARDING_DISABLED: &str = "disabled";
 pub const DB_CLUSTER_ROLE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// Refuse a `MasterUsername` outside the constraints its member documents: "Must be 1 to
-/// 16 letters or numbers. First character must be a letter" and "Can't be a reserved word
-/// for the chosen database engine".
+/// 16 letters, numbers, or underscores. First character must be a letter" and "Can't be a
+/// reserved word for the chosen database engine".
 ///
 /// The LENGTH half is read from the ENGINE the account is being created on
 /// ([`master_username_len`]): `MasterUsername` publishes the bound per engine, so a name the
 /// engine named in the request admits is accepted whatever another engine's line says.
+///
+/// The CHARACTER half is the class the member itself publishes — letters, numbers and
+/// UNDERSCORES — led by a letter; a name outside either half is not a valid identifier for
+/// the engine's admin user, which Amazon RDS refuses with one sentence of its own
+/// ([`INVALID_MASTER_USERNAME_MESSAGE`]) rather than with the member's constraint text.
 ///
 /// The reserved-word half is read over [`RESERVED_MASTER_USERNAMES`]: the accounts Amazon
 /// RDS keeps for ITSELF on the engines this front door serves. The engines' own SQL keyword
@@ -1363,28 +1368,17 @@ pub const DB_CLUSTER_ROLE_STATUS_ACTIVE: &str = "ACTIVE";
 /// refusing a name no published list carries would refuse names AWS accepts.
 pub fn check_master_username(engine: &str, value: &str) -> Result<(), String> {
     let allowed = master_username_len(engine);
-    if !value.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!(
-            "MasterUsername must be 1 to {} letters or numbers; got '{value}'",
-            allowed.end()
-        ));
-    }
     let length = value.chars().count();
-    if length < *allowed.start() || length > *allowed.end() {
-        return Err(format!(
-            "MasterUsername must be {} to {} letters or numbers; got {length} characters",
-            allowed.start(),
-            allowed.end()
-        ));
-    }
     if !value
         .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || !(allowed).contains(&length)
+        || !value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
     {
-        return Err(format!(
-            "the first character of MasterUsername must be a letter; got '{value}'"
-        ));
+        return Err(INVALID_MASTER_USERNAME_MESSAGE.to_string());
     }
     if RESERVED_MASTER_USERNAMES
         .iter()
@@ -1394,6 +1388,13 @@ pub fn check_master_username(engine: &str, value: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// How Amazon RDS refuses a `MasterUsername` that is not a valid admin user name for the
+/// engine — too long for the engine's own identifier bound, outside the character class the
+/// member publishes, or not led by a letter.
+///
+/// The sentence is fixed: it carries neither the name nor the bound.
+pub const INVALID_MASTER_USERNAME_MESSAGE: &str = "Invalid master user name";
 
 /// How long a `MasterUsername` may be on `engine`.
 ///
@@ -1430,9 +1431,9 @@ pub fn master_username_len(engine: &str) -> std::ops::RangeInclusive<usize> {
 /// keeps on every engine, which this emulator's own engine data plane publishes as a
 /// predefined role (`crate::state::data_plane::pg_server`'s role catalogue), beside the
 /// replication and monitoring accounts the PostgreSQL engines' published role list names next
-/// to it. Only names that could be a `MasterUsername` at all are listed — the roles RDS names
-/// with an underscore or a dot (`rds_superuser`, `mysql.sys`) are outside the letters and
-/// numbers [`check_master_username`] admits, so nothing is refused twice.
+/// to it. Only names that could be a `MasterUsername` at all are listed — a role RDS names
+/// with a dot (`mysql.sys`) is outside the character class [`check_master_username`] admits,
+/// so nothing is refused twice.
 pub const RESERVED_MASTER_USERNAMES: [&str; 3] = ["rdsadmin", "rdsrepladmin", "rdstopmgr"];
 
 /// How Amazon RDS refuses a `MasterUsername` that names one of its own engine accounts
@@ -1442,9 +1443,9 @@ pub fn master_username_is_reserved_message(value: &str) -> String {
     format!("MasterUsername {value} cannot be used as it is a reserved word used by the engine")
 }
 
-/// The longest `MasterUsername` the member's own summary states ("Must be 1 to 16 letters or
-/// numbers"), which is the bound an engine with no published line of its own carries; the
-/// engines that publish a wider one take it from [`master_username_len`].
+/// The longest `MasterUsername` the member's own summary states ("Must be 1 to 16 letters,
+/// numbers, or underscores"), which is the bound an engine with no published line of its own
+/// carries; the engines that publish a wider one take it from [`master_username_len`].
 pub const MAX_MASTER_USERNAME_LEN: usize = 16;
 
 /// The longest `RoleArn` an `AssociatedRoles` entry may carry: the bound the member's own

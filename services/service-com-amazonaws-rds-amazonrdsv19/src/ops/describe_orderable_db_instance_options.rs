@@ -1147,12 +1147,14 @@ const ALL_PROVISIONED_STORAGE: &[StorageProfile] = &[GP2, GP3, IO1, IO2];
 /// can still convert to it, so its bounds live beside theirs and [`storage_bounds`] hands
 /// them out.
 ///
-/// Source: the "Magnetic storage (not recommended)" section of the Amazon RDS User Guide —
-/// 20 GiB to 3,072 GiB (3 TiB), with neither provisioned IOPS nor provisioned throughput:
-/// a magnetic volume's performance is not configurable.
+/// Source: `CreateDBInstanceMessage$AllocatedStorage`, whose magnetic line is the widest
+/// for the MariaDB, MySQL and PostgreSQL engines ("Magnetic storage (standard): Must be an
+/// integer from 5 to 3072"); the Oracle and SQL Server engines publish a narrower one of
+/// their own, which [`magnetic_storage_range`] applies. It takes neither provisioned IOPS nor
+/// provisioned throughput: a magnetic volume's performance is not configurable.
 const MAGNETIC: StorageProfile = StorageProfile {
     name: LEGACY_MAGNETIC_STORAGE,
-    size_range: Some((20, 3_072)),
+    size_range: Some((5, 3_072)),
     iops: None,
     throughput: None,
     dedicated_log_volume: false,
@@ -1211,6 +1213,145 @@ pub fn publishes_storage_type(engine: &str, storage_type: &str) -> bool {
 
 /// The legacy magnetic storage type `StorageType` still publishes.
 pub const LEGACY_MAGNETIC_STORAGE: &str = "standard";
+
+/// The `AllocatedStorage` range, in GiB, a DB instance of `engine` takes on `storage_type` —
+/// `None` for storage that is not sized per instance (a type a CLUSTER manages) and for a
+/// type the engine publishes no value for at all.
+///
+/// `CreateDBInstanceMessage$AllocatedStorage` publishes the range per (ENGINE, STORAGE TYPE)
+/// pair rather than per engine or per type alone — one list per engine, one entry per type in
+/// it ("General Purpose (SSD) storage (gp2, gp3): Must be an integer from 20 to 65536",
+/// "Provisioned IOPS storage (io1, io2): Must be an integer from 100 to 65536", "Magnetic
+/// storage (standard): Must be an integer from 5 to 3072") — so a size is judged against the
+/// pair: the bounds the TYPE publishes ([`StorageProfile::size_range`]), capped by what the
+/// ENGINE accepts ([`max_allocated_storage`]), with the magnetic type's own per-engine bounds
+/// ([`magnetic_storage_range`]).
+pub fn allocated_storage_range(engine: &str, storage_type: &str) -> Option<(i32, i32)> {
+    let profile = storage_bounds(engine, storage_type)?;
+    let (min, max) = profile.size_range?;
+    if profile.name == LEGACY_MAGNETIC_STORAGE {
+        return Some(magnetic_storage_range(engine));
+    }
+    Some((min, max.min(max_allocated_storage(engine))))
+}
+
+/// The sizes legacy magnetic storage publishes for `engine`, in GiB.
+///
+/// It is the one type whose bounds differ by engine in
+/// `CreateDBInstanceMessage$AllocatedStorage`: "Magnetic storage (standard): Must be an
+/// integer from 5 to 3072" for the MariaDB, MySQL and PostgreSQL engines, "from 10 to 3072"
+/// for Oracle and "from 20 to 1024" for SQL Server, both editions.
+fn magnetic_storage_range(engine: &str) -> (i32, i32) {
+    let lowered = engine.to_ascii_lowercase();
+    if lowered.starts_with("sqlserver") || lowered.starts_with("custom-sqlserver") {
+        return (20, 1_024);
+    }
+    if lowered.starts_with("oracle") || lowered.starts_with("custom-oracle") {
+        return (10, 3_072);
+    }
+    (5, 3_072)
+}
+
+/// Refuse an `AllocatedStorage` a request asks for an instance of `engine`, held to the
+/// range that applies to it: the range the `StorageType` the request NAMES publishes
+/// ([`check_allocated_storage`]), or — where the request names none — the widest range that
+/// engine's types reach between them ([`check_allocated_storage_for_any_storage_type`]).
+///
+/// `effective_storage_type` is the type the volume ends up on, which the refusal names: the
+/// named one, or the type such a request is placed on by default.
+///
+/// Every door that sizes an instance's own volume reads this one rule — the create, the three
+/// restores and the read replica — so a size one of them would store is a size the others
+/// would too.
+pub fn check_requested_allocated_storage(
+    engine: &str,
+    named_storage_type: Option<&str>,
+    effective_storage_type: &str,
+    allocated_storage: i32,
+) -> Result<(), String> {
+    match named_storage_type {
+        Some(named) => check_allocated_storage(engine, named, allocated_storage),
+        None => check_allocated_storage_for_any_storage_type(
+            engine,
+            effective_storage_type,
+            allocated_storage,
+        ),
+    }
+}
+
+/// Refuse an `AllocatedStorage` the engine and the storage type it is asked for do not take
+/// ([`allocated_storage_range`]).
+///
+/// A pair that publishes no range — storage a cluster manages, or a type the engine does not
+/// publish at all — bounds nothing here: the first is not sized per instance and the second is
+/// its caller's own modelled unsupported-type refusal.
+fn check_allocated_storage(
+    engine: &str,
+    storage_type: &str,
+    allocated_storage: i32,
+) -> Result<(), String> {
+    let Some((min, max)) = allocated_storage_range(engine, storage_type) else {
+        return Ok(());
+    };
+    if (min..=max).contains(&allocated_storage) {
+        return Ok(());
+    }
+    let named = storage_bounds(engine, storage_type).map_or(storage_type, |profile| profile.name);
+    Err(invalid_storage_size_message(engine, named, allocated_storage))
+}
+
+/// Refuse an `AllocatedStorage` that NO storage type `engine` publishes could carry, for a
+/// request that names no `StorageType` of its own.
+///
+/// A request that names a type is held to THAT type's range ([`check_allocated_storage`]); a
+/// request that names none leaves the type to the service, which places the volume on a type
+/// that can hold the size asked for, so only a size outside every range the engine publishes
+/// is refused — and the recorded service accepts a size under the default type's own floor
+/// for exactly that reason. The sentence names the type such a request is placed on by
+/// default (`crate::state::default_storage_type`), which is what the caller sees reported.
+fn check_allocated_storage_for_any_storage_type(
+    engine: &str,
+    default_storage_type: &str,
+    allocated_storage: i32,
+) -> Result<(), String> {
+    let Some((min, max)) = widest_allocated_storage_range(engine) else {
+        return Ok(());
+    };
+    if (min..=max).contains(&allocated_storage) {
+        return Ok(());
+    }
+    Err(invalid_storage_size_message(
+        engine,
+        default_storage_type,
+        allocated_storage,
+    ))
+}
+
+/// The widest `AllocatedStorage` range the storage types `engine` publishes reach between
+/// them: the lowest floor and the highest ceiling of [`allocated_storage_range`] over every
+/// type the member lists for the engine — `None` for an engine whose storage its cluster
+/// manages, which is not sized per instance at all.
+pub fn widest_allocated_storage_range(engine: &str) -> Option<(i32, i32)> {
+    storage_profiles(engine)
+        .iter()
+        .map(|profile| profile.name)
+        .chain([LEGACY_MAGNETIC_STORAGE])
+        .filter_map(|storage_type| allocated_storage_range(engine, storage_type))
+        .reduce(|(low, high), (min, max)| (low.min(min), high.max(max)))
+}
+
+/// How Amazon RDS refuses a storage size the engine and the storage type do not take: the
+/// sentence names both, and the size the request asked for.
+pub fn invalid_storage_size_message(
+    engine: &str,
+    storage_type: &str,
+    allocated_storage: i32,
+) -> String {
+    format!(
+        "Invalid storage size for engine name {engine} and storage type {storage_type}: \
+         {allocated_storage}"
+    )
+}
 
 /// The largest `AllocatedStorage` `engine` accepts, in GiB.
 ///
@@ -1417,10 +1558,8 @@ fn to_wire(
     storage: &StorageProfile,
     region: &str,
 ) -> OrderableDBInstanceOption {
-    // A storage type's published maximum, capped by what the ENGINE accepts.
-    let storage_size = storage
-        .size_range
-        .map(|(min, max)| (min, max.min(max_allocated_storage(engine))));
+    // The sizes this (engine, storage type) pair publishes.
+    let storage_size = allocated_storage_range(engine, storage.name);
     let processor_features = available_processor_features(engine, class);
     // The capability answers of an engine of ANOTHER control plane are that control plane's,
     // held once for both views of this front door that answer for it: the document engine's

@@ -424,6 +424,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         crate::state::check_db_instance_class(&input.db_instance_class)
             .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        // `AllocatedStorage` is bounded by the STORAGE TYPE the volume is created on, not by
+        // the engine alone: the member publishes one size range per (engine, storage type)
+        // pair, and the pair the request asks for is what the volume ends up being
+        // ([`crate::ops::describe_orderable_db_instance_options::check_allocated_storage`],
+        // the same published table `DescribeOrderableDBInstanceOptions` reports and
+        // `ModifyDBInstance` holds a modification to). A request that names NO type leaves
+        // the type to the service, so it is held to the widest range the engine's types reach
+        // between them rather than to the default type's own floor. A size outside the range
+        // that applies is refused before anything is stored, so no instance comes up with an
+        // allocation its storage type cannot carry.
+        let requested_storage_type = input
+            .storage_type
+            .clone()
+            .unwrap_or_else(|| crate::state::default_storage_type(input.iops).to_string());
+        if let Some(allocated_storage) = input.allocated_storage {
+            crate::ops::describe_orderable_db_instance_options::check_requested_allocated_storage(
+                &input.engine,
+                input.storage_type.as_deref(),
+                &requested_storage_type,
+                allocated_storage,
+            )
+            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        }
         // `MasterUsername` carries the same documented constraints wherever it is taken —
         // the LENGTH its member publishes for the engine the account is created on, "first
         // character must be a letter" and "can't be a reserved word for the chosen database
@@ -751,9 +774,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             _ => None,
         };
-        let storage_type = input
-            .storage_type
-            .unwrap_or_else(|| crate::state::default_storage_type(input.iops).to_string());
+        let storage_type = requested_storage_type;
         let endpoint_port = input
             .port
             .unwrap_or_else(|| crate::state::default_port(&input.engine));
