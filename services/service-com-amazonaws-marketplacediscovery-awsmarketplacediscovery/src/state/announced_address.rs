@@ -17,8 +17,12 @@
 //! * the authority that request ARRIVED on is, by construction, an address that reaches this
 //!   process: the client dialled it and got here, so a fetch it sends there arrives the same
 //!   way — through whatever stands between the two, a published container port or a
-//!   forwarding front end included, which the process cannot see and whose address is then
-//!   the only one that leads back to it. The HOST SPELLING the client dialled is kept
+//!   forwarding front end included, whose address is then the only one that leads back to it.
+//!   A front end that re-addresses the request to this process's own socket replaces the
+//!   `Host` the client wrote, so the address the client dialled is read out of what that
+//!   front end STATES about it, ahead of what the request states itself
+//!   (`service_common::data_plane_addressing::forwarded_emulator_endpoint`, consulted by the
+//!   reading below). The HOST SPELLING the client dialled is kept
 //!   (`localhost` stays `localhost`), since that is the name it resolved to get here. It is
 //!   published only where it CAN lead back ([`leads_back_here`]);
 //! * the endpoint this emulator is SERVED at — the data port's own published base
@@ -40,8 +44,8 @@
 //! (`service_common::data_plane_addressing`) and is CALLED here rather than written again, so
 //! this service cannot drift from the others on what the address this emulator answers on is.
 
-/// The scheme a published address is dialled over: every listener of this process presents a
-/// certificate for it, which is why the served base
+/// The scheme an address of THIS PROCESS is dialled over: every listener of this process
+/// presents a certificate for it, which is why the served base
 /// ([`::smithy_server_runtime::OperationContext::endpoint`]) is always written with it.
 const ANNOUNCED_SCHEME: &str = "https";
 
@@ -58,10 +62,26 @@ pub fn announced_page_base(ctx: &::smithy_server_runtime::OperationContext<'_>) 
 /// [`announced_page_base`] over the two things it reads — the request's own parts and the
 /// base this process is served at — so the reading is exercised without a served socket.
 pub(super) fn announced_base(parts: &::http::request::Parts, served_base: &str) -> String {
-    format!(
-        "{ANNOUNCED_SCHEME}://{}",
-        announced_authority(parts, served_base)
-    )
+    let authority = announced_authority(parts, served_base);
+    format!("{}://{authority}", announced_scheme(parts, &authority))
+}
+
+/// The scheme the published address `announced` is dialled over.
+///
+/// For an address of a FORWARDING FRONT END — the one case where what is published is not an
+/// address of this process — it is the scheme that front end states the client dialled it over
+/// (`service_common::data_plane_addressing::forwarded_scheme`): the client reaches this
+/// process through it, so the scheme it presents is the scheme that address is dialled over,
+/// and this process's own has nothing to say about it. For every address of this process
+/// itself it is [`ANNOUNCED_SCHEME`], and so it is for a front end that states no scheme.
+fn announced_scheme(parts: &::http::request::Parts, announced: &str) -> &'static str {
+    use ::service_common::data_plane_addressing as addressing;
+    let stated_by_the_front_end = addressing::forwarded_authority(&parts.headers)
+        .is_some_and(|forwarded| forwarded == announced);
+    match stated_by_the_front_end {
+        true => addressing::forwarded_scheme(&parts.headers).unwrap_or(ANNOUNCED_SCHEME),
+        false => ANNOUNCED_SCHEME,
+    }
 }
 
 /// The `host[:port]` a published address names: the authority the answering request arrived
@@ -244,6 +264,116 @@ mod tests {
                 &announced, expected,
                 "case {case:?} (served at {served_base:?}, carrying {carried:?}): expected \
                  {expected:?}, got {announced:?}"
+            );
+        }
+    }
+
+    /// One row of the forwarded-address table: what the row is, what a front end stated
+    /// about the address the client dialled it at, and the base the published addresses must
+    /// then carry.
+    type ForwardedRow = (&'static str, &'static [(&'static str, &'static str)], &'static str);
+
+    /// A request a FRONT END re-addressed to this process: the `Host` it wrote for this
+    /// process's own socket, plus what it states about the address the client dialled IT at.
+    fn forwarded_request(host: &str, stated: &[(&str, &str)]) -> ::http::request::Parts {
+        let mut builder = ::http::Request::builder()
+            .uri("/2026-02-05/listFulfillmentOptions")
+            .header(::http::header::HOST, host);
+        for (name, value) in stated {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(())
+            .expect("the row is a well-formed request")
+            .into_parts()
+            .0
+    }
+
+    /// RULE: where a FRONT END states the address the client dialled it at, that address is
+    /// the one the answering request arrived on — the `Host` this process was re-addressed
+    /// with is the front end's own upstream, not an address the client has — so it is the one
+    /// published, over the scheme that front end states; where the front end states an
+    /// address that cannot lead back here, the address this process is served at is published
+    /// over this process's own scheme.
+    ///
+    /// The rows differ along what the reading generalises over: whether the stated address
+    /// names its port, states it separately or names none; a chain of hops; the scheme stated
+    /// beside it; an address that cannot lead back here (one of AWS's own hosts, an address
+    /// this emulator is not bound on) and a statement of a scheme alone.
+    #[test]
+    fn a_published_address_names_what_a_front_end_states_the_client_dialled() {
+        /// The base this process is served at in every row: its own socket, which is what the
+        /// front end re-addressed the request to.
+        const SERVED: &str = "https://127.0.0.1:39027";
+        /// What a front end re-addressing a request to that socket writes as the `Host`.
+        const UPSTREAM: &str = "127.0.0.1:39027";
+
+        let cases: &[ForwardedRow] = &[
+            (
+                "the address the client dialled, port and all",
+                &[("x-forwarded-host", "127.0.0.1:37623")],
+                "https://127.0.0.1:37623",
+            ),
+            (
+                "that address with its port stated separately",
+                &[("x-forwarded-host", "localhost"), ("x-forwarded-port", "37623")],
+                "https://localhost:37623",
+            ),
+            (
+                "a chain of front ends, the client's own address at its head",
+                &[("x-forwarded-host", "localhost:37623, 127.0.0.1:39027")],
+                "https://localhost:37623",
+            ),
+            (
+                "a front end the client dialled over plaintext",
+                &[
+                    ("x-forwarded-host", "127.0.0.1:37623"),
+                    ("x-forwarded-proto", "http"),
+                ],
+                "http://127.0.0.1:37623",
+            ),
+            (
+                "a front end the client dialled over TLS",
+                &[
+                    ("x-forwarded-host", "127.0.0.1:37623"),
+                    ("x-forwarded-proto", "https"),
+                ],
+                "https://127.0.0.1:37623",
+            ),
+            (
+                "an address naming no port, where this process is not served on the implicit \
+                 one",
+                &[("x-forwarded-host", "127.0.0.1")],
+                SERVED,
+            ),
+            (
+                "one of AWS's own endpoint hosts",
+                &[(
+                    "x-forwarded-host",
+                    "discovery-marketplace.us-east-1.amazonaws.com",
+                )],
+                SERVED,
+            ),
+            (
+                "an address this emulator is not bound on, and its scheme with it",
+                &[
+                    ("x-forwarded-host", "198.51.100.7:443"),
+                    ("x-forwarded-proto", "http"),
+                ],
+                SERVED,
+            ),
+            (
+                "a scheme stated with no address at all",
+                &[("x-forwarded-proto", "http")],
+                SERVED,
+            ),
+        ];
+        for (case, stated, expected) in cases {
+            let announced = announced_base(&forwarded_request(UPSTREAM, stated), SERVED);
+            assert_eq!(
+                &announced, expected,
+                "case {case:?} (served at {SERVED:?}, re-addressed to {UPSTREAM:?} stating \
+                 {stated:?}): expected {expected:?}, got {announced:?}"
             );
         }
     }

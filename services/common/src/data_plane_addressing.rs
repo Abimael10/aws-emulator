@@ -25,7 +25,10 @@
 //! ordinary hostname an operator points a client at, and the address of the endpoint this
 //! emulator answers on, which is what a DISCOVERY operation publishes for a plane served at
 //! the front door ([`emulator_endpoint_authority`]), or the one a service ANNOUNCES to a
-//! caller that resolves AWS's own hosts ([`served_endpoint_authority`]).
+//! caller that resolves AWS's own hosts ([`served_endpoint_authority`]) — and, for a request
+//! that reached this process through a front end rather than from the client directly, the
+//! address that front end states the client dialled ([`forwarded_emulator_endpoint`],
+//! [`forwarded_scheme`]), which is the only statement of it that survives the hop.
 //!
 //! Services still carrying their own copy of these: this module postdates them, and
 //! `grep -rln 'EMULATOR_PATH_NAMESPACE' services/*/src` lists them (today the API Gateway,
@@ -428,9 +431,16 @@ pub fn reached_emulator_endpoint(uri: &str, host_header: Option<&str>) -> Option
 }
 
 /// [`reached_emulator_endpoint`] for the request PARTS a handler is given, which is the
-/// form a service reads it in: the two places a request carries its host — the `Host`
-/// header and an absolute-form URI — are read off `parts` here, so no service repeats that
-/// extraction beside its own call of the reading above.
+/// form a service reads it in: the places a request carries the address it was dialled at —
+/// the address a forwarding front end STATES the client dialled
+/// ([`forwarded_emulator_endpoint`]), then the `Host` header and an absolute-form URI — are
+/// read off `parts` here, so no service repeats that extraction beside its own call of the
+/// reading above.
+///
+/// The forwarded statement comes FIRST because it is the only one of the three that survives
+/// a hop: a front end that re-addresses a request to the socket this process is served on
+/// replaces the `Host` the client wrote with its own upstream, and the address the client
+/// actually dialled is then carried in that statement alone.
 ///
 /// Services still carrying their own copy of this extraction, to be MIGRATED onto this
 /// function (they predate it):
@@ -439,13 +449,85 @@ pub fn reached_emulator_endpoint(uri: &str, host_header: Option<&str>) -> Option
 /// inlines it again — call this module.
 #[must_use]
 pub fn reached_emulator_endpoint_of_parts(parts: &::http::request::Parts) -> Option<String> {
-    reached_emulator_endpoint(
-        &parts.uri.to_string(),
-        parts
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|value| value.to_str().ok()),
-    )
+    forwarded_emulator_endpoint(&parts.headers).or_else(|| {
+        reached_emulator_endpoint(
+            &parts.uri.to_string(),
+            parts
+                .headers
+                .get(::http::header::HOST)
+                .and_then(|value| value.to_str().ok()),
+        )
+    })
+}
+
+/// The header a forwarding front end states the HOST a client dialled it at in: the de-facto
+/// field every such front end writes when it re-addresses a request to its upstream, which is
+/// the one this tree already reads for that question
+/// (`services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/src/service/data_plane.rs`).
+pub const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
+
+/// The header it states the PORT in, for a forwarded host that names none.
+pub const FORWARDED_PORT_HEADER: &str = "x-forwarded-port";
+
+/// The header it states the SCHEME the client dialled over in, which is the scheme an address
+/// published for that client is dialled over too.
+pub const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+
+/// The `host[:port]` a forwarding front end states the client reached this emulator at:
+/// [`FORWARDED_HOST_HEADER`]'s first entry, with [`FORWARDED_PORT_HEADER`] appended when that
+/// entry names no port of its own.
+///
+/// The FIRST entry, because a chain of front ends appends to the field and the client's own
+/// address is at its head. Only a value SHAPED like a host is taken ([`is_host_shaped`]), as
+/// for every other address this module reads.
+#[must_use]
+pub fn forwarded_authority(headers: &::http::HeaderMap) -> Option<String> {
+    let host = first_forwarded_entry(headers, FORWARDED_HOST_HEADER)
+        .filter(|host| is_host_shaped(host))?;
+    if addressed_port(Some(&host)).is_some() {
+        return Some(host);
+    }
+    match first_forwarded_entry(headers, FORWARDED_PORT_HEADER)
+        .and_then(|port| port.parse::<u16>().ok())
+    {
+        Some(port) => Some(host_port_authority(host_only(&host), port)),
+        None => Some(host),
+    }
+}
+
+/// [`forwarded_authority`] where it names the EMULATOR's own endpoint rather than some
+/// service's, which is the same reading [`reached_emulator_endpoint`] applies to the address
+/// a request states itself: a front end pointed at one of AWS's own hostnames is a caller
+/// that resolves those, and is answered the service's published host instead.
+#[must_use]
+pub fn forwarded_emulator_endpoint(headers: &::http::HeaderMap) -> Option<String> {
+    forwarded_authority(headers).filter(|authority| !names_a_service(authority))
+}
+
+/// The scheme a forwarding front end states the client dialled it over, when it states one of
+/// the two a URL this emulator publishes can be dialled over; `None` otherwise, which leaves
+/// the publishing service's own scheme standing.
+#[must_use]
+pub fn forwarded_scheme(headers: &::http::HeaderMap) -> Option<&'static str> {
+    let stated = first_forwarded_entry(headers, FORWARDED_PROTO_HEADER)?;
+    // Compared in place rather than folded to a new string, so no value a request carries is
+    // copied to decide which of the two schemes it names.
+    ["https", "http"]
+        .into_iter()
+        .find(|scheme| stated.eq_ignore_ascii_case(scheme))
+}
+
+/// The first non-empty, comma-separated entry of the header `name`, which is how every one of
+/// the fields above carries a chain of hops.
+fn first_forwarded_entry(headers: &::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .find(|entry| !entry.is_empty())
+        .map(str::to_string)
 }
 
 /// Whether `host` is a non-empty `host[:port]` written with the characters a hostname, an
@@ -1172,6 +1254,161 @@ mod tests {
                 answered, expected,
                 "case {host:?} served at {served_base:?}: expected {expected:?}, got \
                  {answered:?}"
+            );
+        }
+    }
+
+    /// One row of the forwarded-address table: the headers a request carries, the authority
+    /// the reading must answer, the scheme it must answer, and the endpoint a request with
+    /// those headers reached this emulator at.
+    type ForwardedRow = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+
+    /// RULE: the address a request reached this emulator at is the one a forwarding front end
+    /// states the client dialled, where it states one that names no service, and the address
+    /// the request states itself otherwise.
+    ///
+    /// The rows differ along what the reading generalises over: whether the forwarded host
+    /// names a port of its own, states it in the port field, or names none at all; how many
+    /// hops the fields carry; the case and shape of the stated scheme; a forwarded host that
+    /// names a service or is not an address at all; and a request that states no forwarding
+    /// at all, which is the ordinary direct dial.
+    #[test]
+    fn a_forwarded_request_reached_this_emulator_at_the_address_the_front_end_states() {
+        let rows: &[ForwardedRow] = &[
+            (
+                "no forwarding stated at all",
+                &[("host", "127.0.0.1:9297")],
+                None,
+                None,
+                Some("127.0.0.1:9297"),
+            ),
+            (
+                "a forwarded host naming its own port",
+                &[("host", "127.0.0.1:9297"), ("x-forwarded-host", "127.0.0.1:38377")],
+                Some("127.0.0.1:38377"),
+                None,
+                Some("127.0.0.1:38377"),
+            ),
+            (
+                "a forwarded host whose port is stated in the port field",
+                &[
+                    ("host", "127.0.0.1:9297"),
+                    ("x-forwarded-host", "localhost"),
+                    ("x-forwarded-port", "38377"),
+                ],
+                Some("localhost:38377"),
+                None,
+                Some("localhost:38377"),
+            ),
+            (
+                "a forwarded host naming no port anywhere",
+                &[("host", "127.0.0.1:9297"), ("x-forwarded-host", "localhost")],
+                Some("localhost"),
+                None,
+                Some("localhost"),
+            ),
+            (
+                "a chain of hops, the client's own address at its head",
+                &[
+                    ("host", "127.0.0.1:9297"),
+                    ("x-forwarded-host", "localhost:38377, 127.0.0.1:9297"),
+                    ("x-forwarded-port", "38377, 9297"),
+                ],
+                Some("localhost:38377"),
+                None,
+                Some("localhost:38377"),
+            ),
+            (
+                "an IPv6 literal with the port in the port field",
+                &[
+                    ("host", "127.0.0.1:9297"),
+                    ("x-forwarded-host", "[::1]"),
+                    ("x-forwarded-port", "8443"),
+                ],
+                Some("[::1]:8443"),
+                None,
+                Some("[::1]:8443"),
+            ),
+            (
+                "the scheme the client dialled over, stated in mixed case",
+                &[
+                    ("host", "127.0.0.1:9297"),
+                    ("x-forwarded-host", "127.0.0.1:38377"),
+                    ("x-forwarded-proto", "HTTP"),
+                ],
+                Some("127.0.0.1:38377"),
+                Some("http"),
+                Some("127.0.0.1:38377"),
+            ),
+            (
+                "a scheme no published address is dialled over",
+                &[
+                    ("host", "127.0.0.1:9297"),
+                    ("x-forwarded-host", "127.0.0.1:38377"),
+                    ("x-forwarded-proto", "ws"),
+                ],
+                Some("127.0.0.1:38377"),
+                None,
+                Some("127.0.0.1:38377"),
+            ),
+            (
+                "a forwarded host naming one of AWS's own endpoints",
+                &[
+                    ("host", "127.0.0.1:9297"),
+                    ("x-forwarded-host", "discovery-marketplace.us-east-1.amazonaws.com"),
+                ],
+                Some("discovery-marketplace.us-east-1.amazonaws.com"),
+                None,
+                Some("127.0.0.1:9297"),
+            ),
+            (
+                "a forwarded host that is not an address",
+                &[("host", "127.0.0.1:9297"), ("x-forwarded-host", "a host/../elsewhere")],
+                None,
+                None,
+                Some("127.0.0.1:9297"),
+            ),
+            (
+                "an empty forwarded field",
+                &[("host", "127.0.0.1:9297"), ("x-forwarded-host", "")],
+                None,
+                None,
+                Some("127.0.0.1:9297"),
+            ),
+        ];
+
+        for (case, headers, authority, scheme, reached) in rows {
+            let mut builder = ::http::Request::builder().uri("/_aws/plane/resource");
+            for (name, value) in *headers {
+                builder = builder.header(*name, *value);
+            }
+            let (parts, ()) = builder
+                .body(())
+                .expect("the row is a well-formed request")
+                .into_parts();
+
+            let answered = forwarded_authority(&parts.headers);
+            assert_eq!(
+                answered.as_deref(),
+                *authority,
+                "case {case:?}: expected the forwarded authority {authority:?}, got {answered:?}"
+            );
+            let answered = forwarded_scheme(&parts.headers);
+            assert_eq!(
+                answered, *scheme,
+                "case {case:?}: expected the forwarded scheme {scheme:?}, got {answered:?}"
+            );
+            let answered = reached_emulator_endpoint_of_parts(&parts);
+            assert_eq!(
+                answered.as_deref(),
+                *reached,
+                "case {case:?}: expected the endpoint reached {reached:?}, got {answered:?}"
             );
         }
     }
