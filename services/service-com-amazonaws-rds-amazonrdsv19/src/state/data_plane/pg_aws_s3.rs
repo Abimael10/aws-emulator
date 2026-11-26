@@ -221,6 +221,7 @@ pub fn aws_s3_call(facts: &SessionFacts, sql: &str) -> Option<Result<AwsS3Call, 
     if matches!(call, AwsS3Call::Import { .. }) && facts.read_only_transaction() {
         return Some(Err(super::read_only::refusal(
             facts.wire,
+            &facts.engine,
             COPY_FROM_COMMAND,
         )));
     }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,254 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBCapacityReservation"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBCapacityReservationError::validation)?;
+        // "The identifier or the name of the DB capacity reservation to modify." Its length,
+        // its alphabet and its hyphen rules are the `@length` and `@pattern` of the
+        // `DBCapacityReservationIdentifier` shape, already refused at the boundary — so a
+        // well-formed value that names nothing here is a not-found, never a validation
+        // failure.
+        let named = input.db_capacity_reservation_identifier;
+
+        // "You must specify CapacityPerAvailabilityZone, EndDateType, or EndDate. A request
+        // that specifies none of the three changes nothing, and Amazon RDS rejects it."
+        if input.capacity_per_availability_zone.is_none()
+            && input.end_date_type.is_none()
+            && input.end_date.is_none()
+        {
+            return Err(ModifyDBCapacityReservationError::invalid_parameter_combination(
+                crate::state::NO_MODIFICATIONS_REQUESTED_MESSAGE.to_string(),
+            ));
+        }
+
+        // What the `EndDateType`/`EndDate` pair asks for, resolved before anything is read
+        // out of the store: the two members are specified together or not at all.
+        let expiry = requested_expiry(input.end_date_type.as_deref(), input.end_date)?;
+
+        // "Minimum 1" — the new capacity reserves at least one DB instance in each zone; the
+        // model publishes no `@range` for the member, so the floor is checked here, through
+        // the one reading of it this service has.
+        if let Some(capacity) = input.capacity_per_availability_zone {
+            crate::state::check_capacity_per_availability_zone(capacity)
+                .map_err(ModifyDBCapacityReservationError::invalid_parameter_value)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a modification that changed nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due are materialised first, so the state
+        // this modification is checked against is the state the reservation is in NOW: the
+        // `active` a create owed it, and the `expired` its own `EndDate` owes it.
+        store.settle_due_transitions(&region);
+
+        let now = crate::state::now_as_wire_timestamp();
+        // What the checks below read off the reservation, taken while it is held immutably so
+        // the Region's reserved capacity can be read beside it.
+        let Some(record) = store.resolve_db_capacity_reservation(&region, &named) else {
+            return Err(
+                ModifyDBCapacityReservationErrorModeled::DBCapacityReservationNotFoundFault(
+                    DBCapacityReservationNotFoundFault {
+                        message: Some(crate::state::db_capacity_reservation_not_found_message(
+                            &named,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let identifier = record.identifier.clone();
+        let current_state = record.state.clone();
+        let zones = record.availability_zones.len();
+        let reserved_now = record.reserved_capacity_per_availability_zone;
+        let committed = record.committed_capacity_per_availability_zone(now);
+        let commitment_end_date = record
+            .commitment
+            .as_ref()
+            .map(|commitment| commitment.commitment_end_date);
+        let already_reserved = record.reserved_instances();
+
+        // "The reservation must be in the active state. A future-dated reservation that
+        // hasn't started isn't modifiable, and neither is a reservation that Amazon RDS is
+        // already modifying" — each of those reports another state, so the one admitted
+        // state is the whole constraint.
+        if !crate::state::DB_CAPACITY_RESERVATION_MODIFIABLE_STATES
+            .contains(&current_state.as_str())
+        {
+            return Err(invalid_state(
+                crate::state::db_capacity_reservation_state_message(
+                    &named,
+                    &current_state,
+                    &crate::state::DB_CAPACITY_RESERVATION_MODIFIABLE_STATES,
+                ),
+            ));
+        }
+
+        // "Must be a date and time in the future. During a capacity commitment, must be at
+        // or after CommitmentEndDate." Both are the one reading this service has of when a
+        // reservation may expire, which is what the create is checked against too.
+        if let RequestedExpiry::At(end_date) = expiry {
+            crate::state::check_reservation_end_date(
+                end_date,
+                now,
+                committed.and(commitment_end_date),
+            )
+            .map_err(ModifyDBCapacityReservationError::invalid_parameter_value)?;
+        }
+
+        if let Some(capacity) = input.capacity_per_availability_zone {
+            // "During a capacity commitment, can't be less than
+            // CommittedCapacityPerAvailabilityZone": Amazon RDS holds that capacity for the
+            // length of the commitment, so a modification cannot give it back.
+            if let Some(committed) = committed {
+                crate::state::check_committed_capacity_floor(capacity, committed)
+                    .map_err(ModifyDBCapacityReservationError::invalid_parameter_value)?;
+            }
+            // "This value multiplied by the number of Availability Zones counts against the
+            // DB instances quota for your Amazon Web Services account in the Amazon Web
+            // Services Region. Amazon RDS checks the quota only when you increase the
+            // value." The reservation's own current capacity is taken out of the Region's
+            // total first, so what is checked is the allowance the increase would need.
+            if capacity > reserved_now {
+                let requested = usize::try_from(capacity)
+                    .unwrap_or(0)
+                    .saturating_mul(zones);
+                let reserved_elsewhere = store
+                    .reserved_db_instances_in(&region)
+                    .saturating_sub(already_reserved);
+                let total = reserved_elsewhere.saturating_add(requested);
+                if total > crate::state::DB_INSTANCE_QUOTA_PER_REGION {
+                    return Err(
+                        ModifyDBCapacityReservationErrorModeled::InstanceQuotaExceededFault(
+                            InstanceQuotaExceededFault {
+                                message: Some(format!(
+                                    "The request would reserve capacity for {total} DB \
+                                     instances in {region}, and the allowed number is {}",
+                                    crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+        // `InsufficientDBInstanceCapacityFault` — "the specified DB instance class isn't
+        // available in the specified Availability Zone" — is modelled for this operation but
+        // unreachable from it: the class and the zones of a reservation cannot be changed,
+        // and every class this service publishes an option for is offered in every zone of
+        // its Region (`DescribeOrderableDBInstanceOptions` reports exactly that), so no zone
+        // of a reservation this store holds is short of the class it was created for.
+
+        let Some(record) = store.resolve_db_capacity_reservation_mut(&region, &identifier) else {
+            // Unreachable: the record was resolved under this same lock a moment ago.
+            return Err(
+                ModifyDBCapacityReservationErrorModeled::DBCapacityReservationNotFoundFault(
+                    DBCapacityReservationNotFoundFault {
+                        message: Some(crate::state::db_capacity_reservation_not_found_message(
+                            &named,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The accepted modification: "Amazon RDS applies this number to every Availability
+        // Zone of the reservation", and the expiry the pair asked for — a `limited` end date,
+        // or none at all for `unlimited`, which is the reservation that "doesn't expire".
+        if let Some(capacity) = input.capacity_per_availability_zone {
+            record.reserved_capacity_per_availability_zone = capacity;
+        }
+        match expiry {
+            RequestedExpiry::Unchanged => {}
+            RequestedExpiry::Never => record.end_date = None,
+            RequestedExpiry::At(end_date) => record.end_date = Some(end_date),
+        }
+        // "A reservation reports the pending state while Amazon RDS modifies it" — the state
+        // in which "Amazon RDS is ... applying a requested modification" — and it reports no
+        // available capacity while it does. The reservation reaches `active` again when the
+        // transition the clock owes it comes due; nothing sleeps for it.
+        record.state = crate::state::DB_CAPACITY_RESERVATION_STATE_PENDING.to_string();
+        record.pending_state = Some(crate::state::PendingStatus::in_a_moment(
+            crate::state::DB_CAPACITY_RESERVATION_STATE_ACTIVE,
+        ));
+        Ok(ModifyDBCapacityReservationOutput {
+            db_capacity_reservation: Some(record.to_wire()),
+        })
     }
+}
+
+/// What the `EndDateType`/`EndDate` pair of one modification asks for.
+enum RequestedExpiry {
+    /// Neither member was carried: the expiry the reservation has stays as it is.
+    Unchanged,
+    /// `unlimited` — "the reservation doesn't expire".
+    Never,
+    /// `limited` — "the reservation has a specific end date", this one.
+    At(::aws_smithy_types::DateTime),
+}
+
+/// Read the `EndDateType`/`EndDate` pair of a request, refusing the combinations the two
+/// members cannot be carried in.
+///
+/// "`EndDate` ... Required when `EndDateType` is `limited`. Don't specify a value when
+/// `EndDateType` is `unlimited`. When you specify `EndDate`, you must also specify
+/// `EndDateType`" — so each of those three is the combination that cannot hold, rather than a
+/// member silently ignored. A value outside the two the enum publishes is an invalid value
+/// for the member; the boundary validator refuses one before this handler runs, and the arm
+/// is here so no unmodelled value can reach the store.
+fn requested_expiry(
+    end_date_type: Option<&str>,
+    end_date: Option<::aws_smithy_types::DateTime>,
+) -> Result<RequestedExpiry, ModifyDBCapacityReservationError> {
+    match (end_date_type, end_date) {
+        (None, None) => Ok(RequestedExpiry::Unchanged),
+        (None, Some(_)) => Err(
+            ModifyDBCapacityReservationError::invalid_parameter_combination(
+                "EndDate requires EndDateType: specify EndDateType with it".to_string(),
+            ),
+        ),
+        (Some(kind), end_date) if kind == crate::state::END_DATE_TYPE_LIMITED => match end_date {
+            Some(end_date) => Ok(RequestedExpiry::At(end_date)),
+            None => Err(
+                ModifyDBCapacityReservationError::invalid_parameter_combination(format!(
+                    "EndDateType {} requires EndDate: specify the date and time the \
+                     reservation expires at",
+                    crate::state::END_DATE_TYPE_LIMITED
+                )),
+            ),
+        },
+        (Some(kind), end_date) if kind == crate::state::END_DATE_TYPE_UNLIMITED => match end_date {
+            None => Ok(RequestedExpiry::Never),
+            Some(_) => Err(
+                ModifyDBCapacityReservationError::invalid_parameter_combination(format!(
+                    "EndDate can't be specified with EndDateType {}, which is the \
+                     reservation that doesn't expire",
+                    crate::state::END_DATE_TYPE_UNLIMITED
+                )),
+            ),
+        },
+        (Some(kind), _) => Err(ModifyDBCapacityReservationError::invalid_parameter_value(
+            format!(
+                "Invalid value {kind} for EndDateType. Valid values are {}, {}",
+                crate::state::END_DATE_TYPE_LIMITED,
+                crate::state::END_DATE_TYPE_UNLIMITED
+            ),
+        )),
+    }
+}
+
+/// The modelled `InvalidDBCapacityReservationStateFault` — "the DB capacity reservation isn't
+/// in a valid state" — carrying the sentence that says which state it is in and which the
+/// call needs ([`crate::state::db_capacity_reservation_state_message`]).
+fn invalid_state(message: String) -> ModifyDBCapacityReservationError {
+    ModifyDBCapacityReservationErrorModeled::InvalidDBCapacityReservationStateFault(
+        InvalidDBCapacityReservationStateFault {
+            message: Some(message),
+        },
+    )
+    .into()
 }

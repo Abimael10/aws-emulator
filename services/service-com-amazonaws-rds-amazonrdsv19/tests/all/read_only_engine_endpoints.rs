@@ -17,7 +17,9 @@
 //!
 //! The rows span what the rule generalises over: both wires (PostgreSQL and MySQL), both
 //! kinds of read-only endpoint (a cluster's reader endpoint and a replica instance's own),
-//! both cluster types (an Aurora cluster and a Multi-AZ DB cluster), and — for the
+//! both cluster types (an Aurora cluster and a Multi-AZ DB cluster), both MySQL-family
+//! read-only conditions (an Aurora node reading a volume it cannot write, and an RDS for
+//! MySQL replica held read-only by the server's own option), and — for the
 //! statements a read-only session refuses — a write of each class the engines list (a row
 //! insert, a row update, a row delete, a table create and a table drop) beside the reads
 //! the same session serves.
@@ -67,10 +69,13 @@ const REFUSED_WRITES: &[&str] = &[
 /// What each wire's server answers a refused write with: the code a client branches on and
 /// the sentence it reports.
 ///
-/// PostgreSQL names the command it refused, under `read_only_sql_transaction` (25006);
-/// MySQL has one sentence for every statement its `read_only` setting refuses, under
-/// `ER_OPTION_PREVENTS_STATEMENT` (1290).
-fn expected_refusal(wire: Wire, statement: &str) -> Refusal {
+/// PostgreSQL names the command it refused, under `read_only_sql_transaction` (25006),
+/// whichever PostgreSQL-family engine serves the endpoint. The MySQL family has one sentence
+/// per read-only CONDITION, and which condition a node is in follows its ENGINE: an Aurora
+/// MySQL node that is not the cluster's writer reads a volume it cannot write and reports
+/// `ER_READ_ONLY_MODE` (1836), while an RDS for MySQL or MariaDB read replica is held
+/// read-only by the server's own option and reports `ER_OPTION_PREVENTS_STATEMENT` (1290).
+fn expected_refusal(wire: Wire, engine: &str, statement: &str) -> Refusal {
     match wire {
         Wire::Postgres => {
             let command = match statement.split_whitespace().next().unwrap_or_default() {
@@ -83,6 +88,10 @@ fn expected_refusal(wire: Wire, statement: &str) -> Refusal {
                 message: format!("cannot execute {command} in a read-only transaction"),
             }
         }
+        Wire::MySql if engine.starts_with("aurora") => Refusal {
+            code: "1836".to_string(),
+            message: "Running in read-only mode".to_string(),
+        },
         Wire::MySql => Refusal {
             code: "1290".to_string(),
             message: "The MySQL server is running with the --read-only option so it cannot \
@@ -97,6 +106,7 @@ fn expected_refusal(wire: Wire, statement: &str) -> Refusal {
 async fn the_read_only_endpoint_serves_reads_and_refuses_writes(
     case: &str,
     wire: Wire,
+    engine: &str,
     writes: &mut Session,
     reads: &mut Session,
 ) {
@@ -131,7 +141,7 @@ async fn the_read_only_endpoint_serves_reads_and_refuses_writes(
         });
         assert_eq!(
             refusal,
-            expected_refusal(wire, statement),
+            expected_refusal(wire, engine, statement),
             "case {case:?}: expected the engine's own refusal of {statement:?}, got {refusal:?}"
         );
     }
@@ -337,6 +347,7 @@ async fn a_clusters_reader_endpoint_serves_the_writers_rows_and_refuses_every_wr
         the_read_only_endpoint_serves_reads_and_refuses_writes(
             row.case,
             row.wire,
+            row.engine,
             &mut writes,
             &mut reads,
         )
@@ -549,7 +560,7 @@ async fn a_cluster_members_endpoint_serves_the_cluster_volume_in_the_role_the_cl
             DATABASE,
         )
         .await;
-        the_read_only_endpoint_serves_reads_and_refuses_writes(case, wire, &mut writes, &mut reads)
+        the_read_only_endpoint_serves_reads_and_refuses_writes(case, wire, engine, &mut writes, &mut reads)
             .await;
 
         // A failover moves the write role, so it moves which member's endpoint serves a
@@ -595,7 +606,7 @@ async fn a_cluster_members_endpoint_serves_the_cluster_volume_in_the_role_the_cl
             });
         assert_eq!(
             refusal,
-            expected_refusal(wire, "INSERT"),
+            expected_refusal(wire, engine, "INSERT"),
             "case {case:?}: expected the engine's own read-only refusal, got {refusal:?}"
         );
     }
@@ -702,6 +713,7 @@ async fn a_read_replicas_endpoint_serves_reads_and_refuses_every_write() {
         the_read_only_endpoint_serves_reads_and_refuses_writes(
             row.case,
             row.wire,
+            row.engine,
             &mut writes,
             &mut reads,
         )

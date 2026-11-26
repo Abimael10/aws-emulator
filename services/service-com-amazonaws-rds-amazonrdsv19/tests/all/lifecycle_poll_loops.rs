@@ -845,7 +845,7 @@ async fn a_start_is_accepted_only_for_a_stopped_instance_this_command_applies_to
         );
         assert_eq!(
             text(&body, "Message"),
-            format!("DBCapacityReservation {reservation} not found."),
+            format!("The specified DBCapacityReservation '{reservation}' does not exist."),
             "case {case:?}: got {:?}",
             text(&body, "Message")
         );

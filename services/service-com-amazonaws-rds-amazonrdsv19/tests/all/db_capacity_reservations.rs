@@ -593,7 +593,7 @@ async fn a_value_nothing_created_is_the_modelled_not_found_fault() {
         );
         assert_eq!(
             text(&refused, "Message"),
-            format!("DBCapacityReservation {named} not found."),
+            format!("The specified DBCapacityReservation '{named}' does not exist."),
             "case {case:?}: expected the fault to name the value the request carried, got \
              {refused}"
         );

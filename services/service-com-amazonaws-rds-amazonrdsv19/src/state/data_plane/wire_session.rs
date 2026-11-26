@@ -2073,7 +2073,7 @@ pub fn streamed_rows(
     // ([`read_only::refused_command`]).
     if facts.read_only_transaction() {
         if let Some(command) = read_only::refused_command(&tokens) {
-            return Err(read_only::refusal(facts.wire, &command));
+            return Err(read_only::refusal(facts.wire, &facts.engine, &command));
         }
     }
     let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
@@ -2157,7 +2157,7 @@ pub(super) fn run_statement_at(
     // reaches the storage behind it.
     if facts.read_only_transaction() {
         if let Some(command) = read_only::refused_command(&tokens) {
-            return Err(read_only::refusal(facts.wire, &command));
+            return Err(read_only::refusal(facts.wire, &facts.engine, &command));
         }
     }
     // And on a STANDBY, the statements that would put the transaction they open, or the one

@@ -15,7 +15,10 @@
 //! FROM`, every `CREATE`, `ALTER` and `DROP` command, and `COMMENT`, `GRANT`, `REVOKE` and
 //! `TRUNCATE`. MySQL's `read_only` system variable draws the same line — "the server permits
 //! no client updates", refusing the statements that modify tables or data — so the two wires
-//! refuse the same statements and differ only in what they call the refusal.
+//! refuse the same statements and differ only in what they call the refusal. Within the MySQL
+//! family the refusal follows the ENGINE as well as the wire: an Aurora node that is not the
+//! cluster's writer reports the server's read-only MODE, and an RDS for MySQL or MariaDB read
+//! replica the server's `--read-only` OPTION ([`refusal`]).
 //!
 //! Read off the statement's own leading KEYWORDS, which is what names the command a server
 //! reports in that refusal. A statement whose first keyword is none of them is handed to the
@@ -32,15 +35,30 @@ use super::EngineWire;
 /// `read_only_sql_transaction`.
 pub const POSTGRES_READ_ONLY_SQLSTATE: &str = "25006";
 
-/// The MySQL server error a write on a read-only server is refused with:
+/// The MySQL server error a write on a server running with `--read-only` is refused with:
 /// `ER_OPTION_PREVENTS_STATEMENT`, under the general-error SQLSTATE it carries.
+///
+/// What an RDS for MySQL or MariaDB read replica answers: those engines hold a read replica
+/// read-only through the server's own `read_only` option.
 pub const MYSQL_READ_ONLY_ERROR: (u16, &str) = (1290, "HY000");
+
+/// The MySQL server error an AURORA MySQL node that is not the cluster's writer refuses a
+/// write with: `ER_READ_ONLY_MODE`, under the same general-error SQLSTATE.
+///
+/// An Aurora Replica is not a server started with `--read-only`: it is a node reading a
+/// cluster volume it cannot write, and the server has its own error for that condition. A
+/// client that branches on the error code sees the one its own engine sends.
+pub const AURORA_MYSQL_READ_ONLY_ERROR: (u16, &str) = (1836, "HY000");
 
 /// What MySQL answers a statement its `read_only` setting refuses with, worded as the
 /// server words it.
 const MYSQL_READ_ONLY_MESSAGE: &str =
     "The MySQL server is running with the --read-only option so it cannot execute this \
      statement";
+
+/// What an Aurora MySQL node refuses a write with, worded as the server words
+/// `ER_READ_ONLY_MODE`: one sentence, whatever the statement was.
+const AURORA_MYSQL_READ_ONLY_MESSAGE: &str = "Running in read-only mode";
 
 /// The commands a read-only session refuses that are named by ONE keyword, with the command
 /// name the refusal reports for each.
@@ -155,24 +173,37 @@ pub fn verb_writes(verb: &str) -> bool {
         || matches!(named.as_str(), "COPY" | "LOAD")
 }
 
-/// How `wire`'s engine refuses `command` on a read-only session.
+/// How the engine `engine` speaking `wire` refuses `command` on a read-only session.
 ///
-/// PostgreSQL names the command it refused and reports the condition's own SQLSTATE;
-/// MySQL's refusal is the one sentence its `read_only` setting has, whatever the statement
-/// was.
+/// PostgreSQL names the command it refused and reports the condition's own SQLSTATE,
+/// whichever PostgreSQL-family engine serves the endpoint. The MySQL family has one sentence
+/// per read-only CONDITION, whatever the statement was, and which condition the node is in
+/// follows the engine: an Aurora MySQL node that is not the cluster's writer is reading a
+/// volume it cannot write ([`AURORA_MYSQL_READ_ONLY_ERROR`]), while an RDS for MySQL or
+/// MariaDB read replica is a server held read-only by its own `read_only` option
+/// ([`MYSQL_READ_ONLY_ERROR`]).
 #[must_use]
-pub fn refusal(wire: EngineWire, command: &str) -> EngineError {
+pub fn refusal(wire: EngineWire, engine: &str, command: &str) -> EngineError {
     match wire {
         EngineWire::Postgres => EngineError::new(
             EngineErrorKind::ReadOnlySqlTransaction,
             format!("cannot execute {command} in a read-only transaction"),
         )
         .with_sqlstate(POSTGRES_READ_ONLY_SQLSTATE),
-        EngineWire::MySql => EngineError::new(
-            EngineErrorKind::ReadOnlySqlTransaction,
-            MYSQL_READ_ONLY_MESSAGE.to_string(),
-        )
-        .with_mysql_error(MYSQL_READ_ONLY_ERROR.0, MYSQL_READ_ONLY_ERROR.1),
+        EngineWire::MySql => {
+            let (message, (code, sqlstate)) = match crate::state::is_aurora(engine) {
+                true => (
+                    AURORA_MYSQL_READ_ONLY_MESSAGE,
+                    AURORA_MYSQL_READ_ONLY_ERROR,
+                ),
+                false => (MYSQL_READ_ONLY_MESSAGE, MYSQL_READ_ONLY_ERROR),
+            };
+            EngineError::new(
+                EngineErrorKind::ReadOnlySqlTransaction,
+                message.to_string(),
+            )
+            .with_mysql_error(code, sqlstate)
+        }
     }
 }
 

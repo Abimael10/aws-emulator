@@ -10,6 +10,53 @@ Issue-Commit: 22c0b68190b6d53f08de46118af925b6725f9997
 
 # rds: 2 net-new causes — the DB-capacity-reservation not-found refusal is emulator-authored prose on Describe/Modify/Cancel, and an Aurora ReaderEndpoint connection never lands on a read-only replica
 
+## Resolution
+
+Cause 1 is FIXED and its replay unit passes: the one not-found wording helper of the DB
+capacity reservation state now carries AWS's sentence
+("The specified DBCapacityReservation '<the value the request sent>' does not exist."), and
+`ModifyDBCapacityReservation` and `CancelDBCapacityReservation` — both still 501 scaffolds at
+the commit above, which is why the check could not even reach their wording — are implemented,
+so all three operations that resolve a `DBCapacityReservationIdentifier` raise the modelled
+404 fault with that sentence.
+
+Cause 2 is PARTLY IMPLEMENTED and otherwise BLOCKED on the read-only core; its two replay
+units still fail, because the one piece that is blocked is the one the checks need first.
+
+What the cause asks for, and where each part stands:
+
+* reader-endpoint ROUTING — already implemented: a DB cluster opens a SECOND, read-only
+  listener (`src/state/data_plane.rs`, `EndpointRole::Reader`), its sessions are served by the
+  first non-writer member (`src/state/data_plane/cluster_endpoint.rs`, `serving_member`) and
+  serve no writes (`serves_reads_only`), and the member a session landed on is what
+  `@@aurora_server_id` answers.
+* the reader node's READ-ONLY ENGINE STATE — already implemented: `pg_is_in_recovery()` is
+  true and `@@innodb_read_only` / `@@read_only` / `@@super_read_only` are 1 on such a session
+  (`tests/all/engine_read_only_system_variables.rs`), and the reader reads the rows the writer
+  committed, both members sharing one cluster volume.
+* the reader's REFUSAL of a write — FIXED here: a MySQL-family read-only session was refused
+  with `ER_OPTION_PREVENTS_STATEMENT` (1290, "The MySQL server is running with the
+  --read-only option …") whatever the engine, which is the sentence an RDS for MySQL read
+  replica sends; an Aurora MySQL node that is not the cluster's writer sends
+  `ER_READ_ONLY_MODE` (1836, "Running in read-only mode"). The refusal now follows the engine
+  family that serves the endpoint (`src/state/data_plane/read_only.rs`), with both rows in
+  `tests/all/read_only_engine_endpoints.rs`. Aurora PostgreSQL already answered SQLSTATE
+  25006.
+* the published ADDRESS of the reader endpoint — BLOCKED. `DBCluster` carries ONE `Port` for
+  both endpoint hosts, so the reader endpoint is reachable only when the two hosts resolve to
+  different interfaces at the same port — and the core binds every listener on one
+  operator-chosen interface at a port it assigns itself
+  (`vendor/server/src/listeners.rs:88` `bind_tokio`, `:230` `tcp_plaintext`), then DROPS the
+  accepted connection's local address (`vendor/server/src/listeners.rs:319`
+  `let (stream, _peer) = ...`), handing `NativeHandler::serve` the stream alone (`:136`).
+  Neither wire carries the host the client dialled in band, so a handler cannot tell a reader
+  connection from a writer one on the single published `host:Port` pair, and a service may not
+  bind a socket or choose a port of its own (`vendor/engine/src/lib.rs:21-32`). Required core
+  change: hand a native handler the local address each accepted connection arrived on (and
+  accept on the loopback block), or let a service open a second listener at an already-assigned
+  port on another loopback address — then the cluster can publish two distinct loopback hosts
+  beside one `Port` and serve the reader role on the one the client dialled.
+
 > _Note: this issue was identified against the code base at commit `22c0b68190b6d53f08de46118af925b6725f9997`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

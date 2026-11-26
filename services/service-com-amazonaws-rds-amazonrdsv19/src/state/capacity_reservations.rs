@@ -37,6 +37,14 @@ pub const DB_CAPACITY_RESERVATION_STATE_SCHEDULED: &str = "scheduled";
 /// the reserved capacity".
 pub const DB_CAPACITY_RESERVATION_STATE_EXPIRED: &str = "expired";
 
+/// The state a reservation reaches once "you cancelled the reservation, and Amazon RDS
+/// released the reserved capacity" — what `CancelDBCapacityReservation` leaves behind.
+pub const DB_CAPACITY_RESERVATION_STATE_CANCELLED: &str = "cancelled";
+
+/// The state a future-dated reservation reports when "Amazon RDS couldn't provide the
+/// reserved capacity of a future-dated reservation by its start date".
+pub const DB_CAPACITY_RESERVATION_STATE_DELAYED: &str = "delayed";
+
 /// Every state `DBCapacityReservationState` publishes
 /// (`smithy_query(query="shape",shape="DBCapacityReservationState")`), in the order the
 /// enum lists them. This is the domain of the `state` filter of
@@ -45,12 +53,12 @@ pub const DB_CAPACITY_RESERVATION_STATE_EXPIRED: &str = "expired";
 pub const DB_CAPACITY_RESERVATION_STATES: [&str; 9] = [
     DB_CAPACITY_RESERVATION_STATE_ACTIVE,
     DB_CAPACITY_RESERVATION_STATE_EXPIRED,
-    "cancelled",
+    DB_CAPACITY_RESERVATION_STATE_CANCELLED,
     DB_CAPACITY_RESERVATION_STATE_PENDING,
     "failed",
     DB_CAPACITY_RESERVATION_STATE_ASSESSING,
     DB_CAPACITY_RESERVATION_STATE_SCHEDULED,
-    "delayed",
+    DB_CAPACITY_RESERVATION_STATE_DELAYED,
     "unsupported",
 ];
 
@@ -60,9 +68,30 @@ pub const DB_CAPACITY_RESERVATION_STATES: [&str; 9] = [
 /// moving it again.
 const TERMINAL_DB_CAPACITY_RESERVATION_STATES: [&str; 4] = [
     DB_CAPACITY_RESERVATION_STATE_EXPIRED,
-    "cancelled",
+    DB_CAPACITY_RESERVATION_STATE_CANCELLED,
     "failed",
     "unsupported",
+];
+
+/// The states `ModifyDBCapacityReservation` can act in: "the reservation must be in the
+/// `active` state. A future-dated reservation that hasn't started isn't modifiable, and
+/// neither is a reservation that Amazon RDS is already modifying" — both of those report
+/// another state ([`DB_CAPACITY_RESERVATION_STATE_SCHEDULED`],
+/// [`DB_CAPACITY_RESERVATION_STATE_PENDING`]), so the one admitted state is the whole rule.
+pub const DB_CAPACITY_RESERVATION_MODIFIABLE_STATES: [&str; 1] =
+    [DB_CAPACITY_RESERVATION_STATE_ACTIVE];
+
+/// The states `CancelDBCapacityReservation` can act in: "the reservation must be in the
+/// `active`, `assessing`, or `delayed` state."
+///
+/// "The reservation must not be past its end date" is the other constraint of that call, and
+/// needs no state of its own here: a reservation past its end date has already been moved to
+/// [`DB_CAPACITY_RESERVATION_STATE_EXPIRED`] by the clock
+/// ([`DbCapacityReservationRecord::settle`]), which is not one of these.
+pub const DB_CAPACITY_RESERVATION_CANCELLABLE_STATES: [&str; 3] = [
+    DB_CAPACITY_RESERVATION_STATE_ACTIVE,
+    DB_CAPACITY_RESERVATION_STATE_ASSESSING,
+    DB_CAPACITY_RESERVATION_STATE_DELAYED,
 ];
 
 /// The values the `state` filter of `DescribeDBCapacityReservations` accepts: every
@@ -113,18 +142,79 @@ pub fn db_capacity_reservation_arn(region: &str, identifier: &str) -> String {
 
 /// The message a `DBCapacityReservationNotFoundFault` carries: the
 /// `DBCapacityReservationIdentifier` the request sent "doesn't refer to an existing DB
-/// capacity reservation", in the `<resource type> <name> not found.` wording this front door
-/// answers a named resource it cannot resolve with — the sentence
-/// [`db_shard_group_not_found_message`] carries for the DB shard group REPORT, which is the
-/// newest resource of this door recorded answering one.
+/// capacity reservation", in the sentence Amazon RDS words that condition with.
 ///
-/// `named` is the value the REQUEST carried — the identifier or the reservation name,
-/// whichever it sent — so a caller matching the message against what it sent finds it
-/// there. One wording serves the report and the call that names a reservation for a DB
-/// instance to use: the fault is the same claim about the same value in both, and nothing
-/// recorded here words those two differently.
+/// The FIXED text is `The specified DBCapacityReservation '` … `' does not exist.` — the
+/// single quotes around the value and the trailing period included — and the only variable
+/// part is the value the REQUEST carried, the identifier or the reservation name, whichever
+/// it sent. It is quoted as AWS quotes it, so a caller that lifts the value back out of the
+/// sentence finds exactly what it sent.
+///
+/// ONE wording serves every call that resolves a reservation and finds none — the report,
+/// the modification, the cancel and the call that names a reservation for a DB instance to
+/// use: the fault is the same claim about the same value in all of them. This resource is
+/// therefore NOT worded like the resources whose own refusal this door words
+/// `<resource type> <name> not found.` ([`db_shard_group_not_found_message`]).
 pub fn db_capacity_reservation_not_found_message(named: &str) -> String {
-    format!("DBCapacityReservation {named} not found.")
+    format!("The specified DBCapacityReservation '{named}' does not exist.")
+}
+
+/// What a call on a DB capacity reservation whose `State` is not one it can act in is
+/// refused with: the modelled `InvalidDBCapacityReservationStateFault` says "the DB capacity
+/// reservation isn't in a valid state", and the sentence states the reservation, the state it
+/// is in and the states the call needs, all three from the record and the call itself.
+///
+/// `named` is the value the REQUEST carried, and `expected` the states that call admits
+/// ([`DB_CAPACITY_RESERVATION_MODIFIABLE_STATES`],
+/// [`DB_CAPACITY_RESERVATION_CANCELLABLE_STATES`]) — so a caller can see whether waiting
+/// will clear the refusal. One wording for every operation in that position, in the form this
+/// front door words a resource's state refusal in ([`cluster_state_message`]), so the two
+/// calls that raise this fault cannot drift from each other.
+pub fn db_capacity_reservation_state_message(
+    named: &str,
+    state: &str,
+    expected: &[&str],
+) -> String {
+    format!(
+        "DBCapacityReservation {named} is in {state} state but expected it to be one of {}.",
+        expected.join(", ")
+    )
+}
+
+/// What a cancel of a reservation that is holding capacity for a CAPACITY COMMITMENT is
+/// refused with: "you can't cancel a reservation in the `active` state during a capacity
+/// commitment", and "the response of `DescribeDBCapacityReservations` reports the end of the
+/// commitment in `CommitmentInfo`" — which is where the sentence sends the caller, rather
+/// than restating a date the report already carries.
+///
+/// The same modelled fault as [`db_capacity_reservation_state_message`] with a different
+/// cause, so the sentence is what tells the two apart: this one is not a state the
+/// reservation will leave on its own before the commitment ends.
+pub fn db_capacity_reservation_commitment_message(named: &str) -> String {
+    format!(
+        "DBCapacityReservation {named} can't be cancelled during its capacity commitment. The \
+         commitment ends at the CommitmentEndDate of its CommitmentInfo."
+    )
+}
+
+/// `EndDateType` `limited`: "the reservation has a specific end date. You must also specify
+/// `EndDate`." One of the two values that enum publishes
+/// (`smithy_query(query="shape",shape="EndDateType")`).
+pub const END_DATE_TYPE_LIMITED: &str = "limited";
+
+/// `EndDateType` `unlimited`: "the reservation doesn't expire. Don't specify `EndDate`."
+pub const END_DATE_TYPE_UNLIMITED: &str = "unlimited";
+
+/// Refuse a new `CapacityPerAvailabilityZone` below the capacity a running commitment holds:
+/// "during a capacity commitment, can't be less than `CommittedCapacityPerAvailabilityZone`."
+pub fn check_committed_capacity_floor(capacity: i32, committed: i32) -> Result<(), String> {
+    if capacity < committed {
+        return Err(format!(
+            "Invalid value {capacity} for CapacityPerAvailabilityZone. Must be at least the \
+             committed capacity of {committed} during a capacity commitment"
+        ));
+    }
+    Ok(())
 }
 
 /// How many DB capacity reservation RECORDS one region may hold at all, whatever state each
@@ -575,6 +665,37 @@ impl DbCapacityReservationRecord {
         self.start_date.is_some()
     }
 
+    /// Whether a capacity commitment of this reservation is still RUNNING at `wall_clock`:
+    /// Amazon RDS "holds that capacity for the length of the commitment", and the commitment
+    /// it granted ends at [`DbCapacityReservationCommitment::commitment_end_date`].
+    ///
+    /// The one reading of that question: it is what keeps a cancel from releasing committed
+    /// capacity ("you can't cancel a reservation in the `active` state during a capacity
+    /// commitment") and what floors a modification's new capacity
+    /// ([`check_committed_capacity_floor`]). A reservation that carries no commitment is in
+    /// none, and one whose commitment has ended is past it.
+    pub fn commitment_is_running(&self, wall_clock: ::aws_smithy_types::DateTime) -> bool {
+        self.commitment.as_ref().is_some_and(|commitment| {
+            wall_clock.as_secs_f64() < commitment.commitment_end_date.as_secs_f64()
+        })
+    }
+
+    /// The capacity a running commitment of this reservation holds in each Availability Zone
+    /// at `wall_clock`, or `None` where no commitment is running: the floor a modification's
+    /// new `CapacityPerAvailabilityZone` cannot go below.
+    pub fn committed_capacity_per_availability_zone(
+        &self,
+        wall_clock: ::aws_smithy_types::DateTime,
+    ) -> Option<i32> {
+        self.commitment_is_running(wall_clock)
+            .then(|| {
+                self.commitment
+                    .as_ref()
+                    .map(|commitment| commitment.committed_capacity_per_availability_zone)
+            })
+            .flatten()
+    }
+
     /// `arn:aws:rds:<region>:<account>:db-capacity-reservation:<identifier>`, from the
     /// stored region and identifier.
     pub fn arn(&self) -> String {
@@ -695,6 +816,26 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         self.capacity_reservations_in(region)
             .into_iter()
             .any(|record| record.name == name)
+    }
+
+    /// The same reservation [`Self::resolve_db_capacity_reservation`] resolves, held MUTABLY:
+    /// what the calls that CHANGE one write through — the modification and the cancel.
+    ///
+    /// Resolved by the one reading of the two namespaces a reservation answers to, so a
+    /// mutation and a report cannot disagree about which reservation a value names; the
+    /// record is then taken by its own stored key, which is the identifier that reading
+    /// placed.
+    pub fn resolve_db_capacity_reservation_mut(
+        &mut self,
+        region: &str,
+        named: &str,
+    ) -> Option<&mut DbCapacityReservationRecord> {
+        let identifier = self
+            .resolve_db_capacity_reservation(region, named)?
+            .identifier
+            .clone();
+        self.db_capacity_reservations
+            .get_mut(&(region.to_string(), identifier))
     }
 
     /// How many DB instances the reservations of `region` already hold capacity for

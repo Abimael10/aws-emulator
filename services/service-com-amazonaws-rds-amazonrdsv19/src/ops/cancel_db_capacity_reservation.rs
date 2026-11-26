@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelDBCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelDBCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelDBCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +143,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelDBCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelDBCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelDBCapacityReservation"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CancelDBCapacityReservationError::validation)?;
+        // "The identifier or the name of the DB capacity reservation to cancel." Its length,
+        // its alphabet and its hyphen rules are the `@length` and `@pattern` of the
+        // `DBCapacityReservationIdentifier` shape, already refused at the boundary — so a
+        // well-formed value that names nothing here is a not-found, never a validation
+        // failure.
+        let named = input.db_capacity_reservation_identifier;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a cancel that released nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due are materialised first, so the state
+        // this cancel is checked against is the state the reservation is in NOW: the `active`
+        // a create owed it, and the `expired` its own `EndDate` owes it.
+        store.settle_due_transitions(&region);
+
+        let now = crate::state::now_as_wire_timestamp();
+        let Some(record) = store.resolve_db_capacity_reservation_mut(&region, &named) else {
+            return Err(CancelDBCapacityReservationErrorModeled::DBCapacityReservationNotFoundFault(
+                DBCapacityReservationNotFoundFault {
+                    message: Some(crate::state::db_capacity_reservation_not_found_message(
+                        &named,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "Constraints: The reservation must be in the active, assessing, or delayed state.
+        // The reservation must not be past its end date." A reservation past its end date
+        // reports `expired`, which is not one of those states, so the state check is the
+        // whole constraint.
+        if !crate::state::DB_CAPACITY_RESERVATION_CANCELLABLE_STATES
+            .contains(&record.state.as_str())
+        {
+            return Err(invalid_state(
+                crate::state::db_capacity_reservation_state_message(
+                    &named,
+                    &record.state,
+                    &crate::state::DB_CAPACITY_RESERVATION_CANCELLABLE_STATES,
+                ),
+            ));
+        }
+        // "You can't cancel a reservation in the active state during a capacity commitment":
+        // Amazon RDS holds that capacity for the length of the commitment, so the capacity
+        // cannot be released until the commitment ends.
+        if record.state == crate::state::DB_CAPACITY_RESERVATION_STATE_ACTIVE
+            && record.commitment_is_running(now)
+        {
+            return Err(invalid_state(
+                crate::state::db_capacity_reservation_commitment_message(&named),
+            ));
+        }
+
+        // "Amazon RDS changes the state of the reservation to cancelled and stops reporting
+        // available capacity for it. Amazon RDS then releases the reserved capacity." The
+        // record stays: a cancelled reservation is still reported, with no capacity left
+        // available in any of its zones, and it is past every transition the clock could owe
+        // it, so the pending one is dropped with the capacity.
+        record.state = crate::state::DB_CAPACITY_RESERVATION_STATE_CANCELLED.to_string();
+        record.pending_state = None;
+        Ok(CancelDBCapacityReservationOutput {
+            db_capacity_reservation: Some(record.to_wire()),
+        })
     }
+}
+
+/// The modelled `InvalidDBCapacityReservationStateFault` — "the DB capacity reservation isn't
+/// in a valid state" — carrying `message`, which is the only thing that tells the two causes
+/// of it apart ([`crate::state::db_capacity_reservation_state_message`],
+/// [`crate::state::db_capacity_reservation_commitment_message`]).
+fn invalid_state(message: String) -> CancelDBCapacityReservationError {
+    CancelDBCapacityReservationErrorModeled::InvalidDBCapacityReservationStateFault(
+        InvalidDBCapacityReservationStateFault {
+            message: Some(message),
+        },
+    )
+    .into()
 }
