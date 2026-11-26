@@ -100,15 +100,19 @@ async fn a_delete_of_a_protected_resource_names_the_setting_that_has_to_change()
     );
     wait_for_settle();
 
-    for (case, operation, member, identifier, kind, extra) in [
+    // Each row carries the resource KIND as Amazon RDS names it in this sentence, and
+    // whether that operation's recorded answer also names the resource the request sent:
+    // the DB cluster and DB instance deletes carry the kind alone, while the
+    // global-database delete interpolates the `GlobalClusterIdentifier` between the
+    // sentence's two halves. Each delete is held to the answer ITS own front door gives.
+    for (case, operation, member, identifier, kind, names_the_identifier, extra) in [
         (
             "a DB instance",
             "DeleteDBInstance",
             "DBInstanceIdentifier",
             "emu-prot-instance",
-            // The resource KIND as Amazon RDS names it in this sentence; the recorded
-            // answers carry no identifier in it.
             "DB Instance",
+            false,
             Some(("SkipFinalSnapshot", "true")),
         ),
         (
@@ -117,6 +121,7 @@ async fn a_delete_of_a_protected_resource_names_the_setting_that_has_to_change()
             "DBClusterIdentifier",
             "emu-prot-cluster",
             "Cluster",
+            false,
             Some(("SkipFinalSnapshot", "true")),
         ),
         (
@@ -125,6 +130,7 @@ async fn a_delete_of_a_protected_resource_names_the_setting_that_has_to_change()
             "GlobalClusterIdentifier",
             "emu-prot-global",
             "Global Cluster",
+            true,
             None,
         ),
     ] {
@@ -138,14 +144,19 @@ async fn a_delete_of_a_protected_resource_names_the_setting_that_has_to_change()
             400,
             INVALID_PARAMETER_COMBINATION,
         );
+        let subject = if names_the_identifier {
+            format!("{kind} {identifier}")
+        } else {
+            kind.to_string()
+        };
         assert_eq!(
             text(&body, "Message"),
             format!(
-                "Cannot delete protected {kind}, please disable deletion protection and \
+                "Cannot delete protected {subject}, please disable deletion protection and \
                  try again."
             ),
-            "case {case:?}: the refusal must carry the sentence this class is worded \
-             with, naming the resource kind, got {:?}",
+            "case {case:?}: the refusal must carry the sentence this operation words the \
+             class with, got {:?}",
             text(&body, "Message")
         );
     }

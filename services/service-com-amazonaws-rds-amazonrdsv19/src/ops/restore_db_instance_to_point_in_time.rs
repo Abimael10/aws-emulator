@@ -534,10 +534,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     RestoreDBInstanceToPointInTimeErrorModeled::DBInstanceNotFoundFault(
                         DBInstanceNotFoundFault {
-                            message: Some(format!(
-                                "DBInstance not found: {}",
-                                named_source.describe()
-                            )),
+                            // This operation names a source AND a target instance, so the
+                            // refusal says it is the SOURCE that was not found rather than
+                            // carrying the shared not-found template
+                            // (`crate::state::restore_source_db_instance_not_found_message`),
+                            // and it names the source in the spelling the REQUEST wrote it in
+                            // — only the lookup folds the identifier.
+                            message: Some(
+                                crate::state::restore_source_db_instance_not_found_message(
+                                    input
+                                        .source_db_instance_identifier
+                                        .as_deref()
+                                        .or(input.source_dbi_resource_id.as_deref())
+                                        .unwrap_or_default(),
+                                ),
+                            ),
                         },
                     )
                     .into(),

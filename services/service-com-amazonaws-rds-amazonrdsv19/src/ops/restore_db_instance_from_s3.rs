@@ -509,6 +509,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.tag_specifications,
         );
 
+        // `EnableCloudwatchLogsExports` is STORED on the restored instance, so the list's
+        // length and each entry are bounded where they enter the handler, exactly as the
+        // create of an instance bounds the same member — with every other refusal the REQUEST
+        // alone decides, above everything that resolves a resource.
+        if let Some(values) = &input.enable_cloudwatch_logs_exports {
+            crate::state::check_request_list_len(
+                "EnableCloudwatchLogsExports",
+                values.len(),
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            )
+            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+            for value in values {
+                crate::state::check_free_form("EnableCloudwatchLogsExports", value)
+                    .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated instance.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // WHERE the restored instance would be placed is resolved BEFORE the source the
+        // migration reads: a `DBSubnetGroupName` that matches no DB subnet group of this
+        // Region names a resource of THIS service that does not exist, which is the modelled
+        // 404 for that resource type, and answering the source's refusal instead would point
+        // the caller at a bucket when what is missing is the subnet group. The instance-level
+        // front door words the fault its own way
+        // (`crate::state::db_subnet_group_not_found_for_db_instance_message`).
+        let db_subnet_group_name = input
+            .db_subnet_group_name
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase());
+        if let Some(name) = &db_subnet_group_name {
+            if state
+                .lock()
+                .resolve_db_subnet_group(&region, name)
+                .is_none()
+            {
+                return Err(
+                    RestoreDBInstanceFromS3ErrorModeled::DBSubnetGroupNotFoundFault(
+                        DBSubnetGroupNotFoundFault {
+                            message: Some(
+                                crate::state::db_subnet_group_not_found_for_db_instance_message(
+                                    name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // WHO the restore would read the backup AS, asked of the VALUE before anything is
+        // read: `S3IngestionRoleArn` is the role Amazon RDS acts as while it reads the
+        // backup, so a value that is no role of this account, or one IAM answers it holds no
+        // such role under or whose trust does not admit Amazon RDS, leaves the migration no
+        // identity to run under at all — the refusal naming the feature the role is required
+        // for ([`crate::state::ingestion_role_is_unusable`]). What the role may DO is a
+        // separate question, asked of the location below once that location resolves.
+        if crate::state::ingestion_role_is_unusable(ctx, &region, &input.s3_ingestion_role_arn)
+            .await
+        {
+            return Err(RestoreDBInstanceFromS3Error::invalid_parameter_value(
+                crate::state::unusable_ingestion_role_message(),
+            ));
+        }
+
         // THE BACKUP the restore reads: the location is a resource of ANOTHER service, so it
         // is resolved where that service holds it, and each of the two conditions that leave
         // this call nothing to migrate is answered as Amazon RDS answers it — a bucket this
@@ -541,13 +611,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {}
         }
 
-        // WHO the restore reads that backup AS: `S3IngestionRoleArn` is "an IAM role with a
-        // trust policy and a permissions policy that allows Amazon RDS to access your Amazon
-        // S3 bucket", so the Amazon S3 reads the migration makes are authorized against that
-        // role's permissions rather than against the caller's own — and a role whose
-        // permissions withhold one of them leaves this restore unable to list or read the
-        // backup's files at all, which is what the refusal reports. It is decided BEFORE any
-        // instance state exists, and nothing is refused on evidence IAM did not give
+        // WHAT the role the restore acts as may DO on the location that resolved: the Amazon
+        // S3 reads the migration makes are authorized against the ingestion role's own
+        // permissions rather than against the caller's — the listing that finds the backup's
+        // files and the read of each of them — so a role whose permissions withhold one of
+        // them leaves this restore unable to read the backup it just located, which is what
+        // this refusal reports. It is decided BEFORE any instance state exists, and nothing
+        // is refused on evidence IAM did not give
         // ([`crate::state::ingestion_role_is_unauthorized`]).
         if crate::state::ingestion_role_is_unauthorized(
             &*self.engine,
@@ -564,28 +634,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `EnableCloudwatchLogsExports` is STORED on the restored instance, so the list's
-        // length and each entry are bounded where they enter the handler, exactly as the
-        // create of an instance bounds the same member.
-        if let Some(values) = &input.enable_cloudwatch_logs_exports {
-            crate::state::check_request_list_len(
-                "EnableCloudwatchLogsExports",
-                values.len(),
-                crate::state::MAX_CLUSTER_LIST_ENTRIES,
-            )
-            .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
-            for value in values {
-                crate::state::check_free_form("EnableCloudwatchLogsExports", value)
-                    .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
-            }
-        }
-
-        // No store means this service was mounted on an engine it has no state in, so it
-        // cannot serve the operation at all. Unreachable with the engine the router builds;
-        // 501 is the honest answer, never a fabricated instance.
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
-        };
         // The key the restored instance is stored under, in both the record map and the engine
         // endpoint map, so the two always name the same instance.
         let key = (region.clone(), identifier.clone());
@@ -614,27 +662,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every resource this request REFERENCES by name is resolved in the store before
             // the instance is inserted, and a name that resolves to nothing is that resource
             // type's modelled not-found fault — the same resolution `CreateDBInstance` does,
-            // because the restored resource IS a DB instance.
-            let db_subnet_group_name = input
-                .db_subnet_group_name
-                .as_ref()
-                .map(|name| name.to_ascii_lowercase());
-            if let Some(name) = &db_subnet_group_name {
-                if store.resolve_db_subnet_group(&region, name).is_none() {
-                    return Err(
-                        RestoreDBInstanceFromS3ErrorModeled::DBSubnetGroupNotFoundFault(
-                            DBSubnetGroupNotFoundFault {
-                                message: Some(
-                                    crate::state::db_subnet_group_not_found_for_db_instance_message(
-                                        name,
-                                    ),
-                                ),
-                            },
-                        )
-                        .into(),
-                    );
-                }
-            }
+            // because the restored resource IS a DB instance. `DBSubnetGroupName` is resolved
+            // further up, above the source the migration reads, because the fault of a
+            // resource the request names comes before the state of the source it would read.
             if let Some(named) = &input.db_parameter_group_name {
                 if !store.db_parameter_group_exists(&region, named) {
                     return Err(

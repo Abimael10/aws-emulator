@@ -45,10 +45,10 @@ const ACCOUNT: &str = "000000000000";
 // The sentences this service's refusals must carry, spelled out HERE rather than taken
 // from the code under test, so the table pins the wording instead of re-stating whatever
 // the implementation happens to say. Each is the text the recorded answers of this front
-// door carry, including which parts Amazon RDS does NOT interpolate: the deletion-protection
-// sentences name the resource KIND and not the identifier the request sent, and the
-// final-snapshot, force-failover, subnet-list and modification-state sentences have no
-// variable part at all.
+// door carry, including which parts Amazon RDS does NOT interpolate: the DB cluster and DB
+// instance deletion-protection sentences name the resource KIND and not the identifier the
+// request sent, where the GLOBAL cluster's names the identifier, and the final-snapshot,
+// force-failover, subnet-list and modification-state sentences have no variable part at all.
 
 /// `DeleteDBCluster` on a cluster whose deletion protection is on.
 const PROTECTED_CLUSTER: &str =
@@ -58,9 +58,15 @@ const PROTECTED_CLUSTER: &str =
 const PROTECTED_DB_INSTANCE: &str = "Cannot delete protected DB Instance, please disable \
                                     deletion protection and try again.";
 
-/// `DeleteGlobalCluster` on a global cluster whose deletion protection is on.
-const PROTECTED_GLOBAL_CLUSTER: &str = "Cannot delete protected Global Cluster, please \
-                                        disable deletion protection and try again.";
+/// `DeleteGlobalCluster` on a global cluster whose deletion protection is on: this front door
+/// words it with the global cluster the request NAMED between the same two halves, so a
+/// teardown of several of them reads which one is protected.
+fn protected_global_cluster(identifier: &str) -> String {
+    format!(
+        "Cannot delete protected Global Cluster {identifier}, please disable deletion \
+         protection and try again."
+    )
+}
 
 /// A delete that names BOTH of its final-snapshot members.
 const ONLY_ONE_SNAPSHOT_MEMBER: &str =
@@ -350,7 +356,7 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             params: params!["GlobalClusterIdentifier" => "emu-rcls-global"],
             status: 400,
             code: INVALID_PARAMETER_COMBINATION,
-            wording: Wording::Exact(PROTECTED_GLOBAL_CLUSTER.to_string()),
+            wording: Wording::Exact(protected_global_cluster("emu-rcls-global")),
         },
         // The final-snapshot pair, in both directions, on the two deletes that carry it.
         Row {

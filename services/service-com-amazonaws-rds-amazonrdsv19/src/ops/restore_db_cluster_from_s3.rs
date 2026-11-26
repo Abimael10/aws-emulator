@@ -576,6 +576,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answers for. The cluster's own tags are `Tags`, which this member is not.
         let _ = &input.tag_specifications;
 
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated cluster.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // `DBSubnetGroupName`: "If supplied, must match the name of an existing DBSubnetGroup",
+        // folded the way `CreateDBSubnetGroup` stores it and resolved in the store below.
+        // Where the request names none, the restored cluster is placed in the DB subnet group
+        // the real service provides alongside the account's VPC, exactly as a created cluster
+        // is.
+        let named_subnet_group_name = input
+            .db_subnet_group_name
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase());
+        let db_subnet_group_name = Some(
+            named_subnet_group_name
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_DB_SUBNET_GROUP.to_string()),
+        );
+        // WHERE the restored cluster would be placed is resolved BEFORE the source the
+        // migration reads: a `DBSubnetGroupName` that matches no DB subnet group of this
+        // Region names a resource of THIS service that does not exist, which is the modelled
+        // 404 for that resource type, and answering the source's refusal instead would point
+        // the caller at a bucket when what is missing is the subnet group. The resource the
+        // request NAMES is resolved first, each with the fault its own type carries.
+        if let Some(name) = &named_subnet_group_name {
+            if state
+                .lock()
+                .resolve_db_subnet_group(&region, name)
+                .is_none()
+            {
+                return Err(
+                    RestoreDBClusterFromS3ErrorModeled::DBSubnetGroupNotFoundFault(
+                        DBSubnetGroupNotFoundFault {
+                            message: Some(crate::state::db_subnet_group_does_not_exist_message(
+                                name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // WHO the restore would read the backup AS, asked of the VALUE before anything is
+        // read: `S3IngestionRoleArn` is the role Amazon RDS acts as while it reads the
+        // backup, so a value that is no role of this account, or one IAM answers it holds no
+        // such role under or whose trust does not admit Amazon RDS, leaves the migration no
+        // identity to run under at all — the refusal naming the feature the role is required
+        // for ([`crate::state::ingestion_role_is_unusable`]). What the role may DO is a
+        // separate question, asked of the location below once that location resolves.
+        if crate::state::ingestion_role_is_unusable(ctx, &region, &input.s3_ingestion_role_arn)
+            .await
+        {
+            return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(
+                crate::state::unusable_ingestion_role_message(),
+            ));
+        }
+
         // THE BACKUP the restore reads: the location is a resource of ANOTHER service, so it
         // is resolved where that service holds it, and each of the two conditions that leave
         // this call nothing to migrate is answered as Amazon RDS answers it — a bucket this
@@ -608,12 +668,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {}
         }
 
-        // WHO the restore reads that backup AS: `S3IngestionRoleArn` is the IAM role "that
-        // authorizes Amazon RDS to access the Amazon S3 bucket on your behalf", so the Amazon
-        // S3 reads the migration makes are authorized against that role's permissions rather
-        // than against the caller's own — and a role whose permissions withhold one of them
-        // leaves this restore unable to list or read the backup's files at all, which is what
-        // the refusal reports. It is decided BEFORE any cluster state exists, and nothing is
+        // WHAT the role the restore acts as may DO on the location that resolved: the Amazon
+        // S3 reads the migration makes are authorized against the ingestion role's own
+        // permissions rather than against the caller's — the listing that finds the backup's
+        // files and the read of each of them — so a role whose permissions withhold one of
+        // them leaves this restore unable to read the backup it just located, which is what
+        // this refusal reports. It is decided BEFORE any cluster state exists, and nothing is
         // refused on evidence IAM did not give
         // ([`crate::state::ingestion_role_is_unauthorized`]).
         if crate::state::ingestion_role_is_unauthorized(
@@ -631,26 +691,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // No store means this service was mounted on an engine it has no state in, so it
-        // cannot serve the operation at all. Unreachable with the engine the router builds;
-        // 501 is the honest answer, never a fabricated cluster.
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
-        };
-        // `DBSubnetGroupName`: "If supplied, must match the name of an existing DBSubnetGroup",
-        // folded the way `CreateDBSubnetGroup` stores it and resolved in the store below.
-        // Where the request names none, the restored cluster is placed in the DB subnet group
-        // the real service provides alongside the account's VPC, exactly as a created cluster
-        // is.
-        let named_subnet_group_name = input
-            .db_subnet_group_name
-            .as_ref()
-            .map(|name| name.to_ascii_lowercase());
-        let db_subnet_group_name = Some(
-            named_subnet_group_name
-                .clone()
-                .unwrap_or_else(|| crate::state::DEFAULT_DB_SUBNET_GROUP.to_string()),
-        );
         let key = (region.clone(), identifier.clone());
 
         // What this restore is REFUSED for in THIS service's state, decided under the store's
@@ -690,21 +730,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every resource the request REFERENCES by name is resolved before the cluster is
             // inserted, and a name that resolves to nothing is that resource type's modelled
             // not-found fault: a restore AWS would never have accepted must leave no cluster
-            // behind for a later call to find.
-            if let Some(name) = &named_subnet_group_name {
-                if store.resolve_db_subnet_group(&region, name).is_none() {
-                    return Err(
-                        RestoreDBClusterFromS3ErrorModeled::DBSubnetGroupNotFoundFault(
-                            DBSubnetGroupNotFoundFault {
-                                message: Some(
-                                    crate::state::db_subnet_group_does_not_exist_message(name),
-                                ),
-                            },
-                        )
-                        .into(),
-                    );
-                }
-            }
+            // behind for a later call to find. `DBSubnetGroupName` is resolved further up,
+            // above the source the migration reads, because the fault of a resource the
+            // request names comes before the state of the source it would read.
             // `DBClusterParameterGroupName`: "If supplied, must match the name of an existing
             // DBClusterParameterGroup." The groups RDS provides itself are there without any
             // request having created them, so a name of that form resolves even though this

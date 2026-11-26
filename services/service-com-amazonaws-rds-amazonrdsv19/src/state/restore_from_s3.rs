@@ -21,7 +21,11 @@
 //! with a trust policy and a permissions policy that allows Amazon RDS to access your Amazon
 //! S3 bucket", so the Amazon S3 reads the migration makes are authorized against that role's
 //! permissions rather than against the caller's own
-//! ([`ingestion_role_is_unauthorized`]).
+//! ([`ingestion_role_is_unauthorized`]) — and the role is read in two stages, because the two
+//! answer different things to the caller: whether the value is a role this restore can be run
+//! under AT ALL ([`ingestion_role_is_unusable`], asked before the location is resolved, since
+//! there is no role to read the location under), and then whether the permissions in force on
+//! that role cover the reads this restore makes on the location it resolved.
 
 /// The engine pair ONE restore-from-Amazon-S3 operation migrates between, as that operation's
 /// own members publish it.
@@ -48,12 +52,19 @@ pub const S3_RESTORE_CLUSTER: S3RestorePair = S3RestorePair {
 };
 
 /// What `RestoreDBInstanceFromS3` migrates: "Valid Values: mysql" for both `Engine` and
-/// `SourceEngine`, and "MySQL versions 5.6 and 5.7 are supported. Example: 5.6.40"
-/// (`SourceEngineVersion`).
+/// `SourceEngine`, and the MySQL series the import reads a backup of.
+///
+/// The member's own example text ("MySQL versions 5.6 and 5.7 are supported. Example: 5.6.40")
+/// trails the engine's releases: the recorded front door accepts a restore whose backup was
+/// taken from MySQL 8.0 and goes on to resolve the ingestion role, so the series it reads are
+/// the MySQL major-version lines this service publishes engine versions of
+/// (`crate::ops::describe_db_engine_versions`) rather than the two that example names. The
+/// cluster-level restore reads the same lines minus the one the Aurora MySQL migration does
+/// not ([`S3_RESTORE_CLUSTER`]).
 pub const S3_RESTORE_INSTANCE: S3RestorePair = S3RestorePair {
     engine: "mysql",
     source_engine: "mysql",
-    source_engine_versions: &["5.6", "5.7"],
+    source_engine_versions: &["5.6", "5.7", "8.0"],
 };
 
 impl S3RestorePair {
@@ -214,8 +225,78 @@ pub fn ingestion_role_cannot_list_message() -> String {
         .to_string()
 }
 
+/// The permission set a restore from Amazon S3 reads its backup under, as Amazon RDS names it
+/// in the refusal of a role it cannot use ([`unusable_ingestion_role_message`]): the feature
+/// the ingestion role's trust and permissions are required FOR.
+pub const S3_SNAPSHOT_INGESTION_FEATURE: &str = "S3_SNAPSHOT_INGESTION";
+
+/// What a restore whose `S3IngestionRoleArn` is not a role this restore can be run under at
+/// all is refused with: "IAM role ARN value is invalid or does not include the required
+/// permissions for: S3_SNAPSHOT_INGESTION".
+///
+/// This is the refusal of the VALUE as a role — a value that is no IAM role ARN of this
+/// account, or one IAM holds no such role under, or one whose trust does not let Amazon RDS
+/// act as it — and it is decided before the location the role would read is resolved: there is
+/// no role to read anything under. The sentence states both of the things that make a value
+/// unusable (it is not a valid role ARN, or the role it names does not carry what the feature
+/// requires) and names the feature the permissions are required for, so a caller knows which
+/// role to fix and for what.
+///
+/// A role that IS usable and whose permissions withhold one of the reads the migration makes
+/// is a DIFFERENT refusal of the same class, reported after the location resolves and worded
+/// as the files it cannot list ([`ingestion_role_cannot_list_message`]).
+///
+/// Fixed text with no variable part: it names neither the role nor the bucket, only the
+/// feature the role is required for.
+#[must_use]
+pub fn unusable_ingestion_role_message() -> String {
+    format!(
+        "IAM role ARN value is invalid or does not include the required permissions for: \
+         {S3_SNAPSHOT_INGESTION_FEATURE}"
+    )
+}
+
+/// Whether `role_arn` is not a role a restore from Amazon S3 can read its backup UNDER:
+/// either the value is no IAM role ARN of this account, or IAM answers that this account holds
+/// no such role or that its trust policy does not let Amazon RDS assume it.
+///
+/// `S3IngestionRoleArn` is the role Amazon RDS acts as while it reads the backup, so the
+/// restore is validated against that role BEFORE it reads anything: a value that names no role
+/// of this account is not an ARN this restore could ever assume, and a role this account's IAM
+/// answers is absent or untrusting is one Amazon RDS cannot act as. Both are the one refusal
+/// [`unusable_ingestion_role_message`] words — which is also what the real front door answers
+/// while a freshly created role has not propagated to it — and no resource is created for a
+/// request carrying one.
+///
+/// The IAM half is this crate's one reading of that question
+/// ([`::service_common::iam_role::role_is_unassumable`]), asked about the principal Amazon RDS
+/// acts under ([`super::RDS_SERVICE_PRINCIPAL`], the same principal an associated role of a DB
+/// instance or DB cluster is resolved against), so nothing is refused on evidence IAM did not
+/// give: an emulator with no IAM beside this service, and an answer it could not read, refuse
+/// nothing.
+pub async fn ingestion_role_is_unusable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    if ::service_common::iam_role::role_name(role_arn).is_none() {
+        return true;
+    }
+    ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        region,
+        role_arn,
+        super::RDS_SERVICE_PRINCIPAL,
+    )
+    .await
+}
+
 /// The Amazon S3 action a restore performs to FIND the backup's files: the listing of the
 /// bucket under the prefix the request named.
+///
+/// Source: the permissions policy the Amazon RDS User Guide asks an ingestion role to carry
+/// ("Creating an IAM role manually", Migrating data from MySQL by using an Amazon S3 bucket),
+/// whose statement allows `s3:ListBucket` on the bucket and `s3:GetObject` on its objects.
 ///
 /// Source: the permissions policy the Amazon RDS User Guide asks an ingestion role to carry
 /// ("Creating an IAM role manually", Migrating data from MySQL by using an Amazon S3 bucket),

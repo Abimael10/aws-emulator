@@ -241,6 +241,23 @@ fn effective_default(
     (engine_boot_value(family, spec), false)
 }
 
+/// The value the engine is configured with for a parameter the group SETS: the number a value
+/// that is a DB parameter formula comes to for this instance class's hardware, and every
+/// other value exactly as it was set.
+///
+/// A caller may set a parameter to a formula over the hardware rather than to a number
+/// (`crate::state::parameter_formula`), and the service evaluates it for the class the
+/// resource runs on before the engine is configured with it — the same reading
+/// [`effective_default`] takes of a formula the CATALOG publishes as a default, so a value in
+/// force is a number whichever of the two set it. A class whose memory this service publishes
+/// nothing for, and an expression this grammar does not cover, leave the value as written:
+/// there is nothing to evaluate it with.
+fn configured_value(value: &str, class_memory_bytes: Option<u64>) -> String {
+    class_memory_bytes
+        .and_then(|memory| crate::state::parameter_formula::evaluate(value, memory))
+        .map_or_else(|| value.to_string(), |evaluated| evaluated.to_string())
+}
+
 /// `pg_settings.vartype` for a parameter the catalog publishes, from the data type and the
 /// shape of the values it admits: an enumeration of admitted strings is PostgreSQL's `enum`
 /// and a free string is `string`.
@@ -333,13 +350,15 @@ pub fn running_parameters(
         parameters.push(RunningParameter {
             name: spec.name.to_string(),
             running: match setting {
-                Some(setting) if !pending => setting.value.clone(),
+                Some(setting) if !pending => {
+                    configured_value(&setting.value, class_memory_bytes)
+                }
                 _ => default.clone(),
             },
             boot_value: engine_boot_value(family, spec),
             reset_value: setting.map_or_else(
                 || default.clone(),
-                |setting| setting.value.clone(),
+                |setting| configured_value(&setting.value, class_memory_bytes),
             ),
             pending_restart: pending,
             // Which configuration the value in force came from: the group's own setting, the

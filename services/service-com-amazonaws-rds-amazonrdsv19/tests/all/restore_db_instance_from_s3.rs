@@ -19,8 +19,9 @@
 //!   `DescribeDBInstances` then reports, reaching `available` on its own.
 
 use crate::db_instances::{call, expect_error, expect_ok, text, REGION};
-use crate::rds_s3_integration::{create_bucket, emulator, put_object};
+use crate::rds_s3_integration::{create_bucket, emulator, put_object, role};
 use service_com_amazonaws_rds_amazonrdsv19::state as st;
+use smithy_server_runtime::MultiServiceRouter;
 
 /// A second Region, for the row whose bucket exists outside the restore's own.
 const OTHER_REGION: &str = "eu-west-1";
@@ -36,6 +37,34 @@ const INSTANCE_CLASS: &str = "db.t3.micro";
 /// The bytes one staged backup file carries — a backup is binary, and nothing here reads it,
 /// so the content only has to be non-empty.
 const BACKUP_BYTES: &[u8] = b"percona-xtrabackup-emulated-payload";
+
+/// The service principal an ingestion role trusts: Amazon RDS acts under it.
+const RDS_PRINCIPAL: &str = "rds.amazonaws.com";
+
+/// The ingestion policy the Amazon RDS User Guide asks an ingestion role to carry, granted on
+/// every bucket — so nothing a row below is refused for is the role's permissions.
+fn grants_the_whole_read() -> String {
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket","s3:GetObject"],"Resource":"*"}]}"#
+        .to_string()
+}
+
+/// Create the ingestion role [`restore_params`] names for `identifier` — a role IAM really
+/// holds, trusting Amazon RDS and granted the whole read.
+///
+/// A restore reads its backup AS this role, so a value naming a role this account's IAM holds
+/// nothing under is refused before the source location is resolved (the rule
+/// `crate::restore_from_s3_ingestion_role` pins); a row whose subject is the engine pair or
+/// the location therefore stages the role first, so the only thing left to refuse it is its
+/// own subject.
+async fn staged_ingestion_role(router: &MultiServiceRouter, identifier: &str) {
+    role(
+        router,
+        &format!("{identifier}-ingest"),
+        RDS_PRINCIPAL,
+        Some(grants_the_whole_read()),
+    )
+    .await;
+}
 
 /// `[(name, value.to_string()), ..]` — the query parameters of one call.
 macro_rules! params {
@@ -117,8 +146,10 @@ async fn an_engine_pair_the_instance_migration_does_not_read_is_refused() {
         },
         EngineRow {
             case: "a source engine version above the published series",
-            identifier: "emu-s3-inst-version-80",
-            replaced: &[("SourceEngineVersion", "8.0.36")],
+            identifier: "emu-s3-inst-version-90",
+            // No MySQL 9 release is one this service publishes a version of, so no backup
+            // taken from one is a backup this import reads.
+            replaced: &[("SourceEngineVersion", "9.0.1")],
             bucket_holds_a_backup: true,
         },
         EngineRow {
@@ -269,6 +300,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             .prefix
             .map(|prefix| params!["S3Prefix" => prefix].to_vec())
             .unwrap_or_default();
+        staged_ingestion_role(&router, row.identifier).await;
         let body = expect_error(
             row.case,
             call(
@@ -359,6 +391,22 @@ async fn a_resolvable_request_restores_the_instance_and_reports_it() {
             source_engine: "mysql",
             source_engine_version: "5.7.44",
         },
+        AcceptedRow {
+            case: "a backup taken from the newest published source series",
+            identifier: "emu-s3-inst-eighty",
+            object_key: "eighty/xtrabackup_info",
+            prefix: Some("eighty"),
+            source_engine: "mysql",
+            source_engine_version: "8.0.40",
+        },
+        AcceptedRow {
+            case: "the same series named bare, without its patch component",
+            identifier: "emu-s3-inst-eighty-bare",
+            object_key: "eighty-bare/full-backup.xbstream",
+            prefix: Some("eighty-bare"),
+            source_engine: "MySQL",
+            source_engine_version: "8.0",
+        },
     ];
 
     let (router, _engine) = emulator();
@@ -378,6 +426,7 @@ async fn a_resolvable_request_restores_the_instance_and_reports_it() {
         if let Some(prefix) = row.prefix {
             extra.push(("S3Prefix", prefix.to_string()));
         }
+        staged_ingestion_role(&router, row.identifier).await;
         let body = expect_ok(
             row.case,
             call(

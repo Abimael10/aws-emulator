@@ -559,7 +559,42 @@ pub fn validate_db_parameter_setting(
     value: &str,
 ) -> Result<(), String> {
     validate_db_parameter_name(family, name)?;
-    validate_known_setting(published_db_parameters(family), name, value)
+    validate_setting_value(published_db_parameters(family), name, value)
+}
+
+/// The value half of a parameter setting at either level: [`validate_known_setting`], with the
+/// values that are FORMULAS rather than numbers accepted as the formulas they are.
+///
+/// Amazon RDS's "DB parameter formulas" let the value of a numeric parameter be an expression
+/// over the DB instance class's hardware — the form this front door's own catalogs publish
+/// several defaults as (`{DBInstanceClassMemory*3/4}`) — and the service evaluates it for the
+/// class the resource runs on, so a caller may SET one. Such a value is not a number, so the
+/// parameter's published range says nothing about it: holding it to that range would refuse
+/// every formula, including the one the catalog publishes as that parameter's own default. The
+/// published range still bounds every value that IS a number, and a parameter the engine
+/// protects takes no value at all — formula or number — so that half of
+/// [`validate_known_setting`] is asked first.
+///
+/// A formula is admitted for a parameter whose published `DataType` is numeric, because that
+/// is what an expression over the hardware comes to; for every other parameter — a boolean,
+/// an enumeration, a free string — the value is held to its published domain as written.
+fn validate_setting_value(
+    catalog: Option<&'static [ClusterParameterSpec]>,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let spec = spec_in_catalog(catalog, name);
+    if let Some(spec) = spec {
+        if !spec.is_modifiable {
+            return Err(parameter_cannot_be_modified_message(name));
+        }
+        if matches!(spec.data_type, "integer" | "float")
+            && crate::state::parameter_formula::is_formula(value)
+        {
+            return Ok(());
+        }
+    }
+    validate_known_setting(catalog, name, value)
 }
 
 /// The cluster parameters the DB CLUSTER parameter group family `family` publishes, or
@@ -807,7 +842,7 @@ pub fn validate_cluster_parameter_setting(
     // ([`published_cluster_parameter_at_any_level`]) is the record the value it carries is
     // held to, so a group can never store a value the `AllowedValues` it publishes for that
     // parameter forbids, nor a value for a parameter it reports as not modifiable.
-    validate_known_setting(
+    validate_setting_value(
         published_cluster_parameter_at_any_level(family, name).map(std::slice::from_ref),
         name,
         value,

@@ -192,11 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`CreateGlobalCluster$DeletionProtection`) — a setting of the global cluster the
         // request CONFLICTS with rather than a state it is passing through, so the refusal
         // is the Query API's `InvalidParameterCombination` a client treats as terminal, the
-        // same answer the DB cluster and DB instance deletes give their own protection.
+        // same class the DB cluster and DB instance deletes answer their own protection with.
+        // The SENTENCE is this operation's own: it names the global cluster the request asked
+        // to delete, so a teardown of several of them reads which one is protected
+        // (`crate::state::deletion_protected_global_cluster_message`).
         if record.deletion_protection {
             return Err(DeleteGlobalClusterError::invalid_parameter_combination(
-                crate::state::deletion_protection_refusal_message(
-                    crate::state::DELETION_PROTECTED_GLOBAL_CLUSTER,
+                crate::state::deletion_protected_global_cluster_message(
+                    &input.global_cluster_identifier,
                 ),
             ));
         }

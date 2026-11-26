@@ -6,13 +6,22 @@
 //! The rule both restore-from-Amazon-S3 operations are accepted against: `S3IngestionRoleArn`
 //! is the IAM role "that authorizes Amazon RDS to access the Amazon S3 bucket on your behalf"
 //! — "a trust policy and a permissions policy that allows Amazon RDS to access your Amazon S3
-//! bucket" — so the Amazon S3 reads the migration makes are authorized against THAT role's
-//! permissions rather than against the caller's own: the listing that finds the backup's
-//! files (`s3:ListBucket`, on the bucket) and the read of each file it found (`s3:GetObject`,
-//! on the object), the two the user guide's ingestion policy grants. Where IAM answers that
-//! the role withholds one of them, the restore is refused as the parameter value it is
-//! (`InvalidParameterValue`, with the sentence Amazon RDS words files it cannot list in) and
-//! no resource is created; where IAM answers nothing about the role, nothing is refused.
+//! bucket" — so the restore is accepted against that role in TWO stages, which answer
+//! different things to the caller:
+//!
+//! * whether the value is a role the restore can be run under AT ALL — a role ARN of this
+//!   account that IAM holds and whose trust lets Amazon RDS act as it. It is asked BEFORE the
+//!   source location is resolved, since there is no identity to read that location under, and a
+//!   value that is not one is refused as the parameter value it is (`InvalidParameterValue`)
+//!   with the sentence naming the permission set the role is required for;
+//! * and then whether the permissions in force on that role cover the Amazon S3 reads the
+//!   migration makes on the location that resolved: the listing that finds the backup's files
+//!   (`s3:ListBucket`, on the bucket) and the read of each file it found (`s3:GetObject`, on the
+//!   object), the two the user guide's ingestion policy grants. Where IAM answers that the role
+//!   withholds one of them, the restore is refused with the sentence Amazon RDS words files it
+//!   cannot list in; where IAM answers nothing about the role, nothing is refused.
+//!
+//! No resource is created for a restore refused at either stage.
 //!
 //! Each rule is asserted over a TABLE whose rows differ in WHAT the role's policy set states —
 //! which of the two actions it grants, which resources it grants them on, whether it denies
@@ -55,6 +64,12 @@ const CANNOT_LIST: &str = "Files from the specified Amazon S3 bucket cannot be l
                            sure that you have created an AWS Identity and Access Management \
                            (IAM) role that lets Amazon RDS access Amazon S3 for you.";
 
+/// The sentence Amazon RDS refuses a value that is not a role the restore can be run under
+/// with: it states that the ARN is invalid or does not carry what is required, and names the
+/// permission set it is required for. Fixed text, naming no value of the request.
+const UNUSABLE_ROLE: &str = "IAM role ARN value is invalid or does not include the required \
+                             permissions for: S3_SNAPSHOT_INGESTION";
+
 /// `[(name, value.to_string()), ..]` — the query parameters of one call.
 macro_rules! params {
     ($($name:expr => $value:expr),* $(,)?) => {
@@ -67,9 +82,15 @@ type Params = Vec<(&'static str, String)>;
 
 /// What IAM holds for one row's ingestion role.
 enum RolePolicySet {
-    /// IAM holds NO role under that name: the ARN names a role provisioned out of band, which
-    /// says nothing about what it may do.
+    /// IAM holds NO role under that name: the ARN names a role of this account that is not
+    /// there, so Amazon RDS has no identity to read the backup under.
     NoRole,
+    /// The role is there, trusting a service that is not Amazon RDS: Amazon RDS cannot act as
+    /// it, whatever its permissions say.
+    TrustsAnotherService,
+    /// The value names no role of THIS account at all — it is used as written, so a row can
+    /// carry an ARN of another account or a value that is no ARN.
+    NotThisAccountsRole(&'static str),
     /// The role is there and carries no identity-based policy at all — the routine state of a
     /// role provisioned out of band, so its policy set states nothing about the reads.
     NoPolicy,
@@ -146,6 +167,10 @@ async fn ingestion_role(router: &MultiServiceRouter, row: &Row, bucket: &str) ->
             emulator_server::emulator_account_id(),
             row.role_name
         ),
+        RolePolicySet::NotThisAccountsRole(value) => (*value).to_string(),
+        RolePolicySet::TrustsAnotherService => {
+            role(router, row.role_name, "ec2.amazonaws.com", None).await
+        }
         RolePolicySet::NoPolicy => role(router, row.role_name, RDS_PRINCIPAL, None).await,
         RolePolicySet::Document(document) => {
             role(
@@ -241,6 +266,98 @@ fn expect_cannot_list(case: &str, response: (u16, String)) {
     );
 }
 
+/// Assert one row's refusal of the ROLE VALUE itself: the same code, the sentence that names
+/// the permission set the role is required for, and no value of the request in it.
+fn expect_unusable_role(case: &str, response: (u16, String)) {
+    let body = expect_error(case, response, 400, "InvalidParameterValue");
+    let message = text(&body, "Message");
+    assert_eq!(
+        message, UNUSABLE_ROLE,
+        "case {case:?}: expected the sentence {UNUSABLE_ROLE:?}, got {message:?}"
+    );
+}
+
+/// Rule: a value that is not a role this restore can be run under at all — one IAM holds no
+/// such role of this account under, one whose trust does not let Amazon RDS act as it, one
+/// naming another account's role, and one that is no role ARN — leaves the restore no identity
+/// to read the backup under, so it is refused with the sentence that names the permission set
+/// the role is required for, and NOTHING is created.
+///
+/// It is refused BEFORE the source location is resolved, which the rows prove by naming a
+/// bucket this Region's object store holds nothing under: the location's own refusal never
+/// reaches the caller. The rule is pinned for both restores, because it is one rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_that_is_no_usable_ingestion_role_refuses_both_restores() {
+    const ROWS: &[Row] = &[
+        Row {
+            case: "a role ARN of this account IAM holds nothing under",
+            identifier: "emu-ingest-absent",
+            role_name: "emu-ingest-absent-role",
+            policies: RolePolicySet::NoRole,
+        },
+        Row {
+            case: "a role whose trust policy admits another service only",
+            identifier: "emu-ingest-untrusting",
+            role_name: "emu-ingest-untrusting-role",
+            policies: RolePolicySet::TrustsAnotherService,
+        },
+        Row {
+            case: "a well-formed role ARN of another account",
+            identifier: "emu-ingest-other-account",
+            role_name: "emu-ingest-other-account-role",
+            policies: RolePolicySet::NotThisAccountsRole(
+                "arn:aws:iam::210987654321:role/emu-ingest-elsewhere",
+            ),
+        },
+        Row {
+            case: "a value that is no ARN at all",
+            identifier: "emu-ingest-not-an-arn",
+            role_name: "emu-ingest-not-an-arn-role",
+            policies: RolePolicySet::NotThisAccountsRole("emu-ingest-just-a-name"),
+        },
+        Row {
+            case: "an ARN of another service's resource",
+            identifier: "emu-ingest-not-a-role",
+            role_name: "emu-ingest-not-a-role-role",
+            policies: RolePolicySet::NotThisAccountsRole(
+                "arn:aws:s3:::emu-ingest-cluster-refused",
+            ),
+        },
+    ];
+
+    let (router, _engine) = emulator();
+    // A bucket this Region's object store holds NOTHING under: a restore that got past the
+    // role would be refused for the location, so the sentence each row asserts is proof that
+    // the role is read first.
+    let bucket = "emu-ingest-never-created";
+
+    for row in ROWS {
+        let role_arn = ingestion_role(&router, row, bucket).await;
+        expect_unusable_role(
+            row.case,
+            call(
+                &router,
+                "RestoreDBClusterFromS3",
+                &cluster_params(row.identifier, bucket, &role_arn),
+            )
+            .await,
+        );
+        no_such_cluster(row.case, &router, row.identifier).await;
+
+        let instance_identifier = format!("{}-inst", row.identifier);
+        expect_unusable_role(
+            row.case,
+            call(
+                &router,
+                "RestoreDBInstanceFromS3",
+                &instance_params(&instance_identifier, bucket, &role_arn),
+            )
+            .await,
+        );
+        no_such_instance(row.case, &router, &instance_identifier).await;
+    }
+}
+
 /// Rule: the Amazon S3 reads a restore from Amazon S3 makes are authorized against the
 /// ingestion role's permissions, so a role IAM answers withholds the listing of the bucket or
 /// the read of the backup's files leaves the DB cluster restore refused with
@@ -306,8 +423,8 @@ async fn an_ingestion_role_that_cannot_read_the_backup_refuses_the_cluster_resto
 /// reads, and one IAM says nothing about at all — leaves the restore to run, and the cluster it
 /// creates is reported by `DescribeDBClusters` from that moment on.
 ///
-/// The rows span a grant written for this bucket, a grant of every action, a role carrying no
-/// policy at all, and a role IAM holds nothing under.
+/// The rows span a grant written for this bucket, a grant of every action, and a role IAM
+/// holds that carries no policy at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ingestion_role_iam_does_not_refuse_restores_the_cluster() {
     const ROWS: &[Row] = &[
@@ -328,12 +445,6 @@ async fn an_ingestion_role_iam_does_not_refuse_restores_the_cluster() {
             identifier: "emu-ingest-silent",
             role_name: "emu-ingest-silent-role",
             policies: RolePolicySet::NoPolicy,
-        },
-        Row {
-            case: "a role IAM holds nothing under, provisioned out of band",
-            identifier: "emu-ingest-unknown",
-            role_name: "emu-ingest-unknown-role",
-            policies: RolePolicySet::NoRole,
         },
     ];
 
@@ -419,10 +530,10 @@ async fn the_ingestion_role_rule_holds_for_the_instance_restore() {
             policies: RolePolicySet::Document(grants_the_whole_read),
         },
         Row {
-            case: "an instance restore under a role IAM holds nothing under",
-            identifier: "emu-ingest-inst-unknown",
-            role_name: "emu-ingest-inst-unknown-role",
-            policies: RolePolicySet::NoRole,
+            case: "an instance restore under a role that states no permissions at all",
+            identifier: "emu-ingest-inst-silent",
+            role_name: "emu-ingest-inst-silent-role",
+            policies: RolePolicySet::NoPolicy,
         },
     ];
 

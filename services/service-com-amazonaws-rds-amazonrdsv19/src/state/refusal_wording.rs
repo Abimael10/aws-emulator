@@ -264,6 +264,24 @@ pub fn reboot_cluster_source_not_found_message(named: &str) -> String {
     format!("The source cluster could not be found or cannot be accessed: {named}")
 }
 
+/// The message `RestoreDBInstanceToPointInTime` carries for a source that names no DB
+/// instance of the request's Region: `The source instance could not be found: <id>`.
+///
+/// This operation names TWO instances — the source it restores FROM
+/// (`SourceDBInstanceIdentifier` or `SourceDbiResourceId`) and the target it creates
+/// (`TargetDBInstanceIdentifier`) — so a refusal that merely said an instance was not found
+/// would leave a caller unable to tell which of the two the fault is about. Amazon RDS words
+/// it as the SOURCE, exactly as the sibling cluster reboot words the cluster it reads
+/// ([`reboot_cluster_source_not_found_message`]), rather than from the shared not-found
+/// template the reports of an instance use ([`db_instance_not_found_colon_message`]).
+///
+/// The fixed text is the whole requirement; the only variable part is the source the request
+/// named, in the spelling it wrote it in — whichever of the two members named it, since both
+/// name the same thing.
+pub fn restore_source_db_instance_not_found_message(named: &str) -> String {
+    format!("The source instance could not be found: {named}")
+}
+
 /// What `RebootDBCluster` refuses an AURORA DB cluster with.
 ///
 /// "Use this operation only for a non-Aurora Multi-AZ DB cluster": Amazon RDS words this
@@ -354,7 +372,10 @@ pub fn modify_db_instance_state_message(status: &str) -> String {
 /// is held to carry exactly `Cannot delete protected Cluster, please disable deletion
 /// protection and try again.` for a DB cluster and the same sentence with `DB Instance` for
 /// a DB instance — the identifier the request named is NOT in them — so neither the
-/// identifier nor anything else of the request or the store is substituted here.
+/// identifier nor anything else of the request or the store is substituted here. The GLOBAL
+/// cluster delete is worded apart ([`deletion_protected_global_cluster_message`]), because
+/// each of these deletes is held to the answer ITS own front door is recorded giving, and the
+/// global-database one names the global cluster it refused.
 pub fn deletion_protection_refusal_message(subject: &str) -> String {
     format!(
         "Cannot delete protected {subject}, please disable deletion protection and try \
@@ -368,8 +389,21 @@ pub const DELETION_PROTECTED_DB_INSTANCE: &str = "DB Instance";
 /// How [`deletion_protection_refusal_message`] names a DB cluster.
 pub const DELETION_PROTECTED_CLUSTER: &str = "Cluster";
 
-/// How [`deletion_protection_refusal_message`] names a global cluster.
-pub const DELETION_PROTECTED_GLOBAL_CLUSTER: &str = "Global Cluster";
+/// What a delete of a GLOBAL cluster whose deletion protection is enabled is refused with:
+/// the two halves [`deletion_protection_refusal_message`] words, with the global cluster the
+/// request NAMED between them.
+///
+/// The global-database front door interpolates the identifier where the DB cluster and DB
+/// instance deletes name the resource kind alone: a teardown that deletes several global
+/// databases reads out of the sentence WHICH one is protected, and therefore whose
+/// `DeletionProtection` to turn off. The identifier is the one variable part, and it is the
+/// value the request carried rather than anything derived from the store.
+pub fn deletion_protected_global_cluster_message(identifier: &str) -> String {
+    format!(
+        "Cannot delete protected Global Cluster {identifier}, please disable deletion \
+         protection and try again."
+    )
+}
 
 /// What a delete of a DB cluster that still holds member DB instances is refused with.
 ///

@@ -28,7 +28,7 @@
 //! `PutObject`, so what the restore finds is what that service really holds.
 
 use crate::db_instances::{call, expect_error, expect_ok, text, REGION};
-use crate::rds_s3_integration::{create_bucket, emulator, put_object};
+use crate::rds_s3_integration::{create_bucket, emulator, put_object, role};
 use service_com_amazonaws_rds_amazonrdsv19::state as st;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -53,6 +53,34 @@ type Params = Vec<(&'static str, String)>;
 /// The bytes one staged backup file carries — a backup is binary, and nothing here reads it,
 /// so the content only has to be non-empty.
 const BACKUP_BYTES: &[u8] = b"percona-xtrabackup-emulated-payload";
+
+/// The service principal an ingestion role trusts: Amazon RDS acts under it.
+const RDS_PRINCIPAL: &str = "rds.amazonaws.com";
+
+/// The ingestion policy the Amazon RDS User Guide asks an ingestion role to carry, granted on
+/// every bucket — so nothing a row below is refused for is the role's permissions.
+fn grants_the_whole_read() -> String {
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket","s3:GetObject"],"Resource":"*"}]}"#
+        .to_string()
+}
+
+/// Create the ingestion role [`restore_params`] names for `identifier` — a role IAM really
+/// holds, trusting Amazon RDS and granted the whole read.
+///
+/// A restore reads its backup AS this role, so a value naming a role this account's IAM holds
+/// nothing under is refused before the source location is resolved (the rule
+/// `crate::restore_from_s3_ingestion_role` pins); a row whose subject is the engine pair or
+/// the location therefore stages the role first, so the only thing left to refuse it is its
+/// own subject.
+async fn staged_ingestion_role(router: &MultiServiceRouter, identifier: &str) {
+    role(
+        router,
+        &format!("{identifier}-ingest"),
+        RDS_PRINCIPAL,
+        Some(grants_the_whole_read()),
+    )
+    .await;
+}
 
 /// `RestoreDBClusterFromS3` with every required member, `extra` replacing or adding to them.
 fn restore_params(identifier: &str, bucket: &str, extra: &[(&'static str, String)]) -> Params {
@@ -317,6 +345,7 @@ async fn a_location_holding_no_backup_is_refused_as_that_location_is() {
             .prefix
             .map(|prefix| params!["S3Prefix" => prefix].to_vec())
             .unwrap_or_default();
+        staged_ingestion_role(&router, row.identifier).await;
         let body = expect_error(
             row.case,
             call(
@@ -437,6 +466,7 @@ async fn a_resolvable_request_restores_the_cluster_and_reports_it() {
         if let Some(prefix) = row.prefix {
             extra.push(("S3Prefix", prefix.to_string()));
         }
+        staged_ingestion_role(&router, row.identifier).await;
         let body = expect_ok(
             row.case,
             call(
