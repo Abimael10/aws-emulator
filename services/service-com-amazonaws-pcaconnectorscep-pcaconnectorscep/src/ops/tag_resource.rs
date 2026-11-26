@@ -93,29 +93,16 @@ use super::types::*;
 // `TagResourceError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-pcaconnectorscep-pcaconnectorscep.json");
 
-#[derive(Debug, Clone, Default)]
-pub struct TagResourceOutput;
-
-impl TagResourceOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
-    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
-        ::aws_smithy_schema::ShapeType::Structure,
-        &[],
-    )
-    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
-        "POST",
-        "/tags/{ResourceArn}",
-        Some(204u16),
-    ));
-}
-
-pub static TAG_RESOURCE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &TagResourceOutput::SCHEMA;
-
-impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
-    fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
-}
+// This operation's output is modelled `smithy.api#Unit`, declared in this crate's one
+// spelling of that rule (`super::types::unit_output`) with this operation's own `@http`
+// method, URI and status.
+super::types::unit_output!(
+    TagResourceOutput,
+    TAG_RESOURCE_OUTPUT_SCHEMA,
+    method = "POST",
+    uri = "/tags/{ResourceArn}",
+    status = 204u16,
+);
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live

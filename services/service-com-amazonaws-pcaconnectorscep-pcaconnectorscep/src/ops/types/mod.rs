@@ -26,7 +26,16 @@ pub mod list_connectors_types;
 pub mod list_tags_for_resource_types;
 pub mod shared_types;
 pub mod tag_resource_types;
+// The one spelling of a `smithy.api#Unit` output, expanded per operation by the
+// `unit_output!` macro this module re-exports below. It declares no type of its own, so
+// there is nothing for the glob re-exports further down to carry.
+pub mod unit_output;
 pub mod untag_resource_types;
+
+// `unit_output!` is a `macro_rules!` macro rather than a type, so it is named here
+// explicitly: a glob re-export would leave the operation modules reaching into the
+// submodule for it.
+pub(crate) use unit_output::unit_output;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_challenge_types::*;
