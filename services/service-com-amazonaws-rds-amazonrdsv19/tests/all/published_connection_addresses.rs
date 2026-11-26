@@ -3,15 +3,16 @@
 //! WHAT a client of this emulator is handed to open a session on a resource whose engine wire
 //! this emulator serves, across every resource KIND of this control plane that publishes one.
 //!
-//! The rule under test: the member a client COMPOSES ITS CONNECTION FROM publishes the address
-//! the listener the core opened for that resource is answered at — the host in the member and
-//! the port in the shape's own port member where it has one (`DBCluster$Endpoint` beside
-//! `DBCluster$Port`, `DBInstance$Endpoint$Address` beside `DBInstance$Endpoint$Port`), and the
-//! `host:port` authority where the shape carries no port member of its own
-//! (`DBClusterEndpoint$Endpoint`). This emulator resolves no name for its clients, so a name it
-//! minted for such a member would be an address none of them could dial; the pair a client
-//! composes is therefore an address of the interface the core bound, on the port that
-//! resource's own listener answers on.
+//! The rule under test: the member a client COMPOSES ITS CONNECTION FROM publishes a host this
+//! emulator ANSWERS on — the host in the member and the port in the shape's own port member
+//! where it has one (`DBCluster$Endpoint` beside `DBCluster$Port`,
+//! `DBInstance$Endpoint$Address` beside `DBInstance$Endpoint$Port`), and the `host:port`
+//! authority where the shape carries no port member of its own (`DBClusterEndpoint$Endpoint`).
+//! A host a client is handed is one it RESOLVES and then dials, so it is either the address the
+//! listener the core opened for that resource is answered at or a name in the zone that
+//! interface is named in — the loopback zone, whose names RFC 6761 reserves for it, which is
+//! where a DB cluster announces the pair it mints from its own identifier. The port is the one
+//! that resource's own listener landed on.
 //!
 //! The rows span what the rule generalises over: the resource kinds that publish a connection
 //! address (a DB cluster, a DB instance, a custom endpoint of a cluster), both engine wires
@@ -28,7 +29,7 @@ use crate::db_clusters::the_cluster;
 use crate::db_instance_engine_endpoint::{
     endpoint_of, wire_login as login, Wire, DATABASE, MASTER_PASSWORD, MASTER_USER,
 };
-use crate::db_instances::{call, emulator_with_engine, expect_ok, subtrees, text, REGION};
+use crate::db_instances::{call, emulator_with_engine, expect_ok, subtrees, text};
 use crate::lifecycle_poll_loops::poll_until;
 
 /// WHICH resource of this control plane the published address is read off.
@@ -287,19 +288,28 @@ async fn every_published_connection_address_is_one_this_emulator_answers_on() {
     for row in RESOURCES {
         let (host, port) = published_address(&router, row).await;
 
-        // What the rule says: the host is an ADDRESS of the interface the core bound its
-        // listeners on, not a name this emulator resolves for nobody, and the port is the one
-        // that resource's own listener landed on.
-        let address: IpAddr = host.parse().unwrap_or_else(|error| {
-            panic!(
-                "case {:?}: expected the address this emulator answers the resource's engine \
-                 wire at, got the name {host:?}: {error}",
-                row.case
-            )
-        });
+        // What the rule says: the host is one this emulator answers on — an address of the
+        // interface the core bound its listeners on, or a name in the zone that interface is
+        // named in, which is what a DB cluster publishes — and the port is the one that
+        // resource's own listener landed on.
+        crate::db_clusters::assert_own_endpoint_host(row.case, "published", &host);
+        let resolved: Vec<std::net::SocketAddr> =
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {:?}: the published host {host:?} must resolve, got {error}",
+                        row.case
+                    )
+                })
+                .collect();
         assert!(
-            address.is_loopback(),
-            "case {:?}: expected an address of the interface the core bound, got {address}",
+            !resolved.is_empty()
+                && resolved
+                    .iter()
+                    .all(|address| IpAddr::is_loopback(&address.ip())),
+            "case {:?}: expected a host that resolves to the interface the core bound, got \
+             {resolved:?} for {host:?}",
             row.case
         );
         assert!(
@@ -352,11 +362,10 @@ async fn every_published_connection_address_is_one_this_emulator_answers_on() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clusters_reader_endpoint_names_the_interface_its_read_only_listener_is_reached_on() {
     let (router, _engine) = emulator_with_engine();
-    // The reader member is the one connection endpoint of a cluster the model gives no port
-    // of its own, so no client composes an address from it on its own: it is the OTHER own
-    // spelling of the interface the cluster's read-only listener is bound on — the name
-    // RFC 6761 reserves for the loopback interface — which is what tells a read path from a
-    // write path while staying an address a client of this emulator resolves.
+    // The reader member is the name the CLUSTER mints under its `cluster-ro-` label, which is
+    // what tells a read path from a write path, in the zone a resolver answers with the
+    // interface the cluster's listeners are bound on — so it stays an address a client of this
+    // emulator resolves.
     let row = &RESOURCES[0];
     let identifier = "emu-pca-reader";
     create_cluster(&router, row, identifier).await;
@@ -369,7 +378,13 @@ async fn a_clusters_reader_endpoint_names_the_interface_its_read_only_listener_i
          both",
         row.case
     );
-    crate::db_clusters::assert_own_endpoint_host(row.case, "reader", identifier, REGION, &reader);
+    crate::db_clusters::assert_own_endpoint_host(row.case, "reader", &reader);
+    assert!(
+        reader.starts_with(&format!("{identifier}.cluster-ro-")),
+        "case {:?}: expected a reader endpoint of the form <identifier>.cluster-ro-<label>…, \
+         got {reader:?}",
+        row.case
+    );
     // A spelling of the loopback interface and nothing of AWS's own: a name in a zone AWS
     // serves would send the client out of the emulated environment.
     assert!(

@@ -4,16 +4,17 @@
 //!
 //! The rule under test: `DBCluster$Endpoint` and `DBCluster$ReaderEndpoint` are hosts, with
 //! the port reported only in `DBCluster$Port` and the zone in `DBCluster$HostedZoneId`, and
-//! the two are non-empty and DISTINCT whatever the cluster's membership is. For a cluster
-//! whose engine wire this emulator SERVES, both are hosts this emulator ANSWERS on, because an
-//! address a service hands a client is one the client resolves and dials and a name minted
-//! under this emulator's own zone resolves for nobody: `Endpoint` is the address that wire is
-//! answered at — the host of the cluster's own listener — because that host with the published
-//! `Port` is the whole address a session is opened on, and `ReaderEndpoint` is the other own
-//! spelling of that interface, the name RFC 6761 reserves for it, which is what lets a
-//! read/write-splitting client, a DSN builder or a production-readiness audit tell a read path
-//! from a write path. Neither member is read off a member instance: a cluster with no DB
-//! instance in it at all publishes both.
+//! both are the names the CLUSTER mints from its own `DBClusterIdentifier` — the writer under
+//! the `cluster-` label and the reader under `cluster-ro-`, over one server-assigned label and
+//! ONE shared suffix — so they are non-empty and DISTINCT whatever the cluster's membership is.
+//! For a cluster whose engine wire this emulator SERVES that shared suffix is the zone RFC 6761
+//! reserves for the interface its own listeners are bound on, because an address a service
+//! hands a client is one the client resolves and dials: a name announced there resolves to
+//! exactly that interface, while a name in a zone AWS serves resolves nowhere near this
+//! process. The `cluster-`/`cluster-ro-` labels are what let a read/write-splitting client, a
+//! DSN builder or a production-readiness audit tell a read path from a write path. Neither
+//! member is read off a member instance: a cluster with no DB instance in it at all publishes
+//! both.
 //!
 //! Both published members therefore lead to the interface the cluster's own listeners are bound
 //! on, and the pair `<endpoint>` + `<Port>` is an address a session really opens on — asserted

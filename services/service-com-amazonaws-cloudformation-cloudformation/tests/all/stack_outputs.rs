@@ -304,14 +304,17 @@ fn is_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
     )
 }
 
-/// Whether `value` is a host of the EMULATOR's own, which is what a DB CLUSTER whose engine
-/// wire this emulator SERVES publishes for BOTH of its endpoint members: the address its own
-/// listener is answered at for the writer — what a client composes with the published port
-/// (pinned in the RDS crate's own suites) — and the name RFC 6761 reserves for the loopback
-/// interface for the reader. A name minted under this emulator's own zone resolves for no
-/// client of it, so neither member carries one.
-fn is_own_host(value: &str) -> bool {
-    value.parse::<std::net::IpAddr>().is_ok() || value.eq_ignore_ascii_case("localhost")
+/// [`is_endpoint_name`] in the zone the interface this emulator's listeners are bound on is
+/// named in, which is where the endpoints of a resource whose engine wire it SERVES sit: the
+/// names such a resource mints resolve to that interface, while a name in a zone AWS serves
+/// resolves nowhere near this process.
+fn is_served_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
+    is_endpoint_name(
+        value,
+        identifier,
+        infix,
+        &format!(".{REGION}.rds.localhost"),
+    )
 }
 
 /// Whether `value` is an Amazon RDS immutable resource id: `prefix-` and 26 UPPERCASE
@@ -1101,22 +1104,27 @@ fn output_cases() -> Vec<OutputCase> {
                 ),
                 (
                     // The cluster's engine is one this emulator SERVES a native wire for, so
-                    // the writer endpoint Amazon RDS publishes — and so the stack's output
-                    // carries — is the address that engine wire is answered at, beside the
-                    // port the core assigned that listener; the reader endpoint is the other
-                    // own spelling of the interface those listeners are bound on.
+                    // the endpoint names Amazon RDS publishes — and so the stack's outputs
+                    // carry — are the ones the CLUSTER mints from its identifier, in the zone
+                    // the interface those listeners are bound on is named in, beside the port
+                    // the core assigned that listener.
                     "ClusterEndpoint",
                     Expected::Form {
-                        described: "the address this emulator answers the cluster's engine \
-                                    wire at",
-                        check: |value| value.parse::<std::net::IpAddr>().is_ok(),
+                        described: "the name the cluster mints for its writer endpoint, in the \
+                                    zone this emulator answers its engine wire in",
+                        check: |value| {
+                            is_served_rds_endpoint(value, "probe-app-cluster", ".cluster-")
+                        },
                     },
                 ),
                 (
                     "ClusterReaderEndpoint",
                     Expected::Form {
-                        described: "a host this emulator answers the cluster's read path on",
-                        check: is_own_host,
+                        described: "the name the cluster mints for its read path, in that same \
+                                    zone",
+                        check: |value| {
+                            is_served_rds_endpoint(value, "probe-app-cluster", ".cluster-ro-")
+                        },
                     },
                 ),
                 (

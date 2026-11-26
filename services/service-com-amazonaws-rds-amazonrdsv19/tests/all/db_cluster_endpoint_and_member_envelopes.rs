@@ -10,13 +10,12 @@
 //!    `DBCluster$Port` ("the port that the database engine is listening on") beside its two
 //!    endpoint members, so neither `Endpoint` nor `ReaderEndpoint` carries a port of its own
 //!    and neither is ever written as a `host:port` authority; a client composes the address
-//!    it dials from an endpoint and that one port. A cluster whose data plane this emulator
-//!    SERVES publishes a host this emulator answers on for BOTH members — as `Endpoint` the
-//!    address its own listener is answered at and as `ReaderEndpoint` the other own spelling
-//!    of that interface; every other
-//!    cluster publishes the documented DNS names the CLUSTER mints from its identifier for
-//!    both, `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>`, over one
-//!    shared suffix: the endpoint domain of the control plane that owns its engine.
+//!    it dials from an endpoint and that one port. Every cluster publishes the documented DNS
+//!    names the CLUSTER mints from its identifier for both,
+//!    `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>`, over one shared
+//!    suffix: the zone the interface its own listeners are bound on is named in for a cluster
+//!    whose data plane this emulator SERVES, and the endpoint domain of the control plane that
+//!    owns its engine for every other.
 //!
 //! 2. `DBClusterMember$PromotionTier` is "the order in which an Aurora Replica is promoted
 //!    to the primary instance": a property of the MEMBER instance — the value its request
@@ -172,9 +171,8 @@ fn the_published_address(case: &str, row: &EndpointCase, which: &str, cluster: &
         );
     }
     if row.served {
-        // A cluster whose engine wire this emulator serves publishes the address that wire is
-        // answered at as its writer endpoint, and the other own spelling of that interface —
-        // the loopback zone's own name — as its reader endpoint.
+        // A cluster whose engine wire this emulator serves announces the pair it minted in the
+        // zone the interface that wire is answered on is named in.
         crate::db_clusters::assert_served_endpoint_pair(
             &format!("{case} ({which})"),
             row.identifier,

@@ -20,17 +20,20 @@
 //! reached at it — and the discriminating `cluster-`/`cluster-ro-` label is what tells a read
 //! path from a write path.
 //!
-//! WHICH of the two members a minted name is published in depends on where that cluster's
-//! data plane is served, because the member a client COMPOSES ITS CONNECTION FROM has to be
-//! an address that client can dial and this emulator resolves no name for its clients:
+//! BOTH members carry a minted name, in the ZONE a client of that cluster resolves it in,
+//! because the member a client COMPOSES ITS CONNECTION FROM has to lead back to the plane
+//! that answers the session:
 //!
 //! * a cluster whose engine wire this emulator serves is reached on listeners of its own
-//!   ([`super::data_plane::cluster_endpoint`]), so BOTH of its members publish a host this
-//!   emulator answers on: the WRITER member the address its own listener is answered at
-//!   ([`super::DbClusterRecord::endpoint`]) beside the one published `Port`, and the READER
-//!   member the other own spelling of that same interface ([`served_reader_host`]) — a name
-//!   MINTED under that interface's zone resolves for no client of this emulator, however
-//!   RFC 6761 reads the zone, so neither member carries one;
+//!   ([`super::data_plane::cluster_endpoint`]), so both names sit in the zone that interface
+//!   is named in ([`served_endpoint_suffix`]) — the loopback zone, whose names RFC 6761
+//!   reserves for the loopback interface, so a resolver answers a name minted there with the
+//!   address the core bound and the one published `Port` completes the address a session is
+//!   opened on. A minted name leads there only while that zone names the interface the
+//!   listener was bound on, which is what [`minted_name_reaches_listener`] asks: a listener an
+//!   operator bound on another interface is named as the core reports it
+//!   ([`super::DbClusterRecord::endpoint`]), because no zone this emulator may announce in
+//!   resolves to that address;
 //! * a cluster this emulator serves no data plane for publishes the AWS form for BOTH, under
 //!   the DNS domain of the control plane that owns its engine ([`super::endpoint_domain`]):
 //!   there is no local plane for such a cluster to lead a client to.
@@ -92,6 +95,15 @@ pub fn cluster_endpoint_host(
 /// zone AWS serves resolves nowhere near this process or, worse, at genuine AWS
 /// infrastructure, so this never announces one; a name in the loopback zone resolves to the
 /// interface the listener was opened on.
+///
+/// Who resolves it: the HOST's resolver, not this emulator, which runs no name server. The
+/// loopback zone is the one zone that needs none — RFC 6761 reserves `localhost` and the names
+/// under it for the loopback interface, and a resolver that honours that reservation answers
+/// every name minted here with the address the listener accepts on. A client of a host whose
+/// resolver answers only the bare name would have to be pointed at the interface itself, which
+/// is an environment prerequisite of the published pair rather than a property of the record:
+/// what this service decides is the NAME, and what the name has to name is the interface the
+/// listener was bound on ([`minted_name_reaches_listener`]).
 #[must_use]
 pub fn served_endpoint_suffix(endpoint_domain: &str, served_host: &str) -> String {
     let service = endpoint_domain
@@ -102,40 +114,33 @@ pub fn served_endpoint_suffix(endpoint_domain: &str, served_host: &str) -> Strin
     format!("{service}.{zone}")
 }
 
-/// The host a cluster whose data plane this emulator SERVES publishes for its READ path,
-/// given `served_host`, the interface its listeners are bound on.
+/// Whether a name MINTED for a cluster whose listeners are bound on `served_host` LEADS a
+/// client back to those listeners — the question that decides whether a served cluster
+/// publishes its minted names or the address the core reports.
 ///
-/// An endpoint member is an address a client RESOLVES and then dials, and the only addresses
-/// a client of this emulator can resolve are this process's own: the interface the core bound
-/// and the name reserved for it. A name this service MINTS under that interface's zone is not
-/// one of them — nothing answers for a sub-name of the host this process is reached at — so a
-/// served cluster publishes no minted name for either member, and the cluster's own identifier
-/// and server-assigned label are reported in the members that carry an identity
-/// (`DBClusterIdentifier`, `DbClusterResourceId`) rather than in an address.
+/// An endpoint member is a name a client RESOLVES and then dials, so a minted one is an
+/// address only where the zone it sits in ([`served_endpoint_suffix`]) resolves to the
+/// interface the listener was bound on. That holds for the interface the core binds by
+/// default: the zone is then the loopback zone, and RFC 6761 reserves `localhost` and the
+/// names under it for the loopback interface, so a resolver answers every name minted there
+/// with the address those listeners accept on — a wildcard bind included, which accepts on
+/// loopback too.
 ///
-/// The two members stay DISTINCT, which is what tells a read path from a write path: the
-/// writer publishes the address its listener is bound to ([`super::DbClusterRecord::endpoint`])
-/// — it is the member a client composes with the one published `Port`, so it is the literal
-/// the listener landed on — and the reader the OTHER own spelling of that same interface, the
-/// zone name RFC 6761 reserves for the loopback interface
-/// ([`::service_common::data_plane_addressing::LOOPBACK_ZONE`]), which resolves to exactly the
-/// interface the cluster's read-only listener is answered on. An interface an OPERATOR bound
-/// instead of loopback has no second name this emulator may announce, so both members name it
-/// as the core reports it.
+/// An interface an OPERATOR bound instead has no zone this emulator may announce a name in
+/// that resolves to it: a name under the loopback zone would lead past that interface, and a
+/// sub-name of the operator's own host is one nothing answers for. Such a cluster therefore
+/// names the interface as the core reports it ([`super::DbClusterRecord::endpoint`]).
+///
+/// The names under the loopback zone are answered by the HOST's own resolver, which is where
+/// RFC 6761's reservation is honoured; see [`served_endpoint_suffix`] for what that means for
+/// a client of this emulator.
 #[must_use]
-pub fn served_reader_host(served_host: &str) -> String {
-    let loopback_zone = ::service_common::data_plane_addressing::LOOPBACK_ZONE;
+pub fn minted_name_reaches_listener(served_host: &str) -> bool {
     let unspecified = served_host
         .parse::<std::net::IpAddr>()
         .is_ok_and(|address| address.is_unspecified());
-    match ::service_common::data_plane_addressing::names_the_loopback_interface(served_host)
+    ::service_common::data_plane_addressing::names_the_loopback_interface(served_host)
         || unspecified
-    {
-        // A listener on the loopback interface — and one on the wildcard address, which
-        // accepts on loopback too — is reached at the loopback zone's own name.
-        true => loopback_zone.to_string(),
-        false => served_host.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -218,32 +223,31 @@ mod tests {
         }
     }
 
-    /// RULE: the host a SERVED cluster publishes for its read path is an own host of this
-    /// emulator naming the interface its listeners are bound on — the loopback zone's own
-    /// name for a loopback or wildcard bind, the bound address itself otherwise — and never a
-    /// name minted under that interface's zone.
+    /// RULE: a minted name leads a client back to the cluster's listeners exactly when the
+    /// zone it sits in names the interface those listeners are bound on — the interface the
+    /// core binds by default, in either address family, and the wildcard address, which
+    /// accepts on it too — and not when an operator bound another interface.
     #[test]
-    fn a_served_clusters_reader_host_is_an_own_host_of_this_emulator() {
+    fn a_minted_name_reaches_a_listener_the_loopback_zone_names() {
         // The rows span the addresses the core can report a listener on: both loopback
-        // literals, the wildcard addresses of both families (which accept on loopback too),
-        // and a routable address an operator bound.
-        let rows: &[(&str, &str, &str)] = &[
-            ("the default loopback bind", "127.0.0.1", "localhost"),
-            ("another address of the loopback block", "127.0.0.42", "localhost"),
-            ("an IPv6 loopback bind", "::1", "localhost"),
-            ("a wildcard bind", "0.0.0.0", "localhost"),
-            ("an IPv6 wildcard bind", "::", "localhost"),
-            ("a routable bind", "192.168.1.10", "192.168.1.10"),
+        // literals, another address of the loopback block, the loopback zone's own name, the
+        // wildcard addresses of both families, a routable address an operator bound, and a
+        // name an operator serves this emulator at.
+        let rows: &[(&str, &str, bool)] = &[
+            ("the default loopback bind", "127.0.0.1", true),
+            ("another address of the loopback block", "127.0.0.42", true),
+            ("an IPv6 loopback bind", "::1", true),
+            ("the loopback zone's own name", "localhost", true),
+            ("a wildcard bind", "0.0.0.0", true),
+            ("an IPv6 wildcard bind", "::", true),
+            ("a routable bind", "192.168.1.10", false),
+            ("a name an operator serves this emulator at", "emulator.internal", false),
         ];
         for (case, served_host, expected) in rows {
-            let reader = served_reader_host(served_host);
+            let reaches = minted_name_reaches_listener(served_host);
             assert_eq!(
-                reader, *expected,
-                "case {case:?}: expected the reader host {expected:?}, got {reader:?}"
-            );
-            assert!(
-                !reader.contains(':') || reader.contains("::"),
-                "case {case:?}: an endpoint member carries no port, got {reader:?}"
+                reaches, *expected,
+                "case {case:?}: expected minted_name_reaches_listener {expected}, got {reaches}"
             );
         }
     }

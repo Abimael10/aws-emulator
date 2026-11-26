@@ -6,14 +6,14 @@
 //! then DIALS, so every such member a cluster whose data plane this emulator SERVES publishes
 //! — `DBCluster$Endpoint` ("the connection endpoint for the primary instance of the DB
 //! cluster") and `DBCluster$ReaderEndpoint` (the member that "load-balances connections across
-//! the Aurora Replicas") — is a host this emulator ANSWERS on: the address the listener
-//! serving that role is bound to, or the name RFC 6761 reserves for that interface. A name
-//! this service MINTS under its own zone is not one of them — nothing resolves a sub-name of
-//! the host this process is reached at — so a served cluster publishes none, while the two
-//! members stay DISTINCT, which is what tells a read path from a write path. A cluster this
-//! emulator serves no data plane for keeps the published AWS DNS form for both members, the
-//! names the CLUSTER mints from its own identifier: there is no local plane for such a cluster
-//! to lead a client to.
+//! the Aurora Replicas") — is a host this emulator ANSWERS on: the pair of names the CLUSTER
+//! mints from its own identifier, under the `cluster-` and `cluster-ro-` labels over one shared
+//! suffix, announced in the zone RFC 6761 reserves for the interface those listeners are bound
+//! on. The two members stay DISTINCT, which is what tells a read path from a write path, and
+//! neither sits in a zone AWS serves, which would resolve nowhere near this process. A cluster
+//! this emulator serves no data plane for keeps the published AWS DNS form for both members,
+//! the same names under the endpoint domain of the control plane that owns its engine: there is
+//! no local plane for such a cluster to lead a client to.
 //!
 //! The rows span what the rule generalises over: both engine wires this emulator speaks
 //! (PostgreSQL and MySQL), both cluster types (an Aurora cluster, including a Serverless v2
@@ -128,14 +128,14 @@ fn assert_published_hosts(row: &ClusterRow, which: &str, cluster: &str) -> (Stri
             &writer,
             &reader,
         ),
-        // A served cluster publishes a host this emulator answers on for both, and no name of
-        // its own minting.
+        // A served cluster announces the same pair in the zone the interface its own listeners
+        // are bound on is named in, and in no zone of AWS's own.
         None => {
             assert_served_endpoint_pair(&case, row.identifier, REGION, &writer, &reader);
             assert!(
-                !writer.contains(SERVED_SUFFIX) && !reader.contains(SERVED_SUFFIX),
-                "case {case:?}: a served cluster publishes no name under the zone this \
-                 emulator announces in ({SERVED_SUFFIX}), got {writer:?} and {reader:?}"
+                writer.ends_with(SERVED_SUFFIX) && reader.ends_with(SERVED_SUFFIX),
+                "case {case:?}: a served cluster announces both names under the zone this \
+                 emulator answers in ({SERVED_SUFFIX}), got {writer:?} and {reader:?}"
             );
         }
     }

@@ -209,11 +209,10 @@ fn assert_engine_defaults(case: &str, label: &str, cluster: &str, row: &EngineCa
         row.expected_allocated_storage
     );
     let identifier = text(cluster, "DBClusterIdentifier");
-    // A cluster whose engine wire this emulator SERVES publishes a host this emulator answers
-    // on for both members — the address that wire is answered at as its writer endpoint and
-    // the other own spelling of that interface as its reader one; a cluster this emulator
-    // serves no data plane for mints both names over the endpoint domain of the control plane
-    // that owns its engine.
+    // Every cluster mints both endpoint names from its own identifier; what differs is the
+    // zone they sit in — the one the interface its own listeners are bound on is named in for
+    // a cluster whose engine wire this emulator SERVES, and the endpoint domain of the control
+    // plane that owns its engine for a cluster it serves no data plane for.
     if row.serves_the_engines_wire {
         crate::db_clusters::assert_served_endpoint_pair(
             &case,
