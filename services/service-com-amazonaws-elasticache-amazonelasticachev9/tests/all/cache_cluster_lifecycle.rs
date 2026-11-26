@@ -2014,7 +2014,8 @@ async fn a_log_delivery_request_replaces_or_removes_the_stored_one() {
         described.all("LogDeliveryConfiguration/DestinationType")
     );
 
-    // `Enabled: false` removes it.
+    // `Enabled: false` withdraws it: the configuration is reported being withdrawn, carrying
+    // the destination it was delivering to, and the clock then takes it out of the list.
     let removed = emulator
         .call(
             "ModifyCacheCluster",
@@ -2026,10 +2027,29 @@ async fn a_log_delivery_request_replaces_or_removes_the_stored_one() {
         )
         .await;
     assert_eq!(removed.status, 200, "the removal must succeed: {}", removed.body);
-    let after = describe_cluster(&emulator, "logs").await;
+    assert_eq!(
+        (
+            removed.all("LogDeliveryConfiguration/Status"),
+            removed.all("LogDeliveryConfiguration/DestinationType"),
+        ),
+        (vec!["disabling"], vec!["kinesis-firehose"]),
+        "a disabled request leaves the configuration being withdrawn, got {}",
+        removed.body
+    );
+    let after = poll_until(
+        &emulator,
+        REGION,
+        "a disabled log delivery",
+        "the configuration being taken out of the cluster's list",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "logs")]),
+        |reply| reply.all("LogDeliveryConfiguration/LogType").is_empty(),
+    )
+    .await;
     assert!(
         after.all("LogDeliveryConfiguration/LogType").is_empty(),
-        "a disabled request removes the configuration, got {}",
+        "a disabled request leaves the cluster carrying no configuration for that log type, \
+         got {}",
         after.body
     );
 }

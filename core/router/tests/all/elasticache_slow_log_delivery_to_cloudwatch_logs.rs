@@ -83,14 +83,14 @@ const POLL_DEADLINE: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// What one call answered.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
     /// Assert the call was served, and hand back its body.
-    fn served(self, case: &str) -> String {
+    pub(crate) fn served(self, case: &str) -> String {
         assert_eq!(
             self.status, 200,
             "case {case:?}: the call must be served, got HTTP {} with {}",
@@ -137,7 +137,7 @@ async fn dispatch(
 }
 
 /// One awsQuery call to Amazon ElastiCache, as an SDK client sends one.
-async fn elasticache(
+pub(crate) async fn elasticache(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(String, String)],
@@ -159,7 +159,7 @@ async fn elasticache(
 }
 
 /// `[("A", "b")]` as the owned pairs [`elasticache`] takes.
-fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
@@ -167,7 +167,12 @@ fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// One CloudWatch Logs call that must be served, as its JSON client sends one.
-async fn logs(router: &MultiServiceRouter, operation: &str, request: Value, case: &str) -> Value {
+pub(crate) async fn logs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: Value,
+    case: &str,
+) -> Value {
     let target = format!("Logs_20140328.{operation}");
     let body = dispatch(
         router,
@@ -258,7 +263,7 @@ async fn delivered_events(
 
 /// One RESP reply, as a client reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Resp {
+pub(crate) enum Resp {
     Status(String),
     Error(String),
     Integer(i64),
@@ -286,7 +291,7 @@ impl Resp {
 }
 
 /// A RESP session on the address the control plane published for a cache.
-struct Session {
+pub(crate) struct Session {
     conn: TcpStream,
 }
 
@@ -296,7 +301,7 @@ impl Session {
     /// The assertion is what pins the endpoint to this machine: the core binds its resource
     /// listeners on the operator-chosen interface, loopback by default, so the address a
     /// cache publishes is this machine's own — and that is the address dialled.
-    async fn open(case: &str, address: &str, port: u16) -> Self {
+    pub(crate) async fn open(case: &str, address: &str, port: u16) -> Self {
         assert_eq!(
             address, "127.0.0.1",
             "case {case:?}: the published endpoint must be this machine's loopback address, \
@@ -315,7 +320,7 @@ impl Session {
 
     /// Send one command as the array of bulk strings every client library sends, and read the
     /// one reply it is answered with.
-    async fn command(&mut self, case: &str, arguments: &[&str]) -> Resp {
+    pub(crate) async fn command(&mut self, case: &str, arguments: &[&str]) -> Resp {
         let mut request = format!("*{}\r\n", arguments.len());
         for argument in arguments {
             request.push_str(&format!("${}\r\n{argument}\r\n", argument.len()));

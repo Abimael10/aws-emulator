@@ -624,7 +624,10 @@ fn slow_log_policy(
 /// A configuration that settled in the ERROR state carries nowhere: it names a destination
 /// that was not there when the configuration was resolved
 /// ([`super::log_delivery::settle_log_delivery`]), and a delivery that is reported as having
-/// failed must not start carrying records because the destination appeared later.
+/// failed must not start carrying records because the destination appeared later. Neither
+/// does one a request has asked for no longer ([`super::LOG_DELIVERY_STATUS_DISABLING`]): a
+/// client that turned its delivery off is answered by a stream that has stopped, and that
+/// configuration is on its way out of the cache's list.
 fn slow_log_delivery(
     cluster: &super::CacheClusterRecord,
     configurations: &[super::LogDeliveryRecord],
@@ -639,6 +642,7 @@ fn slow_log_delivery(
                 .as_deref()
                 .is_some_and(|destination| destination == slow_log::CLOUDWATCH_LOGS_DESTINATION)
             && record.status != super::LOG_DELIVERY_STATUS_ERROR
+            && !record.is_disabling()
     })?;
     let log_group = configured
         .destination_details

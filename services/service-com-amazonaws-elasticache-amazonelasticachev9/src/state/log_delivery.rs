@@ -18,6 +18,15 @@
 //!   ([`missing_log_group_message`]) — and nothing here creates it, because the destination
 //!   is a resource of the ACCOUNT, held by the service that owns it.
 //!
+//! TURNING ONE OFF is work of the same kind: a request that asks for a log type already
+//! configured to be delivered no longer leaves that configuration reported
+//! [`LOG_DELIVERY_STATUS_DISABLING`], carrying the destination it was delivering to, and the
+//! clock then takes it out of the list — which is when the cache carries no configuration for
+//! that log type at all. So a client that turns a delivery off sees it being withdrawn before
+//! it is gone, and can tell a delivery it has just turned off from a log type that was never
+//! configured; a delivery in that status carries no further record
+//! ([`super::cache_data_plane`]).
+//!
 //! `active` is the one signal a client has that its logs are flowing, so a destination that
 //! does not exist must not be reported as a healthy delivery: an operator or a readiness
 //! check that waits for `active` would otherwise conclude delivery is healthy while no
@@ -58,6 +67,11 @@ pub const LOG_DELIVERY_STATUS_MODIFYING: &str = "modifying";
 /// The `LogDeliveryConfigurationStatus` of a delivery that could not be set up, which is
 /// what [`LogDeliveryRecord::message`] then says the reason for.
 pub const LOG_DELIVERY_STATUS_ERROR: &str = "error";
+
+/// The `LogDeliveryConfigurationStatus` of a delivery a request has asked for no longer, and
+/// which is being withdrawn: the configuration is still reported, with the destination it was
+/// delivering to, until the clock has taken it out of the cache's list.
+pub const LOG_DELIVERY_STATUS_DISABLING: &str = "disabling";
 
 /// How long a log-delivery configuration stays in the status the call that asked for it
 /// answered before the clock owes it a settled one.
@@ -149,14 +163,25 @@ impl LogDeliveryRecord {
     /// lookup is left for the next pass rather than settled against an answer that was never
     /// asked about it. This is the one write a reporting operation may make: the settlement
     /// was owed at this instant whether or not anybody called.
+    ///
+    /// Answers whether the cache still holds this configuration afterwards: a delivery being
+    /// withdrawn ([`LOG_DELIVERY_STATUS_DISABLING`]) is GONE once the withdrawal is due, which
+    /// is the one settled outcome that is not a status.
     fn settle(
         &mut self,
         now: SystemTime,
         resolved: &BTreeSet<String>,
         groups_present: &BTreeSet<String>,
-    ) {
+    ) -> bool {
         if self.due.is_none_or(|due| now < due) {
-            return;
+            return true;
+        }
+        if self.status == LOG_DELIVERY_STATUS_DISABLING {
+            // The withdrawal is through: the cache carries no configuration for this log
+            // type, which is what a cache that never configured one carries too. Nothing is
+            // resolved for it — the destination it was delivering to is no longer its
+            // business.
+            return false;
         }
         let Some(log_group) = self.cloud_watch_log_group().map(str::to_string) else {
             // Nothing to resolve: a destination this service holds no view of takes the
@@ -164,10 +189,10 @@ impl LogDeliveryRecord {
             self.due = None;
             self.status = LOG_DELIVERY_STATUS_ACTIVE.to_string();
             self.message = None;
-            return;
+            return true;
         };
         if !resolved.contains(&log_group) {
-            return;
+            return true;
         }
         self.due = None;
         if groups_present.contains(&log_group) {
@@ -177,17 +202,30 @@ impl LogDeliveryRecord {
             self.status = LOG_DELIVERY_STATUS_ERROR.to_string();
             self.message = Some(missing_log_group_message(&log_group));
         }
+        true
+    }
+
+    /// Whether this configuration is being withdrawn, which is what a delivery a request has
+    /// asked for no longer reports until the clock has taken it out of the list.
+    #[must_use]
+    pub fn is_disabling(&self) -> bool {
+        self.status == LOG_DELIVERY_STATUS_DISABLING
     }
 }
 
 /// Apply `requests` to the log-delivery configurations `stored`: a request
-/// replaces the configuration for its log type, and `Enabled: false` removes it.
+/// replaces the configuration for its log type, and `Enabled: false` withdraws it.
 ///
 /// A stored configuration is NOT settled: the one a request asks for answers
 /// [`LOG_DELIVERY_STATUS_ENABLING`], one that replaces a configuration already held for that
-/// log type answers [`LOG_DELIVERY_STATUS_MODIFYING`], and the clock owes both a settled
-/// status [`LOG_DELIVERY_TRANSITION`] after `now` — reached by resolving the destination
-/// ([`settle_log_delivery`]).
+/// log type answers [`LOG_DELIVERY_STATUS_MODIFYING`], one a request asks for no longer
+/// answers [`LOG_DELIVERY_STATUS_DISABLING`], and the clock owes each of them its settled
+/// outcome [`LOG_DELIVERY_TRANSITION`] after `now` — the destination resolved for the first
+/// two, the configuration taken out of the list for the third ([`settle_log_delivery`]).
+///
+/// A request that asks a log type NO configuration is held for to be delivered no longer has
+/// nothing to withdraw, so it stores none: `Enabled: false` is how a delivery is turned off,
+/// never how one comes to exist.
 ///
 /// What is stored is bounded at [`MAX_LOG_DELIVERY_CONFIGURATIONS`] however many requests
 /// arrive, so neither one call nor a run of them can grow this list without end.
@@ -197,13 +235,26 @@ pub fn apply_log_delivery(
     now: SystemTime,
 ) {
     for request in requests {
-        let replaced = stored
-            .iter()
-            .any(|existing| existing.log_type == request.log_type);
-        stored.retain(|existing| existing.log_type != request.log_type);
         if request.enabled == Some(false) {
+            // Being withdrawn, with the destination it was delivering to still reported: the
+            // configuration is the one that was there, in the status that says it is going.
+            // A log type nothing is held for has nothing to withdraw, so nothing is stored.
+            if let Some(withdrawn) = stored
+                .iter_mut()
+                .find(|existing| existing.log_type == request.log_type)
+            {
+                withdrawn.status = LOG_DELIVERY_STATUS_DISABLING.to_string();
+                withdrawn.message = None;
+                withdrawn.due = Some(now + LOG_DELIVERY_TRANSITION);
+            }
             continue;
         }
+        // A configuration that is being withdrawn is not one a change is MODIFYING: asking
+        // for that log type again sets a delivery up, which is what `enabling` reports.
+        let replaced = stored
+            .iter()
+            .any(|existing| existing.log_type == request.log_type && !existing.is_disabling());
+        stored.retain(|existing| existing.log_type != request.log_type);
         // The bound, taken before the record is allocated: a cache holds one configuration
         // per modelled log type, and a request for a type already held was just removed
         // above, so this is unreachable for any request the boundary validator admits — it is
@@ -228,11 +279,19 @@ pub fn apply_log_delivery(
 }
 
 /// Settle every log-delivery configuration of this store whose status the clock has already
-/// made due, resolving each destination where the service that owns it answers.
+/// made due, resolving each destination where the service that owns it answers — and take out
+/// of the list every configuration whose WITHDRAWAL is due
+/// ([`LOG_DELIVERY_STATUS_DISABLING`]).
 ///
 /// Called with NO guard of this service's store held, by the reporting operations that
 /// publish a `LogDeliveryConfiguration` — the settlement is owed at the instant they answer
 /// whether or not anybody called, exactly as a cluster's own status change is.
+///
+/// A member cluster reports, BESIDE its own list,
+/// `CacheCluster$ReplicationGroupLogDeliveryEnabled` — whether it delivers any of its group's
+/// logs — which the call that applies a change derives from that list
+/// (`crate::ops::modify_replication_group`). So the withdrawal that empties the list turns
+/// that flag off here, where the list is emptied, and the two cannot come to disagree.
 ///
 /// Nothing is settled while the destination answers cannot be read at all (an engine holding
 /// no CloudWatch Logs store), so a configuration keeps the transient status it was asked for
@@ -262,9 +321,28 @@ pub fn settle_log_delivery<Eng: ::std::marker::Send + ::std::marker::Sync + 'sta
             .collect()
     };
     let mut store = state.lock();
-    for configurations in every_configuration_list(&mut store) {
-        for record in configurations {
-            record.settle(now, &wanted, &groups_present);
+    for cluster in store.cache_clusters.values_mut() {
+        let carried = !cluster.log_delivery_configurations.is_empty();
+        cluster
+            .log_delivery_configurations
+            .retain_mut(|record| record.settle(now, &wanted, &groups_present));
+        // The withdrawal that leaves a member carrying no configuration at all is what turns
+        // its group-log-delivery flag off, exactly as the call that applied the change did
+        // while it emptied the list itself. A cluster the flag says nothing about (one in no
+        // replication group) keeps saying nothing.
+        if carried && cluster.log_delivery_configurations.is_empty() {
+            if let Some(enabled) = cluster.replication_group_log_delivery_enabled.as_mut() {
+                *enabled = false;
+            }
+        }
+    }
+    for group in store.replication_groups.values_mut() {
+        // The group's own configurations, and the ones a deferred change to it is holding.
+        for configurations in [
+            &mut group.log_delivery_configurations,
+            &mut group.pending_modified_values.log_delivery_configurations,
+        ] {
+            configurations.retain_mut(|record| record.settle(now, &wanted, &groups_present));
         }
     }
 }
@@ -292,6 +370,11 @@ fn destinations_due(
     });
     for configurations in clusters.chain(groups) {
         for record in configurations {
+            // A configuration being WITHDRAWN resolves nothing: what the clock owes it is to
+            // be taken out of the list, whatever its destination now holds.
+            if record.is_disabling() {
+                continue;
+            }
             if record.due.is_some_and(|due| now >= due) {
                 if let Some(log_group) = record.cloud_watch_log_group() {
                     wanted.insert(log_group.to_string());
@@ -300,23 +383,4 @@ fn destinations_due(
         }
     }
     wanted
-}
-
-/// Every list of log-delivery configurations this store holds, so one settle pass reaches
-/// each of them: the configurations of a cache cluster, those of a replication group, and the
-/// ones a deferred change to a group is holding.
-fn every_configuration_list(
-    store: &mut ComAmazonawsElasticacheAmazonelasticachev9State,
-) -> impl Iterator<Item = &mut Vec<LogDeliveryRecord>> {
-    let clusters = store
-        .cache_clusters
-        .values_mut()
-        .map(|cluster| &mut cluster.log_delivery_configurations);
-    let groups = store.replication_groups.values_mut().flat_map(|group| {
-        [
-            &mut group.log_delivery_configurations,
-            &mut group.pending_modified_values.log_delivery_configurations,
-        ]
-    });
-    clusters.chain(groups)
 }
