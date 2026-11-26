@@ -21,6 +21,42 @@ const LAST_BOT_ID: u64 = 9_999_999_999;
 /// `lastLogin` and no `pubkey`.
 pub const BOT_STATUS_PENDING: i32 = 1;
 
+/// What every bot account's `username` ends with.
+///
+/// `CreateBotRequest$username` "must be unique within the network and follow the
+/// network's naming conventions", and the convention a bot account's name
+/// follows is this suffix: a name that does not end with it is not a name a bot
+/// of a network may hold. The model expresses no part of it — `GenericString`'s
+/// `^[\S\s]*$` matches every string — so the service owns the whole rule and
+/// this is RECORDED behaviour.
+pub const BOT_USERNAME_SUFFIX: &str = "bot";
+
+/// Why a bot `username` was refused: it does not end with [`BOT_USERNAME_SUFFIX`].
+///
+/// ENTIRELY fixed text, like the other reasons this service states: it names
+/// neither the submitted name nor the network, so the refusal carries no part of
+/// the request. Shared, so no operation that accepts a bot username can word the
+/// convention or its refusal differently.
+pub const BOT_USERNAME_INVALID_REASON: &str = "Bot Username must end with bot";
+
+/// Whether `username` is a name a bot of a network may be created with.
+///
+/// The convention is the suffix and nothing else: the name has to END with
+/// [`BOT_USERNAME_SUFFIX`], whatever the rest of it is built from and however
+/// long it is. The suffix is matched without regard to case, which is the
+/// reading that refuses nothing the recorded wire shows accepted — the recording
+/// carries only lower-case names, so a name whose suffix differs only in case is
+/// not known to be refused.
+pub fn bot_username_follows_convention(username: &str) -> bool {
+    username
+        .len()
+        .checked_sub(BOT_USERNAME_SUFFIX.len())
+        // A split that does not land on a character boundary is not a suffix:
+        // `get` answers `None` for it rather than cutting a character in half.
+        .and_then(|start| username.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(BOT_USERNAME_SUFFIX))
+}
+
 /// One stored bot of one network — every member of the modelled `Bot` shape.
 #[derive(Debug, Clone)]
 pub struct BotRecord {

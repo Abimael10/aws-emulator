@@ -19,6 +19,9 @@
 //!   network nor which account holds it. (`ValidationError` models no reason text, so this
 //!   is recorded behaviour, like the fixed sentence the same service states for a network
 //!   name it will not accept.)
+//! * A name a bot may hold also follows the network's bot-naming convention, which is a
+//!   rule of its own with its own fixed reason: every name below follows it, so what
+//!   decides each case here is availability alone.
 //! * A username names one account of ONE network, so the same name is free in another
 //!   network, and both operations that create an account of a network — `CreateBot` and
 //!   `BatchCreateUser`, whose per-item failure carries the same `field` / `reason` pair —
@@ -232,18 +235,21 @@ async fn a_username_the_network_already_holds_is_refused_with_one_fixed_reason()
     let router = emulator();
     let network_id = create_network(&router, "taken-name-net").await;
     let group_id = default_group_id(&router, &network_id).await;
-    let long_name = "n".repeat(64);
+    let long_name = format!("{}bot", "n".repeat(61));
 
     // (case, the username, whether a BOT or a USER takes it first)
+    //
+    // Every row is a name a bot may hold — it follows the bot-naming convention — so what
+    // decides each second create is the uniqueness rule and not the shape of the name.
     let rows: &[(&str, &str, bool)] = &[
-        ("a short name a bot holds", "zz", true),
-        ("a name a bot holds, ending in bot", "integration-bot", true),
-        ("an address-shaped name a user holds", "ann.lee@example.com", false),
+        ("a short name a bot holds", "zzbot", true),
+        ("a name a bot holds, hyphenated", "integration-bot", true),
+        ("a dotted name a user holds", "ann.lee.bot", false),
         ("a mixed-case name a bot holds", "MixedCaseBot", true),
         ("a name of 64 characters", long_name.as_str(), true),
-        ("a name built from another script", "ロボット", true),
-        ("a name carrying a space", "two words", false),
-        ("a name of digits only", "12345678", false),
+        ("a name built from another script", "ロボットbot", true),
+        ("a name carrying a space", "two words bot", false),
+        ("a name of digits and the suffix", "12345678bot", false),
     ];
 
     for (case, username, taken_by_a_bot) in rows {

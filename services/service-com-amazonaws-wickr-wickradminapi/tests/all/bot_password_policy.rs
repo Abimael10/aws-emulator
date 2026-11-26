@@ -417,7 +417,7 @@ async fn a_challenge_that_meets_the_policy_creates_a_bot_that_reads_back() {
              the group's minimum {min_length}, got {} characters",
             challenge.chars().count()
         );
-        let username = format!("bot-{index}");
+        let username = format!("strong-{index}-bot");
         let (status, body) = create_bot(&router, &network_id, &username, &group_id, challenge).await;
         assert_eq!(
             status, 200,
@@ -741,17 +741,17 @@ async fn a_create_that_names_no_resource_or_a_taken_username_is_refused() {
         &router,
         "POST",
         &format!("/networks/{network_id}/users"),
-        Some(json!({ "users": [{ "username": "taken-user", "securityGroupIds": [group_id] }] })),
+        Some(json!({ "users": [{ "username": "taken-user-bot", "securityGroupIds": [group_id] }] })),
     )
     .await;
     assert_eq!(
         status, 200,
-        "BatchCreateUser \"taken-user\": expected 200, got {status} with {body}"
+        "BatchCreateUser \"taken-user-bot\": expected 200, got {status} with {body}"
     );
 
     for (case, username) in [
         ("a username another bot holds", "taken-bot"),
-        ("a username a user holds", "taken-user"),
+        ("a username a user holds", "taken-user-bot"),
     ] {
         let (status, body) = create_bot(&router, &network_id, username, &group_id, challenge).await;
         assert_eq!(

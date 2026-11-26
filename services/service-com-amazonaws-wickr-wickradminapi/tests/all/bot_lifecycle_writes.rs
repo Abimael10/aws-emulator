@@ -417,7 +417,7 @@ async fn an_update_writes_the_members_it_carries_and_leaves_the_rest() {
     for (index, (case, patch, display_name, group_id, has_challenge, suspended)) in
         rows.into_iter().enumerate()
     {
-        let username = format!("update-bot-{index}");
+        let username = format!("update-{index}-bot");
         let bot_id = create_bot(&router, &network_id, &home, &username).await;
         let before = bot_members(&router, &network_id, &bot_id).await;
 

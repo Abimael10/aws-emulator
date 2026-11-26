@@ -8,6 +8,11 @@
 //! lowercase letters, numbers and symbols — which is checked before anything is
 //! stored, so a password the policy turns down leaves the network's bots untouched.
 //!
+//! The `username` it is created with has to be one a bot of the network may hold: it
+//! follows the network's bot-naming convention and is held by no account of the
+//! network yet. Each of those is checked before anything is stored too, so a name the
+//! convention turns down creates no account.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -220,6 +225,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `username` must "follow the network's naming conventions", and the
+        // convention a bot account's name follows is its suffix, so a name that
+        // does not end with it is refused before any bot is created. The refusal
+        // states the service's fixed reason for a name that is not a bot name,
+        // which carries no part of the submitted name.
+        if !crate::state::bot_username_follows_convention(&input.username) {
+            return Err(refused(
+                crate::state::USERNAME_FIELD,
+                crate::state::BOT_USERNAME_INVALID_REASON.to_string(),
+            ));
+        }
+
         // `username` "must be unique within the network". One username names one
         // account of a network whether that account is a user or a bot — `uname` is
         // derived from it, so two accounts holding it would share one identifier.
@@ -282,10 +299,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The sentence this operation's success body states the create in.
 ///
-/// FIXED text: it names neither the bot nor its id, so the confirmation every caller
-/// reads is one sentence and carries nothing a caller would have to parse out of it.
-/// What identifies the bot that was created is the response's own members.
-const CREATED_MESSAGE: &str = "Bot created successfully";
+/// `CreateBotResponse$message` is "a message indicating the result of the bot creation
+/// operation", and the result this service indicates for a create it served is this one
+/// word. RECORDED behaviour, the model stating no text: it is ENTIRELY fixed — it names
+/// neither the bot, its id nor the network, so the confirmation every caller reads is the
+/// same and carries nothing a caller would have to parse out of it. What identifies the
+/// bot that was created is the response's own members.
+const CREATED_MESSAGE: &str = "success";
 
 /// The modelled `ResourceNotFoundError` (HTTP 404) for a resource the request named
 /// that "doesn't exist or has been deleted", stated in this API's fixed sentence for
