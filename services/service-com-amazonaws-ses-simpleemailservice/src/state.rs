@@ -3151,6 +3151,45 @@ pub fn identity_domain(identity: &str) -> &str {
     }
 }
 
+/// The sentence Amazon SES refuses an Easy DKIM ENABLEMENT with when no Easy DKIM
+/// setup covers the identity whose mail it was asked to sign.
+///
+/// Easy DKIM is set up on a DOMAIN — "for email addresses (for example,
+/// user@example.com), you can only enable DKIM signing if the corresponding domain
+/// (in this case, example.com) has been set up to use Easy DKIM"
+/// (`SetIdentityDkimEnabled`'s own documentation) — so this refusal is worded in terms
+/// of that domain's DKIM setup rather than of the identity's plain verification: the
+/// fixed text is `Domain ` + ` is not verified for DKIM signing.`, and its only
+/// variable part is the domain the requested identity belongs to
+/// ([`identity_domain`]) — the whole value for a domain identity, and the domain half
+/// of an address. The same sentence the SES v2 surface words its own DKIM-attribute
+/// write's refusal with, so one condition reads the same whichever API reports it.
+///
+/// The identity-state refusals of the `SetIdentity*` writes that configure no
+/// mechanism of their own name the IDENTITY instead
+/// ([`unverified_identity_message`]), so a client that tells failure causes apart by
+/// their wording — this operation models no error shape to tell them apart by — can
+/// see which condition it hit.
+pub fn domain_not_verified_for_dkim(identity: &str) -> String {
+    format!(
+        "Domain {} is not verified for DKIM signing.",
+        identity_domain(identity)
+    )
+}
+
+/// The sentence the `SetIdentity*` writes refuse an identity this account does not
+/// hold with: the fixed text `Identity ` + ` is not verified`, with the `Identity` the
+/// request spelled as its only variable part.
+///
+/// One sentence for the writes that configure a property OF an identity without
+/// standing for a mechanism of their own — its notification topics, its custom MAIL
+/// FROM domain, its feedback forwarding — so none of them words that one condition
+/// differently. The Easy DKIM enablement does stand for a mechanism, and states its
+/// gate in terms of it ([`domain_not_verified_for_dkim`]).
+pub fn unverified_identity_message(identity: &str) -> String {
+    format!("Identity {identity} is not verified")
+}
+
 /// Whether `candidate` is a domain strictly BELOW `parent`: it ends in `parent`
 /// after a label separator, so it carries at least one more label.
 ///

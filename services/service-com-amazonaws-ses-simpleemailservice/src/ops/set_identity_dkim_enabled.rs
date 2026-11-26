@@ -158,26 +158,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether an Easy DKIM setup covers the identity, read before the record
         // is taken mutably below.
         let covered_by_easy_dkim = state.easy_dkim_for(&identity).is_some();
-        let Some(record) = state.identities.get_mut(&identity) else {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {named} is not verified"),
-            ));
-        };
 
         // "For email addresses (for example, user@example.com), you can only
         // enable DKIM signing if the corresponding domain (in this case,
         // example.com) has been set up to use Easy DKIM" (this operation's own
-        // documentation), so enabling an identity no Easy DKIM setup covers is
-        // refused and the flag stays as it was: there would be no tokens to sign
-        // with. Disabling is always allowed.
+        // documentation), so what turning signing ON is gated on is the Easy DKIM
+        // setup of the DOMAIN the identity's mail comes from, not the identity's
+        // plain verification: an identity no setup covers has no tokens to sign
+        // with, so the request is refused and the flag stays as it was. The
+        // refusal is worded in terms of that domain's DKIM setup
+        // ([`crate::state::domain_not_verified_for_dkim`]) rather than with the
+        // identity-state sentence the other `SetIdentity*` writes answer with —
+        // this operation models no error shape, so its message is the only signal
+        // a client has for which condition it hit. A domain this account holds no
+        // identity for has no Easy DKIM setup either, so this one gate covers
+        // that too: either way there is nothing to sign with. Disabling is always
+        // allowed.
         if input.dkim_enabled && !covered_by_easy_dkim {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!(
-                    "DkimEnabled can only be set to true for an identity that has been set up to \
-                     use Easy DKIM; {named} has no Easy DKIM tokens"
-                ),
+                crate::state::domain_not_verified_for_dkim(&named),
             ));
         }
+
+        // Turning signing OFF configures nothing of its own, so an identity this
+        // account does not hold is refused as that — the sentence every
+        // `SetIdentity*` write of this surface states that one condition with.
+        let Some(record) = state.identities.get_mut(&identity) else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                crate::state::unverified_identity_message(&named),
+            ));
+        };
         record.dkim_enabled = input.dkim_enabled;
 
         // Whether SES signs messages from the identity is a fact about the

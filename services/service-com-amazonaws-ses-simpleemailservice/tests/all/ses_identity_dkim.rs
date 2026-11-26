@@ -20,7 +20,9 @@
 //!   with no tokens — for an identity nothing covers;
 //! * `SetIdentityDkimEnabled` stores the signing flag on the named identity's own
 //!   record, so one identity's flag says nothing about another's, and enabling an
-//!   identity no Easy DKIM setup covers is refused with HTTP 400;
+//!   identity no Easy DKIM setup covers is refused with HTTP 400 — worded in terms
+//!   of the DOMAIN whose mail it was asked to sign, whatever state that domain's
+//!   plain identity verification is in, because Easy DKIM is set up on a domain;
 //! * `DkimEnabled` is whether Amazon SES signs that identity's mail — the flag on
 //!   its own record together with an Easy DKIM setup covering it to sign with — so
 //!   an identity no setup covers reports `false`;
@@ -33,7 +35,10 @@
 //!   identity named more than once is reported once, and the order they were
 //!   named in changes nothing.
 
-use crate::harness::{call, element, elements, emulator, field, map_entries, Field};
+use crate::harness::{
+    account, call, element, elements, emulator, emulator_and_engine, error_envelope, field,
+    map_entries, settle_verifications, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::ops::VERIFICATION_STATUS_VALUES;
 use service_com_amazonaws_ses_simpleemailservice::state::{
     DKIM_SIGNING_AT_IDENTITY_START, EASY_DKIM_TOKEN_COUNT, EASY_DKIM_TOKEN_LEN,
@@ -984,5 +989,185 @@ async fn dkim_enabled_reports_whether_signing_is_enabled_for_the_identity() {
             row.case,
             row.expected
         );
+    }
+}
+
+/// The sentence `SetIdentityDkimEnabled` must refuse an enablement with when no
+/// Easy DKIM setup covers the identity.
+///
+/// Easy DKIM is set up on a DOMAIN, so the sentence names that domain: the fixed
+/// text `Domain ` + ` is not verified for DKIM signing.`, with the domain the
+/// requested identity belongs to as its only variable part. Written out here rather
+/// than read from the implementation, so what is asserted is the wording itself.
+fn domain_not_verified_for_dkim(domain: &str) -> String {
+    format!("Domain {domain} is not verified for DKIM signing.")
+}
+
+/// `VerifyEmailIdentity` for an address and `VerifyDomainIdentity` for a domain —
+/// the calls that START an identity's verification without setting Easy DKIM up for
+/// it.
+async fn start_verification(router: &MultiServiceRouter, identity: &str) {
+    if identity.contains('@') {
+        verify_email_identity(router, identity).await;
+    } else {
+        verify_domain_identity(router, identity).await;
+    }
+}
+
+/// One request to turn Easy DKIM signing on that must be refused, and the domain
+/// its refusal must name.
+struct RefusalRow {
+    /// What this row is, for the assertion messages.
+    case: &'static str,
+    /// The identities whose verification is started before the call.
+    recorded: Vec<String>,
+    /// The `Identity` the call names, in the spelling it uses.
+    identity: String,
+    /// The domain the refusal must name.
+    domain: String,
+}
+
+#[tokio::test]
+async fn enabling_easy_dkim_with_no_setup_is_refused_naming_the_domain() {
+    // "For email addresses (for example, user@example.com), you can only enable
+    // DKIM signing if the corresponding domain (in this case, example.com) has been
+    // set up to use Easy DKIM" — so the refusal is about that domain's Easy DKIM
+    // setup, and names the domain the identity the request spelled belongs to.
+    let router = emulator();
+
+    // The rows span the ways an enablement finds no Easy DKIM setup over the
+    // identity, and what the domain of that identity is: a domain identity, an
+    // address under one, an address a label deeper, an identity named by its ARN,
+    // identities the account holds nothing for at all, and a spelling that differs
+    // in case from the identity on record.
+    let rows: Vec<RefusalRow> = vec![
+        RefusalRow {
+            case: "a domain whose verification was started but Easy DKIM never was",
+            recorded: vec!["started.example.com".to_string()],
+            identity: "started.example.com".to_string(),
+            domain: "started.example.com".to_string(),
+        },
+        RefusalRow {
+            case: "an address under a domain with no Easy DKIM setup",
+            recorded: vec![
+                "bare.example.com".to_string(),
+                "user@bare.example.com".to_string(),
+            ],
+            identity: "user@bare.example.com".to_string(),
+            domain: "bare.example.com".to_string(),
+        },
+        RefusalRow {
+            case: "an address a label below a domain with no Easy DKIM setup",
+            recorded: vec![
+                "deep.example.com".to_string(),
+                "user@mail.deep.example.com".to_string(),
+            ],
+            identity: "user@mail.deep.example.com".to_string(),
+            domain: "mail.deep.example.com".to_string(),
+        },
+        RefusalRow {
+            case: "a domain identity named by its identity ARN",
+            recorded: vec!["by-arn.example.com".to_string()],
+            identity: format!("arn:aws:ses:{REGION}:{}:identity/by-arn.example.com", account()),
+            domain: "by-arn.example.com".to_string(),
+        },
+        RefusalRow {
+            case: "a domain this account holds no identity for",
+            recorded: Vec::new(),
+            identity: "stranger.example.net".to_string(),
+            domain: "stranger.example.net".to_string(),
+        },
+        RefusalRow {
+            case: "an address this account holds no identity for",
+            recorded: Vec::new(),
+            identity: "user@stranger.example.org".to_string(),
+            domain: "stranger.example.org".to_string(),
+        },
+        RefusalRow {
+            case: "an address spelling its domain in another case",
+            recorded: vec!["cased.example.com".to_string()],
+            identity: "user@CASED.example.com".to_string(),
+            domain: "CASED.example.com".to_string(),
+        },
+    ];
+
+    for row in &rows {
+        for identity in &row.recorded {
+            start_verification(&router, identity).await;
+        }
+        let (status, body) = set_dkim_enabled(&router, &row.identity, true).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected 400, got {status} with {body}",
+            row.case
+        );
+        let (code, message) = error_envelope(&body);
+        assert_eq!(
+            code.as_deref(),
+            Some("InvalidParameterValue"),
+            "case {:?}: expected InvalidParameterValue, got {code:?} in {body}",
+            row.case
+        );
+        assert_eq!(
+            message,
+            Some(domain_not_verified_for_dkim(&row.domain)),
+            "case {:?}: expected {:?}, got {message:?}",
+            row.case,
+            domain_not_verified_for_dkim(&row.domain)
+        );
+    }
+
+    // The gate is the Easy DKIM setup and nothing else, so setting one up for a
+    // domain of one of those rows makes the very same call succeed.
+    verify_domain_dkim_ok(&router, "bare.example.com").await;
+    set_dkim_enabled_ok(&router, "user@bare.example.com", true).await;
+}
+
+#[tokio::test]
+async fn a_fully_verified_domain_with_no_easy_dkim_setup_is_refused_the_same_way() {
+    // Plain identity verification and Easy DKIM are two different setups: an
+    // identity whose verification has gone all the way through still has no tokens
+    // to sign with until Easy DKIM has been set up for its domain, so the
+    // enablement is refused in terms of that setup rather than of the identity's
+    // verification state.
+    let (router, engine) = emulator_and_engine();
+    let domain = "verified.example.com";
+    let address = format!("user@{domain}");
+    verify_domain_identity(&router, domain).await;
+    verify_email_identity(&router, &address).await;
+    settle_verifications(&engine);
+
+    for identity in [domain.to_string(), address.clone()] {
+        let (status, body) = set_dkim_enabled(&router, &identity, true).await;
+        assert_eq!(
+            status, 400,
+            "case {identity:?} verified without Easy DKIM: expected 400, got {status} with {body}"
+        );
+        let (code, message) = error_envelope(&body);
+        assert_eq!(
+            code.as_deref(),
+            Some("InvalidParameterValue"),
+            "case {identity:?} verified without Easy DKIM: expected InvalidParameterValue, got \
+             {code:?} in {body}"
+        );
+        assert_eq!(
+            message,
+            Some(domain_not_verified_for_dkim(domain)),
+            "case {identity:?} verified without Easy DKIM: expected {:?}, got {message:?}",
+            domain_not_verified_for_dkim(domain)
+        );
+        let report = reported(&router, &identity).await;
+        assert_eq!(
+            report.as_ref().map(|report| report.enabled.clone()),
+            Some(false.to_string()),
+            "case {identity:?} verified without Easy DKIM: a refused call must leave signing off, \
+             got {report:?}"
+        );
+    }
+
+    // And once Easy DKIM is set up for that domain, both identities are accepted.
+    verify_domain_dkim_ok(&router, domain).await;
+    for identity in [domain.to_string(), address] {
+        set_dkim_enabled_ok(&router, &identity, true).await;
     }
 }

@@ -209,9 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports: the key above is what the list is looked up by.
         let named = crate::state::named_identity(&input.identity).to_string();
         let unverified = || -> SetIdentityNotificationTopicError {
-            crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
-                "Identity {named} is not verified"
-            ))
+            crate::scaffolded::Scaffolded::invalid_parameter_value(
+                crate::state::unverified_identity_message(&named),
+            )
         };
         // The identity the request IDENTIFIES is resolved first, before any
         // question is put to another service about the topic it would bind: an

@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named = crate::state::named_identity(&input.identity).to_string();
         let Some(record) = state.identities.get_mut(&identity) else {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!("Identity {named} is not verified"),
+                crate::state::unverified_identity_message(&named),
             ));
         };
 
