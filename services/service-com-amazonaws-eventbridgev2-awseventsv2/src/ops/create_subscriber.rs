@@ -238,6 +238,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The run state the request asks the new subscriber to be created in: the `State` it names,
+/// or the service's own default when it names none.
+///
+/// Decided from the request alone, so a `State` this service declares no `SubscriberState`
+/// for is refused as the bad parameter it is before anything is resolved or minted.
+fn requested_run_state(
+    input: &CreateSubscriberInput,
+) -> Result<crate::state::SubscriberRunState, CreateSubscriberError> {
+    crate::state::SubscriberRunState::from_wire(input.state.as_deref()).ok_or_else(|| {
+        CreateSubscriberErrorModeled::InvalidInputException(InvalidInputException {
+            message: Some(format!(
+                "State: {} is not a SubscriberState this service declares",
+                input.state.as_deref().unwrap_or_default()
+            )),
+        })
+        .into()
+    })
+}
+
 /// What one create leaves behind: the response it answers, and the backlog the
 /// new subscriber's starting position already owes it.
 struct Created {
@@ -257,6 +276,62 @@ fn create(
     input: &CreateSubscriberInput,
     now: ::std::time::SystemTime,
 ) -> Result<Created, CreateSubscriberError> {
+    // What the request asks for, decided from the REQUEST alone: every reading below is
+    // about the request's own parameters, so each is answered before the store is read and
+    // before the bus the request names is resolved. A request whose own parameters are not
+    // valid is refused for them — not for the resource it happens to name — and a refused
+    // create mints nothing.
+    let run_state = requested_run_state(input)?;
+
+    // A filter configuration is stored only if it is one this service can
+    // evaluate: `FilterConfiguration` makes `Filters` required on a create and
+    // `FilterConfiguration$Language` declares one language,
+    // `EVENT_BRIDGE_PATTERN`, so a configuration naming no filters, or a text
+    // that is not a pattern of that language, would select nothing for the
+    // lifetime of the subscriber.
+    if let Some(reason) = input
+        .filter_configuration
+        .as_ref()
+        .and_then(crate::state::filter_configuration_fault)
+    {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
+    // A `Transformer` and a universal target are mutually exclusive: the one
+    // rule both the create and the update of a subscriber are held to.
+    if let Some(reason) = crate::state::transformer_fault(
+        input
+            .invoke_configuration
+            .universal_target_parameters
+            .as_ref(),
+        input.transformer.as_ref(),
+    ) {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
+    // And the configuration it names has to be one a subscriber could deliver
+    // under at all — the transformation, the target, the parameters member that
+    // goes with it, the values it carries and the batching it is invoked under
+    // ([`invalid_input`]).
+    if let Some(reason) = invalid_input(input) {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
     state.settle_lifecycles(now);
 
     // The bus the subscriber is created on has to exist, and "The bus must
@@ -316,57 +391,6 @@ fn create(
         &starting_position,
         input.point_in_time_configuration.as_ref(),
     );
-
-    // A filter configuration is stored only if it is one this service can
-    // evaluate: `FilterConfiguration` makes `Filters` required on a create and
-    // `FilterConfiguration$Language` declares one language,
-    // `EVENT_BRIDGE_PATTERN`, so a configuration naming no filters, or a text
-    // that is not a pattern of that language, would select nothing for the
-    // lifetime of the subscriber.
-    if let Some(reason) = input
-        .filter_configuration
-        .as_ref()
-        .and_then(crate::state::filter_configuration_fault)
-    {
-        return Err(CreateSubscriberErrorModeled::InvalidInputException(
-            InvalidInputException {
-                message: Some(reason),
-            },
-        )
-        .into());
-    }
-
-    // A `Transformer` and a universal target are mutually exclusive: the one
-    // rule both the create and the update of a subscriber are held to.
-    if let Some(reason) = crate::state::transformer_fault(
-        input
-            .invoke_configuration
-            .universal_target_parameters
-            .as_ref(),
-        input.transformer.as_ref(),
-    ) {
-        return Err(CreateSubscriberErrorModeled::InvalidInputException(
-            InvalidInputException {
-                message: Some(reason),
-            },
-        )
-        .into());
-    }
-
-    // And the configuration it names has to be one a subscriber could deliver
-    // under at all — the transformation, the target, the parameters member that
-    // goes with it, the values it carries and the batching it is invoked under
-    // ([`invalid_input`]). Every one of those readings happens HERE, before
-    // anything is minted, so a create this service refuses leaves no subscriber
-    // behind and holds no bus.
-    if let Some(reason) = invalid_input(input) {
-        return Err(CreateSubscriberErrorModeled::InvalidInputException(
-            InvalidInputException {
-                message: Some(reason),
-            },
-        )
-        .into());
-    }
 
     // The role is the one thing a request does not merely NAME but acts under:
     // "IAM role the service assumes to invoke the target. Must belong to the
@@ -449,18 +473,6 @@ fn create(
         )
         .into());
     }
-
-    let Some(run_state) = crate::state::SubscriberRunState::from_wire(input.state.as_deref()) else {
-        return Err(CreateSubscriberErrorModeled::InvalidInputException(
-            InvalidInputException {
-                message: Some(format!(
-                    "State: {} is not a SubscriberState this service declares",
-                    input.state.as_deref().unwrap_or_default()
-                )),
-            },
-        )
-        .into());
-    };
 
     // The ARN's id segment is minted from the store's own counter, so no
     // two subscribers can share one.

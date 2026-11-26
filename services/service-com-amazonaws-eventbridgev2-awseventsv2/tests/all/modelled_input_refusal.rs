@@ -96,11 +96,11 @@ const EVENT_BUS_NAME_MAX: usize = 256;
 
 /// `ClientToken`'s modelled `@length` maximum.
 /// Source: `smithy_query(query="shape", shape="ClientToken")`.
-const CLIENT_TOKEN_MAX: usize = 64;
+pub(crate) const CLIENT_TOKEN_MAX: usize = 64;
 
 /// `ClientToken`'s modelled `@pattern`, quoted the same way.
 /// Source: `smithy_query(query="shape", shape="ClientToken")`.
-const CLIENT_TOKEN_PATTERN: &str = r"[\u0021-\u007E]+";
+pub(crate) const CLIENT_TOKEN_PATTERN: &str = r"[\u0021-\u007E]+";
 
 /// `RetentionPeriodInDays`' modelled `@range`, which a storage configuration a request
 /// names must sit inside and the effective retention period of a bus therefore does too.
@@ -397,7 +397,7 @@ pub(crate) fn refusal(case: &str, body: &[u8]) -> (String, String) {
 
 /// One clause of the constraint envelope: the value as submitted, the member it sat at,
 /// and the requirement it broke.
-fn clause(value: &str, member: &str, requirement: &str) -> String {
+pub(crate) fn clause(value: &str, member: &str, requirement: &str) -> String {
     format!("Value '{value}' at '{member}' failed to satisfy constraint: {requirement}")
 }
 
@@ -407,7 +407,7 @@ pub(crate) fn absent_clause(member: &str) -> String {
 }
 
 /// The requirement clause of a `@pattern`.
-fn must_match(pattern: &str) -> String {
+pub(crate) fn must_match(pattern: &str) -> String {
     format!("Member must satisfy regular expression pattern: {pattern}")
 }
 

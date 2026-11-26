@@ -248,30 +248,14 @@ fn apply(
     input: &UpdateSubscriberInput,
     now: ::std::time::SystemTime,
 ) -> Result<Applied, UpdateSubscriberError> {
-    state.settle_lifecycles(now);
-
-    let Some(subscriber) = state.subscriber(&input.subscriber_arn) else {
-        return Err(UpdateSubscriberErrorModeled::ResourceNotFoundException(
-            crate::state::subscriber_not_found(&input.subscriber_arn),
-        )
-        .into());
-    };
-
-    // "Mutating operations on a revoked subscriber fail with
-    // InvalidStateException": a subscriber the bus owner has withdrawn takes no
-    // further change, whatever the request carries.
-    if subscriber.revoked {
-        return Err(UpdateSubscriberErrorModeled::InvalidStateException(
-            InvalidStateException {
-                message: Some(REVOKED_SUBSCRIBER_MESSAGE.to_string()),
-            },
-        )
-        .into());
-    }
-
     // The run state this request asks for, and `None` when it asks for no
     // change: "Fields omitted from the request are left unchanged", so an
     // omitted `State` is NOT the default a create takes.
+    //
+    // Decided from the REQUEST alone, like the filter reading below it, so both are
+    // answered before the subscriber the request names is resolved: a request whose own
+    // parameters are not valid is refused for them rather than for the resource it names,
+    // and a refused update changes nothing.
     let requested_state = match input.state.as_deref() {
         None => None,
         Some(value) => match crate::state::SubscriberRunState::from_wire(Some(value)) {
@@ -312,6 +296,27 @@ fn apply(
             )
             .into());
         }
+    }
+
+    state.settle_lifecycles(now);
+
+    let Some(subscriber) = state.subscriber(&input.subscriber_arn) else {
+        return Err(UpdateSubscriberErrorModeled::ResourceNotFoundException(
+            crate::state::subscriber_not_found(&input.subscriber_arn),
+        )
+        .into());
+    };
+
+    // "Mutating operations on a revoked subscriber fail with
+    // InvalidStateException": a subscriber the bus owner has withdrawn takes no
+    // further change, whatever the request carries.
+    if subscriber.revoked {
+        return Err(UpdateSubscriberErrorModeled::InvalidStateException(
+            InvalidStateException {
+                message: Some(REVOKED_SUBSCRIBER_MESSAGE.to_string()),
+            },
+        )
+        .into());
     }
 
     // A `Transformer` and a universal target are mutually exclusive, read

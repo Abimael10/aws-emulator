@@ -202,6 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
+        // A source forwards only with a `Configuration` this service can
+        // forward with: the one reading of that rule both the create and the
+        // update of an EventSource are held to, so a pattern a later update
+        // would be refused for cannot be stored by a create either.
+        //
+        // Decided from the REQUEST alone, so it is answered before the store is
+        // touched and before any resource the request names is resolved: a
+        // request whose own parameters are not valid is refused for them, and a
+        // refused create mints nothing. The same ordering as
+        // `crate::ops::update_event_source`.
+        if let Some(reason) = crate::state::event_source_configuration_fault(&input.configuration) {
+            return Err(CreateEventSourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
         let mut state = store.lock();
         state.settle_lifecycles(now);
 
@@ -228,19 +247,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let bus_arn = bus.arn.clone();
         let region = bus.region.clone();
-
-        // A source forwards only with a `Configuration` this service can
-        // forward with: the one reading of that rule both the create and the
-        // update of an EventSource are held to, so a pattern a later update
-        // would be refused for cannot be stored by a create either.
-        if let Some(reason) = crate::state::event_source_configuration_fault(&input.configuration) {
-            return Err(CreateEventSourceErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(reason),
-                },
-            )
-            .into());
-        }
 
         // A retry carrying the same ClientToken replays the EventSource that
         // token minted — identical parameters only; different ones are the

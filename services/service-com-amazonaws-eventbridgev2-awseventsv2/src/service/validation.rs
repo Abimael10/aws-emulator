@@ -40,14 +40,23 @@
 //! well-formed create that reaches its handler and mints its resource with no replay
 //! record. This door adds no requirement of its own: it restates the model's refusals in
 //! the modelled shape, and refuses nothing the model accepts.
+//!
+//! What it does decide is HOW one of those refusals is worded. A member stated with a value
+//! of zero length states no value for it at all, so it is a request parameter that is
+//! MISSING rather than one carrying a value that is not valid, and the idempotency token is
+//! the member of this service for which the two read differently to a caller: a create that
+//! OMITS it is served, so a create that states it empty has to say which of the two it was
+//! refused for ([`states_no_token`], [`member_required`]). Every other value the model's
+//! constraints exclude keeps the constraint envelope.
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints::Violation;
+use aws_smithy_schema_server::constraints::{path, Violation};
 use service_common::unstated_members::{stating_every_absence, unstated_members, worth_walking};
-use service_common::validation::{refusing_violations, MAX_VIOLATIONS};
+use service_common::validation::{refusing_violations, submitted_leaves, MAX_VIOLATIONS};
 use service_common::validation_message::aws_validation_refusal;
 use smithy_server_runtime::{
-    BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, ServerHttpProtocol, Service,
+    BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
+    ServerHttpProtocol, Service,
 };
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -65,6 +74,25 @@ pub const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 /// The status such a refusal is served on: `InvalidInputException`'s own
 /// `@httpError(400)`.
 pub const INVALID_INPUT_STATUS: u16 = 400;
+
+/// The member each create of this service models as its idempotency token.
+///
+/// Source: `smithy_query(query="operation",
+/// operation="CreateEventBus,CreateEventSource,CreateSubscriber")` — every create's input
+/// declares `ClientToken`, `@idempotencyToken`, with `@length` 1..64 and `@pattern`
+/// `^[\u0021-\u007E]+$`, so a value of zero length is no token the member could carry.
+/// Which operations declare it is read off the operation's own input schema
+/// ([`states_no_token`]); this names the member the model names and nothing else.
+const IDEMPOTENCY_TOKEN_MEMBER: &str = "ClientToken";
+
+/// The whole `Message` of a refusal of a request parameter that is MISSING rather than
+/// carrying a value that is not valid.
+///
+/// FIXED text of that error class, with the member name — which the MODEL supplies — as its
+/// one variable part: nothing of the request and nothing of this service's state reaches it.
+fn member_required(member: &str) -> String {
+    format!("{member} is required")
+}
 
 /// This service's `InvalidInputException` carrying `message`. The shape models
 /// `Message` alone.
@@ -99,6 +127,39 @@ fn stated<Op: Operation>(walked: Vec<Violation>, unapplied: Vec<Violation>) -> V
     let mut violations = unapplied_patterns::in_member_order(Op::INPUT_SCHEMA, violations);
     violations.truncate(MAX_VIOLATIONS);
     violations
+}
+
+/// The idempotency-token member `Op`'s input declares, when this request STATES it and
+/// states an EMPTY value in it — a value of zero length.
+///
+/// A member stated empty states no value for it, so the parameter is MISSING rather than
+/// carrying one that is not valid, and that is the refusal this service words for it
+/// ([`member_required`]). The two neighbouring readings are deliberately left alone: a
+/// request that OMITS the member states nothing about it and is SERVED, because the model
+/// leaves it optional and an SDK fills it in; and a value that DOES carry characters the
+/// member's grammar excludes is a value that is not valid, stated in the constraint envelope
+/// every other bad value is stated in.
+///
+/// Read off `Op`'s own input schema, so an operation whose input declares no such member
+/// pays for nothing: the request is not read again for a clause that cannot arise in it.
+fn states_no_token<Op: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &WireRequest,
+) -> Option<&'static str> {
+    let declared = Op::INPUT_SCHEMA.members().iter().find_map(|member| {
+        member
+            .member_name()
+            .filter(|name| *name == IDEMPOTENCY_TOKEN_MEMBER)
+    })?;
+    // The dotted path the validating walk reports a violation on that member at, spelled by
+    // the same speller, so the leaf read here and the leaf a clause names are one text.
+    let at = path::member(declared);
+    let mut deserializer = protocol.deserialize_input(req, Op::INPUT_SCHEMA).ok()?;
+    let input = <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
+    submitted_leaves(&input, Op::INPUT_SCHEMA)
+        .into_iter()
+        .any(|(leaf, value)| leaf == at && value.is_empty())
+        .then_some(IDEMPOTENCY_TOKEN_MEMBER)
 }
 
 /// The whole `Message` of a refusal of a union-typed member the request did not set exactly
@@ -159,7 +220,15 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
         protocol: &dyn ServerHttpProtocol,
         req: &WireRequest,
     ) -> Option<InvalidInputException> {
-        // The model's own constraints first, since they answer most refusals on their own.
+        // The idempotency token the request STATES but states no value in: a parameter that
+        // is missing rather than one whose value is not valid, so it is worded as the
+        // missing parameter it is ([`states_no_token`]) and decided here — from the request
+        // alone, before any state this service holds is looked at, so a create refused for
+        // it mints nothing.
+        if let Some(member) = states_no_token::<Op>(protocol, req) {
+            return Some(invalid_input(member_required(member)));
+        }
+        // The model's own constraints next, since they answer most refusals on their own.
         let violations = refusing_violations::<Op>(protocol, req);
         // Beside them, the violations of the SAME model rules that walk cannot report,
         // because the engine behind `@pattern` could not compile the expression and so left
