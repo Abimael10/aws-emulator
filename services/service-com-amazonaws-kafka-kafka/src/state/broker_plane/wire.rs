@@ -838,14 +838,15 @@ impl Broker {
                 let request = OffsetFetchRequest::decode(&mut body, api_version).ok()?;
                 // A group nobody has joined has committed nothing, which is what the
                 // protocol's "no committed offset" answers — reading it registers no
-                // group.
+                // group. A refusal is reported in BOTH fields this response can carry one
+                // in, because which of them a client reads is the negotiated version's
+                // ([`groups::refused_offsets`]).
                 let response = match self.group_allowed(
                     session,
                     &request.group_id.0.to_string(),
                     iam_access::ACTION_DESCRIBE_GROUP,
                 ) {
-                    false => ::kafka_protocol::messages::OffsetFetchResponse::default()
-                        .with_error_code(group_authorization_failed()),
+                    false => groups::refused_offsets(&request, group_authorization_failed()),
                     true => self
                         .group(&request.group_id.0, false, |group| {
                             group.fetch_offsets(&request)

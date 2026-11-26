@@ -98,6 +98,28 @@ pub const MAX_REBALANCE_BARRIER: Duration = Duration::from_secs(15);
 /// partition the request named, each with no committed offset — which is what a group
 /// nobody has joined has committed, and what lets the read register no group.
 pub fn uncommitted_offsets(request: &OffsetFetchRequest) -> OffsetFetchResponse {
+    offsets_reported_with(request, NO_ERROR)
+}
+
+/// The `OffsetFetch` answer for a request the connection may not make: the refusal `code`,
+/// reported BOTH on every partition the request named and at the top level.
+///
+/// Which of the two a client READS is the negotiated version's: Apache Kafka's
+/// `OffsetFetchResponse` carries a top-level error code from version 2 on, and before that
+/// a refusal of the whole request is reported on each partition — so stating it in both
+/// places is what makes the refusal reach a client of either, instead of a client on an
+/// older version reading an answer that looks like a group with nothing committed.
+pub fn refused_offsets(request: &OffsetFetchRequest, code: i16) -> OffsetFetchResponse {
+    offsets_reported_with(request, code).with_error_code(code)
+}
+
+/// The error code a partition that is answered rather than refused carries.
+const NO_ERROR: i16 = 0;
+
+/// Every partition the request named, each reporting no committed offset and the error
+/// code `code` — the shape both answers above are built from, so a refusal names exactly
+/// the partitions a read of the same request would name.
+fn offsets_reported_with(request: &OffsetFetchRequest, code: i16) -> OffsetFetchResponse {
     let topics = request
         .topics
         .as_ref()
@@ -116,6 +138,7 @@ pub fn uncommitted_offsets(request: &OffsetFetchRequest) -> OffsetFetchResponse 
                                     OffsetFetchResponsePartition::default()
                                         .with_partition_index(*partition)
                                         .with_committed_offset(NO_COMMITTED_OFFSET)
+                                        .with_error_code(code)
                                 })
                                 .collect(),
                         )
