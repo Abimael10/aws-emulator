@@ -108,14 +108,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use ::std::sync::LazyLock;
-
-use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
-use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
-use ::aws_smithy_schema_server::constraints::{
-    envelope, validate, LengthTrait, PatternTrait, Violation,
-};
 use ::aws_smithy_types::Document;
+
+// Both update operations read the string their `AttributeValue` carries through the
+// service's ONE text reader, in `crate::state`, so the modelled constraints of the member
+// being written have one refusal for a group and a user alike.
+use crate::state::attribute_text_value;
+use crate::state::AttributeTextShape;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -159,93 +158,11 @@ impl From<UpdateGroupErrorModeled> for UpdateGroupError {
     }
 }
 
-/// This service's Smithy namespace, for the shadow member schemas below.
-const NAMESPACE: &str = "com.amazonaws.identitystore";
-
-/// The `@pattern` the group's two text attributes carry: `DisplayName` (targeting
-/// `GroupDisplayName`) and `Description` (targeting `SensitiveStringType`) declare the
-/// SAME character class (`smithy_query(query="shape",shape="Group")`) — letters, marks,
-/// symbols, numbers, punctuation, tab, newline, carriage return, and the three space
-/// characters the model spells out literally: U+0020, U+00A0 (no-break space) and
-/// U+3000 (ideographic space), which are the only space characters the model's own text
-/// contains. They are written here as `\x{A0}` / `\x{3000}` so the class is the
-/// model's exactly while this source stays ASCII.
-const GROUP_TEXT_PATTERN: &str = r"^[\p{L}\p{M}\p{S}\p{N}\p{P}\t\n\r \x{A0}\x{3000}]+$";
-
-/// The `@length` both group text attributes carry: 1..1024 characters.
-const GROUP_TEXT_LENGTH: (Option<i64>, Option<i64>) = (Some(1), Some(1024));
-
-/// What a `@sensitive` attribute's offending value is reported as.
-///
-/// Both group text attributes are `@sensitive` in the model, so a refusal names the
-/// attribute and the constraint it failed but never echoes what was sent — which is
-/// what the framework's own clause would otherwise interpolate.
-const REDACTED: &str = "***";
-
-/// `GroupDisplayName` / `SensitiveStringType`: `@length(1..1024)` plus
-/// [`GROUP_TEXT_PATTERN`].
-static GROUP_TEXT_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
-    let mut traits = TraitMap::new();
-    traits.insert(Box::new(LengthTrait::new(
-        GROUP_TEXT_LENGTH.0,
-        GROUP_TEXT_LENGTH.1,
-    )));
-    traits.insert(Box::new(PatternTrait::new(GROUP_TEXT_PATTERN)));
-    traits
-});
-
-/// The `DisplayName` attribute, as the constraint walk reads it.
-static M_DISPLAY_NAME: Schema = Schema::new_member(
-    ShapeId::from_static(
-        "com.amazonaws.identitystore#UpdatedGroupAttributes$DisplayName",
-        NAMESPACE,
-        "DisplayName",
-    ),
-    ShapeType::String,
-    "DisplayName",
-    0,
-)
-.with_traits(&GROUP_TEXT_TRAITS);
-
-/// The `Description` attribute, as the constraint walk reads it.
-static M_DESCRIPTION: Schema = Schema::new_member(
-    ShapeId::from_static(
-        "com.amazonaws.identitystore#UpdatedGroupAttributes$Description",
-        NAMESPACE,
-        "Description",
-    ),
-    ShapeType::String,
-    "Description",
-    1,
-)
-.with_traits(&GROUP_TEXT_TRAITS);
-
-/// The root of the shadow structure the constraint walk is driven over. Its member
-/// list is empty on purpose: the walk visits what [`AttributeText`] WRITES, and a root
-/// struct schema carries no member name so it contributes no path segment.
-static UPDATED_GROUP_ATTRIBUTES_SCHEMA: Schema = Schema::new_struct(
-    ShapeId::from_static(
-        "com.amazonaws.identitystore#UpdatedGroupAttributes",
-        NAMESPACE,
-        "UpdatedGroupAttributes",
-    ),
-    ShapeType::Structure,
-    &[],
-);
-
-/// One attribute value handed to the framework's constraint walk, written the way a
-/// codec writes a string member so the walk builds the same path and runs the same
-/// checks the request boundary does for a modelled string.
-struct AttributeText<'a> {
-    schema: &'static Schema,
-    text: &'a str,
-}
-
-impl SerializableStruct for AttributeText<'_> {
-    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        s.write_string(self.schema, self.text)
-    }
-}
+/// The modelled string shape both of the group's text attributes target: `DisplayName`
+/// targets `GroupDisplayName` and `Description` targets `SensitiveStringType`
+/// (`smithy_query(query="shape",shape="Group")`), and the two shapes declare the SAME
+/// `@length` and the same `@pattern`, so one constraint set covers both.
+const GROUP_TEXT: AttributeTextShape = AttributeTextShape::SensitiveText;
 
 /// A group attribute an `AttributeOperation` can add, replace or remove.
 ///
@@ -272,15 +189,6 @@ impl GroupAttribute {
         match self {
             Self::DisplayName => "displayName",
             Self::Description => "description",
-        }
-    }
-
-    /// The member schema whose modelled constraints this attribute's value must
-    /// satisfy.
-    fn member_schema(self) -> &'static Schema {
-        match self {
-            Self::DisplayName => &M_DISPLAY_NAME,
-            Self::Description => &M_DESCRIPTION,
         }
     }
 
@@ -313,53 +221,31 @@ fn invalid(message: String) -> UpdateGroupErrorModeled {
 /// The value `operation` sets `attribute` to: `None` when the operation carries no
 /// value, which REMOVES the attribute.
 ///
-/// `AttributeValue` is a `Document`, so no modelled constraint was enforced at the
-/// request boundary: the type the attribute is modelled with, and its `@length` and
-/// `@pattern`, are checked here instead, through the framework's OWN constraint walk
-/// over the member schemas above, so the clause, the bound and the violation cap are
-/// the framework's rather than this file's.
+/// `AttributeValue` is a `Document`, so no modelled constraint was enforced at the request
+/// boundary: the type the attribute is modelled with, and its `@length` and `@pattern`,
+/// are checked by the shared reader instead — the ONE place either update operation decodes
+/// a string attribute, so the clause, the bound and the violation cap are the ones a create
+/// of that member is refused with.
+///
+/// "These operations might add, replace, or remove an attribute": an operation that carries
+/// no value is the remove, and an explicit JSON null is the same request written the other
+/// way, which is what the reader answers `None` for.
 fn attribute_value(
     attribute: GroupAttribute,
     value: Option<&Document>,
 ) -> Result<Option<String>, UpdateGroupErrorModeled> {
-    let text = match value {
-        // "These operations might add, replace, or remove an attribute": an operation
-        // that carries no value is the remove. An explicit JSON null is the same
-        // request written the other way.
-        None | Some(Document::Null) => return Ok(None),
-        Some(Document::String(text)) => text,
-        Some(_) => {
-            return Err(invalid(format!(
-                "AttributeValue for the group attribute {} must be a string",
-                attribute.path()
-            )))
-        }
-    };
-    let violations: Vec<Violation> = validate(
-        &AttributeText {
-            schema: attribute.member_schema(),
-            text,
-        },
-        &UPDATED_GROUP_ATTRIBUTES_SCHEMA,
-    )
-    .into_iter()
-    .map(|violation| Violation {
-        value: Some(REDACTED.to_string()),
-        ..violation
-    })
-    .collect();
-    if let Some(message) = envelope(&violations) {
-        return Err(invalid(message));
-    }
+    let text = attribute_text_value(value, attribute.path(), GROUP_TEXT).map_err(invalid)?;
     // `DisplayName` NAMES the group, so an update that would give it a name this API
     // reserves is refused exactly as a create carrying one is, and the group keeps the
     // name it had.
     if attribute == GroupAttribute::DisplayName
-        && crate::state::is_reserved_identity_name(text)
+        && text
+            .as_deref()
+            .is_some_and(crate::state::is_reserved_identity_name)
     {
         return Err(invalid(crate::state::reserved_identity_name_message()));
     }
-    Ok(Some(text.clone()))
+    Ok(text)
 }
 
 /// Every change `operations` asks for, in request order, with each one's path resolved

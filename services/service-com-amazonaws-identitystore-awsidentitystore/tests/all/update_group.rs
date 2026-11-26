@@ -20,7 +20,9 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
+use crate::harness::{
+    emulator, error_message, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE,
+};
 use crate::identity_store_lifecycle::assert_resource_arn;
 
 /// The upper bound of the `@length` both group text attributes carry: `DisplayName`
@@ -762,4 +764,112 @@ async fn the_group_an_update_names_must_exist_in_the_store_it_names() {
         Some("the group's id in upper case"),
         "after the refusals",
     );
+}
+
+/// One member, one value set: a value `CreateGroup` refuses for one of its string members
+/// is refused by the `UpdateGroup` that writes that same member, and with the SAME clause.
+/// The length bound and the character class belong to the member, not to the operation that
+/// writes it, so the untyped `AttributeValue` an update carries is checked against exactly
+/// the traits a create's modelled member carries.
+///
+/// The rows differ along which attribute is written and which constraint of its shape the
+/// value fails: a control character the class excludes, a space character it does not list,
+/// the length maximum and the length minimum.
+#[tokio::test]
+async fn an_update_refuses_a_value_the_create_of_the_same_member_refuses() {
+    let router = emulator();
+    // U+0007 BELL is a control character the modelled class excludes; U+2000 EN QUAD is a
+    // space character, but not one of the three the class lists
+    // (`smithy_query(query="shape",shape="GroupDisplayName,SensitiveStringType")`).
+    let bell = format!("bell{}value", '\u{7}');
+    let en_quad = format!("en{}quad", '\u{2000}');
+
+    // (case, the CreateGroup member, the AttributePath an UpdateGroup names it by, value)
+    let rows: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "a description carrying a control character",
+            "Description",
+            "description",
+            bell.clone(),
+        ),
+        (
+            "a display name carrying a control character",
+            "DisplayName",
+            "displayName",
+            bell,
+        ),
+        (
+            "a description carrying a space character the class omits",
+            "Description",
+            "description",
+            en_quad.clone(),
+        ),
+        (
+            "a display name carrying a space character the class omits",
+            "DisplayName",
+            "displayName",
+            en_quad,
+        ),
+        (
+            "a description one past the modelled maximum length",
+            "Description",
+            "description",
+            "d".repeat(GROUP_TEXT_MAX_LEN + 1),
+        ),
+        (
+            "a description below the modelled minimum length",
+            "Description",
+            "description",
+            String::new(),
+        ),
+    ];
+
+    for (index, (case, member, path, value)) in rows.iter().enumerate() {
+        let display_name = format!("parity {index}");
+        let group = create(&router, STORE, &display_name, case).await;
+
+        // The create side: the same value at the same member, refused at the request
+        // boundary because a create carries it in a modelled string member.
+        let mut request = json!({
+            "IdentityStoreId": STORE,
+            "DisplayName": format!("parity create {index}"),
+        });
+        request[*member] = json!(value);
+        let created =
+            refused(&router, "CreateGroup", request, 400, "ValidationException", case).await;
+
+        let updated = refused(
+            &router,
+            "UpdateGroup",
+            json!({
+                "IdentityStoreId": STORE,
+                "GroupId": group.group_id,
+                "Operations": [{ "AttributePath": path, "AttributeValue": value }],
+            }),
+            400,
+            "ValidationException",
+            case,
+        )
+        .await;
+
+        let (on_create, on_update) = (error_message(&created), error_message(&updated));
+        assert_eq!(
+            on_update, on_create,
+            "case {case:?}: expected the update to be refused as the create is, \
+             with {on_create:?}, got {on_update:?}"
+        );
+        // Both members are `@sensitive`, so neither refusal echoes what was sent.
+        assert!(
+            value.is_empty() || !on_update.contains(value.as_str()),
+            "case {case:?}: expected no fragment of the rejected value in {on_update:?}"
+        );
+        // And nothing was applied: the group still holds what it was created with.
+        let reported = describe(&router, STORE, &group.group_id, case).await;
+        assert_attributes(
+            &reported,
+            Some(&display_name),
+            Some(CREATED_DESCRIPTION),
+            case,
+        );
+    }
 }

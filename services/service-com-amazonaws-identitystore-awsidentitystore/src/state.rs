@@ -14,7 +14,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ::aws_smithy_types::Document;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 use crate::ops::types::{
@@ -1383,55 +1382,11 @@ pub fn unsupported_attribute_path_message(path: &str) -> String {
     format!("Updates for AttributePath: {path} is not supported")
 }
 
-/// Which JSON type a document carries, for a refusal that says what arrived.
-pub fn attribute_value_kind(value: &Document) -> &'static str {
-    match value {
-        Document::Object(_) => "an object",
-        Document::Array(_) => "an array",
-        Document::Number(_) => "a number",
-        Document::String(_) => "a string",
-        Document::Bool(_) => "a boolean",
-        Document::Null => "null",
-    }
-}
-
-/// The new value of a STRING attribute an `AttributeOperation` sets: `None` when the
-/// operation REMOVES it (an absent `AttributeValue` or an explicit JSON `null`),
-/// otherwise the text it carries.
-///
-/// `max_len` is the modelled length of the member being set, and the model gives every
-/// one of them a minimum of 1, so an empty string is refused rather than quietly meaning
-/// "remove" — an operation that removes carries no value at all.
-///
-/// This is the reader `UpdateUser`'s decoders read every string attribute through, so
-/// one modelled constraint has one refusal there. `UpdateGroup` reads its two string
-/// attributes through the FRAMEWORK's own constraint walk over their member schemas
-/// instead (`crate::ops::update_group::attribute_value`), so its clause, bound and
-/// violation cap are the framework's; it shares the removal rule and the
-/// unsupported-path message with this module, not the length check.
-pub fn attribute_text_value(
-    value: Option<&Document>,
-    path: &str,
-    max_len: usize,
-) -> Result<Option<String>, String> {
-    match value {
-        None | Some(Document::Null) => Ok(None),
-        Some(Document::String(text)) => {
-            let length = text.chars().count();
-            if !(1..=max_len).contains(&length) {
-                return Err(format!(
-                    "the AttributeValue for {path} is {length} characters long, \
-                     outside the 1..{max_len} the model allows"
-                ));
-            }
-            Ok(Some(text.clone()))
-        }
-        Some(other) => Err(format!(
-            "the AttributeValue for {path} must be a string, got {}",
-            attribute_value_kind(other)
-        )),
-    }
-}
+/// How the VALUE an `AttributeOperation` carries is read and constraint-checked: a
+/// submodule because the modelled constraints of the member being written are a concern of
+/// their own, shared by both update operations.
+mod attribute_text;
+pub use attribute_text::*;
 
 /// The cursor for a page that starts at the resource `resource_id` names.
 ///

@@ -25,7 +25,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
+use crate::harness::{emulator, error_message, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 
 /// The emulator's account id, as it appears in an identity store's ARN — the other
 /// form the modelled `IdentityStoreId` pattern admits.
@@ -37,6 +37,24 @@ const TEXT_MAX_LEN: usize = 1024;
 
 /// The longest a `UserName` may be (modelled length 1..128).
 const USER_NAME_MAX_LEN: usize = 128;
+
+// The characters the two modelled string classes divide on, from the model's own patterns
+// (`smithy_query(query="shape",shape="UserName,SensitiveStringType")`): `UserName` admits
+// letters, marks, symbols, numbers and punctuation and NOTHING else, while the sensitive
+// text shape every other string attribute targets admits those plus tab, newline, carriage
+// return and exactly three space characters — U+0020, U+00A0 and U+3000.
+
+/// A control character neither class admits.
+const BELL: char = '\u{7}';
+
+/// U+2000 EN QUAD: a space character, but not one of the three either class lists.
+const EN_QUAD: char = '\u{2000}';
+
+/// U+00A0 NO-BREAK SPACE: admitted by the sensitive text class, not by `UserName`.
+const NO_BREAK_SPACE: char = '\u{a0}';
+
+/// U+3000 IDEOGRAPHIC SPACE: admitted by the sensitive text class, not by `UserName`.
+const IDEOGRAPHIC_SPACE: char = '\u{3000}';
 
 /// Every attribute of a `User` an `UpdateUser` can set, as `DescribeUser` names it in
 /// its response (from the modelled `User` shape). A case that updates one of these
@@ -1193,6 +1211,325 @@ async fn an_element_reports_only_the_sub_attributes_it_carries() {
             listed.get(*member).unwrap_or(&Value::Null),
             replacement,
             "case {case:?}: expected ListUsers to report {member} as {replacement}, got {listed}"
+        );
+    }
+}
+
+/// A string value an update writes has to satisfy every constraint the member it writes
+/// declares — the `@pattern` of that member's shape as much as its `@length` — because an
+/// `AttributeValue` is an untyped `document` the request boundary checks nothing about. A
+/// value the member's own character class excludes is refused with `ValidationException`
+/// and the stored user is left exactly as it was.
+///
+/// The rows differ along what that rule generalises over: which attribute is written (the
+/// user's name, a plain text attribute, a sub-attribute, a member inside an object value,
+/// a member inside a list element), which of the two modelled string shapes that member
+/// targets, and which character puts the value outside that shape's class — a control
+/// character neither class admits, a space character neither class lists, and the ordinary
+/// whitespace only the sensitive text class admits.
+#[tokio::test]
+async fn a_value_the_members_modelled_pattern_excludes_is_refused() {
+    let router = emulator();
+    let case = "pattern-checked attribute values";
+    let user = create_user(&router, json!({ "UserName": user_name(case, 0) }), case).await;
+    update(&router, &user, set("displayName", json!("Ada Lovelace")), case).await;
+    let before = describe(&router, &user, case).await;
+
+    // (case, the Operations list)
+    let rows: Vec<(&str, Value)> = vec![
+        // `UserName`'s class admits no whitespace at all, so each of the space characters
+        // the sensitive text class does admit is outside it.
+        (
+            "a user name carrying a space",
+            set("userName", json!("ada lovelace")),
+        ),
+        (
+            "a user name carrying a no-break space",
+            set("userName", json!(format!("ada{NO_BREAK_SPACE}lovelace"))),
+        ),
+        (
+            "a user name carrying an ideographic space",
+            set("userName", json!(format!("ada{IDEOGRAPHIC_SPACE}lovelace"))),
+        ),
+        (
+            "a user name carrying a tab",
+            set("userName", json!("ada\tlovelace")),
+        ),
+        (
+            "a user name carrying a control character",
+            set("userName", json!(format!("ada{BELL}lovelace"))),
+        ),
+        // The sensitive text class admits those spaces and still excludes control
+        // characters and every other space character.
+        (
+            "a display name carrying a control character",
+            set("displayName", json!(format!("Ada{BELL}Lovelace"))),
+        ),
+        (
+            "a title carrying a space character the class omits",
+            set("title", json!(format!("Countess{EN_QUAD}of Lovelace"))),
+        ),
+        (
+            "a nick name carrying a control character",
+            set("nickName", json!(format!("{BELL}Ada"))),
+        ),
+        (
+            "a birthdate carrying a space character the class omits",
+            set("birthdate", json!(format!("1815{EN_QUAD}12-10"))),
+        ),
+        // A sub-attribute of the name, written through its own path and through the whole
+        // object, is the same member either way.
+        (
+            "a name sub-attribute carrying a control character",
+            set("name.givenName", json!(format!("Ada{BELL}"))),
+        ),
+        (
+            "a name object member carrying a control character",
+            set("name", json!({ "GivenName": format!("Ada{BELL}"), "FamilyName": "Lovelace" })),
+        ),
+        (
+            "a name object member carrying a space character the class omits",
+            set("name", json!({ "Formatted": format!("Ada{EN_QUAD}Lovelace") })),
+        ),
+        // The members inside a list element target the same sensitive text shape.
+        (
+            "an email value carrying a control character",
+            set("emails", json!([{ "Value": format!("ada{BELL}@example.invalid") }])),
+        ),
+        (
+            "an email type carrying a space character the class omits",
+            set(
+                "emails",
+                json!([{ "Value": "ada@example.invalid", "Type": format!("w{EN_QUAD}rk") }]),
+            ),
+        ),
+        (
+            "a phone number value carrying a control character",
+            set("phoneNumbers", json!([{ "Value": format!("+1 (555) 0100{BELL}") }])),
+        ),
+        (
+            "an address locality carrying a control character",
+            set("addresses", json!([{ "Locality": format!("Lond{BELL}n") }])),
+        ),
+        (
+            "a role type carrying a space character the class omits",
+            set("roles", json!([{ "Value": "Researcher", "Type": format!("w{EN_QUAD}rk") }])),
+        ),
+        (
+            "a photo value carrying a control character",
+            set("photos", json!([{ "Value": format!("https://example.invalid/{BELL}.png") }])),
+        ),
+        (
+            "a second photo whose value carries a control character",
+            set(
+                "photos",
+                json!([
+                    { "Value": "https://example.invalid/1.png" },
+                    { "Value": format!("https://example.invalid/2{BELL}.png") },
+                ]),
+            ),
+        ),
+        // An operation this service can apply, followed by one it cannot: nothing is
+        // written.
+        (
+            "a valid operation followed by one outside the class",
+            json!([
+                { "AttributePath": "nickName", "AttributeValue": "Ada" },
+                { "AttributePath": "userName", "AttributeValue": "ada lovelace" },
+            ]),
+        ),
+    ];
+
+    for (row, operations) in &rows {
+        let refusal = refused(
+            &router,
+            "UpdateUser",
+            json!({ "IdentityStoreId": STORE, "UserId": user, "Operations": operations }),
+            400,
+            "ValidationException",
+            row,
+        )
+        .await;
+        let message = error_message(&refusal);
+        assert!(
+            message.contains("failed to satisfy constraint"),
+            "case {row:?}: expected a constraint clause, got {message:?}"
+        );
+        let after = describe(&router, &user, row).await;
+        assert_eq!(
+            after, before,
+            "case {row:?}: expected a refused update to leave the user unchanged"
+        );
+    }
+}
+
+/// The same classes from the other side: the check applied is the MODEL's class and not a
+/// narrower one, so every character class the member's pattern names is stored and reported
+/// back unchanged.
+///
+/// The rows differ along which attribute is written, which shape it targets, and which part
+/// of that shape's class the value exercises: the five classes `UserName` names, and the
+/// whitespace the sensitive text shape adds — tab, newline, carriage return and all three
+/// space characters it lists.
+#[tokio::test]
+async fn every_character_the_members_modelled_pattern_admits_is_stored() {
+    let router = emulator();
+    // A `UserName` drawn from each class the modelled pattern names: a letter (`\p{L}`), a
+    // combining mark (`\p{M}`), a currency symbol (`\p{S}`), a digit (`\p{N}`) and
+    // punctuation (`\p{P}`).
+    let classes = "Ada\u{301}$1-.".to_string();
+    // Every whitespace character the sensitive text class lists, at once.
+    let spaces = format!("Ada\tB\nC\rD E{NO_BREAK_SPACE}F{IDEOGRAPHIC_SPACE}G");
+
+    // (case, AttributePath, AttributeValue, the DescribeUser member it lands in, what that
+    // member must then carry)
+    let rows: Vec<(&str, &str, Value, &str, Value)> = vec![
+        (
+            "a user name of every class its pattern names",
+            "userName",
+            json!(classes),
+            "UserName",
+            json!(classes),
+        ),
+        (
+            "a display name carrying every space character its class lists",
+            "displayName",
+            json!(spaces),
+            "DisplayName",
+            json!(spaces),
+        ),
+        (
+            "a title carrying the two spaces the model spells out",
+            "title",
+            json!(format!("Countess{NO_BREAK_SPACE}of{IDEOGRAPHIC_SPACE}Lovelace")),
+            "Title",
+            json!(format!("Countess{NO_BREAK_SPACE}of{IDEOGRAPHIC_SPACE}Lovelace")),
+        ),
+        (
+            "a name sub-attribute carrying a no-break space",
+            "name.formatted",
+            json!(format!("Ada{NO_BREAK_SPACE}Lovelace")),
+            "Name",
+            json!({ "Formatted": format!("Ada{NO_BREAK_SPACE}Lovelace") }),
+        ),
+        (
+            "an email entry whose members carry a tab and a newline",
+            "emails",
+            json!([{ "Value": "ada@example.invalid", "Type": "work\tand\nhome" }]),
+            "Emails",
+            json!([{ "Value": "ada@example.invalid", "Type": "work\tand\nhome" }]),
+        ),
+    ];
+
+    for (index, (case, path, value, member, expected)) in rows.iter().enumerate() {
+        let created_name = user_name(case, index);
+        let user = create_user(&router, json!({ "UserName": created_name }), case).await;
+        update(&router, &user, set(path, value.clone()), case).await;
+        let described = describe(&router, &user, case).await;
+        assert_member(&described, member, expected, case);
+    }
+}
+
+/// One member, one value set: a value `CreateUser` refuses for one of its string members is
+/// refused by the `UpdateUser` that writes that same member, and with the SAME clause — the
+/// length bound and the character class belong to the member, not to the operation that
+/// writes it.
+///
+/// The rows differ along which member is written, which of the two modelled shapes it
+/// targets, and which constraint of that shape the value fails: the character class, the
+/// length maximum and the length minimum.
+#[tokio::test]
+async fn an_update_refuses_a_value_the_create_of_the_same_member_refuses() {
+    let router = emulator();
+    // (case, the CreateUser member, the AttributePath an UpdateUser names it by, value)
+    let rows: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "a user name carrying a space",
+            "UserName",
+            "userName",
+            "ada lovelace".to_string(),
+        ),
+        (
+            "a user name carrying a control character",
+            "UserName",
+            "userName",
+            format!("ada{BELL}"),
+        ),
+        (
+            "a display name carrying a control character",
+            "DisplayName",
+            "displayName",
+            format!("Ada{BELL}Lovelace"),
+        ),
+        (
+            "a title carrying a space character the class omits",
+            "Title",
+            "title",
+            format!("Countess{EN_QUAD}"),
+        ),
+        (
+            "a user name one past the modelled maximum length",
+            "UserName",
+            "userName",
+            text('u', USER_NAME_MAX_LEN + 1),
+        ),
+        (
+            "a display name one past the modelled maximum length",
+            "DisplayName",
+            "displayName",
+            text('a', TEXT_MAX_LEN + 1),
+        ),
+        (
+            "a display name below the modelled minimum length",
+            "DisplayName",
+            "displayName",
+            String::new(),
+        ),
+    ];
+
+    for (index, (case, member, path, value)) in rows.iter().enumerate() {
+        let user = create_user(&router, json!({ "UserName": user_name(case, index) }), case).await;
+        let before = describe(&router, &user, case).await;
+
+        // The create side: the same value at the same member, refused at the request
+        // boundary because a create carries it in a modelled string member.
+        let mut create = json!({
+            "IdentityStoreId": STORE,
+            "UserName": user_name(case, index + rows.len()),
+        });
+        create[*member] = json!(value);
+        let created = refused(&router, "CreateUser", create, 400, "ValidationException", case).await;
+
+        let updated = refused(
+            &router,
+            "UpdateUser",
+            json!({
+                "IdentityStoreId": STORE,
+                "UserId": user,
+                "Operations": set(path, json!(value)),
+            }),
+            400,
+            "ValidationException",
+            case,
+        )
+        .await;
+
+        let (on_create, on_update) = (error_message(&created), error_message(&updated));
+        assert_eq!(
+            on_update, on_create,
+            "case {case:?}: expected the update to be refused as the create is, \
+             with {on_create:?}, got {on_update:?}"
+        );
+        // Every one of these members is `@sensitive`, so neither refusal echoes what was
+        // sent.
+        assert!(
+            value.is_empty() || !on_update.contains(value.as_str()),
+            "case {case:?}: expected no fragment of the rejected value in {on_update:?}"
+        );
+        let after = describe(&router, &user, case).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused update to leave the user unchanged"
         );
     }
 }

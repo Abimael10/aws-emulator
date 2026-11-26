@@ -30,8 +30,11 @@
 //! case (SCIM attribute names are case-insensitive), so `displayName`, `DisplayName`
 //! and `displayname` all name one attribute. A path that names no attribute of a user,
 //! or one the service mints rather than the caller (`userId`, `userArn`, `revision`,
-//! the timestamps), is refused with the modelled `ValidationException`, as is a value
-//! of the wrong JSON type or one outside the length the model gives that member.
+//! the timestamps), is refused with the modelled `ValidationException`, as is a value of
+//! the wrong JSON type or one the modelled shape of the member being written does not
+//! admit — its `@length` and its `@pattern` are applied here, because an `AttributeValue`
+//! is an untyped document the request boundary checks nothing about, so a value a create
+//! of that member refuses an update of it refuses too.
 //!
 //! Nothing is written until EVERY operation has been decoded, so a request refused
 //! half-way leaves the stored user exactly as it was.
@@ -109,10 +112,12 @@
 use super::types::*;
 
 // Every string attribute is read through the service's ONE text reader, in
-// `crate::state`, so one modelled constraint has one refusal; `optional_text` is the
-// name the decoders below call it by.
+// `crate::state`, so the modelled constraints of the member being written — its type, its
+// `@length` and its `@pattern` — have one refusal; `optional_text` is the name the
+// decoders below call it by.
 use crate::state::attribute_text_value as optional_text;
 use crate::state::attribute_value_kind as kind;
+use crate::state::AttributeTextShape;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -289,13 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The longest a user's `SensitiveStringType` attribute may be: every string attribute
-/// of a `User` but `UserName` targets that shape, whose modelled length is 1..1024
-/// (`smithy_query(query="shape",shape="User")`).
-const TEXT_MAX_LEN: usize = 1024;
+/// The modelled string shape every string attribute of a `User` but `UserName` targets:
+/// `SensitiveStringType`, whose `@length` is 1..1024 and whose `@pattern` admits the three
+/// space characters the model lists (`smithy_query(query="shape",shape="User")`).
+const TEXT: AttributeTextShape = AttributeTextShape::SensitiveText;
 
-/// The longest a `UserName` may be: the modelled `UserName` length is 1..128.
-const USER_NAME_MAX_LEN: usize = 128;
+/// The modelled string shape `User$UserName` targets: `UserName`, whose `@length` is 1..128
+/// and whose `@pattern` admits no whitespace at all.
+const USER_NAME: AttributeTextShape = AttributeTextShape::UserName;
 
 /// The most entries `User$Emails`, `User$Addresses`, `User$PhoneNumbers` and
 /// `User$Roles` admit: each of those members is modelled `length 1..1`.
@@ -365,7 +371,7 @@ fn apply(
     let key = path.to_ascii_lowercase();
     match key.as_str() {
         "username" => {
-            let user_name = optional_text(value, path, USER_NAME_MAX_LEN)?;
+            let user_name = optional_text(value, path, USER_NAME)?;
             // `UserName` NAMES the user, so an update that would give it a name this API
             // reserves is refused exactly as a create carrying one is, and the user keeps
             // the name it had.
@@ -377,16 +383,16 @@ fn apply(
             }
             user.user_name = user_name;
         }
-        "displayname" => user.display_name = optional_text(value, path, TEXT_MAX_LEN)?,
-        "nickname" => user.nick_name = optional_text(value, path, TEXT_MAX_LEN)?,
-        "profileurl" => user.profile_url = optional_text(value, path, TEXT_MAX_LEN)?,
-        "usertype" => user.user_type = optional_text(value, path, TEXT_MAX_LEN)?,
-        "title" => user.title = optional_text(value, path, TEXT_MAX_LEN)?,
-        "preferredlanguage" => user.preferred_language = optional_text(value, path, TEXT_MAX_LEN)?,
-        "locale" => user.locale = optional_text(value, path, TEXT_MAX_LEN)?,
-        "timezone" => user.timezone = optional_text(value, path, TEXT_MAX_LEN)?,
-        "website" => user.website = optional_text(value, path, TEXT_MAX_LEN)?,
-        "birthdate" => user.birthdate = optional_text(value, path, TEXT_MAX_LEN)?,
+        "displayname" => user.display_name = optional_text(value, path, TEXT)?,
+        "nickname" => user.nick_name = optional_text(value, path, TEXT)?,
+        "profileurl" => user.profile_url = optional_text(value, path, TEXT)?,
+        "usertype" => user.user_type = optional_text(value, path, TEXT)?,
+        "title" => user.title = optional_text(value, path, TEXT)?,
+        "preferredlanguage" => user.preferred_language = optional_text(value, path, TEXT)?,
+        "locale" => user.locale = optional_text(value, path, TEXT)?,
+        "timezone" => user.timezone = optional_text(value, path, TEXT)?,
+        "website" => user.website = optional_text(value, path, TEXT)?,
+        "birthdate" => user.birthdate = optional_text(value, path, TEXT)?,
         "userstatus" => user.user_status = user_status(value, path)?,
         "name" => user.name = optional_name(value, path)?,
         "name.formatted" => set_name_part(user, |name| &mut name.formatted, value, path)?,
@@ -444,7 +450,7 @@ fn required_text(
     path: &str,
     member: &str,
 ) -> Result<String, String> {
-    optional_text(value, path, TEXT_MAX_LEN)?
+    optional_text(value, path, TEXT)?
         .ok_or_else(|| format!("every {member} entry of {path} must carry a Value"))
 }
 
@@ -479,7 +485,10 @@ fn user_status(
             USER_STATUS_VALUES.join(", ")
         )
     };
-    let status = optional_text(value, path, TEXT_MAX_LEN)?.ok_or_else(expected)?;
+    // `UserStatus` is a modelled ENUM, so its value set is the constraint on it and it
+    // carries neither the `@length` nor the `@pattern` a text attribute does: the string is
+    // read for its JSON type alone and then checked against the enum.
+    let status = crate::state::attribute_string_value(value, path)?.ok_or_else(expected)?;
     if !USER_STATUS_VALUES.contains(&status.as_str()) {
         return Err(expected());
     }
@@ -536,19 +545,19 @@ fn optional_name(
     };
     let members = object(value, path, "Name", NAME_MEMBERS)?;
     let name = Name {
-        formatted: optional_text(members.get("Formatted").copied(), path, TEXT_MAX_LEN)?,
-        family_name: optional_text(members.get("FamilyName").copied(), path, TEXT_MAX_LEN)?,
-        given_name: optional_text(members.get("GivenName").copied(), path, TEXT_MAX_LEN)?,
-        middle_name: optional_text(members.get("MiddleName").copied(), path, TEXT_MAX_LEN)?,
+        formatted: optional_text(members.get("Formatted").copied(), path, TEXT)?,
+        family_name: optional_text(members.get("FamilyName").copied(), path, TEXT)?,
+        given_name: optional_text(members.get("GivenName").copied(), path, TEXT)?,
+        middle_name: optional_text(members.get("MiddleName").copied(), path, TEXT)?,
         honorific_prefix: optional_text(
             members.get("HonorificPrefix").copied(),
             path,
-            TEXT_MAX_LEN,
+            TEXT,
         )?,
         honorific_suffix: optional_text(
             members.get("HonorificSuffix").copied(),
             path,
-            TEXT_MAX_LEN,
+            TEXT,
         )?,
     };
     // A name every member of which was removed is no name at all, so it is reported
@@ -580,7 +589,7 @@ fn set_name_part(
     value: Option<&::aws_smithy_types::Document>,
     path: &str,
 ) -> Result<(), String> {
-    let text = optional_text(value, path, TEXT_MAX_LEN)?;
+    let text = optional_text(value, path, TEXT)?;
     if text.is_none() && user.name.is_none() {
         return Ok(());
     }
@@ -643,8 +652,8 @@ fn email(
     path: &str,
 ) -> Result<Email, String> {
     Ok(Email {
-        value: optional_text(members.get("Value").copied(), path, TEXT_MAX_LEN)?,
-        r#type: optional_text(members.get("Type").copied(), path, TEXT_MAX_LEN)?,
+        value: optional_text(members.get("Value").copied(), path, TEXT)?,
+        r#type: optional_text(members.get("Type").copied(), path, TEXT)?,
         primary: flag(members.get("Primary").copied(), path)?,
     })
 }
@@ -655,8 +664,8 @@ fn phone(
     path: &str,
 ) -> Result<PhoneNumber, String> {
     Ok(PhoneNumber {
-        value: optional_text(members.get("Value").copied(), path, TEXT_MAX_LEN)?,
-        r#type: optional_text(members.get("Type").copied(), path, TEXT_MAX_LEN)?,
+        value: optional_text(members.get("Value").copied(), path, TEXT)?,
+        r#type: optional_text(members.get("Type").copied(), path, TEXT)?,
         primary: flag(members.get("Primary").copied(), path)?,
     })
 }
@@ -667,8 +676,8 @@ fn role(
     path: &str,
 ) -> Result<Role, String> {
     Ok(Role {
-        value: optional_text(members.get("Value").copied(), path, TEXT_MAX_LEN)?,
-        r#type: optional_text(members.get("Type").copied(), path, TEXT_MAX_LEN)?,
+        value: optional_text(members.get("Value").copied(), path, TEXT)?,
+        r#type: optional_text(members.get("Type").copied(), path, TEXT)?,
         primary: flag(members.get("Primary").copied(), path)?,
     })
 }
@@ -679,13 +688,13 @@ fn address(
     path: &str,
 ) -> Result<Address, String> {
     Ok(Address {
-        street_address: optional_text(members.get("StreetAddress").copied(), path, TEXT_MAX_LEN)?,
-        locality: optional_text(members.get("Locality").copied(), path, TEXT_MAX_LEN)?,
-        region: optional_text(members.get("Region").copied(), path, TEXT_MAX_LEN)?,
-        postal_code: optional_text(members.get("PostalCode").copied(), path, TEXT_MAX_LEN)?,
-        country: optional_text(members.get("Country").copied(), path, TEXT_MAX_LEN)?,
-        formatted: optional_text(members.get("Formatted").copied(), path, TEXT_MAX_LEN)?,
-        r#type: optional_text(members.get("Type").copied(), path, TEXT_MAX_LEN)?,
+        street_address: optional_text(members.get("StreetAddress").copied(), path, TEXT)?,
+        locality: optional_text(members.get("Locality").copied(), path, TEXT)?,
+        region: optional_text(members.get("Region").copied(), path, TEXT)?,
+        postal_code: optional_text(members.get("PostalCode").copied(), path, TEXT)?,
+        country: optional_text(members.get("Country").copied(), path, TEXT)?,
+        formatted: optional_text(members.get("Formatted").copied(), path, TEXT)?,
+        r#type: optional_text(members.get("Type").copied(), path, TEXT)?,
         primary: flag(members.get("Primary").copied(), path)?,
     })
 }
@@ -698,8 +707,8 @@ fn photo(
 ) -> Result<Photo, String> {
     Ok(Photo {
         value: required_text(members.get("Value").copied(), path, "Photo")?,
-        r#type: optional_text(members.get("Type").copied(), path, TEXT_MAX_LEN)?,
-        display: optional_text(members.get("Display").copied(), path, TEXT_MAX_LEN)?,
+        r#type: optional_text(members.get("Type").copied(), path, TEXT)?,
+        display: optional_text(members.get("Display").copied(), path, TEXT)?,
         primary: flag(members.get("Primary").copied(), path)?,
     })
 }
