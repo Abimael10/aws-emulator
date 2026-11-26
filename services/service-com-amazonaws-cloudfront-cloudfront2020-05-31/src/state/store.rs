@@ -1545,6 +1545,15 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             ));
         }
 
+        // `TenantConfig` is the member only a multi-tenant distribution's configuration
+        // carries, and its parameter definitions are what a tenant's values are admitted by,
+        // so whether the configuration may carry the member at all — and whether the schemas
+        // it declares admit anything — is decided BEFORE the references those definitions
+        // would resolve, and before anything is created.
+        if let Some(message) = tenant_config_refusal(&config) {
+            return Err(CreateRefusal::InvalidArgument(message));
+        }
+
         // A multi-tenant distribution serves its tenants, not its own traffic: the members
         // the model documents as standard-distribution-only — or as a connection group's to
         // carry — are no members of its configuration, so one that states any of them is

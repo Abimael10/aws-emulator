@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input
             .tags
             .as_ref()
-            .map(crate::state::tag_set)
+            .map(|tags| crate::state::tag_set_reason(tags, crate::state::tag_key_origin(ctx)))
             .transpose()
             .map_err(invalid_argument)?
             .unwrap_or_default();

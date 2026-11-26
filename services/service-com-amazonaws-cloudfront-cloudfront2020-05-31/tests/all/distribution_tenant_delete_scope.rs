@@ -45,6 +45,7 @@ use crate::tenant_invalidations::{
     summaries,
 };
 use crate::tenant_web_acl_association::{associate, read_tenant, web_acl_of};
+use crate::waf_control_plane::shared_web_acl_arn;
 use crate::web_acl_association::WEB_ACLS;
 
 // ---------------------------------------------------------------------------
@@ -109,9 +110,9 @@ fn create_body(
 enum WebAcl {
     /// The record carries no web ACL customization at all.
     Absent,
-    /// The create states the customization, naming the [`WEB_ACLS`] form at this index — a
-    /// create states the identifier it is given.
-    StatedByTheCreate(usize),
+    /// The create states the customization, naming a web ACL WAF holds — a create resolves
+    /// the web ACL its customization names, exactly as the association does.
+    StatedByTheCreate,
     /// A later `AssociateDistributionTenantWebACL` call writes it, naming a web ACL WAF
     /// holds, since that call resolves the web ACL it is handed.
     WrittenByACall,
@@ -156,7 +157,7 @@ const ROWS: &[Row] = &[
         slug: "scope-one",
         domains: 1,
         batches: &[&["/index.html"]],
-        web_acl: WebAcl::StatedByTheCreate(1),
+        web_acl: WebAcl::StatedByTheCreate,
     },
     Row {
         case: "three invalidations, two domains, a web ACL written by a call",
@@ -197,13 +198,22 @@ struct Staged {
     web_acl: Option<String>,
 }
 
+/// The web ACL the create of `row` states its customization for: one WAF holds, under a name
+/// of this row's own, since a create resolves the web ACL its customization names.
+///
+/// IDEMPOTENT ([`shared_web_acl_arn`]), so the staging that builds the request document and
+/// the one that reports what the record now names read the same ARN.
+async fn stated_web_acl(router: &MultiServiceRouter, row: &Row) -> String {
+    shared_web_acl_arn(router, &format!("delete-scope-stated-{}", row.slug)).await
+}
+
 /// Create one tenant for `row` under `distribution_id`, with its invalidations and its web
 /// ACL customization, and report the record as it now stands.
 async fn stage(router: &MultiServiceRouter, distribution_id: &str, row: &Row) -> Staged {
     let case = row.case;
     let domains = row.domains();
     let customizations = match row.web_acl {
-        WebAcl::StatedByTheCreate(index) => web_acl_customization(WEB_ACLS[index].1),
+        WebAcl::StatedByTheCreate => web_acl_customization(&stated_web_acl(router, row).await),
         _ => String::new(),
     };
     let created = create_distribution_tenant(
@@ -256,7 +266,7 @@ async fn stage(router: &MultiServiceRouter, distribution_id: &str, row: &Row) ->
 
     let web_acl = match row.web_acl {
         WebAcl::Absent => None,
-        WebAcl::StatedByTheCreate(index) => Some(WEB_ACLS[index].1.to_string()),
+        WebAcl::StatedByTheCreate => Some(stated_web_acl(router, row).await),
         WebAcl::WrittenByACall => {
             // The association resolves the web ACL, so the one this row writes by a call is
             // created in WAF first, under a name of this row's own.

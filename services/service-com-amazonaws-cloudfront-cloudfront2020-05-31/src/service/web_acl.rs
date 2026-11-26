@@ -190,6 +190,38 @@ pub fn inaccessible_web_acl<Eng: Send + Sync + 'static>(
     Some(INACCESSIBLE_WEB_ACL_MESSAGE)
 }
 
+/// Whether the web ACL a distribution tenant's `Customizations` names does NOT resolve, so
+/// the customization is one CloudFront would not write.
+///
+/// `WebAclCustomization$Arn` is "the Amazon Resource Name (ARN) of the WAF web ACL" the
+/// tenant is protected by, and the tenant REPORTS that ARN through the member it was written
+/// to — so a customization naming a web ACL that resolves to nothing would tell a client
+/// reading its posture back that the tenant is protected by something nothing holds. The web
+/// ACL is therefore resolved on the way IN, against the service that HOLDS web ACLs and in
+/// the one namespace CloudFront is protected by ([`associable`]): the same question, asked of
+/// the same records, that `AssociateDistributionTenantWebACL` resolves before it writes the
+/// very same member.
+///
+/// A customization that names no ARN at all resolves nothing: the member is optional, and
+/// `disable` — the action that "won't have WAF web ACL protections and won't inherit from the
+/// multi-tenant distribution" — names no web ACL to resolve.
+///
+/// Call it with NO lock of this service's store held, for the reason [`associable`] gives.
+pub fn unresolvable_customization_web_acl<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    customizations: Option<&crate::ops::types::Customizations>,
+) -> bool {
+    let Some(web_acl_arn) = customizations
+        .and_then(|customizations| customizations.web_acl.as_ref())
+        .and_then(|web_acl| web_acl.arn.as_deref())
+        .map(str::trim)
+        .filter(|arn| !arn.is_empty())
+    else {
+        return false;
+    };
+    !associable(engine, web_acl_arn)
+}
+
 /// Whether `web_acl_id` names a WAFv2 resource at all, which is what makes it a value the
 /// service that holds web ACLs can be asked about.
 ///

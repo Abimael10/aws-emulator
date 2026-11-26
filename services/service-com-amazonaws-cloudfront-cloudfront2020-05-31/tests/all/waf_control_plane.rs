@@ -133,6 +133,55 @@ pub(crate) async fn create_web_acl(
     }
 }
 
+/// The ARN of ONE web ACL of CloudFront's own namespace that WAF really holds, created under
+/// `name` with no rules and an allowing default action.
+///
+/// What a suite that only needs a web ACL a CloudFront resource may be put BEHIND names: a
+/// distribution's `WebACLId` and a distribution tenant's web ACL customization are both
+/// resolved against WAF on the way in, so an identifier built by hand names no web ACL and is
+/// refused. `name` is WAF's own identity for the web ACL, so each call in one emulator passes
+/// a name of its own.
+pub(crate) async fn held_web_acl_arn(router: &MultiServiceRouter, name: &str) -> String {
+    create_web_acl(router, name, SCOPE_CLOUDFRONT, "{\"Allow\":{}}", "")
+        .await
+        .arn
+}
+
+/// The ARN of the web ACL named `name` in CloudFront's own namespace, held by WAF whether or
+/// not this call is the one that created it.
+///
+/// IDEMPOTENT, which is what [`held_web_acl_arn`] is not: a suite reaches the ONE web ACL its
+/// resources are put behind from several places in one test — the call that states a
+/// customization and the assertion that reads it back — and WAF holds at most one web ACL
+/// under a name, so the first call creates it and every later one reports the ARN that create
+/// minted.
+pub(crate) async fn shared_web_acl_arn(router: &MultiServiceRouter, name: &str) -> String {
+    match listed_web_acl_arn(router, name).await {
+        Some(arn) => arn,
+        None => held_web_acl_arn(router, name).await,
+    }
+}
+
+/// The ARN WAF's own listing reports for the web ACL named `name` in CloudFront's namespace,
+/// or `None` when the account holds none under that name.
+///
+/// `WebACLSummary` carries its `ARN` after its `Name`
+/// (`smithy_query(query="shape",shape="WebACLSummary")`), so the ARN read is the one of the
+/// summary that named it.
+async fn listed_web_acl_arn(router: &MultiServiceRouter, name: &str) -> Option<String> {
+    let (status, listed) = waf_call(
+        router,
+        "ListWebACLs",
+        &format!("{{\"Scope\":\"{SCOPE_CLOUDFRONT}\",\"Limit\":100}}"),
+    )
+    .await;
+    if status != 200 {
+        return None;
+    }
+    let named = listed.find(&format!("\"Name\":\"{name}\""))?;
+    json_string(&listed[named..], "ARN")
+}
+
 /// Delete one web ACL WAFv2 holds, so a suite can state what an association does with an
 /// identifier the account no longer has.
 pub(crate) async fn delete_web_acl(router: &MultiServiceRouter, web_acl: &CreatedWebAcl) {

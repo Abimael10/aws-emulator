@@ -49,6 +49,7 @@ use crate::distribution_lifecycle::{
     CUSTOM_VIEWER_CERTIFICATE,
 };
 use crate::managed_certificate_domain_ownership::await_certificate_issuance;
+use crate::waf_control_plane::held_web_acl_arn;
 
 // ---------------------------------------------------------------------------
 // Calling the distribution tenant surface
@@ -137,8 +138,12 @@ pub(crate) fn escape(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The parameter definitions the multi-tenant distribution under test declares: one
-/// REQUIRED parameter with no default, one required parameter that carries a
-/// `DefaultValue`, and one optional parameter.
+/// REQUIRED parameter with no default, one optional parameter that carries a
+/// `DefaultValue`, and one optional parameter with neither.
+///
+/// A definition that is `Required` AND carries a `DefaultValue` is not among them: the
+/// default would supply the value the tenant is required to supply itself, so CloudFront
+/// admits no such schema ([`crate::tenant_config_admission`] is that rule).
 ///
 /// `ParameterDefinitions` is a list whose member carries no `xmlName`
 /// (`smithy_query(query="shape",shape="ParameterDefinitions")`), so each entry travels in
@@ -147,7 +152,7 @@ const TENANT_CONFIG: &str = "<TenantConfig><ParameterDefinitions>\
      <member><Name>tenantName</Name><Definition><StringSchema>\
      <Required>true</Required></StringSchema></Definition></member>\
      <member><Name>stage</Name><Definition><StringSchema>\
-     <DefaultValue>prod</DefaultValue><Required>true</Required>\
+     <DefaultValue>prod</DefaultValue><Required>false</Required>\
      </StringSchema></Definition></member>\
      <member><Name>region-label</Name><Definition><StringSchema>\
      <Required>false</Required></StringSchema></Definition></member>\
@@ -280,7 +285,7 @@ struct Create {
     domains: Vec<String>,
     /// `Customizations`, as the XML fragment the row submits, or `None` to leave the
     /// member out entirely.
-    customizations: Option<&'static str>,
+    customizations: Option<String>,
     /// `Parameters`, as `(Name, Value)` pairs.
     parameters: Vec<(&'static str, &'static str)>,
     /// `Tags.Items`, as `(Key, Value)` pairs.
@@ -308,7 +313,7 @@ impl Create {
             ));
         }
         out.push_str("</Domains>");
-        if let Some(customizations) = self.customizations {
+        if let Some(customizations) = self.customizations.as_deref() {
             out.push_str(customizations);
         }
         if !self.parameters.is_empty() {
@@ -350,16 +355,24 @@ impl Create {
     }
 }
 
-/// A `Customizations` element that overrides the distribution's WAF web ACL and narrows
-/// its geographic restrictions. `LocationList`'s member carries `xmlName` `Location`
-/// (`smithy_query(query="shape",shape="LocationList")`), so each entry travels in a
-/// `<Location>` element.
-const CUSTOMIZATIONS_OVERRIDE: &str = "<Customizations>\
-     <WebAcl><Action>override</Action>\
-     <Arn>arn:aws:wafv2:us-east-1:000000000000:global/webacl/tenant/abc</Arn></WebAcl>\
-     <GeoRestrictions><RestrictionType>whitelist</RestrictionType>\
-     <Locations><Location>DE</Location><Location>JP</Location></Locations>\
-     </GeoRestrictions></Customizations>";
+/// A `Customizations` element that overrides the distribution's WAF web ACL with
+/// `web_acl_arn` and narrows its geographic restrictions. `LocationList`'s member carries
+/// `xmlName` `Location` (`smithy_query(query="shape",shape="LocationList")`), so each entry
+/// travels in a `<Location>` element.
+///
+/// The ARN is one WAF really holds, minted by that service: a customization naming a web ACL
+/// the account does not hold is refused ([`crate::tenant_config_admission`] is that rule), so
+/// nothing here builds a WAF identifier by hand.
+fn customizations_override(web_acl_arn: &str) -> String {
+    format!(
+        "<Customizations>\
+         <WebAcl><Action>override</Action><Arn>{}</Arn></WebAcl>\
+         <GeoRestrictions><RestrictionType>whitelist</RestrictionType>\
+         <Locations><Location>DE</Location><Location>JP</Location></Locations>\
+         </GeoRestrictions></Customizations>",
+        escape(web_acl_arn)
+    )
+}
 
 /// A `Customizations` element that DISABLES the distribution's web ACL for the tenant —
 /// `CustomizationActionType` is `override | disable`
@@ -376,7 +389,10 @@ const CUSTOMIZATIONS_DISABLE: &str =
 /// `Customizations`, a parameter list that relies on a `DefaultValue` and one that does
 /// not, a tagged and an untagged create, and `Enabled` submitted true, submitted false and
 /// left out.
-fn create_table() -> Vec<Create> {
+///
+/// `web_acl_arn` is the web ACL the overriding row's customization names — one WAF really
+/// holds, since a customization naming any other is refused.
+fn create_table(web_acl_arn: &str) -> Vec<Create> {
     vec![
         Create {
             case: "the shortest admissible name, one domain, nothing optional",
@@ -395,7 +411,7 @@ fn create_table() -> Vec<Create> {
                 "cdn.second.example.com".to_string(),
                 "static.second.example.com".to_string(),
             ],
-            customizations: Some(CUSTOMIZATIONS_OVERRIDE),
+            customizations: Some(customizations_override(web_acl_arn)),
             parameters: vec![("tenantName", "second"), ("stage", "staging")],
             tags: vec![("stage", "prod"), ("owner", "edge-team")],
             enabled: Some(true),
@@ -404,7 +420,7 @@ fn create_table() -> Vec<Create> {
             case: "dots and hyphens in the name, a disabled tenant",
             name: "third.tenant-2".to_string(),
             domains: vec!["THIRD.EXAMPLE.COM".to_string()],
-            customizations: Some(CUSTOMIZATIONS_DISABLE),
+            customizations: Some(CUSTOMIZATIONS_DISABLE.to_string()),
             parameters: vec![("tenantName", "third"), ("region-label", "eu")],
             tags: vec![("owner", "edge-team")],
             enabled: Some(false),
@@ -414,7 +430,7 @@ fn create_table() -> Vec<Create> {
             name: "Fourth42".to_string(),
             domains: vec![longest_domain()],
             customizations: None,
-            // `stage` is required but carries a `DefaultValue`, so a valid value exists
+            // `stage` is optional and carries a `DefaultValue`, so a valid value exists
             // for it without the request naming one.
             parameters: vec![("tenantName", "fourth")],
             tags: Vec::new(),
@@ -638,7 +654,8 @@ fn assert_record(
         create.customizations.is_some(),
         customizations.is_some()
     );
-    if create.customizations == Some(CUSTOMIZATIONS_OVERRIDE) {
+    let submitted_customizations = create.customizations.as_deref().unwrap_or_default();
+    if submitted_customizations.contains("<Action>override</Action>") {
         let action = member(tenant, "Customizations/WebAcl/Action", case, raw);
         assert_eq!(
             action, "override",
@@ -659,7 +676,7 @@ fn assert_record(
             "case {case} ({context}): expected the submitted Locations, got {locations:?}"
         );
     }
-    if create.customizations == Some(CUSTOMIZATIONS_DISABLE) {
+    if submitted_customizations.contains("<Action>disable</Action>") {
         let action = member(tenant, "Customizations/WebAcl/Action", case, raw);
         assert_eq!(
             action, "disable",
@@ -702,8 +719,9 @@ async fn create_persists_the_tenant_the_read_then_reports() {
     let mut arns = BTreeSet::new();
     let mut etags = BTreeSet::new();
     let mut connection_groups = BTreeSet::new();
+    let web_acl = held_web_acl_arn(&router, "tenant-persist-web-acl").await;
 
-    for create in create_table() {
+    for create in create_table(&web_acl) {
         let case = create.case;
         let created = create_distribution_tenant(&router, &create.xml(&distribution_id)).await;
         assert_eq!(
@@ -778,8 +796,9 @@ async fn create_persists_the_tenant_the_read_then_reports() {
 async fn a_name_names_at_most_one_distribution_tenant() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-name").await;
+    let web_acl = held_web_acl_arn(&router, "tenant-name-web-acl").await;
 
-    for create in create_table() {
+    for create in create_table(&web_acl) {
         let case = create.case;
         let first = create_distribution_tenant(&router, &create.xml(&distribution_id)).await;
         assert_eq!(

@@ -149,7 +149,11 @@ struct Declaration {
     tenant_config: bool,
 }
 
-/// The four ways a document declares its tenancy, each named by the mode it declares.
+/// The three ways a document declares its tenancy, each named by the mode it declares.
+///
+/// A `TenantConfig` with no `ConnectionMode` is not among them: the member "only supports
+/// multi-tenant distributions", and a configuration that does not DECLARE the tenant-only
+/// mode may not carry it at all ([`crate::tenant_config_admission`] is that rule).
 const DECLARATIONS: &[Declaration] = &[
     Declaration {
         case: "the member stating direct",
@@ -166,22 +170,13 @@ const DECLARATIONS: &[Declaration] = &[
         connection_mode: Some(TENANT_ONLY),
         tenant_config: true,
     },
-    Declaration {
-        case: "a TenantConfig and no member",
-        connection_mode: None,
-        tenant_config: true,
-    },
 ];
 
 impl Declaration {
-    /// The mode this declaration declares: the member when it states one, and otherwise the
-    /// mode `TenantConfig`'s presence describes.
+    /// The mode this declaration declares: the member when it states one, and the standard
+    /// mode when it states none.
     fn declares(&self) -> &'static str {
-        match self.connection_mode {
-            Some(mode) => mode,
-            None if self.tenant_config => TENANT_ONLY,
-            None => DIRECT,
-        }
+        self.connection_mode.unwrap_or(DIRECT)
     }
 
     /// This declaration's document under `reference`, carrying `comment`.

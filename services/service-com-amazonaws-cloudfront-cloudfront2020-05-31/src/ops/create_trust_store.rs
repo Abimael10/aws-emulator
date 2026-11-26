@@ -175,11 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input
             .tags
             .as_ref()
-            .map(crate::state::tag_set)
+            .map(|tags| crate::state::tag_set_from(tags, crate::state::tag_key_origin(ctx)))
             .transpose()
-            .map_err(|reason| {
-                CreateTrustStoreErrorModeled::InvalidTagging(crate::state::invalid_tagging(reason))
-            })?
+            .map_err(CreateTrustStoreErrorModeled::InvalidTagging)?
             .unwrap_or_default();
 
         // The bundle is READ first, before the store is touched at all: the certificate

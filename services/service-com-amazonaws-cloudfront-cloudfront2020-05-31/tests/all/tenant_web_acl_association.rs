@@ -46,6 +46,7 @@ use crate::distribution_lifecycle::{
 use crate::distribution_tenant_lifecycle::{
     create_distribution_tenant, escape, managed_certificate_request, multi_tenant_distribution,
 };
+use crate::waf_control_plane::shared_web_acl_arn;
 use crate::web_acl_association::{held_web_acls, Stated};
 
 // ---------------------------------------------------------------------------
@@ -147,13 +148,26 @@ const GEO_ONLY: &str = "<Customizations>\
      </GeoRestrictions></Customizations>";
 
 /// A `Customizations` element that already OVERRIDES a web ACL, beside geographic
-/// restrictions.
+/// restrictions. The ARN is substituted at request time
+/// ([`START_WEB_ACL_PLACEHOLDER`]): a tenant may be put only behind a web ACL WAF really
+/// holds, so no identifier here is built by hand.
 const OVERRIDDEN: &str = "<Customizations>\
      <WebAcl><Action>override</Action>\
-     <Arn>arn:aws:wafv2:us-east-1:000000000000:global/webacl/first/aaa</Arn></WebAcl>\
+     <Arn>{held-web-acl}</Arn></WebAcl>\
      <GeoRestrictions><RestrictionType>blacklist</RestrictionType>\
      <Locations><Location>CU</Location></Locations>\
      </GeoRestrictions></Customizations>";
+
+/// What [`create_tenant`] replaces with the ARN of the web ACL the starting states are put
+/// behind ([`START_WEB_ACL_NAME`]).
+const START_WEB_ACL_PLACEHOLDER: &str = "{held-web-acl}";
+
+/// WAF's own name for the ONE web ACL every starting state that overrides one is put behind.
+///
+/// `pub(crate)` so a sibling suite that asserts what such a tenant reports reads the ARN WAF
+/// minted for it ([`crate::waf_control_plane::shared_web_acl_arn`]) rather than carrying an
+/// identifier of its own.
+pub(crate) const START_WEB_ACL_NAME: &str = "tenant-start-overridden";
 
 /// A `Customizations` element that DISABLES the distribution's web ACL for the tenant —
 /// `CustomizationActionType` is `override | disable`
@@ -171,8 +185,10 @@ pub(crate) struct Start {
     /// The `Customizations` element the create submits, or `None` to leave the member out.
     pub(crate) customizations: Option<&'static str>,
     /// The `(Action, Arn)` a read reports before the association, or `None` for a record
-    /// that carries no web ACL customization.
-    pub(crate) web_acl_before: Option<(&'static str, &'static str)>,
+    /// that carries no web ACL customization. An `Arn` of [`START_WEB_ACL_PLACEHOLDER`]
+    /// stands for the ARN WAF minted for the web ACL the start is put behind, which
+    /// [`Start::web_acl_before`] substitutes.
+    stated_web_acl: Option<(&'static str, &'static str)>,
     /// Whether the tenant carries a customization OTHER than the web ACL, which every call
     /// here must leave in place.
     pub(crate) other_customizations: bool,
@@ -187,31 +203,44 @@ pub(crate) const STARTS: &[Start] = &[
     Start {
         case: "no customizations at all",
         customizations: None,
-        web_acl_before: None,
+        stated_web_acl: None,
         other_customizations: false,
     },
     Start {
         case: "customizations that name no web ACL",
         customizations: Some(GEO_ONLY),
-        web_acl_before: None,
+        stated_web_acl: None,
         other_customizations: true,
     },
     Start {
         case: "a web ACL already overridden",
         customizations: Some(OVERRIDDEN),
-        web_acl_before: Some((
-            "override",
-            "arn:aws:wafv2:us-east-1:000000000000:global/webacl/first/aaa",
-        )),
+        stated_web_acl: Some(("override", START_WEB_ACL_PLACEHOLDER)),
         other_customizations: true,
     },
     Start {
         case: "the web ACL disabled",
         customizations: Some(DISABLED),
-        web_acl_before: Some(("disable", "")),
+        stated_web_acl: Some(("disable", "")),
         other_customizations: false,
     },
 ];
+
+impl Start {
+    /// The `(Action, Arn)` a read must report for a tenant created in this starting state,
+    /// where `held` is the ARN WAF minted for the web ACL the starts are put behind
+    /// ([`START_WEB_ACL_NAME`]).
+    ///
+    /// `pub(crate)` so every suite that spans these starting states reads the same pair back.
+    pub(crate) fn web_acl_before(&self, held: &str) -> Option<(String, String)> {
+        self.stated_web_acl.map(|(action, arn)| {
+            (
+                action.to_string(),
+                arn.replace(START_WEB_ACL_PLACEHOLDER, held),
+            )
+        })
+    }
+}
 
 /// Create one distribution tenant under `distribution_id`, in the starting state `start`,
 /// and report `(Id, ETag)`.
@@ -226,6 +255,9 @@ pub(crate) async fn create_tenant(
     case: &str,
     start: Start,
 ) -> (String, String) {
+    // The web ACL a starting state overrides is one WAF really holds: the starts name it by
+    // a placeholder, and the ARN substituted here is the one WAF minted for it.
+    let held = shared_web_acl_arn(router, START_WEB_ACL_NAME).await;
     let body = format!(
         "<CreateDistributionTenantRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -234,7 +266,10 @@ pub(crate) async fn create_tenant(
          <Parameters><member><Name>tenantName</Name><Value>{slug}</Value></member></Parameters>\
          {}{}</CreateDistributionTenantRequest>",
         escape(distribution_id),
-        start.customizations.unwrap_or_default(),
+        start
+            .customizations
+            .unwrap_or_default()
+            .replace(START_WEB_ACL_PLACEHOLDER, &held),
         managed_certificate_request()
     );
     let created = create_distribution_tenant(router, &body).await;
@@ -266,6 +301,7 @@ async fn associating_and_disassociating_move_the_tenants_web_acl() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-web-acl").await;
     let web_acls = held_web_acls(&router).await;
+    let held = shared_web_acl_arn(&router, START_WEB_ACL_NAME).await;
 
     for (acl_index, (acl_case, web_acl)) in web_acls.iter().enumerate() {
         for (start_index, start) in STARTS.iter().enumerate() {
@@ -278,9 +314,7 @@ async fn associating_and_disassociating_move_the_tenants_web_acl() {
             // included.
             let before = read_tenant(&router, &id, &case).await;
             let reported = web_acl_of(before.root());
-            let expected = start
-                .web_acl_before
-                .map(|(action, arn)| (action.to_string(), arn.to_string()));
+            let expected = start.web_acl_before(&held);
             assert_eq!(
                 reported, expected,
                 "case {case}: expected the created tenant to report web ACL customization \
@@ -493,6 +527,7 @@ async fn the_tenants_version_is_a_required_precondition() {
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-web-acl-if-match").await;
     let web_acls = held_web_acls(&router).await;
     let web_acl = web_acls[0].1.as_str();
+    let held = shared_web_acl_arn(&router, START_WEB_ACL_NAME).await;
 
     for (index, row) in PRECONDITIONS.iter().enumerate() {
         for (which, associating) in [("associate", true), ("disassociate", false)] {
@@ -551,9 +586,7 @@ async fn the_tenants_version_is_a_required_precondition() {
                     read.header("etag")
                 );
             } else {
-                let expected = start
-                    .web_acl_before
-                    .map(|(action, arn)| (action.to_string(), arn.to_string()));
+                let expected = start.web_acl_before(&held);
                 assert_eq!(
                     reported, expected,
                     "case {case}: expected a refused call to leave web ACL customization \

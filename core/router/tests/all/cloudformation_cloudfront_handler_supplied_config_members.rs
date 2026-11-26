@@ -29,8 +29,8 @@
 //! The rows differ along what the rule generalises over: which of the two ports a
 //! declaration states (neither, only the HTTPS one, only the HTTP one), whether the
 //! configuration declares a price class of its own, whether the distribution is standard or
-//! multi-tenant — and, for a multi-tenant one, which member says so, its `ConnectionMode` or
-//! the `TenantConfig` that describes its tenants — and whether the change the update carries
+//! multi-tenant — and, for a multi-tenant one, whether its `ConnectionMode` says so alone or
+//! beside the `TenantConfig` that describes its tenants — and whether the change the update carries
 //! is to the origin the distribution fetches from (the recorded blue/green cutover, an origin
 //! `DomainName` resolved from a stack parameter) or to another member of the configuration.
 //!
@@ -283,37 +283,42 @@ pub(crate) fn repointed_origin_template(bucket_a: &str, bucket_b: &str) -> Strin
     .to_string()
 }
 
-/// Which member a row declares a MULTI-TENANT distribution with — the two ways a declaration
-/// says a configuration is one, either of which makes the members only a standard distribution
-/// has (the price class among them) members CloudFront refuses on that configuration.
+/// Which member a row declares a MULTI-TENANT distribution with — the two declarations that
+/// make the members only a standard distribution has (the price class among them) members
+/// CloudFront refuses on that configuration.
 #[derive(Debug, Clone, Copy)]
 enum Tenancy {
     /// `ConnectionMode: tenant-only`, the member that states what the distribution IS.
     ConnectionMode,
-    /// A `TenantConfig` and no mode at all: the member "only supports multi-tenant
-    /// distributions", so declaring one says the same thing.
-    TenantConfig,
+    /// That mode beside a `TenantConfig`, the member that "only supports multi-tenant
+    /// distributions" and that a configuration declaring any other mode — or none — may not
+    /// carry at all.
+    ConnectionModeAndTenantConfig,
 }
 
 impl Tenancy {
-    /// The `(member, value)` the declaration carries for this way of saying it.
-    fn declaration(self) -> (&'static str, serde_json::Value) {
+    /// The members the declaration carries for this way of saying it.
+    fn declaration(self) -> Vec<(&'static str, serde_json::Value)> {
+        let mode = (
+            "ConnectionMode",
+            serde_json::Value::String("tenant-only".to_string()),
+        );
         match self {
-            Self::ConnectionMode => (
-                "ConnectionMode",
-                serde_json::Value::String("tenant-only".to_string()),
-            ),
-            Self::TenantConfig => (
-                "TenantConfig",
-                serde_json::json!({"ParameterDefinitions": [{
-                    "Name": "tenantName",
-                    "Definition": {"StringSchema": {
-                        "Required": false,
-                        "Comment": "the tenant's own name",
-                        "DefaultValue": "demo"
-                    }}
-                }]}),
-            ),
+            Self::ConnectionMode => vec![mode],
+            Self::ConnectionModeAndTenantConfig => vec![
+                mode,
+                (
+                    "TenantConfig",
+                    serde_json::json!({"ParameterDefinitions": [{
+                        "Name": "tenantName",
+                        "Definition": {"StringSchema": {
+                            "Required": false,
+                            "Comment": "the tenant's own name",
+                            "DefaultValue": "demo"
+                        }}
+                    }]}),
+                ),
+            ],
         }
     }
 }
@@ -360,8 +365,9 @@ fn custom_origin_template(
         );
     }
     if let Some(tenancy) = tenancy {
-        let (member, value) = tenancy.declaration();
-        members.insert(member.to_string(), value);
+        for (member, value) in tenancy.declaration() {
+            members.insert(member.to_string(), value);
+        }
     }
     serde_json::json!({
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -466,14 +472,14 @@ const ROWS: &[Row] = &[
         expected_price_class: None,
     },
     Row {
-        case: "a multi-tenant distribution declared by its tenant configuration alone, naming \
-               no connection mode",
+        case: "a multi-tenant distribution declared by its connection mode and its tenant \
+               configuration, which supports no price class",
         template: |bucket_a, _bucket_b| {
             custom_origin_template(
                 bucket_a,
                 serde_json::json!({}),
                 None,
-                Some(Tenancy::TenantConfig),
+                Some(Tenancy::ConnectionModeAndTenantConfig),
             )
         },
         expected_origin_domain: website_endpoint,

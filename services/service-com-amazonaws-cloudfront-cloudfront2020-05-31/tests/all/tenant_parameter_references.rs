@@ -25,13 +25,16 @@
 //! name differing from a declared one only in case, which `ParameterName`'s pattern
 //! `^[a-zA-Z0-9-_]+$` admits as a name of its own), and how many references one member
 //! carries. Every refusal is asserted to have left nothing behind, and every acceptance to
-//! have stored the members verbatim.
+//! have stored the members verbatim. A configuration that declares `direct` and carries a
+//! `TenantConfig` is refused for THAT member first, which is the rule
+//! [`crate::tenant_config_admission`] states.
 //!
 //! The wire harness is the lifecycle suite's and the configuration builder the
 //! connection-mode suite's, reused rather than copied.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     unresolvable_parameter_member_message, PARAMETER_NOT_DECLARED_MESSAGE,
+    TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -52,6 +55,9 @@ enum Expectation {
     Member(&'static str),
     /// Refused because the name is not among the configuration's parameter definitions.
     NotDeclared,
+    /// Refused because a configuration that does not declare the tenant-only connection mode
+    /// may carry no `TenantConfig` at all, whatever its templated members reference.
+    TenantConfigOnDirect,
 }
 
 /// One configuration under test.
@@ -85,7 +91,12 @@ impl Row {
     /// refusal is the one under test.
     fn baseline(&self) -> TenancyConfig {
         TenancyConfig {
-            parameters: self.parameters.clone(),
+            // A configuration that declares `direct` may carry no `TenantConfig` at all, so
+            // the baseline of a row whose refusal is about THAT member declares none either,
+            // and the update is what adds it.
+            parameters: (self.expected != Expectation::TenantConfigOnDirect)
+                .then(|| self.parameters.clone())
+                .flatten(),
             connection_mode: self.connection_mode,
             ..TenancyConfig::new(&self.reference())
         }
@@ -122,7 +133,7 @@ fn rows() -> Vec<Row> {
             parameters: Some(vec!["TenantPath"]),
             domain_name: "origin.example.com",
             origin_path: Some("/{{TenantPath}}"),
-            expected: Expectation::Member("originPath"),
+            expected: Expectation::TenantConfigOnDirect,
         },
         Row {
             case: "no tenancy member with a reference in the origin path",
@@ -213,6 +224,9 @@ fn assert_refusal(answer: &Answer, case: &str, expected: Expectation) {
     let sentence = match expected {
         Expectation::Member(member) => unresolvable_parameter_member_message(member),
         Expectation::NotDeclared => PARAMETER_NOT_DECLARED_MESSAGE.to_string(),
+        Expectation::TenantConfigOnDirect => {
+            TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE.to_string()
+        }
         Expectation::Accepted => unreachable!("case {case}: an acceptance is not a refusal"),
     };
     assert_eq!(

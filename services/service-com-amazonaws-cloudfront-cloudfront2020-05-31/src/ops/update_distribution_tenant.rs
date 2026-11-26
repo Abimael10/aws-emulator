@@ -257,6 +257,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_argument(reason));
         }
 
+        // The same rule the create path applies: WHICH web ACL a customization names is
+        // RESOLVED against WAF before this service's store is locked, so an update cannot
+        // leave a tenant reporting a protection nothing holds either.
+        if crate::service::web_acl::unresolvable_customization_web_acl(
+            &*self.engine,
+            input.customizations.as_ref(),
+        ) {
+            return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(
+                crate::state::invalid_web_acl(),
+            )
+            .into());
+        }
+
         // ---- The store ------------------------------------------------------------
         let now = SystemTime::now();
         let mut store = state.lock();

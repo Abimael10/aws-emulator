@@ -28,14 +28,6 @@ use smithy_server_runtime::MultiServiceRouter;
 /// (`smithy_query(query="shape",shape="ConnectionMode")`): exactly these two.
 const CONNECTION_MODES: [&str; 2] = ["direct", "tenant-only"];
 
-/// A `TenantConfig` element. `ParameterDefinitions` is a list whose member carries no
-/// `xmlName` (`smithy_query(query="shape",shape="ParameterDefinitions")`), so each entry
-/// travels in the restXml default `<member>` element.
-const TENANT_CONFIG: &str = "<TenantConfig><ParameterDefinitions>\
-     <member><Name>tenantName</Name><Definition><StringSchema>\
-     <Required>true</Required></StringSchema></Definition></member>\
-     </ParameterDefinitions></TenantConfig>";
-
 /// One row: a configuration, and the connection mode it is therefore listed under.
 #[derive(Debug, Clone, Copy)]
 struct Row {
@@ -48,6 +40,10 @@ struct Row {
 
 /// Every arrangement of the two members that decide a distribution's tenancy, with more
 /// than one row per mode so a page boundary can fall inside either set.
+///
+/// A `TenantConfig` with no `ConnectionMode` is no row: the member "only supports
+/// multi-tenant distributions", and a configuration that does not DECLARE the tenant-only
+/// mode may not carry it at all ([`crate::tenant_config_admission`] is that rule).
 const ROWS: &[Row] = &[
     Row {
         case: "no-tenancy-member-at-all",
@@ -70,8 +66,14 @@ const ROWS: &[Row] = &[
         mode: "tenant-only",
     },
     Row {
-        case: "tenant-config-alone",
-        extra: TENANT_CONFIG,
+        case: "connection-mode-tenant-only-second",
+        extra: concat!(
+            "<ConnectionMode>tenant-only</ConnectionMode>",
+            "<TenantConfig><ParameterDefinitions>\
+             <member><Name>tenantName</Name><Definition><StringSchema>\
+             <Required>true</Required></StringSchema></Definition></member>\
+             </ParameterDefinitions></TenantConfig>"
+        ),
         mode: "tenant-only",
     },
     Row {

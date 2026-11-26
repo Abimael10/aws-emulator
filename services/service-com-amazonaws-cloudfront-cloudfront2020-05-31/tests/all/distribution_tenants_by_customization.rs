@@ -26,10 +26,10 @@
 //! * each summary reports the same values a read of that one tenant reports, down to its
 //!   version token — one record, two readers.
 //!
-//! The rows differ along what the rules generalise over: the FORM of the ARN filtered by
-//! (every entry of [`crate::web_acl_association::WEB_ACLS`] — the WAF generation, the
-//! account, the partition and the bare WAF Classic id — and three ACM certificate ARNs
-//! spanning regions and partitions), the KIND of customization a tenant carries (a web ACL
+//! The rows differ along what the rules generalise over: WHICH web ACL is filtered by (one
+//! per web ACL WAF holds in CloudFront's namespace, [`crate::web_acl_association::held_web_acls`]
+//! — a tenant may be put only behind one of those) and three ACM certificate ARNs spanning
+//! regions and partitions, the KIND of customization a tenant carries (a web ACL
 //! overridden, a web ACL disabled, a certificate, both, geographic restrictions only, none
 //! at all), how many tenants share one ARN, and every page size from one up past the
 //! matching set, plus this service's own page ceiling and one past it.
@@ -52,7 +52,7 @@ use crate::distribution_tenant_lifecycle::{
 };
 use crate::response_headers_policy_lifecycle::{assert_absent, text};
 use crate::tenant_web_acl_association::{associate, disassociate};
-use crate::web_acl_association::WEB_ACLS;
+use crate::web_acl_association::held_web_acls;
 
 // ---------------------------------------------------------------------------
 // Calling the surface
@@ -168,7 +168,7 @@ const CERTIFICATES: &[(&str, &str)] = &[
 ];
 
 /// One distribution tenant the table creates.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Tenant {
     case: &'static str,
     /// Names the tenant and its domain, both unique in the account.
@@ -178,7 +178,8 @@ struct Tenant {
     certificate_arn: Option<&'static str>,
     /// `Customizations$WebAcl` as `(Action, Arn)` — the ARN is absent on the `disable`
     /// action, which names no web ACL — or `None` for a tenant that customizes no web ACL.
-    web_acl: Option<(&'static str, Option<&'static str>)>,
+    /// An ARN it names is one WAF really holds, because a create resolves it.
+    web_acl: Option<(&'static str, Option<String>)>,
     /// Whether the create also names geographic restrictions, a customization no filter here
     /// is about.
     geo: bool,
@@ -192,7 +193,7 @@ impl Tenant {
             return String::new();
         }
         let mut out = String::from("<Customizations>");
-        if let Some((action, arn)) = self.web_acl {
+        if let Some((action, arn)) = self.web_acl.as_ref() {
             out.push_str(&format!("<WebAcl><Action>{action}</Action>"));
             if let Some(arn) = arn {
                 out.push_str(&format!("<Arn>{}</Arn>", escape(arn)));
@@ -235,8 +236,22 @@ impl Tenant {
     fn carries(&self, kind: Kind, arn: &str) -> bool {
         match kind {
             Kind::Certificate => self.certificate_arn == Some(arn),
-            Kind::WebAcl => self.web_acl.and_then(|(_, named)| named) == Some(arn),
+            Kind::WebAcl => {
+                self.web_acl
+                    .as_ref()
+                    .and_then(|(_, named)| named.as_deref())
+                    == Some(arn)
+            }
         }
+    }
+
+    /// Whether this tenant's record names an ARN a filter here is about at all.
+    fn customizes_a_filtered_arn(&self) -> bool {
+        self.certificate_arn.is_some()
+            || self
+                .web_acl
+                .as_ref()
+                .is_some_and(|(_, arn)| arn.is_some())
     }
 }
 
@@ -247,9 +262,17 @@ enum Kind {
     WebAcl,
 }
 
-/// The tenants every case below is asserted over, spanning each kind of customization, each
-/// ARN form of the two catalogs, and several tenants sharing one ARN.
-fn tenants() -> Vec<Tenant> {
+/// The tenants every case below is asserted over, spanning each kind of customization, one
+/// tenant per web ACL the account holds, and several tenants sharing one ARN.
+///
+/// `web_acls` are the web ACLs WAF holds, as [`held_web_acls`] reports them: a tenant's web
+/// ACL customization is resolved against WAF on the way in, so these are the only ARNs a
+/// create may name.
+fn tenants(web_acls: &[(&'static str, String)]) -> Vec<Tenant> {
+    let first_web_acl = web_acls
+        .first()
+        .map(|(_, arn)| arn.clone())
+        .expect("WAF holds at least one web ACL");
     let mut rows = vec![
         Tenant {
             case: "no customizations at all",
@@ -276,7 +299,7 @@ fn tenants() -> Vec<Tenant> {
             case: "a second tenant sharing the first web ACL",
             slug: "web-twin-tenant",
             certificate_arn: None,
-            web_acl: Some(("override", Some(WEB_ACLS[0].1))),
+            web_acl: Some(("override", Some(first_web_acl.clone()))),
             geo: true,
         },
         Tenant {
@@ -290,18 +313,18 @@ fn tenants() -> Vec<Tenant> {
             case: "both a certificate and a web ACL",
             slug: "both-tenant",
             certificate_arn: Some(CERTIFICATES[0].1),
-            web_acl: Some(("override", Some(WEB_ACLS[0].1))),
+            web_acl: Some(("override", Some(first_web_acl))),
             geo: false,
         },
     ];
-    // One tenant per web ACL form, so every form the catalog states is both stored and
+    // One tenant per web ACL the account holds, so every one of them is both stored and
     // filtered by.
-    for (case, arn) in WEB_ACLS {
+    for (case, arn) in web_acls {
         rows.push(Tenant {
             case,
             slug: case,
             certificate_arn: None,
-            web_acl: Some(("override", Some(arn))),
+            web_acl: Some(("override", Some(arn.clone()))),
             geo: false,
         });
     }
@@ -327,32 +350,43 @@ struct Created {
     etag: String,
 }
 
-/// Create the multi-tenant distribution and every tenant of [`tenants`] under it.
-async fn create_every_tenant(router: &MultiServiceRouter) -> Vec<Created> {
+/// Everything one case runs against: the tenants the table created, and the web ACLs WAF
+/// holds that their customizations name.
+#[derive(Debug, Clone)]
+struct World {
+    created: Vec<Created>,
+    web_acls: Vec<(&'static str, String)>,
+}
+
+/// Create the web ACLs the customizations name, the multi-tenant distribution and every
+/// tenant of [`tenants`] under it.
+async fn create_every_tenant(router: &MultiServiceRouter) -> World {
     let distribution_id = multi_tenant_distribution(router, "ref-by-customization").await;
+    let web_acls = held_web_acls(router).await;
     let mut created = Vec::new();
-    for tenant in tenants() {
+    for tenant in tenants(&web_acls) {
+        let case = tenant.case;
         let answer = create_distribution_tenant(router, &tenant.xml(&distribution_id)).await;
         assert_eq!(
             answer.status, 201,
-            "case {}: expected HTTP 201 from CreateDistributionTenant, got {} with {}",
-            tenant.case, answer.status, answer.raw
+            "case {case}: expected HTTP 201 from CreateDistributionTenant, got {} with {}",
+            answer.status, answer.raw
         );
         created.push(Created {
-            tenant,
-            id: text(answer.root(), "Id", tenant.case, "the created tenant", &answer.raw),
+            id: text(answer.root(), "Id", case, "the created tenant", &answer.raw),
             etag: answer.header("etag").to_string(),
+            tenant,
         });
     }
-    created
+    World { created, web_acls }
 }
 
-/// Every filter the cases below run: each ARN of both catalogs, plus one ARN of each kind
-/// that no tenant names.
-fn filters() -> Vec<(String, Kind, String)> {
+/// Every filter the cases below run: each web ACL the account holds and each certificate ARN
+/// of the catalog, plus one ARN of each kind that no tenant names.
+fn filters(web_acls: &[(&'static str, String)]) -> Vec<(String, Kind, String)> {
     let mut rows: Vec<(String, Kind, String)> = Vec::new();
-    for (case, arn) in WEB_ACLS {
-        rows.push((format!("web ACL {case}"), Kind::WebAcl, arn.to_string()));
+    for (case, arn) in web_acls {
+        rows.push((format!("web ACL {case}"), Kind::WebAcl, arn.clone()));
     }
     for (case, arn) in CERTIFICATES {
         rows.push((
@@ -408,9 +442,10 @@ fn expected_ids(created: &[Created], kind: Kind, arn: &str) -> Vec<String> {
 #[tokio::test]
 async fn each_filter_reports_the_tenants_whose_record_names_that_arn() {
     let router = emulator();
-    let created = create_every_tenant(&router).await;
+    let world = create_every_tenant(&router).await;
+    let created = world.created.clone();
 
-    for (case, kind, arn) in filters() {
+    for (case, kind, arn) in filters(&world.web_acls) {
         let answer = list_by_customization(&router, &body_for(kind, &arn, None, None)).await;
         assert_eq!(
             answer.status, 200,
@@ -430,13 +465,12 @@ async fn each_filter_reports_the_tenants_whose_record_names_that_arn() {
 
     // Every tenant the table stored that customizes nothing a filter is about is reported by
     // no filter at all.
-    let reported: BTreeSet<String> = filters()
+    let reported: BTreeSet<String> = filters(&world.web_acls)
         .into_iter()
         .flat_map(|(_, kind, arn)| expected_ids(&created, kind, &arn))
         .collect();
     for row in &created {
-        let customized = row.tenant.certificate_arn.is_some()
-            || row.tenant.web_acl.and_then(|(_, arn)| arn).is_some();
+        let customized = row.tenant.customizes_a_filtered_arn();
         assert_eq!(
             reported.contains(&row.id),
             customized,
@@ -454,7 +488,8 @@ async fn each_filter_reports_the_tenants_whose_record_names_that_arn() {
 #[tokio::test]
 async fn each_summary_reports_what_a_read_of_the_same_tenant_reports() {
     let router = emulator();
-    let created = create_every_tenant(&router).await;
+    let world = create_every_tenant(&router).await;
+    let created = world.created.clone();
 
     // The members a summary and the full document state under the same name. Read as
     // `Option`, so a member absent from one must be absent from the other too.
@@ -474,7 +509,7 @@ async fn each_summary_reports_what_a_read_of_the_same_tenant_reports() {
         "Customizations/GeoRestrictions/RestrictionType",
     ];
 
-    for (case, kind, arn) in filters() {
+    for (case, kind, arn) in filters(&world.web_acls) {
         let answer = list_by_customization(&router, &body_for(kind, &arn, None, None)).await;
         for summary in summaries(&answer) {
             let id = text(summary, "Id", &case, "a summary", &answer.raw);
@@ -590,12 +625,14 @@ async fn walk_pages(
 #[tokio::test]
 async fn the_listing_pages_and_resumes_from_the_marker() {
     let router = emulator();
-    let created = create_every_tenant(&router).await;
+    let world = create_every_tenant(&router).await;
+    let created = world.created.clone();
+    let shared_web_acl = world.web_acls[0].1.clone();
 
     // The two filters several tenants share, so a page really is cut: the first web ACL and
     // the first certificate.
     for (case, kind, arn) in [
-        ("the shared web ACL", Kind::WebAcl, WEB_ACLS[0].1),
+        ("the shared web ACL", Kind::WebAcl, shared_web_acl.as_str()),
         ("the shared certificate", Kind::Certificate, CERTIFICATES[0].1),
     ] {
         let all = expected_ids(&created, kind, arn);
@@ -667,8 +704,10 @@ const ONE_CUSTOMIZATION_REQUIRED: &str = "Exactly one customization filter must 
 #[tokio::test]
 async fn a_request_that_does_not_name_exactly_one_customization_is_refused() {
     let router = emulator();
-    let created = create_every_tenant(&router).await;
-    let web_acl = WEB_ACLS[0].1;
+    let world = create_every_tenant(&router).await;
+    let created = world.created.clone();
+    let web_acl = world.web_acls[0].1.clone();
+    let web_acl = web_acl.as_str();
     let certificate = CERTIFICATES[0].1;
 
     for (case, body) in [
@@ -752,8 +791,10 @@ async fn a_request_that_does_not_name_exactly_one_customization_is_refused() {
 #[tokio::test]
 async fn a_request_that_names_no_page_is_refused() {
     let router = emulator();
-    let created = create_every_tenant(&router).await;
-    let web_acl = WEB_ACLS[0].1;
+    let world = create_every_tenant(&router).await;
+    let created = world.created.clone();
+    let web_acl = world.web_acls[0].1.clone();
+    let web_acl = web_acl.as_str();
 
     // Below the admissible `MaxItems` range: the member bounds the page, so a negative count
     // bounds nothing and names no page at all.
@@ -851,7 +892,8 @@ async fn a_request_that_names_no_page_is_refused() {
 #[tokio::test]
 async fn a_tenant_joins_and_leaves_a_listing_as_its_record_changes() {
     let router = emulator();
-    let created = create_every_tenant(&router).await;
+    let world = create_every_tenant(&router).await;
+    let created = world.created.clone();
     let plain = created
         .iter()
         .find(|row| row.tenant.slug == "plain-tenant")

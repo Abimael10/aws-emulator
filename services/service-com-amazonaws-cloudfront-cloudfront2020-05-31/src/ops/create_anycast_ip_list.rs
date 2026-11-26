@@ -184,13 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input
             .tags
             .as_ref()
-            .map(crate::state::tag_set)
+            .map(|tags| crate::state::tag_set_from(tags, crate::state::tag_key_origin(ctx)))
             .transpose()
-            .map_err(|reason| {
-                CreateAnycastIpListErrorModeled::InvalidTagging(crate::state::invalid_tagging(
-                    reason,
-                ))
-            })?
+            .map_err(CreateAnycastIpListErrorModeled::InvalidTagging)?
             .unwrap_or_default();
 
         // "The number of static IP addresses that are allocated to the Anycast static IP

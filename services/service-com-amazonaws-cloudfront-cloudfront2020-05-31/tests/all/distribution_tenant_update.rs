@@ -57,7 +57,8 @@ use crate::distribution_tenant_lifecycle::{
 use crate::managed_certificate_details::get_managed_certificate_details;
 use crate::managed_certificate_domain_ownership::await_certificate_issuance;
 use crate::tenant_web_acl_association::{read_tenant, web_acl_of};
-use crate::web_acl_association::{Stated, WEB_ACLS};
+use crate::waf_control_plane::held_web_acl_arn;
+use crate::web_acl_association::Stated;
 
 // ---------------------------------------------------------------------------
 // Calling the update
@@ -300,7 +301,8 @@ struct Row {
     customizations: Option<&'static str>,
     /// The locations the tenant's geographic restriction names after the update.
     expected_geo_locations: &'static [&'static str],
-    /// Whether the tenant carries the web ACL customization `WEB_ACLS[0]` afterwards.
+    /// Whether the tenant carries the web ACL customization [`WEB_ACL_CUSTOMIZATIONS`]
+    /// states afterwards.
     expects_web_acl: bool,
     /// `Parameters`, as `(Name, Value)` pairs, or `None` to leave the member out.
     parameters: Option<&'static [(&'static str, &'static str)]>,
@@ -310,9 +312,14 @@ struct Row {
 
 /// A `Customizations` element that OVERRIDES a web ACL and names no geographic restriction,
 /// so stating it both adds a customization and drops the one the create stored.
+///
+/// The ARN is substituted at request time ([`HELD_WEB_ACL_PLACEHOLDER`]): a tenant may be put
+/// only behind a web ACL WAF really holds, so no identifier here is built by hand.
 const WEB_ACL_CUSTOMIZATIONS: &str = "<Customizations><WebAcl><Action>override</Action>\
-     <Arn>arn:aws:wafv2:us-east-1:123456789012:global/webacl/ExampleWebACL/\
-     a1b2c3d4-5678-90ab-cdef-EXAMPLE11111</Arn></WebAcl></Customizations>";
+     <Arn>{held-web-acl}</Arn></WebAcl></Customizations>";
+
+/// What a row's `Customizations` names the web ACL by, replaced with the ARN WAF minted.
+const HELD_WEB_ACL_PLACEHOLDER: &str = "{held-web-acl}";
 
 /// A `Customizations` element naming nothing at all, which describes no customization.
 const EMPTY_CUSTOMIZATIONS: &str = "<Customizations></Customizations>";
@@ -458,8 +465,9 @@ impl Row {
         }
     }
 
-    /// The request document this row submits against `tenant`.
-    fn xml(self, tenant: &Tenant, slug: &str) -> String {
+    /// The request document this row submits against `tenant`, naming `web_acl` wherever its
+    /// customizations state one.
+    fn xml(self, tenant: &Tenant, slug: &str, web_acl: &str) -> String {
         let mut members = String::new();
         if let Some(domains) = self.stated_domains(tenant, slug) {
             members.push_str(&domains_element(&domains));
@@ -474,7 +482,7 @@ impl Row {
             members.push_str(&format!("<Enabled>{enabled}</Enabled>"));
         }
         if let Some(customizations) = self.customizations {
-            members.push_str(customizations);
+            members.push_str(&customizations.replace(HELD_WEB_ACL_PLACEHOLDER, web_acl));
         }
         if let Some(parameters) = self.parameters {
             let owned: Vec<(String, String)> = parameters
@@ -492,8 +500,9 @@ impl Row {
         update_xml(&members)
     }
 
-    /// The facts the tenant reports once this row has landed on it.
-    fn expected(self, tenant: &Tenant, slug: &str) -> Facts {
+    /// The facts the tenant reports once this row has landed on it, where `web_acl` is the
+    /// ARN its customizations named.
+    fn expected(self, tenant: &Tenant, slug: &str, web_acl: &str) -> Facts {
         let domains = self
             .stated_domains(tenant, slug)
             .unwrap_or_else(|| vec![tenant.domain.clone()]);
@@ -534,7 +543,7 @@ impl Row {
             web_acl: self.expects_web_acl.then(|| {
                 (
                     CUSTOMIZATION_ACTION_OVERRIDE.to_string(),
-                    WEB_ACLS[0].1.to_string(),
+                    web_acl.to_string(),
                 )
             }),
         }
@@ -551,6 +560,7 @@ impl Row {
 async fn a_stated_member_replaces_and_an_unstated_member_is_left_alone() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-update").await;
+    let web_acl = held_web_acl_arn(&router, "tenant-update-web-acl").await;
 
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
@@ -560,7 +570,7 @@ async fn a_stated_member_replaces_and_an_unstated_member_is_left_alone() {
         let answer = update_tenant(
             &router,
             &tenant.id,
-            &row.xml(&tenant, &slug),
+            &row.xml(&tenant, &slug, &web_acl),
             Some(&tenant.etag),
         )
         .await;
@@ -569,7 +579,7 @@ async fn a_stated_member_replaces_and_an_unstated_member_is_left_alone() {
             "case {case}: expected HTTP 200 from UpdateDistributionTenant, got {} with {}",
             answer.status, answer.raw
         );
-        let expected = row.expected(&tenant, &slug);
+        let expected = row.expected(&tenant, &slug, &web_acl);
         let answered = facts_of(answer.root());
         assert_eq!(
             answered, expected,

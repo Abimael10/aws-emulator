@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
@@ -175,10 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The tagging specified is not valid." The tag set the REQUEST describes is
         // decided first, under the same at-most-one-tag-per-key and tag-count rules every
         // tagging path in this service runs, so a request that describes no tag set at
-        // all is refused before any resource is touched.
-        let submitted = crate::state::tag_set(&input.tags).map_err(|reason| {
-            TagResourceErrorModeled::InvalidTagging(crate::state::invalid_tagging(reason))
-        })?;
+        // all is refused before any resource is touched. A key in the namespace AWS
+        // reserves is refused for a CALLER's request and admitted on the in-process path
+        // the tags AWS sets from inside itself arrive on
+        // (`crate::state::tag_key_origin`).
+        let submitted =
+            crate::state::tag_set_from(&input.tags, crate::state::tag_key_origin(ctx))
+                .map_err(TagResourceErrorModeled::InvalidTagging)?;
 
         // The resource is named by ARN. `ResourceARN`'s pattern is already enforced
         // before this handler runs, so what is left to decide is whether the resource TYPE

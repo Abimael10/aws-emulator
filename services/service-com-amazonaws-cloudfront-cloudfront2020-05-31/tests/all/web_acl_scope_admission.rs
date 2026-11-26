@@ -34,7 +34,10 @@
 
 use crate::distribution_lifecycle::{config_table, emulator, Answer};
 use crate::distribution_tenant_lifecycle::multi_tenant_distribution;
-use crate::tenant_web_acl_association::{associate, create_tenant, read_tenant, web_acl_of, STARTS};
+use crate::tenant_web_acl_association::{
+    associate, create_tenant, read_tenant, web_acl_of, START_WEB_ACL_NAME, STARTS,
+};
+use crate::waf_control_plane::shared_web_acl_arn;
 use crate::web_acl_association::{associate_web_acl, create, held_web_acls, read_back};
 
 /// The sentence CloudFront refuses an association naming a web ACL it may not be put behind
@@ -204,6 +207,7 @@ async fn a_tenant_takes_only_a_web_acl_of_cloudfronts_namespace() {
     let web_acls = held_web_acls(&router).await;
     let admitted_arn = web_acls[0].1.as_str();
     let start = STARTS[0];
+    let held = shared_web_acl_arn(&router, START_WEB_ACL_NAME).await;
 
     for (index, (case, web_acl)) in UNASSOCIABLE_WEB_ACLS.iter().enumerate() {
         let slug = format!("scope{index}");
@@ -218,9 +222,7 @@ async fn a_tenant_takes_only_a_web_acl_of_cloudfronts_namespace() {
         let read = read_tenant(&router, &id, case).await;
         assert_eq!(
             web_acl_of(read.root()),
-            start
-                .web_acl_before
-                .map(|(action, arn)| (action.to_string(), arn.to_string())),
+            start.web_acl_before(&held),
             "case {case}: expected the refused association to leave the tenant's web ACL \
              customization as it was, got {:?}",
             web_acl_of(read.root())
@@ -258,6 +260,7 @@ async fn the_refusal_leaves_every_starting_customization_as_it_was() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-scope-tenant-starts").await;
     let web_acl = UNASSOCIABLE_WEB_ACLS[0].1;
+    let held = shared_web_acl_arn(&router, START_WEB_ACL_NAME).await;
 
     for (index, start) in STARTS.iter().enumerate() {
         let case = format!("{}/{}", start.case, UNASSOCIABLE_WEB_ACLS[0].0);
@@ -271,9 +274,7 @@ async fn the_refusal_leaves_every_starting_customization_as_it_was() {
         let read = read_tenant(&router, &id, &case).await;
         assert_eq!(
             web_acl_of(read.root()),
-            start
-                .web_acl_before
-                .map(|(action, arn)| (action.to_string(), arn.to_string())),
+            start.web_acl_before(&held),
             "case {case}: expected the tenant's web ACL customization to be what the create \
              stored, got {:?}",
             web_acl_of(read.root())

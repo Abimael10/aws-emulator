@@ -439,12 +439,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The tagging specified is not valid." A tag set no resource can carry is refused
         // before anything is claimed for the distribution — before the listener below, and
         // so before this request has cost any host resource — so a bad tag set creates
-        // nothing and opens nothing.
-        let tags = crate::state::tag_set(&tags).map_err(|reason| {
-            CreateDistributionWithTagsErrorModeled::InvalidTagging(crate::state::invalid_tagging(
-                reason,
-            ))
-        })?;
+        // nothing and opens nothing. A key in the namespace AWS reserves is refused for a
+        // CALLER's request and admitted on the in-process path the tags AWS sets from
+        // inside itself arrive on (`crate::state::tag_key_origin`).
+        let tags = crate::state::tag_set_from(&tags, crate::state::tag_key_origin(ctx))
+            .map_err(CreateDistributionWithTagsErrorModeled::InvalidTagging)?;
 
         // The listener this distribution's edge is served on, opened before the store lock
         // is taken for the reason `CreateDistribution` opens it there — and, as there, after

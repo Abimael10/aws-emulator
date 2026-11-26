@@ -1404,36 +1404,147 @@ const OPAQUE_ID_DIGITS_PER_DRAW: usize = 10;
 /// CloudFront leaves unspecified.
 pub type TagSet = BTreeMap<String, Option<String>>;
 
-/// The tag set `tags` describes, or the REASON a tag set no resource can carry was
-/// refused.
+/// The tag set `tags` describes, or the REASON a tag set no resource can carry was refused,
+/// for a surface whose own model declares no `InvalidTagging`.
 ///
-/// Two rules the model cannot express: a resource carries at most one tag per key, so a
-/// request naming one key twice describes no tag set at all; and a resource carries at
-/// most [`MAX_TAGS_PER_RESOURCE`] tags. Each tag's key and value length and character
-/// constraints ARE modelled (`TagKey`, `TagValue`), so those are already refused before
-/// any handler runs.
+/// The same rule [`tag_set_from`] applies, reported as text rather than as that error shape:
+/// each such surface words the refusal with the sentence of whichever error IT declares and
+/// states this reason after it.
+pub fn tag_set_reason(tags: &Tags, origin: TagKeyOrigin) -> Result<TagSet, String> {
+    tag_set_refusal(tags, origin).map_err(|refusal| refusal.reason)
+}
+
+/// Who is naming the tag keys one request carries, which is what decides whether a key in
+/// the namespace AWS reserves may be written ([`tag_set_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagKeyOrigin {
+    /// A request a CLIENT made. A key in the reserved namespace is AWS's own, so such a
+    /// request may not write one.
+    Caller,
+    /// A request another emulated service made in-process on behalf of a resource it
+    /// provisions — the path the tags AWS sets from inside itself arrive on, which no
+    /// client's request can be. A key in the reserved namespace travels on it.
+    Service,
+}
+
+/// Where the tag keys this request names came from.
 ///
-/// ONE rule for every resource kind this service tags. The reason carries no error
-/// wording of its own: each caller prefixes it with the wording of whichever refusal its
-/// OWN model declares, so the message a client reads names the error it was given.
-pub fn tag_set(tags: &Tags) -> Result<TagSet, String> {
+/// A tag in the reserved namespace is AWS's to set: the refusal
+/// ([`RESERVED_TAG_KEY_MESSAGE`]) is the answer to an API CALLER, while the services that own
+/// such a tag set it from inside AWS, through no public API — the stack tags a provisioned
+/// resource carries are exactly that. In this emulator one service reaches another ONLY
+/// through the in-process callback
+/// ([`::smithy_server_runtime::OperationContext::callback`]), so that callback is the inside
+/// path, and the signal is the [`::smithy_server_runtime::CallbackRecursionDepth`] request
+/// EXTENSION the framework's callback transport stamps on every in-process call. An extension
+/// never travels over the wire: nothing a client can send — on any socket, signed with any
+/// credential — sets it, so a client's reserved key is refused exactly as before.
+pub fn tag_key_origin(ctx: &::smithy_server_runtime::OperationContext<'_>) -> TagKeyOrigin {
+    match ctx
+        .parts()
+        .extensions
+        .get::<::smithy_server_runtime::CallbackRecursionDepth>()
+    {
+        Some(_) => TagKeyOrigin::Service,
+        None => TagKeyOrigin::Caller,
+    }
+}
+
+/// The tag set `tags` describes, or the modelled `InvalidTagging` a tag set no resource
+/// can carry is refused with.
+///
+/// Three rules the model cannot express: a key an API caller names may not be in the
+/// namespace AWS reserves for its own tags ([`RESERVED_TAG_KEY_PREFIX`], the one rule that
+/// depends on WHO named the key — see [`TagKeyOrigin`]); a resource carries at most one
+/// tag per key, so a request naming one key twice describes no tag set at all; and a
+/// resource carries at most [`MAX_TAGS_PER_RESOURCE`] tags. Each tag's key and value
+/// length and character constraints ARE modelled (`TagKey`, `TagValue`), so those are
+/// already refused before any handler runs.
+///
+/// ONE rule for every resource kind this service tags, and one producer of each refusal
+/// it carries: the reserved namespace is the condition AWS states a sentence of its own
+/// for ([`reserved_tag_key`]), while the two conditions about the SET state the constraint
+/// the request broke after the error shape's own sentence ([`invalid_tagging`]) — so every
+/// tagging surface answers the same condition with the same words, and a handler only
+/// names the variant its own model declares. A surface whose model declares no
+/// `InvalidTagging` reads the same rule through [`tag_set_reason`].
+pub fn tag_set_from(tags: &Tags, origin: TagKeyOrigin) -> Result<TagSet, InvalidTagging> {
+    tag_set_refusal(tags, origin).map_err(|refusal| {
+        if refusal.reserved_key {
+            reserved_tag_key()
+        } else {
+            invalid_tagging(refusal.reason)
+        }
+    })
+}
+
+/// What a tag set no resource can carry was refused for: the text stating the condition, and
+/// whether that condition is the reserved namespace — the one condition AWS words with a
+/// sentence of its own rather than after the error shape's.
+struct TagSetRefusal {
+    reason: String,
+    reserved_key: bool,
+}
+
+/// The one reading of the tagging rule both reports above are built from.
+fn tag_set_refusal(tags: &Tags, origin: TagKeyOrigin) -> Result<TagSet, TagSetRefusal> {
+    let unusable = |reason: String| TagSetRefusal {
+        reason,
+        reserved_key: false,
+    };
     let items = tags.items.as_deref().unwrap_or_default();
     if items.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(format!(
+        return Err(unusable(format!(
             "a CloudFront resource carries at most {MAX_TAGS_PER_RESOURCE} tags but the \
              request names {}",
             items.len()
-        ));
+        )));
     }
     let mut set = TagSet::new();
     for tag in items {
+        // The reserved namespace is AWS's own, so a key in it is no key a CALLER may
+        // attach: decided from the key alone, before the set it would join is built.
+        if origin == TagKeyOrigin::Caller && is_reserved_tag_key(&tag.key) {
+            return Err(TagSetRefusal {
+                reason: RESERVED_TAG_KEY_MESSAGE.to_string(),
+                reserved_key: true,
+            });
+        }
         // One lookup: a key the set already held is a request that does not describe a
         // tag set at all.
         if set.insert(tag.key.clone(), tag.value.clone()).is_some() {
-            return Err(format!("the tag key {} is named more than once", tag.key));
+            return Err(unusable(format!(
+                "the tag key {} is named more than once",
+                tag.key
+            )));
         }
     }
     Ok(set)
+}
+
+/// The namespace AWS reserves for the tags IT attaches, which no caller may write a tag
+/// in: `TagKey`'s pattern admits the colon, so a key in it reaches a handler and is
+/// refused here rather than by the modelled constraints.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in the namespace AWS reserves ([`RESERVED_TAG_KEY_PREFIX`]). A tag key is
+/// matched case-sensitively, but the NAMESPACE is AWS's whatever case it is written in, so
+/// the prefix is compared without regard to case.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The sentence a tagging call naming a key in the reserved namespace is refused with: the
+/// whole text is fixed — it states the namespace no key may open with and carries neither
+/// the key submitted nor the resource it was meant for. Recorded behaviour.
+pub const RESERVED_TAG_KEY_MESSAGE: &str = "Tag key cannot start with 'aws:'.";
+
+/// The modelled `InvalidTagging` (HTTP 400) for a tag key in the namespace AWS reserves.
+pub fn reserved_tag_key() -> InvalidTagging {
+    InvalidTagging {
+        message: Some(RESERVED_TAG_KEY_MESSAGE.to_string()),
+    }
 }
 
 /// The `Tags` projection a tag read returns for a stored tag set.

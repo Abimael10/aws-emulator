@@ -238,19 +238,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_argument(reason));
         }
 
+        // WHICH web ACL a customization names is RESOLVED against WAF — the service that
+        // holds web ACLs — before this service's store is locked, so a tenant is never
+        // created reporting a protection nothing holds. The refusal is the one sentence this
+        // service answers an unresolvable web ACL with, wherever the ARN arrived.
+        if crate::service::web_acl::unresolvable_customization_web_acl(
+            &*self.engine,
+            input.customizations.as_ref(),
+        ) {
+            return Err(CreateDistributionTenantErrorModeled::InvalidArgument(
+                crate::state::invalid_web_acl(),
+            )
+            .into());
+        }
+
         // A tag set no resource can carry is refused with the error this operation models
         // for an invalid tag set, under the service's one tagging rule (which bounds the
         // tag count too).
         let tags = input
             .tags
             .as_ref()
-            .map(crate::state::tag_set)
+            .map(|tags| crate::state::tag_set_from(tags, crate::state::tag_key_origin(ctx)))
             .transpose()
-            .map_err(|reason| {
-                CreateDistributionTenantErrorModeled::InvalidTagging(crate::state::invalid_tagging(
-                    reason,
-                ))
-            })?
+            .map_err(CreateDistributionTenantErrorModeled::InvalidTagging)?
             .unwrap_or_default();
 
         // ---- The store ------------------------------------------------------------

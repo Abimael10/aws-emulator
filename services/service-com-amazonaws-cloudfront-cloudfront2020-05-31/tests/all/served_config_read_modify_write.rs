@@ -19,8 +19,8 @@
 //! for some member the flip made inadmissible.
 //!
 //! The rows differ along what the rule generalises over: which KIND of distribution the
-//! document describes (multi-tenant by `ConnectionMode`, multi-tenant by `TenantConfig`
-//! alone, standard), which member of the served document is changed (a comment, a flag the
+//! document describes (multi-tenant, standard), which member of the served document is
+//! changed (a comment, a flag the
 //! service itself supplied, an enum, a nested value inside an origin, a nested value inside
 //! the tenant configuration) and, for the refusals, which immutable member is moved.
 //!
@@ -30,6 +30,7 @@
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     DEFAULT_COMPRESS, DEFAULT_HTTP_VERSION, ILLEGAL_UPDATE_CONNECTION_MODE_MESSAGE,
     ILLEGAL_UPDATE_DISTRIBUTION_CALLER_REFERENCE_MESSAGE,
+    TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE,
 };
 
 use crate::connection_mode_immutable::{
@@ -82,17 +83,15 @@ impl Kind {
     }
 }
 
-/// The three kinds, spanning both tenancies and both ways a document declares a
-/// multi-tenant one.
+/// The two kinds, spanning both tenancies.
+///
+/// A `TenantConfig` with no `ConnectionMode` is no kind: the member "only supports
+/// multi-tenant distributions", and a configuration that does not DECLARE the tenant-only
+/// mode may not carry it at all ([`crate::tenant_config_admission`] is that rule).
 const KINDS: &[Kind] = &[
     Kind {
         case: "multi-tenant by ConnectionMode and TenantConfig",
         connection_mode: Some(TENANT_ONLY),
-        tenant_config: true,
-    },
-    Kind {
-        case: "multi-tenant by TenantConfig alone",
-        connection_mode: None,
         tenant_config: true,
     },
     Kind {
@@ -354,13 +353,23 @@ fn refusals() -> Vec<Refusal> {
             } else {
                 TENANT_ONLY
             };
+            // Moving the mode of a document that CARRIES a `TenantConfig` to `direct`
+            // describes a direct distribution with tenant parameters, which is refused for
+            // that member rather than for the mode it moved: the member is one only a
+            // multi-tenant configuration may state
+            // ([`crate::tenant_config_admission`]).
+            let (code, message) = if other == DIRECT && kind.tenant_config {
+                ("InvalidArgument", TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE)
+            } else {
+                ("IllegalUpdate", ILLEGAL_UPDATE_CONNECTION_MODE_MESSAGE)
+            };
             rows.push(Refusal {
                 case: format!("{}, moving ConnectionMode to {other}", kind.case),
                 kind: *kind,
                 find: element("ConnectionMode", mode),
                 replace: element("ConnectionMode", other),
-                code: "IllegalUpdate",
-                message: ILLEGAL_UPDATE_CONNECTION_MODE_MESSAGE,
+                code,
+                message,
             });
         }
         rows.push(Refusal {

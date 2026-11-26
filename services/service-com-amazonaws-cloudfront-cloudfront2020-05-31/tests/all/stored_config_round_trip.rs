@@ -17,8 +17,8 @@
 //!
 //! Every row stands a distribution up over HTTP, reads its configuration back and resubmits
 //! that document unchanged, twice. The rows differ along what the rule generalises over:
-//! which member declares the distribution multi-tenant (`ConnectionMode`, `TenantConfig`,
-//! both), how many cache behaviours the configuration carries (the default one alone, and
+//! which member declares the distribution multi-tenant (`ConnectionMode` alone, and beside a
+//! `TenantConfig`), how many cache behaviours the configuration carries (the default one alone, and
 //! one and two ordered ones beside it), which members a behaviour states for itself, and —
 //! as the control the other side of the rule is read on — the same shapes on a STANDARD
 //! distribution, where those members are the distribution's own and the service does supply
@@ -162,17 +162,6 @@ fn rows() -> Vec<Row> {
                 MANAGED_CACHE_KEY,
                 &[],
                 "<ConnectionMode>tenant-only</ConnectionMode>",
-            ),
-        },
-        Row {
-            case: "multi-tenant by TenantConfig alone, no ConnectionMode",
-            multi_tenant: true,
-            legacy_cache_key: false,
-            config: config_xml(
-                "round-trip-tenant-config-only",
-                MANAGED_CACHE_KEY,
-                &[],
-                TENANT_CONFIG,
             ),
         },
         Row {

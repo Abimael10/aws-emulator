@@ -108,7 +108,14 @@ pub fn tenant_parameter_refusal(config: &DistributionConfig) -> Option<String> {
             ),
         ];
         for (member, value) in members {
-            for name in parameter_references(value) {
+            let references = parameter_references(value);
+            // How MANY parameters one member references is a property of that member alone,
+            // so it is answered before the names are resolved: a field past the ceiling is
+            // refused whether or not every name in it is declared.
+            if references.len() > MAX_PARAMETERS_PER_FIELD {
+                return Some(TOO_MANY_PARAMETERS_PER_FIELD_MESSAGE.to_string());
+            }
+            for name in references {
                 if !multi_tenant {
                     return Some(unresolvable_parameter_member_message(member));
                 }
@@ -120,6 +127,90 @@ pub fn tenant_parameter_refusal(config: &DistributionConfig) -> Option<String> {
     }
     None
 }
+
+/// The most tenant parameters ONE member of a configuration may reference.
+///
+/// RECORDED behaviour, which is where this number comes from: the service creates a
+/// multi-tenant distribution whose `OriginPath` references exactly this many of its declared
+/// parameters and reports the path back unchanged, and refuses one referencing one more —
+/// "your request exceeds the maximum number of parameters per field". CloudFront publishes no
+/// figure for it, so it is the recording that fixes the bound here.
+pub const MAX_PARAMETERS_PER_FIELD: usize = 2;
+
+/// The sentence CloudFront refuses a configuration whose member references more parameters
+/// than [`MAX_PARAMETERS_PER_FIELD`] with.
+///
+/// FIXED text: it states the ceiling the field broke and what to do about it, and names
+/// neither the member nor the value that carried the references. Recorded behaviour.
+pub const TOO_MANY_PARAMETERS_PER_FIELD_MESSAGE: &str =
+    "Your request exceeds the maximum number of parameters per field. Specify fewer parameters \
+     and try again.";
+
+/// Why the `TenantConfig` of a submitted `DistributionConfig` is one CloudFront would not
+/// store, or `None` when the configuration carries none or carries a usable one.
+///
+/// Two rules about the member itself, read before the references its definitions admit
+/// ([`tenant_parameter_refusal`]) are resolved:
+///
+/// * `TenantConfig` "only supports multi-tenant distributions. You can't specify this field
+///   for standard distributions", so only a configuration DECLARING the tenant-only
+///   connection mode may carry it. What declares that is the `ConnectionMode` MEMBER — a
+///   configuration that states `direct`, states another mode or states none at all describes
+///   a standard distribution, which is what "a direct distribution" is in the sentence the
+///   refusal states ([`TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE`]);
+/// * a parameter definition's `Definition` is "the value that you assigned to the parameter",
+///   and `StringSchemaConfig` is the schema that value is admitted by — so a definition has to
+///   state a schema at all, and a schema that marks the parameter `Required` ("whether the
+///   defined parameter is required") states no `DefaultValue` for it: a default would supply
+///   the value every tenant is required to supply itself, so the two together describe no
+///   admission rule. Either way the whole list is refused with the one sentence the service
+///   states for it ([`INVALID_PARAMETER_DEFINITION_SCHEMAS_MESSAGE`]).
+///
+/// Checked on the way IN, on every path that stores a `DistributionConfig`, so no stored
+/// configuration carries a `TenantConfig` the distribution it describes could not have.
+pub fn tenant_config_refusal(config: &DistributionConfig) -> Option<String> {
+    let tenant_config = config.tenant_config.as_ref()?;
+    if config.connection_mode.as_deref() != Some(CONNECTION_MODE_TENANT_ONLY) {
+        return Some(TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE.to_string());
+    }
+    tenant_config
+        .parameter_definitions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(unusable_parameter_definition)
+        .then(|| INVALID_PARAMETER_DEFINITION_SCHEMAS_MESSAGE.to_string())
+}
+
+/// Whether `definition` states no schema a tenant's value for that parameter could be
+/// admitted by ([`tenant_config_refusal`] states the rule).
+fn unusable_parameter_definition(definition: &ParameterDefinition) -> bool {
+    match definition.definition.string_schema.as_ref() {
+        None => true,
+        Some(schema) => {
+            schema.required
+                && schema
+                    .default_value
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+        }
+    }
+}
+
+/// The sentence CloudFront refuses a `TenantConfig` on a configuration that does not declare
+/// the tenant-only connection mode with: the fixed text names the member that may not be
+/// there and the kind of distribution it may not be there for. Recorded behaviour.
+pub const TENANT_CONFIG_ON_DIRECT_DISTRIBUTION_MESSAGE: &str =
+    "The parameter TenantConfig cannot be set for a direct distribution.";
+
+/// The sentence CloudFront refuses a parameter definition list carrying a schema it cannot
+/// admit values by with.
+///
+/// FIXED text: it states the condition over the whole list and what to review, so neither the
+/// parameter that broke it nor anything else of the request belongs in it. Recorded behaviour.
+pub const INVALID_PARAMETER_DEFINITION_SCHEMAS_MESSAGE: &str =
+    "One or more parameter definition schemas aren't valid. Review the parameters for the \
+     multi-tenant distribution and try again.";
 
 /// The sentence CloudFront refuses a configuration whose member `member` references a
 /// parameter that configuration cannot resolve with, on the wire.

@@ -452,12 +452,17 @@ struct TenancyCase {
 /// `ParameterDefinitions` is a list whose member carries no `xmlName`
 /// (`smithy_query(query="shape",shape="ParameterDefinitions")`), so each entry travels in
 /// the restXml default `<member>` element.
+///
+/// A `DefaultValue` sits on the OPTIONAL definition: a schema that is `Required` and carries
+/// a default supplies the value the tenant must supply itself, and CloudFront admits no such
+/// schema ([`crate::tenant_config_admission`] is that rule).
 const TENANT_CONFIG: &str = "<TenantConfig><ParameterDefinitions>\
      <member><Name>tenantName</Name><Definition><StringSchema>\
-     <Comment>the tenant's name</Comment><DefaultValue>acme</DefaultValue>\
+     <Comment>the tenant's name</Comment>\
      <Required>true</Required></StringSchema></Definition></member>\
      <member><Name>region-label</Name><Definition><StringSchema>\
-     <Required>false</Required></StringSchema></Definition></member>\
+     <DefaultValue>eu</DefaultValue><Required>false</Required>\
+     </StringSchema></Definition></member>\
      </ParameterDefinitions></TenantConfig>";
 
 /// Every arrangement of the two members that make a distribution multi-tenant, and the
@@ -475,11 +480,6 @@ const TENANCY_CASES: &[TenancyCase] = &[
         multi_tenant: true,
     },
     TenancyCase {
-        case: "tenant-config-alone",
-        extra: "",
-        multi_tenant: true,
-    },
-    TenancyCase {
         case: "connection-mode-direct",
         extra: "<ConnectionMode>direct</ConnectionMode>",
         multi_tenant: false,
@@ -492,9 +492,10 @@ const TENANCY_CASES: &[TenancyCase] = &[
 ];
 
 impl TenancyCase {
-    /// Whether this row's configuration carries a `TenantConfig`. Every multi-tenant row
-    /// but the first does, so the table covers the member on its own, beside the
-    /// connection mode, and absent.
+    /// Whether this row's configuration carries a `TenantConfig`. One multi-tenant row does
+    /// and the other does not, so the table covers the member beside the connection mode and
+    /// absent — a `TenantConfig` without the tenant-only connection mode is no configuration
+    /// CloudFront admits ([`crate::tenant_config_admission`]).
     fn carries_tenant_config(&self) -> bool {
         self.multi_tenant && self.case != "connection-mode-tenant-only"
     }

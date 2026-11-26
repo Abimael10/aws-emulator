@@ -44,6 +44,14 @@
 //! * `CacheBehavior$TargetOriginId` is "the value of the `ID` field of the origin that you
 //!   want CloudFront to route requests to", so it resolves against the `Origins` and
 //!   `OriginGroups` of the SAME configuration;
+//! * `DistributionConfig$Comment` "cannot be longer than 128 characters"
+//!   ([`MAX_DISTRIBUTION_COMMENT`]), the bound every comment of this service states;
+//! * `CacheTagConfig$HeaderName` is "the name of the HTTP header that your origin includes in
+//!   responses", so it is written as a header field name ([`is_http_token`]) — a value that is
+//!   not names a header no origin could send;
+//! * `OriginCustomHeader$HeaderName` is "the name of a header that you want CloudFront to send
+//!   to your origin", and the service documents the headers it will not add for one
+//!   ([`RESERVED_ORIGIN_CUSTOM_HEADERS`]);
 //! * `TrustedKeyGroups$Items` are "the identifiers of key groups" whose public keys verify a
 //!   signed URL, so each one resolves against the key groups the account holds.
 //!
@@ -233,6 +241,15 @@ pub fn config_member_refusal(config: &DistributionConfig) -> Option<ConfigMember
         return Some(refusal);
     }
     if let Some(refusal) = behavior_member_refusal(config) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = comment_refusal(config) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = cache_tag_config_refusal(config) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = origin_custom_header_refusal(config) {
         return Some(refusal);
     }
     unresolved_target_origin(config).map(|_| {
@@ -530,6 +547,152 @@ fn behavior_member_refusal(config: &DistributionConfig) -> Option<ConfigMemberRe
         }
     }
     None
+}
+
+/// The refusal `config`'s `Comment` carries, or `None` when it is inside the length the member
+/// admits.
+///
+/// `DistributionConfig$Comment` is "a comment to describe the distribution. The comment cannot
+/// be longer than 128 characters" — the bound every free-text comment of this service states
+/// ([`MAX_DISTRIBUTION_COMMENT`]) — and the member carries no `@length` in the model, so
+/// nothing refuses a longer one before a handler runs. Over it the refusal is the one sentence
+/// this service answers every comment bound with ([`comment_too_long`]).
+fn comment_refusal(config: &DistributionConfig) -> Option<ConfigMemberRefusal> {
+    (config.comment.chars().count() > MAX_DISTRIBUTION_COMMENT)
+        .then(|| ConfigMemberRefusal::InvalidArgument(comment_too_long()))
+}
+
+/// The longest comment a distribution's configuration carries: the 128 characters
+/// `DistributionConfig$Comment` documents ("the comment cannot be longer than 128
+/// characters"), which is the same bound stated in the same words for every other comment of
+/// this service — so it is that constant rather than a second literal.
+pub const MAX_DISTRIBUTION_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
+
+/// The refusal `config`'s `CacheTagConfig` carries, or `None` when it names an HTTP header —
+/// or when the configuration extracts no cache tags at all.
+///
+/// `CacheTagConfig$HeaderName` is "the name of the HTTP header that your origin includes in
+/// responses. CloudFront uses this header to extract cache tags", so the value has to be a
+/// header FIELD NAME: an origin can never send a header whose name is not one, and the tags
+/// such a configuration keys on would never be extracted from anything. The set a field name
+/// is written from is the HTTP token ([`is_http_token`]), and a value outside it is refused
+/// with the sentence that names the parameter and echoes the value the caller has to fix
+/// ([`cache_tag_header_name_message`]).
+fn cache_tag_config_refusal(config: &DistributionConfig) -> Option<ConfigMemberRefusal> {
+    let header_name = config.cache_tag_config.as_ref()?.header_name.as_str();
+    (!is_http_token(header_name)).then(|| {
+        ConfigMemberRefusal::InvalidArgument(crate::ops::types::InvalidArgument {
+            message: Some(cache_tag_header_name_message(header_name)),
+        })
+    })
+}
+
+/// Whether `value` is an HTTP token, which is what a header field name is written as: a
+/// non-empty run of the ASCII letters, the digits and the punctuation RFC 9110's `tchar`
+/// admits ([`HTTP_TOKEN_PUNCTUATION`]). A value carrying anything else — a space, a
+/// separator, a control character, a byte outside ASCII — is no field name, and neither is the
+/// empty value, which names no header at all.
+pub fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || HTTP_TOKEN_PUNCTUATION.contains(character)
+        })
+}
+
+/// The punctuation an HTTP token carries beside the ASCII letters and digits, as RFC 9110
+/// states `tchar`.
+pub const HTTP_TOKEN_PUNCTUATION: &str = "!#$%&'*+-.^_`|~";
+
+/// The sentence CloudFront refuses a cache tag header name that is no header field name with,
+/// on the wire.
+///
+/// The fixed text names the member PATH the value arrived in, as the service words it —
+/// the shape name and the wire name of the member — and the one variable part is the value
+/// submitted, taken from the request so the caller reads back the name it sent. Recorded
+/// behaviour.
+pub fn cache_tag_header_name_message(header_name: &str) -> String {
+    format!(
+        "The parameter CacheTagConfig:headerName contains {header_name} that has illegal \
+         characters."
+    )
+}
+
+/// The refusal the first origin custom header of `config` that names a header CloudFront
+/// reserves carries, or `None` when every one of them names a header CloudFront may add.
+///
+/// `OriginCustomHeader$HeaderName` is "the name of a header that you want CloudFront to send
+/// to your origin", and the service documents the headers it will not add for you
+/// ([`RESERVED_ORIGIN_CUSTOM_HEADERS`]): each of them is part of how the edge itself
+/// addresses the origin or is the viewer's own, so a configuration naming one describes a
+/// request CloudFront would never make. The refusal names the member and the header the
+/// caller has to drop ([`reserved_origin_custom_header_message`]).
+///
+/// The origins are walked in the order the configuration states them, and each origin's
+/// headers in the order it lists them, so a configuration naming several reserved headers is
+/// always refused for the same one.
+fn origin_custom_header_refusal(config: &DistributionConfig) -> Option<ConfigMemberRefusal> {
+    config
+        .origins
+        .items
+        .iter()
+        .filter_map(|origin| origin.custom_headers.as_ref())
+        .flat_map(|headers| headers.items.as_deref().unwrap_or_default())
+        .find(|header| is_reserved_origin_custom_header(&header.header_name))
+        .map(|header| {
+            ConfigMemberRefusal::InvalidArgument(crate::ops::types::InvalidArgument {
+                message: Some(reserved_origin_custom_header_message(&header.header_name)),
+            })
+        })
+}
+
+/// Whether `header_name` names a header CloudFront reserves
+/// ([`RESERVED_ORIGIN_CUSTOM_HEADERS`]). A field name is case-insensitive, so the comparison
+/// is too.
+pub fn is_reserved_origin_custom_header(header_name: &str) -> bool {
+    RESERVED_ORIGIN_CUSTOM_HEADERS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(header_name.trim()))
+}
+
+/// The headers CloudFront will not add to an origin request on a distribution's behalf, so
+/// none of them may be named by an origin's `CustomHeaders`.
+///
+/// The list is the one the Amazon CloudFront Developer Guide's "Adding custom headers to
+/// origin requests" states — the page `OriginCustomHeader$HeaderName` itself points at
+/// (`smithy_query(query="doc",shape="OriginCustomHeader",member="HeaderName")`) — under the
+/// headers CloudFront can't add: the hop-by-hop and framing headers of the connection the
+/// edge itself opens to the origin, the conditional and range headers the viewer's own
+/// request carries, and the address the edge reports the viewer by.
+pub const RESERVED_ORIGIN_CUSTOM_HEADERS: &[&str] = &[
+    "Cache-Control",
+    "Connection",
+    "Content-Length",
+    "Cookie",
+    "Host",
+    "If-Match",
+    "If-Modified-Since",
+    "If-None-Match",
+    "If-Range",
+    "If-Unmodified-Since",
+    "Max-Forwards",
+    "Pragma",
+    "Proxy-Authorization",
+    "Proxy-Connection",
+    "Range",
+    "Request-Range",
+    "TE",
+    "Trailer",
+    "Transfer-Encoding",
+    "Upgrade",
+    "Via",
+    "X-Real-IP",
+];
+
+/// The sentence CloudFront refuses an origin custom header naming a reserved header with, on
+/// the wire: the fixed text names the MEMBER the value arrived in and the one variable part is
+/// the header name submitted, taken from the request. Recorded behaviour.
+pub fn reserved_origin_custom_header_message(header_name: &str) -> String {
+    format!("The parameter HeaderName : {header_name} is not allowed.")
 }
 
 /// The `TargetOriginId` of the first cache behaviour of `config` that names neither an origin

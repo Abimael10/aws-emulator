@@ -616,6 +616,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same rule the create path applies: `TenantConfig` is the multi-tenant-only
+        // member, and the schemas its definitions declare are what a tenant's values are
+        // admitted by, so an update cannot leave a distribution carrying one a create could
+        // not have stored.
+        if let Some(message) = crate::state::tenant_config_refusal(&input.distribution_config) {
+            return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The same rule the create path applies: a configuration may reference a tenant
         // parameter only where it declares one, so an update cannot leave a distribution
         // carrying a reference CloudFront could never substitute either.
