@@ -974,7 +974,9 @@ pub fn metadata_for(
 ///
 /// `userId` and `itemId` are bounded only by a `@length` that starts at 0, so the
 /// boundary validator accepts an empty string for either; an empty string identifies no
-/// user and no item, so every handler reads it as the member not being supplied.
+/// user and no item, so every handler reads it as the member not being supplied. The
+/// entries of `GetPersonalizedRanking`'s `inputList` target that same `ItemID` shape, so
+/// an entry that is the empty string is read the same way: it names no item.
 ///
 /// The ARN members — `campaignArn`, `recommenderArn` and `filterArn` — carry that same
 /// length bound AND the `Arn` `@pattern`, which no empty or blank string satisfies, so

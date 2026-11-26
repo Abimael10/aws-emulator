@@ -25,7 +25,12 @@
 //!    version ("The solution backing the campaign must have been created using a
 //!    recipe of type PERSONALIZED_RANKING") — otherwise 400.
 //! 3. Each `inputList` entry is looked up in the campaign's STORED Items catalog. An
-//!    entry the catalog holds is scored by [`crate::state::scoring::Seed::relevance`] from
+//!    entry is an `ItemID`, bounded only by a `@length` that starts at 0, so an entry
+//!    that is the empty string identifies no item and is read as the entry not being
+//!    supplied (`crate::state::present`, the rule every `UserID`/`ItemID` of this
+//!    service is read by): it names neither a catalog record nor an item to append, so
+//!    it adds nothing to the ranking. An entry the catalog holds is scored by
+//!    [`crate::state::scoring::Seed::relevance`] from
 //!    its stored `base_score` and the request's `userId`/`context`; an entry the
 //!    catalog does not hold "is appended to the end of the reranked list", with no
 //!    relevance score for the user. The reported score is the entry's share of the
@@ -368,10 +373,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    holding only the requested columns the entry actually carries — none, here.
         let no_attributes: BTreeMap<String, String> = BTreeMap::new();
         for item_id in &input.input_list {
-            if catalog.iter().any(|item| &item.item_id == item_id) {
+            //    An entry that names no item appends none: it is read as the entry not
+            //    being supplied ([`listed_positions`]), so it is neither a catalog record
+            //    nor an item the training dataset left out.
+            let Some(item_id) = registry::present(Some(item_id.as_str())) else {
+                continue;
+            };
+            if catalog.iter().any(|item| item.item_id == item_id) {
                 continue;
             }
-            if !reported.insert(item_id.as_str()) {
+            if !reported.insert(item_id) {
                 continue;
             }
             if request_filter
@@ -381,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             personalized_ranking.push(PredictedItem {
-                item_id: Some(item_id.clone()),
+                item_id: Some(item_id.to_string()),
                 score: Some(0.0),
                 promotion_name: None,
                 metadata: registry::metadata_for(&no_attributes, metadata_columns.as_deref()),
@@ -403,10 +414,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The first occurrence is the one that counts: an id the caller listed again names the
 /// same catalog entry, so the repeat may move neither which ids come back nor the order
 /// a tie between them resolves in.
+///
+/// An entry NAMES an id: an entry is an `ItemID`, bounded only by a `@length` that starts
+/// at 0, so the boundary admits the empty string for one, and an empty string identifies
+/// no item — the one reading of a `UserID`/`ItemID` this crate has
+/// ([`registry::present`]). Such an entry is therefore read as the entry not being
+/// supplied: it names nothing to report, and the ranking is the one the same list without
+/// it gets.
 fn listed_positions(input_list: &[String]) -> BTreeMap<&str, usize> {
     let mut listed: BTreeMap<&str, usize> = BTreeMap::new();
     for (position, item_id) in input_list.iter().enumerate() {
-        listed.entry(item_id.as_str()).or_insert(position);
+        if let Some(item_id) = registry::present(Some(item_id.as_str())) {
+            listed.entry(item_id).or_insert(position);
+        }
     }
     listed
 }
