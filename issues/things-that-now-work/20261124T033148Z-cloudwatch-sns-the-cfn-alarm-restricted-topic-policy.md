@@ -40,3 +40,42 @@ Actual: no verdict; the run was ended by the 60 s per-check cap before any of th
 4. Poll the control stack's QueueUrl: a notification must arrive whose Message has AlarmName == the control alarm and NewStateValue == 'ALARM'.
 5. Poll the restricted stack's QueueUrl for at least as long as the control took: nothing may arrive.
 6. Re-replay the id to confirm the scenario reaches a verdict inside the suite's cap.
+
+## Resolution
+
+* Cause 1 — "the two-stack alarm-notification permission scenario never reaches a verdict" — is
+  DECLINED: every leg the report asks about is served, and the report's own hypothesis (that the
+  CloudFormation deploys do not converge quickly enough) does not hold. Timed on the emulator a
+  client STARTS (the built binary, authentication on, the consumer long-polling), with the two
+  templates this report describes: the control stack reaches `CREATE_COMPLETE` 0.73 s after
+  `CreateStack` and the restricted stack 0.68 s after its own; `SetAlarmState` answers in 12 ms and
+  60 ms; the control queue holds the notification 3.5 ms after the force — its `Body` is the SNS
+  envelope and `json.loads(Body)["Message"]` carries `AlarmName` = the control alarm and
+  `NewStateValue` = `ALARM` — and the restricted queue holds nothing. The whole scenario up to the
+  absence window takes 1.49 s. What is left of the check's 60 s cap is the check's own absence
+  window, which it holds on the restricted queue for at least as long as the control took and in
+  practice for tens of seconds: that window is wall-clock time no emulator change can shorten,
+  which is why the cut lands in `_poll_for_notification`, the helper BOTH of the check's polls go
+  through. The same reason is already recorded for this trace id in
+  `issues/things-that-now-work/20261114T170523Z-cloudwatch-sns-a-cfn-deployed-alarm-s-sns.md`,
+  `issues/things-that-now-work/20261114T083920Z-cloudwatch-sns-a-cfn-deployed-aws-sns-topicpolicy.md`
+  and `issues/things-that-now-work/20261029T182452Z-cloudwatch-sns-alarm-actions-cfn-alarms-are-never.md`.
+* What this change adds is the one axis of that chain no test pinned: WHICH transitions a deployed
+  estate owes its topic, and that a withheld publish is not retried by a later evaluation.
+  `core/router/tests/all/cloudwatch_cfn_alarm_action_lists_fire_once_per_transition.rs` deploys four
+  stacks — a topic, the queue subscribed to it, the queue policy that lets SNS write to it and an
+  alarm whose action lists the row decides — and observes three transitions of each deployed alarm:
+  the first evaluation out of `INSUFFICIENT_DATA`, the force into `ALARM`, and the evaluation that
+  takes the forced state back. Its rows span which list names the topic (`AlarmActions` only,
+  `OKActions` only, both) and whether the policy the same stack declares grants the publish, and each
+  row's queue must hold exactly the transitions that list is owed and nothing more once the alarm is
+  back in the state its own evaluation decides.
+* No handler changed, because each already does what this report asks for: the dispatch and the
+  topic-policy reading
+  (`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/state/alarm_actions.rs`),
+  the subscribed-queue hand-over
+  (`services/service-com-amazonaws-sns-amazonsimplenotificationservice/src/ops/publish/service_delivery.rs`)
+  and the `AWS::SNS::Topic` / `AWS::SNS::TopicPolicy` / `AWS::SNS::Subscription` / `AWS::SQS::Queue` /
+  `AWS::SQS::QueuePolicy` / `AWS::CloudWatch::Alarm` providers
+  (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/application_services.rs`,
+  `.../provisioner/cloudwatch_alarms.rs`).
