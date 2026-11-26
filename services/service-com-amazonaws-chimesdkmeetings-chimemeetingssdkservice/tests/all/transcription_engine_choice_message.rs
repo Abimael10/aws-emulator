@@ -14,14 +14,16 @@
 //! The table spans the class the rule generalises over: both halves of the violation
 //! (neither block, both blocks), the contents of the blocks that are there (a stated
 //! language, an identified language, optional vocabularies and regions, each medical
-//! specialty/type pair), configurations whose inner blocks would THEMSELVES break a
-//! per-engine combination rule (the choice is judged first, so the sentence is still this
-//! one), and the meeting the call named (a live meeting in two media regions, and an id
-//! naming no meeting at all — the configuration is judged before the store is consulted).
+//! specialty/type pair), configurations whose inner blocks carry parameters Amazon
+//! Transcribe itself would reject (the exclusive choice is the only thing this call judges,
+//! so the sentence is still this one), and the meeting the call named (a live meeting in
+//! two media regions, and an id naming no meeting at all — the configuration is judged
+//! before the store is consulted).
 //!
 //! Two control rows keep the sentence specific to its class: a configuration naming exactly
-//! one engine correctly is ACCEPTED, and one naming exactly one engine while breaking that
-//! engine's own combination rule is refused with a different sentence.
+//! one engine correctly is ACCEPTED, and so is one naming exactly one engine whose own
+//! parameters combine in a way Amazon Transcribe rejects — the model reports that as a
+//! `TranscriptFailed` event on the session, not as a refusal of this call.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -312,8 +314,7 @@ async fn a_configuration_that_names_no_single_engine_is_refused_with_the_fixed_m
 }
 
 /// The sentence belongs to the exclusive-choice class alone: a configuration naming exactly
-/// one engine correctly is ACCEPTED, and one naming exactly one engine while breaking that
-/// engine's own combination rule is refused with a different sentence.
+/// one engine is ACCEPTED, whether or not that engine's own parameters combine validly.
 #[tokio::test]
 async fn naming_exactly_one_engine_is_not_refused_with_the_engine_choice_message() {
     let router = router();
@@ -350,8 +351,9 @@ async fn naming_exactly_one_engine_is_not_refused_with_the_engine_choice_message
         );
     }
 
-    // Exactly one engine, but that engine's own rule is broken: still a 400
-    // BadRequestException, worded for the rule it broke rather than for the choice.
+    // Exactly one engine, with parameters Amazon Transcribe itself would reject: the
+    // engine choice is satisfied, so this call is accepted and the engine's complaint
+    // travels on the session as a TranscriptFailed event.
     let reply = start_transcription(
         &router,
         &meeting_id,
@@ -360,17 +362,11 @@ async fn naming_exactly_one_engine_is_not_refused_with_the_engine_choice_message
     .await;
     assert_eq!(
         (reply.status, reply.error_code.as_deref()),
-        (400, Some("BadRequestException")),
-        "case \"one engine breaking its own rule\": expected the modelled 400 \
-         BadRequestException, got {} {:?} with {:?}",
+        (200, None),
+        "case \"one engine with an invalid parameter combination\": expected HTTP 200 with no \
+         error code, got {} {:?} with {:?}",
         reply.status,
         reply.error_code,
         reply.body
-    );
-    let message = reply.message().unwrap_or_default();
-    assert_ne!(
-        message, ENGINE_CHOICE_MESSAGE,
-        "case \"one engine breaking its own rule\": the exclusive-choice sentence must not be \
-         served for another rule, got {message:?}"
     );
 }
