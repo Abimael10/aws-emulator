@@ -510,8 +510,7 @@ async fn the_listing_reports_the_capped_version_set_and_nothing_past_it() {
 }
 
 /// RULE: a `templateName` the account holds no template under names no version set, and the
-/// listing refuses it with the sentence the operations reaching a template through its
-/// versions state that miss with.
+/// listing refuses it with its own sentence — the template is not found.
 #[tokio::test]
 async fn a_template_the_account_does_not_hold_has_no_version_set() {
     let emulator = Emulator::new();
@@ -528,7 +527,7 @@ async fn a_template_the_account_does_not_hold_has_no_version_set() {
     ];
     for template_name in &missing {
         let reply = emulator.list_versions(template_name, None, None).await;
-        let expected = format!("Unable to find a template named {template_name}");
+        let expected = format!("Template named {template_name} not found");
         assert_eq!(
             (reply.status, reply.error_code(), reply.error_message()),
             (

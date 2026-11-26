@@ -192,15 +192,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // The versions are the template's own, so a name the account holds no template
         // under names no version set to page through: the modelled
-        // `ResourceNotFoundException` (HTTP 404), worded the way the operations that reach
-        // a template THROUGH its versions state that miss
-        // (`crate::state::provisioning_templates::missing_template_for_version_message`).
+        // `ResourceNotFoundException` (HTTP 404), worded the way THIS listing states that
+        // miss — the template is not found
+        // (`crate::state::provisioning_templates::missing_template_for_version_listing_message`),
+        // which is this operation's own sentence and not the version reader's.
         let Some(template) = store.provisioning_templates.get(&input.template_name) else {
             return Err(
                 ListProvisioningTemplateVersionsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            crate::state::provisioning_templates::missing_template_for_version_message(
+                            crate::state::provisioning_templates::missing_template_for_version_listing_message(
                                 &input.template_name,
                             ),
                         ),

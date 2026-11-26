@@ -124,6 +124,20 @@ pub fn missing_template_for_version_message(template_name: &str) -> String {
     format!("Unable to find a template named {template_name}")
 }
 
+/// How the LISTER of a template's versions refuses a template name the account holds none
+/// under.
+///
+/// The lister states the template as NOT FOUND — "Template named … not found" — where the
+/// reader of ONE version states that it could not find it
+/// ([`missing_template_for_version_message`]) and every operation addressing the template
+/// RECORD states the same without the article ([`missing_provisioning_template_message`]).
+/// Each of those wordings is a requirement of the operation that answers it, which is why
+/// they sit beside each other here rather than one standing in for another. The ONE
+/// variable part is the name the request asked about, taken verbatim from the URI label.
+pub fn missing_template_for_version_listing_message(template_name: &str) -> String {
+    format!("Template named {template_name} not found")
+}
+
 /// How a DELETE of a template refuses a name the account holds none under.
 ///
 /// A delete states what it could not do rather than what it could not find, and it names
