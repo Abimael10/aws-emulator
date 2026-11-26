@@ -329,10 +329,25 @@ pub(crate) async fn build(emulator: &Emulator, bot_id: &str) {
     panic!("the locale must reach botLocaleStatus Built, last saw {status:?}");
 }
 
-/// One `RecognizeText` turn.
+/// One `RecognizeText` turn, carrying no dialog state of its own.
 pub(crate) async fn say(emulator: &Emulator, bot: &Bot, session_id: &str, text: &str) -> Value {
+    say_with_state(emulator, bot, session_id, text, None).await
+}
+
+/// One `RecognizeText` turn, with the `sessionState` the request carries.
+pub(crate) async fn say_with_state(
+    emulator: &Emulator,
+    bot: &Bot,
+    session_id: &str,
+    text: &str,
+    state: Option<Value>,
+) -> Value {
     let path = format!("{}/text", bot.session(session_id));
-    let reply = emulator.send("POST", &path, Some(json!({"text": text}))).await;
+    let mut body = json!({"text": text});
+    if let Some(state) = state {
+        body["sessionState"] = state;
+    }
+    let reply = emulator.send("POST", &path, Some(body)).await;
     assert_eq!(
         reply.status,
         200,

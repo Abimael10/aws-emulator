@@ -35,7 +35,12 @@
 //!    response to convey that it did and no fulfilment code hook to hand the
 //!    intent to
 //!    ([`crate::state::bot_model::ModelIntent::bot_completes_fulfillment`]) —
-//!    and `ReadyForFulfillment` where the fulfilment is the caller's.
+//!    and `ReadyForFulfillment` where the fulfilment is the caller's. The step
+//!    is the bot's decision, but the members that configure HOW a slot is
+//!    elicited — `DialogAction$slotElicitationStyle` and
+//!    `DialogAction$subSlotToElicit` — are the client's, so an elicitation of
+//!    the slot the dialog state already names keeps the ones that state holds
+//!    for it ([`elicit_slot`]).
 //! 4. Every turn reports every member a client drives a dialog off:
 //!    `Intent.state`; `Intent.slots` — the map of the intent's slots, which
 //!    names EVERY slot the recognized intent declares with a null value for each
@@ -310,12 +315,7 @@ pub fn interpret(model: &BotLocaleModel, text: &str, state: &SessionState) -> Tu
                 messages = unfilled.prompt_messages.clone();
                 (
                     Some(INTENT_STATE_IN_PROGRESS.to_string()),
-                    DialogAction {
-                        r#type: DIALOG_ACTION_ELICIT_SLOT.to_string(),
-                        slot_to_elicit: Some(unfilled.name.clone()),
-                        slot_elicitation_style: None,
-                        sub_slot_to_elicit: None,
-                    },
+                    elicit_slot(&unfilled.name, state),
                 )
             }
             None => {
@@ -440,6 +440,30 @@ pub(crate) fn declared_slots(
 /// slot holding nothing at all serializes as.
 fn unfilled() -> Slot {
     Slot::default()
+}
+
+/// `ElicitSlot` for `slot`, carrying the elicitation settings the dialog state
+/// holds FOR THAT SLOT.
+///
+/// The step is the bot's own decision, but two members of a dialog action are not
+/// a decision about the next step: `slotElicitationStyle` "configures the slot to
+/// use spell-by-letter or spell-by-word style" and `subSlotToElicit` names "the
+/// constituent sub slot of the composite slot specified in slotToElicit" — both
+/// say HOW the slot named by `slotToElicit` is elicited. So a turn that goes on
+/// eliciting the slot the dialog state already names keeps what that state holds
+/// for it, and the elicitation of another slot — which nothing has configured —
+/// carries neither.
+fn elicit_slot(slot: &str, state: &SessionState) -> DialogAction {
+    let configured = state
+        .dialog_action
+        .as_ref()
+        .filter(|held| held.slot_to_elicit.as_deref() == Some(slot));
+    DialogAction {
+        r#type: DIALOG_ACTION_ELICIT_SLOT.to_string(),
+        slot_to_elicit: Some(slot.to_string()),
+        slot_elicitation_style: configured.and_then(|held| held.slot_elicitation_style.clone()),
+        sub_slot_to_elicit: configured.and_then(|held| held.sub_slot_to_elicit.clone()),
+    }
 }
 
 /// `Close`, the dialog action of a turn that elicits nothing further.

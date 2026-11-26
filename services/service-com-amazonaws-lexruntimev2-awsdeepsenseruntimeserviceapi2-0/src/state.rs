@@ -425,7 +425,10 @@ impl ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
         // user": the step the dialog reached, which is what a caller drives the
         // conversation off. A `Delegate` a request carried is an instruction —
         // "the next action is determined by Amazon Lex V2" — so what the turn
-        // reports is the decision, not the instruction.
+        // reports is the decision, not the instruction. The members that
+        // configure HOW the slot being elicited is elicited are not part of that
+        // decision: the turn carries them over from the dialog state it was
+        // interpreted against (`nlu::interpret`).
         session.session_state.dialog_action = Some(plan.dialog_action);
         // "A list of messages last sent to the user": the ones THIS turn sends —
         // a slot's prompt, or the intent's closing response — and none when the
