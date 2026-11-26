@@ -2674,3 +2674,171 @@ async fn a_map_keyed_by_several_reserved_keywords_is_refused_for_one_of_them() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// A reserved keyword is reserved as the FIELD it names, in every spelling of it
+// ---------------------------------------------------------------------------
+
+/// The interactions-schema FIELD name a camel-case `properties` key names.
+///
+/// Both `Event$properties` and `ActionInteraction$properties` state the correspondence:
+/// "The keys use camel case names that match the fields in the Item interactions dataset's
+/// schema. In the above example, the `numberOfRatings` would match the 'NUMBER_OF_RATINGS'
+/// field defined in the Item interactions dataset's schema"
+/// (`smithy_query(query="doc", shape="Event", member="properties")`). So one field has two
+/// spellings of its name — the camel-case key and the upper-snake field a schema declares,
+/// which is also the spelling a filter expression over an interaction dataset uses — and
+/// they differ only in case and in the underscores between the words.
+fn field_name(camel_case_key: &str) -> String {
+    let mut field = String::new();
+    for character in camel_case_key.chars() {
+        if character.is_ascii_uppercase() && !field.is_empty() {
+            field.push('_');
+        }
+        field.push(character.to_ascii_uppercase());
+    }
+    field
+}
+
+/// Every spelling of ONE field name a request can write a `properties` key in: the four
+/// casings of the camel-case key the model lists ([`casings`]), the upper-snake field name
+/// a schema declares, that field name lower-cased, and the field name with each word
+/// capitalised — all naming the same field.
+fn spellings_of(reserved: &str) -> Vec<String> {
+    let field = field_name(reserved);
+    let title_case: Vec<String> = field
+        .split('_')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => format!(
+                    "{first}{}",
+                    characters.as_str().to_lowercase()
+                ),
+                None => String::new(),
+            }
+        })
+        .collect();
+    let mut spellings = casings(reserved);
+    spellings.push(field.to_lowercase());
+    spellings.push(title_case.join("_"));
+    spellings.push(field);
+    spellings.sort();
+    spellings.dedup();
+    spellings
+}
+
+/// RULE: Amazon Personalize reserves a `properties` keyword as the interaction FIELD it
+/// names, so a key naming a reserved field is refused with the service's own sentence —
+/// 400 `InvalidInputException`, the keyword in its one normal form — whichever of that
+/// field's spellings the request wrote, and nothing of the call is ingested.
+///
+/// The rows span what the rule generalises over: both streams the keyword list is
+/// documented on, every reserved keyword, and every spelling of each keyword's field name
+/// (camel case, upper snake, lower snake, capitalised words). The `RECOMMENDATION_ID`
+/// spelling the issue cited is one row.
+#[tokio::test]
+async fn a_reserved_properties_keyword_is_reserved_in_every_spelling_of_its_field() {
+    for route in EVENT_STREAM_ROUTES {
+        for reserved in RESERVED_PROPERTY_KEYS {
+            for key in spellings_of(reserved) {
+                let case = format!("{route} properties keyed {key:?}");
+                let emulator = Emulator::new();
+                emulator.seed_tracker("tracker-1");
+
+                let reply = emulator
+                    .post(
+                        route,
+                        &body_carrying_properties(
+                            route,
+                            &json!({ key.as_str(): "x", "numberOfRatings": "12" }),
+                        ),
+                    )
+                    .await;
+                assert_refused(&case, &reply, 400, "InvalidInputException");
+                let message = refusal_message(&reply);
+                assert_eq!(
+                    message,
+                    reserved_keyword_message(reserved),
+                    "case {case:?}: unexpected refusal wording, got {message:?}"
+                );
+                // One normal form: the sentence states the keyword the service reserves,
+                // so it carries no separator the request happened to spell it with.
+                assert!(
+                    !message.contains('_'),
+                    "case {case:?}: expected the keyword in one normal form, got {message:?}"
+                );
+                assert_eq!(
+                    stored_record_count(&emulator, route, "tracker-1"),
+                    0,
+                    "case {case:?}: a refused call ingests nothing, got {} record(s)",
+                    stored_record_count(&emulator, route, "tracker-1")
+                );
+            }
+        }
+    }
+}
+
+/// The contrast, which bounds the rule: a key naming ANOTHER field is accepted in either
+/// spelling — including the upper-snake name of an interaction column that is NOT one of
+/// the six keywords the model reserves (`ITEM_ID`, `ACTION_ID`, `EVENT_VALUE`), and a key
+/// that merely extends a reserved name.
+#[tokio::test]
+async fn a_properties_key_naming_another_field_is_accepted_in_either_spelling() {
+    let accepted = [
+        "numberOfRatings",
+        "NUMBER_OF_RATINGS",
+        "number_of_ratings",
+        "Number_Of_Ratings",
+        "itemId",
+        "ITEM_ID",
+        "ACTION_ID",
+        "eventValue",
+        "EVENT_VALUE",
+        "userIds",
+        "my_timestamp",
+        "impressionCount",
+        "sessionIdentifier",
+    ];
+
+    for route in EVENT_STREAM_ROUTES {
+        for key in accepted {
+            let case = format!("{route} properties keyed {key:?}");
+            let emulator = Emulator::new();
+            emulator.seed_tracker("tracker-1");
+            let reply = emulator
+                .post(route, &body_carrying_properties(route, &json!({ key: "x" })))
+                .await;
+            assert_accepted(&case, &reply);
+            assert_eq!(
+                stored_record_count(&emulator, route, "tracker-1"),
+                1,
+                "case {case:?}: an accepted call ingests its one record"
+            );
+        }
+    }
+}
+
+/// And the rule stays where it is documented: a metadata put reserves NO keyword, so the
+/// field spelling of a reserved one is an ordinary property there.
+#[tokio::test]
+async fn a_metadata_put_accepts_the_field_spelling_of_a_reserved_keyword() {
+    for (route, dataset) in [
+        ("/items", ITEMS_DATASET),
+        ("/users", USERS_DATASET),
+        ("/actions", ACTIONS_DATASET),
+    ] {
+        for reserved in RESERVED_PROPERTY_KEYS {
+            for key in spellings_of(reserved) {
+                let case = format!("{route} properties keyed {key:?}");
+                let emulator = Emulator::new();
+                emulator.seed_dataset(dataset);
+                let properties = json!({ key.as_str(): "x" }).to_string();
+                let reply = emulator
+                    .post(route, &body_with_properties(route, &properties))
+                    .await;
+                assert_accepted(&case, &reply);
+            }
+        }
+    }
+}

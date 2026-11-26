@@ -100,6 +100,37 @@ pub const RESERVED_PROPERTY_KEYS: [&str; 6] = [
     "impression",
 ];
 
+/// The characters of the interaction FIELD a `properties` key names: the key without its
+/// word separators and with its case folded.
+///
+/// A key and the field it names are TWO SPELLINGS of one name. `Event$properties` /
+/// `ActionInteraction$properties` state the correspondence — "The keys use camel case
+/// names that match the fields in the Item interactions dataset's schema. In the above
+/// example, the `numberOfRatings` would match the 'NUMBER_OF_RATINGS' field defined in the
+/// Item interactions dataset's schema" — so the two differ only in case and in the
+/// underscores that separate the words, and folding both away leaves one form per field.
+fn field_characters(name: &str) -> impl Iterator<Item = char> + '_ {
+    name.chars()
+        .filter(|character| *character != '_')
+        .map(|character| character.to_ascii_lowercase())
+}
+
+/// Whether two `properties` keys name the SAME interaction field
+/// ([`field_characters`]) — the comparison a reserved keyword is screened by, because a
+/// keyword is reserved as the field it names: Amazon Personalize fills such a field from
+/// the record's own member, so no key naming one is a key a caller may send, in whichever
+/// spelling the request writes that name.
+fn names_same_field(key: &str, other: &str) -> bool {
+    field_characters(key).eq(field_characters(other))
+}
+
+/// The reserved keyword `key` names, if any.
+pub fn reserved_property_key(key: &str) -> Option<&'static str> {
+    RESERVED_PROPERTY_KEYS
+        .into_iter()
+        .find(|reserved| names_same_field(reserved, key))
+}
+
 /// The sentence Amazon Personalize refuses a `properties` map using one of
 /// [`RESERVED_PROPERTY_KEYS`] with.
 ///
@@ -107,9 +138,9 @@ pub const RESERVED_PROPERTY_KEYS: [&str; 6] = [
 /// keyword is written LOWER-CASED, because the rule it broke is case insensitive and the
 /// service states the keyword in one normal form rather than echoing the caller's casing.
 ///
-/// `reserved` is the RESERVED name the request's key matched, not the key as submitted:
-/// the two have the same lower-cased form (they match case-insensitively), so the sentence
-/// is the same one either way and no part of the request is reflected back in it.
+/// `reserved` is the RESERVED keyword the request's key named, not the key as submitted:
+/// the sentence states the keyword the service reserves, so no part of the request is
+/// reflected back in it however the request spelled that keyword's name.
 pub fn reserved_property_key_message(reserved: &str) -> String {
     let keyword = reserved.to_lowercase();
     format!(
@@ -121,7 +152,8 @@ pub fn reserved_property_key_message(reserved: &str) -> String {
 /// Parse a `properties` member: the modelled shape is a JSON string map
 /// (`@mediaType("application/json")`, documented as "a string map of ... data" whose
 /// elements are key-value pairs), so a value that is not a JSON object, or — when
-/// `reserved_keys_apply` — one using a reserved key, is not a `properties` map at all.
+/// `reserved_keys_apply` — one naming a reserved field ([`reserved_property_key`]), is not
+/// a `properties` map at all.
 ///
 /// Returns the parsed object on success, and on failure the message for the caller's
 /// `InvalidInputException`. A value that is not a JSON object at all is stated against the
@@ -140,10 +172,7 @@ pub fn parse_properties(
         .ok_or_else(|| format!("{member} must be a JSON object of key-value pairs"))?;
     if reserved_keys_apply {
         for key in object.keys() {
-            if let Some(reserved) = RESERVED_PROPERTY_KEYS
-                .iter()
-                .find(|reserved| reserved.eq_ignore_ascii_case(key))
-            {
+            if let Some(reserved) = reserved_property_key(key) {
                 return Err(reserved_property_key_message(reserved));
             }
         }
