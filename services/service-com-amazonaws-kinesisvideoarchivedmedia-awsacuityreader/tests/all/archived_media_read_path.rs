@@ -2289,35 +2289,34 @@ async fn get_hls_streaming_session_url_refuses_a_stream_with_no_retention() {
 }
 
 /// Seed `stream` with one fragment per entry of `fragments`, ten seconds apart
-/// from [`T0_SECS`], and answer the request body that clips the whole of it.
+/// from [`T0_SECS`], registered and retaining data like every other seeded
+/// stream — the archive a probe of one read path is driven over.
+fn seed_probe_stream(harness: &Harness, stream: &str, fragments: &[Vec<u8>]) {
+    let state = service_state(&*harness.engine).expect("the service store");
+    let mut state = state.lock();
+    let archived = ArchivedStream::new(stream, REGION, from_epoch_millis(T0_SECS * 1000), 24);
+    register_stream(&harness.engine, &archived);
+    state.put_stream(archived);
+    for (index, media) in fragments.iter().enumerate() {
+        let at = from_epoch_millis((T0_SECS + 10 * index as i64) * 1000);
+        assert!(
+            state.append_fragment(
+                stream,
+                StoredFragment::new(fragment_number(index as u64), at, at, 2000, media.clone()),
+            ),
+            "case seed {stream:?} fragment {index}: the stream must exist"
+        );
+    }
+}
+
+/// Seed `stream` with [`seed_probe_stream`] and answer the request body that
+/// clips the whole of it.
 fn seeded_clip_request(
     harness: &Harness,
     stream: &str,
     fragments: &[Vec<u8>],
 ) -> serde_json::Value {
-    {
-        let state = service_state(&*harness.engine).expect("the service store");
-        let mut state = state.lock();
-        let archived = ArchivedStream::new(stream, REGION, from_epoch_millis(T0_SECS * 1000), 24);
-        register_stream(&harness.engine, &archived);
-        state.put_stream(archived);
-        for (index, media) in fragments.iter().enumerate() {
-            let at = from_epoch_millis((T0_SECS + 10 * index as i64) * 1000);
-            assert!(
-                state.append_fragment(
-                    stream,
-                    StoredFragment::new(
-                        fragment_number(index as u64),
-                        at,
-                        at,
-                        2000,
-                        media.clone(),
-                    ),
-                ),
-                "case seed {stream:?} fragment {index}: the stream must exist"
-            );
-        }
-    }
+    seed_probe_stream(harness, stream, fragments);
     serde_json::json!({
         "StreamName": stream,
         "ClipFragmentSelector": {
@@ -2706,6 +2705,224 @@ async fn get_clip_refuses_archived_media_it_cannot_mux() {
 const UNSUPPORTED_MEDIA_TYPE: &str =
     "The type of the media (for example, h.264 or h.265 video or ACC or G.711 audio) could not \
      be determined from the codec IDs of the tracks in the first fragment for a playback session.";
+
+/// The two streaming-session operations: the route, the input member each
+/// carries its fragment selector in, and the output member each reports its URL
+/// in (`smithy_query(query="operation",operation="GetHLSStreamingSessionURL,\
+/// GetDASHStreamingSessionURL")`).
+const SESSION_PROTOCOLS: [(&str, &str, &str); 2] = [
+    (
+        "/getHLSStreamingSessionURL",
+        "HLSFragmentSelector",
+        "HLSStreamingSessionURL",
+    ),
+    (
+        "/getDASHStreamingSessionURL",
+        "DASHFragmentSelector",
+        "DASHStreamingSessionURL",
+    ),
+];
+
+/// The body of an ON_DEMAND session request over the whole of `stream`, with the
+/// selector in the member `member` names.
+fn probe_session_request(stream: &str, member: &str) -> serde_json::Value {
+    serde_json::json!({
+        "StreamName": stream,
+        "PlaybackMode": "ON_DEMAND",
+        member: {
+            "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+            "TimestampRange": {
+                "StartTimestamp": T0_SECS,
+                "EndTimestamp": T0_SECS + 1000,
+            },
+        },
+    })
+}
+
+/// RULE: a streaming session exists only over media that meets the requirements
+/// its operation documents — the codec ids of the fragment it starts from must
+/// name the H.264 video track, and that track must carry codec private data that
+/// reads as an AVC decoder configuration record — and media that meets neither is
+/// the modelled refusal for the requirement it breaks (400), the same refusal
+/// `GetClip` answers for the same archive.
+///
+/// The rows differ along which requirement the media breaks, the track and the
+/// codec id it breaks it on, and whether the container reads at all; every row is
+/// driven through BOTH session operations, because the requirement is a property
+/// of the media rather than of the streaming protocol.
+#[tokio::test]
+async fn a_streaming_session_refuses_media_that_breaks_the_codec_requirements() {
+    // (case, the media the archive holds, the error code, the message)
+    let rows: Vec<(&str, Vec<Vec<u8>>, &str, String)> = vec![
+        (
+            "a track that declares no codec private data",
+            vec![MkvFragment {
+                codec_private: None,
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "another track that declares none",
+            vec![MkvFragment {
+                track: 4,
+                codec_private: None,
+                ..MkvFragment::of(1, 2)
+            }
+            .bytes()],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 4.".to_string(),
+        ),
+        (
+            "codec private data of zero length",
+            vec![MkvFragment {
+                codec_private: Some(Vec::new()),
+                ..MkvFragment::of(2, 2)
+            }
+            .bytes()],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "codec private data that is not a record at all",
+            vec![MkvFragment {
+                codec_private: Some(b"not-a-decoder-configuration-record".to_vec()),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a record of another configuration version, on another track",
+            vec![MkvFragment {
+                track: 2,
+                codec_private: Some({
+                    let mut record = fixture_record();
+                    record[0] = 2;
+                    record
+                }),
+                ..MkvFragment::of(3, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 2.".to_string(),
+        ),
+        (
+            "a record stating neither a readable parameter set nor a geometry",
+            vec![MkvFragment {
+                codec_private: Some(avc_record(
+                    &[0x67, 0x64, 0x00, 0x1F, 0x00, 0x00],
+                    &[0x68, 0xEE, 0x3C, 0x80],
+                )),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a track that declares no codec id at all",
+            vec![MkvFragment {
+                codec_id: String::new(),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "UnsupportedStreamMediaTypeException",
+            UNSUPPORTED_MEDIA_TYPE.to_string(),
+        ),
+        (
+            "a video codec id of a codec this read path does not read",
+            vec![MkvFragment {
+                codec_id: "V_VP9".to_string(),
+                ..MkvFragment::of(4, 2)
+            }
+            .bytes()],
+            "UnsupportedStreamMediaTypeException",
+            UNSUPPORTED_MEDIA_TYPE.to_string(),
+        ),
+        (
+            "media that is not a Matroska document, so it names no codec id",
+            vec![b"this is not a matroska document".to_vec()],
+            "UnsupportedStreamMediaTypeException",
+            UNSUPPORTED_MEDIA_TYPE.to_string(),
+        ),
+    ];
+
+    let harness = seeded();
+    for (path, member, _) in SESSION_PROTOCOLS {
+        for (index, (row, media, code, message)) in rows.iter().enumerate() {
+            let stream = format!("{}-media-probe-{index}", path.trim_start_matches('/'));
+            seed_probe_stream(&harness, &stream, media);
+            let response = harness.post(path, &probe_session_request(&stream, member)).await;
+            let case = format!("{path}, {row}");
+            assert_eq!(
+                response.status().as_u16(),
+                400,
+                "case {case}: expected HTTP 400, got {} with body {:?}",
+                response.status(),
+                String::from_utf8_lossy(response.body())
+            );
+            let reported = body_json(&response);
+            assert_eq!(
+                reported["__type"], *code,
+                "case {case}: expected {code}, got {reported:?}"
+            );
+            assert_eq!(
+                reported["Message"].as_str().unwrap_or_default(),
+                message.as_str(),
+                "case {case}: expected {message:?}, got {reported:?}"
+            );
+            assert_eq!(
+                recorded_sessions(&harness),
+                0,
+                "case {case}: a refused request must mint no session"
+            );
+        }
+    }
+}
+
+/// RULE, from the other side: the requirements are read off the fragment the
+/// session STARTS from — "the codec IDs of the tracks in the first fragment for a
+/// playback session" — so a session whose first fragment meets them is minted and
+/// reports its URL, whatever a later fragment of the same range declares.
+#[tokio::test]
+async fn a_streaming_session_reads_the_requirements_off_the_fragment_it_starts_from() {
+    let harness = seeded();
+    for (path, member, url_member) in SESSION_PROTOCOLS {
+        let stream = format!("{}-first-fragment", path.trim_start_matches('/'));
+        seed_probe_stream(
+            &harness,
+            &stream,
+            &[
+                MkvFragment::of(0, 2).bytes(),
+                MkvFragment {
+                    codec_private: None,
+                    ..MkvFragment::of(2, 2)
+                }
+                .bytes(),
+            ],
+        );
+        let response = harness.post(path, &probe_session_request(&stream, member)).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "case {path}: expected HTTP 200, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        let url = body_json(&response)[url_member]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            url.contains("SessionToken="),
+            "case {path}: expected a session URL carrying a token, got {url:?}"
+        );
+    }
+}
 
 /// The sentence a clip of media whose frames cannot be read is refused with: the
 /// modelled description of `InvalidMediaFrameException`.

@@ -150,6 +150,9 @@ use super::types::*;
 use crate::service::archived_container::{
     avcc_sample, read_codec_private, read_fragment, video_track, ContainerFault,
 };
+// The three codec/media-type requirements this operation shares with the two
+// streaming-session operations, which model exactly the same refusals for them.
+use crate::service::media_requirements::{self, MediaRefusal};
 use crate::state::{
     date_time_millis, epoch_millis, range_within_max_span, service_state, ArchivedStream,
     StoredFragment, StreamLookupError, TimestampOrigin, NO_DATA_RETENTION_MESSAGE,
@@ -192,12 +195,6 @@ const MINIMUM_SAMPLE_TICKS: u32 = 1;
 /// frames read out of it. The frames past it are left out exactly as the fragments
 /// past the fragment ceiling are.
 const MAX_CLIP_SAMPLES: usize = 50_000;
-
-/// The refusal a clip of media that declares no H.264 video track carries, which
-/// is the modelled sentence for a media type the codec ids do not name.
-const UNSUPPORTED_MEDIA_MESSAGE: &str =
-    "The type of the media (for example, h.264 or h.265 video or ACC or G.711 audio) could not \
-     be determined from the codec IDs of the tracks in the first fragment for a playback session.";
 
 /// The refusal a clip whose selected fragments carry no readable frame carries:
 /// the modelled sentence for frames that "could not be parsed based on the
@@ -451,38 +448,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled refusal `fault` is reported as.
+///
+/// A fault that breaks one of the media requirements this plane states is the
+/// modelled refusal for THAT requirement, worded by
+/// [`crate::service::media_requirements`] — the same answer the streaming-session
+/// operations give for the same archive. Anything else stands in the way of the
+/// clip rather than of the media type, which is this operation's own
+/// `InvalidMediaFrameException`: it models that error and they do not.
 fn refused_clip(fault: ContainerFault) -> GetClipError {
-    match fault {
-        ContainerFault::MissingCodecPrivateData(track) => {
-            GetClipErrorModeled::MissingCodecPrivateDataException(MissingCodecPrivateDataException {
-                message: Some(format!(
-                    "Missing codec private data in fragment for track {track}."
-                )),
-            })
-        }
-        ContainerFault::InvalidCodecPrivateData(track) => {
-            GetClipErrorModeled::InvalidCodecPrivateDataException(InvalidCodecPrivateDataException {
-                message: Some(format!(
-                    "Invalid codec private data in fragment for track {track}."
-                )),
-            })
-        }
-        ContainerFault::UnsupportedMedia => {
+    if let ContainerFault::Unwritable(reason) = &fault {
+        ::tracing::error!(reason = %reason, "the clip could not be written");
+    }
+    if let Some(refusal) = media_requirements::refusal(&fault) {
+        return refused_media(refusal);
+    }
+    GetClipErrorModeled::InvalidMediaFrameException(InvalidMediaFrameException {
+        message: Some(INVALID_MEDIA_FRAME_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled error this operation reports a broken media requirement as.
+fn refused_media(refusal: MediaRefusal) -> GetClipError {
+    let message = Some(refusal.message());
+    match refusal {
+        MediaRefusal::UnsupportedMediaType => {
             GetClipErrorModeled::UnsupportedStreamMediaTypeException(
-                UnsupportedStreamMediaTypeException {
-                    message: Some(UNSUPPORTED_MEDIA_MESSAGE.to_string()),
-                },
+                UnsupportedStreamMediaTypeException { message },
             )
         }
-        ContainerFault::Unreadable | ContainerFault::NoFrames => {
-            GetClipErrorModeled::InvalidMediaFrameException(InvalidMediaFrameException {
-                message: Some(INVALID_MEDIA_FRAME_MESSAGE.to_string()),
+        MediaRefusal::MissingCodecPrivateData(_) => {
+            GetClipErrorModeled::MissingCodecPrivateDataException(MissingCodecPrivateDataException {
+                message,
             })
         }
-        ContainerFault::Unwritable(reason) => {
-            ::tracing::error!(reason = %reason, "the clip could not be written");
-            GetClipErrorModeled::InvalidMediaFrameException(InvalidMediaFrameException {
-                message: Some(INVALID_MEDIA_FRAME_MESSAGE.to_string()),
+        MediaRefusal::InvalidCodecPrivateData(_) => {
+            GetClipErrorModeled::InvalidCodecPrivateDataException(InvalidCodecPrivateDataException {
+                message,
             })
         }
     }

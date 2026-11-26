@@ -38,6 +38,11 @@ use archived_media::state::{
     ARCHIVE_CONTENT_TYPE,
 };
 
+// The archived Matroska document one fragment IS, written by the suite that owns this
+// family's container fixture: a session is minted over media whose codec ids and codec
+// private data the read plane can classify, so the seeded archive carries the real thing.
+use crate::kinesisvideo_clip_muxes_the_ingested_fragments::archived_fragment;
+
 /// The region every call here is signed for.
 const REGION: &str = "us-west-2";
 
@@ -213,9 +218,11 @@ fn fragment_number(base: u64, index: u64) -> String {
 /// identity an ingest writes an archive under — with [`FRAGMENTS`] fragments stamped from
 /// `first_millis` at [`FRAGMENT_SPACING_SECS`].
 ///
-/// The media bytes are a short, per-fragment marker rather than a container: the rule under
-/// test selects fragments by their timestamps and reports their NUMBERS, and no call this
-/// suite makes reads a fragment's bytes.
+/// Each fragment's media is the Matroska document an ingest would have written for it
+/// ([`archived_fragment`]), distinct per fragment: the rule under test selects fragments by
+/// their timestamps and reports their NUMBERS, but minting a session over the archive reads
+/// the codec ids and the codec private data of the fragment it starts from, so the seeded
+/// archive is a real one.
 fn seed_archive(
     engine: &engine::InMemoryEngine,
     stream: &str,
@@ -245,7 +252,7 @@ fn seed_archive(
                     from_epoch_millis(stamped),
                     from_epoch_millis(stamped),
                     u64::try_from(FRAGMENT_SPACING_SECS).unwrap_or_default() * 1000,
-                    vec![u8::try_from(index).unwrap_or_default(); 8],
+                    archived_fragment(u8::try_from(index + 1).unwrap_or(u8::MAX)),
                 ),
             ),
             "case seed {stream} fragment {index}: the seeded stream must exist"

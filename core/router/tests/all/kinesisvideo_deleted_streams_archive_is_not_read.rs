@@ -42,6 +42,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_kinesisvideo_kinesisvideo_20170930 as kvs;
 use service_com_amazonaws_kinesisvideomedia_awsacuityinletservice as kv_media;
 
+// The archived Matroska document one fragment IS, written by the suite that owns
+// this family's container fixture: a producer ingests a container, and the reads of
+// the archive look inside it.
+use crate::kinesisvideo_clip_muxes_the_ingested_fragments::archived_fragment;
+
 /// The region every call here is signed for.
 const REGION: &str = "us-west-2";
 
@@ -240,10 +245,11 @@ fn ingest(
         .collect()
 }
 
-/// The media bytes of the `index`-th produced fragment, distinct per fragment so
+/// The media bytes of the `index`-th produced fragment: the Matroska document a
+/// producer submits for one fragment, carrying a frame `index` makes distinct so
 /// one fragment's media can never be mistaken for another's.
 fn produced_media(index: u64) -> Vec<u8> {
-    format!("produced-fragment-{index}-media").into_bytes()
+    archived_fragment(u8::try_from(index + 1).unwrap_or(u8::MAX))
 }
 
 /// The timestamp range every selector in this suite asks for: wide enough to

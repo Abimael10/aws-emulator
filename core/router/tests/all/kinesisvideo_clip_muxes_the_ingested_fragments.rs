@@ -174,6 +174,32 @@ fn frame(marker: u8) -> Vec<u8> {
 /// The container a producer submits: one Cluster per fragment, carrying `frames_each`
 /// frames spaced a frame apart, with the track declaring `codec_private` or nothing.
 fn container(clusters: usize, frames_each: usize, codec_private: Option<Vec<u8>>) -> Vec<u8> {
+    document(clusters, frames_each, codec_private, submitted_frame)
+}
+
+/// One ARCHIVED fragment as this family holds it: a Matroska document of its own —
+/// one Cluster, one frame that `marker` makes distinct — declaring the H.264 track
+/// and the decoder configuration record of that track.
+///
+/// Kinesis Video Streams archives every fragment as such a document, and the reads
+/// of the archive look inside it: a streaming session determines the type of its
+/// media "from the codec IDs of the tracks in the first fragment" and its
+/// initialization fragment from that track's codec private data. So a suite that
+/// seeds an archive directly seeds this, the container an ingest would have
+/// written, rather than a bare marker no read can classify.
+pub(crate) fn archived_fragment(marker: u8) -> Vec<u8> {
+    document(1, 1, Some(avc_record()), |_, _| frame(marker))
+}
+
+/// The Matroska document of `clusters` Clusters of `frames_each` frames, each frame
+/// the one `frame_of` gives for its place, with the track declaring `codec_private`
+/// or nothing.
+fn document(
+    clusters: usize,
+    frames_each: usize,
+    codec_private: Option<Vec<u8>>,
+    frame_of: impl Fn(usize, usize) -> Vec<u8>,
+) -> Vec<u8> {
     let mut document = Vec::new();
     let mut header = Vec::new();
     push_ebml_element(&mut header, ID_DOC_TYPE, b"matroska");
@@ -217,7 +243,7 @@ fn container(clusters: usize, frames_each: usize, codec_private: Option<Vec<u8>>
             let mut block = vec![0x80 | TRACK_NUMBER as u8];
             block.extend_from_slice(&(position as i16 * 33).to_be_bytes());
             block.push(KEYFRAME_FLAG);
-            block.extend_from_slice(&submitted_frame(cluster, position));
+            block.extend_from_slice(&frame_of(cluster, position));
             push_ebml_element(&mut body, ID_SIMPLE_BLOCK, &block);
         }
         push_ebml_element(&mut segment, ID_CLUSTER, &body);

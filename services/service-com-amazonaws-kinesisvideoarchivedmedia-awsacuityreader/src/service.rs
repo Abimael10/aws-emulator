@@ -54,6 +54,14 @@ use std::sync::Arc;
 /// the media a streaming session's playback plane serves — and two readers of
 /// one container are two chances to disagree about what a producer ingested.
 pub mod archived_container;
+/// The requirements this plane puts on the media it reads — the H.264 video track
+/// and the AVC codec private data the archived-media documentation asks for — and
+/// the modelled refusals they raise.
+///
+/// It lives beside the operations because all THREE that read inside a fragment
+/// declare those refusals: the clip `GetClip` muxes and the sessions
+/// `GetHLSStreamingSessionURL` and `GetDASHStreamingSessionURL` mint.
+pub mod media_requirements;
 /// The MEDIA a streaming session's playback plane serves, written from the
 /// archived container: the MP4 initialization fragment, the MP4 media fragment of
 /// one archived fragment, and the MPEG TS fragment an `MPEG_TS` session serves

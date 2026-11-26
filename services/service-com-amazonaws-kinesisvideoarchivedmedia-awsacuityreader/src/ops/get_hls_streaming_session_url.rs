@@ -38,6 +38,14 @@
 //!   — none in the requested range for ON_DEMAND / LIVE_REPLAY, none in the
 //!   last 30 seconds for LIVE — is `ResourceNotFoundException`, exactly as the
 //!   error's own documentation states.
+//! * The media requirements this operation documents are conditions on minting
+//!   the session: the first fragment it would play must declare the H.264 video
+//!   track its codec ids name and that track must carry readable AVC codec
+//!   private data, so media naming no such track is
+//!   `UnsupportedStreamMediaTypeException` (400), a track declaring none is
+//!   `MissingCodecPrivateDataException` (400) and a record that cannot be read is
+//!   `InvalidCodecPrivateDataException` (400) — the same three refusals `GetClip`
+//!   answers for the same archive.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +222,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The three codec/media-type requirements the archived-media documentation puts
+// on the media a session plays, classified by the one reader of this plane.
+use crate::service::media_requirements::{session_media_refusal, MediaRefusal};
 use crate::state::{
     date_time_millis, service_state, session_parameters, session_url, SelectedTimestampRange,
     SessionParameters, SessionProtocol, SessionRequest, StreamLookupError, StreamingSession,
@@ -452,6 +463,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
             }
 
+            // "For streaming video, the media must contain H.264 or H.265
+            // encoded video" and "The video track of each fragment must contain
+            // codec private data in the Advanced Video Coding (AVC) for H.264
+            // format": a session exists only over media that meets those
+            // requirements, and media that meets neither is one of the three
+            // refusals this operation models for them rather than a session over
+            // bytes no player could decode. Determined on the FIRST fragment the
+            // session plays, which is what the media-type refusal itself names
+            // ("the codec IDs of the tracks in the first fragment for a playback
+            // session") and whose codec private data the session's
+            // initialization fragment carries.
+            if let Some(refusal) = selected
+                .first()
+                .and_then(|number| stream.fragment(number))
+                .and_then(|fragment| session_media_refusal(&fragment.media))
+            {
+                return Err(refused_media(refusal));
+            }
+
             (stream.name.clone(), selected)
         };
 
@@ -486,4 +516,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             hls_streaming_session_url: Some(session_url(ctx, SessionProtocol::Hls, &token)),
         })
     }
+}
+
+/// The modelled error this operation reports a broken media requirement as,
+/// worded by [`crate::service::media_requirements`] — so the same archive is
+/// refused with the same sentence here, by an MPEG-DASH session and by a clip.
+fn refused_media(refusal: MediaRefusal) -> GetHLSStreamingSessionURLError {
+    let message = Some(refusal.message());
+    match refusal {
+        MediaRefusal::UnsupportedMediaType => {
+            GetHLSStreamingSessionURLErrorModeled::UnsupportedStreamMediaTypeException(
+                UnsupportedStreamMediaTypeException { message },
+            )
+        }
+        MediaRefusal::MissingCodecPrivateData(_) => {
+            GetHLSStreamingSessionURLErrorModeled::MissingCodecPrivateDataException(
+                MissingCodecPrivateDataException { message },
+            )
+        }
+        MediaRefusal::InvalidCodecPrivateData(_) => {
+            GetHLSStreamingSessionURLErrorModeled::InvalidCodecPrivateDataException(
+                InvalidCodecPrivateDataException { message },
+            )
+        }
+    }
+    .into()
 }
