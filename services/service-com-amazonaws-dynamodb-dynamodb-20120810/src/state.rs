@@ -2869,13 +2869,19 @@ impl ResourceTags {
 /// Anything else addresses no table from this endpoint, so it is an INPUT failure rather
 /// than a lookup miss, stated over the member the request actually carries.
 pub fn check_table_arn(table_arn: &str, request_region: &str) -> Result<String, RequestError> {
-    resolve_resource_arn(table_arn, request_region)
-        .map(|resource| resource.table)
-        .map_err(|_| {
-            RequestError::Validation(format!(
-                "Invalid TableArn: Invalid TableArn provided as input {table_arn}"
-            ))
-        })
+    let invalid = || {
+        RequestError::Validation(format!(
+            "Invalid TableArn: Invalid TableArn provided as input {table_arn}"
+        ))
+    };
+    let resource = resolve_resource_arn(table_arn, request_region).map_err(|_| invalid())?;
+    // The member names the TABLE, so the one resource it accepts is the table itself: a
+    // stream's ARN, which the tagging surface does address, names something this member
+    // has no meaning for.
+    match resource.target {
+        PolicyTarget::Table => Ok(resource.table),
+        PolicyTarget::Stream => Err(invalid()),
+    }
 }
 
 /// One stored table: its configuration, its lifecycle instants, and its items.
@@ -2941,6 +2947,15 @@ pub struct Table {
     /// `TagResource`/`UntagResource` edited, together with the set the eventually
     /// consistent `ListTagsOfResource` can see yet (see [`ResourceTags`]).
     pub tags: ResourceTags,
+    /// The tags this table's STREAM carries, held beside the table's own and never merged
+    /// with them.
+    ///
+    /// A stream is a resource of its own — its ARN is
+    /// `arn:…:table/<name>/stream/<label>`, and the tagging surface takes "the Amazon
+    /// DynamoDB resource with tags to be listed" by that ARN — so tagging the stream
+    /// leaves the table's set exactly as it was and the other way round, exactly as the
+    /// two resources' policies are held apart ([`Table::stream_resource_policy`]).
+    pub stream_tags: ResourceTags,
     pub creation_date_time: SystemTime,
     /// When the clock owes this table its `CREATING` -> `ACTIVE` transition.
     pub active_at: SystemTime,
@@ -2948,6 +2963,16 @@ pub struct Table {
     /// `ACTIVE` transition. `None` once no update is in flight, which is also the case
     /// for an update the service applies with the call itself (see `UpdateTable`).
     pub updated_at: Option<SystemTime>,
+    /// When the clock owes the end of the CAPACITY MOVE an update in flight started, and
+    /// `None` for a table whose unsettled update moves no capacity at all.
+    ///
+    /// What the table is doing is part of the refusal a second change to it earns — AWS
+    /// states a capacity move as the table's IOPS being updated and every other change as
+    /// the table being updated ([`throughput_update_in_flight`]) — so the call that accepts
+    /// a move records that this is the work still running. Set beside
+    /// [`Self::updated_at`], at the same instant, and read by comparison against the clock
+    /// like every other transient fact of a table, so nothing has to clear it.
+    pub capacity_moving_until: Option<SystemTime>,
     /// When `PAY_PER_REQUEST` was LAST SET as this table's read/write capacity mode,
     /// which is what `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports:
     /// "Represents the time when `PAY_PER_REQUEST` was last set as the read/write
@@ -3299,73 +3324,9 @@ pub fn cannot_delete_non_global_secondary_index(index: &str) -> RequestError {
     ))
 }
 
-/// The `ResourceNotFoundException` message an ARN-ADDRESSED operation answers with.
-///
-/// The tagging surface and the resource-policy surface carry no `TableName`: the
-/// caller's whole selector is the `ResourceArn` member, so the refusal names THAT
-/// member and echoes the value the request carried — the same construction the
-/// name-addressed [`not_found`] above makes for `Table`, over the identifier that was
-/// actually sent. Nothing derived from the ARN (the table name inside it) appears,
-/// because no member of the request holds it.
-pub fn resource_arn_not_found(resource_arn: &str) -> RequestError {
-    RequestError::NotFound(format!(
-        "Requested resource not found: ResourceArn: {resource_arn} not found"
-    ))
-}
-
-/// The `ValidationException` message an ARN-ADDRESSED operation answers a
-/// `ResourceArn` it cannot address with, in the form that states the rule the value
-/// broke.
-///
-/// This is an INPUT refusal, not a lookup miss: a value that is not an ARN this
-/// service can address names no resource whose existence could be checked. Two rules
-/// can be broken, and the message states the one that was:
-///
-/// * a value that is NOT AN ARN AT ALL — it does not begin with the `arn:` every ARN
-///   begins with — is refused by that rule, with the value the request carried, so a
-///   caller that sent a bare resource name is told what the member takes;
-/// * an ARN that is well formed but addresses no table of this endpoint (another
-///   service, partition, account or region, or a deeper sub-resource) is refused by the
-///   member it was sent in, because the value IS an ARN and the rule it broke is which
-///   resource it names.
-pub fn invalid_resource_arn(resource_arn: &str) -> RequestError {
-    RequestError::Validation(invalid_resource_arn_message(resource_arn))
-}
-
-/// The MESSAGE of that refusal, for the one caller that states it outside a handler: the
-/// member's own bounds are declared by the model, so the validating walk can reach the
-/// value before any handler does, and `src/service.rs` restates the refusal from here
-/// rather than letting the walk's clause stand (see its `SELF_CHECKED_MEMBER_OPERATIONS`).
-pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
-    if resource_arn.starts_with(ARN_PREFIX) {
-        format!("{INVALID_TABLE_ARN}: Invalid ResourceArn provided as input {resource_arn}")
-    } else {
-        format!(
-            "One or more parameter values were invalid: ARNs must start with '{ARN_PREFIX}': \
-             {resource_arn}"
-        )
-    }
-}
-
 /// What every ARN begins with, which is the first thing an ARN-addressed member is held
 /// to ([`invalid_resource_arn`]).
 pub const ARN_PREFIX: &str = "arn:";
-
-/// The CLASS sentence a `ResourceArn` the TAGGING surface cannot read as a table ARN of
-/// this endpoint is refused by, and the WHOLE message when there is no value to name.
-///
-/// The refusal states the failure in two parts: this sentence, which is the rule that was
-/// broken, and — when the request carried a value — the detail clause naming it
-/// ([`invalid_resource_arn`]). A request that carries NO value for the member leaves
-/// nothing to detail, so the class sentence is the whole message: fixed text, no member
-/// path, nothing echoed. `src/service.rs` is where the member's absence reaches it, because
-/// the walk is what finds a member missing.
-pub const INVALID_TABLE_ARN: &str = "Invalid TableArn";
-
-/// The member path the validating walk reports an ARN-ADDRESSED operation's selector
-/// under: the lowerCamel spelling of `ResourceArn`, which is the path a clause about that
-/// member names it by.
-pub const RESOURCE_ARN_MEMBER_PATH: &str = "resourceArn";
 
 /// The `ValidationException` message for a request whose tag list repeats a key.
 ///
@@ -3469,6 +3430,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
                 table.apply_due_index_removals(now);
                 table.refresh_due_counters(now);
                 table.tags.apply_due_propagation(now);
+                // The stream's own tag set propagates on the same schedule the table's
+                // does: it is the same eventually consistent tag reader that sees it.
+                table.stream_tags.apply_due_propagation(now);
             }
         }
         for change in expired {
@@ -4047,76 +4011,6 @@ pub use streams_seam::{
 pub(crate) fn check_value_rules(value: &AttributeValue) -> Result<(), RequestError> {
     let mut probe = value.clone();
     canonicalize_attribute_value(&mut probe)
-}
-
-/// The DynamoDB resource an ARN-addressed operation's `ResourceArn` names: the region
-/// it lives in, the table it is, and the ARN as the request spelled it.
-///
-/// Such a call carries no `TableName`, so the ARN is the caller's whole selector — and
-/// it is also the only identifier the request holds, which is why it is kept here: a
-/// refusal about this resource echoes `arn`, never the `table` derived from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaggedResource {
-    pub region: String,
-    pub table: String,
-    pub arn: String,
-}
-
-/// Resolve an ARN-addressed operation's `ResourceArn` to the table it names, in the
-/// scope the request itself is made in.
-///
-/// The one place an ARN is classified for the tagging and resource-policy surfaces, so
-/// `TagResource`, `UntagResource`, `ListTagsOfResource` and the three `*ResourcePolicy`
-/// operations share a single rule, in two parts:
-///
-/// * SHAPE — the value must be an ARN of THIS service
-///   (`arn:<partition>:dynamodb:<region>:<account>:table/<name>`) naming a table and
-///   nothing deeper: a sub-resource ARN (`.../index/<i>`, `.../stream/<label>`) is not
-///   a resource this emulator keeps a tag set or a policy for, so it is refused rather
-///   than silently taken for its table;
-/// * SCOPE — the ARN must address a resource of the endpoint the request reached: the
-///   same partition, account and REGION this request is signed for, which is the one
-///   this service answers for. [`table_arn`] mints exactly that form for a table of
-///   this region, so the comparison against it is the whole scope check.
-///
-/// Either way the value names no resource whose existence could be looked up, so it is
-/// an INPUT failure ([`invalid_resource_arn`], 400 `ValidationException`) and not a
-/// missing resource — an out-of-scope ARN is not "absent here", it is unaddressable
-/// from here. Only a well-formed, in-scope ARN reaches the lookup, where a table that
-/// is not there is [`resource_arn_not_found`].
-pub fn resolve_resource_arn(
-    resource_arn: &str,
-    request_region: &str,
-) -> Result<TaggedResource, RequestError> {
-    let invalid = || invalid_resource_arn(resource_arn);
-    // `arn`, partition, service, region, account, resource — the resource field is
-    // the last one and may itself carry `/`, so the split stops at six.
-    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
-    let (partition, service, region, resource) = match fields.as_slice() {
-        ["arn", partition, service, region, _account, resource] => {
-            (*partition, *service, *region, *resource)
-        }
-        _ => return Err(invalid()),
-    };
-    if partition.is_empty() || service != "dynamodb" || region.is_empty() {
-        return Err(invalid());
-    }
-    let path = resource.strip_prefix("table/").ok_or_else(invalid)?;
-    if path.contains('/') {
-        return Err(invalid());
-    }
-    let table = resolve_table_name(path).map_err(|_| invalid())?;
-    // The scope half of the rule: anything but this endpoint's own ARN form for that
-    // table — another partition, another account, another region — is unaddressable
-    // here, whatever this store happens to hold.
-    if resource_arn != table_arn(request_region, &table) {
-        return Err(invalid());
-    }
-    Ok(TaggedResource {
-        region: request_region.to_string(),
-        table,
-        arn: resource_arn.to_string(),
-    })
 }
 
 /// What a refused tagging write would have done to the resource, as
@@ -4993,3 +4887,10 @@ pub use async_capacity::*;
 /// every caller still names them `crate::state::…`.
 mod vector_index_declarations;
 pub use vector_index_declarations::*;
+
+/// How the TAGGING surface reads the `ResourceArn` that is its whole selector — which of a
+/// table's resources it names, and the sentence each refusal states — in its own file,
+/// because it is about the IDENTIFIER a request carries rather than about what the store
+/// holds. Re-exported below, so every caller still names them `crate::state::…`.
+mod resource_tagging;
+pub use resource_tagging::*;

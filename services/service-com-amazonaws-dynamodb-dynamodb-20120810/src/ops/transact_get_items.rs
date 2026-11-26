@@ -269,8 +269,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (at, (requested, projected)) in
             input.transact_items.iter().zip(&projections).enumerate()
         {
-            let name = crate::state::resolve_table_name_in(&requested.get.table_name, &region)
-                .map_err(lift)?;
+            // A clause about a member of an element names that member's FULL path — the
+            // list, the element's 1-based position in it, the collection step into one
+            // element, the action it states and the leaf member — so a caller can find
+            // WHICH element of the transaction was refused. The frame is this plane's:
+            // a transaction reads the ITEMS of the tables its elements address, so an
+            // ARN-field refusal is that member's own constraint clause
+            // ([`crate::state::resolve_table_name_in_member_clause`]).
+            let name = crate::state::resolve_table_name_in_member_clause(
+                &format!(
+                    "{TRANSACT_ITEMS_MEMBER}.{}.member.{GET_MEMBER}.{}",
+                    at + 1,
+                    crate::state::TABLE_NAME_MEMBER_PATH
+                ),
+                &requested.get.table_name,
+                &region,
+            )
+            .map_err(lift)?;
             // A refusal about the value the `Key` carried is stated as the sentence it
             // is: this is a READ, and a read states a clause about a value it was handed
             // outside the `<N> validation error(s) detected: ` envelope
@@ -432,6 +447,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The input member a projection travels in, which is what its refusals name.
 const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
+
+/// The member list this operation's elements arrive in, as the request validator spells
+/// it in the paths it reports.
+const TRANSACT_ITEMS_MEMBER: &str = "transactItems";
+
+/// The action member one element of this operation states, as that same validator spells
+/// it: `TransactGetItem` models exactly one (`Get`), so every element's path names it.
+const GET_MEMBER: &str = "get";
 
 /// The key activity ONE `Get` of the transaction makes: the table it read, the contributor keys
 /// it addressed, and the units it billed ([`crate::state::contributor_insights`]).

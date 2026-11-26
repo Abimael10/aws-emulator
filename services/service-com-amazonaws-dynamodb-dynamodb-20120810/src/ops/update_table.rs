@@ -764,6 +764,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now
         };
         table.updated_at = settles_later.then_some(settles_at);
+        // Whether the work still running is a CAPACITY MOVE, which is what the refusal a
+        // second change earns while it runs states ([`moves_provisioned_capacity`]).
+        table.capacity_moving_until =
+            (settles_later && moves_provisioned_capacity(&input)).then_some(settles_at);
         // "The time when PAY_PER_REQUEST was last set as the read/write capacity mode"
         // (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`) is the instant of the
         // CALL that set it, which is this one, so a description taken while the capacity
@@ -1149,6 +1153,37 @@ fn asks_for_asynchronous_work(input: &UpdateTableInput) -> bool {
         || list_named(input.replica_updates.as_ref())
 }
 
+/// Whether this request moves PROVISIONED CAPACITY — the read and write units the table
+/// or one of its indexes serves — rather than only changing some other setting of the
+/// table.
+///
+/// "UpdateTable is an asynchronous operation" and the capacity it moves is what the
+/// service is still working on while the table reports `UPDATING`, so this is the fact a
+/// refusal of a second change to that table states
+/// ([`crate::state::Table::throughput_update_in_flight`]).
+///
+/// Three members ask for such a move: the table's own `ProvisionedThroughput`, the pair an
+/// index `Update` carries, and a change of the capacity MODE — a switch to
+/// `PAY_PER_REQUEST` withdraws the provisioned pair and a switch back sets one, which is
+/// the same move read the other way. A warm-throughput change, a table class, a stream, an
+/// SSE specification, an index create or delete and a replica update are all asynchronous
+/// work on the table that moves no capacity figure, so none of them is one.
+fn moves_provisioned_capacity(input: &UpdateTableInput) -> bool {
+    input.provisioned_throughput.is_some()
+        || input.billing_mode.is_some()
+        || input.table_throughput_mode.is_some()
+        || input
+            .global_secondary_index_updates
+            .iter()
+            .flatten()
+            .any(|update| {
+                update
+                    .update
+                    .as_ref()
+                    .is_some_and(|change| change.provisioned_throughput.is_some())
+            })
+}
+
 /// Every on-demand capacity ceiling this request names: the table's own, and the one
 /// each index create or index update carries — an index's capacity mode is the table's,
 /// so the same rule holds for all of them.
@@ -1310,15 +1345,31 @@ fn validated_index_updates(
         };
         if !named.insert(index_name) {
             // An UPDATE list naming one index twice asks for two changes to one resource,
-            // which is a defect of the list rather than of a declaration: it keeps this
-            // member's own sentence, not the one a request DECLARING two indexes of a name
-            // earns ([`crate::state::duplicate_index_name`]).
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid GlobalSecondaryIndexUpdates: index {index_name} is named more than once"
-            )));
+            // which is a defect of the list rather than of a declaration: AWS states the
+            // rule the list broke — one update per index at a time — and names the index
+            // it was broken over, which is not the sentence a request DECLARING two
+            // indexes of a name earns ([`crate::state::duplicate_index_name`]).
+            return Err(crate::state::RequestError::Validation(
+                one_update_per_index_message(index_name),
+            ));
         }
     }
     Ok(updates)
+}
+
+/// AWS's text for a `GlobalSecondaryIndexUpdates` list that names one index in more than
+/// one entry: the rule the list broke, with the index it was broken over as its one
+/// variable part.
+///
+/// Fixed text around that name: the sentence states how many updates of ONE index a single
+/// call carries and nothing of how many entries named it or which actions they asked for,
+/// so it reads the same for two deletes of a name, two creates of it, and an update beside
+/// either.
+fn one_update_per_index_message(index_name: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Only one global secondary index update per \
+         index is allowed simultaneously. Index: {index_name}"
+    )
 }
 
 /// Why one request asks for more index lifecycle work than a single `UpdateTable` may
@@ -1498,8 +1549,17 @@ fn index_build_refusal(
         return None;
     }
     table_updating.then(|| {
+        // WHAT is still running is what the refusal states: a capacity move is reported
+        // as the table's IOPS being updated, naming the table after the fact, and every
+        // other unsettled update as the table being updated
+        // ([`crate::state::Table::throughput_update_in_flight`]).
+        let detail = if stored.throughput_update_in_flight(now) {
+            format!("Table IOPS are currently being updated. Table: {name}")
+        } else {
+            format!("Table is being updated: {name}")
+        };
         in_use(format!(
-            "Attempt to change a resource which is still in use: Table is being updated: {name}"
+            "Attempt to change a resource which is still in use: {detail}"
         ))
     })
 }
@@ -1840,6 +1900,12 @@ fn definitions_required_message(index_name: &str) -> String {
     )
 }
 
+/// AWS's fixed text for a `Create` naming an index the table already carries: the whole
+/// sentence states the work that cannot be done and interpolates nothing — neither the
+/// index nor the table — so it reads the same whichever index of whichever table a request
+/// asks to create twice.
+const INDEX_ALREADY_EXISTS_MESSAGE: &str = "Attempting to create an index which already exists";
+
 /// The table's global secondary indexes after the update.
 ///
 /// A `Create` adds one (reported `CREATING` until the clock makes it `ACTIVE`), a
@@ -1878,10 +1944,12 @@ fn resolve_indexes(
     for update in updates {
         if let Some(create) = &update.create {
             if indexes.iter().any(|index| index.name == create.index_name) {
-                return Err(crate::state::RequestError::Validation(format!(
-                    "Invalid GlobalSecondaryIndexUpdates: index {} already exists on table {}",
-                    create.index_name, table.name
-                )));
+                // AWS states the fact about the work asked for and names neither the
+                // index nor the table: the create cannot be served because that index is
+                // already there, which reads the same for every index of every table.
+                return Err(crate::state::RequestError::Validation(
+                    INDEX_ALREADY_EXISTS_MESSAGE.to_string(),
+                ));
             }
             if indexes.len() >= crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
                 return Err(crate::state::RequestError::Validation(format!(
@@ -1905,7 +1973,7 @@ fn resolve_indexes(
                 // that kind's shape.
                 &super::create_table::IndexKeyShape::GLOBAL,
             )?;
-            super::create_table::validated_projection(&create.index_name, &create.projection)?;
+            super::create_table::validated_projection(&create.projection)?;
             let throughput = super::create_table::validated_index_throughput(
                 &create.index_name,
                 billing_mode,

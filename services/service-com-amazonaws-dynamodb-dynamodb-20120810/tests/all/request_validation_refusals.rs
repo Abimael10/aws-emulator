@@ -58,6 +58,15 @@ const INCLUDE_WITHOUT_ATTRIBUTES: &str = "One or more parameter values were inva
                                           ProjectionType is INCLUDE, but NonKeyAttributes is \
                                           not specified";
 
+/// AWS's text for the other half of that pair: a projection naming `NonKeyAttributes`
+/// under a type that projects no such list, which states the type the request sent.
+fn attributes_outside_include(projection_type: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: ProjectionType is {projection_type}, but \
+         NonKeyAttributes is specified"
+    )
+}
+
 /// A create carrying one global secondary index with `projection`.
 fn create_with_index_projection(name: &str, projection: Value) -> Value {
     json!({
@@ -106,11 +115,13 @@ async fn a_projection_of_include_names_the_attributes_it_projects() {
         if projection_type == "INCLUDE" {
             ok(&router, "CreateTable", listed).await;
         } else {
-            // The other half of the same rule, which the service already stated.
+            // The other half of the same rule, stated over the type the request sent.
             let stated = refusal(&router, &case, "CreateTable", listed).await;
-            assert!(
-                stated.contains("NonKeyAttributes can only be specified"),
-                "case {case:?}: expected the member pair to be refused, got {stated:?}"
+            assert_eq!(
+                stated,
+                attributes_outside_include(projection_type),
+                "case {case:?}: expected the parameter-value sentence naming the type, got \
+                 {stated:?}"
             );
         }
     }

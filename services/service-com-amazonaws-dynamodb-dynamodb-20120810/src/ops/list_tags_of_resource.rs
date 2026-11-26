@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsOfResource
-//! Reports the tag set stored on the DynamoDB resource its `ResourceArn` names — what
-//! `CreateTable` seeded and every later `TagResource`/`UntagResource` left there, as
-//! far as this EVENTUALLY CONSISTENT read can see it yet.
+//! Reports the tag set stored on the DynamoDB resource its `ResourceArn` names — a
+//! table, or that table's stream, each carrying its own set
+//! ([`crate::state::Table::tag_set`]) — as `CreateTable` seeded it and every later
+//! `TagResource`/`UntagResource` left it, as far as this EVENTUALLY CONSISTENT read can
+//! see it yet.
 //!
 //! "ListTagsOfResource uses an eventually consistent query, and the metadata for your
 //! tags or table might not be available at that moment" (the `TagResource` doc), so a
@@ -200,8 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListTagsOfResourceOutput {
             // The set this eventually consistent read can see — the newest one whose
-            // propagation span has elapsed, not whatever the last write stored.
-            tags: Some(crate::state::tag_list(table.tags.visible())),
+            // propagation span has elapsed, not whatever the last write stored — of the
+            // resource the ARN addressed: the table's own tags, or its stream's
+            // ([`crate::state::Table::tag_set`]).
+            tags: Some(crate::state::tag_list(
+                table.tag_set(&resource).map_err(lift)?.visible(),
+            )),
             next_token: None,
         })
     }

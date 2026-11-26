@@ -398,6 +398,22 @@ pub fn resolve_table_name_in_member(
     resolve_region_addressed(member, table_name, region, ArnRefusalForm::Sentence)
 }
 
+/// That same per-element resolution with the ARN-FIELD refusals stated as the carrying
+/// member's own CONSTRAINT CLAUSE rather than as the sentence alone — the form the DATA
+/// plane states ([`ArnRefusalForm`]), over the full path of the member the name arrived in.
+///
+/// For the operations that read or write the ITEMS of tables their ELEMENTS address — the
+/// transactional ones — which are of that plane exactly as the single-item operations
+/// beside them are ([`resolve_table_name_in_clause`]): the plane decides the frame, and the
+/// element decides only which path the clause names.
+pub fn resolve_table_name_in_member_clause(
+    member: &str,
+    table_name: &str,
+    region: &str,
+) -> Result<String, RequestError> {
+    resolve_region_addressed(member, table_name, region, ArnRefusalForm::MemberClause)
+}
+
 /// The REGION field of a value spelled as an ARN, or `None` when the value is not
 /// spelled as one — a bare table name addresses no region of its own.
 pub(super) fn table_arn_region(table_name: &str) -> Option<&str> {

@@ -827,9 +827,9 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_by_that_rule() {
         }
     }
 
-    // A STREAM sub-resource ARN is not a resource the tagging surface addresses at all,
-    // while the policy surface takes it and looks the stream up — which is where a table
-    // publishing to no stream answers that the stream is not there.
+    // A STREAM sub-resource ARN is a resource BOTH surfaces address, so each takes it and
+    // looks the stream up — which is where a table publishing to no stream answers that
+    // the stream is not there, in each surface's own vocabulary.
     let stream_arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Addressed/stream/2026-01-01");
     for (operation, body) in arn_addressed(&stream_arn) {
         let (code, stated) = refusal(&router, "a stream sub-resource ARN", operation, body).await;
@@ -862,14 +862,14 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_by_that_rule() {
             assert_eq!(
                 (code.as_str(), stated.as_str()),
                 (
-                    "ValidationException",
+                    "ResourceNotFoundException",
                     format!(
-                        "Invalid TableArn: Invalid ResourceArn provided as input {stream_arn}"
+                        "Requested resource not found: ResourceArn: {stream_arn} not found"
                     )
                     .as_str()
                 ),
-                "case a stream sub-resource ARN ({operation}): expected the member refusal, got \
-                 {code} with {stated:?}"
+                "case a stream sub-resource ARN ({operation}): expected the miss reported \
+                 against the member, got {code} with {stated:?}"
             );
         }
     }

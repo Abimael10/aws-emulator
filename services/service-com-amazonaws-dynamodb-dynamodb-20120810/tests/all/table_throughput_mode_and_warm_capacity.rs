@@ -545,14 +545,22 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
             row.restored_index_warm,
         );
 
-        // And the delete echo projects the same stored table one last time.
+        // And the delete echo projects the same stored table one last time — the table's
+        // own pair, because a DELETING description reports no `GlobalSecondaryIndexes` at
+        // all (`tests/all/delete_table_description_projection.rs`).
         let deleted = ok(&router, "DeleteTable", json!({"TableName": row.name})).await;
-        assert_warm(
-            case,
-            "DeleteTable",
-            &deleted["TableDescription"],
-            row.restored_table_warm,
-            row.restored_index_warm,
+        assert_eq!(
+            deleted["TableDescription"]["WarmThroughput"],
+            expected_warm(row.restored_table_warm),
+            "case {case:?} from DeleteTable: expected the table to keep {:?} warm, got {deleted}",
+            row.restored_table_warm
+        );
+        assert!(
+            deleted["TableDescription"]
+                .get("GlobalSecondaryIndexes")
+                .is_none(),
+            "case {case:?} from DeleteTable: a DELETING description reports no index list, got \
+             {deleted}"
         );
         wait_out_transition();
     }

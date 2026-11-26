@@ -474,6 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "... Tags Stream settings Time to Live (TTL) settings" — none of them
             // carries over from the source table either.
             tags: crate::state::ResourceTags::default(),
+            stream_tags: crate::state::ResourceTags::default(),
             stream: None,
             resource_policy: crate::state::ResourcePolicySlot::default(),
             // "Resource-based policies are not copied to the restored table" — nor to
@@ -482,6 +483,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date_time: now,
             active_at,
             updated_at: None,
+            capacity_moving_until: None,
             // A table restored on-demand has `PAY_PER_REQUEST` set as its capacity mode
             // by this call, which is the instant the table was created at — the same
             // rule a create follows.

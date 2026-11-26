@@ -5,8 +5,9 @@
 //! `ResourceArn` names, leaving every other key alone, and answers an empty body.
 //!
 //! The mirror of `tag_resource`: both resolve the ARN through
-//! [`crate::state::resolve_resource_arn`] and edit the one tag set the table holds,
-//! which `list_tags_of_resource` reports.
+//! [`crate::state::resolve_resource_arn`] and edit the one tag set that resource holds
+//! — a table's own, or its stream's ([`crate::state::Table::tag_set_mut`]) — which
+//! `list_tags_of_resource` reports.
 //!
 //! The removal is ASYNCHRONOUS, as the doc below says: it leaves the resource with the
 //! remaining set at once, and the eventually consistent reader sees that set one
@@ -245,13 +246,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Exactly the keys named go, and a key the table does not carry is nothing to
+        // Exactly the keys named go, and a key the resource does not carry is nothing to
         // remove — so repeating the call changes nothing further. What is left becomes
         // visible to `ListTagsOfResource` one propagation span later: "The application
         // or removal of tags using TagResource and UntagResource APIs is eventually
-        // consistent" (this operation's own doc above).
+        // consistent" (this operation's own doc above). The set is the one the ARN
+        // addressed — the table's own, or its stream's
+        // ([`crate::state::Table::tag_set_mut`]).
         table
-            .tags
+            .tag_set_mut(&resource)
+            .map_err(lift)?
             .remove(input.tag_keys.iter().map(String::as_str), now);
 
         Ok(UntagResourceOutput)

@@ -307,23 +307,27 @@ fn create_entry(name: &str) -> Value {
 }
 
 /// The boundary of RULE 1, and RULE 3: an UPDATE list that names one index twice asks for
-/// two changes to one resource rather than declaring two indexes of a name, so it keeps
-/// that member's own refusal — a `ValidationException` whose wording its own suite pins
-/// (`tests/all/vector_index_updates.rs`) — and writes nothing. Rows differ in which pair of
-/// actions names the index twice and whether the name is one the table carries or a new one.
+/// two changes to one resource rather than declaring two indexes of a name, so it is
+/// refused over the rule that list broke — AWS's `ValidationException` stating that one
+/// update per index is allowed at a time, naming the index
+/// (`tests/all/control_plane_refusal_wording.rs` drives the whole class) — and writes
+/// nothing. Rows differ in which pair of actions names the index twice and whether the name
+/// is one the table carries or a new one.
 #[tokio::test]
 async fn an_index_update_list_that_names_one_index_twice_is_refused_and_writes_nothing() {
     let router = emulator();
     let table = "IndexNamedTwice";
     table_with_one_index(&router, table).await;
 
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, &str, Value); 4] = [
         (
             "one index deleted twice",
+            "idx.keep",
             json!([{"Delete": {"IndexName": "idx.keep"}}, {"Delete": {"IndexName": "idx.keep"}}]),
         ),
         (
             "one index deleted and updated",
+            "idx.keep",
             json!([
                 {"Delete": {"IndexName": "idx.keep"}},
                 {"Update": {"IndexName": "idx.keep"}},
@@ -331,15 +335,17 @@ async fn an_index_update_list_that_names_one_index_twice_is_refused_and_writes_n
         ),
         (
             "one index updated twice",
+            "idx.keep",
             json!([{"Update": {"IndexName": "idx.keep"}}, {"Update": {"IndexName": "idx.keep"}}]),
         ),
         (
             "a new name created and deleted in one list",
+            "idx.new",
             json!([create_entry("idx.new"), {"Delete": {"IndexName": "idx.new"}}]),
         ),
     ];
 
-    for (case, updates) in cases {
+    for (case, index, updates) in cases {
         let (status, code, stated) = refusal(
             &router,
             "UpdateTable",
@@ -351,9 +357,13 @@ async fn an_index_update_list_that_names_one_index_twice_is_refused_and_writes_n
             (400, "ValidationException"),
             "case {case:?}: expected the list to be refused, got {status} with {stated:?}"
         );
-        assert!(
-            stated.contains("named more than once"),
-            "case {case:?}: expected the member's own duplicate sentence, got {stated:?}"
+        assert_eq!(
+            stated,
+            format!(
+                "One or more parameter values were invalid: Only one global secondary index \
+                 update per index is allowed simultaneously. Index: {index}"
+            ),
+            "case {case:?}: expected the one-update-per-index sentence, got {stated:?}"
         );
     }
 

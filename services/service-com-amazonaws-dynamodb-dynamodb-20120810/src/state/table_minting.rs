@@ -129,9 +129,15 @@ pub fn mint_table(minted: MintedTable) -> Table {
         point_in_time_recovery: PointInTimeRecovery::default(),
         // The seeded set propagates to the tag reader like any other tag change.
         tags: ResourceTags::seeded(tags, creation_date_time),
+        // A stream's tags are the stream's own, and a table minted here publishes to a
+        // stream nothing has tagged yet.
+        stream_tags: ResourceTags::default(),
         creation_date_time,
         active_at,
         updated_at: None,
+        // Nothing has moved this table's capacity: it was created with the capacity it
+        // serves.
+        capacity_moving_until: None,
         removed_at: None,
         resource_policy,
         // A stream's policy is the stream's own, and a table minted here publishes to a

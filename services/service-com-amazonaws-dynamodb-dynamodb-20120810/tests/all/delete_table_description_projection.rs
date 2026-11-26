@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `DeleteTable` ACCEPTS a table the registry holds, and reports the whole table.
+//! `DeleteTable` ACCEPTS a table the registry holds, and reports the table it is
+//! deleting.
 //!
 //! The rule pinned here: `DeleteTable` resolves the table by name in the request's
 //! region exactly as `DescribeTable` does — "If the table is in the ACTIVE state, you
 //! can delete it", and `ResourceNotFoundException` is modelled only for a table that
 //! does not exist — so a table any accepted `CreateTable` registered is deletable, and
-//! the accepted delete answers 200 with the SAME complete `TableDescription` projection
-//! `DescribeTable` reports for that table, differing only in `TableStatus`, which is
+//! the accepted delete answers 200 with the `TableDescription` projection
+//! `DescribeTable` reports for that table, differing in `TableStatus`, which is
 //! `DELETING` ("After a DeleteTable request, the specified table is in the DELETING
-//! state"). Which optional members the create configured — a `StreamSpecification`, a
-//! billing mode, a sort key, secondary indexes, items already written — changes what
-//! that description SAYS, never whether the table is found or whether the description
-//! is there at all.
+//! state"), and in carrying NO `GlobalSecondaryIndexes` list: "when you delete a table,
+//! any indexes on that table are also deleted", so the DELETING description reports no
+//! index state at all. Which optional members the create configured — a
+//! `StreamSpecification`, a billing mode, a sort key, secondary indexes, items already
+//! written — changes what that description SAYS, never whether the table is found or
+//! whether the description is there at all.
 //!
 //! The rows below are a TABLE spanning what the rule generalises over: a create with no
 //! `StreamSpecification`, one that asks for a disabled stream, one per `StreamViewType`
@@ -227,14 +230,18 @@ async fn an_accepted_delete_reports_the_same_description_describe_table_does() {
             "case {case:?}: the delete must report a TableDescription, got {deleted}"
         );
 
-        // The whole projection, not a reduced one: the delete reports the table exactly
-        // as DescribeTable did, with only the status moved on.
+        // The whole projection but the index list: the delete reports the table exactly
+        // as DescribeTable did, with the status moved on and the GlobalSecondaryIndexes
+        // the table's indexes were reported under gone with them.
         let mut expected = active.clone();
         expected["TableStatus"] = json!("DELETING");
+        if let Value::Object(members) = &mut expected {
+            members.remove("GlobalSecondaryIndexes");
+        }
         assert_eq!(
             description, &expected,
             "case {case:?}: expected the delete to report the table DescribeTable reported with \
-             TableStatus DELETING, got {description}"
+             TableStatus DELETING and no GlobalSecondaryIndexes, got {description}"
         );
     }
 }
@@ -384,13 +391,15 @@ async fn the_reported_description_carries_every_member_the_table_was_created_wit
             }
         }
 
-        // The secondary indexes the create declared are reported, and a table that
-        // declared none reports no list at all.
-        assert_eq!(
-            description.get("GlobalSecondaryIndexes").is_some(),
-            row.with_indexes,
-            "case {case:?}: GlobalSecondaryIndexes is reported exactly for a table that has \
-             one, got {description}"
+        // The GlobalSecondaryIndexes list is reported by no DELETING description, whether
+        // or not the table has indexes: they are deleted with the table, so there is no
+        // index state to report. The LOCAL indexes the create declared are part of the
+        // table's own key configuration and carry no status of their own, so they are
+        // reported exactly as DescribeTable reports them.
+        assert!(
+            description.get("GlobalSecondaryIndexes").is_none(),
+            "case {case:?}: a DELETING description reports no GlobalSecondaryIndexes, got \
+             {description}"
         );
         assert_eq!(
             description.get("LocalSecondaryIndexes").is_some(),

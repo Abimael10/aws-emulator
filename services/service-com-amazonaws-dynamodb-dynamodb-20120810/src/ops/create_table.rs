@@ -1284,7 +1284,7 @@ pub(crate) fn validated_indexes(
             &definitions,
             &IndexKeyShape::GLOBAL,
         )?;
-        validated_projection(&index.index_name, &index.projection)?;
+        validated_projection(&index.projection)?;
         let throughput = validated_index_throughput(
             &index.index_name,
             billing_mode,
@@ -1363,7 +1363,7 @@ fn validated_local_indexes(
             &definitions,
             &IndexKeyShape::LOCAL,
         )?;
-        validated_projection(&index.index_name, &index.projection)?;
+        validated_projection(&index.projection)?;
         let hash_key = index
             .key_schema
             .iter()
@@ -1493,7 +1493,7 @@ impl DeclaredVectorIndex<'_> {
         backfill: crate::state::IndexBackfill,
         now: ::std::time::SystemTime,
     ) -> Result<crate::state::VectorIndex, crate::state::RequestError> {
-        validated_projection(self.index_name, self.projection)?;
+        validated_projection(self.projection)?;
         check_vector_dimensions(self.dimensions)?;
         // "HASH - A partition key that partitions the vector index for independent
         // scaling" (`SearchSchemaElement$SearchSchemaElementType`): ONE partition key
@@ -1728,8 +1728,11 @@ pub(crate) fn validated_index_key_schema(
 /// under another type projects something no type projects, and an `INCLUDE` projection
 /// that names none states which attributes are projected nowhere. Either way the index
 /// cannot be built as asked for, so the request is refused before any of it is stored.
+///
+/// Every sentence here is about the PAIR of members and names no index: the projection
+/// contradicts itself the same way wherever it was declared, which is why this takes the
+/// projection alone.
 pub(crate) fn validated_projection(
-    index_name: &str,
     projection: &Projection,
 ) -> Result<(), crate::state::RequestError> {
     // A projection that states no type states nothing the enum names, so there is no
@@ -1750,10 +1753,9 @@ pub(crate) fn validated_projection(
         .as_ref()
         .is_some_and(|attributes| !attributes.is_empty());
     if non_key && projection_type != "INCLUDE" {
-        return Err(crate::state::RequestError::Validation(format!(
-            "Invalid Projection for index {index_name}: NonKeyAttributes can only be specified \
-             with a ProjectionType of INCLUDE"
-        )));
+        return Err(crate::state::RequestError::Validation(
+            non_key_attributes_outside_include_message(projection_type),
+        ));
     }
     if !non_key && projection_type == "INCLUDE" {
         return Err(crate::state::RequestError::Validation(
@@ -1783,6 +1785,21 @@ pub(crate) const UNKNOWN_PROJECTION_TYPE_VALUE: &str = "null";
 pub(crate) const INCLUDE_WITHOUT_NON_KEY_ATTRIBUTES_MESSAGE: &str =
     "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes \
      is not specified";
+
+/// AWS's text for the OTHER half of that pair: a projection that names `NonKeyAttributes`
+/// under a type which projects no such list.
+///
+/// The same sentence as [`INCLUDE_WITHOUT_NON_KEY_ATTRIBUTES_MESSAGE`] read the other way
+/// round — the two members, and which of the two the projection stated — with the
+/// projection type the request carried as its one variable part, so each value of the enum
+/// but `INCLUDE` states its own refusal. Nothing of the index is named: the member pair is
+/// what contradicts itself, and it does so the same way for every index of every table.
+pub(crate) fn non_key_attributes_outside_include_message(projection_type: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: ProjectionType is {projection_type}, but \
+         NonKeyAttributes is specified"
+    )
+}
 
 /// The most dimensions one vector may carry: a vector index holds vectors of up to 4096
 /// dimensions ("Service, Account, and Table Quotas" in the Amazon DynamoDB Developer

@@ -300,20 +300,26 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
         }
     }
 
-    // A STREAM sub-resource ARN is not a resource the TAGGING surface addresses, and IS
-    // one the resource-policy surface does: the policy surface gets as far as looking the
-    // stream up, which is where a table that publishes to no stream answers that the
-    // stream is not there.
+    // A STREAM sub-resource ARN is a resource BOTH surfaces address — a stream carries
+    // its own tags and its own policy — so each of them reads the value as far as looking
+    // the stream up, which is where a table that publishes to no stream answers that the
+    // stream is not there. Each surface reports the miss in its own vocabulary: the
+    // tagging surface against the member it was addressed by, the policy surface over the
+    // stream the ARN names.
     let stream_arn = format!(
         "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/stream/2026-01-01T00:00:00.000"
     );
     for (operation, body) in tag_addressed(&stream_arn) {
         let (status, answered) = call_in(&router, REGION, operation, body).await;
         assert_eq!(
-            (status, error_code(&answered).as_str()),
-            (400, "ValidationException"),
-            "case a stream sub-resource ARN on {operation}: expected 400 ValidationException, \
-             got {status} with {answered}"
+            (status, error_code(&answered).as_str(), message(&answered)),
+            (
+                400,
+                "ResourceNotFoundException",
+                format!("Requested resource not found: ResourceArn: {stream_arn} not found")
+            ),
+            "case a stream sub-resource ARN on {operation}: the stream is addressable and not \
+             there, got {status} with {answered}"
         );
     }
     for (operation, body) in policy_addressed(&stream_arn) {

@@ -890,7 +890,7 @@ fn check_element_shape(
     action: &Requested<'_>,
     region: &str,
 ) -> Result<String, TransactWriteItemsError> {
-    let name = crate::state::resolve_table_name_in_member(
+    let name = crate::state::resolve_table_name_in_member_clause(
         &format!(
             "{TRANSACT_ITEMS_MEMBER}.{}.member.{}.{}",
             at + 1,

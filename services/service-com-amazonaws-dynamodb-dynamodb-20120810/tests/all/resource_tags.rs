@@ -619,7 +619,10 @@ async fn a_resource_arn_naming_no_table_is_refused_on_every_tagging_operation() 
             format!(
                 "arn:aws:dynamodb:{REGION}:{account}:table/tagged-table/stream/2026-01-01T00:00:00.000"
             ),
-            "ValidationException",
+            // A stream IS a resource the tagging surface addresses, so the value is
+            // read as far as the lookup — where a table publishing to no stream of that
+            // label answers that the resource is not there.
+            "ResourceNotFoundException",
         ),
         (
             "an ARN with no region",

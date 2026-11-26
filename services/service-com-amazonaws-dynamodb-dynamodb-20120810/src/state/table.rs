@@ -356,6 +356,64 @@ impl Table {
         self.key_value(attribute, value)
     }
 
+    /// Whether a CAPACITY MOVE this table's unsettled update started is still running at
+    /// `now`.
+    ///
+    /// What a refusal of a second change names is the work in flight: AWS states a table
+    /// whose provisioned capacity is being moved as its IOPS being updated, and a table
+    /// whose update is anything else as the table being updated. The call that accepted
+    /// the move recorded when the clock owes its end ([`Table::capacity_moving_until`]),
+    /// so this is read off the clock like every other transient fact of a table.
+    pub fn throughput_update_in_flight(&self, now: SystemTime) -> bool {
+        self.capacity_moving_until.is_some_and(|due| now < due)
+    }
+
+    /// The tag set an ARN-ADDRESSED tagging call addressed on this table: the table's own
+    /// tags, or its stream's.
+    ///
+    /// A stream is addressed by the ARN of the stream the table publishes to, so an ARN
+    /// naming any OTHER stream label — a stream this table never had, or one it has
+    /// replaced — names a resource that is not there, which the tagging surface reports
+    /// against the member it was addressed by ([`resource_arn_not_found`]).
+    pub fn tag_set(&self, resource: &TaggedResource) -> Result<&ResourceTags, RequestError> {
+        match resource.target {
+            PolicyTarget::Table => Ok(&self.tags),
+            PolicyTarget::Stream => {
+                self.check_addresses_tagged_stream(resource)?;
+                Ok(&self.stream_tags)
+            }
+        }
+    }
+
+    /// That same set, for a call that WRITES it.
+    pub fn tag_set_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Result<&mut ResourceTags, RequestError> {
+        match resource.target {
+            PolicyTarget::Table => Ok(&mut self.tags),
+            PolicyTarget::Stream => {
+                self.check_addresses_tagged_stream(resource)?;
+                Ok(&mut self.stream_tags)
+            }
+        }
+    }
+
+    /// Whether the ARN of that tagging call names the stream THIS table publishes to.
+    fn check_addresses_tagged_stream(
+        &self,
+        resource: &TaggedResource,
+    ) -> Result<(), RequestError> {
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.arn == resource.arn)
+        {
+            return Ok(());
+        }
+        Err(resource_arn_not_found(&resource.arn))
+    }
+
     /// The policy slot a `*ResourcePolicy` call addressed on this table: the table's own
     /// policy, or its stream's.
     ///

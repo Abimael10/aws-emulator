@@ -105,6 +105,11 @@ fn moved(in_force: Option<i64>, requested: Option<i64>) -> Option<i64> {
 /// gives it: 1 or more SETS the ceiling, and -1 REMOVES it. Anything else — zero, or a
 /// negative number that is not the removal value — asks for a maximum the capacity model
 /// has no meaning for, so the request is refused whatever the table's state.
+///
+/// AWS states that as a RANGE refusal: the member the request asked the ceiling through,
+/// the setting it belongs to and the resource it was asked for, and nothing of the value
+/// sent or of the bounds it fell outside — the same sentence for a figure below the
+/// minimum and for any other value the member does not take.
 pub fn check_on_demand_ceiling_values(
     requested: Option<&OnDemandThroughput>,
 ) -> Result<(), RequestError> {
@@ -117,13 +122,25 @@ pub fn check_on_demand_ceiling_values(
     ] {
         if let Some(value) = value {
             if value != NO_ON_DEMAND_CEILING && value < MIN_ON_DEMAND_CEILING {
-                return Err(RequestError::Validation(format!(
-                    "One or more parameter values were invalid: {member} for OnDemandThroughput \
-                     must be at least {MIN_ON_DEMAND_CEILING} to set a maximum, or \
-                     {NO_ON_DEMAND_CEILING} to remove it, got {value}"
-                )));
+                return Err(RequestError::Validation(
+                    on_demand_ceiling_out_of_range_message(member),
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// AWS's text for a ceiling value the member does not take, over the member it was asked
+/// through.
+///
+/// Fixed text around that one member name: the sentence states the request asked for a
+/// figure outside the range the setting admits, and names the resource the ceiling was
+/// asked for — the table — rather than echoing the figure or the bounds, so it reads the
+/// same for every value no ceiling can hold.
+pub fn on_demand_ceiling_out_of_range_message(member: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Requested {member} for OnDemandThroughput \
+         for table is outside of valid range"
+    )
 }

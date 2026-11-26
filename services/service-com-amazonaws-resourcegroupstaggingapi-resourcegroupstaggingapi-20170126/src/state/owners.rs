@@ -893,11 +893,14 @@ fn bucket_tags(bucket: &owner_s3::state::Bucket) -> Tags {
 /// with nothing to keep in step.
 ///
 /// The ARN is read by that service's OWN rule for a tagging `ResourceArn`
-/// ([`owner_dynamodb::state::resolve_resource_arn`]), so the values this API can tag are
-/// exactly the ones that service can, with no second copy of the resolution here to
-/// drift from it: a value in this namespace that names something other than a table of
-/// this endpoint — a sub-resource ARN such as an index or a stream — is a bad request TO
-/// IT, and it is reported with ITS refusal.
+/// ([`owner_dynamodb::state::resolve_resource_arn`]), so no second copy of the resolution
+/// lives here to drift from it. What this API addresses in that namespace is a TABLE: the
+/// resource type its own index reports (`dynamodb:table`), and the only DynamoDB resource
+/// this projection holds a tag set for. A value that names anything else of that service —
+/// a sub-resource ARN such as an index, or the STREAM its own tagging surface does address
+/// and holds a separate tag set for — is a bad request to THIS API, reported with that
+/// service's own sentence for a `ResourceArn` it cannot address a table by, so the two
+/// surfaces word one refusal.
 ///
 /// The Region comes off the ARN, which is the Region the request is addressed to since
 /// [`super::addressable_arn`] has already refused an ARN of any other.
@@ -916,6 +919,17 @@ fn dynamodb<Eng: Send + Sync + 'static>(
         // for the value.
         Err(error) => return absent("ValidationException", error.message().to_string()),
     };
+    // Of the resources that resolution reads, this API addresses the TABLE: the stream of
+    // a table carries a tag set of its own in that service, which is not the set this
+    // projection reports, so a stream ARN names no resource this API can tag and is
+    // refused as the value it is — in that service's own words for an unaddressable
+    // `ResourceArn`.
+    if resource.target != owner_dynamodb::state::PolicyTarget::Table {
+        return absent(
+            "ValidationException",
+            owner_dynamodb::state::invalid_resource_arn_message(&arn.arn),
+        );
+    }
     let now = SystemTime::now();
     let mut state = state.lock();
     // A resolution must see the store a report of it sees: materialising the deletion the

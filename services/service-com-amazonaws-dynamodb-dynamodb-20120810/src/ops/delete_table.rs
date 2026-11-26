@@ -9,6 +9,11 @@
 //! stream the table had enabled goes to `DISABLED` in the streams service's store,
 //! as the doc below states.
 //!
+//! That description carries no `GlobalSecondaryIndexes`: "when you delete a table, any
+//! indexes on that table are also deleted" (the doc below), so the DELETING description
+//! reports no index state — everything else in it is what `DescribeTable` reports for
+//! the table, with the status moved on.
+//!
 //! A table that is still `CREATING` or `UPDATING` is refused with
 //! `ResourceInUseException` — "You tried to delete a table currently in the CREATING
 //! state" (the `ResourceInUseException` doc) — and so is a table that is ALREADY
@@ -307,7 +312,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             );
         }
-        let description = table.describe(now);
+        let mut description = table.describe(now);
+        // A DELETING description reports no `GlobalSecondaryIndexes`: "when you delete a
+        // table, any indexes on that table are also deleted" (the doc above), so there is
+        // no index state left to report — a list whose entries each carry their own
+        // `IndexStatus` would otherwise state ACTIVE indexes of a table that is going.
+        // Everything else the table carries is reported exactly as `DescribeTable` reports
+        // it, with only the status moved on.
+        description.global_secondary_indexes = None;
 
         Ok(DeleteTableOutput {
             table_description: Some(description),

@@ -2,13 +2,15 @@
 
 //! @op TagResource
 //! Associates a tag set with a DynamoDB resource: the request's tags are MERGED into
-//! the tag set stored on the table its `ResourceArn` names, and the response body is
-//! empty.
+//! the tag set stored on the resource its `ResourceArn` names — a table, or that
+//! table's stream — and the response body is empty.
 //!
 //! This is the write half of the tagging surface `list_tags_of_resource` reports and
 //! `untag_resource` edits; all three resolve the ARN through
-//! [`crate::state::resolve_resource_arn`] and read and write the one tag set the
-//! table holds, so no two of them can disagree about what a resource carries.
+//! [`crate::state::resolve_resource_arn`] and read and write the one tag set that
+//! resource holds ([`crate::state::Table::tag_set`]), so no two of them can disagree
+//! about what a resource carries, and a write addressed at one resource leaves the
+//! other's set exactly as it was.
 //!
 //! The write is ASYNCHRONOUS, as the doc below says: the merge lands on the resource
 //! at once, and the eventually consistent reader sees it one propagation span later
@@ -247,9 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Merging overwrites a key the table already carries and adds only the new
-        // ones, so re-tagging an existing key can never push the set past the limit.
-        if table.tags.count_after_merging(&incoming) > crate::state::MAX_TAGS_PER_TABLE {
+        // Merging overwrites a key the resource already carries and adds only the new
+        // ones, so re-tagging an existing key can never push the set past the limit. The
+        // set is the one the ARN addressed — the table's own, or its stream's, which are
+        // held apart ([`crate::state::Table::tag_set_mut`]).
+        let tags = table.tag_set_mut(&resource).map_err(lift)?;
+        if tags.count_after_merging(&incoming) > crate::state::MAX_TAGS_PER_TABLE {
             return Err(too_many_tags());
         }
         // The merge lands on the resource now and becomes VISIBLE to
@@ -257,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asynchronous operation ... The application or removal of tags using
         // TagResource and UntagResource APIs is eventually consistent" (this
         // operation's own doc above).
-        table.tags.merge(incoming, now);
+        tags.merge(incoming, now);
 
         Ok(TagResourceOutput)
     }

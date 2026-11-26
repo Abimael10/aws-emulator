@@ -424,15 +424,20 @@ impl ResourcePolicySlot {
     }
 }
 
-/// Which DynamoDB resource a resource-based policy is attached to: "Attaches a
+/// Which DynamoDB resource an ARN-addressed call acts on: "Attaches a
 /// resource-based policy document to the resource, which can be a table or stream"
 /// (the `PutResourcePolicy` doc).
+///
+/// The two resources a table's ARNs address, so the TAGGING surface reads the same pair
+/// out of its own `ResourceArn` ([`TaggedResource`]): each of them carries its own policy
+/// and its own tag set, held independently of the other's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyTarget {
-    /// The table itself, whose policy governs the table's own actions.
+    /// The table itself, whose policy and tags are the table's own.
     Table,
     /// The table's stream, whose policy governs the stream's actions and is held
-    /// independently of the table's ([`Table::stream_resource_policy`]).
+    /// independently of the table's ([`Table::stream_resource_policy`]), as its tags are
+    /// ([`Table::stream_tags`]).
     Stream,
 }
 

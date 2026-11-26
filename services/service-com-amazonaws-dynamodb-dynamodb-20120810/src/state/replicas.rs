@@ -1087,9 +1087,15 @@ impl Table {
             deletion_protection_enabled: false,
             point_in_time_recovery: PointInTimeRecovery::default(),
             tags: ResourceTags::seeded(BTreeMap::new(), now),
+            // A tag set is held per resource ARN, so the replica's stream carries its own,
+            // which nothing has tagged yet.
+            stream_tags: ResourceTags::default(),
             creation_date_time: now,
             active_at: now + STATUS_TRANSITION,
             updated_at: None,
+            // The replica is being created with the capacity it will serve, so no capacity
+            // move is in flight on it.
+            capacity_moving_until: None,
             pay_per_request_at: (self.billing_mode == "PAY_PER_REQUEST").then_some(now),
             removed_at: None,
             // A resource-based policy is attached to ONE table by its own ARN, so the

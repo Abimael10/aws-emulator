@@ -547,11 +547,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_protection_enabled: false,
             point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
             tags: crate::state::ResourceTags::default(),
+            stream_tags: crate::state::ResourceTags::default(),
             creation_date_time: now,
             // The table becomes ACTIVE when the import that fills it finishes: its data
             // is the import's, so it is not ready before the task is.
             active_at: now + crate::state::STATUS_TRANSITION,
             updated_at: None,
+            capacity_moving_until: None,
             pay_per_request_at: (billing_mode == "PAY_PER_REQUEST").then_some(now),
             removed_at: None,
             resource_policy: crate::state::ResourcePolicySlot::default(),
