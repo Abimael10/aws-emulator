@@ -8,7 +8,11 @@
 //! A connector in any other `ConnectorStatus` cannot authenticate a certificate request with
 //! a password, so it has none to hand out: the call is refused 400 `ValidationException` with
 //! the sentence this service words a not-active reference with
-//! ([`crate::state::resources_not_active_message`]).
+//! ([`crate::state::resources_not_active_message`]). A connector of the other
+//! `ConnectorType` holds its challenge passwords in its mobile device management rather than
+//! here, so that call is refused the same way, with the sentence this service words a
+//! connector of the wrong type with ([`crate::state::challenge_connector_type_message`]):
+//! every precondition this service refuses a call for is worded by one of those builders.
 //!
 //! ## Shape of an operation
 //!
@@ -270,13 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "For general-purpose connectors" (this operation's own doc): with an Intune
         // connector the challenge passwords are managed in Microsoft Intune, so there is
-        // nothing for this call to mint. The model carries the reason for exactly this.
-        if connector.connector_type != crate::state::TYPE_GENERAL_PURPOSE {
+        // nothing for this call to mint. The model carries the reason for exactly this, and
+        // the refusal is the sentence this service words a connector of the wrong type with
+        // (`crate::state::challenge_connector_type_message`) — a precondition over the
+        // connector the request named, so it is stated where its siblings are.
+        if !connector.is_general_purpose() {
             return Err(CreateChallengeErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Connector {connector_arn} has type {}; challenge passwords can only be created for {} connectors",
-                    connector.connector_type,
-                    crate::state::TYPE_GENERAL_PURPOSE
+                message: crate::state::challenge_connector_type_message(
+                    &connector_arn,
+                    &connector.connector_type,
                 ),
                 reason: Some(crate::state::REASON_INVALID_CONNECTOR_TYPE.to_string()),
             })

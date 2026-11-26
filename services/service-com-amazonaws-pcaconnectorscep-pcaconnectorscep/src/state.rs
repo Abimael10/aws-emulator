@@ -375,6 +375,13 @@ impl StoredConnector {
         self.status == STATUS_DELETING
     }
 
+    /// True when the connector is of the `ConnectorType` whose challenge passwords this
+    /// service mints itself, as opposed to one whose passwords its mobile device management
+    /// holds.
+    pub fn is_general_purpose(&self) -> bool {
+        self.connector_type == TYPE_GENERAL_PURPOSE
+    }
+
     /// The modelled `ConnectorSummary`, as `ListConnectors` returns it. This is the ONE place
     /// the stored record is projected onto the connector output shapes.
     pub fn to_summary(&self) -> ConnectorSummary {
@@ -914,6 +921,26 @@ fn precondition_message(clause: impl ::std::fmt::Display) -> String {
 /// one precondition in two sentences.
 pub fn resources_not_active_message(resource_arn: &str) -> String {
     precondition_message(format_args!("Resource(s) are not active: {resource_arn}"))
+}
+
+/// The sentence a call is refused with when the connector it names is of a `ConnectorType`
+/// that call is not for: the precondition scaffold ([`precondition_message`]) around a clause
+/// naming the connector, the type its record carries, and the one type whose challenge
+/// passwords this service mints.
+///
+/// The variable parts are the ARN the request named and the `ConnectorType` the record is of,
+/// read from state rather than from the request's shape; the required type is this service's
+/// own constant, so the sentence and the precondition it states cannot name two different
+/// types.
+///
+/// Stated here with its sibling clauses rather than in the handler that applies it, so a
+/// precondition refusal of this service opens and closes the same way whichever precondition,
+/// and whichever operation, refused the call.
+pub fn challenge_connector_type_message(connector_arn: &str, connector_type: &str) -> String {
+    precondition_message(format_args!(
+        "Connector {connector_arn} has type {connector_type}; challenge passwords can only be \
+         created for {TYPE_GENERAL_PURPOSE} connectors"
+    ))
 }
 
 /// The sentence a tag change is refused with when the connector the resource hangs off has

@@ -1610,6 +1610,360 @@ async fn challenge_creation_is_refused_outside_an_active_general_purpose_connect
     }
 }
 
+/// The opening every sentence this service refuses a PRECONDITION with carries — a request
+/// whose input is well-formed but names a resource whose state or type does not admit the call
+/// — and the period that closes it, spelled here as wire expectations rather than read back out
+/// of the implementation.
+const PRECONDITION_PREFIX: &str = "Validation error detected: ";
+
+/// The two `ConnectorType` values the model declares (smithy_query shape=ConnectorType), named
+/// from the service's own constants so no case can drift off them.
+const TYPE_GENERAL_PURPOSE: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::TYPE_GENERAL_PURPOSE;
+/// The other one, whose challenge passwords are held in its mobile device management.
+const TYPE_INTUNE: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::TYPE_INTUNE;
+
+/// The settled status of a connector whose creation did not come up.
+const STATUS_FAILED: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::STATUS_FAILED;
+
+/// The `ValidationExceptionReason` a refusal over a connector of the wrong type carries
+/// (smithy_query shape=ValidationExceptionReason).
+const REASON_INVALID_CONNECTOR_TYPE: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::REASON_INVALID_CONNECTOR_TYPE;
+/// The one a refusal over the status a record is in carries, from the same enum.
+const REASON_INVALID_STATE: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::REASON_INVALID_STATE;
+
+/// A private-CA ARN of the form `CertificateAuthorityArn`'s own `@pattern` requires, placed in
+/// `region`: a CA outside the Region the connector is created in is one no read of that
+/// connector's endpoint reaches, which settles the connector `FAILED`.
+fn ca_arn_in(region: &str, id: &str) -> String {
+    format!("arn:aws:acm-pca:{region}:{ACCOUNT}:certificate-authority/{id}")
+}
+
+/// The sentence a challenge create is refused with over a connector of the other
+/// `ConnectorType`: the scaffold, the clause naming the connector and the type its record
+/// carries, the one type whose challenge passwords this service mints, and a terminating `.`.
+fn connector_type_message(connector_arn: &str, connector_type: &str) -> String {
+    format!(
+        "{PRECONDITION_PREFIX}Connector {connector_arn} has type {connector_type}; challenge \
+         passwords can only be created for {TYPE_GENERAL_PURPOSE} connectors."
+    )
+}
+
+/// The sentence a call is refused with when a resource it names, or references, is not in the
+/// state that lets it be used — the same scaffold around this service's other clause.
+fn not_active_message(resource_arn: &str) -> String {
+    format!("{PRECONDITION_PREFIX}Resource(s) are not active: {resource_arn}.")
+}
+
+/// The sentence a read is refused with when the record it names is in a state the call cannot
+/// be served from at all — the same scaffold again.
+fn cannot_be_in_state_message(status: &str, resource_arn: &str) -> String {
+    format!("{PRECONDITION_PREFIX}Resource cannot be in state {status}: {resource_arn}.")
+}
+
+/// Assert one refusal is this service's precondition sentence: the modelled status and error
+/// class, the modelled `Reason`, the whole expected sentence, and the scaffold around the one
+/// clause it states — which names the resource whose state or type refused the call.
+fn assert_precondition_refusal(
+    answer: &Answer,
+    case: &str,
+    expected_reason: &str,
+    expected_message: &str,
+    governing_arn: &str,
+) {
+    assert_eq!(
+        (answer.status, answer.error_type.as_str()),
+        (400, "ValidationException"),
+        "case {case:?}: a precondition refusal is a 400 ValidationException, got {} / {:?}",
+        answer.status,
+        answer.body
+    );
+    assert_eq!(
+        &answer.body["Reason"],
+        &json!(expected_reason),
+        "case {case:?}: expected Reason {expected_reason:?}, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        expected_message,
+        "case {case:?}: expected {expected_message:?}, got {:?}",
+        answer.message()
+    );
+    let message = answer.message();
+    assert!(
+        message.starts_with(PRECONDITION_PREFIX),
+        "case {case:?}: expected the sentence to open with {PRECONDITION_PREFIX:?}, got \
+         {message:?}"
+    );
+    assert!(
+        message.ends_with('.'),
+        "case {case:?}: expected the sentence to close with a period, got {message:?}"
+    );
+    // What is left once the scaffold is taken off: the one clause this refusal states.
+    let clause = &message[PRECONDITION_PREFIX.len()..message.len() - 1];
+    assert!(
+        !clause.is_empty() && !clause.ends_with('.'),
+        "case {case:?}: expected one clause inside the scaffold, got {clause:?}"
+    );
+    assert!(
+        clause.contains(governing_arn),
+        "case {case:?}: expected the clause to name {governing_arn:?}, got {clause:?}"
+    );
+}
+
+/// `CreateChallenge` over a connector of the other `ConnectorType` is refused with ONE
+/// sentence: the scaffold this service opens every precondition refusal with, the clause naming
+/// the connector and the type its record carries, and a terminating period — whatever else that
+/// connector, or the refused request, carries.
+#[tokio::test]
+async fn challenge_creation_states_the_connector_type_precondition_in_the_scaffold() {
+    // The rows differ along what the rule generalises over: the CA the connector links, the
+    // Azure application and the domain its mobile device management names, whether it is
+    // restricted to a VPC endpoint, and whether the refused call carries tags or a client
+    // token. None of that is part of the precondition, so none of it may change the sentence.
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "an Intune connector reached over the public internet",
+            json!({
+                "CertificateAuthorityArn": CA_ARNS[2],
+                "MobileDeviceManagement": {
+                    "Intune": {
+                        "AzureApplicationId": "01234567-89ab-cdef-0123-456789abcdef",
+                        "Domain": "example.onmicrosoft.com",
+                    }
+                },
+            }),
+            json!({}),
+        ),
+        (
+            "an Intune connector restricted to a VPC endpoint, asked with tags",
+            json!({
+                "CertificateAuthorityArn": CA_ARNS[3],
+                "MobileDeviceManagement": {
+                    "Intune": {
+                        "AzureApplicationId": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "Domain": "contoso.example.com",
+                    }
+                },
+                "VpcEndpointId": "vpce-0123abcd456789abc",
+                "Tags": { "owner": "scep" },
+            }),
+            json!({ "Tags": { "team": "pki" } }),
+        ),
+        (
+            "an Intune connector of another domain, asked with a client token",
+            json!({
+                "CertificateAuthorityArn": CA_ARNS[4],
+                "MobileDeviceManagement": {
+                    "Intune": {
+                        "AzureApplicationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "Domain": "pki.example.org",
+                    }
+                },
+                "Tags": { "env": "test" },
+            }),
+            json!({ "ClientToken": "a-token-for-a-refused-create" }),
+        ),
+    ];
+
+    for (case, connector_request, extra) in rows {
+        let (router, engine) = new_router();
+        let created = create_connector(&router, connector_request).await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: expected 202 from CreateConnector, got {} / {:?}",
+            created.status, created.body
+        );
+        let arn = created.text("ConnectorArn");
+        // The refusal under test is the TYPE one, so the transition the clock owes is made due
+        // first: nothing about the connector's status may be what refused the call.
+        harness::release_pending(&engine, &arn);
+
+        // The type the clause names is the one the record REPORTS, asked through
+        // `GetConnector` rather than assumed from the request.
+        let reported = get_connector(&router, &arn).await;
+        assert_eq!(
+            reported.connector("Status"),
+            &json!(STATUS_ACTIVE),
+            "case {case:?}: the connector must be serving before the type refusal, got {:?}",
+            reported.body
+        );
+        let connector_type = reported
+            .connector("Type")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a `Type` in {:?}", reported.body))
+            .to_string();
+        assert_eq!(
+            connector_type, TYPE_INTUNE,
+            "case {case:?}: the row's connector must be of the other type, got \
+             {connector_type:?}"
+        );
+
+        let mut request = json!({ "ConnectorArn": arn.clone() });
+        for (member, value) in extra.as_object().into_iter().flatten() {
+            request[member.as_str()] = value.clone();
+        }
+        let answer = create_challenge(&router, request).await;
+        let expected = connector_type_message(&arn, &connector_type);
+        assert_precondition_refusal(
+            &answer,
+            case,
+            REASON_INVALID_CONNECTOR_TYPE,
+            &expected,
+            &arn,
+        );
+
+        // The service's own builder words that same sentence, so an operation reaching this
+        // precondition cannot state it in a second wording.
+        assert_eq!(
+            service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::challenge_connector_type_message(
+                &arn,
+                &connector_type
+            ),
+            expected,
+            "case {case:?}: the service's builder must word this sentence"
+        );
+
+        // The refused create minted nothing: the connector holds no challenge.
+        let listed = list_challenge_metadata(&router, &arn, "").await;
+        assert_eq!(
+            listed.count("Challenges"),
+            0,
+            "case {case:?}: the refused create must mint no challenge, got {:?}",
+            listed.body
+        );
+    }
+}
+
+/// Whichever precondition refused the call, a caller reads ONE scaffold around the clause that
+/// says which one it was. The rows span the preconditions this service states and the
+/// operations that hold a caller to them, so no refusal of this class can be worded on its own.
+#[tokio::test]
+async fn one_scaffold_opens_every_precondition_refusal() {
+    let (router, engine) = new_router();
+
+    // A connector of the other type, settled: a create over it is refused for its TYPE.
+    let intune = create_connector(
+        &router,
+        json!({
+            "CertificateAuthorityArn": CA_ARNS[2],
+            "MobileDeviceManagement": {
+                "Intune": {
+                    "AzureApplicationId": "01234567-89ab-cdef-0123-456789abcdef",
+                    "Domain": "example.onmicrosoft.com",
+                }
+            },
+        }),
+    )
+    .await
+    .text("ConnectorArn");
+    harness::release_pending(&engine, &intune);
+
+    // A general-purpose connector whose `CREATING` transition is held undue, so the status
+    // refusal is the branch exercised rather than one the test had to win a race for.
+    let creating = create_connector(&router, json!({ "CertificateAuthorityArn": CA_ARNS[0] }))
+        .await
+        .text("ConnectorArn");
+    harness::hold_pending(&engine, &creating);
+
+    // A connector accepted for teardown and held there: the same status precondition over a
+    // different non-serving status.
+    let deleting = active_connector(&router, &engine, CA_ARNS[1]).await;
+    let accepted = delete_connector(&router, &deleting).await;
+    assert_eq!(
+        accepted.status, 202,
+        "expected 202 from DeleteConnector, got {} / {:?}",
+        accepted.status, accepted.body
+    );
+    harness::hold_pending(&engine, &deleting);
+
+    // A connector whose creation did not come up, because the CA its create named sits in
+    // another Region and so is outside the connector's reach.
+    let failed = create_connector(
+        &router,
+        json!({
+            "CertificateAuthorityArn":
+                ca_arn_in("us-east-1", "77777777-6666-5555-4444-333333333333"),
+        }),
+    )
+    .await
+    .text("ConnectorArn");
+    harness::release_pending(&engine, &failed);
+
+    // Each status is ASKED for, so every row below rests on what the service reports rather
+    // than on how this case built the record.
+    for (case, arn, expected_status) in [
+        ("the connector of the other type", &intune, STATUS_ACTIVE),
+        ("the connector still creating", &creating, STATUS_CREATING),
+        ("the connector under teardown", &deleting, STATUS_DELETING),
+        ("the connector that did not come up", &failed, STATUS_FAILED),
+    ] {
+        let reported = get_connector(&router, arn).await;
+        assert_eq!(
+            reported.connector("Status"),
+            &json!(expected_status),
+            "case {case:?}: expected the connector to report {expected_status}, got {:?}",
+            reported.body
+        );
+    }
+
+    // The rows: each a well-formed request one of this service's operations refuses because
+    // the type or the state of the resource it names does not admit the call, with the
+    // `Reason` the model carries for it and the whole sentence it must state.
+    let rows: Vec<(&str, &str, String, &String, Answer)> = vec![
+        (
+            "CreateChallenge over a connector of the other type",
+            REASON_INVALID_CONNECTOR_TYPE,
+            connector_type_message(&intune, TYPE_INTUNE),
+            &intune,
+            create_challenge(&router, json!({ "ConnectorArn": intune.clone() })).await,
+        ),
+        (
+            "CreateChallenge over a connector that is still creating",
+            REASON_INVALID_STATE,
+            not_active_message(&creating),
+            &creating,
+            create_challenge(&router, json!({ "ConnectorArn": creating.clone() })).await,
+        ),
+        (
+            "CreateChallenge over a connector under teardown",
+            REASON_INVALID_STATE,
+            not_active_message(&deleting),
+            &deleting,
+            create_challenge(&router, json!({ "ConnectorArn": deleting.clone() })).await,
+        ),
+        (
+            "CreateChallenge over a connector that did not come up",
+            REASON_INVALID_STATE,
+            not_active_message(&failed),
+            &failed,
+            create_challenge(&router, json!({ "ConnectorArn": failed.clone() })).await,
+        ),
+        (
+            "ListChallengeMetadata over a connector that did not come up",
+            REASON_INVALID_STATE,
+            cannot_be_in_state_message(STATUS_FAILED, &failed),
+            &failed,
+            list_challenge_metadata(&router, &failed, "").await,
+        ),
+    ];
+
+    for (case, expected_reason, expected_message, governing_arn, answer) in &rows {
+        assert_precondition_refusal(
+            answer,
+            case,
+            expected_reason,
+            expected_message.as_str(),
+            governing_arn.as_str(),
+        );
+    }
+}
+
 /// `Tags` carries no modelled `@length`, so the per-resource tag limit is the handler's to
 /// enforce: AWS's 50 tags per resource is accepted and 51 is refused, on both creates.
 #[tokio::test]
