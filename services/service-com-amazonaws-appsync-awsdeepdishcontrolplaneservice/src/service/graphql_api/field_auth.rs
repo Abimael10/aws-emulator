@@ -30,11 +30,14 @@ use super::PlaneContext;
 use crate::state::DirectiveUse;
 
 /// The `errorType` AppSync reports a field the caller may not access under, and the sentence
-/// it states: the field, and the TYPE THAT DECLARES it.
+/// it states: the field, and ONE type named beside it.
 ///
 /// The ONE wording of that refusal, so every way a field is refused words it alike — the
 /// authorization in front of the API, this module's mode directives, the Cognito group guard
-/// and a resolver's own `util.unauthorized`.
+/// and a resolver's own `util.unauthorized`. WHICH type the sentence names is the caller's to
+/// decide: a refusal decided before any resolver runs is about the type that DECLARES the
+/// field, and one a resolver RAISED while resolving it is about the type the schema declares
+/// FOR that field (`super::execution`).
 pub const UNAUTHORIZED_FIELD_ERROR_TYPE: &str = "Unauthorized";
 
 #[must_use]

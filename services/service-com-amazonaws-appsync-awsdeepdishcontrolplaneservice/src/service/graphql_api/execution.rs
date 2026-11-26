@@ -1164,10 +1164,14 @@ impl Execution<'_> {
                 // A resolution that REFUSED the field — `util.unauthorized`, "throws
                 // Unauthorized for the field being resolved" — is reported as the error
                 // AppSync words that refusal with, whatever language the resolver is written
-                // in: the class is the resolver's own, and the sentence names the field and
-                // the type that declares it, which the code that refused cannot name itself.
+                // in: the class is the resolver's own, and the sentence names the field
+                // being resolved and the TYPE THE SCHEMA DECLARES FOR IT, neither of which
+                // the code that refused can name itself.
                 let reported = match failure.refuses_the_field() {
-                    true => unauthorized_field(path, type_name, &field.name),
+                    true => {
+                        let declared = self.refused_field_type(type_name, &field.name);
+                        unauthorized_field(path, &declared, &field.name)
+                    }
                     false => failure.document(path),
                 };
                 self.fault(reported);
@@ -1477,6 +1481,26 @@ impl Execution<'_> {
             })
             .and_then(|field| field.value_type.as_ref().map(named_type))
             .unwrap_or_default()
+    }
+
+    /// The TYPE a refusal RAISED WHILE RESOLVING `field_name` of `type_name` names: the type
+    /// the served schema declares for that field, with everything it is wrapped in taken off
+    /// — a list of non-null `Post`s is a field of `Post`.
+    ///
+    /// A refusal a resolver raises is reported as the field being resolved did not resolve, so
+    /// what it names is THAT field and the type of the value it would have carried, which is
+    /// the type the schema declares for it. The refusals decided BEFORE any resolver runs name
+    /// the type that DECLARES the field instead — the coordinates they are addressed by
+    /// ([`Self::resolve_field`]) — so the two are read apart here.
+    ///
+    /// A field the schema declares no type for leaves nothing to name, so the type that
+    /// declares it is named: it is all that is known about the field being refused.
+    fn refused_field_type(&self, type_name: &str, field_name: &str) -> String {
+        let declared = self.field_type_name(type_name, field_name);
+        match declared.is_empty() {
+            true => type_name.to_string(),
+            false => declared,
+        }
     }
 
     /// The TYPE the API's schema declares for `field_name` of `type_name`, with everything it
@@ -3592,10 +3616,15 @@ fn field_error(path: &[Json], message: &str) -> Json {
 }
 
 /// The error AppSync reports for a field the caller may not access: its own path, the
-/// `Unauthorized` error type and the sentence naming the field and the TYPE THAT DECLARES it
-/// — one wording for every way a field is refused, through the plane's one reading of it
+/// `Unauthorized` error type and the sentence naming the field and ONE type — one wording for
+/// every way a field is refused, through the plane's one reading of it
 /// ([`super::field_auth::unauthorized_field_message`]), which a template's own
 /// `$util.unauthorized` states as well.
+///
+/// `type_name` is the type that refusal is ABOUT: the type that declares the field for a
+/// refusal decided before any resolver of it runs, and the type the schema declares FOR the
+/// field for one a resolver raised while resolving it
+/// ([`Execution::refused_field_type`]).
 fn unauthorized_field(path: &[Json], type_name: &str, field_name: &str) -> Json {
     json!({
         "path": path.to_vec(),

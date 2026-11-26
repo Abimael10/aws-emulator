@@ -260,11 +260,11 @@ async fn a_templates_own_errors_are_the_ones_the_field_reports() {
         ),
         (
             // The refusal AppSync words for a resolver that refuses the caller the field
-            // names the field and the type it belongs to, so it is the field's own sentence
-            // rather than a fixed one.
+            // names the field being resolved and the type the schema declares for it, so it
+            // is the field's own sentence rather than a fixed one.
             "the field util.unauthorized refused",
             "guarded",
-            "Not Authorized to access guarded on type Query".to_string(),
+            "Not Authorized to access guarded on type String".to_string(),
         ),
     ] {
         let (status, answered) = post_graphql(

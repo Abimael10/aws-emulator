@@ -19,9 +19,9 @@
 //!
 //! > A resolver that REFUSES the field it is resolving — `util.unauthorized()`, in either
 //! > language a resolver may be written in — is reported as that same error of that same
-//! > class, naming the field and the type that declares it, with the field `null` and every
-//! > sibling of the document resolving normally; an error the resolver WORDED itself keeps
-//! > its own sentence, whatever class it names.
+//! > class, naming the field being resolved and the type the served schema declares FOR that
+//! > field, with the field `null` and every sibling of the document resolving normally; an
+//! > error the resolver WORDED itself keeps its own sentence, whatever class it names.
 //!
 //! The rows span what the rules generalise over: the mode the call resolved to (an API key,
 //! SigV4 material, and material no mode of the API claims), where the directive is written
@@ -41,8 +41,10 @@ use crate::graphql_api_mapping_template_resolvers::{
 
 /// The error AppSync reports for a field the caller may not access; the service's own copies
 /// are `service::graphql_api::field_auth::UNAUTHORIZED_FIELD_ERROR_TYPE` and
-/// `unauthorized_field_message`. The sentence names the field and the type that DECLARES it,
-/// whichever layer refused it.
+/// `unauthorized_field_message`. The sentence names the field, and beside it the type the
+/// refusal is about: the type that DECLARES the field where the refusal was decided before
+/// any resolver ran, and the type the schema declares FOR the field where a resolver raised
+/// it while resolving that field.
 const UNAUTHORIZED_FIELD_ERROR_TYPE: &str = "Unauthorized";
 const UNAUTHORIZED_FIELD: &str = "Not Authorized to access";
 
@@ -243,14 +245,19 @@ async fn a_resolver_that_refuses_the_field_is_reported_unauthorized_beside_its_s
 
     // The two definition forms a resolver may be written in, each refusing the field it
     // resolves, and a refused field whose declared type is not a scalar: the sentence names
-    // the field and the type that DECLARES it either way, so the field's own type does not
-    // enter it.
-    for (case, field) in [
-        ("a resolver written in code", "refusingCode"),
-        ("a resolver written in mapping templates", "refusingTemplate"),
+    // the field being resolved and the type the schema declares FOR it, so a field of an
+    // object type names that object type.
+    for (case, field, declared) in [
+        ("a resolver written in code", "refusingCode", "String"),
+        (
+            "a resolver written in mapping templates",
+            "refusingTemplate",
+            "String",
+        ),
         (
             "a refused field that resolves to an object type",
             "refusingObject",
+            "Secret",
         ),
     ] {
         let selection = match field {
@@ -290,7 +297,7 @@ async fn a_resolver_that_refuses_the_field_is_reported_unauthorized_beside_its_s
             ),
             (
                 Some(UNAUTHORIZED_FIELD_ERROR_TYPE),
-                Some(format!("{UNAUTHORIZED_FIELD} {field} on type Query").as_str()),
+                Some(format!("{UNAUTHORIZED_FIELD} {field} on type {declared}").as_str()),
                 Some(field),
             ),
             "case {case:?}: expected the Unauthorized error of the field's own path, got \
