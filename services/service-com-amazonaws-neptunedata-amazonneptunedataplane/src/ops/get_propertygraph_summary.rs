@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPropertygraphSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPropertygraphSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPropertygraphSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Gets a graph summary for a property graph: the labels, the property keys and the counts
+//! of the graph, as the latest DFE statistics generation run counted them.
+//!
+//! ## What this operation answers from
+//!
+//! The summary is the SNAPSHOT the latest statistics generation run took
+//! ([`crate::state::graph_summary`], counted from the one stored graph), so this read
+//! reports what that run found and changes nothing. An engine holding no generated
+//! statistics has no summary to report and says so with the modelled
+//! `StatisticsNotAvailableException`, exactly as `GetPropertygraphStatistics` does;
+//! `ManagePropertygraphStatistics(mode=refresh)` is what produces one.
+//!
+//! `mode` chooses how much of that snapshot is reported: `detailed` adds `nodeStructures`
+//! and `edgeStructures`, which are "only present when the requested mode is DETAILED". The
+//! request's own spelling of the value is resolved to a modelled one at the service
+//! boundary (`crate::service::graph_summary_mode`), so a mode reaching this handler is one
+//! of the modelled values.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +167,11 @@ impl<Eng> GetPropertygraphSummary<Eng> {
     }
 }
 
+/// The `statusCode` this operation reports: "the HTTP return code of the request. If the
+/// request succeeded, the code is 200". The member is bound to the response's status, so
+/// the one number states both.
+const SUMMARY_SERVED: i32 = 200;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetPropertygraphSummary<Eng>
 {
@@ -175,18 +189,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPropertygraphSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPropertygraphSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPropertygraphSummary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input.mode, "store-unavailable");
+            return Err(GetPropertygraphSummaryErrorModeled::BadRequestException(
+                crate::state::store_unavailable_bad_request(),
+            )
+            .into());
+        };
+
+        // The value is one of the modelled spellings by the time it reaches here (the
+        // service boundary resolves the request's own case to one and refuses a value that
+        // names no mode), so this refusal is reachable only if that set ever widens; it
+        // names the modes the member accepts rather than guessing which one was meant.
+        let Some(mode) = crate::state::SummaryMode::from_wire(&input.mode) else {
+            record_access(ctx, &input.mode, "unsupported-mode");
+            return Err(GetPropertygraphSummaryErrorModeled::IllegalArgumentException(
+                crate::state::unsupported_graph_summary_mode(&input.mode),
+            )
+            .into());
+        };
+
+        // A @readonly operation: the latest run is read, never written. Cloning it under
+        // the lock keeps the rendering below off the critical section.
+        let latest = state
+            .lock()
+            .propertygraph_statistics
+            .as_ref()
+            .and_then(|record| record.latest.clone());
+        let Some(run) = latest else {
+            // No generation run has produced statistics for this data — none has been asked
+            // for, or a delete removed them — so there is no computed summary to report.
+            record_access(ctx, &input.mode, "statistics-not-available");
+            return Err(
+                GetPropertygraphSummaryErrorModeled::StatisticsNotAvailableException(
+                    crate::state::statistics_not_available(),
+                )
+                .into(),
+            );
+        };
+
+        record_access(ctx, &input.mode, "summary-reported");
+        Ok(GetPropertygraphSummaryOutput {
+            status_code: Some(SUMMARY_SERVED),
+            payload: Some(PropertygraphSummaryValueMap {
+                version: Some(crate::state::GRAPH_SUMMARY_VERSION.to_string()),
+                // "The timestamp ... of the time at which Neptune last computed
+                // statistics": the instant the run that counted this summary ran.
+                last_statistics_computation_time: Some(::aws_smithy_types::DateTime::from(
+                    run.generated_at,
+                )),
+                graph_summary: Some(modelled_summary(&run.summary, mode)),
+            }),
+        })
     }
+}
+
+/// The modelled summary of the counts `run` took, reporting the structures only for the
+/// mode they are "only present" for.
+fn modelled_summary(
+    counts: &crate::state::GraphSummaryCounts,
+    mode: crate::state::SummaryMode,
+) -> PropertygraphSummary {
+    PropertygraphSummary {
+        num_nodes: Some(counts.num_nodes),
+        num_edges: Some(counts.num_edges),
+        num_node_labels: Some(counts.num_node_labels()),
+        num_edge_labels: Some(counts.num_edge_labels()),
+        node_labels: Some(counts.node_labels.clone()),
+        edge_labels: Some(counts.edge_labels.clone()),
+        num_node_properties: Some(counts.num_node_properties()),
+        num_edge_properties: Some(counts.num_edge_properties()),
+        node_properties: Some(property_counts(&counts.node_properties)),
+        edge_properties: Some(property_counts(&counts.edge_properties)),
+        total_node_property_values: Some(counts.total_node_property_values),
+        total_edge_property_values: Some(counts.total_edge_property_values),
+        node_structures: mode.reports_structures().then(|| {
+            counts
+                .node_structures
+                .iter()
+                .map(|structure| NodeStructure {
+                    count: Some(structure.count),
+                    node_properties: Some(structure.node_properties.clone()),
+                    distinct_outgoing_edge_labels: Some(
+                        structure.distinct_outgoing_edge_labels.clone(),
+                    ),
+                })
+                .collect()
+        }),
+        edge_structures: mode.reports_structures().then(|| {
+            counts
+                .edge_structures
+                .iter()
+                .map(|structure| EdgeStructure {
+                    count: Some(structure.count),
+                    edge_properties: Some(structure.edge_properties.clone()),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Each distinct property key with how many elements carry it, as the modelled
+/// `LongValuedMapList` spells it: one single-entry map per key, in the order the counts
+/// hold them.
+fn property_counts(counted: &[(String, i64)]) -> Vec<::std::collections::HashMap<String, i64>> {
+    counted
+        .iter()
+        .map(|(key, count)| {
+            let mut entry = ::std::collections::HashMap::with_capacity(1);
+            entry.insert(key.clone(), *count);
+            entry
+        })
+        .collect()
+}
+
+/// Record one summary read: what was asked (the method, the URI and the mode), who asked
+/// (the access key the request presented) and how it ended — including every refusal, so a
+/// read that could not be answered leaves a record too.
+///
+/// The mode is rendered with `Debug`, which escapes control characters, so a value carrying
+/// CRLF cannot forge a second line, and no secret is recorded (the access key id is an
+/// identifier, never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    mode: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "GetPropertygraphSummary",
+        method = %parts.method,
+        uri = %parts.uri,
+        mode = ?mode,
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata get propertygraph summary"
+    );
 }

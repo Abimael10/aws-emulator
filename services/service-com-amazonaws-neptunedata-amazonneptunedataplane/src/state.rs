@@ -27,7 +27,9 @@
 //!   report (see [`statistics`]): the generation mode `ManagePropertygraphStatistics` set
 //!   and the latest run it performed, counted from [`PropertyGraph`] itself.
 //!   `DeletePropertygraphStatistics` removes the record, so `GetPropertygraphStatistics`
-//!   has nothing to answer from and refuses.
+//!   has nothing to answer from and refuses. A run also counts the whole GRAPH SUMMARY
+//!   (see [`graph_summary`]), which is what `GetPropertygraphSummary` reports: the summary
+//!   a client reads is the one the latest run computed, as of the instant it ran.
 //!
 //! `ExecuteGremlinExplainQuery` is what admits a query record for an explain: it reads the
 //! submitted traversal and plans it (see [`gremlin_plan`]), which is work the engine really
@@ -65,6 +67,7 @@ use crate::ops::types::{
     ServerShutdownException,
 };
 mod engine_status;
+mod graph_summary;
 mod gremlin_eval;
 mod gremlin_plan;
 mod loader;
@@ -75,6 +78,7 @@ mod property_graph;
 mod statistics;
 
 pub use engine_status::*;
+pub use graph_summary::*;
 pub use gremlin_eval::*;
 pub use gremlin_plan::*;
 pub use loader::*;
@@ -587,11 +591,16 @@ impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
             }
             StatisticsMode::Refresh => {
                 // The run reads the graph before the record is borrowed to write it, so one
-                // call reads the graph once and writes the statistics once.
+                // call reads the graph once and writes the statistics once. Both of the
+                // things a run counts — the characteristic sets the statistics endpoints
+                // report and the summary the graph-summary endpoint reports — are counted
+                // HERE, from the graph as it stands at `now`, because both are the snapshot
+                // this one run took.
                 let signatures = characteristic_sets(&self.graph);
+                let summary = graph_summary(&self.graph);
                 Some(
                     self.propertygraph_statistics_record()
-                        .record_generation(signatures, now),
+                        .record_generation(signatures, summary, now),
                 )
             }
         }

@@ -64,9 +64,19 @@
 //! Two operations of this plane answer with a text report rather than a JSON document, and
 //! the media type their payload announces is the one the MODEL declares for it. That rule,
 //! and the wrapper the two are served through, live in [`text_report_media_type`].
+//!
+//! ## The `mode` a GRAPH SUMMARY request asks for
+//!
+//! The summary endpoints bind `mode` to the query string and their member's documentation
+//! states its values in a different case from the model's value set, so the value a client
+//! sends is matched to that set without regard to case and a value naming no mode is
+//! refused in a modelled shape. That rule, and the wrapper those operations are served
+//! through, live in [`graph_summary_mode`].
 
+mod graph_summary_mode;
 mod text_report_media_type;
 
+pub use graph_summary_mode::GRAPH_SUMMARY_OPERATIONS;
 pub use text_report_media_type::TEXT_REPORT_OPERATIONS;
 
 use service_common::response_media_type::{ResponseMediaType, ResponseMediaTypeOperation};
@@ -105,6 +115,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// it serves the same walk and then announces the media type the model declares for
     /// that payload (see [`text_report_media_type`]).
     text_report: text_report_media_type::TextReportResponse,
+    /// The wrapper the GRAPH SUMMARY operations are served through: it resolves the `mode`
+    /// the request asks for to a modelled spelling before the walk reads it, and refuses a
+    /// value naming no mode in a modelled shape (see [`graph_summary_mode`]).
+    graph_summary: graph_summary_mode::GraphSummaryMode,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -116,6 +130,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             media_type: ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
             text_report: text_report_media_type::TextReportResponse::new(
+                ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
+            ),
+            graph_summary: graph_summary_mode::GraphSummaryMode::new(
                 ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
             ),
         }
@@ -156,9 +173,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         // An operation whose payload the model declares a media type for is served through
         // the wrapper that announces it: the body of a text report is not a JSON document,
-        // so the one value its response announces is the model's own.
+        // so the one value its response announces is the model's own. An operation whose
+        // `mode` the member's documentation spells in another case is served through the
+        // wrapper that resolves it, so the walk binds the mode the client asked for.
         match self.entry.protocol().routing_key(req).ok() {
             Some(key) if TEXT_REPORT_OPERATIONS.contains(&key) => Some(&self.text_report as _),
+            Some(key) if GRAPH_SUMMARY_OPERATIONS.contains(&key) => {
+                Some(&self.graph_summary as _)
+            }
             _ => Some(&self.media_type as _),
         }
     }

@@ -24,7 +24,7 @@ use crate::ops::types::{
     BadRequestException, IllegalArgumentException, StatisticsNotAvailableException,
 };
 
-use super::PropertyGraph;
+use super::{graph_summary::GraphSummaryCounts, PropertyGraph};
 
 /// The `status` a statistics endpoint reports for a request it served. The member is "the
 /// HTTP return code of the request. If the request succeeded, the code is 200", which the
@@ -115,10 +115,15 @@ pub struct StatisticsGeneration {
     /// hands back.
     pub statistics_id: String,
     /// When the run computed its counts, which is what `Statistics$date` reports ("The UTC
-    /// time at which DFE statistics have most recently been generated").
+    /// time at which DFE statistics have most recently been generated") and what the graph
+    /// summary reports as `lastStatisticsComputationTime`.
     pub generated_at: SystemTime,
     /// What the run counted in the graph.
     pub signatures: StatisticsSignatures,
+    /// The graph summary the run counted, which is what `GetPropertygraphSummary` reports:
+    /// the labels, the property keys and the structures of the graph as the run found it
+    /// (see [`super::graph_summary`]).
+    pub summary: GraphSummaryCounts,
 }
 
 /// The statistics state of one dataset: the mode it is generated in, and the latest run.
@@ -162,10 +167,12 @@ impl StatisticsRecord {
             .map_or_else(|| NO_STATISTICS_ID.to_string(), |run| run.statistics_id.clone())
     }
 
-    /// Record a generation run that counted `signatures` at `now`, and report its id.
+    /// Record a generation run that counted `signatures` and `summary` at `now`, and report
+    /// its id.
     pub fn record_generation(
         &mut self,
         signatures: StatisticsSignatures,
+        summary: GraphSummaryCounts,
         now: SystemTime,
     ) -> String {
         let statistics_id = new_statistics_id(now);
@@ -173,6 +180,7 @@ impl StatisticsRecord {
             statistics_id: statistics_id.clone(),
             generated_at: now,
             signatures,
+            summary,
         });
         statistics_id
     }

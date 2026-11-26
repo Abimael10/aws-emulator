@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The property-graph statistics endpoints end to end over HTTP:
-//! `ManagePropertygraphStatistics`, `GetPropertygraphStatistics` and
-//! `DeletePropertygraphStatistics`.
+//! `ManagePropertygraphStatistics`, `GetPropertygraphStatistics`,
+//! `DeletePropertygraphStatistics` and `GetPropertygraphSummary`.
 //!
 //! The rule under test: the endpoints report the ONE statistics state this engine holds for
 //! property-graph data. A management call is what starts that state and what sets it — an
 //! autocompute mode persists on it, and a `refresh` records a generation run whose counts
-//! are the characteristic sets of the stored graph — a read answers from it, and a delete
-//! removes it, so a read before any management call or after a delete is refused with the
-//! modelled `StatisticsNotAvailableException` and a delete that found nothing answers 204
-//! instead of 200.
+//! are the characteristic sets AND the graph summary of the stored graph — a read answers
+//! from it, and a delete removes it, so a read before any management call or after a delete
+//! is refused with the modelled `StatisticsNotAvailableException` and a delete that found
+//! nothing answers 204 instead of 200.
 //!
-//! The tables below span what the rule generalises over: which mode a call names, how many
-//! calls precede a read, and — for a run's counts — how many nodes the graph holds, which
-//! property keys they carry, whether two nodes share a set of keys, whether a node carries
-//! no keys at all, and which relationship types leave a node.
+//! The summary endpoint adds one rule of its own: its `mode` is bound to the query string
+//! and its own documentation states the values in upper case ("Mode can take one of two
+//! values: BASIC (the default), and DETAILED") while the model lists them in lower case, so
+//! the value a client sends is matched to the modelled set without regard to ASCII case,
+//! and a value matching none of them is refused with the modelled
+//! `IllegalArgumentException` rather than with an error class this service does not model.
+//!
+//! The tables below span what the rules generalise over: which mode a call names, the CASE
+//! a summary mode is spelled in, how many calls precede a read, and — for a run's counts —
+//! how many nodes the graph holds, which property keys they carry, whether two nodes share
+//! a set of keys, whether a node carries no keys at all, and which relationship types leave
+//! a node.
 //!
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
@@ -756,5 +764,532 @@ async fn two_reads_of_the_same_statistics_answer_the_same_thing() {
         first.payload()["statisticsId"],
         "case repeated read after a new run: the new run must be reported by its own id, got {:?}",
         third.payload()
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// `GetPropertygraphSummary`: the graph summary the latest run computed, and the `mode` a
+// request asks for it in.
+// ---------------------------------------------------------------------------------------
+
+/// The route the graph summary is read at.
+/// Source: smithy_query(query="operation", operation="GetPropertygraphSummary") — the http
+/// binding `GET /propertygraph/statistics/summary` and `mode`'s `httpQuery`.
+const SUMMARY_PATH: &str = "/propertygraph/statistics/summary";
+
+/// `PropertygraphSummaryValueMap$version` — the version of the graph summary response
+/// Neptune publishes for a property graph.
+const SUMMARY_VERSION: &str = "v1";
+
+/// The values the model's `GraphSummaryType` enum carries, as the refusal lists them.
+/// Source: smithy_query(query="shape", shape="GraphSummaryType").
+const GRAPH_SUMMARY_TYPES: &str = "basic, detailed";
+
+/// `GetPropertygraphSummary` is `GET /propertygraph/statistics/summary`, with `mode` in the
+/// query string; `None` sends no `mode` at all, which is the member's default (`basic`).
+async fn summary(router: &MultiServiceRouter, mode: Option<&str>) -> Answer {
+    let uri = match mode {
+        Some(mode) => format!("{SUMMARY_PATH}?mode={mode}"),
+        None => SUMMARY_PATH.to_string(),
+    };
+    call(router, "GET", &uri, None).await
+}
+
+/// A summary read that must succeed, with the `graphSummary` it reported.
+async fn summarised(router: &MultiServiceRouter, case: &str, mode: Option<&str>) -> Value {
+    let answer = summary(router, mode).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: mode {mode:?} must be served, got {} with body {:?}",
+        answer.status, answer.body
+    );
+    // `statusCode` is "the HTTP return code of the request", bound to the response's own
+    // status, so the status line above is where it is read and the body carries no copy.
+    assert!(
+        answer.body["statusCode"].is_null(),
+        "case {case}: the return code is the response's status, not a body member, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.payload()["version"].as_str(),
+        Some(SUMMARY_VERSION),
+        "case {case}: expected the published response version, got {:?}",
+        answer.payload()
+    );
+    // The wire form of a timestamp is the framework's to choose; what the read must report
+    // is the instant the run that counted this summary ran.
+    let computed = &answer.payload()["lastStatisticsComputationTime"];
+    assert!(
+        computed.as_f64().is_some_and(|instant| instant > 0.0)
+            || computed.as_str().is_some_and(|text| text.contains('T')),
+        "case {case}: the summary must report when the statistics were computed, got {computed:?}"
+    );
+    answer.payload()["graphSummary"].clone()
+}
+
+/// One spelling of `mode`, and whether the summary it asks for carries the structures.
+/// The rows differ along the CASE the value is spelled in — the model's own lower case, the
+/// upper case the member's documentation states, and a mixed case that is neither — and
+/// along whether the request names a mode at all.
+const SUMMARY_MODES: &[(Option<&str>, bool)] = &[
+    (None, false),
+    (Some("basic"), false),
+    (Some("BASIC"), false),
+    (Some("Basic"), false),
+    (Some("bAsIc"), false),
+    (Some("detailed"), true),
+    (Some("DETAILED"), true),
+    (Some("Detailed"), true),
+    (Some("DeTaIlEd"), true),
+];
+
+#[tokio::test]
+async fn a_summary_mode_is_read_in_any_case_and_detailed_is_what_adds_the_structures() {
+    let router = emulator();
+    write_graph(
+        &router,
+        "mode spellings",
+        "CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})",
+    )
+    .await;
+    managed(&router, "mode spellings", REFRESH).await;
+
+    for (mode, expects_structures) in SUMMARY_MODES {
+        let case = format!("mode {mode:?}");
+        let graph_summary = summarised(&router, &case, *mode).await;
+
+        // Every mode reports the counts and the lists: only the structures are "only
+        // present when the requested mode is DETAILED".
+        assert_eq!(
+            graph_summary["numNodes"].as_i64(),
+            Some(2),
+            "case {case}: the summary must count the stored nodes, got {graph_summary:?}"
+        );
+        assert_eq!(
+            graph_summary["nodeLabels"],
+            json!(["Person"]),
+            "case {case}: the summary must list the stored node labels, got {graph_summary:?}"
+        );
+        if *expects_structures {
+            assert_eq!(
+                graph_summary["nodeStructures"],
+                json!([
+                    { "count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": [] },
+                    { "count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": ["KNOWS"] },
+                ]),
+                "case {case}: a detailed summary reports the node structures, got {graph_summary:?}"
+            );
+            assert_eq!(
+                graph_summary["edgeStructures"],
+                json!([{ "count": 1, "edgeProperties": ["since"] }]),
+                "case {case}: a detailed summary reports the edge structures, got {graph_summary:?}"
+            );
+        } else {
+            assert!(
+                graph_summary["nodeStructures"].is_null()
+                    && graph_summary["edgeStructures"].is_null(),
+                "case {case}: the structures are present only for the detailed mode, got {graph_summary:?}"
+            );
+        }
+    }
+}
+
+/// A `mode` value that names none of the modelled values, in the spelling the request
+/// carries it in. The rows span what a value can be beside a listed one: empty, a word
+/// outside the set, a prefix and a suffix of a listed one, a listed one with a space in
+/// front of it (percent-encoded, as a query string carries it), and two values at once.
+const REFUSED_SUMMARY_MODES: &[(&str, &str)] = &[
+    ("", ""),
+    ("verbose", "verbose"),
+    ("full", "full"),
+    ("detaile", "detaile"),
+    ("detailedly", "detailedly"),
+    ("%20detailed", " detailed"),
+    ("basic,detailed", "basic,detailed"),
+];
+
+#[tokio::test]
+async fn a_summary_mode_outside_the_modelled_values_is_refused_as_an_illegal_argument() {
+    let router = emulator();
+    write_graph(
+        &router,
+        "refused modes",
+        "CREATE (:Person {name: 'Alice'})",
+    )
+    .await;
+    managed(&router, "refused modes", REFRESH).await;
+
+    for (sent, decoded) in REFUSED_SUMMARY_MODES {
+        let case = format!("mode {sent:?}");
+        let answer = summary(&router, Some(sent)).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: a value naming no mode must be refused, got {} with body {:?}",
+            answer.status, answer.body
+        );
+        // The refusal must be one of the operation's OWN modelled error classes, so an SDK
+        // can dispatch on it; `IllegalArgumentException` is "an argument in a request is
+        // not supported".
+        assert_eq!(
+            answer.error_code(),
+            "IllegalArgumentException",
+            "case {case}: expected the modelled IllegalArgumentException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body["code"].as_str(),
+            Some("IllegalArgumentException"),
+            "case {case}: the error must carry its exception class in `code`, got {:?}",
+            answer.body["code"]
+        );
+        assert!(
+            !answer.request_id().is_empty(),
+            "case {case}: the error must name its request, got {:?}",
+            answer.body["requestId"]
+        );
+        let message = answer.detailed_message();
+        assert!(
+            message.contains("mode")
+                && message.contains(decoded)
+                && message.contains(GRAPH_SUMMARY_TYPES),
+            "case {case}: the message must name the member, the value and the accepted \
+             modes, got {message:?}"
+        );
+
+        // A refused read changes nothing: the summary a listed value asks for is still
+        // there.
+        let graph_summary = summarised(&router, &case, Some("DETAILED")).await;
+        assert_eq!(
+            graph_summary["numNodes"].as_i64(),
+            Some(1),
+            "case {case}: a refused read must not change the stored summary, got {graph_summary:?}"
+        );
+    }
+}
+
+/// One graph, and the summary a run over it must report. The rows differ along how many
+/// nodes and relationships the graph holds, which property keys each carries, whether two
+/// elements share a set of keys, whether an element carries none, and which relationship
+/// types leave a node.
+///
+/// The list members are stated as JSON so a row states the ORDER too: every list the
+/// summary reports is sorted, so two reads of one run answer the same summary.
+#[derive(Debug, Clone, Copy)]
+struct SummaryCase {
+    case: &'static str,
+    /// The openCypher writes that fill the graph, in order.
+    seed: &'static [&'static str],
+    num_nodes: i64,
+    num_edges: i64,
+    /// "A list of the distinct node labels in the graph."
+    node_labels: &'static str,
+    edge_labels: &'static str,
+    /// Each distinct property key with the number of elements it is set on.
+    node_properties: &'static str,
+    edge_properties: &'static str,
+    /// "The total number of usages of all node properties."
+    total_node_property_values: i64,
+    total_edge_property_values: i64,
+    /// The structures, which only a detailed summary reports.
+    node_structures: &'static str,
+    edge_structures: &'static str,
+}
+
+const SUMMARY_CASES: &[SummaryCase] = &[
+    SummaryCase {
+        case: "an empty graph is summarised as empty",
+        seed: &[],
+        num_nodes: 0,
+        num_edges: 0,
+        node_labels: "[]",
+        edge_labels: "[]",
+        node_properties: "[]",
+        edge_properties: "[]",
+        total_node_property_values: 0,
+        total_edge_property_values: 0,
+        node_structures: "[]",
+        edge_structures: "[]",
+    },
+    SummaryCase {
+        case: "one labelled node carrying one property key",
+        seed: &["CREATE (:Person {name: 'Alice'})"],
+        num_nodes: 1,
+        num_edges: 0,
+        node_labels: r#"["Person"]"#,
+        edge_labels: "[]",
+        node_properties: r#"[{"name": 1}]"#,
+        edge_properties: "[]",
+        total_node_property_values: 1,
+        total_edge_property_values: 0,
+        node_structures: r#"[{"count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": []}]"#,
+        edge_structures: "[]",
+    },
+    SummaryCase {
+        case: "two nodes carrying the same key share one structure and one property entry",
+        seed: &["CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'})"],
+        num_nodes: 2,
+        num_edges: 0,
+        node_labels: r#"["Person"]"#,
+        edge_labels: "[]",
+        node_properties: r#"[{"name": 2}]"#,
+        edge_properties: "[]",
+        total_node_property_values: 2,
+        total_edge_property_values: 0,
+        node_structures: r#"[{"count": 2, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": []}]"#,
+        edge_structures: "[]",
+    },
+    SummaryCase {
+        case: "nodes with different labels and keys are listed once each, sorted",
+        seed: &["CREATE (:Person {name: 'Alice', age: 30}), (:City {population: 5})"],
+        num_nodes: 2,
+        num_edges: 0,
+        node_labels: r#"["City", "Person"]"#,
+        edge_labels: "[]",
+        node_properties: r#"[{"age": 1}, {"name": 1}, {"population": 1}]"#,
+        edge_properties: "[]",
+        total_node_property_values: 3,
+        total_edge_property_values: 0,
+        node_structures: r#"[
+            {"count": 1, "nodeProperties": ["age", "name"], "distinctOutgoingEdgeLabels": []},
+            {"count": 1, "nodeProperties": ["population"], "distinctOutgoingEdgeLabels": []}
+        ]"#,
+        edge_structures: "[]",
+    },
+    SummaryCase {
+        case: "a node carrying no property key still has a structure of its own",
+        seed: &["CREATE (:Person {name: 'Alice'}), (:Placeholder)"],
+        num_nodes: 2,
+        num_edges: 0,
+        node_labels: r#"["Person", "Placeholder"]"#,
+        edge_labels: "[]",
+        node_properties: r#"[{"name": 1}]"#,
+        edge_properties: "[]",
+        total_node_property_values: 1,
+        total_edge_property_values: 0,
+        node_structures: r#"[
+            {"count": 1, "nodeProperties": [], "distinctOutgoingEdgeLabels": []},
+            {"count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": []}
+        ]"#,
+        edge_structures: "[]",
+    },
+    SummaryCase {
+        case: "a relationship is counted, labelled and structured by its own keys",
+        seed: &["CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})"],
+        num_nodes: 2,
+        num_edges: 1,
+        node_labels: r#"["Person"]"#,
+        edge_labels: r#"["KNOWS"]"#,
+        node_properties: r#"[{"name": 2}]"#,
+        edge_properties: r#"[{"since": 1}]"#,
+        total_node_property_values: 2,
+        total_edge_property_values: 1,
+        node_structures: r#"[
+            {"count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": []},
+            {"count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": ["KNOWS"]}
+        ]"#,
+        edge_structures: r#"[{"count": 1, "edgeProperties": ["since"]}]"#,
+    },
+    SummaryCase {
+        case: "two relationship types leaving one node widen that node's structure",
+        seed: &[
+            "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+            "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:LIKES]->(:Person {name: 'Carol'})",
+        ],
+        num_nodes: 3,
+        num_edges: 2,
+        node_labels: r#"["Person"]"#,
+        edge_labels: r#"["KNOWS", "LIKES"]"#,
+        node_properties: r#"[{"name": 3}]"#,
+        edge_properties: "[]",
+        total_node_property_values: 3,
+        total_edge_property_values: 0,
+        node_structures: r#"[
+            {"count": 2, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": []},
+            {"count": 1, "nodeProperties": ["name"], "distinctOutgoingEdgeLabels": ["KNOWS", "LIKES"]}
+        ]"#,
+        edge_structures: r#"[{"count": 2, "edgeProperties": []}]"#,
+    },
+];
+
+/// The JSON a row states a list member as.
+fn stated(case: &str, member: &str, json_text: &str) -> Value {
+    serde_json::from_str(json_text)
+        .unwrap_or_else(|error| panic!("case {case}: {member} is not JSON ({error}): {json_text}"))
+}
+
+#[tokio::test]
+async fn a_detailed_summary_reports_the_graph_the_latest_run_counted() {
+    for case in SUMMARY_CASES {
+        let router = emulator();
+        for query in case.seed {
+            write_graph(&router, case.case, query).await;
+        }
+        managed(&router, case.case, REFRESH).await;
+
+        let graph_summary = summarised(&router, case.case, Some("DETAILED")).await;
+        for (member, expected) in [
+            ("numNodes", case.num_nodes),
+            ("numEdges", case.num_edges),
+            (
+                "totalNodePropertyValues",
+                case.total_node_property_values,
+            ),
+            (
+                "totalEdgePropertyValues",
+                case.total_edge_property_values,
+            ),
+        ] {
+            assert_eq!(
+                graph_summary[member].as_i64(),
+                Some(expected),
+                "case {}: expected {member}={expected}, got {graph_summary:?}",
+                case.case
+            );
+        }
+
+        for (member, counter, json_text) in [
+            ("nodeLabels", "numNodeLabels", case.node_labels),
+            ("edgeLabels", "numEdgeLabels", case.edge_labels),
+            ("nodeProperties", "numNodeProperties", case.node_properties),
+            ("edgeProperties", "numEdgeProperties", case.edge_properties),
+        ] {
+            let expected = stated(case.case, member, json_text);
+            assert_eq!(
+                graph_summary[member], expected,
+                "case {}: expected {member}={expected:?}, got {:?}",
+                case.case, graph_summary[member]
+            );
+            // The `num…` member is how many distinct entries the list holds, so it is
+            // asserted against the list rather than restated.
+            let entries = expected.as_array().map(|entries| entries.len() as i64);
+            assert_eq!(
+                graph_summary[counter].as_i64(),
+                entries,
+                "case {}: {counter} must count {member}, got {graph_summary:?}",
+                case.case
+            );
+        }
+
+        for (member, json_text) in [
+            ("nodeStructures", case.node_structures),
+            ("edgeStructures", case.edge_structures),
+        ] {
+            let expected = stated(case.case, member, json_text);
+            assert_eq!(
+                graph_summary[member], expected,
+                "case {}: expected {member}={expected:?}, got {:?}",
+                case.case, graph_summary[member]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_summary_is_the_snapshot_of_the_run_that_computed_it() {
+    let router = emulator();
+
+    // Before any run there is no computed summary, in either mode — and a read must not
+    // start one.
+    for mode in [None, Some("DETAILED")] {
+        let case = format!("before any run, mode {mode:?}");
+        assert_not_available(&case, &summary(&router, mode).await);
+    }
+
+    write_graph(
+        &router,
+        "first run",
+        "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+    )
+    .await;
+    managed(&router, "first run", REFRESH).await;
+
+    // Two reads of one run answer the same summary: a read reports the state and changes
+    // nothing.
+    let first = summary(&router, Some("DETAILED")).await;
+    let again = summary(&router, Some("DETAILED")).await;
+    assert_eq!(
+        first.body, again.body,
+        "case first run: a read must not change what a later read sees, got {:?} then {:?}",
+        first.body, again.body
+    );
+
+    // The graph grows after the run, and the run's summary does not move with it.
+    write_graph(
+        &router,
+        "after a later write",
+        "CREATE (:City {population: 5})",
+    )
+    .await;
+    let unchanged = summarised(&router, "after a later write", Some("DETAILED")).await;
+    assert_eq!(
+        unchanged, first.payload()["graphSummary"],
+        "case after a later write: a recorded run keeps the summary it counted, got {unchanged:?}"
+    );
+
+    // The next run is what counts the graph as it then stands.
+    managed(&router, "second run", REFRESH).await;
+    let recounted = summarised(&router, "second run", Some("DETAILED")).await;
+    assert_eq!(
+        recounted["numNodes"].as_i64(),
+        Some(3),
+        "case second run: the later run must count the graph as it then stood, got {recounted:?}"
+    );
+    assert_eq!(
+        recounted["nodeLabels"],
+        json!(["City", "Person"]),
+        "case second run: the later run must list the labels it then found, got {recounted:?}"
+    );
+
+    // And a delete leaves the summary endpoint nothing to answer from.
+    delete(&router).await;
+    assert_not_available(
+        "after a delete",
+        &summary(&router, Some("DETAILED")).await,
+    );
+}
+
+#[tokio::test]
+async fn a_summary_reports_the_vertices_a_gremlin_traversal_added() {
+    let router = emulator();
+
+    // Two vertices carrying one fresh label, written through the Gremlin endpoint, which is
+    // the other writer of the one stored graph.
+    let label = "widget_7";
+    for round in 1..=2u32 {
+        let answer = call(
+            &router,
+            "POST",
+            "/gremlin",
+            Some(json!({ "gremlin": format!("g.addV('{label}')") })),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case addV #{round}: the traversal must be answered, got {} with body {:?}",
+            answer.status, answer.body
+        );
+    }
+    managed(&router, "gremlin vertices", REFRESH).await;
+
+    let graph_summary = summarised(&router, "gremlin vertices", Some("DETAILED")).await;
+    assert_eq!(
+        graph_summary["numNodes"].as_i64(),
+        Some(2),
+        "case gremlin vertices: both added vertices must be counted, got {graph_summary:?}"
+    );
+    assert_eq!(
+        graph_summary["nodeLabels"],
+        json!([label]),
+        "case gremlin vertices: the label the traversal wrote must be listed, got {graph_summary:?}"
+    );
+    assert_eq!(
+        graph_summary["numNodeLabels"].as_i64(),
+        Some(1),
+        "case gremlin vertices: one distinct label was written, got {graph_summary:?}"
+    );
+    assert_eq!(
+        graph_summary["nodeStructures"],
+        json!([{ "count": 2, "nodeProperties": [], "distinctOutgoingEdgeLabels": [] }]),
+        "case gremlin vertices: both vertices have the one empty structure, got {graph_summary:?}"
     );
 }
