@@ -44,10 +44,13 @@
 //! through [`error_message_member::ErrorMessageMemberOperation`], so the text of a failure
 //! the FRAMEWORK rendered is reported in the `Message` member every error shape in this
 //! service's model declares — see [`error_message_member`] for the rule and why the
-//! refusal seam below cannot state it.
+//! refusal seam below cannot state it. That same layer answers the one requirement this
+//! service states as a LIMIT rather than as a constraint refusal, which neither a handler
+//! nor the refusal seam can state — see [`listener_port_range_limit`].
 
 pub mod constraint_report;
 pub mod error_message_member;
+pub mod listener_port_range_limit;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation,

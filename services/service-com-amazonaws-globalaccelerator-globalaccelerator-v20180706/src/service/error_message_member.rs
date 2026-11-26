@@ -160,7 +160,9 @@ pub fn routes(definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> bool
 /// is held beside, which is why the key is resolved here rather than carried in. So the
 /// framework owns the whole deserialize → validate → handle → serialize walk and every
 /// status, code and word it answers with; this wrapper owns only which member the text is
-/// in.
+/// in — plus the one requirement this service states as a LIMIT rather than as a constraint
+/// refusal, which it answers in front of that walk because nothing behind the walk can
+/// state it (see [`super::listener_port_range_limit`] for that rule and why).
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorMessageMemberOperation;
 
@@ -172,6 +174,16 @@ impl ErasedOperation for ErrorMessageMemberOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // The one requirement this service states as a LIMIT rather than as a
+            // constraint refusal, answered in front of the framework's own sequence
+            // because nothing behind that sequence can state it (see
+            // [`super::listener_port_range_limit`]). The borrow of the service definition
+            // ends with this statement: `&dyn ErasedServiceDefinition` is not `Sync`, so
+            // none of it may be held across the await below.
+            let limit = super::listener_port_range_limit::refusal(svc.definition(), req);
+            if let Some(refused) = limit {
+                return with_service_message_member(refused);
+            }
             match routed(svc.definition(), req) {
                 Some(op) => with_service_message_member(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a

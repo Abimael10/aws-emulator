@@ -144,6 +144,16 @@ pub const MAX_ENDPOINTS_PER_ENDPOINT_GROUP: usize = 10;
 /// [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] gives.
 pub const MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP: usize = 10;
 
+/// Port ranges one listener can hold: the model's own `@length` maximum on `PortRanges`
+/// (1..10), which every operation that takes such a list declares.
+///
+/// The service enforces it as a LIMIT rather than as a malformed argument — the error
+/// class and the sentence are [`port_range_limit_for_accelerator_message`] and
+/// [`port_range_limit_for_listener_message`], applied by
+/// [`crate::service::listener_port_range_limit`] — which is also what bounds the vector of
+/// ranges the store holds for a listener.
+pub const MAX_PORT_RANGES_PER_LISTENER: usize = 10;
+
 /// How many hexadecimal characters follow the `i-` of an EC2 instance ID: the eight of
 /// the original form, or the seventeen of the long form every Region mints today (Amazon
 /// EC2 resource IDs). The two lengths an `EndpointId` is matched against in
@@ -1503,6 +1513,31 @@ pub fn create_parent_accelerator_not_found_message() -> String {
 /// rule as [`accelerator_not_found_message`], one level down.
 pub fn listener_not_found_message(listener_arn: &str) -> String {
     format!("Listener {listener_arn} not found.")
+}
+
+/// The sentence this service states the per-listener port-range limit
+/// ([`MAX_PORT_RANGES_PER_LISTENER`]) with on the leg that CREATES a listener.
+///
+/// The limit belongs to a listener, and a create has no listener yet, so it is stated
+/// against the accelerator the new listener would belong to: fixed text whose single
+/// variable part is the `AcceleratorArn` the request carried (recorded wire behaviour on
+/// `CreateListener`). One place for the wording, beside the listener-scoped form the
+/// update leg states, so the two legs of one limit cannot drift apart.
+pub fn port_range_limit_for_accelerator_message(accelerator_arn: &str) -> String {
+    format!(
+        "Limit Exceeded for the number of Port Ranges allowed in a Listener for Accelerator \
+         {accelerator_arn}."
+    )
+}
+
+/// The same limit on the leg that UPDATES a listener that already exists.
+///
+/// Stated against the listener the request identified rather than against its accelerator
+/// — the resource the call is about is the listener itself, so the sentence names it and
+/// carries no accelerator at all — with the `ListenerArn` the request carried as its
+/// single variable part (recorded wire behaviour on `UpdateListener`).
+pub fn port_range_limit_for_listener_message(listener_arn: &str) -> String {
+    format!("Limit Exceeded for the number of Port Ranges allowed in a Listener for {listener_arn}.")
 }
 
 /// The message a STANDARD operation refuses an ARN with that names a resource of the

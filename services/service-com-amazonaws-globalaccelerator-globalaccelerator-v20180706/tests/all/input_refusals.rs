@@ -1097,3 +1097,324 @@ async fn an_unsupported_health_check_interval_states_the_supported_set() {
         "expected the last supported interval to be the stored one, got {reread}"
     );
 }
+
+/// `count` distinct single-port ranges, as a request carries them. The ports sit well
+/// inside `PortNumber`'s published range (1..65535), so a row differs from another in the
+/// COUNT alone.
+fn port_ranges(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| {
+                let port = 5000 + index as i64;
+                json!({ "FromPort": port, "ToPort": port })
+            })
+            .collect(),
+    )
+}
+
+/// What this service is expected to answer one port-range COUNT with.
+#[derive(Debug, Clone, Copy)]
+enum Counted<'a> {
+    /// Inside the limit: the request is served.
+    Served,
+    /// Past the limit: the modelled `LimitExceededException` at the status the model gives
+    /// it, carrying the service's limit sentence — which names the resource the limit is
+    /// stated against.
+    OverTheLimit(&'a str),
+    /// No range at all: the list's MINIMUM is not a limit, so this keeps the modelled
+    /// constraint refusal every other bound of this service answers.
+    NoRange,
+}
+
+/// Call one operation with a port-range count and assert `expected`.
+async fn assert_counted(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+    expected: Counted<'_>,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    let code = error_code(&parsed);
+    let message = error_message(&parsed);
+    match expected {
+        Counted::Served => assert_eq!(
+            status, 200,
+            "case {case}: a count inside the limit must be served, got {status} {parsed}"
+        ),
+        Counted::OverTheLimit(sentence) => {
+            assert_eq!(
+                (status, code.as_str()),
+                (403, "LimitExceededException"),
+                "case {case}: expected the modelled 403 LimitExceededException, \
+                 got {status} {parsed}"
+            );
+            assert_eq!(
+                message, sentence,
+                "case {case}: expected {sentence:?}, got {message:?}"
+            );
+        }
+        Counted::NoRange => {
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case}: expected the modelled 400 InvalidArgumentException, \
+                 got {status} {parsed}"
+            );
+            assert!(
+                message.contains("at 'portRanges'")
+                    && message.contains("Member must have length greater than or equal to 1"),
+                "case {case}: expected the constraint clause for the list's minimum, \
+                 got {message:?}"
+            );
+        }
+    }
+}
+
+/// RULE: how many port ranges one listener may hold is a service LIMIT rather than a
+/// malformed argument — a request naming more than the maximum is refused with the
+/// modelled `LimitExceededException`, at the status the model gives that error, carrying
+/// the service's limit sentence over the ARN the request scoped the listener with, and it
+/// creates nothing; a count inside the limit is served; and a list naming no range at all
+/// keeps the modelled constraint refusal, because the minimum is not a limit.
+///
+/// The catalog is the model's own, from `smithy_query(query="operation",
+/// operation="CreateListener,UpdateListener")`: `PortRanges` is @length{1,10} on both, and
+/// both declare `LimitExceededException` (@httpError 403) beside `InvalidArgumentException`
+/// (@httpError 400). The rows span the count — zero, the published minimum, the published
+/// maximum, one past it and far past it — and the accelerator the request names it under, so
+/// the sentence is tested as a function of the request rather than on one ARN.
+#[tokio::test]
+async fn the_port_range_count_limit_is_the_modelled_limit_error_on_a_create() {
+    let router = emulator();
+
+    // (case, the count, what the service answers it with)
+    let counts: [(&str, usize, Counted); 5] = [
+        ("no-range", 0, Counted::NoRange),
+        ("at-the-minimum", 1, Counted::Served),
+        ("at-the-maximum", 10, Counted::Served),
+        ("one-past-the-maximum", 11, Counted::OverTheLimit("")),
+        ("far-past-the-maximum", 64, Counted::OverTheLimit("")),
+    ];
+
+    // Two accelerators, so the sentence is a function of the ARN the request carried
+    // rather than of one accelerator.
+    for label in ["first", "second"] {
+        let accelerator_arn = arn_of(
+            &ok(
+                &router,
+                "CreateAccelerator",
+                json!({
+                    "Name": format!("range-limit-{label}"),
+                    "IdempotencyToken": format!("range-limit-{label}"),
+                }),
+            )
+            .await["Accelerator"],
+        );
+        // The create leg states the limit against the accelerator the new listener would
+        // belong to.
+        let sentence = format!(
+            "Limit Exceeded for the number of Port Ranges allowed in a Listener for \
+             Accelerator {accelerator_arn}."
+        );
+
+        for (case, count, outcome) in counts {
+            let expected = match outcome {
+                Counted::OverTheLimit(_) => Counted::OverTheLimit(sentence.as_str()),
+                other => other,
+            };
+            assert_counted(
+                &router,
+                &format!("{label} {case}"),
+                "CreateListener",
+                json!({
+                    "AcceleratorArn": accelerator_arn,
+                    "PortRanges": port_ranges(count),
+                    "Protocol": "TCP",
+                    "IdempotencyToken": format!("{label}-{case}"),
+                }),
+                expected,
+            )
+            .await;
+        }
+
+        // Nothing the refusals asked for was created: the accelerator holds exactly the
+        // listeners whose counts were inside the limit, each with the ranges its request
+        // carried.
+        let listeners = ok(
+            &router,
+            "ListListeners",
+            json!({ "AcceleratorArn": accelerator_arn }),
+        )
+        .await["Listeners"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let held: Vec<Value> = listeners
+            .iter()
+            .map(|listener| listener["PortRanges"].clone())
+            .collect();
+        assert_eq!(
+            held,
+            vec![port_ranges(1), port_ranges(10)],
+            "case {label}: expected only the served listeners, got {listeners:?}"
+        );
+    }
+
+    // A request that identifies no accelerator to state the limit against is refused for the
+    // member it left out, not told about a limit: the sentence names a resource the request
+    // carried, so there is none to state.
+    for (case, body) in [
+        (
+            "over the limit with no accelerator at all",
+            json!({
+                "PortRanges": port_ranges(11),
+                "Protocol": "TCP",
+                "IdempotencyToken": "no-accelerator",
+            }),
+        ),
+        (
+            "over the limit with an empty accelerator",
+            json!({
+                "AcceleratorArn": "",
+                "PortRanges": port_ranges(11),
+                "Protocol": "TCP",
+                "IdempotencyToken": "empty-accelerator",
+            }),
+        ),
+    ] {
+        let (status, parsed) = call(&router, "CreateListener", body).await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected the refusal of the member it omitted, got {status} {parsed}"
+        );
+    }
+
+    // A count is a fact about the REQUEST, judged where the model's own walk judges one:
+    // before anything resolves the resource the request named. So an accelerator the store
+    // does not hold is still answered the limit, over the ARN the request carried.
+    let missing =
+        "arn:aws:globalaccelerator::000000000000:accelerator/00000000-0000-4000-8000-000000000000";
+    assert_counted(
+        &router,
+        "over the limit on an accelerator the store does not hold",
+        "CreateListener",
+        json!({
+            "AcceleratorArn": missing,
+            "PortRanges": port_ranges(11),
+            "Protocol": "TCP",
+            "IdempotencyToken": "missing-accelerator",
+        }),
+        Counted::OverTheLimit(&format!(
+            "Limit Exceeded for the number of Port Ranges allowed in a Listener for \
+             Accelerator {missing}."
+        )),
+    )
+    .await;
+}
+
+/// RULE, on the leg that UPDATES a listener that already exists: the same count limit is
+/// the same modelled `LimitExceededException` at the same status, with the limit sentence
+/// stated against the LISTENER the request identified; the refusal writes nothing, so the
+/// listener still reports the ranges it held, in order; a count inside the limit replaces
+/// them.
+///
+/// Same catalog as the create leg above, over the same span of counts.
+#[tokio::test]
+async fn the_port_range_count_limit_is_the_modelled_limit_error_on_an_update() {
+    let router = emulator();
+    let accelerator_arn = arn_of(
+        &ok(
+            &router,
+            "CreateAccelerator",
+            json!({ "Name": "range-limit-update", "IdempotencyToken": "range-limit-update" }),
+        )
+        .await["Accelerator"],
+    );
+
+    // Two listeners of the same accelerator, so the sentence is a function of the listener
+    // ARN the request carried.
+    for label in ["first", "second"] {
+        let listener_arn = ok(
+            &router,
+            "CreateListener",
+            json!({
+                "AcceleratorArn": accelerator_arn,
+                "PortRanges": port_ranges(10),
+                "Protocol": "TCP",
+                "IdempotencyToken": format!("range-limit-update-{label}"),
+            }),
+        )
+        .await["Listener"]["ListenerArn"]
+            .as_str()
+            .expect("the created listener's ARN")
+            .to_string();
+        // The update leg states the limit against the listener the request identified —
+        // the sentence names no accelerator at all.
+        let sentence = format!(
+            "Limit Exceeded for the number of Port Ranges allowed in a Listener for \
+             {listener_arn}."
+        );
+
+        for (case, count, outcome) in [
+            ("no-range", 0, Counted::NoRange),
+            ("one-past-the-maximum", 11, Counted::OverTheLimit("")),
+            ("far-past-the-maximum", 64, Counted::OverTheLimit("")),
+        ] {
+            let expected = match outcome {
+                Counted::OverTheLimit(_) => Counted::OverTheLimit(sentence.as_str()),
+                other => other,
+            };
+            assert_counted(
+                &router,
+                &format!("{label} {case}"),
+                "UpdateListener",
+                json!({ "ListenerArn": listener_arn, "PortRanges": port_ranges(count) }),
+                expected,
+            )
+            .await;
+        }
+
+        // Nothing was written: the listener still holds the ten ranges it was created
+        // with, in the order they were given.
+        let reread = ok(
+            &router,
+            "DescribeListener",
+            json!({ "ListenerArn": listener_arn }),
+        )
+        .await["Listener"]["PortRanges"]
+            .clone();
+        assert_eq!(
+            reread,
+            port_ranges(10),
+            "case {label}: a refused update must change nothing, got {reread}"
+        );
+
+        // A count inside the limit replaces them, so the refusals above are about the
+        // count and not about the member.
+        for count in [1_usize, 3, 10] {
+            assert_counted(
+                &router,
+                &format!("{label} served-{count}"),
+                "UpdateListener",
+                json!({ "ListenerArn": listener_arn, "PortRanges": port_ranges(count) }),
+                Counted::Served,
+            )
+            .await;
+            let reread = ok(
+                &router,
+                "DescribeListener",
+                json!({ "ListenerArn": listener_arn }),
+            )
+            .await["Listener"]["PortRanges"]
+                .clone();
+            assert_eq!(
+                reread,
+                port_ranges(count),
+                "case {label} served-{count}: expected the served update to replace the \
+                 ranges, got {reread}"
+            );
+        }
+    }
+}
