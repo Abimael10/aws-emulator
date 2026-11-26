@@ -169,38 +169,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region the request was signed for.
         let region = crate::state::request_region(ctx);
 
+        // The data plane's one feature-group resolution, for every entry of the batch at
+        // once and BEFORE this service's own store guard is taken below. LOCK ORDER — the
+        // one every operation of this crate takes: the SHARED feature-group directory
+        // first, this service's own record store second
+        // ([`crate::state::resolve_groups`], whose directory guard is released before it
+        // returns). Nothing requires the resolution to happen under this handler's own
+        // guard: it is a read of ANOTHER store keyed by the request alone, exactly as each
+        // single-record read of this data plane performs it before locking this store.
+        let Some(resolved) = crate::state::resolve_groups(
+            &*self.engine,
+            &region,
+            input
+                .identifiers
+                .iter()
+                .map(|wanted| wanted.feature_group_name.as_str()),
+        ) else {
+            return Err(internal_failure(
+                "BatchGetRecord: this service holds no feature-group directory on the \
+                 mounted engine",
+            ));
+        };
+
         let mut store = state.lock();
         // The fan-out is bounded by the request: `Identifiers` is modelled
         // `len 1..100` and each entry's `RecordIdentifiersValueAsString`
         // `len 1..100`, both refused at the boundary before this handler runs, so no
         // cardinality check is repeated here.
-        for wanted in &input.identifiers {
+        //
+        // One resolution per entry, in the order the entries arrive, so each entry is
+        // read against the group IT named.
+        for (wanted, resolved) in input.identifiers.iter().zip(&resolved) {
             // The response names the feature group the way the CALLER named it (an ARN
             // stays an ARN), while the store is keyed by `group_key`, so both modelled
             // spellings reach one store and the reply pairs with the request.
             let group_name = wanted.feature_group_name.clone();
 
-            // The data plane's one feature-group resolution, per entry: this operation
-            // reports a failure that concerns ONE identifier in `Errors` rather than
-            // failing the whole batch, so the refusal an unresolvable `FeatureGroupName`
-            // gets elsewhere (`ValidationError`) is the per-entry `ErrorCode` here. It is
-            // never `ResourceNotFound`, which would say the record is missing from a
-            // feature group that exists. A group that resolves but has no `OnlineStore`
-            // holds nothing this read could serve, and is reported the same way.
-            let refusal = match crate::state::resolve_group(
-                &*self.engine,
-                &region,
-                &wanted.feature_group_name,
-            ) {
+            // This operation reports a failure that concerns ONE identifier in `Errors`
+            // rather than failing the whole batch, so the refusal an unresolvable
+            // `FeatureGroupName` gets elsewhere (`ValidationError`) is the per-entry
+            // `ErrorCode` here. It is never `ResourceNotFound`, which would say the record
+            // is missing from a feature group that exists. A group that resolves but has
+            // no `OnlineStore` holds nothing this read could serve, and is reported the
+            // same way.
+            let refusal = match resolved {
                 Ok(definition) => (!definition.online_store_enabled)
                     .then(|| crate::state::no_online_store(&definition.name)),
-                Err(crate::state::Unresolved::Refused(message)) => Some(message),
-                Err(crate::state::Unresolved::NoDirectory) => {
-                    return Err(internal_failure(
-                        "BatchGetRecord: this service holds no feature-group directory on the \
-                         mounted engine",
-                    ))
-                }
+                Err(message) => Some(message.clone()),
             };
             if let Some(message) = refusal {
                 // The per-element `ErrorMessage` targets the same `Message` as every

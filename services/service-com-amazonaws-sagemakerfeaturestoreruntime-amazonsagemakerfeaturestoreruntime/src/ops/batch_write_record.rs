@@ -215,19 +215,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request was signed for.
         let region = crate::state::request_region(ctx);
 
+        // The data plane's one feature-group resolution, for every entry of the batch at
+        // once and BEFORE this service's own store guard is taken below. LOCK ORDER — the
+        // one every operation of this crate takes: the SHARED feature-group directory
+        // first, this service's own record store second
+        // ([`crate::state::resolve_groups`], whose directory guard is released before it
+        // returns). Nothing requires the resolution to happen under this handler's own
+        // guard: it is a read of ANOTHER store keyed by the request alone, exactly as each
+        // single-record write of this data plane performs it before locking this store.
+        let Some(resolved) = crate::state::resolve_groups(
+            &*self.engine,
+            &region,
+            input
+                .entries
+                .iter()
+                .map(|entry| entry.feature_group_name.as_str()),
+        ) else {
+            return Err(internal_failure(
+                "BatchWriteRecord: this service holds no feature-group directory \
+                 on the mounted engine",
+            ));
+        };
+
         // ONE critical section for the whole batch, so a batch is never half-visible to
         // a concurrent reader. Nothing below can panic — each entry's failure is recorded
         // and the loop goes on to the next entry — and nothing inside the block awaits, so
         // the guard is never held across a suspension point: the offline replications are
-        // collected here and written after it. LOCK ORDER: this service's own store first,
-        // the shared feature-group directory second (the order every other caller of the
-        // directory takes).
+        // collected here and written after it. No other lock is taken inside it either.
         {
         let mut store = state.lock();
         // The fan-out is bounded by the request: `Entries` is modelled `len 1..25`,
         // refused at the boundary before this handler runs, so no cardinality check is
         // repeated here.
-        for entry in &input.entries {
+        //
+        // One resolution per entry, in the order the entries arrive, so each entry is
+        // written to the group IT named.
+        for (entry, resolved) in input.entries.iter().zip(&resolved) {
             // "Time to live duration for this entry … This overrides the request level
             // TtlDuration."
             let ttl_duration = entry.ttl_duration.as_ref().or(input.ttl_duration.as_ref());
@@ -243,39 +266,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
 
-            // The data plane's one feature-group resolution, per entry: this operation
-            // reports a failure that concerns ONE entry in `Errors` rather than failing
-            // the whole batch, so a name that denotes no feature group is that entry's
-            // own error, carrying the `ValidationError` code every single-record write of
-            // this data plane refuses the same name with, and the one message that
-            // resolution states (`crate::state::no_such_feature_group`) — which names the
-            // group by its ARN, so a caller can tell which of up to 25 entries the
-            // failure belongs to.
-            let definition =
-                match crate::state::resolve_group(&*self.engine, &region, &entry.feature_group_name)
-                {
-                    Ok(definition) => definition,
-                    Err(crate::state::Unresolved::Refused(message)) => {
-                        errors.push(entry_error(
-                            entry,
-                            crate::state::VALIDATION_ERROR_CODE,
-                            message,
-                        ));
-                        continue;
-                    }
-                    Err(crate::state::Unresolved::NoDirectory) => {
-                        return Err(internal_failure(
-                            "BatchWriteRecord: this service holds no feature-group directory \
-                             on the mounted engine",
-                        ))
-                    }
-                };
+            // This operation reports a failure that concerns ONE entry in `Errors` rather
+            // than failing the whole batch, so a name that denotes no feature group is
+            // that entry's own error, carrying the `ValidationError` code every
+            // single-record write of this data plane refuses the same name with, and the
+            // one message that resolution states (`crate::state::no_such_feature_group`) —
+            // which names the group by its ARN, so a caller can tell which of up to 25
+            // entries the failure belongs to.
+            let definition = match resolved {
+                Ok(definition) => definition,
+                Err(message) => {
+                    errors.push(entry_error(
+                        entry,
+                        crate::state::VALIDATION_ERROR_CODE,
+                        message.clone(),
+                    ));
+                    continue;
+                }
+            };
 
             // The entry's record is read against the group's DEFINITION by the same
             // preparation `PutRecord` uses, so a record written in a batch is read
             // exactly as the same record written on its own.
             let prepared =
-                match crate::state::prepare_record(&definition, &entry.record, ttl_duration) {
+                match crate::state::prepare_record(definition, &entry.record, ttl_duration) {
                     Ok(prepared) => prepared,
                     Err(message) => {
                         errors.push(entry_error(
@@ -332,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     offline_writes.push((
                         definition.name.clone(),
                         delivery.clone(),
-                        crate::state::offline_store::OfflineRecord::of(&definition, &entry.record),
+                        crate::state::offline_store::OfflineRecord::of(definition, &entry.record),
                     ));
                 }
             }

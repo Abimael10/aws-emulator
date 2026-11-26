@@ -1075,6 +1075,10 @@ pub enum Unresolved {
 /// ([`feature_group_creation_failed`]): the control plane could not create the store it was
 /// asked for, so the group holds nothing this data plane could serve and nothing it could
 /// persist to.
+///
+/// This reads the SHARED directory, a lock of its own: call it BEFORE taking this
+/// service's own store guard, never while holding it — see [`resolve_groups`] for the
+/// crate's lock order and for the pass a batch resolves its own names in.
 pub fn resolve_group<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
@@ -1084,13 +1088,71 @@ pub fn resolve_group<Eng: Send + Sync + 'static>(
         return Err(Unresolved::NoDirectory);
     };
     let held = directory.lock().get(name_or_arn).cloned();
+    classify_group(region, name_or_arn, held).map_err(Unresolved::Refused)
+}
+
+/// What one `FeatureGroupName` of a BATCH resolved to: the group's definition, or the
+/// message the entry naming it is refused with ([`no_such_feature_group`],
+/// [`feature_group_creation_failed`]).
+///
+/// A batch operation reports a failure that concerns ONE element in its own `Errors`
+/// rather than failing the whole call, so a name that resolves to nothing is carried
+/// here as that element's message instead of ending the call.
+pub type ResolvedGroup =
+    Result<::service_common::feature_store_groups::FeatureGroupRecord, String>;
+
+/// The definitions the `names` of one batch resolve to ([`resolve_group`]'s rule, applied
+/// to a sequence), one result per name, in the order the names arrive.
+///
+/// `None` only when the engine holds no directory at all — the condition
+/// [`feature_group_directory`] answers `None` for, which a handler reports as the modelled
+/// server error, exactly as it reports [`Unresolved::NoDirectory`] for one name.
+///
+/// LOCK ORDER — the one every operation of this crate takes: the SHARED feature-group
+/// directory FIRST, this service's own record store ([`service_state`]) SECOND. So a
+/// handler resolves what its request names BEFORE it takes its own store guard, and the
+/// directory's guard, taken here, is released before this function returns. A batch
+/// resolves every name it carries in this one pass under one directory guard, so the
+/// per-element resolution of a batch needs no second visit to the directory from inside
+/// the handler's own critical section.
+pub fn resolve_groups<'a, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<Vec<ResolvedGroup>> {
+    let directory = feature_group_directory(engine)?;
+    let held: Vec<(&str, Option<_>)> = {
+        let directory = directory.lock();
+        names
+            .into_iter()
+            .map(|name| (name, directory.get(name).cloned()))
+            .collect()
+    };
+    Some(
+        held.into_iter()
+            .map(|(name, held)| classify_group(region, name, held))
+            .collect(),
+    )
+}
+
+/// The ONE reading of what the directory holds (or does not hold) under a requested name:
+/// a group whose creation failed serves nothing, a name the directory holds nothing under
+/// denotes no feature group, and anything else is the definition that name resolves to.
+///
+/// Shared by the single-name resolution and the batch pass above, so a name cannot be
+/// judged one way by an operation that names one feature group and another way by one that
+/// names several.
+fn classify_group(
+    region: &str,
+    name_or_arn: &str,
+    held: Option<::service_common::feature_store_groups::FeatureGroupRecord>,
+) -> ResolvedGroup {
     match held {
-        Some(group) if group.creation_failed => Err(Unresolved::Refused(
-            feature_group_creation_failed(&group.name),
-        )),
+        Some(group) if group.creation_failed => Err(feature_group_creation_failed(&group.name)),
         Some(group) => Ok(group),
-        None => Err(Unresolved::Refused(no_such_feature_group(
-            &feature_group_arn(region, name_or_arn),
+        None => Err(no_such_feature_group(&feature_group_arn(
+            region,
+            name_or_arn,
         ))),
     }
 }

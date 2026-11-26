@@ -22,6 +22,11 @@
 //! handler does and then drive the real front door — the multi-service router, the
 //! restJson1 protocol, the modelled constraint validation — so what is asserted is the
 //! wire behaviour a client sees.
+//!
+//! That ONE resolution is what the BATCH operations perform too, for every element of a
+//! batch at once and before they take this service's own record-store guard: each
+//! element's answer is paired with the feature group THAT element named, and a name is
+//! classified exactly as the single-record call carrying the same name classifies it.
 
 use std::sync::Arc;
 
@@ -640,4 +645,369 @@ async fn a_write_to_a_group_without_an_online_store_is_still_judged_by_the_reque
         "case \"GetRecord of the offline-only group\": expected HTTP 400 ValidationError, \
          got {status} with body {body:?}"
     );
+}
+
+/// The ARN the control plane mints for the feature group `name`, the second spelling the
+/// modelled `FeatureGroupNameOrArn` admits.
+fn arn_of(name: &str) -> String {
+    format!("arn:aws:sagemaker:us-east-1:123456789012:feature-group/{name}")
+}
+
+/// Create a feature group whose CREATION FAILED, as the control plane records one whose
+/// `FeatureGroupStatus` reached `CREATE_FAILED`: the name resolves to a definition that
+/// holds no provisioned store, so every operation is refused on it — the second way a
+/// name this data plane resolves yields no servable group.
+fn create_failed_feature_group(emulator: &Emulator, name: &str) {
+    emulator
+        .engine
+        .state::<FeatureGroupDirectory>()
+        .lock()
+        .register(FeatureGroupRecord {
+            name: name.to_owned(),
+            arn: arn_of(name),
+            record_identifier_feature_name: IDENTIFIER_FEATURE.to_owned(),
+            event_time_feature_name: EVENT_TIME_FEATURE.to_owned(),
+            online_store_enabled: true,
+            offline_store: None,
+            default_ttl_seconds: None,
+            creation_failed: true,
+        });
+}
+
+/// One element of a batch: the feature group it names, the record it writes and reads,
+/// and whether that name resolves to a group this data plane can serve.
+#[derive(Debug, Clone)]
+struct Element {
+    /// What this row is, named in every assertion.
+    case: &'static str,
+    /// The spelling the element carries. A batch names its feature group in a BODY
+    /// member, so no spelling is percent-encoded here.
+    name: String,
+    /// The record identifier this element writes, and reads back.
+    identifier: &'static str,
+    /// Whether a READ of this element is refused — a name that resolves to no feature
+    /// group, and a group that resolves with no `OnlineStore` to read.
+    read_refused: bool,
+    /// Whether a WRITE of this element is refused — a name that resolves to no feature
+    /// group. A group with no `OnlineStore` takes the write without storing it here.
+    write_refused: bool,
+}
+
+/// The `(FeatureGroupName, RecordIdentifierValueAsString)` pairs a list of
+/// `BatchGetRecordResultDetail` or `BatchGetRecordError` elements carries, in the order
+/// the response lists them.
+fn named_pairs(body: &Value, member: &str) -> Vec<(String, String)> {
+    body.get(member)
+        .and_then(Value::as_array)
+        .map(|elements| {
+            elements
+                .iter()
+                .map(|element| {
+                    (
+                        element["FeatureGroupName"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        element["RecordIdentifierValueAsString"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `FeatureGroupName` of each entry a `BatchWriteRecord` response reports in
+/// `Errors` ("The entry that failed to be written"), in the order it lists them.
+fn refused_entry_names(body: &Value) -> Vec<String> {
+    body.get("Errors")
+        .and_then(Value::as_array)
+        .map(|errors| {
+            errors
+                .iter()
+                .map(|error| {
+                    error["Entry"]["FeatureGroupName"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The feature groups the resolution table is created against: one with an `OnlineStore`,
+/// a second with one, a third created without one, and one whose creation failed.
+fn create_resolution_groups(emulator: &Emulator) {
+    emulator.create_feature_group("customers", true);
+    emulator.create_feature_group("orders", true);
+    emulator.create_feature_group("offlineonly", false);
+    create_failed_feature_group(emulator, "halfbuilt");
+}
+
+/// The class the resolution rule spans: how an element's name resolves, crossed with the
+/// spelling it arrives in — including two elements naming the SAME feature group in its
+/// two spellings, so an answer paired with the wrong element cannot pass unnoticed.
+fn resolution_elements() -> Vec<Element> {
+    vec![
+        Element {
+            case: "a created group, by bare name",
+            name: "customers".to_owned(),
+            identifier: "c1",
+            read_refused: false,
+            write_refused: false,
+        },
+        Element {
+            case: "the same created group, by the ARN the control plane minted",
+            name: arn_of("customers"),
+            identifier: "c2",
+            read_refused: false,
+            write_refused: false,
+        },
+        Element {
+            case: "a second created group, by its ARN",
+            name: arn_of("orders"),
+            identifier: "o1",
+            read_refused: false,
+            write_refused: false,
+        },
+        Element {
+            case: "a name never created",
+            name: "nosuchgroup".to_owned(),
+            identifier: "x1",
+            read_refused: true,
+            write_refused: true,
+        },
+        Element {
+            case: "a group created without an OnlineStore",
+            name: "offlineonly".to_owned(),
+            identifier: "f1",
+            read_refused: true,
+            write_refused: false,
+        },
+        Element {
+            case: "a group whose creation failed",
+            name: "halfbuilt".to_owned(),
+            identifier: "h1",
+            read_refused: true,
+            write_refused: true,
+        },
+        Element {
+            case: "a name never created, as an ARN",
+            name: arn_of("ghost"),
+            identifier: "g1",
+            read_refused: true,
+            write_refused: true,
+        },
+    ]
+}
+
+/// One `BatchWriteRecord` carrying every row of `elements`: each entry writes the row's
+/// own record into the feature group that row names.
+async fn write_the_batch(emulator: &Emulator, elements: &[Element]) -> (u16, Value) {
+    emulator
+        .send(
+            "POST",
+            "/BatchWriteRecord",
+            Some(json!({
+                "Entries": elements
+                    .iter()
+                    .map(|element| json!({
+                        "FeatureGroupName": element.name,
+                        "Record": [
+                            feature(IDENTIFIER_FEATURE, element.identifier),
+                            feature(EVENT_TIME_FEATURE, EVENT_TIME),
+                            feature("feature_a", element.identifier)
+                        ]
+                    }))
+                    .collect::<Vec<Value>>()
+            })),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn one_batch_pairs_every_elements_answer_with_the_feature_group_that_element_named() {
+    let emulator = Emulator::new();
+    create_resolution_groups(&emulator);
+    let elements = resolution_elements();
+    let cases: Vec<&str> = elements.iter().map(|element| element.case).collect();
+
+    // ONE BatchWriteRecord carrying every row: each entry is written to the group IT
+    // named, and an entry whose name resolves to no servable group is that entry's own
+    // error rather than a failure of the batch.
+    let (status, body) = write_the_batch(&emulator, &elements).await;
+    let refused = refused_entry_names(&body);
+    let expected_refused: Vec<String> = elements
+        .iter()
+        .filter(|element| element.write_refused)
+        .map(|element| element.name.clone())
+        .collect();
+    assert_eq!(
+        (status, refused.clone()),
+        (200, expected_refused.clone()),
+        "cases {cases:?}: expected HTTP 200 with the entries {expected_refused:?} reported \
+         in Errors, got {status} with {refused:?} in {body:?}"
+    );
+    assert_eq!(
+        batch_error_codes(&body),
+        vec!["ValidationError".to_owned(); expected_refused.len()],
+        "cases {cases:?}: expected every reported entry to carry the ValidationError code, \
+         got {body:?}"
+    );
+    let unprocessed = body["UnprocessedEntries"].as_array().map(Vec::len);
+    assert_eq!(
+        unprocessed,
+        Some(0),
+        "cases {cases:?}: expected no entry to be left unprocessed, got {unprocessed:?} in \
+         {body:?}"
+    );
+
+    // Then ONE BatchGetRecord carrying every row, read back from the same batch: each
+    // identifier is read from the group ITS element named, and reported under the
+    // spelling that element used.
+    let (status, body) = emulator
+        .send(
+            "POST",
+            "/BatchGetRecord",
+            Some(json!({
+                "Identifiers": elements
+                    .iter()
+                    .map(|element| json!({
+                        "FeatureGroupName": element.name,
+                        "RecordIdentifiersValueAsString": [element.identifier]
+                    }))
+                    .collect::<Vec<Value>>()
+            })),
+        )
+        .await;
+    let served = named_pairs(&body, "Records");
+    let expected_served: Vec<(String, String)> = elements
+        .iter()
+        .filter(|element| !element.read_refused)
+        .map(|element| (element.name.clone(), element.identifier.to_owned()))
+        .collect();
+    assert_eq!(
+        (status, served.clone()),
+        (200, expected_served.clone()),
+        "cases {cases:?}: expected the records {expected_served:?} to come back, got \
+         {status} with {served:?} in {body:?}"
+    );
+    let reported = named_pairs(&body, "Errors");
+    let expected_reported: Vec<(String, String)> = elements
+        .iter()
+        .filter(|element| element.read_refused)
+        .map(|element| (element.name.clone(), element.identifier.to_owned()))
+        .collect();
+    assert_eq!(
+        reported.clone(),
+        expected_reported.clone(),
+        "cases {cases:?}: expected the identifiers {expected_reported:?} to be reported in \
+         Errors, got {reported:?} in {body:?}"
+    );
+    assert_eq!(
+        batch_error_codes(&body),
+        vec!["ValidationError".to_owned(); expected_reported.len()],
+        "cases {cases:?}: expected every reported identifier to carry the ValidationError \
+         code, got {body:?}"
+    );
+    let unprocessed = body["UnprocessedIdentifiers"].as_array().map(Vec::len);
+    assert_eq!(
+        unprocessed,
+        Some(0),
+        "cases {cases:?}: expected no identifier to be left unprocessed, got \
+         {unprocessed:?} in {body:?}"
+    );
+}
+
+/// The name as an `@httpLabel` carries it: `GetRecord$FeatureGroupName` IS a label, so an
+/// ARN spelling travels percent-encoded there — the inverse of [`percent_decoded`], which
+/// a batch's body member needs.
+fn percent_encoded(name: &str) -> String {
+    name.replace(':', "%3A").replace('/', "%2F")
+}
+
+#[tokio::test]
+async fn a_batch_element_and_a_single_record_read_classify_one_name_the_same_way() {
+    let emulator = Emulator::new();
+    create_resolution_groups(&emulator);
+    let elements = resolution_elements();
+
+    // Seed every row's record through one batch write, so each read below has a record
+    // to find wherever the name resolves to a group this store serves.
+    let (status, body) = write_the_batch(&emulator, &elements).await;
+    assert_eq!(
+        status, 200,
+        "case \"the seeding batch write\": expected HTTP 200, got {status} with body \
+         {body:?}"
+    );
+
+    // RULE: one `FeatureGroupName` resolves ONE way for this data plane, whether the
+    // operation that carries it names one feature group or several — so a batch element
+    // and the single-record read of the same name and identifier agree about whether the
+    // name denotes a group this store can serve. The batch carries the classification in
+    // its own per-element `Errors`, the single-record read in the modelled
+    // `ValidationError`; what cannot differ is WHICH names are refused.
+    for element in &elements {
+        let case = element.case;
+        let (batch_status, batch_body) = emulator
+            .send(
+                "POST",
+                "/BatchGetRecord",
+                Some(json!({ "Identifiers": [{
+                    "FeatureGroupName": element.name,
+                    "RecordIdentifiersValueAsString": [element.identifier]
+                }] })),
+            )
+            .await;
+        let batch_served = named_pairs(&batch_body, "Records");
+        let batch_reported = named_pairs(&batch_body, "Errors");
+        let (status, body) = emulator
+            .send(
+                "GET",
+                &format!(
+                    "/FeatureGroup/{}?RecordIdentifierValueAsString={}",
+                    percent_encoded(&element.name),
+                    element.identifier
+                ),
+                None,
+            )
+            .await;
+        let code = error_code(&body);
+        let served = body
+            .get("Record")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+
+        let pair = (element.name.clone(), element.identifier.to_owned());
+        if element.read_refused {
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ValidationError"),
+                "case {case:?}: expected the single-record read to be refused with HTTP 400 \
+                 ValidationError, got {status} {code:?} with body {body:?}"
+            );
+            assert_eq!(
+                (batch_status, batch_reported.clone(), batch_served.clone()),
+                (200, vec![pair.clone()], Vec::new()),
+                "case {case:?}: expected the batch element to be reported in Errors as \
+                 {pair:?} and to serve no record, got {batch_status} with {batch_body:?}"
+            );
+        } else {
+            assert!(
+                status == 200 && served > 0,
+                "case {case:?}: expected the single-record read to serve the record, got \
+                 {status} with {served} features in {body:?}"
+            );
+            assert_eq!(
+                (batch_status, batch_served.clone(), batch_reported.clone()),
+                (200, vec![pair.clone()], Vec::new()),
+                "case {case:?}: expected the batch element to serve {pair:?} and to report \
+                 no error, got {batch_status} with {batch_body:?}"
+            );
+        }
+    }
 }
