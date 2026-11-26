@@ -413,22 +413,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let prefix =
             crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
 
-        // "The provided IAM role must have access to the S3 bucket". The role IAM holds is
-        // judged call by call, and each answer is reported as the fault that answer carries:
-        // a role IAM HOLDS that the
-        // export principal cannot assume is the modelled `IamRoleNotFoundFault`; and a role
-        // that can be assumed but cannot make one of the calls the export makes on the
-        // destination — because nothing grants it, or because the bucket's own policy denies
-        // it — is the modelled `IamRoleMissingPermissionsFault`, naming the call that failed.
-        // Whether the value resolves to a role of this account AT ALL was decided above, with
-        // the grant that is created for it.
-        //
-        // The object write is judged on an object this export really writes — its own summary
-        // file, which every export leaves behind — because that is the resource of the call:
-        // a policy written about the keys under the export's prefix decides it as IAM does.
-        // Everything IAM and the object store answer about the role and this destination is
-        // resolved ONCE here, because the calls are judged in the ORDER the export makes them
-        // and the destination's own answer comes between them.
+        // "The provided IAM role must have access to the S3 bucket". Everything IAM and the
+        // object store answer about the role and this destination is resolved ONCE here, because
+        // the questions it grounds are answered at three different points below: whether the
+        // export principal can assume the role at all, then — once the destination itself has
+        // resolved — whether the role may make each of the calls the export makes there, in the
+        // order it makes them.
         let access = crate::state::ExportRoleAccess::resolve(
             ctx,
             &*self.engine,
@@ -439,17 +429,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
-        // The FIRST call the export makes on its destination is the bucket-location read
-        // ("include the following required actions ... s3:GetBucketLocation", `IamRoleArn`),
-        // and that call's ANSWER is the only thing that tells the export where — or whether —
-        // the destination is: the object store reports a bucket's location to a caller its
-        // policies allow that read and refuses the call otherwise, disclosing neither the
-        // location nor the bucket's existence. So the role is judged for this ONE call before
-        // anything is said about the destination itself, and a role that may not read a
-        // destination's location is reported as the missing-permissions fault whether or not
-        // this Region holds a bucket of that name.
-        if let Some(defect) = access.defect_on(crate::state::ExportDestinationCall::BucketLocation)
-        {
+        // WHO the export would run as, asked before anything about the destination: Amazon RDS
+        // assumes the role the request names, so a role IAM HOLDS that the export principal
+        // cannot assume leaves the export no identity to make any call under at all — the
+        // modelled `IamRoleNotFoundFault`. Whether the value resolves to a role of this account
+        // AT ALL was decided above, with the grant that is created for it. What the role may DO
+        // on the destination is a separate question, answered below once that destination has
+        // resolved.
+        if let Some(defect) = access.trust_defect() {
             return Err(role_refusal(
                 defect,
                 &input.iam_role_arn,
@@ -457,14 +444,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // What that call ANSWERS, for a role that may make it. The destination bucket is a
-        // resource of ANOTHER service, so it is resolved where that service holds it: a bucket
-        // Amazon S3 holds nothing under can take no export, which is the modelled
-        // `InvalidS3BucketFault` — the one fault that reports both halves of what the location
-        // read can answer ("either it isn't located in the current AWS Region or it doesn't
-        // exist"), and the same fault a name no bucket can carry is refused with above. An
-        // engine with no object store beside this service establishes nothing and refuses
-        // nothing.
+        // THE DESTINATION the export writes to, resolved before the role is judged for the
+        // calls it would make there: `InvalidS3BucketFault` is what Amazon RDS answers when
+        // "the specified Amazon S3 bucket name can't be found", so a destination that cannot be
+        // found is reported as the bucket it is whatever the role's policies are scoped to —
+        // the authorization half of that same fault is a statement about a destination that
+        // IS there. The bucket is a resource of ANOTHER service, so it is resolved where that
+        // service holds it, and the sentence is the one a name no bucket can carry is refused
+        // with above ("either it isn't located in the current AWS Region or it doesn't
+        // exist"). An engine with no object store beside this service establishes nothing and
+        // refuses nothing.
         if crate::state::bucket_is_absent(&*self.engine, &input.s3_bucket_name) == Some(true) {
             return Err(StartExportTaskErrorModeled::InvalidS3BucketFault(
                 InvalidS3BucketFault {
@@ -490,9 +479,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // And the WRITE the export performs into a destination it has now established is
-        // there: the call it makes after the location read, so it is judged after that read's
-        // own answer has been reported.
+        // And WHAT the role may do on the destination that has now resolved, call by call and
+        // in the ORDER the export makes them: the bucket-location read first ("include the
+        // following required actions ... s3:GetBucketLocation", `IamRoleArn`) and then the
+        // object write, each reported as the modelled `IamRoleMissingPermissionsFault` naming
+        // the call that failed — whether nothing grants the role that call or the destination's
+        // own policy denies it.
+        //
+        // The object write is judged on an object this export really writes — its own summary
+        // file, which every export leaves behind — because that is the resource of the call: a
+        // policy written about the keys under the export's prefix decides it as IAM does.
+        if let Some(defect) = access.defect_on(crate::state::ExportDestinationCall::BucketLocation)
+        {
+            return Err(role_refusal(
+                defect,
+                &input.iam_role_arn,
+                &input.s3_bucket_name,
+            ));
+        }
         if let Some(defect) = access.defect_on(crate::state::ExportDestinationCall::ObjectWrite) {
             return Err(role_refusal(
                 defect,

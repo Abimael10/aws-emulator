@@ -191,6 +191,22 @@ impl ExportRoleAccess {
         }
     }
 
+    /// What stops the export from running AS this role at all, before any call is made with
+    /// it: `None` for a role the export principal can assume, and the defect that stops it
+    /// otherwise.
+    ///
+    /// Amazon RDS assumes the role the request names BEFORE it touches the destination — an
+    /// identity nothing can act as makes no call — so this is the one question about the role
+    /// that is answered ahead of the destination itself, where the questions of what the role
+    /// may DO there ([`Self::defect_on`]) are answered after it. The same split the
+    /// restore-from-Amazon-S3 operations of this crate are judged by
+    /// ([`super::ingestion_role_is_unusable`] before the location,
+    /// [`super::ingestion_role_is_unauthorized`] after it).
+    #[must_use]
+    pub fn trust_defect(&self) -> Option<ExportRoleDefect> {
+        (self.names_a_role && self.unassumable).then_some(ExportRoleDefect::NotAssumable)
+    }
+
     /// Judge the export role for ONE of the calls the export makes on its destination, the way
     /// Amazon RDS does before it accepts an export: `None` for a call the role can make, and
     /// the defect that stops it otherwise.

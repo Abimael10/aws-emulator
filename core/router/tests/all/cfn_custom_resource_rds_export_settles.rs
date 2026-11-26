@@ -62,11 +62,12 @@ pub(crate) const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 pub(crate) const BUCKET: &str = "ExportBucket";
 const KEY: &str = "ExportKey";
 const EXPORT_ROLE: &str = "ExportRole";
-/// The role that may read the location of EVERY bucket, so a destination's OWN condition is
-/// what its export is answered with: Amazon RDS reads a destination's location as the role
-/// before anything else, and an object store discloses neither a bucket's location nor its
-/// existence to a caller it refuses that read.
+/// The role that may read the location of EVERY bucket, so its export carries nothing about
+/// the role's own authorization whatever destination the trigger named.
 const EVERY_BUCKET_ROLE: &str = "ExportRoleEveryBucket";
+/// The role granted NO call on any bucket, for the row whose destination is held and whose
+/// export role may not make the calls the export makes there.
+const NO_BUCKET_ROLE: &str = "ExportRoleNoBucket";
 const TRIGGER_ROLE: &str = "TriggerRole";
 const TRIGGER_FUNCTION: &str = "TriggerFunction";
 pub(crate) const TRIGGER: &str = "TriggerResource";
@@ -313,8 +314,29 @@ fn export_role_policy() -> Value {
     })
 }
 
-/// The same identity policy over EVERY bucket, for [`EVERY_BUCKET_ROLE`]: a role the
-/// bucket-location read does not stop, so the export reaches what that read ANSWERS about the
+/// The same identity policy with its Amazon S3 statement LEFT OUT, for [`NO_BUCKET_ROLE`]: a
+/// role the export principal can assume that is granted none of the calls an export makes on
+/// a destination, so an export to a destination that IS there is refused for the first of
+/// them.
+fn no_bucket_role_policy() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+                "kms:CreateGrant",
+                "kms:DescribeKey",
+                "kms:Encrypt",
+                "kms:Decrypt",
+                "kms:GenerateDataKey*",
+            ],
+            "Resource": {"Fn::GetAtt": [KEY, "Arn"]},
+        }],
+    })
+}
+
+/// The same identity policy over EVERY bucket, for [`EVERY_BUCKET_ROLE`]: a role whose own
+/// authorization stops no export, so what each row's export is answered with is about the
 /// destination the trigger named.
 fn every_bucket_role_policy() -> Value {
     json!({
@@ -370,6 +392,9 @@ pub(crate) enum Role {
     /// The stack's role granted the export's calls on EVERY bucket, so the destination the
     /// trigger named decides the export rather than the role's own authorization on it.
     EveryBucket,
+    /// The stack's role granted no call on any bucket, which the export principal can assume:
+    /// the role that cannot make the calls the export makes on a destination that is there.
+    NoBucket,
 }
 
 impl Role {
@@ -378,6 +403,7 @@ impl Role {
             Self::Export => json!({"Fn::GetAtt": [EXPORT_ROLE, "Arn"]}),
             Self::ProvidersOwn => json!({"Fn::GetAtt": [TRIGGER_ROLE, "Arn"]}),
             Self::EveryBucket => json!({"Fn::GetAtt": [EVERY_BUCKET_ROLE, "Arn"]}),
+            Self::NoBucket => json!({"Fn::GetAtt": [NO_BUCKET_ROLE, "Arn"]}),
         }
     }
 }
@@ -427,6 +453,16 @@ pub(crate) fn template(trigger: &Trigger) -> String {
                     "Policies": [{
                         "PolicyName": "export-to-any-s3",
                         "PolicyDocument": every_bucket_role_policy(),
+                    }],
+                },
+            },
+            NO_BUCKET_ROLE: {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": trust_policy("export.rds.amazonaws.com"),
+                    "Policies": [{
+                        "PolicyName": "export-to-no-s3",
+                        "PolicyDocument": no_bucket_role_policy(),
                     }],
                 },
             },
@@ -750,20 +786,20 @@ const ROWS: &[Row] = &[
         task: "cfn-export-absent-bucket",
         held_source: true,
         held_bucket: false,
-        // The destination's own condition is what the bucket-location read ANSWERS a role that
-        // may MAKE that read, so this row runs under the role granted it on every bucket; the
-        // user-guide export role, granted the stack's bucket alone, is refused for the read
-        // itself, which is the row below.
+        // A destination that cannot be found is answered about the DESTINATION whatever the
+        // role's policies are scoped to, so this row and the one below differ only in whether
+        // the object store holds the bucket: this one runs under the role granted every
+        // bucket, and the next under a role granted none.
         role: Role::EveryBucket,
         code: "InvalidS3BucketFault",
     },
     Row {
-        case: "a destination the export role may not read",
+        case: "a destination that is held, which the export role may not read",
         stack: "cfn-rds-export-unreadable-bucket",
         task: "cfn-export-unreadable-bucket",
         held_source: true,
-        held_bucket: false,
-        role: Role::Export,
+        held_bucket: true,
+        role: Role::NoBucket,
         code: "IamRoleMissingPermissions",
     },
 ];

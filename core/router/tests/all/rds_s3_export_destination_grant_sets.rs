@@ -6,17 +6,15 @@
 //! RULE: Amazon RDS decides whether an export's role may make the calls the export makes on
 //! its destination from the role's EFFECTIVE identity policies — every document IAM holds
 //! for it, inline or attached — and from the destination's own policy, and it makes those
-//! calls IN ORDER: the bucket-location read first, the object write after it. That first
-//! call's ANSWER is also the only thing that tells the export whether the destination is a
-//! bucket it can write at all, and an object store discloses neither a bucket's location nor
-//! its existence to a caller it refuses that read. So a role granted the export's calls on
-//! ANOTHER bucket is refused on the bucket the request names — `IamRoleMissingPermissions`
-//! naming `s3:GetBucketLocation` — whether or not the Region holds a bucket of that name;
-//! the destination's own `InvalidS3BucketFault` is the answer to a role that MAY read it (and
-//! to a value that is no bucket name at all, which names no destination and is decided from
-//! the request alone); and the same role is accepted on the bucket it IS granted on,
-//! whichever of the spellings `KmsKeyId` publishes ("the key ARN, key ID, alias ARN, or alias
-//! name") the request named the key by and whether or not it carried an `S3Prefix`.
+//! calls IN ORDER: the bucket-location read first, the object write after it. The DESTINATION
+//! itself is resolved before any of that: a value no bucket is named by, and a name this
+//! Region's object store holds no bucket under, are the destination's own
+//! `InvalidS3BucketFault` whatever the role is granted ("the specified Amazon S3 bucket name
+//! can't be found"). So a role granted the export's calls on ANOTHER bucket is refused on a
+//! bucket that IS there — `IamRoleMissingPermissions` naming `s3:GetBucketLocation` — and
+//! accepted on the bucket it IS granted on, whichever of the spellings `KmsKeyId` publishes
+//! ("the key ARN, key ID, alias ARN, or alias name") the request named the key by and whether
+//! or not it carried an `S3Prefix`.
 //!
 //! Only a cross-service suite can pin this: one export decision spans four services over ONE
 //! engine — Amazon RDS for the control plane and the export, IAM for the role, its trust
@@ -269,7 +267,8 @@ enum Outcome {
     /// — the first one it makes on the destination.
     RefusedOnBucketLocation,
     /// The export is refused for the DESTINATION itself: a value no bucket is named by, or a
-    /// name this Region holds no bucket under, reported to a role that may read it.
+    /// name this Region holds no bucket under — whatever the role is granted, since the
+    /// destination is resolved before the role's authorization on it is judged.
     RefusedOnDestination,
     /// The export is accepted, and the task it started is reported on its way.
     Accepted,
@@ -488,8 +487,11 @@ fn an_exports_destination_grant_is_read_from_every_policy_set_the_role_carries()
 
             // The rows differ along what the rule generalises over: WHERE the role's grant
             // lives (inline, attached), WHICH destination the request names (the granted one,
-            // another one that exists), the SPELLING of the key (id, ARN, alias) and whether
-            // the request carries an `S3Prefix`.
+            // another one that exists, one the Region holds nothing under, a value that is no
+            // bucket name), the SPELLING of the key (id, ARN, alias) and whether the request
+            // carries an `S3Prefix`. The two rows naming a destination the Region does not
+            // hold differ only in what the role is granted, which the destination's own answer
+            // does not depend on.
             let rows = [
                 Row {
                     case: "an inline grant on another bucket, the key by id",
@@ -507,7 +509,7 @@ fn an_exports_destination_grant_is_read_from_every_policy_set_the_role_carries()
                     bucket: ABSENT_BUCKET,
                     key: &key_id,
                     prefix: None,
-                    outcome: Outcome::RefusedOnBucketLocation,
+                    outcome: Outcome::RefusedOnDestination,
                 },
                 Row {
                     case: "a grant on every bucket, naming a bucket the Region does not hold",

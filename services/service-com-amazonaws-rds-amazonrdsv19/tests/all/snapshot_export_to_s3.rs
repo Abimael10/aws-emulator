@@ -904,10 +904,10 @@ async fn each_export_refusal_carries_the_services_own_sentence() {
     .await
     .id;
 
-    // A role granted the export's calls on EVERY bucket: a destination's OWN condition — a
-    // bucket the object store holds nothing under, or one outside this Region — is what the
-    // bucket-location read ANSWERS a role that may MAKE that read, so the rows about the
-    // destination are asked with a role whose own authorization does not stop it first.
+    // A role granted the export's calls on EVERY bucket, so each row about the destination
+    // asserts that destination's OWN condition — a bucket the object store holds nothing
+    // under, or one outside this Region — with nothing to say about the role's authorization.
+    // Which answer comes first is the subject of `export_destination_resolution_order`.
     let everywhere = role(
         &destination.router,
         "emu-refusal-everywhere",
@@ -1365,9 +1365,9 @@ async fn an_export_refused_for_an_unresolvable_destination_is_accepted_once_it_r
     )
     .await;
 
-    // A role granted the export's calls on EVERY bucket: the destination's own condition is
-    // what the bucket-location read ANSWERS a role that may make that read, so the row about
-    // a destination this Region holds nothing under is asked with such a role.
+    // A role granted the export's calls on EVERY bucket, so the row about a destination this
+    // Region holds nothing under carries nothing about the role's own authorization: what each
+    // row asserts is the condition it names.
     let everywhere = role(
         &destination.router,
         "emu-paired-everywhere",
