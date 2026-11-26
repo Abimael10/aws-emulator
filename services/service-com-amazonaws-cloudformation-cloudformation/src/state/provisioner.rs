@@ -497,6 +497,7 @@ use super::template::{
     BEDROCK_GUARDRAIL,
     BEDROCK_KNOWLEDGE_BASE,
     BEDROCK_SESSION,
+    BEDROCK_APPLICATION_INFERENCE_PROFILE,
     BRAKET_SPENDING_LIMIT, CLEANROOMSML_TRAINING_DATASET,
     GAMELIFT_BUILD, GAMELIFT_SCRIPT,
     VPCLATTICE_ACCESS_LOG_SUBSCRIPTION, VPCLATTICE_SERVICE_NETWORK,
@@ -1379,6 +1380,14 @@ pub(super) enum Provisioner {
     /// — the two forms every call on a session takes as its `sessionIdentifier` — so both are
     /// read off that create's own answer and the ARN is the identity a `Ref` resolves to.
     BedrockSession,
+    /// `AWS::Bedrock::ApplicationInferenceProfile`: an APPLICATION INFERENCE PROFILE of
+    /// Amazon Bedrock's own control plane, which `CreateInferenceProfile` makes over the model
+    /// source the template states and `DeleteInferenceProfile` removes — that service
+    /// publishing no update of one. It MINTS the `inferenceProfileArn` the type publishes,
+    /// whose resource segment carries an `inferenceProfileId` of its own, so both are read off
+    /// that create's own answer and its own report of the profile, and the ARN is the identity
+    /// a `Ref` resolves to.
+    BedrockApplicationInferenceProfile,
     /// One of the three resources of Amazon Bedrock DATA AUTOMATION's build-time control
     /// plane — the blueprint an `AWS::Bedrock::Blueprint` declares, the project an
     /// `AWS::Bedrock::DataAutomationProject` declares and the library an
@@ -2022,6 +2031,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BEDROCK_DATA_SOURCE => Some(Provisioner::BedrockDataSource),
         BEDROCK_FLOW => Some(Provisioner::BedrockFlow),
         BEDROCK_SESSION => Some(Provisioner::BedrockSession),
+        BEDROCK_APPLICATION_INFERENCE_PROFILE => {
+            Some(Provisioner::BedrockApplicationInferenceProfile)
+        }
         BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
@@ -2918,6 +2930,11 @@ impl Provisioner {
             Self::BedrockSession => {
                 delete_bedrock_session(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the inference profile by the ARN Amazon Bedrock minted for
+            // it, which is this resource's physical id.
+            Self::BedrockApplicationInferenceProfile => {
+                delete_bedrock_inference_profile(ctx, region, physical_resource_id).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 delete_workload_identity(ctx, region, physical_resource_id).await
             }
@@ -3227,6 +3244,11 @@ mod bedrock_flows;
 /// that service answers for — for its own reads of the session and for every invocation that
 /// stores a checkpoint in it.
 mod bedrock_sessions;
+/// The Amazon Bedrock APPLICATION INFERENCE PROFILE arms: the profile an
+/// `AWS::Bedrock::ApplicationInferenceProfile` declares, created in Amazon Bedrock's own
+/// control plane so the ARN the stack publishes is one that service answers for — for its own
+/// read of the profile and for every invocation addressed to it.
+mod bedrock_inference_profiles;
 /// The Amazon SageMaker AI types a stack declares beside the model registry's: the model,
 /// the notebook instance and the lifecycle configuration one of those runs. Visible to the
 /// rest of this service's state because the type NAMES it owns are what the naming rules and
@@ -3552,6 +3574,7 @@ use bedrock_knowledge_bases::*;
 use bedrock_data_sources::*;
 use bedrock_flows::*;
 use bedrock_sessions::*;
+use bedrock_inference_profiles::*;
 use sagemaker_resources::*;
 /// The AWS Direct Connect arms: the gateway an `AWS::DirectConnect::DirectConnectGateway`
 /// declares and the group an `AWS::DirectConnect::ResiliencyGroup` declares, created in the

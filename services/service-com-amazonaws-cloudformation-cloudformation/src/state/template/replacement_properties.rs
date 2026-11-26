@@ -156,6 +156,16 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // session's identifier and its metadata alone), so a declaration naming another key
         // asks for a different session.
         BEDROCK_SESSION => &["EncryptionKeyArn"],
+        // An application inference profile keeps everything its create made it with: Amazon
+        // Bedrock publishes no update of one at all — `CreateInferenceProfile` takes the
+        // profile's name, its description and the model source it copies from, and the only
+        // calls on a profile afterwards are its read, its delete and the tagging calls — so a
+        // declaration restating any of them asks for a DIFFERENT profile, which CloudFormation
+        // replaces. (Its NAME is one of them, which is why it is listed here rather than left
+        // to the name convention.)
+        BEDROCK_APPLICATION_INFERENCE_PROFILE => {
+            &["Description", "InferenceProfileName", "ModelSource"]
+        }
         // A trigger keeps the TYPE it fires on, the WORKFLOW it belongs to and whether its
         // create started it: all three are members of `CreateTrigger` and of no member of
         // `TriggerUpdate` — which takes a trigger's description, schedule, actions, predicate

@@ -186,17 +186,14 @@ async fn given_stopped_job(emu: &Emulator, region: &str, job_name: &str) -> Stri
 // Expectations the model and the doc sentence fix.
 // ---------------------------------------------------------------------------------------
 
-/// The refusal a batch naming a job in `status` is answered with: it names the job the
-/// delete addressed and the status that job holds, and then the requirement as the model
-/// words it ("An evaluation job can only be deleted if it has following status FAILED,
-/// COMPLETED, and STOPPED").
-fn not_deletable_message(identifier: &str, status: &str) -> String {
-    format!(
-        "Evaluation job: {identifier} is in status {status} and cannot be deleted. An \
-         evaluation job can only be deleted if it has following status FAILED, COMPLETED, \
-         and STOPPED."
-    )
-}
+/// The refusal a batch whose jobs are not all deletable is answered with: ONE statement
+/// about the whole REQUEST, in the fixed text Amazon Bedrock words this error class with —
+/// into which no identifier, status or count of the request's own is interpolated — closing
+/// with what a re-submission has to name.
+const NOT_DELETABLE_MESSAGE: &str =
+    "All provided evaluation jobs in the request are not supported by batch deletion. \
+     Please re-submit with evaluation jobs that exists and under FAILED COMPLETED STOPPED \
+     status.";
 
 /// The `evaluationJobs` list of a reply, as `(jobIdentifier, jobStatus)` pairs in the order
 /// the response carries them.
@@ -424,8 +421,9 @@ async fn a_job_that_is_not_in_a_terminal_status_cannot_be_deleted() {
         );
         assert_eq!(
             refused.get("message"),
-            json!(not_deletable_message(&arn, status)),
-            "case {case:?}: the refusal names the job and the status it holds, got {:?}",
+            json!(NOT_DELETABLE_MESSAGE),
+            "case {case:?}: a batch naming a job in {status} is refused with the fixed \
+             request-level message, got {:?}",
             refused.get("message")
         );
         // And it names every status a deletion DOES admit, so a caller is told what to wait

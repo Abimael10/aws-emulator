@@ -105,6 +105,7 @@ use super::template::{
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE, BACKUP_GATEWAY_HYPERVISOR,
     BCM_DASHBOARD, BCM_SCHEDULED_REPORT,
     BEDROCK_SESSION,
+    BEDROCK_APPLICATION_INFERENCE_PROFILE,
     BEDROCK_BLUEPRINT, BEDROCK_DATA_AUTOMATION_LIBRARY, BEDROCK_DATA_AUTOMATION_PROJECT,
     BRAKET_SPENDING_LIMIT,
     CLEANROOMSML_TRAINING_DATASET,
@@ -367,6 +368,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // The SESSION of the Bedrock Agent RUNTIME plane, whose `CreateSession` a stack's
     // deployment mints one through (`super::provisioner`).
     BEDROCK_SESSION,
+    // The APPLICATION INFERENCE PROFILE of Amazon Bedrock's own control plane, which a
+    // stack's deployment creates there through that service's own `CreateInferenceProfile`
+    // (`super::provisioner`).
+    BEDROCK_APPLICATION_INFERENCE_PROFILE,
     // Amazon Bedrock AgentCore — the seven types this emulator carries the published return
     // values of (`super::template::IMPLEMENTED_RESOURCE_TYPES`). Every one of them is really
     // created in that control plane (`super::provisioner`).

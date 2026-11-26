@@ -753,6 +753,11 @@ impl Provisioner {
             Self::BedrockSession => {
                 describe_bedrock_session(ctx, region, physical_resource_id).await
             }
+            // Amazon Bedrock's own read of the application inference profile the stack
+            // created, by the ARN it minted for it.
+            Self::BedrockApplicationInferenceProfile => {
+                describe_bedrock_inference_profile(ctx, region, physical_resource_id).await
+            }
             // Amazon Bedrock Data Automation's own read of the blueprint, the project or the
             // library the stack created, by the ARN it minted for it.
             Self::BedrockDataAutomation(kind) => {

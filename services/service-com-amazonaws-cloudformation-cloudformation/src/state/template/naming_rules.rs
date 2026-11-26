@@ -973,6 +973,11 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // convention already finds.)
         BEDROCK_DATA_AUTOMATION_PROJECT => Some("ProjectName"),
         BEDROCK_DATA_AUTOMATION_LIBRARY => Some("LibraryName"),
+        // Amazon Bedrock's `CreateInferenceProfile` takes an `inferenceProfileName`, so
+        // `AWS::Bedrock::ApplicationInferenceProfile` takes `InferenceProfileName`, where the
+        // type's last segment is `ApplicationInferenceProfile`: neither
+        // `ApplicationInferenceProfileName` nor `Name` finds it.
+        BEDROCK_APPLICATION_INFERENCE_PROFILE => Some("InferenceProfileName"),
         // Amazon RDS takes a cluster snapshot's own identifier as
         // `CreateDBClusterSnapshot.DBClusterSnapshotIdentifier` — the identifier this type's
         // `Ref` returns and every call on the snapshot takes — where the type's last segment

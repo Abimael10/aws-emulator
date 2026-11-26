@@ -977,6 +977,13 @@ impl Provisioner {
             Self::BedrockSession => {
                 create_bedrock_session(ctx, region, resource, propagated).await
             }
+            // `AWS::Bedrock::ApplicationInferenceProfile` publishes `Tags` as a LIST, which is
+            // the shape `CreateInferenceProfile`'s own `tags` member takes, so a profile a
+            // stack creates carries the tags CloudFormation gives it beside the ones the
+            // declaration asks for.
+            Self::BedrockApplicationInferenceProfile => {
+                create_bedrock_inference_profile(ctx, region, resource, propagated).await
+            }
             // `AWS::BedrockAgentCore::WorkloadIdentity` publishes `Tags`, and
             // `CreateWorkloadIdentity` takes a tag MAP of its own, so an identity a stack
             // creates carries the tags CloudFormation gives it beside the ones the

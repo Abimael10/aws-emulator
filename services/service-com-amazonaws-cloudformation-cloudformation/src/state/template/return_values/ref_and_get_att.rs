@@ -2185,6 +2185,40 @@ pub(crate) fn return_values(
             attributes.insert(BEDROCK_SESSION_ID_ATTRIBUTE.to_string(), session_id);
             (arn, attributes)
         }
+        // Amazon Bedrock's own control plane: the application inference profile an
+        // `AWS::Bedrock::ApplicationInferenceProfile` declares. `Ref` returns the profile's
+        // identifier — the ARN, the type's primary identifier — which `Fn::GetAtt` reads
+        // beside the `InferenceProfileId` inside it. `CreateInferenceProfile` takes the
+        // profile's NAME and its model source and answers the `inferenceProfileArn` IT minted,
+        // whose resource segment carries an id of that service's own
+        // (`InferenceProfileId`: `^[a-zA-Z0-9-:.]+$`), so the two values here are STAND-INS of
+        // those forms and `super::provisioning` re-points them at what the create really
+        // answered
+        // ([`super::provisioner::Provisioner::BedrockApplicationInferenceProfile`]). The
+        // profile's status, its type and the two instants it keeps are that service's to
+        // report and reach the resource off its own read of the profile rather than being
+        // computed here.
+        BEDROCK_APPLICATION_INFERENCE_PROFILE => {
+            let profile_id = service_assigned_label(
+                BEDROCK_INFERENCE_PROFILE_ID_SALT,
+                name,
+                BEDROCK_INFERENCE_PROFILE_ID_DIGITS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                BEDROCK_ARN_NAMESPACE,
+                region,
+                &format!("{BEDROCK_APPLICATION_INFERENCE_PROFILE_PATH}/{profile_id}"),
+            );
+            attributes.insert(
+                BEDROCK_INFERENCE_PROFILE_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            attributes.insert(
+                BEDROCK_INFERENCE_PROFILE_ID_ATTRIBUTE.to_string(),
+                profile_id,
+            );
+            (arn, attributes)
+        }
         // Amazon Bedrock Data Automation's build-time control plane: the blueprint, the data
         // automation project and the data automation library a template declares. `Ref` returns
         // each resource's ARN (the type's primary identifier), which `Fn::GetAtt` reads beside

@@ -244,6 +244,55 @@ pub(crate) const BEDROCK_SESSION_ATTRIBUTES: &[&str] = &[
     BEDROCK_SESSION_ID_ATTRIBUTE,
 ];
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an APPLICATION INFERENCE PROFILE: the
+/// profile of Amazon Bedrock's own control plane that `CreateInferenceProfile` makes over a
+/// foundation model or a system-defined profile, `GetInferenceProfile` reads and
+/// `DeleteInferenceProfile` removes. The middle segment is `Bedrock`, the
+/// `cloudFormationName` every type of that estate carries.
+///
+/// `Ref` returns the profile's identifier — the ARN, which is the type's primary identifier
+/// and one of the two forms `InferenceProfileIdentifier` admits, so every later call on the
+/// profile is addressed by it — and `Fn::GetAtt` reads that ARN and the
+/// `inferenceProfileId` that service minted beside the status, the type and the two instants
+/// it keeps. The create takes the profile's NAME and the model source and answers the
+/// `inferenceProfileArn` IT minted (`InferenceProfileArn`:
+/// `^arn:aws(|-us-gov|-cn|-iso|-iso-b):bedrock:(|[0-9a-z-]{0,20}):(|[0-9]{12}):\
+/// (inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+$`), which is why
+/// [`identity_is_service_assigned`] names this type.
+pub const BEDROCK_APPLICATION_INFERENCE_PROFILE: &str =
+    "AWS::Bedrock::ApplicationInferenceProfile";
+
+/// The resource path an APPLICATION inference profile's ARN carries before the id that
+/// service minted, which is the one of the two alternatives that pattern spells for a profile
+/// an account creates (a `inference-profile/…` ARN names one Amazon Bedrock publishes).
+pub(super) const BEDROCK_APPLICATION_INFERENCE_PROFILE_PATH: &str =
+    "application-inference-profile";
+
+/// The attributes carrying the two handles Amazon Bedrock mints for an application inference
+/// profile: the ARN, which is this type's primary identifier, and the `InferenceProfileId`
+/// inside it — the other form `InferenceProfileIdentifier` admits.
+pub(crate) const BEDROCK_INFERENCE_PROFILE_ARN_ATTRIBUTE: &str = "InferenceProfileArn";
+pub(crate) const BEDROCK_INFERENCE_PROFILE_ID_ATTRIBUTE: &str = "InferenceProfileId";
+
+/// Every `Fn::GetAtt` attribute a [`BEDROCK_APPLICATION_INFERENCE_PROFILE`] publishes that
+/// these naming rules can compute a stand-in for, in the sorted order a resource's own
+/// attribute map holds them in.
+///
+/// The profile's `Status`, its `Type` and the two instants it keeps are that service's own to
+/// report and reach the resource off its reads rather than being computed here, exactly as a
+/// session's status and instants do.
+pub(crate) const BEDROCK_INFERENCE_PROFILE_ATTRIBUTES: &[&str] = &[
+    BEDROCK_INFERENCE_PROFILE_ARN_ATTRIBUTE,
+    BEDROCK_INFERENCE_PROFILE_ID_ATTRIBUTE,
+];
+
+/// How many characters the id Amazon Bedrock mints for an application inference profile
+/// carries, and the salt the STAND-IN computed before the create is derived under: 12, the
+/// width that service's own minted ids have, inside the `^[a-zA-Z0-9-:.]+$` an
+/// `InferenceProfileId` admits.
+pub(super) const BEDROCK_INFERENCE_PROFILE_ID_DIGITS: usize = 12;
+pub(super) const BEDROCK_INFERENCE_PROFILE_ID_SALT: &str = "bedrock/application-inference-profile";
+
 /// The `AWS::BCM::<Resource>` types of the two Billing and Cost Management Dashboards
 /// resources a template declares: the DASHBOARD that service's own `CreateDashboard` makes
 /// under the name the declaration states, and the SCHEDULED REPORT its

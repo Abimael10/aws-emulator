@@ -110,6 +110,12 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // every call on a session takes as its `sessionIdentifier`; the type declares no name a
         // client could name one by.
         BEDROCK_SESSION => BEDROCK_SESSION_ARN_ATTRIBUTE,
+        // An APPLICATION INFERENCE PROFILE, identified by the ARN Amazon Bedrock built around
+        // the id it minted ("Ref returns the inference profile identifier") — one of the two
+        // forms every call on a profile takes as its `inferenceProfileIdentifier`; its own
+        // `InferenceProfileName` is only what the profile is called, and no call of that
+        // service addresses one by it.
+        BEDROCK_APPLICATION_INFERENCE_PROFILE => BEDROCK_INFERENCE_PROFILE_ARN_ATTRIBUTE,
         // The three Amazon Bedrock DATA AUTOMATION resources, each identified by the ARN that
         // service minted for it ("Ref returns the ARN") — the handle every call of that
         // build-time plane on the resource takes. Each type's own name is only what the

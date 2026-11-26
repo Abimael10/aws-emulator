@@ -376,6 +376,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // keeps are that service's clock and reach the resource off its own report of the
         // session, exactly as a flow's do.
         BEDROCK_SESSION => BEDROCK_SESSION_ATTRIBUTES,
+        // An application inference profile publishes the ARN its `Ref` also returns and the id
+        // Amazon Bedrock minted inside it; its `Status`, its `Type` and the two instants that
+        // service keeps reach the resource off its own read of the profile, exactly as a
+        // session's do.
+        BEDROCK_APPLICATION_INFERENCE_PROFILE => BEDROCK_INFERENCE_PROFILE_ATTRIBUTES,
         // A blueprint, a data automation project and a data automation library each publish the
         // ARN Amazon Bedrock Data Automation minted for the resource — the one return value
         // these naming rules compute a stand-in for before the resource exists. Each one's
@@ -1167,6 +1172,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // name CloudFormation decides is either, so the identity in force is the one that
         // service answered.
         || resource_type == BEDROCK_SESSION
+        // An APPLICATION INFERENCE PROFILE is one more: `CreateInferenceProfile` takes the
+        // profile's name and its model source and takes no identifier for it, answering the
+        // `inferenceProfileArn` Amazon Bedrock minted — whose resource segment carries an id of
+        // that service's own (`InferenceProfileId`: `^[a-zA-Z0-9-:.]+$`) — which is the ARN that
+        // type's `Ref` returns and one of the two forms every call on a profile takes as its
+        // `inferenceProfileIdentifier`. No name CloudFormation decides is either, so the
+        // identity in force is the one that service answered.
+        || resource_type == BEDROCK_APPLICATION_INFERENCE_PROFILE
         // The three Amazon Bedrock DATA AUTOMATION types are three more: none of their creates
         // takes an identifier for the resource — each takes the name the declaration states —
         // and each answers the ARN that service minted, whose resource segment carries 12 to 36

@@ -92,6 +92,21 @@ use super::types::*;
 /// a read of that same identifier answers.
 const NOT_FOUND_STATUS_CODE: &str = "404";
 
+/// The message a batch whose jobs are not all deletable is refused with: ONE request-level
+/// statement about the whole batch, in the fixed text Amazon Bedrock words this error class
+/// with, followed by what a re-submission has to name.
+///
+/// Fixed text END TO END: no identifier, status, count or any other value of the request or
+/// of this store is interpolated into it. The refusal is about the REQUEST — none of the
+/// jobs it names is deleted — so it names no job, and the statuses it spells are the ones
+/// the operation's own documentation fixes ("An evaluation job can only be deleted if it
+/// has following status FAILED, COMPLETED, and STOPPED",
+/// `smithy_query(query="operation",operation="BatchDeleteEvaluationJob")`).
+pub const NOT_DELETABLE_MESSAGE: &str =
+    "All provided evaluation jobs in the request are not supported by batch deletion. \
+     Please re-submit with evaluation jobs that exists and under FAILED COMPLETED STOPPED \
+     status.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -205,17 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
             if !job.is_deletable() {
-                let status = job.status;
                 return Err(BatchDeleteEvaluationJobErrorModeled::ValidationException(
                     ValidationException {
-                        // The second sentence is the requirement as the model words it,
-                        // down to the spelling of the statuses it names; the first names the
-                        // job the batch addressed and the status it holds instead.
-                        message: Some(format!(
-                            "Evaluation job: {identifier} is in status {status} and cannot be \
-                             deleted. An evaluation job can only be deleted if it has \
-                             following status FAILED, COMPLETED, and STOPPED."
-                        )),
+                        // The refusal is one statement about the REQUEST
+                        // ([`NOT_DELETABLE_MESSAGE`]), so neither the identifier the batch
+                        // named nor the status the stored job holds is part of it: this
+                        // error class carries that fixed text alone.
+                        message: Some(NOT_DELETABLE_MESSAGE.to_string()),
                     },
                 )
                 .into());
