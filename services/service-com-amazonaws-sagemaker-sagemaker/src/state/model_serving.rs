@@ -16,11 +16,14 @@
 //!
 //! * the variant is resolved through the endpoint's own endpoint configuration — the one
 //!   `CreateEndpoint` snapshotted — so the model behind it is the model the caller deployed;
-//! * that model's `ModelDataUrl` is read out of this emulator's own Amazon S3 and the fitted
-//!   parameters are read back out of the `model.tar.gz` a training or AutoML run wrote
-//!   ([`super::model_from_archive`]), so the model served is the model trained;
+//! * that model's model data is read out of this emulator's own Amazon S3 in the form the model's
+//!   container DECLARED it in ([`ModelDataLocation`]) — one gzip-compressed tar archive, one
+//!   uncompressed object, or every object under a key name prefix — and the files it lays out
+//!   under the model directory are what the model is read from, so the fitted parameters a
+//!   training or AutoML run wrote ([`super::model_from_archive`]) serve the model that was
+//!   trained however the deployment declared where it is;
 //! * a model that carries no artifact of its own but names a MODEL PACKAGE is served from the
-//!   artifact that package's inference specification names ([`model_package_artifact_url`]), so
+//!   artifact that package's inference specification names ([`model_package_model_data`]), so
 //!   a model deployed out of the registry serves what the registered package carries;
 //! * an artifact holding a SERIALIZED GRADIENT-BOOSTED model instead — what SageMaker's own
 //!   boosting algorithm and the framework containers that wrap it upload — is read for the
@@ -66,7 +69,7 @@
 
 use super::*;
 
-use crate::ops::types::{ContainerDefinition, ModelPackageContainerDefinition};
+use crate::ops::types::{ContainerDefinition, ModelPackageContainerDefinition, S3ModelDataSource};
 
 /// The most entries of a model archive that are examined for a serialized model: a container's
 /// artifact carries its model file beside what else it needs (the feature names, the
@@ -152,6 +155,97 @@ pub const CONTAINER_UNSUPPORTED_MEDIA_TYPE_STATUS: i32 = 415;
 /// container made points the caller at: one group per endpoint, under this prefix.
 pub const ENDPOINT_LOG_GROUP_PREFIX: &str = "/aws/sagemaker/Endpoints";
 
+/// `S3ModelDataSource$S3DataType` = `S3Prefix` (a member of the modelled enum,
+/// `S3_MODEL_DATA_TYPE_VALUES`): "`S3Uri` identifies a key name prefix. SageMaker uses all
+/// objects that match the specified key name prefix as part of the ML model data to deploy."
+pub const S3_PREFIX_MODEL_DATA_TYPE: &str = "S3Prefix";
+
+/// `S3ModelDataSource$CompressionType` = `Gzip` (a member of the modelled enum,
+/// `MODEL_COMPRESSION_TYPE_VALUES`): "If you choose `Gzip` and choose `S3Object` as the value of
+/// `S3DataType`, `S3Uri` identifies an object that is a gzip-compressed TAR archive. SageMaker
+/// will attempt to decompress and untar the object during model deployment."
+pub const GZIP_MODEL_COMPRESSION_TYPE: &str = "Gzip";
+
+/// The most objects of one model data PREFIX that are downloaded, which is the same ceiling the
+/// entries of one model ARCHIVE are walked against ([`MAX_ARTIFACT_ENTRIES`]): the location is a
+/// caller's own, so the number of files the model directory is filled from is bounded whichever
+/// form the model data takes.
+pub const MAX_MODEL_DATA_OBJECTS: usize = MAX_ARTIFACT_ENTRIES;
+
+/// How the model data a container declares is PREPARED, which decides how the files of the model
+/// directory a prediction is computed from are laid out
+/// (`S3ModelDataSource$S3DataType`/`$CompressionType`, and `ContainerDefinition$ModelDataUrl`
+/// for a container that names its model data the older way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDataForm {
+    /// ONE object that is a gzip-compressed tar archive, which the deployment "will attempt to
+    /// decompress and untar": the archive's entries are the files of the model directory. What
+    /// `ModelDataUrl` always names ("this path must point to a single gzip compressed tar
+    /// archive") and what a data source naming an object declares with `CompressionType` `Gzip`.
+    CompressedArchive,
+    /// ONE uncompressed object, which "represents an uncompressed ML model to deploy": the
+    /// deployment splits "the key of the S3 object referenced by `S3Uri` by slash (/), and use[s]
+    /// the last part as the filename of the file holding the content of the S3 object".
+    Object,
+    /// A key name PREFIX, under which "all objects represents the uncompressed ML model to
+    /// deploy": for each object the deployment "will trim its key by the prefix, and use the
+    /// remainder as the path (relative to `/opt/ml/model`) of the file holding the content of the
+    /// S3 object".
+    Prefix,
+}
+
+/// WHERE a container holds its model data, and in what form it holds it.
+///
+/// A container names its model data either as `ContainerDefinition$ModelDataUrl` — "the S3 path
+/// where the model artifacts … are stored[;] this path must point to a single gzip compressed tar
+/// archive" — or as `ContainerDefinition$ModelDataSource`, "the location of ML model data to
+/// deploy", whose `S3DataSource` states both the path and how the data is prepared. Both are a
+/// location a deployment DOWNLOADS and lays out under the model directory the inference code
+/// reads, so both are read here and the form travels with the URI: the files the model directory
+/// holds are what a prediction is computed from, and which files those are depends on the form.
+#[derive(Debug, Clone)]
+pub struct ModelDataLocation {
+    /// The Amazon S3 path, as the container named it.
+    pub uri: String,
+    /// How the data at that path is prepared.
+    pub form: ModelDataForm,
+}
+
+impl ModelDataLocation {
+    /// The model data `ModelDataUrl` names: one gzip-compressed tar archive, which is the only
+    /// form that member takes ("this path must point to a single gzip compressed tar archive
+    /// (.tar.gz suffix)").
+    #[must_use]
+    pub fn archive(uri: String) -> Self {
+        Self {
+            uri,
+            form: ModelDataForm::CompressedArchive,
+        }
+    }
+
+    /// The model data a `ModelDataSource`'s `S3DataSource` names, in the form its own
+    /// `S3DataType` and `CompressionType` declare: a key name prefix, one gzip-compressed tar
+    /// archive, or one uncompressed object.
+    ///
+    /// A source may also carry `ManifestS3Uri`, "the Amazon S3 URI of the manifest file … that
+    /// stores the artifact locations", beside the path; the path itself is what the model data is
+    /// read from here either way.
+    #[must_use]
+    pub fn of_source(source: &S3ModelDataSource) -> Self {
+        let form = if source.s3_data_type == S3_PREFIX_MODEL_DATA_TYPE {
+            ModelDataForm::Prefix
+        } else if source.compression_type == GZIP_MODEL_COMPRESSION_TYPE {
+            ModelDataForm::CompressedArchive
+        } else {
+            ModelDataForm::Object
+        };
+        Self {
+            uri: source.s3_uri.clone(),
+            form,
+        }
+    }
+}
+
 /// What serves an invocation behind one of an endpoint's production variants.
 #[derive(Debug, Clone)]
 pub struct ServingVariant {
@@ -159,8 +253,9 @@ pub struct ServingVariant {
     pub variant_name: String,
     /// `ProductionVariant$ModelName`: the model deployed behind the variant.
     pub model_name: String,
-    /// The model's primary container's `ModelDataUrl`, when it names one.
-    pub model_data_url: Option<String>,
+    /// Where the model behind the variant holds its model data, when one of its containers names
+    /// a location at all ([`served_model_data`]).
+    pub model_data: Option<ModelDataLocation>,
     /// The entry point the model's container runs the artifact's own inference code by
     /// ([`super::model_inference_program`]), when the container names one.
     pub inference_program: Option<String>,
@@ -387,7 +482,7 @@ pub fn endpoint_serving_variants(
             let deployed = store.models.get(&model_name);
             Some(ServingVariant {
                 variant_name: variant.variant_name.clone(),
-                model_data_url: deployed.and_then(|model| served_artifact_url(store, model)),
+                model_data: deployed.and_then(|model| served_model_data(store, model)),
                 inference_program: deployed
                     .and_then(|model| served_inference_program(store, model)),
                 model_name,
@@ -431,28 +526,40 @@ pub fn model_data_locations(
         .collect()
 }
 
-/// Where a model's artifacts are: its primary container's `ModelDataUrl`, and otherwise the
-/// first of its inference containers that names one.
+/// Where a model's artifacts are: the model data the first of its containers that names any
+/// declares, the primary container first.
 ///
 /// "PrimaryContainer - The location of the primary docker image containing inference code"
 /// and `Containers` carries the pipeline's containers; either way the artifact a prediction is
-/// computed from is the `ModelDataUrl` the container names.
+/// computed from is the model data that container names ([`container_model_data`]).
 #[must_use]
-pub fn model_artifact_url(model: &Model) -> Option<String> {
+pub fn model_artifact_location(model: &Model) -> Option<ModelDataLocation> {
     let containers = model
         .primary_container
         .iter()
         .chain(model.containers.iter().flatten());
-    containers.filter_map(container_artifact_url).next()
+    containers.filter_map(container_model_data).next()
 }
 
-/// One container's `ModelDataUrl`, when it names one.
-fn container_artifact_url(container: &ContainerDefinition) -> Option<String> {
-    container
+/// The model data one container names: its `ModelDataUrl`, and otherwise the path and form its
+/// `ModelDataSource`'s `S3DataSource` declares. A container that names neither holds no model
+/// data of its own — "which the model's own image may well supply".
+fn container_model_data(container: &ContainerDefinition) -> Option<ModelDataLocation> {
+    if let Some(uri) = container
         .model_data_url
         .as_ref()
         .filter(|uri| !uri.is_empty())
         .cloned()
+    {
+        return Some(ModelDataLocation::archive(uri));
+    }
+    container
+        .model_data_source
+        .as_ref()?
+        .s3_data_source
+        .as_ref()
+        .filter(|source| !source.s3_uri.is_empty())
+        .map(ModelDataLocation::of_source)
 }
 
 /// What serves an invocation of the model a MODEL PACKAGE names, when this account holds that
@@ -480,11 +587,11 @@ pub fn model_package_serving_variant(
     Some(ServingVariant {
         variant_name: package.name.clone(),
         model_name: package.key(),
-        model_data_url: containers
+        model_data: containers
             .iter()
             .copied()
             .flatten()
-            .find_map(package_container_artifact_url),
+            .find_map(package_container_model_data),
         inference_program: containers
             .iter()
             .copied()
@@ -515,14 +622,14 @@ pub fn model_package_serving_variant(
 /// ([`model_package_lookup_key`]), so an ARN and a name resolve to the same package; a package
 /// this account does not hold resolves to nothing, which is not an artifact.
 #[must_use]
-pub fn model_package_artifact_url(
+pub fn model_package_model_data(
     store: &ComAmazonawsSagemakerSagemakerState,
     identifier: &str,
     specification: Option<&str>,
-) -> Option<String> {
+) -> Option<ModelDataLocation> {
     model_package_containers(store, identifier, specification)?
         .iter()
-        .find_map(package_container_artifact_url)
+        .find_map(package_container_model_data)
 }
 
 /// The entry point the container of that same specification runs the artifact's own inference
@@ -585,15 +692,27 @@ fn specification_containers<'package>(
     }
 }
 
-/// One model package container's `ModelDataUrl`, when it names one.
-fn package_container_artifact_url(
+/// The model data one model package container names, read the way a deployed model's container
+/// declares its own ([`container_model_data`]): `ModelDataUrl`, and otherwise the path and form
+/// its `ModelDataSource`'s `S3DataSource` declares.
+fn package_container_model_data(
     container: &ModelPackageContainerDefinition,
-) -> Option<String> {
-    container
+) -> Option<ModelDataLocation> {
+    if let Some(uri) = container
         .model_data_url
         .as_ref()
         .filter(|uri| !uri.is_empty())
         .cloned()
+    {
+        return Some(ModelDataLocation::archive(uri));
+    }
+    container
+        .model_data_source
+        .as_ref()?
+        .s3_data_source
+        .as_ref()
+        .filter(|source| !source.s3_uri.is_empty())
+        .map(ModelDataLocation::of_source)
 }
 
 /// One model package container's `SAGEMAKER_PROGRAM`, when its environment declares one.
@@ -608,24 +727,24 @@ fn package_container_program(container: &ModelPackageContainerDefinition) -> Opt
         .map(str::to_string)
 }
 
-/// Where the artifacts of the DEPLOYED model `model` are: its own container's `ModelDataUrl`,
-/// and otherwise the artifact of the model package one of its containers names
-/// ([`model_package_artifact_url`]) — which is how a model deployed out of the registry names
-/// the artifact it serves.
+/// Where the artifacts of the DEPLOYED model `model` are: the model data its own container names
+/// ([`model_artifact_location`]), and otherwise the model data of the model package one of its
+/// containers names ([`model_package_model_data`]) — which is how a model deployed out of the
+/// registry names the artifact it serves.
 #[must_use]
-pub fn served_artifact_url(
+pub fn served_model_data(
     store: &ComAmazonawsSagemakerSagemakerState,
     model: &Model,
-) -> Option<String> {
-    if let Some(uri) = model_artifact_url(model) {
-        return Some(uri);
+) -> Option<ModelDataLocation> {
+    if let Some(location) = model_artifact_location(model) {
+        return Some(location);
     }
     model
         .primary_container
         .iter()
         .chain(model.containers.iter().flatten())
         .find_map(|container| {
-            model_package_artifact_url(
+            model_package_model_data(
                 store,
                 container.model_package_name.as_deref()?,
                 container.inference_specification_name.as_deref(),
@@ -751,7 +870,13 @@ impl ServedArtifact {
     }
 }
 
-/// Load what serves `variant`, reading its artifact out of this emulator's own Amazon S3.
+/// Load what serves `variant`, reading its model data out of this emulator's own Amazon S3.
+///
+/// The model data is read in the form the variant's container DECLARED it in
+/// ([`ModelDataForm`]), because that is what decides which files the model directory a prediction
+/// is computed from holds: one gzip-compressed tar archive is decompressed and untarred, one
+/// uncompressed object is the single file its key's last part names, and a key name prefix is
+/// every object under it, each under the remainder of its key.
 ///
 /// `None` is a fault of this process rather than of the request — the decode could not be
 /// performed at all — which a handler answers as such; every answer ABOUT the artifact is a
@@ -761,35 +886,129 @@ pub async fn load_served_artifact(
     region: &str,
     variant: &ServingVariant,
 ) -> Option<Result<ServedArtifact, ServingRefusal>> {
-    let Some(uri) = variant.model_data_url.as_deref() else {
+    let Some(model_data) = variant.model_data.as_ref() else {
         return Some(Err(ServingRefusal::NoModelArtifact {
             model_name: variant.model_name.clone(),
         }));
     };
-    let Some(location) = S3Location::parse(uri) else {
+    let Some(location) = S3Location::parse(&model_data.uri) else {
         return Some(Err(ServingRefusal::ArtifactUnreadable {
-            uri: uri.to_string(),
+            uri: model_data.uri.clone(),
         }));
     };
     let client = s3_client(ctx, region);
-    let Ok(bytes) = read_object(&client, &location, MAX_OBJECT_BYTES).await else {
-        return Some(Err(ServingRefusal::ArtifactUnreadable {
-            uri: location.uri(),
-        }));
+    let program = variant.inference_program.clone();
+    // Each form names what has to be DOWNLOADED: one object for the two forms that name an
+    // object, and the objects the listing answers for the one that names a prefix.
+    let read = match model_data.form {
+        ModelDataForm::Prefix => match prefix_model_data_entries(&client, &location).await {
+            Ok(entries) => ReadModelData::Files(entries),
+            Err(refusal) => return Some(Err(refusal)),
+        },
+        form => {
+            let Ok(bytes) = read_object(&client, &location, MAX_OBJECT_BYTES).await else {
+                return Some(Err(ServingRefusal::ArtifactUnreadable {
+                    uri: location.uri(),
+                }));
+            };
+            if form == ModelDataForm::CompressedArchive {
+                // The archive's own entries are the files of the model directory, read out of
+                // these bytes by the decode below.
+                ReadModelData::Archive(bytes)
+            } else {
+                // "SageMaker will split the key of the S3 object referenced by S3Uri by slash
+                // (/), and use the last part as the filename of the file holding the content of
+                // the S3 object" — the same reading of a key under the location that named it
+                // that every other placement of an object into a container's storage takes.
+                ReadModelData::Files(
+                    object_name_under(&location.key, &location.key)
+                        .map(|name| vec![(name, bytes)])
+                        .unwrap_or_default(),
+                )
+            }
+        }
     };
-    // Decoding an artifact is synchronous, CPU-bound work over a caller's own object, so it
+    // Decoding model data is synchronous, CPU-bound work over a caller's own objects, so it
     // goes to the blocking pool and the worker serving this request is released while it runs —
     // the same seam a training run's fit uses. The work itself is bounded (see
-    // [`MAX_ARTIFACT_ENTRIES`] and the ceilings in [`super::boosted_model`] and
-    // [`super::binary_json`]), so the pool is never occupied for long.
-    let program = variant.inference_program.clone();
-    let decoded =
-        ::tokio::task::spawn_blocking(move || artifact_from_bytes(&bytes, program.as_deref()))
-            .await
-            .ok()?;
+    // [`MAX_ARTIFACT_ENTRIES`], [`MAX_MODEL_DATA_OBJECTS`] and the ceilings in
+    // [`super::boosted_model`] and [`super::binary_json`]), so the pool is never occupied for
+    // long.
+    let decoded = ::tokio::task::spawn_blocking(move || match read {
+        ReadModelData::Archive(bytes) => artifact_from_bytes(&bytes, program.as_deref()),
+        ReadModelData::Files(files) => artifact_from_entries(&files, program.as_deref()),
+    })
+    .await
+    .ok()?;
     Some(decoded.ok_or(ServingRefusal::ArtifactNotServable {
         uri: location.uri(),
     }))
+}
+
+/// What one form's download hands the decode: the bytes of ONE gzip-compressed tar archive, whose
+/// own entries are the files of the model directory, or those files as the form laid them out.
+enum ReadModelData {
+    Archive(Vec<u8>),
+    Files(Vec<(String, Vec<u8>)>),
+}
+
+/// The files of the model directory a model data PREFIX fills it with: every object Amazon S3
+/// lists under the prefix, each under the remainder of its key ([`object_name_under`]).
+///
+/// Bounded as explicitly as every other read of a caller's own objects: at most
+/// [`MAX_MODEL_DATA_OBJECTS`] objects, [`MAX_OBJECT_BYTES`] per object and
+/// [`MAX_MODEL_DIRECTORY_BYTES`] over the whole directory. A key ending in the delimiter is a
+/// folder marker rather than a file of the model.
+///
+/// `Err` is the condition that stopped the load: a prefix the listing answered nothing for holds
+/// no model data at all, and an object that could not be read leaves the model directory short of
+/// a file the inference code may need, which is not a model to compute from either.
+async fn prefix_model_data_entries(
+    client: &::aws_sdk_s3::Client,
+    prefix: &S3Location,
+) -> Result<Vec<(String, Vec<u8>)>, ServingRefusal> {
+    let unreadable = || ServingRefusal::ArtifactUnreadable { uri: prefix.uri() };
+    let listed = client
+        .list_objects_v2()
+        .bucket(&prefix.bucket)
+        .prefix(&prefix.key)
+        .max_keys(i32::try_from(MAX_MODEL_DATA_OBJECTS).unwrap_or(i32::MAX))
+        .send()
+        .await
+        .map_err(|_| unreadable())?;
+    let keys: Vec<String> = listed
+        .contents()
+        .iter()
+        .filter_map(|object| object.key().map(str::to_string))
+        .filter(|key| !key.ends_with('/'))
+        .take(MAX_MODEL_DATA_OBJECTS)
+        .collect();
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut remaining = MAX_MODEL_DIRECTORY_BYTES;
+    for key in keys {
+        let object = S3Location {
+            bucket: prefix.bucket.clone(),
+            key,
+        };
+        let Some(name) = object_name_under(&prefix.key, &object.key) else {
+            continue;
+        };
+        let ceiling = MAX_OBJECT_BYTES.min(remaining);
+        if ceiling == 0 {
+            break;
+        }
+        let bytes = read_object(client, &object, ceiling).await.map_err(|_| {
+            ServingRefusal::ArtifactUnreadable {
+                uri: object.uri(),
+            }
+        })?;
+        remaining = remaining.saturating_sub(bytes.len());
+        entries.push((name, bytes));
+    }
+    if entries.is_empty() {
+        return Err(unreadable());
+    }
+    Ok(entries)
 }
 
 /// [`serve_artifact`] on the blocking pool: serving a payload is synchronous, CPU-bound work —
@@ -847,58 +1066,95 @@ pub fn serve_artifact(
 /// `program` is the entry point the model's container names for the code it runs
 /// ([`model_inference_program`]).
 ///
-/// The PARAMETERS are read first: where the artifact carries the model itself, those parameters
-/// ARE the model — the handler script's own `model_fn` would load the very same file out of the
-/// same artifact — so the inference is computed from the model that was deployed either way, by
-/// this service, record by record, the same way for every surface that applies a deployed model
-/// ([`model_from_artifact`]). An artifact carrying no parameters this service can read carries its
-/// model as CODE, and that code is what computes the inference
-/// ([`super::inference_script`]).
+/// The bytes are one gzip-compressed tar archive, so the files of the model directory are its
+/// entries ([`archive_entries_named`]) and what they carry is read the one way every form of
+/// model data is read ([`artifact_from_entries`]). Bytes that are no such archive carry no
+/// entries, and are read as the model FILE itself ([`model_in_bytes`]) — which is what an
+/// artifact that is a serialized model rather than an archive of files holds.
 #[must_use]
 pub fn artifact_from_bytes(bytes: &[u8], program: Option<&str>) -> Option<ServedArtifact> {
-    if let Some(model) = model_from_artifact(bytes) {
+    if let Some(artifact) = artifact_from_entries(&archive_entries_named(bytes), program) {
+        return Some(artifact);
+    }
+    model_in_bytes(bytes).map(ServedArtifact::Model)
+}
+
+/// What the files of a model directory carry, and `None` for model data holding neither a
+/// model's parameters nor its inference code.
+///
+/// `entries` are those files as `(path under the model directory, contents)`, however the model
+/// data they came from was prepared: the entries of an archive, the objects of a prefix, or the
+/// single file an uncompressed object is.
+///
+/// The PARAMETERS are read first: where the model data carries the model itself, those parameters
+/// ARE the model — the handler script's own `model_fn` would load the very same file out of the
+/// same model directory — so the inference is computed from the model that was deployed either
+/// way, by this service, record by record, the same way for every surface that applies a deployed
+/// model ([`model_from_entries`]). Model data carrying no parameters this service can read carries
+/// its model as CODE, and that code is what computes the inference
+/// ([`super::inference_script_in`]).
+#[must_use]
+pub fn artifact_from_entries(
+    entries: &[(String, Vec<u8>)],
+    program: Option<&str>,
+) -> Option<ServedArtifact> {
+    if let Some(model) = model_from_entries(entries) {
         return Some(ServedArtifact::Model(model));
     }
-    super::inference_script_in(&archive_entries_named(bytes), program).map(ServedArtifact::Script)
+    super::inference_script_in(entries, program).map(ServedArtifact::Script)
 }
 
 /// The model the artifact `bytes` carry, and `None` for an artifact holding none.
 ///
-/// The one reading of a deployed artifact, so every caller of a model's artifact — an
+/// The one reading of a deployed artifact's bytes, so every caller of a model's artifact — an
 /// invocation, and any other work that applies a deployed model to records — takes the same
-/// parameters out of the same bytes:
-///
-/// * the model a training or AutoML run of this emulator wrote, read back out of the archive it
-///   wrote it into;
-/// * otherwise, a serialized gradient-boosted model, looked for in each entry of the archive —
-///   a container's artifact carries its model file beside whatever else it needs — and then in
-///   the bytes themselves, for an artifact that is the model file alone.
+/// parameters out of the same bytes: the files the archive holds, read as the model directory's
+/// ([`model_from_entries`]), and otherwise the bytes themselves, for an artifact that is the
+/// model file alone.
 #[must_use]
 pub fn model_from_artifact(bytes: &[u8]) -> Option<ServedModel> {
-    if let Some(fitted) = model_from_archive(bytes) {
-        return Some(ServedModel::Fitted(fitted));
+    if let Some(model) = model_from_entries(&archive_entries_named(bytes)) {
+        return Some(model);
     }
-    if let Some(boosted) = archive_entries(bytes)
-        .into_iter()
-        .find_map(|entry| boosted_model_from_bytes(&entry))
-    {
-        return Some(ServedModel::Boosted(boosted));
-    }
-    boosted_model_from_bytes(bytes).map(ServedModel::Boosted)
+    model_in_bytes(bytes)
 }
 
-/// The bytes of each entry a compressed archive holds, bounded by [`MAX_ARTIFACT_ENTRIES`]
-/// entries and by [`super::MAX_INFLATED_ARCHIVE_BYTES`] over the whole inflated stream — the
-/// archive is a caller's own object, so the decompressed side is bounded as explicitly as the
-/// download was.
+/// The model the files of a model directory carry, and `None` for files holding none:
 ///
-/// Empty for bytes that are not such an archive, which is not an error here: an artifact may be
-/// the model file itself.
-fn archive_entries(bytes: &[u8]) -> Vec<Vec<u8>> {
-    archive_entries_named(bytes)
-        .into_iter()
-        .map(|(_, body)| body)
-        .collect()
+/// * the model a training or AutoML run of this emulator wrote, read back out of the file it
+///   wrote it into;
+/// * otherwise, a serialized gradient-boosted model, looked for in each file — a container's
+///   model data carries its model file beside whatever else it needs.
+///
+/// Every file is examined rather than one name assumed, for the reason
+/// [`super::model_from_archive`] gives: the file an algorithm's container writes its model as is
+/// the ALGORITHM's, so the model is found by what the file CARRIES and not by what it is called.
+#[must_use]
+pub fn model_from_entries(entries: &[(String, Vec<u8>)]) -> Option<ServedModel> {
+    // A fitted model answers before a boosted one wherever both readings are tried, so the whole
+    // set of files is asked for parameters this emulator's own runs wrote before any of them is
+    // read as a serialized booster.
+    if let Some(fitted) = entries
+        .iter()
+        .find_map(|(_, body)| super::fitted_model_from_bytes(body))
+    {
+        return Some(ServedModel::Fitted(fitted));
+    }
+    entries
+        .iter()
+        .find_map(|(_, body)| boosted_model_from_bytes(body))
+        .map(ServedModel::Boosted)
+}
+
+/// The model the bytes of ONE file carry: the parameters a run of this emulator fitted and wrote
+/// ([`super::fitted_model_from_bytes`]), and otherwise a serialized gradient-boosted model
+/// ([`super::boosted_model_from_bytes`]).
+#[must_use]
+fn model_in_bytes(bytes: &[u8]) -> Option<ServedModel> {
+    if let Some(fitted) = super::fitted_model_from_bytes(bytes) {
+        return Some(ServedModel::Fitted(fitted));
+    }
+    boosted_model_from_bytes(bytes).map(ServedModel::Boosted)
 }
 
 /// [`archive_entries`] with each entry's own PATH inside the archive, which is what decides

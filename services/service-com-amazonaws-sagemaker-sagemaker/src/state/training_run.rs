@@ -1536,6 +1536,24 @@ pub fn model_from_archive(bytes: &[u8]) -> Option<LinearModel> {
     None
 }
 
+/// The fitted model the bytes of ONE file carry, and `None` for bytes that carry none.
+///
+/// The same reading [`model_from_archive`] applies to an archive's entries, over a file the
+/// caller handed this service directly: a model directory's files are not always an archive's
+/// entries — model data a container declares as an uncompressed object, or as the objects under a
+/// key name prefix, is read file by file ([`super::model_from_entries`]) — so the reading of ONE
+/// file lives here, beside the fit that wrote it.
+#[must_use]
+pub fn fitted_model_from_bytes(bytes: &[u8]) -> Option<LinearModel> {
+    use ::std::io::Read;
+
+    // Bounded like every other read of a caller's own bytes: the parse is fed at most the budget
+    // the inflated side of an archive is bounded to.
+    let document: ::serde_json::Value =
+        ::serde_json::from_reader(bytes.take(MAX_INFLATED_ARCHIVE_BYTES)).ok()?;
+    fitted_model_in(document)
+}
+
 /// The fitted model `document` carries, and `None` for a document that carries none.
 fn fitted_model_in(document: ::serde_json::Value) -> Option<LinearModel> {
     let model = document.get("model")?;

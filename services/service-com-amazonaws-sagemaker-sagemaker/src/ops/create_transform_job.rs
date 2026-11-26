@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // released before the question below is put to another service: a transform job's
         // name, the store's bound, and the model the job would run — whose execution role is
         // what the input location is then settled against, and whose artifact the run applies.
-        let (execution_role_arn, model_data_url, inference_program) = {
+        let (execution_role_arn, model_data, inference_program) = {
             let store = state.lock();
             // A name already taken is refused before the quota is consulted: the request
             // adds no record, so "the store is full" is not why it fails.
@@ -291,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             (
                 model.execution_role_arn.clone(),
-                crate::state::served_artifact_url(&store, model),
+                crate::state::served_model_data(&store, model),
                 crate::state::served_inference_program(&store, model),
             )
         };
@@ -349,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::TransformTarget {
                 model_name: input.model_name.clone(),
                 role_arn: execution_role_arn.clone(),
-                model_data_url,
+                model_data,
                 inference_program,
                 input_uri: input_uri.clone(),
                 input_data_type: input

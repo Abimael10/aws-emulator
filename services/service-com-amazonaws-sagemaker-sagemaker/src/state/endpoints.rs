@@ -298,7 +298,7 @@ pub struct DeployedArtifact {
 /// ([`model_data_locations`]), bounded by [`MAX_DEPLOYMENT_ARTIFACTS`].
 ///
 /// A model deployed out of the REGISTRY carries no model data of its own: its artifact is
-/// where the model package's inference specification names it ([`served_artifact_url`]), which
+/// where the model package's inference specification names it ([`served_model_data`]), which
 /// is the location such a deployment downloads, so that is what is resolved for it.
 ///
 /// A variant naming no model, a model this account does not hold and a model whose containers
@@ -318,7 +318,7 @@ pub fn deployed_model_artifacts<'variants>(
             let mut locations =
                 model_data_locations(model.primary_container.as_ref(), model.containers.as_deref());
             if locations.is_empty() {
-                locations.extend(served_artifact_url(store, model));
+                locations.extend(served_model_data(store, model).map(|data| data.uri));
             }
             locations.into_iter().map(move |uri| DeployedArtifact {
                 model_name: model.name.clone(),

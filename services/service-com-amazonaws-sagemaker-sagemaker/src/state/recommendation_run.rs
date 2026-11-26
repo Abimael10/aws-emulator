@@ -293,7 +293,7 @@ fn model_serving_variant(
     Some(ServingVariant {
         variant_name: model.name.clone(),
         model_name: model.name.clone(),
-        model_data_url: served_artifact_url(store, model),
+        model_data: served_model_data(store, model),
         inference_program: served_inference_program(store, model),
     })
 }

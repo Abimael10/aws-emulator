@@ -137,8 +137,9 @@ pub struct TransformTarget {
     pub model_name: String,
     /// The model's `ExecutionRoleArn`, when it names one.
     pub role_arn: Option<String>,
-    /// The model's `ModelDataUrl`, when one of its containers names one.
-    pub model_data_url: Option<String>,
+    /// Where the model holds its model data, when one of its containers names a location
+    /// (`ModelDataUrl` or `ModelDataSource`).
+    pub model_data: Option<ModelDataLocation>,
     /// The entry point the model's container runs the artifact's own inference code by
     /// (`SAGEMAKER_PROGRAM`), when the container names one.
     pub inference_program: Option<String>,
@@ -286,7 +287,7 @@ async fn load_transform_model(
     let variant = ServingVariant {
         variant_name: target.model_name.clone(),
         model_name: target.model_name.clone(),
-        model_data_url: target.model_data_url.clone(),
+        model_data: target.model_data.clone(),
         inference_program: target.inference_program.clone(),
     };
     match load_served_artifact(ctx, region, &variant).await {
