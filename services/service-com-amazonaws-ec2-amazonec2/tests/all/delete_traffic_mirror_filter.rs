@@ -196,7 +196,7 @@ fn seed_session(
     engine
         .state::<Ec2State>()
         .lock()
-        .insert_traffic_mirror_session(session)
+        .insert_traffic_mirror_session(session, None)
         .unwrap_or_else(|| panic!("case {case:?}: the store must have room for a seeded session"))
 }
 

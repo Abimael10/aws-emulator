@@ -460,7 +460,7 @@ async fn a_traffic_mirror_filter_a_session_mirrors_by_is_not_deleted() {
             let seeded = engine
                 .state::<Ec2State>()
                 .lock()
-                .insert_traffic_mirror_session(session)
+                .insert_traffic_mirror_session(session, None)
                 .unwrap_or_else(|| {
                     panic!("case {case:?}: the store must have room for a seeded session")
                 });

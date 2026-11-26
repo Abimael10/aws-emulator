@@ -1110,15 +1110,10 @@ pub fn route_server_peer_liveness<E>(
 /// the session ([`AMAZON_SIDE_ASN_RANGE`], `CreateRouteServerRequest$AmazonSideAsn`) and for
 /// the appliance's side (`RouteServerBgpOptionsRequest$PeerAsn`), so the peer's side is held
 /// to that same one pair of published bounds and `member` only names which one the message
-/// is about.
+/// is about. The bounds are checked and the refusal worded by the crate's one reading of a
+/// hand-enforced published range ([`require_within_published_range`]).
 pub fn require_route_server_asn<E>(asn: i64, member: &str) -> Result<i64, Scaffolded<E>> {
-    let (min, max) = AMAZON_SIDE_ASN_RANGE;
-    if (min..=max).contains(&asn) {
-        return Ok(asn);
-    }
-    Err(invalid_parameter_value(format!(
-        "Value ({asn}) for parameter {member} is invalid. Valid values are from {min} to {max}."
-    )))
+    require_within_published_range(asn, AMAZON_SIDE_ASN_RANGE, member)
 }
 
 impl ComAmazonawsEc2Amazonec2State {

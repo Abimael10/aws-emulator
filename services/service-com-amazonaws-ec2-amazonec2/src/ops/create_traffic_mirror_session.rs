@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficMirrorSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficMirrorSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficMirrorSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +160,302 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficMirrorSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficMirrorSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficMirrorSession"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            idempotent_parameter_mismatch, invalid_network_interface_id_malformed,
+            invalid_network_interface_id_not_found, invalid_traffic_mirror_filter_id_not_found,
+            invalid_traffic_mirror_target_id_not_found, network_interface_id_is_well_formed,
+            require_service_state, require_traffic_mirror_packet_length,
+            require_traffic_mirror_session_number, require_traffic_mirror_virtual_network_id,
+            tags_from_specifications, traffic_mirror_session_limit_exceeded,
+            TrafficMirrorSessionRoom, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+            NETWORK_LOAD_BALANCER_DEFAULT_PACKET_LENGTH,
+            TRAFFIC_MIRROR_SESSION_TAGGABLE_RESOURCE,
+            TRAFFIC_MIRROR_TARGET_TYPE_NETWORK_LOAD_BALANCER,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the modelled
+        // `TrafficMirrorSession` names no Region and no ARN of its own. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // The bounded integers first, each held to the range its member publishes, before the
+        // store is asked anything: `SessionNumber` and `PacketLength` target a plain
+        // `Integer`, so the model refuses nothing on its own, and `VirtualNetworkId` names a
+        // VXLAN network identifier, which a VXLAN header carries in 24 bits.
+        let session_number = require_traffic_mirror_session_number(input.session_number)?;
+        let requested_packet_length = input
+            .packet_length
+            .map(require_traffic_mirror_packet_length)
+            .transpose()?;
+        let requested_virtual_network_id = input
+            .virtual_network_id
+            .map(require_traffic_mirror_virtual_network_id)
+            .transpose()?;
+
+        // What the source interface's id has to look like before the store is asked whether
+        // it names one: the id form this crate reads a `NetworkInterfaceId` in everywhere.
+        if !network_interface_id_is_well_formed(&input.network_interface_id) {
+            return Err(invalid_network_interface_id_malformed(
+                &input.network_interface_id,
+            ));
+        }
+
+        // "The tags to assign to a Traffic Mirror session"
+        // (`CreateTrafficMirrorSessionRequest$TagSpecifications`): the session is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded. The tag payload's own bounds are the
+        // ones every create in this crate holds its tags to, so they are applied by the one
+        // shared reader.
+        let tags: Vec<Tag> = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            TRAFFIC_MIRROR_SESSION_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "A Traffic Mirror session actively copies packets from a Traffic Mirror source to a
+        // Traffic Mirror target" and "Create a filter, and then assign it to the session"
+        // (`CreateTrafficMirrorSession`): all three resources the session mirrors between
+        // have to be ones this account holds, each refused with the code its own id is
+        // resolved under, or the session would mirror from or to something that is not there.
+        if !store
+            .network_interfaces
+            .contains_key(&input.network_interface_id)
+        {
+            return Err(invalid_network_interface_id_not_found(
+                &input.network_interface_id,
+            ));
+        }
+        if !store
+            .traffic_mirror_filters
+            .contains_key(&input.traffic_mirror_filter_id)
+        {
+            return Err(invalid_traffic_mirror_filter_id_not_found(
+                &input.traffic_mirror_filter_id,
+            ));
+        }
+        let Some(target) = store
+            .traffic_mirror_targets
+            .get(&input.traffic_mirror_target_id)
+        else {
+            return Err(invalid_traffic_mirror_target_id_not_found(
+                &input.traffic_mirror_target_id,
+            ));
+        };
+
+        // "For sessions with Network Load Balancer (NLB) Traffic Mirror targets the default
+        // PacketLength will be set to 8500"
+        // (`CreateTrafficMirrorSessionRequest$PacketLength`): what the session mirrors TO is
+        // what decides the default, so it is read off the target the request named. For every
+        // other target a request that names no length mirrors the whole packet — "Do not
+        // specify this parameter when you want to mirror the entire packet" — which is a
+        // session carrying no `PacketLength` at all.
+        let packet_length = match requested_packet_length {
+            Some(packet_length) => Some(packet_length),
+            None if target.r#type.as_deref()
+                == Some(TRAFFIC_MIRROR_TARGET_TYPE_NETWORK_LOAD_BALANCER) =>
+            {
+                Some(NETWORK_LOAD_BALANCER_DEFAULT_PACKET_LENGTH)
+            }
+            None => None,
+        };
+
+        // The record this call would store. Everything a REQUEST decides is on it; the id is
+        // minted by the store at the insert, and the `VirtualNetworkId` is left as the
+        // request named it, so a replay of that request compares against what it asked for
+        // rather than against the identifier the service chose for it.
+        let requested = TrafficMirrorSession {
+            // Minted by the store at the insert, so an id is never chosen twice.
+            traffic_mirror_session_id: None,
+            traffic_mirror_target_id: Some(input.traffic_mirror_target_id.clone()),
+            traffic_mirror_filter_id: Some(input.traffic_mirror_filter_id.clone()),
+            network_interface_id: Some(input.network_interface_id.clone()),
+            // "The ID of the account that owns the Traffic Mirror session"
+            // (`TrafficMirrorSession$OwnerId`) — this emulator's one account.
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            packet_length,
+            session_number: Some(session_number),
+            virtual_network_id: requested_virtual_network_id,
+            description: input.description.clone(),
+            tags: Some(tags),
+        };
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`CreateTrafficMirrorSessionRequest$ClientToken`) — one
+        // token names the one session it created, so a replay reports that session and
+        // creates nothing. Read here, answered below the DryRun check, because a replay
+        // stores nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .traffic_mirror_session_client_tokens
+                    .get(token)
+                    .cloned()
+            })
+            // A token whose session the store no longer holds names no session at all — a
+            // delete takes the token out with the record — so a create carrying it is a fresh
+            // create rather than a replay or a mismatch.
+            .filter(|traffic_mirror_session_id| {
+                store
+                    .traffic_mirror_sessions
+                    .contains_key(traffic_mirror_session_id)
+            });
+
+        // A token names ONE request, not merely one session: a repeat of it describing a
+        // different session is not that request, which is EC2's
+        // `IdempotentParameterMismatch` (the code and the fixed sentence
+        // `crate::state::idempotent_parameter_mismatch` holds for the whole error class).
+        // Asked before the ceilings and before DryRun, the way every other refusal of this
+        // operation is.
+        if let Some(traffic_mirror_session_id) = replayed.as_deref() {
+            if !store
+                .traffic_mirror_sessions
+                .get(traffic_mirror_session_id)
+                .is_some_and(|stored| describes_the_same_session(stored, &requested))
+            {
+                return Err(idempotent_parameter_mismatch());
+            }
+        }
+
+        // A count ceiling first, then the byte budget, both asked through the store's ONE
+        // definition of "has room" — which says WHICH bound refused, so each refusal is
+        // worded for the bound that gave it. A record count on its own admits gigabytes,
+        // because each record holds strings the caller chose the length of.
+        if replayed.is_none() {
+            match store.traffic_mirror_session_room(&requested, input.client_token.as_deref()) {
+                TrafficMirrorSessionRoom::Available => {}
+                TrafficMirrorSessionRoom::AtCeiling => return Err(at_session_ceiling()),
+                TrafficMirrorSessionRoom::OverByteBudget { requested, held } => {
+                    return Err(traffic_mirror_session_limit_exceeded(format!(
+                        "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                         caller-supplied data, so it cannot store {requested} more"
+                    )))
+                }
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named resource
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD have
+        // worked, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let traffic_mirror_session_id = match replayed {
+            Some(traffic_mirror_session_id) => traffic_mirror_session_id,
+            None => {
+                // "If you do not specify a VirtualNetworkId, an account-wide unique ID is
+                // chosen" (`CreateTrafficMirrorSessionRequest$VirtualNetworkId`): the session
+                // the store keeps carries an identifier either way, so a request that named
+                // none is given one no other session of the account uses.
+                let mut session = requested;
+                if session.virtual_network_id.is_none() {
+                    session.virtual_network_id = Some(
+                        store
+                            .mint_traffic_mirror_virtual_network_id()
+                            .ok_or_else(no_virtual_network_id_left)?,
+                    );
+                }
+                store
+                    .insert_traffic_mirror_session(session, input.client_token.as_deref())
+                    .ok_or_else(at_session_ceiling)?
+            }
+        };
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeTrafficMirrorSessions` will see rather than the request object.
+        store
+            .traffic_mirror_sessions
+            .get(&traffic_mirror_session_id)
+            .cloned()
+            .map(|traffic_mirror_session| CreateTrafficMirrorSessionOutput {
+                traffic_mirror_session: Some(traffic_mirror_session),
+                // "Unique, case-sensitive identifier that you provide"
+                // (`CreateTrafficMirrorSessionResult$ClientToken`): the token the REQUEST
+                // carried, echoed, and nothing at all when it carried none.
+                client_token: input.client_token.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Traffic Mirror session '{traffic_mirror_session_id}' \
+                     could not be read back"
+                ))
+            })
     }
+}
+
+/// The refusal a create earns when the store already holds as many Traffic Mirror sessions
+/// as it stores: HTTP 400 `TrafficMirrorSessionLimitExceeded`.
+///
+/// Worded ONCE, so the pre-check that refuses before any write and the insert's own backstop
+/// cannot drift apart.
+fn at_session_ceiling() -> CreateTrafficMirrorSessionError {
+    crate::state::traffic_mirror_session_limit_exceeded(format!(
+        "This emulator holds {max} Traffic Mirror sessions, which is as many as it stores",
+        max = crate::state::MAX_TRAFFIC_MIRROR_SESSIONS,
+    ))
+}
+
+/// The refusal a create earns when every identifier a VXLAN header carries already names a
+/// session of this account, so there is none left to choose for a request that named none.
+///
+/// The store's session ceiling is far below the number of those identifiers, so a create
+/// cannot reach this; it is worded rather than asserted because the mint reports the
+/// exhaustion instead of choosing an identifier a second session already uses.
+fn no_virtual_network_id_left() -> CreateTrafficMirrorSessionError {
+    crate::state::traffic_mirror_session_limit_exceeded(
+        "Every virtual network ID a VXLAN header carries already names a Traffic Mirror \
+         session of this account, so this emulator cannot choose one more",
+    )
+}
+
+/// Does the stored Traffic Mirror session `stored` describe the same session as `requested`,
+/// the record this create would have stored?
+///
+/// Everything a REQUEST decides is compared — the three resources the session mirrors
+/// between, the session number, the packet length, the description and the tags — and
+/// nothing the SERVICE decides, the id being minted at the insert and the owner being this
+/// emulator's one account either way. The `VirtualNetworkId` is compared only when the
+/// REQUEST named one, because a request that names none asks the service to choose, and the
+/// identifier it chose for the first of two identical requests is not something the second
+/// asked to differ in. The tags go through the crate's one comparison of a modelled tag
+/// list, [`crate::state::tag_pairs`], which is sorted because "tag keys must be unique per
+/// resource" makes a tag list a set.
+fn describes_the_same_session(
+    stored: &TrafficMirrorSession,
+    requested: &TrafficMirrorSession,
+) -> bool {
+    use crate::state::tag_pairs;
+
+    fn tags(tags: Option<&[Tag]>) -> Vec<(Option<&str>, Option<&str>)> {
+        tag_pairs(tags.unwrap_or_default())
+    }
+
+    stored.traffic_mirror_target_id == requested.traffic_mirror_target_id
+        && stored.traffic_mirror_filter_id == requested.traffic_mirror_filter_id
+        && stored.network_interface_id == requested.network_interface_id
+        && stored.session_number == requested.session_number
+        && stored.packet_length == requested.packet_length
+        && stored.description == requested.description
+        && requested
+            .virtual_network_id
+            .is_none_or(|virtual_network_id| {
+                stored.virtual_network_id == Some(virtual_network_id)
+            })
+        && tags(stored.tags.as_deref()) == tags(requested.tags.as_deref())
 }

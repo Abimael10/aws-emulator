@@ -62,6 +62,43 @@ pub fn missing_required_parameter_message(member: &str) -> String {
     )
 }
 
+/// How EC2 refuses a member's value outside the inclusive range that member publishes:
+/// HTTP 400 `InvalidParameterValue`, "Value (`<value>`) for parameter `<member>` is
+/// invalid. Valid values are from `<min>` to `<max>`."
+///
+/// The ONE definition of that sentence, so two operations holding different members to their
+/// own published bounds cannot word one refusal differently. Every variable part comes from
+/// the request and from the member's own published bounds, so nothing of one run is written
+/// into the template.
+pub fn value_outside_published_range<E>(
+    value: i64,
+    (min, max): (i64, i64),
+    member: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Value ({value}) for parameter {member} is invalid. Valid values are from {min} to \
+         {max}."
+    ))
+}
+
+/// `value` if the inclusive published bounds `(min, max)` admit it, or the refusal
+/// [`value_outside_published_range`] words for one they do not.
+///
+/// The one reading of a bounded integer this service has to hold by hand, taken over `i64` so
+/// a member published in any narrower integer can be widened into it and answered with its own
+/// bounds.
+pub fn require_within_published_range<E>(
+    value: i64,
+    bounds: (i64, i64),
+    member: &str,
+) -> Result<i64, crate::scaffolded::Scaffolded<E>> {
+    let (min, max) = bounds;
+    if (min..=max).contains(&value) {
+        return Ok(value);
+    }
+    Err(value_outside_published_range(value, bounds, member))
+}
+
 /// How EC2's CORE parameter validator states a parameter the request left out: `The request
 /// must contain the parameter <parameter>`.
 ///

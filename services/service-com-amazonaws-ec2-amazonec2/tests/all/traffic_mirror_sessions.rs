@@ -39,9 +39,11 @@
 //!    naming no session of the account is refused with the same code the delete answers,
 //!    and neither leaves the store changed — nor does a report that succeeded.
 //!
-//! `CreateTrafficMirrorSession` is still a scaffold stub with an issue of its own, so the
-//! sessions here are seeded through the store's own write path
-//! (`insert_traffic_mirror_session`), which is where that create will write them.
+//! The sessions here are seeded through the store's own write path
+//! (`insert_traffic_mirror_session`), which is where `CreateTrafficMirrorSession` writes
+//! them, so what this suite reports, deletes and pages over is what that create stores.
+//! The create's own rules are the subject of
+//! [`super::create_traffic_mirror_session`].
 //!
 //! Each table row is a distinct input along what the rule generalises over — which members
 //! a session carries, how many sessions the store holds, which of them is deleted, and the
@@ -131,7 +133,7 @@ fn seed(engine: &engine::InMemoryEngine, case: &str, row: &SessionRow, n: usize)
     let id = engine
         .state::<Ec2State>()
         .lock()
-        .insert_traffic_mirror_session(session(row, n));
+        .insert_traffic_mirror_session(session(row, n), None);
     let id = id.unwrap_or_else(|| {
         panic!("case {case:?}: the store must have room for the few sessions this suite seeds")
     });
@@ -403,9 +405,9 @@ fn the_session_store_gives_its_byte_charge_back_and_is_bounded() {
         let mut store = store.lock();
         let before = store.stored_bytes();
         let record = session(row, 0);
-        let charge = traffic_mirror_session_payload_bytes(&record);
+        let charge = traffic_mirror_session_payload_bytes(&record, None);
         let id = store
-            .insert_traffic_mirror_session(record)
+            .insert_traffic_mirror_session(record, None)
             .unwrap_or_else(|| panic!("case {case:?}: the store must have room for one session"));
         assert_eq!(
             store.stored_bytes(),
@@ -430,13 +432,13 @@ fn the_session_store_gives_its_byte_charge_back_and_is_bounded() {
     for n in 0..MAX_TRAFFIC_MIRROR_SESSIONS {
         let record = session(&SessionRow::default(), n);
         assert!(
-            store.has_traffic_mirror_session_capacity(&record),
+            store.has_traffic_mirror_session_capacity(&record, None),
             "case \"session {n} of {MAX_TRAFFIC_MIRROR_SESSIONS}\": the store must still have \
              room, it holds {}",
             store.traffic_mirror_sessions.len()
         );
         assert!(
-            store.insert_traffic_mirror_session(record).is_some(),
+            store.insert_traffic_mirror_session(record, None).is_some(),
             "case \"session {n} of {MAX_TRAFFIC_MIRROR_SESSIONS}\": the store must accept a \
              session below its ceiling, it holds {}",
             store.traffic_mirror_sessions.len()
@@ -445,14 +447,14 @@ fn the_session_store_gives_its_byte_charge_back_and_is_bounded() {
 
     let past_the_ceiling = session(&SessionRow::default(), MAX_TRAFFIC_MIRROR_SESSIONS);
     assert!(
-        !store.has_traffic_mirror_session_capacity(&past_the_ceiling),
+        !store.has_traffic_mirror_session_capacity(&past_the_ceiling, None),
         "case \"at the ceiling\": the store must report no room, it holds {} of \
          {MAX_TRAFFIC_MIRROR_SESSIONS}",
         store.traffic_mirror_sessions.len()
     );
     assert!(
         store
-            .insert_traffic_mirror_session(past_the_ceiling.clone())
+            .insert_traffic_mirror_session(past_the_ceiling.clone(), None)
             .is_none(),
         "case \"one past the ceiling\": the store must refuse the session, it holds {}",
         store.traffic_mirror_sessions.len()
@@ -470,7 +472,9 @@ fn the_session_store_gives_its_byte_charge_back_and_is_bounded() {
         "case \"a delete at the ceiling\": the store must remove the session named"
     );
     assert!(
-        store.insert_traffic_mirror_session(past_the_ceiling).is_some(),
+        store
+            .insert_traffic_mirror_session(past_the_ceiling, None)
+            .is_some(),
         "case \"after a delete at the ceiling\": the freed slot must take a session, the store \
          holds {}",
         store.traffic_mirror_sessions.len()
