@@ -207,7 +207,12 @@ const ROWS: &[Row] = &[
 /// One emulator carrying Amazon EC2, Elastic Load Balancing v2, Amazon ECS and CloudWatch — which
 /// owns the metric store both publishers write into — over ONE shared engine, exactly as the
 /// production router builds them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because this is the ONE mounting of those four crates this test crate keeps: a
+/// sibling suite measuring another rule of the same metered topology
+/// ([`crate::alb_fronted_ecs_request_series_at_every_covering_period`]) calls this rather than
+/// keeping a second copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
