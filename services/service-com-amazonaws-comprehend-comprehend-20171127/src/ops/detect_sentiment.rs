@@ -183,29 +183,65 @@ const NEUTRAL_MATERIAL_WEIGHT: f64 = 0.3;
 /// document onto one reported value.
 const SENTIMENT_CONTRAST_EXPONENT: i32 = 6;
 
-/// The confidence an OPEN reading keeps whatever the document says.
+/// The weight of a reading the document leaves OPEN, per WORD of the document that
+/// leaves it open.
 ///
 /// A reading is open when the document could carry it and the engine's lexicon could
-/// have missed the words that show it: `POSITIVE`, `NEGATIVE` and `NEUTRAL` are open
-/// for any document, since a document the engine reads as wholly positive still
-/// leaves a little room for a negative word the lexicon does not hold. This is that
-/// room, so a class the engine found no word for comes back as the negligible
-/// possibility it is rather than as a flat 0.
+/// have missed the words that show it, or read words it holds the other way round:
+/// `POSITIVE`, `NEGATIVE` and `NEUTRAL` are open for any document, since a document
+/// the engine read as wholly positive still leaves room for a negative word the
+/// lexicon does not hold or a negation it mis-scoped. This is the weight of that room,
+/// so a class the engine found no word for comes back as the negligible possibility it
+/// is rather than as a flat 0.
 ///
-/// `MIXED` is NOT such a reading, and keeps no floor: it is the confidence that the
+/// How MUCH room each reading keeps is a function of the DOCUMENT, because the document
+/// is what leaves it, and it is counted in the document's own words
+/// ([`open_reading_words`]): for a signed reading, the words the engine placed no
+/// polarity on — each one a word that could have carried the polarity it missed — as
+/// far as the net polarity it measured admits that direction; for `NEUTRAL`, the words
+/// it DID read as polar, which it could have over-read. So the residual members of two
+/// documents are not one shared literal — which says the same thing about every
+/// document and destroys any ordering between them — and the residual members of one
+/// document are ordered by what that document itself says.
+///
+/// `MIXED` is NOT such a reading, and keeps no room: it is the confidence that the
 /// document carries BOTH polarities at once, which is measured from the two signed
-/// readings rather than read off the document on its own, so a document whose
-/// material carries at most one polarity supports it with nothing at all and it is
-/// reported as the zero it was measured as. The room a missed word leaves is already
-/// what the two signed readings keep below.
+/// readings rather than read off the document on its own, so a document whose material
+/// carries at most one polarity supports it with nothing at all and it is reported as
+/// the zero it was measured as. The room a missed word leaves is already what the two
+/// signed readings keep below.
 ///
-/// It is the FLOOR of a reported confidence and not a share of one, and is applied as
-/// one: an open reading the document carries no evidence for is reported at exactly
-/// this value — not at a value that depends on how many classes there are — and the
-/// room it takes is conceded by the reading the document's own material supports,
-/// which is the only one with anything to concede. A class the document carries any
-/// evidence at all for is reported with that evidence, which is far larger.
-const SENTIMENT_CLASS_PRIOR: f64 = 1e-6;
+/// The room is conceded by the reading the document's own material supports, which is
+/// the only one with anything to concede, so the four still sum to 1. A class the
+/// document carries any evidence at all for is reported with that evidence, which is
+/// far larger. The weight itself is the ONE such constant of this projection, applied
+/// identically to every class of every document, so no request can select it: a
+/// hundred-thousandth of one word's worth, which leaves an open reading orders of
+/// magnitude below any threshold a caller gates a decision on while keeping it above
+/// the flat impossibility it is not.
+const MISSED_READING_WEIGHT: f64 = 1e-5;
+
+/// How many of a document's words can bear on the room one open reading keeps.
+///
+/// The room is a RESIDUAL, so it stays one: a document long enough to hold hundreds of
+/// words the engine placed no polarity on has already said everything it can about a
+/// polarity the lexicon might have missed, and a reading nothing else supports may not
+/// grow into a confidence a caller could act on however long the document runs.
+const MISSED_READING_WORD_CEILING: f64 = 500.0;
+
+/// The words of `text` that leave a reading open, in the document's own words: `share`
+/// of them, plus the one word any document could have hidden a missed reading in, and
+/// no more than [`MISSED_READING_WORD_CEILING`].
+///
+/// The share is the engine's own — the share of the document's weight it read as
+/// carrying no polarity, for a signed reading, or as carrying one, for `NEUTRAL` — so
+/// the count is a property of the submitted document and of nothing else. The plus one
+/// is what keeps every open reading strictly above 0 for a document the engine read at
+/// all, however short it is.
+fn open_reading_words(text: &str, share: f64) -> f64 {
+    let words = text.split_whitespace().count() as f64;
+    (1.0 + words * share).min(MISSED_READING_WORD_CEILING)
+}
 
 /// Score `text` into Comprehend's four confidences plus the winning label.
 ///
@@ -232,11 +268,12 @@ const SENTIMENT_CLASS_PRIOR: f64 = 1e-6;
 ///    predominantly supports while keeping the four ordered exactly as the engine's
 ///    shares ordered them.
 ///
-/// Each OPEN class then keeps the [`SENTIMENT_CLASS_PRIOR`] a reading the lexicon
-/// could have missed holds, conceded by the reading the document supports, so no open
-/// reading is reported as a flat impossibility and `MIXED` is reported as the zero it
-/// was measured as for a document carrying at most one polarity. The verdict is the
-/// arg-max of the four the response carries.
+/// Each OPEN class then keeps the room the DOCUMENT leaves it
+/// ([`MISSED_READING_WEIGHT`]), conceded by the reading the document supports, so no
+/// open reading is reported as a flat impossibility, the residual members of two
+/// documents are not one shared literal, and `MIXED` is reported as the zero it was
+/// measured as for a document carrying at most one polarity. The verdict is the arg-max
+/// of the four the response carries.
 ///
 /// Visible to the crate because `DetectTargetedSentiment` scores the clause each
 /// mention sits in through exactly this function, and `BatchDetectSentiment` scores
@@ -291,16 +328,20 @@ pub(crate) fn score_sentiment(text: &str) -> (String, SentimentScore) {
         [0.0, 0.0, 1.0, 0.0]
     };
 
-    // The floor every OPEN reading keeps ([`SENTIMENT_CLASS_PRIOR`]), raised on the
-    // three single-polarity readings and conceded by the reading the material
-    // supports, so the four still sum to 1. `MIXED` keeps no floor: it is measured
-    // from the two signed readings, and a text carrying at most one polarity
-    // measures it at zero.
+    // The room every OPEN reading keeps ([`MISSED_READING_WEIGHT`]), counted in the
+    // document's own words and conceded by the reading that material supports, so the
+    // four still sum to 1. A signed reading is open over the words the engine placed no
+    // polarity on, as far as the net polarity it measured admits that direction;
+    // `NEUTRAL` is open over the words it read as polar, which it could have over-read.
+    // `MIXED` keeps no room: it is measured from the two signed readings, and a text
+    // carrying at most one polarity measures it at zero.
+    let lean = ((scores.get("compound").copied().unwrap_or_default() + 1.0) / 2.0).clamp(0.0, 1.0);
+    let unread = open_reading_words(text, (1.0 - signed).clamp(0.0, 1.0));
     let mut confidences = [positive, negative, neutral, mixed];
     let floors = [
-        SENTIMENT_CLASS_PRIOR,
-        SENTIMENT_CLASS_PRIOR,
-        SENTIMENT_CLASS_PRIOR,
+        MISSED_READING_WEIGHT * unread * lean,
+        MISSED_READING_WEIGHT * unread * (1.0 - lean),
+        MISSED_READING_WEIGHT * open_reading_words(text, signed.clamp(0.0, 1.0)),
         0.0,
     ];
     // The supported reading is the arg-max, taken as the LAST of equal readings

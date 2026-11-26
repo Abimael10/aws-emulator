@@ -11,10 +11,13 @@
 //! dominant language first, the runner-up candidates after it in descending order of
 //! score. A hypothesis the engine scored more than [`CANDIDATE_RELATIVE_FLOOR`] below
 //! the dominant language is not a language it detected, so it is not reported, and
-//! every reported confidence is the engine's own less the mass [`withheld_mass`]
-//! keeps for a language outside the engine's set, which follows how much text the
-//! identification was made from — so no identification comes back certain, and one
-//! made from a fragment comes back materially below one made from a paragraph.
+//! every reported confidence is ONE tally over the document's own material — what the
+//! engine's identification claims of it, what the other candidates claim of the same
+//! material, and the reading no evidence closes off, that the document is written in a
+//! language outside the engine's set ([`UNMODELLED_LANGUAGE_WEIGHT`]) — so no
+//! identification comes back certain, two documents the engine is differently sure
+//! about are reported differently however long they are, and one made from a fragment
+//! comes back materially below one made from a sentence.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +89,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
+
+// The ONE tally of this service's rule-based scorers: a confidence is the supported
+// reading's share of everything the evidence leaves open, weighed against the reading
+// no evidence closes off. The identification engine's own values are what this
+// operation weighs there, so a language score and an entity score are read off the
+// same scale.
+use super::detect_entities::Reading;
 
 /// Comprehend's `LanguageCode` values (`super::types::LANGUAGE_CODE_VALUES`) paired
 /// with the language the identification engine recognises for each.
@@ -202,52 +212,45 @@ fn detector() -> &'static LanguageDetector {
 /// back carrying the same rounded confidence, which tells a caller nothing.
 const SCORE_CONTRAST_EXPONENT: i32 = 2;
 
-/// The confidence the reported distribution keeps for a language outside the set the
-/// identification engine was built with.
+/// How much evidence the identification was made from: the letters and figures of
+/// the sample the engine read.
+///
+/// The material an identification RESTS ON, which is what the modelled `Score` — "the
+/// level of confidence that Amazon Comprehend has in the accuracy of the detection" —
+/// is a confidence about: a word belongs to as many languages as write it, while a
+/// sentence carries a whole profile of the n-grams the engine models. Punctuation and
+/// whitespace carry no language, so they are not counted.
+fn identification_evidence(sample: &str) -> f64 {
+    sample.chars().filter(|c| c.is_alphanumeric()).count() as f64
+}
+
+/// The weight of the reading in which the document is written in a language the
+/// identification engine was NOT built with, on the scale the document's own material
+/// is tallied in.
 ///
 /// The engine's per-language values sum to 1 over [`DETECTABLE_LANGUAGES`] alone, so
 /// they are a distribution CONDITIONAL on the document being written in one of those
 /// languages — a document in a language Comprehend's `LanguageCode` enum does not
 /// name, or in the traditional-script Chinese the engine cannot tell apart, still has
-/// its whole mass spread over them. An identification is therefore never certain, and
-/// this is the mass the response withholds from the candidates to say so: every
-/// reported `Score` is the engine's own confidence scaled by `1 - ` this mass, which
-/// is strictly monotone and so changes no ranking.
+/// its whole mass spread over them. No amount of text closes that reading off, which
+/// is what keeps every reported `Score` strictly below 1.
 ///
-/// How much is withheld is a function of the DOCUMENT, because the document is what
-/// the identification rests on: the modelled `Score` is "the level of confidence that
-/// Amazon Comprehend has in the accuracy of the detection", and a detection made from
-/// one word is not the same detection as one made from a paragraph. A word belongs to
-/// as many languages as write it, while a sentence carries a whole profile of the
-/// n-grams the engine models, so each further stretch of text is a further
-/// observation agreeing with the language identified and the mass withheld for every
-/// other hypothesis HALVES: the odds grow geometrically with the evidence and the
-/// reported confidence approaches 1 without reaching it. A caller gating on the score
-/// can therefore tell a detection the document supports from a guess, and the
-/// fallback branch a low confidence selects is reachable.
+/// Its weight is what puts the tally on the scale a confidence is read on, and it is
+/// stated in the same unit as the evidence itself: it weighs as much as ONE character
+/// of the document's own material. So a one-character document leaves the
+/// identification an even bet against a language the engine does not model, a short
+/// sentence leaves it a few hundredths and a paragraph a few thousandths — the
+/// confidence approaches 1 with the text the identification was made from without
+/// reaching it, and the fallback branch a caller takes when it cannot trust the
+/// detected language stays reachable.
 ///
-/// The unit of evidence is a stretch of [`EVIDENCE_HALVING_CHARS`] letters and
-/// figures of the sample the engine read, and the halving stops at
-/// [`UNMODELLED_LANGUAGE_MASS_FLOOR`], which keeps the dominant language's confidence
-/// strictly below 1 however long the document is. Both are constants of the
-/// projection, applied identically to every document, so no request can select them.
-fn withheld_mass(sample: &str) -> f64 {
-    let evidence = sample.chars().filter(|c| c.is_alphanumeric()).count() as f64;
-    0.5f64
-        .powf(evidence / EVIDENCE_HALVING_CHARS)
-        .max(UNMODELLED_LANGUAGE_MASS_FLOOR)
-}
-
-/// The characters of text that make up one unit of identification evidence: the mean
-/// length of a written word, so one word of the document halves the mass
-/// [`withheld_mass`] keeps back.
-const EVIDENCE_HALVING_CHARS: f64 = 5.0;
-
-/// The floor of [`withheld_mass`]: the mass no amount of text takes away from the
-/// hypothesis that the document is written in none of the languages the engine was
-/// built with, so an identification is reported as a confidence and never as a
-/// certainty.
-const UNMODELLED_LANGUAGE_MASS_FLOOR: f64 = 1e-6;
+/// It is weighed BESIDE the engine's own reading of the document rather than applied
+/// as a factor over it, which is what keeps the engine's margin the thing that
+/// separates two documents: the length of a document decides how certain ANY
+/// identification of it can be, and the engine's confidence decides where inside that
+/// bound each candidate lands. A scaling by a function of length alone would order two
+/// documents by which was longer, whatever the engine made of either.
+const UNMODELLED_LANGUAGE_WEIGHT: f64 = 1.0;
 
 /// How far below the dominant language a candidate may be scored and still be
 /// reported as a runner-up.
@@ -279,13 +282,14 @@ const CANDIDATE_RELATIVE_FLOOR: f64 = 0.1;
 /// value is raised to [`SCORE_CONTRAST_EXPONENT`] and renormalised over the set, so
 /// the score is a confidence rather than a relative rank; a candidate scored more
 /// than [`CANDIDATE_RELATIVE_FLOOR`] below the dominant one is DROPPED rather than
-/// reported as a runner-up the engine did not detect; and every reported confidence
-/// is scaled by the mass [`withheld_mass`] withholds for a language outside the
-/// engine's set, which follows how much of the document the identification was made
-/// from. All three are strictly monotone over the engine's values, so the dominant
-/// language and the order of the runner-ups are exactly the engine's; the scores stay
-/// a distribution, summing to at most 1, and the dominant language's score stays
-/// strictly below 1.
+/// reported as a runner-up the engine did not detect; and each reported confidence is
+/// that candidate's share of ONE tally over the document's own material — the
+/// characters the engine read as its language against the same characters as read by
+/// every other candidate, weighed beside the one reading no evidence closes off
+/// ([`UNMODELLED_LANGUAGE_WEIGHT`]). All three are strictly monotone over the engine's
+/// values, so the dominant language and the order of the runner-ups are exactly the
+/// engine's; the scores stay a distribution, summing to at most 1, and the dominant
+/// language's score stays strictly below 1.
 ///
 /// Equal confidences are ordered by language code, so the list is a total order and
 /// two identical requests return byte-identical arrays.
@@ -328,13 +332,22 @@ pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
         .map(|(_, weight)| *weight)
         .fold(0.0f64, f64::max);
     // What the identification rests on: the text the engine read of this document.
-    let reported = 1.0 - withheld_mass(&sample);
+    let evidence = identification_evidence(&sample);
     let mut candidates: Vec<DominantLanguage> = weighted
         .into_iter()
         // A candidate the engine all but rejected is not a language it detected.
         .filter(|(_, weight)| *weight >= leading * CANDIDATE_RELATIVE_FLOOR)
         .filter_map(|(code, weight)| {
-            let score = (weight / total * reported) as f32;
+            // This candidate's share of the document's own material, against what
+            // every other candidate claims of the same material and the reading that
+            // the document is in a language the engine was not built with.
+            let share = weight / total;
+            let score = Reading {
+                support: evidence * share,
+                competing: evidence * (1.0 - share),
+                never_excluded: UNMODELLED_LANGUAGE_WEIGHT,
+            }
+            .confidence();
             // A score that renders as zero at the modelled float width would claim
             // a candidate with no confidence at all.
             (score > 0.0).then(|| DominantLanguage {

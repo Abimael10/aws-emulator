@@ -19,8 +19,9 @@
 //!    how much sentiment-bearing material the document holds.
 //! 3. `BatchDetectSyntax`: a tag is the reading the token's own evidence and the
 //!    context it stands in support, so the same word in two contexts can come back
-//!    with two tags and two confidences, and the confidence is near certainty only
-//!    where the evidence is.
+//!    with two tags, and the confidence is FULL only where no competing reading of the
+//!    token is left open — a token one of whose readings stays live is reported below
+//!    it.
 //!
 //! The fourth analyser of the family, `BatchDetectKeyPhrases`, is held in
 //! `noun_phrase_key_phrases.rs`, which reads this suite's batch helpers.
@@ -676,9 +677,10 @@ async fn a_tag_is_the_reading_the_token_and_its_context_support() {
     };
     const COPULA_CASE: &str = "a copula with an adjective predicate is the clause's main verb";
     const PASSIVE_CASE: &str = "a passive with an agent keeps its verb reading";
+    const GERUND_CASE: &str = "a gerund inside a compound is nominal";
 
-    // The SAME word in two contexts: a confidence read out of a rule table could not
-    // differ between these, and a tag read out of a word list could not either.
+    // The SAME word in two contexts: a tag read out of a word list could not differ
+    // between these.
     let (auxiliary_tag, auxiliary_score) = reading(PASSIVE_CASE, "was");
     let (main_verb_tag, main_verb_score) = reading(COPULA_CASE, "was");
     assert_ne!(
@@ -686,44 +688,84 @@ async fn a_tag_is_the_reading_the_token_and_its_context_support() {
         "expected the same form of \"be\" to be read differently in the two contexts, \
          got {auxiliary_tag:?} both times"
     );
-    assert!(
-        (auxiliary_score - main_verb_score).abs() > 1e-6,
-        "expected the confidence to follow the context the word stands in, got \
-         {auxiliary_score} and {main_verb_score}"
-    );
 
-    // Near certainty only where the evidence is: a word one word class claims and
-    // nothing contradicts, against one whose reading a context had to overturn. The
-    // reading the context overturned keeps a residual rather than a share of the
-    // question, so the resolved word is reported BELOW the unambiguous one and still
-    // near the certainty the recorded response reports a resolved token with.
+    // Full confidence exactly where nothing contests the reading. A token whose class
+    // its own evidence and the position it stands in settle between them leaves no
+    // competing reading of that token open — whether the class comes from its evidence
+    // alone (a determiner one word class claims) or from the position (a form of `be`
+    // read as its clause's main verb, and the same form read as the auxiliary of a
+    // passive) — so it is reported at the certainty the recorded responses report such
+    // a token with, rather than a hair below it at a value that recurs across
+    // unrelated tokens.
     let (_, determiner) = reading(COPULA_CASE, "The");
-    assert!(
-        determiner > 0.99,
-        "expected a word only one class claims to be reported near certainty, got \
-         {determiner}"
+    for (case, word, score) in [
+        (COPULA_CASE, "The", determiner),
+        (COPULA_CASE, "was", main_verb_score),
+        (PASSIVE_CASE, "was", auxiliary_score),
+    ] {
+        assert_eq!(
+            score, 1.0,
+            "case {case:?}: expected {word:?}, whose reading nothing leaves open, to be \
+             reported at full confidence, got {score}"
+        );
+    }
+
+    // Below it exactly where a reading stays live: the position a gerund heading a
+    // nominal compound stands in PREFERS the nominal reading without excluding the
+    // verbal one, which is still a verb form, so the token keeps only the share the
+    // displaced reading leaves it and a caller filtering on confidence can tell the
+    // two apart.
+    let (gerund_tag, gerund_score) = reading(GERUND_CASE, "processing");
+    assert_eq!(
+        gerund_tag, "NOUN",
+        "case {GERUND_CASE:?}: expected the gerund to be read as the compound's noun, \
+         got {gerund_tag:?}"
     );
     assert!(
-        main_verb_score < determiner,
-        "expected a reading a context had to resolve to carry a lower confidence, got \
-         {main_verb_score} against {determiner}"
+        gerund_score < determiner,
+        "case {GERUND_CASE:?}: expected a token whose other reading stays live to be \
+         reported below one nothing contests, got {gerund_score} against {determiner}"
     );
     assert!(
-        main_verb_score > 0.99,
-        "expected a token whose class its position settles to stay near certainty \
-         rather than being reported as a doubtful reading, got {main_verb_score}"
+        gerund_score > 0.9,
+        "case {GERUND_CASE:?}: expected the preferred reading to stay a confident one \
+         rather than being reported as a doubtful reading, got {gerund_score}"
     );
 
-    // The table's confidences are not one repeated constant.
-    let spread = distinct(
-        tagged
-            .iter()
-            .filter(|(_, text, _, _)| text.chars().any(char::is_alphabetic))
-            .map(|(_, _, _, score)| *score),
-    );
+    // Over EVERY token of the table, not only the rows named above: a confidence is
+    // either the certainty a token nothing contests carries, or visibly below it. The
+    // band just under 1 is where a share left to a reading the position RULES OUT lands
+    // — a value belonging to the rule table rather than to the token, which is what
+    // recurs across unrelated tokens of unrelated documents — so no token may be
+    // reported in it, and the table must hold tokens of both kinds.
+    let mut settled = 0usize;
+    let mut contested = 0usize;
+    for (case, text, _, score) in tagged
+        .iter()
+        .filter(|(_, text, _, _)| text.chars().any(char::is_alphabetic))
+    {
+        assert!(
+            *score == 1.0 || *score < CONTESTED_CONFIDENCE_CEILING,
+            "case {case:?}: expected {text:?} to be reported at full confidence or \
+             visibly below it, got {score}"
+        );
+        if *score == 1.0 {
+            settled += 1;
+        } else {
+            contested += 1;
+        }
+    }
     assert!(
-        spread >= 5,
-        "expected the confidences to follow each token's own evidence, got {spread} \
-         distinct values across the table"
+        settled > 0 && contested > 0,
+        "expected the table to hold both tokens nothing contests and tokens a reading \
+         stays live on, got {settled} at full confidence and {contested} below it"
     );
 }
+
+/// The confidence a token one of whose readings stays LIVE is reported below.
+///
+/// Not a rounding below 1: the share a live reading holds is a share of the question,
+/// so it shows in the third decimal place at the latest. A token reported between this
+/// and 1 would be one whose analysis is settled but whose confidence says otherwise,
+/// which is what a residual left to an excluded reading produces.
+const CONTESTED_CONFIDENCE_CEILING: f64 = 0.999;

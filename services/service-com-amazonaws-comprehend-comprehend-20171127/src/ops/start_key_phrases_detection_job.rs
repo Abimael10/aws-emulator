@@ -133,6 +133,34 @@ use crate::state::{
     SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
 };
 
+// The ONE tally of this service's rule-based scorers: a confidence is the supported
+// reading's share of everything the evidence leaves open, weighed against the reading
+// no evidence closes off. What a key-phrase extraction weighs there is the phrase's
+// own characters as the analysis that found it read them.
+use crate::ops::detect_entities::Reading;
+
+/// The weight of the reading in which a phrase the document holds is NOT a key phrase
+/// of it, on the scale the phrase's own characters are tallied in.
+///
+/// Always open: no chunking rule and no salience measure excludes it, so this is what
+/// keeps every reported `Score` strictly below 1 — a key phrase is a detection, and
+/// the modelled member is "the level of confidence that Amazon Comprehend has in the
+/// accuracy of the detection", never a certainty.
+///
+/// Its size is what puts the tally on the scale a confidence is read on. It is stated
+/// in the same unit as the evidence — one character of the phrase as the analysis read
+/// it — and is a thousandth of one such character: a phrase whose every word the
+/// analysis settled keeps a residual in the fourth decimal place, which is where a
+/// client pruning a key-phrase list to build tags, facets or search terms reads it,
+/// and a longer phrase, which the document gives more material for, keeps less of one
+/// than a one-word phrase. A weight of the order of the evidence itself would instead
+/// report a short phrase the analysis is sure about down in the ninth decimal of a
+/// confidence — below any gate a client sets — while a reading the analysis did NOT
+/// settle still costs the phrase the whole share that reading holds, so a phrase
+/// resting on a word two readings claim stays materially below one the document
+/// settles.
+const READING_NOT_A_KEY_PHRASE: f64 = 1e-3;
+
 /// The family every job this operation creates belongs to.
 const FAMILY: JobFamily = JobFamily::KeyPhrasesDetection;
 
@@ -357,12 +385,17 @@ impl KeyPhraseAnalyser {
 /// due next Friday` holds the phrase `next Friday`), which is what keeps a reported
 /// span bounded by the noun phrase it describes.
 ///
-/// `Score` is the confidence of that analysis: the joint confidence of the tags that
-/// formed the phrase, which is each token's own `PartOfSpeech.Score` multiplied
-/// together. A phrase every word of which the tagger reads unambiguously comes back
-/// near 1; one resting on a reading the context had to resolve comes back lower, by
-/// exactly the share that reading left behind. Nothing here is invented: both the
-/// phrase and its confidence come from the analysis of the submitted document.
+/// `Score` is the confidence of the detection, tallied over the phrase's own
+/// characters as the analysis read them: each word's characters carry the confidence
+/// that word's class was identified with and leave the rest of their weight to the
+/// readings the analysis did not settle, weighed against the reading no rule closes
+/// off — that a phrase the document holds is not a KEY phrase of it
+/// ([`READING_NOT_A_KEY_PHRASE`]). So the confidence follows the phrase: one the
+/// document spells out at length and whose every word the analysis settles comes back
+/// near 1 but never at it, a shorter one comes back below it, and one resting on a
+/// word the context only resolved comes back materially lower, by exactly the share
+/// the reading it did not pick holds. Nothing here is invented: both the phrase and
+/// its confidence come from the analysis of the submitted document.
 fn noun_phrases(text: &str) -> Vec<KeyPhrase> {
     let tokens = crate::ops::detect_syntax::analyse(text);
     let mut phrases: Vec<KeyPhrase> = Vec::new();
@@ -399,9 +432,23 @@ fn push_noun_phrase(
         return;
     };
     let span = &tokens[first..=head];
-    let confidence: f32 = span.iter().map(|token| token.score()).product();
+    // The phrase's own characters, as the analysis read them: a character of a word
+    // whose class the analysis settled is evidence for the phrase, and one of a word
+    // the analysis left two readings open on carries only the share the reported
+    // reading holds, leaving the rest against it.
+    let mut reading = Reading {
+        support: 0.0,
+        competing: 0.0,
+        never_excluded: READING_NOT_A_KEY_PHRASE,
+    };
+    for token in span {
+        let characters = token.text.chars().count() as f64;
+        let settled = f64::from(token.score());
+        reading.support += characters * settled;
+        reading.competing += characters * (1.0 - settled);
+    }
     phrases.push(KeyPhrase {
-        score: Some(confidence),
+        score: Some(reading.confidence()),
         text: Some(text[tokens[first].byte_begin..tokens[head].byte_end].to_string()),
         begin_offset: Some(tokens[first].begin as i32),
         end_offset: Some(tokens[head].end as i32),
@@ -421,10 +468,16 @@ fn push_noun_phrase(
 /// [`KeyPhraseAnalyser::for_language`] and handed in, so a job of many documents does
 /// not rebuild it per document.
 ///
-/// `Score` is that phrase score relative to the document's highest — a computed,
-/// document-relative weight in `(0, 1]`, so the phrase the document is most about
-/// scores 1.0. Nothing here is invented: a document with no content word produces no
-/// key phrase at all.
+/// `Score` is the confidence of the detection, tallied over the phrase's own
+/// characters: each of them carries the phrase's salience — its RAKE score relative to
+/// the document's highest, a computed, document-relative weight in `(0, 1]` — as
+/// evidence and leaves the rest against it, weighed beside the reading no measure
+/// closes off, that the phrase is not a KEY phrase of the document
+/// ([`READING_NOT_A_KEY_PHRASE`]). So the phrase the document is most about comes back
+/// near 1 without reaching it, a phrase the document barely supports comes back far
+/// below, and two phrases of different length or salience are not reported with one
+/// value. Nothing here is invented: a document with no content word produces no key
+/// phrase at all.
 fn content_runs(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
     let words = words(text);
     let candidates = candidates(&words, stopwords);
@@ -474,7 +527,16 @@ fn content_runs(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
     scored
         .into_iter()
         .map(|(score, mut phrase)| {
-            phrase.score = Some((score / highest.max(f64::MIN_POSITIVE)) as f32);
+            let salience = score / highest.max(f64::MIN_POSITIVE);
+            phrase.score = Some(
+                Reading::over(
+                    phrase.text.as_deref().unwrap_or_default(),
+                    salience,
+                    1.0 - salience,
+                    READING_NOT_A_KEY_PHRASE,
+                )
+                .confidence(),
+            );
             phrase
         })
         .collect()

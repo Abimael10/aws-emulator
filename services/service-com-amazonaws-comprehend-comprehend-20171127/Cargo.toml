@@ -74,6 +74,9 @@ stop-words = "0.8"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file in the single integration-test
+# target's root, so a new suite is a new file and needs no declaration.
+automod = { workspace = true }
 # The dominant-language job suite mounts the S3 service beside Comprehend on one
 # engine, because StartDominantLanguageDetectionJob reads its input documents from S3
 # and writes its output archive back there by calling it in process.

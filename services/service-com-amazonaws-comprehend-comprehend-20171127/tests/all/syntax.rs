@@ -327,12 +327,13 @@ async fn offsets_and_ids_round_trip_the_document_for_any_text() {
     }
 }
 
-/// A word only one word class claims is reported with a higher confidence than a
-/// word several classes claim, whose tag is the most frequent of its readings.
+/// A word whose class is left in doubt is reported with a lower confidence than one
+/// whose class nothing contests — and a word several classes claim is left in doubt
+/// only where its position does not settle which reading it has.
 #[tokio::test]
 async fn an_ambiguous_word_is_reported_with_a_lower_confidence_than_an_unambiguous_one() {
     let comprehend = Comprehend::new();
-    let text = "The dog that barks is mine.";
+    let text = "The dog that barks is mine, and it sleeps after dark.";
 
     let output = comprehend
         .ok(
@@ -350,15 +351,33 @@ async fn an_ambiguous_word_is_reported_with_a_lower_confidence_than_an_unambiguo
             .unwrap_or_else(|| panic!("case \"ambiguity\": no token {word:?} in {tokens:?}"))
     };
 
-    // "the" is a determiner and nothing else; "that" is also a pronoun and a
-    // subordinating conjunction.
-    let unambiguous = score_of("The");
-    let ambiguous = score_of("that");
+    // "after" is a preposition and a subordinating conjunction, and the position it
+    // stands in settles neither reading, so the reading it is reported with holds only
+    // its share of the evidence.
+    let ambiguous = score_of("after");
     assert!(
-        ambiguous < unambiguous,
-        "case \"ambiguity\": expected \"that\" to score below \"the\", got \
-         {ambiguous} and {unambiguous}"
+        ambiguous < 1.0,
+        "case \"ambiguity\": expected \"after\", which two word classes claim and no \
+         position settles, to be reported below full confidence, got {ambiguous}"
     );
+
+    // Two words nothing contests the reading of: "the" is a determiner and nothing
+    // else, and "that" is also a pronoun and a subordinating conjunction but stands
+    // for the noun its clause modifies, which settles it. Neither leaves a competing
+    // reading of its own token open, so both are reported at full confidence.
+    for word in ["The", "that"] {
+        let settled = score_of(word);
+        assert_eq!(
+            settled, 1.0,
+            "case \"ambiguity\": expected {word:?}, whose reading nothing leaves open, \
+             to be reported at full confidence, got {settled}"
+        );
+        assert!(
+            ambiguous < settled,
+            "case \"ambiguity\": expected \"after\" to score below {word:?}, got \
+             {ambiguous} and {settled}"
+        );
+    }
 }
 
 #[tokio::test]

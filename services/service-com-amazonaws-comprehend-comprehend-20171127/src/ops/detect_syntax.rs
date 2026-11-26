@@ -110,9 +110,11 @@ pub(crate) const TAGGABLE_LANGUAGES: &[&str] = &["en"];
 // by the cue that speaks for it, and reports the DISTRIBUTION that induces. The tag
 // is the reading holding the most weight and `PartOfSpeech.Score` is that reading's
 // share of the whole, so the confidence follows the token's own evidence: a token
-// whose evidence leaves ONE reading is reported at full confidence, two word classes
-// claiming one word leave the most frequent reading holding only its share, and a
-// reading a context rule overturns keeps the share that context leaves it.
+// whose evidence leaves ONE reading is reported at full confidence, as is one whose
+// class the position it stands in settles, since neither leaves a competing reading of
+// that token open; two word classes claiming one word leave the most frequent reading
+// holding only its share, and a position that merely PREFERS one of two readings the
+// word genuinely keeps leaves the other the share it allows it.
 //
 // The weights below are the model's parameters: one per KIND of evidence, applied
 // identically to every token of every document, so no request can select them.
@@ -153,35 +155,41 @@ const CUE_OPEN_CLASS: f64 = 0.2;
 /// overturn one.
 const CUE_CONTEXT: f64 = 1.0;
 
-/// The SHARE a reading keeps of its own weight when the context it stands in speaks
-/// AGAINST it.
+/// The SHARE a reading keeps of its own weight in a position that RULES IT OUT: none
+/// of it.
 ///
-/// The reading does not disappear — the word still has it, so a context can never make
-/// one impossible — but a position that decides between two readings decides: the word
-/// after a determiner is the noun that phrase is headed by, the auxiliary in front of a
-/// participle accompanies it. What the overturned reading keeps is therefore a
-/// RESIDUAL rather than a fraction of the question: a little weight, because the word
-/// really has this reading, and no more than a little, because the context settled it.
+/// The word still carries the reading — that is what the lexicon says and what another
+/// position gives it back — but this position does not leave it open: the word after a
+/// determiner is the noun that phrase is headed by, the form of `be` in front of a
+/// participle accompanies it, a word inside a name is part of the name. A reading the
+/// position excludes is therefore not a competing reading of THIS token, and takes no
+/// share of the confidence reported for it.
 ///
-/// It is what calibrates a resolved token's reported confidence. A reading that keeps a
-/// large share of its weight makes `PartOfSpeech.Score` report a word whose class the
-/// position settles as a coin toss — three quarters, nine tenths — where the analysis
-/// is not in doubt at all and the share the loser keeps is the only reason the number
-/// is not near 1.
+/// It is what calibrates a resolved token's reported confidence, and it is what
+/// `PartOfSpeech.Score` — "the confidence that Amazon Comprehend has that the part of
+/// speech was correctly identified" — describes: a token whose class its own evidence
+/// and its position settle between them is an identification nothing contests, so it is
+/// reported at FULL confidence rather than a hair below one, which is how a settled
+/// token is reported. A share left to an excluded reading instead reports every settled
+/// token a few hundred-thousandths short of 1 — a value that says the analysis was in
+/// doubt where it was not, and that recurs across unrelated tokens whose evidence
+/// happened to be shaped alike, so a caller filtering on confidence can tell nothing
+/// from it.
 ///
 /// A position that only PREFERS one of two readings the word genuinely keeps — a gerund
 /// read as part of the nominal compound it stands in, which is still a verb form —
-/// contradicts nothing, and the reading it did not pick keeps the share
+/// excludes nothing, and the reading it did not pick keeps the share
 /// [`CONTEXT_OUTWEIGHED`] leaves it, so such a token is reported with a visibly lower
 /// confidence than one whose class is settled, which is the difference a caller
 /// filtering on confidence reads.
-const CONTEXT_CONTRADICTED: f64 = 1e-4;
+const CONTEXT_CONTRADICTED: f64 = 0.0;
 
 /// The SHARE a reading keeps of its own weight when the position PREFERS another one
 /// without excluding it.
 ///
-/// Between [`CONTEXT_CONTRADICTED`] and the whole weight, and that is the point: the
-/// word really can be read the other way here — a gerund heading a nominal compound is
+/// Between nothing at all ([`CONTEXT_CONTRADICTED`]) and the whole weight, and that is
+/// the point: the word really can be read the other way here — a gerund heading a
+/// nominal compound is
 /// a verbal noun, a participle describing the noun behind it is a verb form — so the
 /// displaced reading keeps far more than one a position rules out, and the token is
 /// reported as decided rather than as a coin toss. It is what makes a genuinely
@@ -214,6 +222,40 @@ pub(crate) const COPULA_FORMS: &[&str] = &[
 
 /// The endings an English participle carries, for the predicative rule above.
 const PARTICIPLE_ENDINGS: &[&str] = &["ed", "en"];
+
+/// The adverbs that modify a DEGREE: the `very` class of intensifiers and diminishers.
+///
+/// English puts a degree adverb in front of an ADJECTIVE and never in front of a verb
+/// phrase (`very delayed`, `too slow`, `somewhat tired`), so one standing in a
+/// predicate says what the word behind it is: the participle a degree adverb modifies
+/// is the ADJECTIVE that predicate predicates of its subject rather than the
+/// predicate's own passive or progressive verb, and the form of `be` in front of it
+/// then accompanies no verb and is the clause's main verb. [`resolve_predicative`]
+/// reads them.
+///
+/// Source: the English degree adverbs, the class Universal Dependencies v2 — the tag
+/// set this service reports — reads as an `advmod` of degree. The words are the
+/// FREQUENT members of it, each of which grades an adjective and none of which
+/// modifies a verb phrase; the class is open, so an unlisted degree word leaves the
+/// participle behind it read as its predicate's verb, exactly as an ungraded one is.
+const DEGREE_ADVERBS: &[&str] = &[
+    "very", "so", "too", "quite", "rather", "somewhat", "fairly", "slightly", "extremely",
+    "really", "incredibly", "exceedingly", "awfully", "terribly", "remarkably", "unusually",
+    "exceptionally", "particularly", "especially", "pretty", "highly", "immensely", "enormously",
+    "hugely", "mildly", "moderately", "reasonably", "surprisingly", "unbelievably", "deeply",
+];
+
+/// Whether `word` is an English participle or gerund FORM — a form a verb lends to an
+/// adjective (`delayed`, `broken`, `frustrating`) — rather than a word read as a verb
+/// for some other reason.
+///
+/// Longer than the ending it is matched on, which is the same bound the derivational
+/// suffix rules apply, so a word that IS the ending is not read as a form built on one.
+fn is_participle_form(word: &str) -> bool {
+    let formed_with =
+        |ending: &str| word.chars().count() > ending.chars().count() + 1 && word.ends_with(ending);
+    PARTICIPLE_ENDINGS.iter().any(|ending| formed_with(ending)) || formed_with(GERUND_ENDING)
+}
 
 /// The words English opens a RELATIVE clause with that the lexicon also claims as a
 /// determiner.
@@ -532,8 +574,13 @@ impl Readings {
         }
     }
 
-    /// Leave the reading of `tag` what [`CONTEXT_CONTRADICTED`] keeps: the context
-    /// speaks against it, which does not make it impossible.
+    /// Leave the reading of `tag` what [`CONTEXT_CONTRADICTED`] keeps: the position
+    /// rules it out, which the lexicon does not.
+    ///
+    /// Every caller pairs this with a [`Readings::support`] for the reading the position
+    /// DOES leave open — that is what a rule excluding one reading is for — and must:
+    /// a token whose every reading were ruled out would carry no weight at all, and
+    /// [`Readings::reported`] would report the share of nothing.
     fn contradict(&mut self, tag: &str) {
         if let Some(reading) = self
             .readings
@@ -585,10 +632,11 @@ impl Readings {
 
     /// The reading holding the most weight, and its share of the whole.
     ///
-    /// The share is strictly positive, and it is 1 exactly when the token's evidence
-    /// left ONE reading — a word a single word class claims standing in a position
-    /// nothing else is open in, which is the analysis no competing reading takes a
-    /// share of.
+    /// The share is strictly positive, and it is 1 exactly when no competing reading of
+    /// the token is left open — a word a single word class claims, or one whose class
+    /// its position settles, which is the analysis no other reading takes a share of.
+    /// A token two readings the evidence leaves open is reported below it, by the share
+    /// the one not reported holds.
     fn reported(&self) -> (&'static str, f32) {
         let mut best: Option<(&'static str, f64)> = None;
         let mut total = 0.0;
@@ -997,7 +1045,10 @@ impl AnalysedToken<'_> {
 ///    reading is that predicate's verb instead: a participle after a form of `be` is
 ///    the clause's passive or progressive verb (`the flight was delayed`, `the window
 ///    was broken by a storm`), which is what makes the form of `be` in front of it
-///    the auxiliary accompanying it.
+///    the auxiliary accompanying it — unless a DEGREE adverb grades that participle
+///    (`was very disappointed`), a modification only an adjective takes, which reads
+///    it as the predicate's adjective and leaves the form of `be` the clause's own
+///    verb.
 /// 3. An auxiliary. An auxiliary or modal is AUX when it ACCOMPANIES a main verb, as
 ///    the modelled tag's own documentation says — which a participle in the predicate
 ///    of a form of `be` is, so the copula of a passive or a progressive is read as its
@@ -1313,32 +1364,43 @@ fn heads_a_noun_phrase(tagger: &Tagger, token: &AnalysedToken<'_>) -> bool {
 ///   participle after a form of `be` is the clause's passive or progressive verb (`the
 ///   flight was delayed`, `the window was broken by a storm`), and reading it as the
 ///   predicate's adjective is what would leave the form of `be` in front of it as the
-///   clause's only verb.
+///   clause's only verb. UNLESS a degree adverb modifies it ([`DEGREE_ADVERBS`]): a
+///   degree is something an adjective has and a verb phrase has not (`was very
+///   disappointed`, `is too complicated`), so the participle a degree adverb grades is
+///   read as the predicate's adjective, and the form of `be` in front of it
+///   accompanies no verb and is read as the clause's own.
 /// * A word of a closed class — the determiner, pronoun or preposition opening the
 ///   predicate — is never the adjective of one, whatever stands behind it.
 /// * A predicate NOMINAL rather than an adjective, which a determiner, a pronoun or a
 ///   proper name behind the word marks (`the manager is John Smith`, `the delay is a
-///   problem`), as does the `by` of an agent phrase.
+///   problem`), as does the `by` of an agent phrase — neither of which a degree adverb
+///   can grade either, so a graded word is an adjective whatever follows it.
 ///
 /// The answer is recorded on the token ([`AnalysedToken::predicative`]) as well as in
 /// its readings, because the noun-phrase chunking needs the POSITION and not only the
 /// tag: an adjective of a clause's predicate is not a modifier inside the noun phrase
 /// standing behind it, so a phrase chunked over it covers text the phrase does not.
 fn resolve_predicative(tokens: &mut [AnalysedToken<'_>], position: usize) -> bool {
+    // The word carrying the predicate, past the adverbs standing between it and this
+    // one (`is rather pleasant`), and whether one of them grades a DEGREE.
+    let mut before = position;
+    let mut graded = false;
+    while before > 0 && AUXILIARY_SKIPPABLE_TAGS.contains(&tokens[before - 1].tag()) {
+        before -= 1;
+        graded |= DEGREE_ADVERBS.contains(&tokens[before].lowercase.as_str());
+    }
+    // A participle a degree adverb grades is the one word carrying a verbal reading
+    // that is read as its predicate's adjective: a verb phrase takes no degree.
+    let graded_participle = graded && is_participle_form(&tokens[position].lowercase);
     // The readings a predicate's adjective can be read from: the open classes a
     // describing word belongs to. Punctuation, a figure, a name and the closed-class
     // words opening a predicate are not candidates, and neither is a word carrying a
     // verbal reading, which is that predicate's own verb.
-    if !PREDICATIVE_CANDIDATE_TAGS.contains(&tokens[position].tag())
-        || tokens[position].readings.has("VERB")
+    if !graded_participle
+        && (!PREDICATIVE_CANDIDATE_TAGS.contains(&tokens[position].tag())
+            || tokens[position].readings.has("VERB"))
     {
         return false;
-    }
-    // The word carrying the predicate, past the adverbs standing between it and this
-    // one (`is rather pleasant`).
-    let mut before = position;
-    while before > 0 && AUXILIARY_SKIPPABLE_TAGS.contains(&tokens[before - 1].tag()) {
-        before -= 1;
     }
     let predicate_of = before
         .checked_sub(1)
@@ -1351,10 +1413,13 @@ fn resolve_predicative(tokens: &mut [AnalysedToken<'_>], position: usize) -> boo
         let tag = after.tag();
         after.lowercase != "by" && tag != "PROPN" && tag != "DET" && tag != "PRON"
     });
-    if !predicate_of || !complement {
+    if !predicate_of || !(complement || graded_participle) {
         return false;
     }
     tokens[position].readings.contradict("NOUN");
+    // A no-op for a word with no verbal reading, which is every other word this rule
+    // reads: only a graded participle reaches here carrying one.
+    tokens[position].readings.contradict("VERB");
     tokens[position].readings.support("ADJ", CUE_CONTEXT);
     tokens[position].predicative = true;
     true
