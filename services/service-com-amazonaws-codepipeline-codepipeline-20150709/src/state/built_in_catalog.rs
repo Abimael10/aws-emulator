@@ -732,8 +732,11 @@ pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 27] = [
     },
     // ---- Source ---------------------------------------------------------------------
     BuiltInActionType {
+        // The console page for a source action's resource is the branch the action detects
+        // changes on, named by the action's own `BranchName` configuration: the template
+        // takes that name, not a git ref built around it.
         entity_url_template: Some(
-            "https://console.aws.amazon.com/codesuite/codecommit/repositories/{Config:RepositoryName}/browse/refs/heads/{Config:BranchName}?region={region}",
+            "https://console.aws.amazon.com/codesuite/codecommit/repositories/{Config:RepositoryName}/browse/{Config:BranchName}?region={region}",
         ),
         configuration_properties: &[
             property(

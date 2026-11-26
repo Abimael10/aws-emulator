@@ -40,9 +40,25 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::served_at(None)
+    }
+
+    /// An emulator whose published base URL is `base` — what the data port's own URL is
+    /// for a served emulator, and `None` for one served on no port at all.
+    ///
+    /// Which base is published is what a suite about the addresses this service ANNOUNCES
+    /// varies (`tests/all/reported_action_links.rs`); every other suite takes
+    /// [`Emulator::new`].
+    pub(crate) fn served_at(base: Option<&str>) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
+        if let Some(base) = base {
+            router.set_url_base(
+                smithy_server_runtime::EndpointUrl::parse(base)
+                    .unwrap_or_else(|| panic!("{base} is an endpoint base")),
+            );
+        }
         router.register_service(
             service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(
                 Arc::clone(&engine),
@@ -79,11 +95,56 @@ impl Emulator {
         self.call_in("us-east-1", operation, body).await
     }
 
+    /// Call `operation` signed for `region` and ADDRESSED to `host` — the endpoint this
+    /// caller reached the emulator at, which is the address a URL the answer publishes is
+    /// announced on (`state::announced_authority`). `None` names no endpoint, the way an
+    /// in-process caller reaches a service.
+    pub(crate) async fn call_addressed(
+        &self,
+        region: &str,
+        host: Option<&str>,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/codepipeline/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
+        );
+        self.dispatch(operation, body, Some(authorization.as_str()), host)
+            .await
+    }
+
+    /// That same call, asserting it succeeded.
+    pub(crate) async fn ok_addressed(
+        &self,
+        region: &str,
+        host: Option<&str>,
+        operation: &str,
+        body: &Value,
+    ) -> Value {
+        let (status, response) = self.call_addressed(region, host, operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with {response}"
+        );
+        response
+    }
+
     async fn send(
         &self,
         operation: &str,
         body: &Value,
         authorization: Option<&str>,
+    ) -> (u16, Value) {
+        self.dispatch(operation, body, authorization, None).await
+    }
+
+    async fn dispatch(
+        &self,
+        operation: &str,
+        body: &Value,
+        authorization: Option<&str>,
+        host: Option<&str>,
     ) -> (u16, Value) {
         let mut request = http::Request::builder()
             .method("POST")
@@ -92,9 +153,14 @@ impl Emulator {
             .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"));
         if let Some(authorization) = authorization {
             request = request.header("authorization", authorization);
-        } else {
+        }
+        match (host, authorization) {
+            (Some(host), _) => request = request.header("host", host),
             // No credential scope at all: the request still routes on X-Amz-Target.
-            request = request.header("host", "codepipeline.us-east-1.amazonaws.com");
+            (None, None) => {
+                request = request.header("host", "codepipeline.us-east-1.amazonaws.com")
+            }
+            (None, Some(_)) => {}
         }
         let request = request
             .body(bytes::Bytes::from(body.to_string()))

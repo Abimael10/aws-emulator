@@ -5,17 +5,20 @@
 //!
 //! # The rule this module implements
 //!
-//! A URL this service hands a caller to DIAL — the trigger URL a webhook publishes for a
-//! provider to POST to ([`crate::service::webhook_trigger`]) — is published on the
+//! A URL this service hands a caller to FOLLOW — the trigger URL a webhook publishes for a
+//! provider to POST to ([`crate::service::webhook_trigger`]), and the deep link an action's
+//! state carries for the resource the action acted on
+//! ([`crate::state::action_urls`]) — is published on the
 //! `host[:port]` the request that minted it reached this emulator at. That address is the
 //! only one a client on the machine this process runs on resolves, so a URL announced
 //! anywhere else is one no caller of this emulator can reach.
 //!
-//! It is not the reading for a URL this service merely REPORTS about another system: an
-//! action type's `entityUrlTemplate` is "[t]he URL returned to the CodePipeline console
-//! that provides a deep link to the resources of the external system", so the deep link an
-//! action's state carries ([`crate::state::action_urls`]) is published as that system's own
-//! console publishes it, and this emulator serves no console to move it to.
+//! It is not the reading for the text of a modelled member this service PUBLISHES about
+//! another system: an action type's `entityUrlTemplate` is "[t]he URL returned to the
+//! CodePipeline console that provides a deep link to the resources of the external system",
+//! so the catalog reports a template as that system publishes it
+//! ([`crate::state::built_in_catalog`]) and only the link RESOLVED from it, which a caller
+//! follows, is announced here.
 //!
 //! The reading is `service_common::data_plane_addressing`'s, in the order every data plane
 //! served at the front door announces an address in, so this service cannot drift from the

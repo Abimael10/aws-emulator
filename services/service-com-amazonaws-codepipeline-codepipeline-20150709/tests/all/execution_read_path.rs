@@ -22,7 +22,8 @@
 //!   repository service appears in it;
 //! * `ActionState$entityUrl` is the action type's published `entityUrlTemplate` with
 //!   every `{Config:<property>}` reference replaced by the action's configuration value
-//!   for that property, and is absent for an action type that publishes no template;
+//!   for that property, announced on the address the read reached this emulator at, and
+//!   is absent for an action type that publishes no template;
 //! * retrying a stage runs its failed action AGAIN, and each ATTEMPT is an action
 //!   execution of its own: the history holds one record per attempt, each under its own
 //!   `actionExecutionId`.
@@ -55,6 +56,13 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// The `FailureType` an action carries when its declaration cannot be executed at all.
 const CONFIGURATION_ERROR: &str = "ConfigurationError";
+
+/// The `host[:port]` this emulator publishes for itself here: the calls below address
+/// AWS's own endpoint host, and this router is served on no port, so a URL it announces
+/// names the base it publishes for itself (`smithy_server_runtime::UNSERVED_URL_BASE`).
+/// Which endpoint a link is announced on, over every address a read can arrive at, is
+/// `tests/all/reported_action_links.rs`.
+const EMULATOR_AUTHORITY: &str = "emulator.invalid";
 
 /// One emulator: the shared engine with CodePipeline, S3 and CodeCommit on it, and the
 /// router that dispatches to all three.
@@ -663,14 +671,16 @@ async fn a_missing_branch_fails_with_the_providers_configuration_error_sentence(
 
 /// RULE: `ActionState$entityUrl` is the deep link the action's type publishes
 /// (`ActionTypeSettings$entityUrlTemplate`) with every `{Config:<property>}` reference
-/// replaced by the action's configuration value for that property; an action type that
-/// publishes no template reports no URL at all.
+/// replaced by the action's configuration value for that property, announced on the
+/// address the reading request reached this emulator at; an action type that publishes no
+/// template reports no URL at all.
 ///
 /// The template is read back from `ListActionTypes` rather than written out here, so the
 /// assertion is that the state resolves the PUBLISHED template for the action rather than
 /// that it equals one particular string. The rows differ along what the rule generalises
 /// over: the action type (one with a template, one without) and the configuration values
-/// the template's references resolve to.
+/// the template's references resolve to. WHERE the link is announced is its own suite,
+/// over the endpoints a read can arrive at (`tests/all/reported_action_links.rs`).
 #[tokio::test]
 async fn an_action_state_reports_its_action_types_entity_url_resolved_for_the_action() {
     // (case, the repository and branch the source action is configured with)
@@ -721,14 +731,24 @@ async fn an_action_state_reports_its_action_types_entity_url_resolved_for_the_ac
         let template = published("Source", "CodeCommit").unwrap_or_else(|| {
             panic!("case {case:?}: the CodeCommit source type publishes a deep link")
         });
-        let expected = template
+        let resolved = template
             .replace("{Config:RepositoryName}", repository)
             .replace("{Config:BranchName}", branch);
         assert!(
-            !expected.contains("{Config:"),
+            !resolved.contains("{Config:"),
             "case {case:?}: every reference of the template is resolved by the action's \
-             configuration, got {expected}"
+             configuration, got {resolved}"
         );
+        // The resource the template names, announced on the address this emulator answers
+        // on: the console host the template carries is not one this emulator serves or is
+        // reached at, so the link a caller is handed names the resource under the
+        // emulator's own authority.
+        let resource = resolved
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.find(['/', '?', '#']).map(|start| &rest[start..]))
+            .unwrap_or_else(|| panic!("case {case:?}: {resolved} names a resource"));
+        let expected = format!("https://{EMULATOR_AUTHORITY}{resource}");
 
         let state = emulator
             .cp_ok("GetPipelineState", &json!({"name": pipeline}))

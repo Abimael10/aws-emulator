@@ -191,6 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .unwrap_or_default();
 
+        // The deep links a reported action carries name the console page of the Region
+        // the state is read in, and are announced on the address this request reached the
+        // emulator at — the one address the caller reading them can follow a link on.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let authority = crate::state::announced_authority(ctx);
+
         Ok(GetPipelineStateOutput {
             pipeline_name: Some(pipeline.declaration.name.clone()),
             pipeline_version: Some(pipeline.version),
@@ -204,9 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get(&input.name)
                     .map(Vec::as_slice)
                     .unwrap_or_default(),
-                // The deep links a reported action carries point into the console of the
-                // Region the state is read in.
-                &crate::state::request_region(&ctx.parts().headers),
+                crate::state::action_urls::ReportedLinkSite {
+                    region: &region,
+                    authority: &authority,
+                },
             )),
             created: Some(crate::state::to_date_time(pipeline.created)),
             updated: Some(crate::state::to_date_time(pipeline.updated)),
