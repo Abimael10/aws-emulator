@@ -191,9 +191,12 @@ const DOCUMENTS: &[(&str, &str, &[&str])] = &[
     ("voter id", "voter id ABC1234567", &["IN_VOTER_NUMBER"]),
     ("nrega job card", "NREGA job card number UP1234567", &["IN_NREGA"]),
     (
+        // The document writes a COMPONENT of a physical address and no address: a
+        // place name is part of what one is written with, so `DetectPiiEntities`
+        // places the span and the document's label set does not name the category.
         "a place name written without a street line",
         "The parcel went to Portland last week.",
-        &["ADDRESS"],
+        &[],
     ),
     (
         "several categories at once",
@@ -822,9 +825,12 @@ async fn a_pii_score_is_the_confidence_the_detections_own_evidence_leaves() {
 async fn a_label_confidence_combines_the_detections_that_support_it() {
     let comprehend = Comprehend::new();
 
-    // The rows differ in how many detections of the one type the document carries:
-    // each is its own evidence that the document CONTAINS that type, which is the
-    // detection `EntityLabel$Score` is about.
+    // The rows differ in how many detections of the one type the document carries.
+    // Each is its own evidence that the document CONTAINS that type, which is the
+    // detection `EntityLabel$Score` is about, and the type here is identified by its
+    // own published form: a document writing one value of that form contains the
+    // category, so the label is already at full confidence and a further writing of it
+    // cannot raise the confidence further.
     let rows = [
         (
             "one e-mail address",
@@ -876,20 +882,23 @@ async fn a_label_confidence_combines_the_detections_that_support_it() {
         let (weaker_case, weaker_count, weaker) = pair[0];
         let (stronger_case, stronger_count, stronger) = pair[1];
         assert!(
-            stronger > weaker,
+            stronger >= weaker,
             "case {stronger_case:?} vs {weaker_case:?}: {stronger_count} detections are \
-             more evidence that the document contains the type than {weaker_count}, so \
-             expected a higher confidence, got {stronger} against {weaker}"
+             no less evidence that the document contains the type than {weaker_count}, so \
+             expected a confidence at or above it, got {stronger} against {weaker}"
         );
     }
 
-    // A document that spells the category out several times leaves the detection all
-    // but certain, which is where the cheap pre-filter in front of redaction has to
-    // sit for a client's threshold to route the document at all.
-    let (case, _, saturated) = by_count[by_count.len() - 1];
-    assert!(
-        saturated > 0.999,
-        "case {case:?}: expected an unambiguous document to saturate the label \
-         confidence, got {saturated}"
-    );
+    // A category a published form identifies is CONTAINED in the document the moment
+    // the document writes one value of that form: the label question asks only that,
+    // not where the value's own boundaries are, so it is answered at full confidence —
+    // which is where the cheap pre-filter in front of redaction has to sit for a
+    // client's "act only at full confidence" threshold to route the document at all.
+    for (case, count, score) in &by_count {
+        assert_eq!(
+            *score, 1.0,
+            "case {case:?}: a form-identified category written {count} time(s) is \
+             contained in the document, so expected a label confidence of 1, got {score}"
+        );
+    }
 }

@@ -2331,9 +2331,23 @@ pub(crate) fn entity_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
         .collect()
 }
 
+/// What a PII-bearing span the recogniser placed IS, for the operation that asks
+/// which categories a document holds: a whole value of its modelled `PiiEntityType`,
+/// or a component of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PiiExtent {
+    /// The characters are a value of the type: a person's name is the whole of the
+    /// modelled `NAME`.
+    WholeValue,
+    /// The characters are part of what a value of the type is written with: a place
+    /// name is one line of the physical address the modelled `ADDRESS` is.
+    Component,
+}
+
 /// Every mention of a kind the PII family reports, as its BYTE span, the modelled
-/// `PiiEntityType` that kind is reported under, and the confidence the recogniser's
-/// own evidence leaves the reading.
+/// `PiiEntityType` that kind is reported under, the confidence the recogniser's own
+/// evidence leaves the reading, and whether those characters are a whole value of that
+/// type or only a component of one.
 ///
 /// The ONE recogniser of the things a document NAMES, read by the PII family: a
 /// personal name and a place name carry no closed form, so what places one is the
@@ -2345,28 +2359,32 @@ pub(crate) fn entity_spans(text: &str) -> Vec<(Range<usize>, &'static str)> {
 /// entities from this list rather than from a second, narrower recogniser of their
 /// own, and report each with the confidence the recognition carries.
 ///
-/// The two kinds, and why each is PII:
-/// * a `PERSON` is the modelled `NAME`, "an individual's name";
-/// * a `LOCATION` is a component of the modelled `ADDRESS`, documented as a physical
+/// The two kinds, why each is PII, and which of them is a whole value of its type:
+/// * a `PERSON` is the modelled `NAME`, "an individual's name", and a name the
+///   recogniser placed is that whole value — the document writes nothing more of it;
+/// * a `LOCATION` is a COMPONENT of the modelled `ADDRESS`, documented as a physical
 ///   address, which "can include a street, building, location, city, state, country,
 ///   county, zip, precinct, neighborhood" — so a place name the document writes is an
-///   address component whether or not a street line stands beside it. Where one does,
-///   the PII recognizer's own street-address rule claims the whole line and the
-///   overlap sweep drops this narrower span.
+///   address component whether or not a street line stands beside it, and a document
+///   writing only the component has not written the whole address. Where a street line
+///   does stand beside it, the PII recognizer's own street-address rule claims the
+///   whole line and the overlap sweep drops this narrower span.
 ///
 /// Byte offsets, because that is the scale the PII recognizer resolves overlaps on
 /// before translating the surviving spans to the character offsets the modelled
 /// members carry.
-pub(crate) fn pii_bearing_spans(text: &str) -> Vec<(Range<usize>, &'static str, f32)> {
+pub(crate) fn pii_bearing_spans(
+    text: &str,
+) -> Vec<(Range<usize>, &'static str, f32, PiiExtent)> {
     recognised_spans(text)
         .into_iter()
         .filter_map(|(span, entity_type, confidence)| {
-            let pii_type = match entity_type {
-                TYPE_PERSON => "NAME",
-                TYPE_LOCATION => "ADDRESS",
+            let (pii_type, extent) = match entity_type {
+                TYPE_PERSON => ("NAME", PiiExtent::WholeValue),
+                TYPE_LOCATION => ("ADDRESS", PiiExtent::Component),
                 _ => return None,
             };
-            Some((span, pii_type, confidence))
+            Some((span, pii_type, confidence, extent))
         })
         .collect()
 }

@@ -21,7 +21,9 @@
 //! and `DetectEntities` cannot disagree. Each span carries the confidence ITS OWN
 //! evidence leaves, never a constant of the rule class that found it, and this
 //! operation combines the spans of one type into the confidence that the document
-//! CONTAINS that type ([`labels_of`]), which is the detection its `Labels` are about.
+//! CONTAINS that type ([`labels_of`]), which is the detection its `Labels` are about —
+//! a coarser question than any one span's, which a whole value of the type answers and
+//! a component of one does not put in the label set at all.
 //! `DetectPiiEntities` projects the same spans into `PiiEntity` values, so the two
 //! operations agree by construction.
 //!
@@ -234,6 +236,16 @@ const EVIDENCE_PER_CORROBORATING_OCCURRENCE: f64 = 1.25;
 /// left open and lands materially below it.
 const READING_NOT_PII: f64 = 0.04;
 
+/// The confidence that a document CONTAINS a type it writes a whole value of, which is
+/// the question [`labels_of`] answers.
+///
+/// Full, and not as a choice: the label asks only whether the document holds such a
+/// value, and a whole value of the type IS one — the reading in which the document
+/// carries nothing of the kind has nothing left to stand on, however the span's own
+/// boundaries are drawn. The uncertainty a detection does carry belongs to the span,
+/// which is where `DetectPiiEntities` reports it.
+const CONTAINED: f32 = 1.0;
+
 /// What one detection's own evidence weighs, for and against the reading it is
 /// reported with: the service's one tally
 /// (`crate::ops::detect_entities::Reading`), with the weights this recognizer reads a
@@ -265,6 +277,10 @@ pub struct PiiSpan {
     pub entity_type: &'static str,
     /// What the rule that found this span verified.
     pub evidence: Evidence,
+    /// Whether these characters are a COMPLETE value of the type, which is what
+    /// answers whether the document CONTAINS it, or only a component of one (a place
+    /// name where the type is a physical address).
+    pub complete: bool,
     /// The confidence this detection's OWN evidence leaves the reading, in (0, 1).
     pub score: f32,
     pub begin: usize,
@@ -283,6 +299,39 @@ struct Rule {
     group: usize,
     /// A check the matched value must pass, for a type whose standard gives it one.
     validate: Option<fn(&str) -> bool>,
+}
+
+/// The published form of an e-mail address: RFC 5322's addr-spec, in the practical
+/// form a document carries it — a local part, `@`, and a dotted domain closed by a
+/// letter top-level label, so the period that ends a sentence stays outside it.
+///
+/// Named here, beside the rule that types it `EMAIL`, because this module is where the
+/// published forms of PII live; `crate::ops::detect_syntax` reads it (through
+/// [`unbroken_word_form`]) to find where a document's WORD boundaries are, so a
+/// correction to the form corrects both the typing and the segmentation.
+pub(crate) const EMAIL_FORM: &str = r"(?i)\b[\w.%+\-]+@[\w\-]+(?:\.[\w\-]+)*\.\p{L}{2,}";
+
+/// The published form of an absolute URI: RFC 3986's scheme-prefixed form. See
+/// [`EMAIL_FORM`] for why the form is named here.
+pub(crate) const ABSOLUTE_URI_FORM: &str = r#"(?i)\b(?:https?|ftp)://[^\s<>"']+"#;
+
+/// The scheme-less host form a document writes a URL as. See [`EMAIL_FORM`].
+pub(crate) const HOST_URI_FORM: &str =
+    r#"(?i)\bwww\.[\w\-]+(?:\.[\w\-]+)*\.\p{L}{2,}(?:/[^\s<>"']*)?"#;
+
+/// The three forms above as ONE pattern, compiled once: the values a document writes
+/// as a single unbroken word.
+///
+/// An alternation rather than three patterns, because the matcher's own left-to-right
+/// walk then returns the matches in document order and WITHOUT overlap — no caller
+/// resolves overlaps a second time. The e-mail form stands first, so an address whose
+/// domain also reads as a host name is matched as the address it is.
+pub(crate) fn unbroken_word_form() -> &'static Regex {
+    static FORM: OnceLock<Regex> = OnceLock::new();
+    FORM.get_or_init(|| {
+        let alternation = [EMAIL_FORM, ABSOLUTE_URI_FORM, HOST_URI_FORM].join("|");
+        Regex::new(&alternation).expect("the published word forms are valid regexes")
+    })
 }
 
 /// Every rule, built once: compiling 30-odd regexes costs far more than matching a
@@ -309,25 +358,13 @@ fn rules() -> &'static [Rule] {
         };
         vec![
             // RFC 5322 addr-spec, in the practical form a document carries it.
-            rule(
-                "EMAIL",
-                Evidence::Format,
-                r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}\b",
-                0,
-                None,
-            ),
+            rule("EMAIL", Evidence::Format, EMAIL_FORM, 0, None),
             // RFC 3986 absolute URI, and the scheme-less host form a document uses.
+            rule("URL", Evidence::Format, ABSOLUTE_URI_FORM, 0, None),
             rule(
                 "URL",
                 Evidence::Format,
-                r#"(?i)\b(?:https?|ftp)://[^\s<>"']+"#,
-                0,
-                None,
-            ),
-            rule(
-                "URL",
-                Evidence::Format,
-                r#"(?i)\bwww\.[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}(?:/[^\s<>"']*)?"#,
+                HOST_URI_FORM,
                 0,
                 None,
             ),
@@ -708,6 +745,9 @@ struct ByteSpan {
     /// span, for a mention IT placed rather than a rule here. One recognition, one
     /// confidence: a name is reported with the confidence it was recognised with.
     recognised: Option<f32>,
+    /// Whether the span is a COMPLETE value of its type rather than a component of
+    /// one. See [`PiiSpan::complete`].
+    complete: bool,
 }
 
 /// Place every PII entity this service's recognizer can find in `text`.
@@ -766,6 +806,9 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
                     .map_or(0, |whole| whole.as_str().chars().count())
                     .saturating_sub(found.as_str().chars().count()),
                 recognised: None,
+                // A rule's pattern IS a value of its type, written out: a mail
+                // address, a checksummed number, the whole address line.
+                complete: true,
             });
         }
     }
@@ -781,10 +824,13 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
     // here, so the two operations cannot disagree about what a document names, and
     // each is reported with the confidence THAT recognition carries. The evidence
     // class is `Context` for the reason the rules above carry it: what admits the
-    // value is the text around it, not a form or a check digit of its own. Where a
+    // value is the text around it, not a form or a check digit of its own, and the
+    // recogniser also says which of the two is a WHOLE value of its type. Where a
     // rule above claimed a wider span over the same characters — the street-address
     // rule over the whole address line — the overlap sweep below keeps the wider one.
-    for (span, entity_type, confidence) in crate::ops::detect_entities::pii_bearing_spans(text) {
+    for (span, entity_type, confidence, extent) in
+        crate::ops::detect_entities::pii_bearing_spans(text)
+    {
         matched.push(ByteSpan {
             entity_type,
             evidence: Evidence::Context,
@@ -792,6 +838,7 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
             end: span.end,
             label_chars: 0,
             recognised: Some(confidence),
+            complete: extent == crate::ops::detect_entities::PiiExtent::WholeValue,
         });
     }
 
@@ -898,6 +945,7 @@ pub fn detect_pii_spans(text: &str) -> Vec<PiiSpan> {
             PiiSpan {
                 entity_type: span.entity_type,
                 evidence: span.evidence,
+                complete: span.complete,
                 score,
                 begin: translate(span.begin),
                 end: translate(span.end),
@@ -1189,43 +1237,47 @@ impl<Eng> ContainsPiiEntities<Eng> {
     }
 }
 
-/// The distinct entity types `spans` carry, each with the confidence the detections
-/// supporting it add up to, ordered by descending confidence and then by type name so
-/// repeating a call returns the same list.
+/// The PII types the document CONTAINS, each with the confidence of that detection, in
+/// type-name order so repeating a call returns the same list.
 ///
 /// The modelled `EntityLabel$Score` is "the level of confidence that Amazon Comprehend
 /// has in the accuracy of the detection" — of the detection that the document CONTAINS
-/// that type, which is a different question from any one span's. Each span of the type
-/// is its own evidence for it, so the label's confidence is the complement of the
-/// product of their complements: it is at least as high as the best single span and
-/// rises with every further one, so a document writing a type once is reported below
-/// one writing it three times, and a document that spells a category out
-/// unambiguously is reported at the top of the scale. It is a function of the
-/// detections, never a constant of the type.
+/// the type, which is a DIFFERENT and coarser question from any one span's: a span's
+/// own confidence carries the risk that THESE characters are the value and that its
+/// boundaries are right, where the label answers only whether the document holds such
+/// a value at all.
+///
+/// So the label question is answered over the spans that are a WHOLE value of their
+/// type. A document writing a mail address contains one, and a document naming a person
+/// contains that person's name, whether or not the recogniser drew either boundary
+/// exactly where a reader would: the reading in which the document carries nothing of
+/// the kind is CLOSED by that value, which is why such a type is reported at
+/// [`CONTAINED`] rather than at what one span's boundaries leave. A span that is only a
+/// COMPONENT of its type closes nothing and does not put the type in the label set: a
+/// city is part of what a physical address is written with, and a document naming one
+/// has not written an address, so the category is not one the document carries —
+/// `DetectPiiEntities` still reports that span, with the confidence its own evidence
+/// leaves, because it answers which characters bear PII rather than which categories
+/// the document holds.
+///
+/// What the answer therefore follows is the detections: WHICH types are labelled is
+/// read off the document's spans, and a type the document writes nothing whole of is
+/// not labelled at all.
 fn labels_of(spans: &[PiiSpan]) -> Vec<EntityLabel> {
-    let mut combined: Vec<(&'static str, f32)> = Vec::new();
-    for span in spans {
-        match combined.iter_mut().find(|(name, _)| *name == span.entity_type) {
-            // Independent evidence for the same type: the confidence that none of
-            // the spans is a detection of it is the product of their complements.
-            Some((_, absent)) => *absent *= 1.0 - span.score,
-            None => combined.push((span.entity_type, 1.0 - span.score)),
+    let mut contained: Vec<&'static str> = Vec::new();
+    for span in spans.iter().filter(|span| span.complete) {
+        if !contained.contains(&span.entity_type) {
+            contained.push(span.entity_type);
         }
     }
-    let mut best: Vec<(&'static str, f32)> = combined
+    // Every label answers the one question at the same confidence, so the order is the
+    // type's name — a total order over the catalog, which keeps the list stable.
+    contained.sort_unstable();
+    contained
         .into_iter()
-        .map(|(name, absent)| (name, (1.0 - absent).clamp(0.0, 1.0)))
-        .collect();
-    best.sort_by(|(left_name, left_score), (right_name, right_score)| {
-        right_score
-            .partial_cmp(left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(left_name.cmp(right_name))
-    });
-    best.into_iter()
-        .map(|(name, score)| EntityLabel {
+        .map(|name| EntityLabel {
             name: Some(name.to_string()),
-            score: Some(score),
+            score: Some(CONTAINED),
         })
         .collect()
 }

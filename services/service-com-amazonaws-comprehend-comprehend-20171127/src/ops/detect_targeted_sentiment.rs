@@ -30,6 +30,18 @@
 //! mention short nor leaves the rest of that name to open a mention — or an entity
 //! group — of its own. See [`place_mentions`].
 //!
+//! What is GROUPED rather than placed: a document mentions one entity in more than one
+//! way, and every such mention belongs to that entity's group instead of opening a
+//! group of its own — the same surface form again, and a pronoun referring back to it.
+//! See [`group_mentions`]; a group's `GroupScore` is the confidence of the link that
+//! placed each mention in it.
+//!
+//! What is not placed at all: a noun phrase that REFERS to nothing. The predicate a
+//! copula states of its subject ascribes a category to it rather than naming a further
+//! thing (`Amazon Comprehend is a natural language processing service` writes ONE
+//! entity and says what kind of thing it is), so such a phrase is no target — while the
+//! same words standing as a clause's subject or object refer, and are.
+//!
 //! The honest limits of that, which a reader of the response should know: an
 //! adjective in a noun phrase can be taken for its head, a capitalised word that is
 //! not a proper noun is taken for one, and the finer types a learned model assigns
@@ -1005,19 +1017,35 @@ fn place_mentions(text: &str, words: &[Word<'_>], entities: &[Recognition]) -> V
             continue;
         }
 
-        // A determiner opens a noun phrase whose head is a mention.
+        // A determiner opens a noun phrase whose head is a mention — unless that
+        // phrase refers to nothing. The predicate a copula states of its subject
+        // ascribes a category to it (`Amazon Comprehend is a natural language
+        // processing service`): the words name what KIND of thing the subject is
+        // rather than a further thing the document writes about, so no sentiment is
+        // directed at them and they are no target. The phrase is still consumed, so no
+        // word inside it opens a mention of its own.
         if DETERMINERS.contains(&lower.as_str()) {
             if let Some((next, head)) = noun_phrase_head(words, &tags, index + 1) {
-                found.push(Mention::new(
-                    text,
-                    head.start,
-                    head.end,
-                    Kind::CommonNoun,
-                    "OTHER",
-                    mention_score(entities, &head, phrase_head_confidence(head.text)),
-                    head.sentence,
-                    None,
-                ));
+                let predicative = index
+                    .checked_sub(1)
+                    .and_then(|before| words.get(before))
+                    .is_some_and(|before| {
+                        before.sentence == word.sentence
+                            && crate::ops::detect_syntax::COPULA_FORMS
+                                .contains(&before.text.to_lowercase().as_str())
+                    });
+                if !predicative {
+                    found.push(Mention::new(
+                        text,
+                        head.start,
+                        head.end,
+                        Kind::CommonNoun,
+                        "OTHER",
+                        mention_score(entities, &head, phrase_head_confidence(head.text)),
+                        head.sentence,
+                        None,
+                    ));
+                }
                 index = next;
                 continue;
             }

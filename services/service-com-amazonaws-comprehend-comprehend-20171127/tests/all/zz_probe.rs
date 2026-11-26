@@ -61,9 +61,12 @@ const PII_ENTITIES: &[(&str, &str)] = &[
 /// answers which CHARACTERS it typed and types the company name and the product name
 /// beside it separately, while a targeted-sentiment mention is the whole name the
 /// document writes, typed by the part that says what is named.
+///
+/// The predicate of the first clause (`is a natural language processing service`) is
+/// no mention: it says what KIND of thing the document's subject is rather than naming
+/// a further thing, so no sentiment is directed at it.
 const TARGETS: &[(&str, &str)] = &[
     ("Amazon Comprehend", "ORGANIZATION"),
-    ("service", "OTHER"),
     ("John Smith", "PERSON"),
     ("123", "QUANTITY"),
     ("Main Street", "LOCATION"),
@@ -300,13 +303,8 @@ const TOKENS: &[(&str, &str)] = &[
     ("WA", "PROPN"),
     ("98101", "NUM"),
     ("or", "CCONJ"),
-    ("john", "NOUN"),
-    (".", "PUNCT"),
-    ("smith", "NOUN"),
-    ("@", "PUNCT"),
-    ("example", "NOUN"),
-    (".", "PUNCT"),
-    ("com", "NOUN"),
+    // A mail address is one word of the document, and no word class claims it.
+    ("john.smith@example.com", "O"),
     ("for", "ADP"),
     ("more", "NOUN"),
     ("details", "NOUN"),

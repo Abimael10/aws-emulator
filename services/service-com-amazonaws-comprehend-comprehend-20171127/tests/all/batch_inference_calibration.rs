@@ -648,16 +648,6 @@ async fn a_tag_is_the_reading_the_token_and_its_context_support() {
                 score > 0.0 && score <= 1.0,
                 "case {case:?}: expected a Score in (0, 1], got {score} in {token}"
             );
-            // A word is read out of an open vocabulary, so no labelling of one is
-            // certain; a token whose class its Unicode category decides —
-            // punctuation, a figure — carries no other reading at all.
-            if text.chars().any(char::is_alphabetic) {
-                assert!(
-                    score < 1.0,
-                    "case {case:?}: expected the confidence of a word to stay below 1, \
-                     got {score} in {token}"
-                );
-            }
             tagged.push((case, text, tag, score));
         }
 

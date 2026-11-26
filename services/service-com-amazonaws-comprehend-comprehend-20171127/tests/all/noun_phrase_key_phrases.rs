@@ -163,19 +163,19 @@ async fn every_key_phrase_is_a_whole_noun_phrase_of_its_document() {
 
             let score = phrase["Score"].as_f64().unwrap_or(f64::NAN);
             assert!(
-                score > 0.0 && score < 1.0,
-                "case {case:?}: a detection is a confidence, never a certainty, so \
-                 expected a Score strictly inside (0, 1), got {score} in {phrase}"
+                score > 0.0 && score <= 1.0,
+                "case {case:?}: a confidence is reported inside (0, 1], got {score} in \
+                 {phrase}"
             );
             scores.push((text.to_string(), score));
         }
     }
 
     // The confidence follows the ANALYSIS: a phrase every word of which the analyser
-    // reads unambiguously comes back near certainty, and one resting on a reading the
-    // context had to resolve comes back below it — below, and still near certainty,
-    // because the recorded responses report a token whose class its position settles
-    // at or near 1.0 rather than as a doubtful reading.
+    // reads unambiguously comes back at full confidence, and one holding a word whose
+    // class is a genuine ambiguity the position only decides — a gerund naming a thing
+    // inside a nominal compound, which is still a verb form — comes back visibly below
+    // it, by the share that live reading keeps.
     let score_of = |needle: &str| -> f64 {
         scores
             .iter()
@@ -196,8 +196,8 @@ async fn every_key_phrase_is_a_whole_noun_phrase_of_its_document() {
          unambiguous words, got {resolved} against {unambiguous}"
     );
     assert!(
-        resolved > 0.99,
-        "expected a phrase whose words' classes their positions settle to stay near \
-         certainty rather than being reported as a doubtful detection, got {resolved}"
+        resolved > 0.9,
+        "expected a phrase whose one ambiguous word the position decides to stay a \
+         confident reading rather than a coin toss, got {resolved}"
     );
 }

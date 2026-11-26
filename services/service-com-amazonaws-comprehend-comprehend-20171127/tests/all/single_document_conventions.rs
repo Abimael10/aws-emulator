@@ -21,20 +21,27 @@
 //!    position it stands in — a name's words are `PROPN`, a copula standing as its
 //!    clause's only verb is `VERB`, a relativizer standing for the noun its clause
 //!    modifies is `PRON`, and a gerund naming a thing inside a nominal compound is
-//!    `NOUN`.
+//!    `NOUN` — the token list holds ONE record per word of the document, a word the
+//!    document writes unbroken (a mail address, a URL) included, and a token's
+//!    confidence is the supported reading's share of the readings its evidence leaves.
 //! 4. `DetectPiiEntities` / `ContainsPiiEntities`: a modelled PII type with no closed
 //!    form of its own is still placed — a personal NAME the document does not
 //!    introduce with a courtesy title, and an ADDRESS over the whole address the
-//!    document writes — and the two operations answer the same set of types.
+//!    document writes — and `Labels` names the categories the document CONTAINS: a
+//!    category it writes a whole value of, at the confidence that settles, and not one
+//!    it writes only a component of.
 //! 5. `DetectEntities` / `DetectTargetedSentiment`: a company's name followed by a
 //!    name of its own is TWO entities (the company, then its product), and targeted
 //!    sentiment types every target from that same recogniser, including a named thing
 //!    the document writes without a capital.
+//! 6. `DetectTargetedSentiment`: a noun phrase that REFERS to nothing is no target —
+//!    the predicate a copula states of its subject says what kind of thing the subject
+//!    is rather than naming a further thing to direct sentiment at.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
-    ENTITY_TYPE_VALUES, PART_OF_SPEECH_TAG_TYPE_VALUES, TARGETED_SENTIMENT_ENTITY_TYPE_VALUES,
-    TOXIC_CONTENT_TYPE_VALUES,
+    ENTITY_TYPE_VALUES, PART_OF_SPEECH_TAG_TYPE_VALUES, PII_ENTITY_TYPE_VALUES,
+    TARGETED_SENTIMENT_ENTITY_TYPE_VALUES, TOXIC_CONTENT_TYPE_VALUES,
 };
 
 use crate::comprehend_client::Comprehend;
@@ -519,8 +526,9 @@ async fn the_pii_family_places_every_type_the_document_carries() {
             );
         }
 
-        // The two operations read ONE recogniser, so the label set is exactly the set
-        // of types the entity list carries.
+        // The two operations read ONE recogniser: every type the document writes a
+        // whole value of is labelled, and every label names a type the entity list
+        // places a span of.
         let labelled = comprehend.ok("ContainsPiiEntities", &document(text)).await;
         let mut labels: Vec<String> = labelled["Labels"]
             .as_array()
@@ -536,10 +544,17 @@ async fn the_pii_family_places_every_type_the_document_carries() {
             .collect();
         types.sort();
         types.dedup();
-        assert_eq!(
-            labels, types,
-            "case {case:?}: ContainsPiiEntities labels the types DetectPiiEntities \
-             places, got {labels:?} against {types:?}"
+        for (entity_type, _) in *expected {
+            assert!(
+                labels.iter().any(|label| label == entity_type),
+                "case {case:?}: the document writes a whole {entity_type}, so expected it \
+                 among the labels, got {labels:?}"
+            );
+        }
+        assert!(
+            labels.iter().all(|label| types.contains(label)),
+            "case {case:?}: every label names a type DetectPiiEntities places, got \
+             {labels:?} against {types:?}"
         );
     }
 }
@@ -712,5 +727,478 @@ async fn targeted_sentiment_types_every_target_from_the_entity_recogniser() {
             "case \"named targets\": expected {value:?} to be mentioned by exactly one \
              entity, got {holders} in {output}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. DetectSyntax: one token per WORD, a word written unbroken included
+// ---------------------------------------------------------------------------
+
+/// `(case, document, the (word, tag) pairs the token list must hold as ONE token
+/// each)`.
+///
+/// `SyntaxTokens` is documented as "one syntax token record for each word in the
+/// source text", so the rows differ along what makes a word hard to find rather than
+/// along the word: the separators a mail address and a URI carry inside them, which
+/// the word rules break on, where such a word stands in its sentence, and the
+/// punctuation the document writes after it. The last row is the word-internal
+/// punctuation the word rules already keep whole, so the table spans both kinds.
+const UNBROKEN_WORDS: &[SyntaxRow] = &[
+    (
+        "a mail address in running text",
+        "Write to jane.roe@example.com before noon.",
+        &[("jane.roe@example.com", "O")],
+    ),
+    (
+        "a mail address closing a sentence",
+        "Write to jane.roe@example.com.",
+        // The sentence's own period is a token of its own, not part of the address.
+        &[("jane.roe@example.com", "O"), (".", "PUNCT")],
+    ),
+    (
+        "an absolute URI with a path",
+        "The dashboard lives at https://example.com/docs/profile for now.",
+        &[("https://example.com/docs/profile", "O")],
+    ),
+    (
+        "a scheme-less host name with a path",
+        "See www.example.co.uk/help before calling.",
+        &[("www.example.co.uk/help", "O")],
+    ),
+    (
+        "a mail address whose local part carries digits and a plus",
+        "Mail ops+alerts2@mail.example.com today.",
+        &[("ops+alerts2@mail.example.com", "O")],
+    ),
+    (
+        "a mail address whose local part is not ASCII",
+        "Mail jos\u{e9}.p@example.com today.",
+        &[("jos\u{e9}.p@example.com", "O")],
+    ),
+    (
+        "the word-internal punctuation the word rules keep",
+        "The company's invoice for 1,250.50 arrived.",
+        &[("company's", "NOUN"), ("1,250.50", "NUM")],
+    ),
+];
+
+#[tokio::test]
+async fn syntax_reports_one_token_per_word_of_the_document() {
+    let comprehend = Comprehend::new();
+
+    for (case, text, expected) in UNBROKEN_WORDS {
+        let output = comprehend.ok("DetectSyntax", &document(text)).await;
+        let tokens = output["SyntaxTokens"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected SyntaxTokens, got {output}"))
+            .clone();
+
+        let characters: Vec<char> = text.chars().collect();
+        let mut read: Vec<(String, String)> = Vec::new();
+        for (position, token) in tokens.iter().enumerate() {
+            let begin = token["BeginOffset"].as_u64().unwrap_or_default() as usize;
+            let end = token["EndOffset"].as_u64().unwrap_or_default() as usize;
+            let slice: String = characters[begin..end.min(characters.len())]
+                .iter()
+                .collect();
+            assert_eq!(
+                token["Text"].as_str(),
+                Some(slice.as_str()),
+                "case {case:?}: a token's Text is the characters its offsets delimit, \
+                 got {token}"
+            );
+            assert_eq!(
+                token["TokenId"].as_u64(),
+                Some(position as u64 + 1),
+                "case {case:?}: TokenId is the token's 1-based position, got {token}"
+            );
+            read.push((
+                slice,
+                token["PartOfSpeech"]["Tag"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+        }
+
+        // Every non-whitespace character of the document belongs to exactly one
+        // token, in order: nothing is dropped and no record is emitted past the end
+        // of the text.
+        let rejoined: String = read.iter().map(|(text, _)| text.as_str()).collect();
+        let without_whitespace: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            rejoined, without_whitespace,
+            "case {case:?}: the tokens cover every non-whitespace character of the \
+             document exactly once, got {rejoined:?} for {without_whitespace:?}"
+        );
+
+        for (word, tag) in *expected {
+            assert!(
+                PART_OF_SPEECH_TAG_TYPE_VALUES.contains(tag),
+                "case {case:?}: {tag:?} is not a modelled PartOfSpeechTagType value"
+            );
+            let records: Vec<&(String, String)> =
+                read.iter().filter(|(text, _)| text == word).collect();
+            assert_eq!(
+                records.len(),
+                1,
+                "case {case:?}: expected {word:?} to come back as exactly one token, \
+                 got {read:?}"
+            );
+            assert_eq!(
+                records[0].1, *tag,
+                "case {case:?}: expected {word:?} to read {tag:?}, got {:?} in {read:?}",
+                records[0].1
+            );
+        }
+    }
+}
+
+/// `(case, document, word, whether the position SETTLES the word's class)`.
+///
+/// `PartOfSpeech.Score` is "the confidence that Amazon Comprehend has that the part of
+/// speech was correctly identified", so the rows differ along how much the word's
+/// class is in doubt: a word one word class claims and nothing competes for, three
+/// words whose class the position they stand in settles, and two whose verbal reading
+/// the position prefers against without excluding it — a gerund naming a thing inside a
+/// nominal compound is still a verb form, wherever in the compound it stands.
+const TOKEN_CONFIDENCES: &[(&str, &str, &str, bool)] = &[
+    ("a word one word class claims", "The flight left.", "The", true),
+    (
+        "a word standing inside a name",
+        "The parcel went to Main Street yesterday.",
+        "Main",
+        true,
+    ),
+    (
+        "a relativizer standing for the noun its clause modifies",
+        "The service that uses machine learning is new.",
+        "that",
+        true,
+    ),
+    (
+        "a copula standing as its clause's only verb",
+        "The staff were rude.",
+        "were",
+        true,
+    ),
+    (
+        "a gerund naming a thing inside a nominal compound",
+        "The language processing service is new.",
+        "processing",
+        false,
+    ),
+    (
+        "a gerund heading a nominal compound",
+        "Machine learning finds insights.",
+        "learning",
+        false,
+    ),
+];
+
+#[tokio::test]
+async fn a_tokens_confidence_is_the_share_of_the_readings_its_evidence_leaves() {
+    let comprehend = Comprehend::new();
+    let mut settled: Vec<(&str, f64)> = Vec::new();
+    let mut ambiguous: Vec<(&str, f64)> = Vec::new();
+
+    for (case, text, word, is_settled) in TOKEN_CONFIDENCES {
+        let output = comprehend.ok("DetectSyntax", &document(text)).await;
+        let tokens = output["SyntaxTokens"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected SyntaxTokens, got {output}"))
+            .clone();
+        let token = tokens
+            .iter()
+            .find(|token| token["Text"].as_str() == Some(*word))
+            .unwrap_or_else(|| panic!("case {case:?}: no token {word:?} in {tokens:?}"));
+        let score = token["PartOfSpeech"]["Score"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            score > 0.0 && score <= 1.0,
+            "case {case:?}: a confidence is reported inside (0, 1], got {score} in {token}"
+        );
+        if *is_settled {
+            // Nothing is left competing for the reading, so the confidence is at or
+            // next to the top of the scale.
+            assert!(
+                score > 0.99,
+                "case {case:?}: the position settles {word:?}, so expected a confidence \
+                 at or next to 1, got {score} in {token}"
+            );
+            settled.push((case, score));
+        } else {
+            // The other reading is one the word really has here, so it keeps a visible
+            // share of the confidence — and the supported reading still leads clearly.
+            assert!(
+                score > 0.9 && score < 0.99,
+                "case {case:?}: {word:?} keeps a live second reading, so expected a \
+                 confidence visibly below 1 and still a confident reading, got {score} \
+                 in {token}"
+            );
+            ambiguous.push((case, score));
+        }
+    }
+
+    // A word only one word class claims, standing where no other reading is open, is
+    // identified with nothing competing for the confidence at all.
+    let (case, unambiguous) = settled[0];
+    assert_eq!(
+        unambiguous, 1.0,
+        "case {case:?}: one reading and no competitor is a full confidence, got \
+         {unambiguous}"
+    );
+    // The two kinds are DISTINGUISHABLE, which is what a caller filtering on
+    // confidence reads: every settled token is reported above every ambiguous one.
+    for (settled_case, settled_score) in &settled {
+        for (ambiguous_case, ambiguous_score) in &ambiguous {
+            assert!(
+                settled_score > ambiguous_score,
+                "case {settled_case:?} vs {ambiguous_case:?}: expected a settled reading \
+                 above an ambiguous one, got {settled_score} against {ambiguous_score}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. ContainsPiiEntities: the label set names the categories the document holds
+// ---------------------------------------------------------------------------
+
+/// `(case, document, the labels the response must hold, and nothing else)`.
+///
+/// `EntityLabel` is documented as one of "the label or labels that categorize the
+/// personally identifiable information (PII) entity being analyzed", so the rows differ
+/// along WHICH categories a document carries and how each is written: a value its own
+/// published form spells out, a personal name the recogniser places, a physical address
+/// written as the whole line, and two documents naming a place without writing an
+/// address at all — a city or a region code is part of what an address is written with,
+/// so the document has not written one and the category is not among the labels, even
+/// though `DetectPiiEntities` reports the place name it did write.
+type PiiLabelRow = (&'static str, &'static str, &'static [&'static str]);
+const PII_LABELS: &[PiiLabelRow] = &[
+    (
+        "a personal name and a mail address",
+        "John Smith can be reached at john.smith@example.com.",
+        &["EMAIL", "NAME"],
+    ),
+    (
+        "a street address written with its locality line",
+        "The parcel went to 42 Oak Avenue, Portland, OR 97201 last week.",
+        &["ADDRESS"],
+    ),
+    (
+        "a place name written without a street line",
+        "The parcel went to Portland last week.",
+        &[],
+    ),
+    (
+        "a city and a region code written without a street line",
+        "The team met in Seattle, WA last week.",
+        &[],
+    ),
+    (
+        "a mail address alone",
+        "Write to ops@example.com now.",
+        &["EMAIL"],
+    ),
+];
+
+#[tokio::test]
+async fn a_pii_label_names_a_category_the_document_contains() {
+    let comprehend = Comprehend::new();
+
+    for (case, text, expected) in PII_LABELS {
+        let output = comprehend.ok("ContainsPiiEntities", &document(text)).await;
+        let labels = output["Labels"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected Labels, got {output}"))
+            .clone();
+
+        let mut read: Vec<String> = labels
+            .iter()
+            .map(|label| label["Name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for name in &read {
+            assert!(
+                PII_ENTITY_TYPE_VALUES.contains(&name.as_str()),
+                "case {case:?}: {name:?} is not a modelled PiiEntityType value"
+            );
+        }
+        read.sort();
+        let mut names: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+        names.sort();
+        assert_eq!(
+            read, names,
+            "case {case:?}: the labels name exactly the categories the document \
+             carries, expected {names:?}, got {labels:?}"
+        );
+
+        for name in *expected {
+            let score = labels
+                .iter()
+                .find(|label| label["Name"].as_str() == Some(*name))
+                .map(|label| label["Score"].as_f64().unwrap_or(f64::NAN))
+                .unwrap_or_else(|| panic!("case {case:?}: no {name} label in {labels:?}"));
+            // The question the label answers is whether the document CONTAINS the
+            // category, and a document writing a whole value of it — a mail address, a
+            // person's name, an address line — answers that outright, whatever the
+            // span's own boundaries leave open.
+            assert_eq!(
+                score, 1.0,
+                "case {case:?}: the document writes a whole {name}, so it contains the \
+                 category and the label is reported at full confidence, got {score}"
+            );
+        }
+
+        // The two PII operations read ONE recogniser, so every category the labels
+        // name is one the entity list places a span of — the label set is the
+        // categories the document CARRIES, which is why a span that is only a
+        // component of its type is placed without putting its type in the set.
+        let placed = comprehend.ok("DetectPiiEntities", &document(text)).await;
+        let mut types: Vec<String> = placed["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|entity| entity["Type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        types.sort();
+        types.dedup();
+        assert!(
+            read.iter().all(|label| types.contains(label)),
+            "case {case:?}: every label names a category DetectPiiEntities places a \
+             span of, got {read:?} against {types:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. DetectTargetedSentiment: a noun phrase that refers to nothing is no target
+// ---------------------------------------------------------------------------
+
+/// `(case, document, the thing the document is about, the head of the noun phrase in
+/// question, whether that phrase is a mention of an entity)`.
+///
+/// `TargetedSentimentMention$Text` is "the text in the document that identifies the
+/// entity", and the predicate a copula states of its subject identifies no entity: it
+/// says what KIND of thing the subject is, so there is nothing there for sentiment to
+/// be directed at. The rows differ along the construction the phrase stands in rather
+/// than along the phrase — the forms of the copula, and what kind of thing the subject
+/// is — and the last row is the control: a phrase of the same shape standing as a
+/// clause's object does refer to something, and is a target.
+type PredicationRow = (&'static str, &'static str, &'static str, &'static str, bool);
+const PREDICATIONS: &[PredicationRow] = &[
+    (
+        "a company and the kind of thing it is",
+        "Amazon Comprehend is a natural language processing service.",
+        "Amazon Comprehend",
+        "service",
+        false,
+    ),
+    (
+        "a person and the role they are",
+        "Jane Roe is the project manager.",
+        "Jane Roe",
+        "manager",
+        false,
+    ),
+    (
+        "a past-tense copula",
+        "Initech Inc was a small startup.",
+        "Initech Inc",
+        "startup",
+        false,
+    ),
+    (
+        "a noun phrase the clause's verb takes as its object",
+        "Amazon Comprehend reads the document.",
+        "Amazon Comprehend",
+        "document",
+        true,
+    ),
+];
+
+#[tokio::test]
+async fn a_noun_phrase_that_refers_to_nothing_is_not_a_targeted_mention() {
+    let comprehend = Comprehend::new();
+
+    for (case, text, subject, head, is_mention) in PREDICATIONS {
+        let output = comprehend
+            .ok("DetectTargetedSentiment", &document(text))
+            .await;
+        let entities = output["Entities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected Entities, got {output}"))
+            .clone();
+
+        // Every mention the response carries, with the group it sits in.
+        let characters: Vec<char> = text.chars().collect();
+        let mut mentions: Vec<(usize, String, String)> = Vec::new();
+        for (group, entity) in entities.iter().enumerate() {
+            for mention in entity["Mentions"].as_array().cloned().unwrap_or_default() {
+                let begin = mention["BeginOffset"].as_u64().unwrap_or_default() as usize;
+                let end = mention["EndOffset"].as_u64().unwrap_or_default() as usize;
+                let slice: String = characters[begin..end.min(characters.len())]
+                    .iter()
+                    .collect();
+                assert_eq!(
+                    mention["Text"].as_str(),
+                    Some(slice.as_str()),
+                    "case {case:?}: a mention's Text is the characters its offsets \
+                     delimit, got {mention}"
+                );
+                let entity_type = mention["Type"].as_str().unwrap_or_default().to_string();
+                assert!(
+                    TARGETED_SENTIMENT_ENTITY_TYPE_VALUES.contains(&entity_type.as_str()),
+                    "case {case:?}: {entity_type:?} is not a modelled \
+                     TargetedSentimentEntityType value"
+                );
+                mentions.push((group, slice, entity_type));
+            }
+        }
+
+        // What the document is about is a target whichever row this is.
+        let named: Vec<&(usize, String, String)> = mentions
+            .iter()
+            .filter(|(_, text, _)| text == subject)
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "case {case:?}: expected {subject:?} to be targeted exactly once, got \
+             {mentions:?}"
+        );
+
+        let found: Vec<&(usize, String, String)> =
+            mentions.iter().filter(|(_, text, _)| text == head).collect();
+        if *is_mention {
+            assert_eq!(
+                found.len(),
+                1,
+                "case {case:?}: {head:?} is what the clause is about, so expected it \
+                 targeted once, got {mentions:?}"
+            );
+            assert_ne!(
+                found[0].0, named[0].0,
+                "case {case:?}: {head:?} is not what {subject:?} is, so expected its own \
+                 entity group, got both in group {} in {entities:?}",
+                found[0].0
+            );
+        } else {
+            assert!(
+                found.is_empty(),
+                "case {case:?}: {head:?} heads the predicate the clause states of \
+                 {subject:?}, so it identifies no entity and is no target, got \
+                 {mentions:?}"
+            );
+            // Nothing else of that phrase is targeted either: the document writes ONE
+            // thing to be about.
+            assert_eq!(
+                entities.len(),
+                1,
+                "case {case:?}: the document writes one entity and says what kind of \
+                 thing it is, so expected one entity group, got {entities:?}"
+            );
+        }
     }
 }

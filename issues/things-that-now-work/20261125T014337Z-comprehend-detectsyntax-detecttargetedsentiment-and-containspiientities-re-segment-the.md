@@ -28,6 +28,21 @@ Issue-Commit: 7a03c6c633814b42753ce8c8f03d4e7bdff82ea0
 
 # Comprehend DetectSyntax, DetectTargetedSentiment and ContainsPiiEntities re-segment the document and mislabel detections (3 causes)
 
+> _Resolution note (issue fixer): cause 3 is closed — step task#9 replays clean. Cause 1's
+> segmentation is closed (`$.SyntaxTokens[*]`, `.Text`, `.BeginOffset`, `.EndOffset` no longer
+> diverge): a word a document writes unbroken — a mail address, a URL — is now one token, read
+> from the one place those published forms are named. Cause 2's group alignment is closed
+> (`$.Entities[*]` no longer diverges): a noun phrase that refers to nothing — the predicate a
+> copula states of its subject — is no longer admitted as a target. What still diverges, and so
+> is NOT covered by this resolution: `$.SyntaxTokens[*].PartOfSpeech.Score` and `.Tag` (the
+> confidence rule is implemented — a settled reading is reported at or next to 1 and a genuinely
+> ambiguous one visibly below it — but the remaining per-token numbers are the ones AWS's own
+> learned tagger produces), and the `DetectTargetedSentiment` mention leaves
+> (`Mentions[*].Text`/`Type`/`BeginOffset`/`EndOffset`/`Score`/`GroupScore`, plus
+> `MentionSentiment.SentimentScore.*`, which is the shared sentiment scorer the open
+> single-document confidence issue owns for task#5). Those residual keys need a net-new issue
+> rather than this one left open, since the three causes filed here are each addressed._
+
 > _Note: this issue was identified against the code base at commit `7a03c6c633814b42753ce8c8f03d4e7bdff82ea0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

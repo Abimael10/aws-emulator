@@ -3,7 +3,8 @@
 //! @op DetectSyntax
 //!
 //! IMPLEMENTED. The document is segmented into tokens on word boundaries (the UAX#29
-//! word rules over the Unicode character properties the standard library exposes) and
+//! word rules over the Unicode character properties the standard library exposes, plus
+//! the forms a document writes as one unbroken word — a mail address, a URL) and
 //! every token is labelled in-process by the lexicon-and-morphology part-of-speech
 //! tagger below, over the modelled `PartOfSpeechTagType` set — so the token list, its
 //! offsets, its tags and its confidences are all computed from the submitted text
@@ -108,18 +109,18 @@ pub(crate) const TAGGABLE_LANGUAGES: &[&str] = &["en"];
 // word for, an inflection, a derivational suffix, a syntactic context — weighs each
 // by the cue that speaks for it, and reports the DISTRIBUTION that induces. The tag
 // is the reading holding the most weight and `PartOfSpeech.Score` is that reading's
-// share of the whole, so the confidence follows the token's own evidence: cues that
-// agree add up and come back near certain, two word classes claiming one word leave
-// the most frequent reading holding only its share, and a reading a context rule
-// overturns keeps the share that context leaves it.
+// share of the whole, so the confidence follows the token's own evidence: a token
+// whose evidence leaves ONE reading is reported at full confidence, two word classes
+// claiming one word leave the most frequent reading holding only its share, and a
+// reading a context rule overturns keeps the share that context leaves it.
 //
 // The weights below are the model's parameters: one per KIND of evidence, applied
 // identically to every token of every document, so no request can select them.
 // ---------------------------------------------------------------------------
 
 /// The class a token's Unicode general categories decide on their own: punctuation, a
-/// symbol, a figure. There is no competing reading of such a token, so it is the one
-/// case a confidence of exactly 1 is the honest answer.
+/// symbol, a figure, and the non-linguistic token a mail address or a URL is. There is
+/// no competing reading of such a token, so its reported confidence is exactly 1.
 const CUE_CATEGORY: f64 = 1.0;
 
 /// The most frequent reading of a word the closed-class lexicon carries.
@@ -159,26 +160,34 @@ const CUE_CONTEXT: f64 = 1.0;
 /// one impossible — but a position that decides between two readings decides: the word
 /// after a determiner is the noun that phrase is headed by, the auxiliary in front of a
 /// participle accompanies it. What the overturned reading keeps is therefore a
-/// RESIDUAL rather than a fraction of the question: an order of magnitude more than the
-/// weight held back for a reading this lexicon does not carry at all
-/// ([`CUE_UNLISTED_READING`]), because the word really has this one, and no more than
-/// that, because the context settled it.
+/// RESIDUAL rather than a fraction of the question: a little weight, because the word
+/// really has this reading, and no more than a little, because the context settled it.
 ///
 /// It is what calibrates a resolved token's reported confidence. A reading that keeps a
 /// large share of its weight makes `PartOfSpeech.Score` report a word whose class the
 /// position settles as a coin toss — three quarters, nine tenths — where the analysis
 /// is not in doubt at all and the share the loser keeps is the only reason the number
 /// is not near 1.
+///
+/// A position that only PREFERS one of two readings the word genuinely keeps — a gerund
+/// read as part of the nominal compound it stands in, which is still a verb form —
+/// contradicts nothing, and the reading it did not pick keeps the share
+/// [`CONTEXT_OUTWEIGHED`] leaves it, so such a token is reported with a visibly lower
+/// confidence than one whose class is settled, which is the difference a caller
+/// filtering on confidence reads.
 const CONTEXT_CONTRADICTED: f64 = 1e-4;
 
-/// The weight every WORD keeps for a reading this lexicon does not carry.
+/// The SHARE a reading keeps of its own weight when the position PREFERS another one
+/// without excluding it.
 ///
-/// English is an open vocabulary and the lexicon below is a finite list, so no
-/// labelling of a word is certain: this is the residual the distribution holds back
-/// to say so, which keeps a word's confidence strictly below 1 however much evidence
-/// agrees on it. A token whose class follows from its Unicode general category alone
-/// — punctuation, a symbol, a figure — has no unlisted reading to keep weight for.
-const CUE_UNLISTED_READING: f64 = 1e-5;
+/// Between [`CONTEXT_CONTRADICTED`] and the whole weight, and that is the point: the
+/// word really can be read the other way here — a gerund heading a nominal compound is
+/// a verbal noun, a participle describing the noun behind it is a verb form — so the
+/// displaced reading keeps far more than one a position rules out, and the token is
+/// reported as decided rather than as a coin toss. It is what makes a genuinely
+/// ambiguous token distinguishable from a settled one: the first comes back a few
+/// hundredths below 1, the second at or next to it.
+const CONTEXT_OUTWEIGHED: f64 = 0.05;
 
 /// Characters that end a sentence, after which a capitalised word is no longer
 /// evidence of a proper noun. A line break does too, and is handled where
@@ -198,7 +207,7 @@ const ARTICLES: &[&str] = &["a", "an", "the"];
 /// were rude`, `the flight was delayed`), and the form itself is this tagset's
 /// auxiliary only where that word is the verb — standing in front of a predicate it
 /// carries no other verb than itself.
-const COPULA_FORMS: &[&str] = &[
+pub(crate) const COPULA_FORMS: &[&str] = &[
     "am", "is", "are", "was", "were", "be", "been", "being", "isn't", "aren't", "wasn't",
     "weren't", "ain't", "'s", "'re", "'m",
 ];
@@ -262,9 +271,7 @@ const AUXILIARY_SKIPPABLE_TAGS: &[&str] = &["ADV", "PART"];
 
 /// The connector a word can carry inside it. A token holding one is an identifier
 /// (`user_id`) rather than a word, so it is reported with the modelled `O` tag —
-/// "Other: words that are non-linguistic". An address or a URL carries characters
-/// the word rules below break on, so it is reported as the several tokens those
-/// rules make of it rather than as one `O` token.
+/// "Other: words that are non-linguistic".
 const NON_LINGUISTIC_MARKERS: &[char] = &['_'];
 
 /// Characters that continue a word when a word character stands on either side of
@@ -544,11 +551,44 @@ impl Readings {
             .any(|(candidate, _)| *candidate == tag)
     }
 
+    /// Leave `tag` the reading the context SETTLES on, and every other reading of the
+    /// token what [`CONTEXT_CONTRADICTED`] keeps.
+    ///
+    /// For a position that admits one reading and excludes the rest: a word inside a
+    /// name, a relativizer standing for the noun its clause modifies. Every reading the
+    /// position speaks against is contradicted at once, so the token comes back with the
+    /// confidence a settled analysis has rather than with the share its displaced
+    /// readings leave it.
+    fn settle(&mut self, tag: &'static str, weight: f64) {
+        self.outweigh(tag, weight, CONTEXT_CONTRADICTED);
+    }
+
+    /// Leave `tag` the reading the context PREFERS, and every other reading of the
+    /// token the share [`CONTEXT_OUTWEIGHED`] keeps.
+    ///
+    /// For a position that picks one of two readings the word genuinely keeps: the
+    /// gerund naming a thing inside a nominal compound is still a verb form, so its
+    /// verbal reading stays live and takes a visible share of the confidence.
+    fn prefer(&mut self, tag: &'static str, weight: f64) {
+        self.outweigh(tag, weight, CONTEXT_OUTWEIGHED);
+    }
+
+    /// Support `tag` with `weight` and leave every other reading `share` of its own.
+    fn outweigh(&mut self, tag: &'static str, weight: f64, share: f64) {
+        for reading in &mut self.readings {
+            if reading.0 != tag {
+                reading.1 *= share;
+            }
+        }
+        self.support(tag, weight);
+    }
+
     /// The reading holding the most weight, and its share of the whole.
     ///
-    /// The share is strictly positive, and strictly below 1 for any token carrying
-    /// the [`CUE_UNLISTED_READING`] residual, so no word is ever reported as
-    /// certain.
+    /// The share is strictly positive, and it is 1 exactly when the token's evidence
+    /// left ONE reading — a word a single word class claims standing in a position
+    /// nothing else is open in, which is the analysis no competing reading takes a
+    /// share of.
     fn reported(&self) -> (&'static str, f32) {
         let mut best: Option<(&'static str, f64)> = None;
         let mut total = 0.0;
@@ -686,10 +726,6 @@ impl Tagger {
             readings.support("NOUN", CUE_OPEN_CLASS);
             readings.open_class_default = true;
         }
-        // The residual every open vocabulary leaves: a reading this lexicon does not
-        // carry, reported as the modelled `O` tag if it ever won, which it cannot,
-        // since the cues above always weigh more.
-        readings.support("O", CUE_UNLISTED_READING);
         readings
     }
 
@@ -770,6 +806,38 @@ fn is_word_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 
+/// Punctuation a document writes AFTER a URL rather than inside it: the sentence it
+/// ends, or the parenthesis it stands in. The published URI form admits every
+/// character a path may carry, so the trailing run of these is given back to the
+/// punctuation tokens it belongs to.
+const TRAILING_PUNCTUATION: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\''];
+
+/// Where every word `text` writes UNBROKEN begins and ends, as byte offsets keyed by
+/// the byte the word starts at.
+///
+/// A mail address and a URL are each one word of a document, whatever separators stand
+/// inside them, and `DetectSyntax` reports "one syntax token record for each word in
+/// the source text" — so no token boundary may fall within one, and a client slicing
+/// the source text by a token's offsets gets that word back. The published forms are
+/// the ones the PII recognizer types an `EMAIL` and a `URL` on, read from the one place
+/// they are named (`crate::ops::contains_pii_entities::unbroken_word_form`) so the
+/// segmenter and the recognizer cannot drift apart. None of these words is a word of
+/// any word class, so each is reported with the modelled `O` tag, like the identifier
+/// it resembles.
+///
+/// The matcher returns them in document order and without overlap, so there is nothing
+/// here to resolve: only the punctuation a document writes AFTER a URL rather than
+/// inside it is given back, since the URI form admits every character a path may carry.
+fn non_linguistic_words(text: &str) -> HashMap<usize, usize> {
+    crate::ops::contains_pii_entities::unbroken_word_form()
+        .find_iter(text)
+        .filter_map(|found| {
+            let end = found.as_str().trim_end_matches(TRAILING_PUNCTUATION).len() + found.start();
+            (end > found.start()).then_some((found.start(), end))
+        })
+        .collect()
+}
+
 /// The index just past the word starting at `start` in `characters`.
 ///
 /// A word is a run of word characters, which a joiner continues when a character of
@@ -804,8 +872,9 @@ fn word_end(characters: &[(usize, char)], start: usize) -> usize {
 
 /// Segment `text` into the syntax tokens `DetectSyntax` reports.
 ///
-/// Boundaries are word boundaries, so a figure (`3.14`) and a contraction (`don't`)
-/// each stay whole while punctuation is split off; whitespace carries no token.
+/// Boundaries are word boundaries, so a figure (`3.14`), a contraction (`don't`) and a
+/// word a document writes unbroken (`name@example.com`) each stay whole while
+/// punctuation is split off; whitespace carries no token.
 /// `TokenId` is the token's 1-based position in the document and the offsets are a
 /// half-open range of zero-based character positions, so slicing the document by them
 /// returns the token's own `Text`.
@@ -941,6 +1010,9 @@ impl AnalysedToken<'_> {
 pub(crate) fn analyse(text: &str) -> Vec<AnalysedToken<'_>> {
     let tagger = tagger();
     let characters: Vec<(usize, char)> = text.char_indices().collect();
+    // The words whose own form says where they end, read before the word rules, since
+    // those rules break on the separators inside one.
+    let unbroken = non_linguistic_words(text);
     let mut tokens: Vec<AnalysedToken<'_>> = Vec::new();
     let mut index = 0usize;
     let mut sentence_initial = true;
@@ -958,16 +1030,27 @@ pub(crate) fn analyse(text: &str) -> Vec<AnalysedToken<'_>> {
         // `index` counts CHARACTERS, so it is the offset the response reports; the
         // byte index beside it is only used to slice the token out of the document.
         let begin = index;
-        let end = if is_word_character(character) {
-            word_end(&characters, index)
-        } else {
-            index + 1
+        // A mail address or a URL is one word of the document, whatever separators it
+        // carries inside it.
+        let unbroken_end = unbroken.get(&byte).copied();
+        let end = match unbroken_end {
+            Some(end_byte) => characters.partition_point(|(at, _)| *at < end_byte),
+            None if is_word_character(character) => word_end(&characters, index),
+            None => index + 1,
         };
         let end_byte = characters.get(end).map_or(text.len(), |(byte, _)| *byte);
         let piece = &text[byte..end_byte];
         index = end;
 
-        let readings = tagger.readings(piece, sentence_initial);
+        let readings = if unbroken_end.is_some() {
+            // Nothing else reads such a word: its form decides its class, as a
+            // token's Unicode categories decide punctuation's.
+            let mut readings = Readings::default();
+            readings.support("O", CUE_CATEGORY);
+            readings
+        } else {
+            tagger.readings(piece, sentence_initial)
+        };
         sentence_initial = piece.chars().all(|c| SENTENCE_FINAL.contains(&c));
 
         tokens.push(AnalysedToken {
@@ -1043,7 +1126,7 @@ fn resolve_proper_names(tokens: &mut [AnalysedToken<'_>]) {
                 if tokens[position].readings.open_class_default
                     && names_the_subject(tokens, &capitalised, position)
                 {
-                    tokens[position].readings.support("PROPN", CUE_CONTEXT);
+                    tokens[position].readings.settle("PROPN", CUE_CONTEXT);
                 }
                 continue;
             }
@@ -1052,7 +1135,10 @@ fn resolve_proper_names(tokens: &mut [AnalysedToken<'_>]) {
                 .is_some_and(|before| anchors(tokens, before))
                 || (position + 1 < tokens.len() && anchors(tokens, position + 1));
             if beside_a_name {
-                tokens[position].readings.support("PROPN", CUE_CONTEXT);
+                // The run settles the reading: a word standing inside a name is a word
+                // of that name, whatever class the lexicon claims it for elsewhere
+                // (`Main` in `Main Street`).
+                tokens[position].readings.settle("PROPN", CUE_CONTEXT);
             }
         }
     }
@@ -1118,8 +1204,10 @@ fn resolve_relative_pronouns(tokens: &mut [AnalysedToken<'_>]) {
             .get(behind)
             .is_some_and(|candidate| PREDICATE_TAGS.contains(&candidate.tag()));
         if modifies_a_noun && heads_a_clause {
-            tokens[position].readings.support("PRON", CUE_CONTEXT);
-            tokens[position].readings.contradict("DET");
+            // The position admits the relative reading and excludes the others: a
+            // relativizer standing for the noun its clause modifies determines
+            // nothing and subordinates nothing.
+            tokens[position].readings.settle("PRON", CUE_CONTEXT);
         }
     }
 }
@@ -1322,11 +1410,14 @@ fn resolve_noun_phrases(tokens: &mut [AnalysedToken<'_>]) {
             tokens[position].readings.contradict("VERB");
             tokens[position].readings.support("NOUN", CUE_CONTEXT);
         } else if gerund && (compound_modifier || nominal_modifier) {
-            tokens[position].readings.contradict("VERB");
-            tokens[position].readings.support("NOUN", CUE_CONTEXT);
+            // The position PREFERS the nominal reading rather than excluding the
+            // verbal one: a gerund inside a nominal compound is still a verb form, so
+            // the verb reading keeps the share a preference leaves it and the token is
+            // reported with the confidence two live readings leave it.
+            tokens[position].readings.prefer("NOUN", CUE_CONTEXT);
         } else if nominal_modifier && participle {
-            tokens[position].readings.contradict("VERB");
-            tokens[position].readings.support("ADJ", CUE_CONTEXT);
+            // The same preference for a participle describing the head behind it.
+            tokens[position].readings.prefer("ADJ", CUE_CONTEXT);
         }
     }
 }
