@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRegistrationCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRegistrationCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRegistrationCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: answers the account's CA-certificate registration code, MINTING and
+//! persisting one when the account holds none — which is what the model documents this
+//! call as doing — and answering the persisted one unchanged on every later call, so a
+//! caller that repeats the call registers its certificate authority against one value.
+//!
+//! The code itself lives in this service's state and is minted there
+//! ([`crate::state::registration_code`]), so this read and `DeleteRegistrationCode` agree
+//! about what holding a code means: after a delete the account holds none again and the
+//! next call here mints a NEW code.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +143,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRegistrationCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRegistrationCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRegistrationCode"))
+        // `GetRegistrationCodeRequest` is an empty structure and the registration code is
+        // account-wide, so neither the request nor its metadata selects what is answered.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRegistrationCodeErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // "IoT will create a registration code as part of this API call if the registration
+        // code doesn't exist or has been deleted. If you already have a registration code,
+        // this API call will return the same registration code": the call that finds no
+        // code mints one and persists it, and every later call reads that record back, so
+        // the write this read makes is the one the model documents it as making, and the
+        // value a caller is handed is stable until a delete takes it away.
+        let registration_code = state.lock().registration_code_or_create().ok_or_else(|| {
+            GetRegistrationCodeErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(
+                        "no registration code could be generated in this emulator".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        Ok(GetRegistrationCodeOutput {
+            registration_code: Some(registration_code),
+        })
     }
 }

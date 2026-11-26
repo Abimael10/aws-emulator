@@ -23,6 +23,9 @@
 //! * The BULK THING REGISTRATION task family words it with a sentence that carries no
 //!   variable part at all ([`MISSING_THING_REGISTRATION_TASK_MESSAGE`]): the task id is
 //!   not interpolated.
+//! * The CA-CERTIFICATE REGISTRATION CODE family words it with a sentence that carries no
+//!   variable part either ([`MISSING_REGISTRATION_CODE_MESSAGE`]), because the operation
+//!   that addresses it names nothing at all.
 //!
 //! Every operation that addresses ONE resource of a family refuses a lookup miss with
 //! that family's sentence, so a describe, a delete and an update of the same resource
@@ -246,6 +249,14 @@ pub fn missing_job_execution_message(thing_name: &str, job_id: &str) -> String {
 /// FIXED text with no variable part: this family keeps the requested id out of the
 /// refusal, so nothing of the request is echoed back.
 pub const MISSING_THING_REGISTRATION_TASK_MESSAGE: &str = "Task doesn't exist";
+
+/// How this service states that the account has no CA-certificate registration code for a
+/// `DeleteRegistrationCode` to delete (see [`super::registration_code`]).
+///
+/// FIXED text with no variable part, like the bulk-registration family's sentence above:
+/// this resource is the account's single registration code and the request names nothing,
+/// so there is no id, name or member to interpolate.
+pub const MISSING_REGISTRATION_CODE_MESSAGE: &str = "The registration code does not exist.";
 
 /// How this service states that a `taskId` names no Device Defender audit task this
 /// account holds — for a reader of one and for a cancel of one.

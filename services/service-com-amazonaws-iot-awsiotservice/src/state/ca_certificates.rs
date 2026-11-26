@@ -413,9 +413,10 @@ impl super::ComAmazonawsIotAwsiotserviceState {
     ///
     /// AWS additionally proves that the registering caller holds the CA's PRIVATE key, by
     /// requiring the verification certificate to be signed by it over the account's
-    /// registration code; that code is the resource `GetRegistrationCode` publishes and no
-    /// operation here mints one yet, so the verification certificate is read and required
-    /// as the model documents, and nothing about a registration code is claimed.
+    /// registration code; that code is the resource `GetRegistrationCode` publishes (see
+    /// [`super::registration_code`]), and this registration does not check that the
+    /// verification certificate was signed over it, so the verification certificate is read
+    /// and required as the model documents and nothing about that proof is claimed.
     pub fn register_ca_certificate(
         &mut self,
         region: &str,

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRegistrationCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRegistrationCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRegistrationCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: DELETES the account's CA-certificate registration code, so the account
+//! holds none again and the next `GetRegistrationCode` mints a new one — which is what that
+//! read documents ("IoT will create a registration code as part of this API call if the
+//! registration code doesn't exist or has been deleted").
+//!
+//! An account that holds NO registration code has nothing to delete, which is the one
+//! resource either operation addresses and so the condition this operation's modelled
+//! `ResourceNotFoundException` (HTTP 404) is about; the read models no not-found error at
+//! all because it creates what it reports. The account's code lives in this service's state
+//! ([`crate::state::registration_code`]), beside the mint, so the two cannot drift about
+//! what holding a code means.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +138,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRegistrationCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRegistrationCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRegistrationCode"))
+        // `DeleteRegistrationCodeRequest` is an empty structure and the registration code
+        // is account-wide, so neither the request nor its metadata selects what is deleted.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteRegistrationCodeErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // The delete is answered from what the store HELD: an account carrying a code has it
+        // taken away — so the next read mints a new one — and an account carrying none is
+        // refused rather than told that something was deleted.
+        if !state.lock().delete_registration_code() {
+            return Err(DeleteRegistrationCodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MISSING_REGISTRATION_CODE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteRegistrationCodeOutput {})
     }
 }

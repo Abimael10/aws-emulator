@@ -1049,6 +1049,18 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// issued here, is reached through its own URIs, and is reported through its own
     /// shapes and its own status set (see [`ca_certificates`]).
     pub ca_certificates: BTreeMap<String, RegisteredCaCertificate>,
+    /// The account's CA-CERTIFICATE REGISTRATION CODE — one value, not a map, because
+    /// neither `GetRegistrationCode` nor `DeleteRegistrationCode` names a resource: there is
+    /// one registration code per account. It sits beside the CA registry above because it is
+    /// what a caller registering a certificate authority proves it holds that authority's
+    /// private key with.
+    ///
+    /// It is an `Option` because an account nobody has asked for one HAS none: the read is
+    /// documented as the call that creates it ("IoT will create a registration code as part
+    /// of this API call if the registration code doesn't exist or has been deleted"), and the
+    /// delete puts the account back into that state so the next read mints a new code. See
+    /// [`registration_code`].
+    pub registration_code: Option<String>,
     /// Every role alias that exists, keyed by `roleAlias`.
     ///
     /// The name is the alias's identity — the model binds it as the `@httpLabel` of
@@ -3451,6 +3463,13 @@ pub use ca_certificates::{
     MAX_CA_CERTIFICATES_PER_SUBJECT,
 };
 
+// WHAT a caller proves it holds a certificate authority's private key with — the account's
+// single CA-CERTIFICATE REGISTRATION CODE, how one is minted and what deleting it leaves —
+// lives in `state/registration_code.rs`, beside the CA registry that code belongs to. Its
+// names are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod registration_code;
+pub use registration_code::REGISTRATION_CODE_LENGTH;
+
 // WHICH POLICIES are attached to which target — what a policy target is, how one is
 // resolved against this account's state, and the relation `AttachPolicy`,
 // `DetachPolicy`, `ListAttachedPolicies` and `ListTargetsForPolicy` are four views of —
@@ -3621,7 +3640,7 @@ pub use not_found::{
     tagged_thing_group_not_found_message, thing_write_not_found_message,
     unauthorized_topic_rule_message,
     unrecognized_index_name_message, unresolved_resource_message,
-    MISSING_THING_REGISTRATION_TASK_MESSAGE,
+    MISSING_REGISTRATION_CODE_MESSAGE, MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 // How a create whose name is already taken is REFUSED — the fixed sentence each resource
