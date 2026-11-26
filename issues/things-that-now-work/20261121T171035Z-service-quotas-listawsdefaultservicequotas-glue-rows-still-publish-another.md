@@ -44,6 +44,32 @@ Quoted divergences (expected -> actual):
 
 Model evidence: Smithy `ListAWSDefaultServiceQuotas` input ServiceCode required @length 1..63 @pattern ^[a-zA-Z][a-zA-Z0-9-]{1,63}$, output Quotas -> ServiceQuotaListDefinition, paginated items=Quotas; `ServiceQuota.QuotaCode` @length 1..128, `Value` @range 0..10000000000, `Description` @length 0..350. The shape is satisfied; only the code-to-row binding diverges.
 
+## Resolution
+The four rows this report quotes a recorded value for — `L-FEBBFA7A` the account partition
+ceiling, `L-FB210BD9` the Data Catalog's global paths, `L-83A59AA6` the account-wide
+machine-learning task runs and `L-096DBB95` the spare compute capacity — carry the quota,
+limit and sentence the recording states for their codes, pinned member for member by
+`tests/all/glue_account_planes_under_their_published_codes.rs`.
+
+What remained of the cause was the other half of the report: the `QuotaCode`s of this catalog
+that answered NO row, so a client holding one resolved nothing. `L-5E4153CA`, `L-337244C9`
+and `L-2E9FB93F` — the codes the sourced `L-04CEE988`, `L-11FA2C1A` and `L-096DBB95` bindings
+vacated — now keep a row carrying the plane each of those bindings displaced (the account
+database plane, the account's concurrent job runs, the per-table table-version plane), as the
+rule at the head of `src/state/quota_rows.rs` states: every code the catalog publishes keeps
+a row, a plane with no code of its own is published under no row, and such a row is no claim
+that AWS publishes that plane under that code — it is replaced the moment the quota the code
+publishes can be sourced. The three codes are published in both listings and resolve through
+`GetAWSDefaultServiceQuota`, `GetServiceQuota` and the increase path; the catalog now
+publishes all 47 rows AWS's does. Pinned by
+`tests/all/glue_vacated_codes_keep_their_rows.rs`.
+
+Still open, with its own report: the per-code CONTENT of the `glue` codes whose recorded quota
+nothing available in this checkout states (`L-071ABE08`, `L-4071B0E3`, `L-64A88F0A`,
+`L-76EC689B`, `L-7DD7C33A`, the catalog-API rate codes, and the three codes above). Closing
+those needs the recorded rows themselves; they are filed as
+`issues/things-that-do-not-work/20261124T090000Z-service-quotas-listawsdefaultservicequotas-glue-codes-whose-recorded-quota-no-source-states.md`.
+
 ## Steps to Reproduce
 1. Boot the emulator from this checkout and replay trace set simparity-wire-aws-v1, fixture service-quotas-catalog-list-aws-default-service-quotas-glue, step task#1 — it reports verdict mismatch with expected and actual status 200.
 2. Equivalently POST the service-quotas endpoint with X-Amz-Target `ServiceQuotasV20190624.ListAWSDefaultServiceQuotas` and body {"ServiceCode": "glue"}.

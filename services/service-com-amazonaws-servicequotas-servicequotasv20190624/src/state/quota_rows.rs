@@ -2196,14 +2196,22 @@ pub(super) fn glacier_quotas() -> Vec<QuotaRow> {
 /// connection TYPES of the Data Catalog (`L-F545C262`) and the security configurations of
 /// an account (`L-83192DBF`, which that listing publishes as adjustable).
 ///
-/// The quotas this catalog had served under those codes — the database, workflow and
-/// account-wide machine-learning-transform planes, the job-concurrency planes, the
-/// per-table table-version plane, the schema-version plane, and the `GetTable`,
-/// `StartCrawler`, `BatchCreatePartition`, `UpdatePartition`, `UpdateJob`, `GetPartitions`,
-/// `StartJobRun`, `CreateTable`, `StartWorkflowRun` and `BatchDeletePartition` call rates —
-/// name no code that listing states, so they are published under no code at all rather than
-/// served under another quota's; so are the codes this catalog had served the account-wide
-/// crawler plane and the account's machine-learning transforms under.
+/// The quotas this catalog had served under those codes — the workflow and account-wide
+/// machine-learning-transform planes, the per-job job-concurrency plane, the
+/// schema-version plane, and the `GetTable`, `StartCrawler`, `BatchCreatePartition`,
+/// `UpdatePartition`, `UpdateJob`, `GetPartitions`, `StartJobRun`, `CreateTable`,
+/// `StartWorkflowRun` and `BatchDeletePartition` call rates — name no code that listing
+/// states, so they are published under no code at all rather than served under another
+/// quota's.
+///
+/// The codes those sourced bindings VACATED keep answering a row, as the module header
+/// states: `L-5E4153CA`, which the account's machine-learning transforms left for
+/// `L-04CEE988`, carries the account database plane that binding displaced; `L-337244C9`,
+/// which the account-wide crawler plane left for `L-11FA2C1A`, carries the account's
+/// concurrent job runs that binding displaced; and `L-2E9FB93F` carries the per-table
+/// table-version plane the `L-096DBB95` binding displaced. None of the three is a claim
+/// that AWS publishes that plane under that code, and each is replaced the moment the
+/// quota its code publishes can be sourced.
 pub(super) fn glue_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "Glue", api, per_second);
     vec![
@@ -2259,6 +2267,21 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Max partitions per table", 10_000_000.0)
             .code("L-2C3F5401")
             .describe("The maximum number of partitions per table."),
+        // A code whose own published quota no source available here states, carrying the
+        // plane the sourced `L-096DBB95` binding displaced: the table versions of ONE
+        // table, at the limit and with the sentence it carried them under. It is not a
+        // claim that AWS publishes that plane under this code — see the module header —
+        // and it is replaced the moment the quota this code publishes can be sourced.
+        quota("Table versions per table", 100_000.0)
+            .code("L-2E9FB93F")
+            .describe("The maximum number of table versions per table."),
+        // The code the account-wide CRAWLER plane vacated when the sourced `L-11FA2C1A`
+        // binding took that plane: it carries the plane that binding displaced, the
+        // concurrent job runs of an account, at the limit it carried it at. The sentence
+        // this code's quota is published with is one nothing available here states, so the
+        // row carries none rather than one worded here, and the binding is no claim about
+        // AWS (see the module header).
+        quota("Concurrent job runs per account", 200.0).code("L-337244C9"),
         // The COLUMN STATISTICS tasks an account may run at once, under the code the
         // recorded listing binds that plane to, with the name, value and sentence it
         // carries for it. The connection plane this catalog had served under the code is
@@ -2287,11 +2310,15 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Global s3 path max length", 2000.0)
             .code("L-4F4B522D")
             .describe("Catalog: global s3 path max length"),
-        // NOT published here: `L-5E4153CA`, the code this catalog had served the account's
-        // machine-learning transforms under. That plane is published under `L-04CEE988`
-        // above, the code the recorded listing binds it to, and the listing states no quota
-        // this catalog can cite under `L-5E4153CA`, so that code is left to the
-        // default-quota-set gap.
+        // The code the account's machine-learning TRANSFORM plane vacated when the sourced
+        // `L-04CEE988` binding took that plane: it carries the plane that binding
+        // displaced, the database plane of an account, with the name, limit and sentence it
+        // carried them under. Not a claim that AWS publishes that plane under this code
+        // (see the module header), and replaced the moment the quota this code publishes
+        // can be sourced.
+        quota("Databases per account", 10_000.0)
+            .code("L-5E4153CA")
+            .describe("The maximum number of databases in your account."),
         quota("Max jobs per account", 2000.0)
             .code("L-611FDDE4")
             .describe("The maximum number of jobs in your account."),

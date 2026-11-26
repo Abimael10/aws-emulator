@@ -5,9 +5,11 @@
 //! THE RULE: a row published under a `QuotaCode` carries the `QuotaName`, `Value`, `Unit`,
 //! `Adjustable`, `GlobalQuota`, `Period`, `UsageMetric` and `Description` of the quota the
 //! service publishes UNDER THAT CODE — the service's own wording, never a paraphrase and
-//! never a neighbouring quota's. Two consequences follow, and both are asserted here: a
-//! quota whose own code no source states is published under NO code rather than under
-//! another quota's, and a code whose quota no source states carries no row at all.
+//! never a neighbouring quota's. The consequence asserted here is that a quota whose own
+//! code no source states is published under NO code rather than under another quota's. Its
+//! counterpart — a CODE whose quota no source states keeps answering a row, carrying the
+//! plane the sourced binding displaced — is the subject of
+//! `glue_vacated_codes_keep_their_rows.rs`, so each invariant is asserted in one suite.
 //!
 //! The table below spans what the rule generalises over rather than repeating one row: a
 //! counted account plane and a counted per-resource plane, a row published in a unit of its
@@ -19,14 +21,14 @@
 //!
 //! Each row is read BOTH through `ListAWSDefaultServiceQuotas` and through
 //! `GetAWSDefaultServiceQuota`, because the code is the only key the single reads take.
-//! The harness (`client`, `emulator`, `default_quotas`, `walk_pages`) is the one
-//! `quota_workflow.rs` owns.
+//! The harness (`client`, `emulator`, `default_quotas`) is the one `quota_workflow.rs`
+//! owns.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::quota_workflow::{client, default_quotas, emulator, walk_pages, Client};
+use crate::quota_workflow::{client, default_quotas_by_code, emulator};
 use crate::recorded_rows_events_through_imagebuilder::sentence_is_unsourced;
 
 /// One row of the `glue` catalog, as the service publishes it under its own code.
@@ -220,9 +222,10 @@ const ROWS: &[Row] = &[
 /// The quotas DISPLACED by the bindings above: each is a quota this catalog used to publish
 /// under one of those codes, and no source available here states the code `glue` publishes
 /// it under — so it is published under no code of the service at all, by the `QuotaName` it
-/// was served as.
+/// was served as. The account DATABASE plane the `L-04CEE988` binding displaced is NOT among
+/// them: it is carried by `L-5E4153CA`, the code that binding vacated, the way the row
+/// tables' module header says a code whose own quota no source states keeps a row.
 const DISPLACED_QUOTA_NAMES: &[&str] = &[
-    "Databases per account",
     "Workflows per account",
     "Development endpoints per account",
     "Machine learning transforms per account",
@@ -240,35 +243,6 @@ const DISPLACED_QUOTA_NAMES: &[&str] = &[
     "Rate of StartWorkflowRun requests",
 ];
 
-/// The `QuotaCode` this catalog used to serve a quota that belongs under another code: no
-/// source available here binds any `glue` quota to it, so it carries no row at all rather
-/// than a second copy of the quota now published under `L-04CEE988`.
-///
-/// The rest of the default-quota-set gap (the recorded codes whose quota no source states)
-/// is reported by the count equation and the `GAP_CODE_COUNT` tripwire of
-/// `aws_minted_catalog_coverage.rs`, so that shortfall is not asserted here as a contract.
-const GAP_CODES: &[&str] = &["L-5E4153CA"];
-
-/// The `glue` catalog, keyed by `QuotaCode`, asserting each code is published once.
-async fn catalog_by_code(caller: &Client) -> BTreeMap<String, Value> {
-    let listed = default_quotas(caller, "glue").await;
-    assert!(
-        !listed.is_empty(),
-        "case glue: the service publishes a default-quota catalog, got none"
-    );
-    let mut by_code: BTreeMap<String, Value> = BTreeMap::new();
-    for quota in listed {
-        let code = quota["QuotaCode"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case glue: a row without a code: {quota}"))
-            .to_string();
-        if let Some(first) = by_code.insert(code.clone(), quota.clone()) {
-            panic!("case glue/{code}: a code is published once, got {first} and {quota}");
-        }
-    }
-    by_code
-}
-
 /// Every pinned row carries the facts the service publishes under its own code, through
 /// the listing and through the single read alike.
 #[tokio::test]
@@ -277,7 +251,7 @@ async fn a_glue_row_carries_the_facts_published_under_its_code() {
     let region = "eu-west-1";
     let caller = client(&engine, region);
 
-    let catalog = catalog_by_code(&caller).await;
+    let catalog = default_quotas_by_code(&caller, "glue").await;
     for row in ROWS {
         let case = format!("glue/{}", row.quota_code);
         let listed = catalog
@@ -375,7 +349,7 @@ async fn a_displaced_glue_quota_is_published_under_no_code() {
     let engine = emulator();
     let caller = client(&engine, "us-east-2");
 
-    let catalog = catalog_by_code(&caller).await;
+    let catalog = default_quotas_by_code(&caller, "glue").await;
     for name in DISPLACED_QUOTA_NAMES {
         let carried: Vec<&String> = catalog
             .iter()
@@ -411,50 +385,6 @@ async fn a_displaced_glue_quota_is_published_under_no_code() {
             panic!(
                 "case glue/{code}: a published sentence belongs to one quota, got \
                  {description:?} under {code} and under {first}"
-            );
-        }
-    }
-}
-
-/// A code whose quota no source states carries no row, and resolves nothing: not in either
-/// listing, and not through a read that takes a `QuotaCode`.
-#[tokio::test]
-async fn a_glue_code_with_no_stated_quota_resolves_nothing() {
-    let engine = emulator();
-    let caller = client(&engine, "ap-south-1");
-
-    for gap_code in GAP_CODES {
-        let case = format!("glue/{gap_code}");
-        for operation in ["ListAWSDefaultServiceQuotas", "ListServiceQuotas"] {
-            let listed = walk_pages(
-                &caller,
-                operation,
-                &json!({"ServiceCode": "glue"}),
-                "Quotas",
-                None,
-            )
-            .await;
-            assert!(
-                !listed
-                    .iter()
-                    .any(|quota| quota["QuotaCode"] == json!(gap_code)),
-                "case {case}: {operation} publishes no row under a code whose quota no source \
-                 states, got one"
-            );
-        }
-
-        for operation in ["GetAWSDefaultServiceQuota", "GetServiceQuota"] {
-            let (status, error) = caller
-                .refused(
-                    operation,
-                    json!({"ServiceCode": "glue", "QuotaCode": gap_code}),
-                )
-                .await;
-            assert_eq!(
-                (status, error.as_str()),
-                (400, "NoSuchResourceException"),
-                "case {case}: {operation} must refuse a code this service publishes nothing \
-                 under"
             );
         }
     }

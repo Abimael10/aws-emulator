@@ -376,7 +376,6 @@ const DISPLACED_QUOTA_NAMES: &[(&str, &str)] = &[
     ("glue", "Partitions per table"),
     ("glue", "Connections per account"),
     ("glue", "Rate of StartCrawler requests"),
-    ("glue", "Databases per account"),
     ("glue", "Workflows per account"),
     ("glue", "Development endpoints per account"),
     ("glue", "Machine learning transforms per account"),

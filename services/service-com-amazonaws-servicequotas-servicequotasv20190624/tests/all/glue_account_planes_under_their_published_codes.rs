@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::quota_workflow::{client, default_quotas, emulator, Client};
+use crate::quota_workflow::{client, default_quotas_by_code, emulator};
 use crate::recorded_rows_events_through_imagebuilder::sentence_is_unsourced;
 
 /// One row of the `glue` catalog, as the service publishes it under its own code.
@@ -150,33 +150,14 @@ const ROWS: &[Row] = &[
 /// The quotas DISPLACED by the bindings above: each is a quota this catalog used to publish
 /// under one of those codes, and no source available here states the code `glue` publishes
 /// it under — so it is published under no code of the service at all, by the `QuotaName` it
-/// was served as.
+/// was served as. The per-table table-version plane one of them displaced is NOT among them:
+/// it is carried by `L-2E9FB93F`, a code whose own quota no source states, the way the row
+/// tables' module header says such a code keeps a row.
 const DISPLACED_QUOTA_NAMES: &[&str] = &[
-    "Table versions per table",
     "Rate of BatchCreatePartition requests",
     "Rate of UpdatePartition requests",
     "Rate of UpdateJob requests",
 ];
-
-/// The `glue` catalog, keyed by `QuotaCode`, asserting each code is published once.
-async fn catalog_by_code(caller: &Client) -> BTreeMap<String, Value> {
-    let listed = default_quotas(caller, "glue").await;
-    assert!(
-        !listed.is_empty(),
-        "case glue: the service publishes a default-quota catalog, got none"
-    );
-    let mut by_code: BTreeMap<String, Value> = BTreeMap::new();
-    for quota in listed {
-        let code = quota["QuotaCode"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case glue: a row without a code: {quota}"))
-            .to_string();
-        if let Some(first) = by_code.insert(code.clone(), quota.clone()) {
-            panic!("case glue/{code}: a code is published once, got {first} and {quota}");
-        }
-    }
-    by_code
-}
 
 /// Every pinned row carries the facts the service publishes under its own code, through the
 /// listing and through the single read alike.
@@ -185,7 +166,7 @@ async fn a_glue_account_plane_carries_the_facts_published_under_its_code() {
     let engine = emulator();
     let caller = client(&engine, "us-west-2");
 
-    let catalog = catalog_by_code(&caller).await;
+    let catalog = default_quotas_by_code(&caller, "glue").await;
     for row in ROWS {
         let case = format!("glue/{}", row.quota_code);
         let listed = catalog
@@ -278,7 +259,7 @@ async fn a_glue_quota_displaced_from_an_account_plane_code_is_published_under_no
     let engine = emulator();
     let caller = client(&engine, "eu-central-1");
 
-    let catalog = catalog_by_code(&caller).await;
+    let catalog = default_quotas_by_code(&caller, "glue").await;
     for name in DISPLACED_QUOTA_NAMES {
         let carried: Vec<&String> = catalog
             .iter()

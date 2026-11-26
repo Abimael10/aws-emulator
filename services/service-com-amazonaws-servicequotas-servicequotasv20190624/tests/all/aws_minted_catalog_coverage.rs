@@ -100,7 +100,7 @@ const SERVICES: &[CatalogService] = &[
         service_code: "glue",
         service_name: "AWS Glue",
         quota_count: 47,
-        gap_codes: &["L-2E9FB93F", "L-337244C9", "L-5E4153CA"],
+        gap_codes: &[],
     },
     CatalogService {
         service_code: "groundstation",
@@ -127,7 +127,7 @@ const SERVICES: &[CatalogService] = &[
 ///
 /// Pinned as ONE number so that leaving a further code to the default-quota-set gap is a
 /// deliberate, visible edit rather than one more entry in a list nothing counts.
-const GAP_CODE_COUNT: usize = 8;
+const GAP_CODE_COUNT: usize = 5;
 
 /// A code this catalog used to derive from a quota NAME for one of these services, which
 /// the service answers to nothing under.

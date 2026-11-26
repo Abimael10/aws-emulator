@@ -55,12 +55,16 @@ const SERVICE_CODES: &[&str] = &[
 /// than a sentence this catalog would be wording itself, which is what the rule forbids.
 /// The same holds for the two `glue` rows whose name, value and adjustability that
 /// service's recorded listing states while stating no sentence for them: the account's
-/// security configurations and the Data Catalog's connection types.
+/// security configurations and the Data Catalog's connection types. It holds too for the
+/// `glue` code whose own quota no source states and which therefore keeps the plane a
+/// sourced binding displaced (the account's concurrent job runs): the plane's limit is the
+/// one that row carried, and no source states a sentence for it.
 ///
 /// `pub(crate)` so the suites that assert "every row carries its published sentence"
 /// read the one list rather than each keeping a copy of it.
 pub(crate) const PUBLISHED_WITHOUT_A_DESCRIPTION: &[(&str, &str)] = &[
     ("events", "L-9B653E91"),
+    ("glue", "L-337244C9"),
     ("glue", "L-83192DBF"),
     ("glue", "L-F545C262"),
 ];

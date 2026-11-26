@@ -275,6 +275,33 @@ pub(crate) async fn default_quotas(client: &Client, service_code: &str) -> Vec<V
     .await
 }
 
+/// Every AWS default quota of `service_code`, keyed by `QuotaCode`, asserting that a code is
+/// published once.
+///
+/// `pub(crate)` so the suites that index a catalog by its only client-visible key share ONE
+/// copy of that walk rather than each keeping its own.
+pub(crate) async fn default_quotas_by_code(
+    client: &Client,
+    service_code: &str,
+) -> std::collections::BTreeMap<String, Value> {
+    let listed = default_quotas(client, service_code).await;
+    assert!(
+        !listed.is_empty(),
+        "case {service_code}: the service publishes a default-quota catalog, got none"
+    );
+    let mut by_code: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for quota in listed {
+        let code = quota["QuotaCode"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {service_code}: a row without a code: {quota}"))
+            .to_string();
+        if let Some(first) = by_code.insert(code.clone(), quota.clone()) {
+            panic!("case {service_code}/{code}: a code is published once, got {first} and {quota}");
+        }
+    }
+    by_code
+}
+
 /// The whole catalog, as `ServiceCode -> its default quotas`.
 pub(crate) async fn whole_default_catalog(
     client: &Client,
