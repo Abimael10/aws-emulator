@@ -285,6 +285,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `KmsKeyArn` names the customer managed key this service will encrypt the
+        // schedule's data under, so the create resolves that reference against KMS before
+        // it writes anything: a key this account and Region hold none of is refused here,
+        // and no schedule pointing at a key its occurrences could never be encrypted
+        // under is stored. Like the role lookup above, it runs before the store is
+        // locked: the guard is not held across an await.
+        if let Some(message) =
+            crate::state::kms_key_violation(ctx, &region, input.kms_key_arn.as_deref()).await
+        {
+            return Err(
+                CreateScheduleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         let mut store = state.lock();
         store.settle(now);
 

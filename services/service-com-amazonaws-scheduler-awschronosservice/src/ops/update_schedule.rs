@@ -298,6 +298,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // An update states the schedule's whole configuration, `KmsKeyArn` included, so
+        // the key it names is resolved against KMS exactly as the create resolves it: an
+        // update naming a key this account and Region hold none of is refused before the
+        // stored schedule is touched, so the schedule keeps the key the last accepted
+        // write left on it. The lookup runs before the store is locked: the guard is not
+        // held across an await.
+        if let Some(message) = crate::state::kms_key_violation(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            input.kms_key_arn.as_deref(),
+        )
+        .await
+        {
+            return Err(
+                UpdateScheduleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         let mut store = state.lock();
         store.settle(now);
 

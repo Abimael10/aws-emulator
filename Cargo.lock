@@ -21059,6 +21059,7 @@ dependencies = [
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-rds-amazonrdsv19",
  "service-com-amazonaws-sfn-awsstepfunctions",

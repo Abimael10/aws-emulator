@@ -33,6 +33,9 @@
 //! had on its target — the counts EventBridge Scheduler publishes about its own
 //! deliveries, their failures and their dead-letter route — is [`schedule_metrics`].
 //!
+//! The customer managed key a write states is a reference to a resource of ANOTHER
+//! service, so it is resolved against that service as the write takes it: [`kms_key`].
+//!
 //! Whether the CALLER may hand this service the execution role its request names at
 //! all — the `iam:PassRole` every operation that carries a `Target.RoleArn` charges
 //! against the calling principal's own policies — is [`pass_role`]. Whether the caller may
@@ -42,6 +45,7 @@
 
 mod dead_letter;
 mod event_bridge_target;
+mod kms_key;
 mod occurrence;
 mod schedule_definition;
 mod server_defaults;
@@ -59,6 +63,7 @@ pub use caller_authorization::{caller_denial, ANY_RESOURCE};
 pub use dead_letter::RETRY_INTERVAL;
 pub(crate) use event_bridge_target::event_bridge_target_violation;
 pub use invocation::{drive_invocation_clock, Invocations};
+pub use kms_key::{kms_key_refusal, kms_key_violation};
 pub use occurrence::Occurrences;
 pub use schedule_definition::*;
 pub use schedule_metrics::ScheduleMetrics;
