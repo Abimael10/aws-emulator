@@ -287,7 +287,7 @@ fn assert_page(case: &str, answer: &Answer, portal_id: &str) {
     );
 }
 
-/// Whether a client can still open a connection to `address`.
+/// Whether a client can open a connection to `address` right now.
 ///
 /// The port is the one the portal's site is served at and the host is the loopback literal
 /// this emulator's listeners bind, so nothing here dials off this machine. Answers as soon as
@@ -302,6 +302,26 @@ async fn connects(address: &str) -> bool {
         tokio::time::timeout(CONDITION_DEADLINE, dialed).await,
         Ok(Ok(_))
     )
+}
+
+/// Wait until `address` accepts no connection any more, and answer whether it got there.
+///
+/// Closing the socket is work the service carries out AFTER it has answered the call that
+/// freed it, so the condition a case asserts is that the address STOPS being accepted — and it
+/// is waited out by dialling again until that holds or [`CONDITION_DEADLINE`] passes, never by
+/// dialling once at the instant the delete answered, which is what makes the same outcome
+/// reached on a loaded host as on an idle one. Nothing here is timed.
+async fn refuses_connections_eventually(address: &str) -> bool {
+    let deadline = std::time::Instant::now() + CONDITION_DEADLINE;
+    loop {
+        if !connects(address).await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
 }
 
 /// The whole flow a consumer of a published portal drives, over real connections to the
@@ -458,18 +478,131 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
         // the runtime completes after the 204 has been answered, so the wait is for that
         // CONDITION — the port refusing a dial — and not for the instant the delete returned,
         // which is only how fast the host happens to be.
-        let deadline = std::time::Instant::now() + CONDITION_DEADLINE;
-        loop {
-            if !connects(&address).await {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "case {case:?}: expected {address} to accept no connection once the portal is \
-                 deleted"
+        assert!(
+            refuses_connections_eventually(&address).await,
+            "case {case:?}: expected {address} to accept no connection once the portal is \
+             deleted"
+        );
+    }
+}
+
+/// What a row of [`a_deleted_portals_address_stops_accepting_connections`] leaves the portal's
+/// publication in before the portal itself is taken away.
+#[derive(Debug, Clone, Copy)]
+enum Publication {
+    /// Nothing was ever published: the address answers the refusal a site with nothing live
+    /// earns.
+    NothingLive,
+    /// A publish was accepted and its build has settled: the address serves the portal's page.
+    Live,
+    /// A publish was taken down again: the address is accepted and serves nothing.
+    TakenDown,
+}
+
+/// The address a portal's site is served at accepts no connection once the portal is DELETED,
+/// whatever its publication was doing when the delete took it away — because the socket's life
+/// is the portal RECORD's, not the publication's.
+///
+/// The rows span that publication state, which is what the rule generalises over here: a
+/// portal nothing published, one serving a settled publish, and one whose publication was
+/// taken down again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_portals_address_stops_accepting_connections() {
+    let row = &rows()[0];
+    for publication in [
+        Publication::NothingLive,
+        Publication::Live,
+        Publication::TakenDown,
+    ] {
+        let case = &format!("a portal deleted with its publication {publication:?}");
+        let emulator = emulator();
+
+        let (status, created) =
+            control(&emulator, row, "POST", "/v2/portals", Some(default_domain_portal())).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreatePortal, got {status} {created}"
+        );
+        let portal_id = as_str(&created, "portalId");
+        let published = as_str(
+            created
+                .get("endpointConfiguration")
+                .unwrap_or(&Value::Null),
+            "portalDefaultDomainName",
+        );
+        let preview_url = preview_url_once_ready(&emulator, row, case, &portal_id).await;
+        let address = site_address(case, &preview_url);
+
+        if matches!(publication, Publication::Live | Publication::TakenDown) {
+            let (status, body) = control(
+                &emulator,
+                row,
+                "POST",
+                &format!("/v2/portals/{portal_id}/publish"),
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected 202 from PublishPortal, got {status} {body}"
             );
-            tokio::time::sleep(PROBE_INTERVAL).await;
+            let answer = probe_until(
+                case,
+                &address,
+                &published,
+                "/",
+                "the portal's page",
+                |answer| answer.status == SERVED,
+            )
+            .await;
+            assert_page(case, &answer, &portal_id);
         }
+        if matches!(publication, Publication::TakenDown) {
+            let (status, body) = control(
+                &emulator,
+                row,
+                "DELETE",
+                &format!("/v2/portals/{portal_id}/publish"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 204,
+                "case {case:?}: expected 204 from DisablePortal, got {status} {body}"
+            );
+        }
+
+        // The address is reached while the portal is still held, whatever its publication is:
+        // that is what makes the assertion below about the DELETE rather than about an address
+        // nothing ever answered.
+        let answer = request_as(case, &address, "/", &published).await;
+        let expected = match publication {
+            Publication::Live => SERVED,
+            Publication::NothingLive | Publication::TakenDown => FORBIDDEN,
+        };
+        assert_eq!(
+            answer.status, expected,
+            "case {case:?}: expected {expected} from the published name while the portal is \
+             held, got {answer:?}"
+        );
+
+        let (status, body) = control(
+            &emulator,
+            row,
+            "DELETE",
+            &format!("/v2/portals/{portal_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 204,
+            "case {case:?}: expected 204 from DeletePortal, got {status} {body}"
+        );
+        assert!(
+            refuses_connections_eventually(&address).await,
+            "case {case:?}: expected {address} to accept no connection once the portal is \
+             deleted"
+        );
     }
 }
 
