@@ -25,7 +25,7 @@
 //! `tests/all/pipe_tagging.rs` pins). Each row below also spells out the message the
 //! broken rule is stated by, independently of the handler that built it: a broken
 //! `@length` is the request-validation sentence itself, and a rule the model expresses
-//! nowhere is the documented sentence itself —
+//! nowhere is the documented sentence itself — each the bare sentence, as
 //! `tests/all/tagging_refusal_wording.rs` owns that rule.
 //!
 //! Every assertion goes through `MultiServiceRouter::dispatch`, reusing the harness
@@ -67,16 +67,6 @@ pub(crate) const RESERVED_PREFIX_SENTENCE: &str =
 const ADDED_TAGS: &str = "addedTags";
 const CREATE_TAGS: &str = "tags";
 
-/// The message a constraint-validation refusal of the tagging surface carries for
-/// `sentence`: the JSON document this error class words such a refusal as, with the
-/// sentence under its `message` member as a JSON string — so every character a JSON string
-/// must escape is escaped — and the apostrophes the sentence quotes with escaped on top of
-/// that. Shared with the sibling suites that assert the same wording.
-pub(crate) fn validation_document(sentence: &str) -> String {
-    let quoted = Value::String(sentence.to_string()).to_string();
-    format!("{{\"message\": {}}}", quoted.replace('\'', "\\'"))
-}
-
 /// How a refused row must be worded. Spelled out here rather than read from the service,
 /// so what the test pins is the sentence a client sees.
 #[derive(Debug, Clone)]
@@ -100,24 +90,24 @@ enum Broken {
 impl Broken {
     /// The message this refusal carries for a write whose tags arrived on `member`.
     ///
-    /// A broken `@length` is stated as request validation states one, inside the document
-    /// this error class carries such a sentence in (`tagging_refusal_wording` owns that
-    /// rule); a rule the model expresses nowhere is the documented sentence itself, stated
-    /// bare.
+    /// A broken `@length` is stated as request validation states one — the bare sentence,
+    /// which is the whole value of the refusal's `message` member
+    /// (`tagging_refusal_wording` owns that rule); a rule the model expresses nowhere is
+    /// the documented sentence itself, stated just as bare.
     fn message(&self, member: &str) -> String {
         match self {
-            Self::KeyBound(shown) => validation_document(&format!(
+            Self::KeyBound(shown) => format!(
                 "1 validation error detected: Value '{shown}' at '{member}' failed to \
                  satisfy constraint: Map keys must satisfy constraint: [Member must have \
                  length less than or equal to {MAX_TAG_KEY_LEN}, Member must have length \
                  greater than or equal to {MIN_TAG_KEY_LEN}]"
-            )),
-            Self::ValueBound(shown) => validation_document(&format!(
+            ),
+            Self::ValueBound(shown) => format!(
                 "1 validation error detected: Value '{shown}' at '{CREATE_TAGS}' failed to \
                  satisfy constraint: Map value must satisfy constraint: [Member must have \
                  length less than or equal to {MAX_TAG_VALUE_LEN}, Member must have length \
                  greater than or equal to {MIN_TAG_VALUE_LEN}]"
-            )),
+            ),
             Self::ReservedPrefix => RESERVED_PREFIX_SENTENCE.to_string(),
             Self::CharacterSet => CHARACTER_SET_SENTENCE.to_string(),
         }
@@ -436,10 +426,10 @@ async fn a_refused_tag_names_the_input_member_it_arrived_on() {
         (400, TAG_RULE_CODE),
         "TagResource must refuse an over-long key with 400 {TAG_RULE_CODE}, got {refused:?}"
     );
-    // The sentence travels inside the refusal document, which escapes the apostrophes it
-    // quotes the member name with.
+    // The sentence is the message member's own value, so the apostrophes it quotes the
+    // member name with are plain apostrophes.
     assert!(
-        refused.message().contains(&format!("at \\'{ADDED_TAGS}\\'")),
+        refused.message().contains(&format!("at '{ADDED_TAGS}'")),
         "TagResource's refusal must name its own validation member, got {refused:?}"
     );
     assert_eq!(
@@ -463,7 +453,7 @@ async fn a_refused_tag_names_the_input_member_it_arrived_on() {
     assert!(
         refused_create
             .message()
-            .contains(&format!("at \\'{CREATE_TAGS}\\'")),
+            .contains(&format!("at '{CREATE_TAGS}'")),
         "CreatePipe's refusal must name its own member, got {refused_create:?}"
     );
 
