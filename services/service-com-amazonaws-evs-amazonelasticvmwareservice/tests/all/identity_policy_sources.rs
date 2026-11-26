@@ -16,6 +16,10 @@
 //! read — and since only an explicit deny refuses here (see
 //! `tests/all/authorization.rs`, which owns that part of the rule), neither refuses
 //! anything.
+//!
+//! The one source a USER has beyond its own two — the policies in force on the groups it
+//! belongs to — is owned by `tests/all/group_policy_sources.rs`, which reuses the
+//! fixtures below.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -33,27 +37,27 @@ use crate::environment_lifecycle::{
 };
 
 /// The wire error code the AWS authorization layer refuses with.
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// How long the sessions these tests register last — long enough that none expires while
 /// the test runs.
 const SESSION_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// A document denying every action of this service, on every resource.
-const DENY_EVS: &str =
+pub(crate) const DENY_EVS: &str =
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"evs:*","Resource":"*"}]}"#;
 
 /// A document allowing every action of this service, denying nothing.
-const ALLOW_EVS: &str =
+pub(crate) const ALLOW_EVS: &str =
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"evs:*","Resource":"*"}]}"#;
 
 /// A document denying another service's actions: it says nothing about this one.
-const DENY_EC2: &str =
+pub(crate) const DENY_EC2: &str =
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"ec2:*","Resource":"*"}]}"#;
 
 /// A document denying this service, but only on ONE environment — never the environment
 /// the requests below address, which the test creates and whose id this service mints.
-const DENY_OTHER_ENVIRONMENT: &str = r#"{"Version":"2012-10-17","Statement":[
+pub(crate) const DENY_OTHER_ENVIRONMENT: &str = r#"{"Version":"2012-10-17","Statement":[
     {"Effect":"Deny","Action":"evs:*",
      "Resource":"arn:aws:evs:us-west-2:000000000000:environment/env-0000000000"}
 ]}"#;
@@ -61,12 +65,12 @@ const DENY_OTHER_ENVIRONMENT: &str = r#"{"Version":"2012-10-17","Statement":[
 /// An ARN in AWS's OWN managed-policy namespace (`arn:aws:iam::aws:policy/…`) that the
 /// IAM emulator carries no document for, so an attachment of it is a grant whose
 /// statements nothing here can read.
-const UNREADABLE_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AWSDenyAll";
+pub(crate) const UNREADABLE_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AWSDenyAll";
 
 /// Which kind of IAM principal a request speaks for: the two forms this service's gate
 /// resolves out of a caller ARN.
 #[derive(Clone, Copy, Debug)]
-enum Principal {
+pub(crate) enum Principal {
     /// An `sts:AssumeRole` session of a role, reported as
     /// `arn:aws:sts::<account>:assumed-role/<role>/<session>`.
     AssumedRole,
@@ -88,7 +92,7 @@ const PRINCIPALS: [(&str, Principal); 3] = [
 
 /// Where a row holds the documents it puts in the account.
 #[derive(Clone, Copy, Debug)]
-enum Document {
+pub(crate) enum Document {
     /// An inline policy embedded on the principal itself, where `iam:PutRolePolicy` and
     /// `iam:PutUserPolicy` write one.
     Inline(&'static str),
@@ -126,7 +130,7 @@ fn seed_user(engine: &engine::InMemoryEngine, path: &str, user_name: &str) -> Us
 /// Written through the store rather than by calling `sts:AssumeRole` or
 /// `sts:GetSessionToken`, because what is under test is what this service does with the
 /// principal a credential names, not how the credential was minted.
-fn register_principal(
+pub(crate) fn register_principal(
     engine: &engine::InMemoryEngine,
     access_key_id: &str,
     principal: Principal,
@@ -176,7 +180,7 @@ fn register_principal(
 
 /// Embed an inline identity policy on the principal, where `iam:PutRolePolicy` and
 /// `iam:PutUserPolicy` write one.
-fn put_inline_policy(
+pub(crate) fn put_inline_policy(
     engine: &engine::InMemoryEngine,
     principal: Principal,
     name: &str,
@@ -223,7 +227,7 @@ fn attach_policy(
 ///
 /// `versions` carries each version's id, document and whether it is the policy's DEFAULT
 /// version — the one in force on every entity the policy is attached to.
-fn create_managed_policy(
+pub(crate) fn create_managed_policy(
     engine: &engine::InMemoryEngine,
     policy_name: &str,
     versions: &[(&str, &str, bool)],

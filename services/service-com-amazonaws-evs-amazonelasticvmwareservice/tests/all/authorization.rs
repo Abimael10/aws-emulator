@@ -10,11 +10,15 @@
 //! the error code is asserted on the wire body rather than against a modelled shape.
 //!
 //! What does NOT refuse here is as much of the rule as what does. The IAM emulator does
-//! not model a principal's whole permission set (group policies, permissions boundaries,
-//! service control policies), so an ABSENT `Allow` is not evidence that the caller lacks
-//! the permission and only an EXPLICIT `Deny` refuses — the reading
-//! `crate::state::authorization` documents. Each row below therefore pairs a denied
-//! caller with a caller the same request is not refused for.
+//! not model a principal's whole permission set (permissions boundaries, service control
+//! policies), so an ABSENT `Allow` is not evidence that the caller lacks the permission
+//! and only an EXPLICIT `Deny` refuses — the reading `crate::state::authorization`
+//! documents. Each row below therefore pairs a denied caller with a caller the same
+//! request is not refused for.
+//!
+//! WHICH documents are read for a caller is owned by
+//! `tests/all/identity_policy_sources.rs` (a principal's own two sources) and
+//! `tests/all/group_policy_sources.rs` (the groups a user belongs to).
 
 use std::time::{Duration, SystemTime};
 

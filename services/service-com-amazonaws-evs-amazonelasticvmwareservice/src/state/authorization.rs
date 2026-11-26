@@ -20,6 +20,8 @@
 //! 2. **what it may do** — the identity-based policy documents the IAM store holds for
 //!    that principal: its inline policies and the default versions of the managed
 //!    policies attached to it, whichever kind of principal it is (a role or a user),
+//!    plus — for a USER — those same two sources on every GROUP the user belongs to,
+//!    because a user's permissions include the policies in force on its groups, all
 //!    read out of the IAM service's OWN store so this service sees exactly what IAM's
 //!    handlers wrote;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the ONE shared
@@ -37,20 +39,33 @@
 //! An EXPLICIT `Deny` about the action is the one IAM decision this emulator can make
 //! soundly, and it is final whatever else the account holds, so it is what refuses here.
 //! An ABSENT `Allow` is NOT evidence that the caller lacks the permission: the rest of a
-//! principal's permission set (group policies, permissions boundaries, service control
-//! policies, session policies) is not modelled by the IAM emulator, so refusing on its
-//! absence would deny calls AWS permits. This is the reading AWS Transfer Family's gate
-//! takes of the same store.
+//! principal's permission set (permissions boundaries, service control policies, session
+//! policies) is not modelled by the IAM emulator, so refusing on its absence would deny
+//! calls AWS permits. This is the reading AWS Transfer Family's gate takes of the same
+//! store.
 //!
 //! A request signed with a credential the IAM and STS stores know nothing about — the
 //! emulator's own published credential, which is the position AWS account root
 //! credentials are in — carries no identity policy and so is never refused here.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
+
+/// The IAM store this gate reads the identity-based documents out of.
+type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// The IAM store's map of one kind of entity's INLINE policies:
+/// `<entity key> -> <policy name> -> the policy`.
+type InlinePolicies = BTreeMap<String, BTreeMap<String, iam_store::InlinePolicy>>;
+
+/// The IAM store's map of one kind of entity's managed-policy ATTACHMENTS:
+/// `<entity key> -> the ARNs attached to it`.
+type Attachments = BTreeMap<String, BTreeSet<String>>;
 
 /// This service's IAM action prefix: an action is `evs:<OperationName>` ("Actions
 /// defined by Amazon Elastic VMware Service", IAM Service Authorization Reference),
@@ -166,27 +181,63 @@ pub fn caller<Eng: Send + Sync + 'static>(
         return caller;
     };
     let store = iam.lock();
-    // The documents in force on an identity are its INLINE policies plus the default
+    // The documents in force on an ENTITY are its INLINE policies plus the default
     // version of every MANAGED policy attached to it — the same two sources for every
-    // kind of principal, so the two branches differ only in which maps they are read
-    // from.
-    let (inline, attached) = if let Some(role_name) = assumed_role_name(&caller.arn) {
+    // kind of entity, so the branches below differ only in which maps they are read
+    // from. A USER carries, besides its own, the documents in force on every GROUP it
+    // belongs to.
+    if let Some(role_name) = assumed_role_name(&caller.arn) {
         let role_key = iam_store::name_key(role_name);
-        (
-            inline_documents(&store.role_inline_policies, &role_key),
-            store.role_attached_policies.get(&role_key),
-        )
+        entity_documents(
+            &store,
+            &store.role_inline_policies,
+            &store.role_attached_policies,
+            &role_key,
+            &mut caller.documents,
+        );
     } else if let Some(user_name) = iam_user_name(&caller.arn) {
         let user_key = iam_store::name_key(user_name);
-        (
-            inline_documents(&store.user_inline_policies, &user_key),
-            store.user_attached_policies.get(&user_key),
-        )
-    } else {
-        (Vec::new(), None)
-    };
-    caller.documents.extend(inline);
-    for attachment in attached.into_iter().flatten() {
+        entity_documents(
+            &store,
+            &store.user_inline_policies,
+            &store.user_attached_policies,
+            &user_key,
+            &mut caller.documents,
+        );
+        // The groups the user belongs to, as the IAM store's own reading of its
+        // membership map reports them.
+        for group_key in store.group_keys_held_by(&user_key) {
+            entity_documents(
+                &store,
+                &store.group_inline_policies,
+                &store.group_attached_policies,
+                group_key,
+                &mut caller.documents,
+            );
+        }
+    }
+    caller
+}
+
+/// Add the identity-based documents one IAM entity carries to `documents`: the inline
+/// policies embedded in it, plus the DEFAULT version of every managed policy attached to
+/// it — the two kinds of identity-based policy IAM evaluates, read the same way
+/// whichever kind of entity carries them (a role, a user, or a group a user belongs to).
+fn entity_documents(
+    store: &IamState,
+    inline: &InlinePolicies,
+    attached: &Attachments,
+    entity_key: &str,
+    documents: &mut Vec<String>,
+) {
+    documents.extend(
+        inline
+            .get(entity_key)
+            .into_iter()
+            .flat_map(|held| held.values())
+            .map(|policy| policy.policy_document.clone()),
+    );
+    for attachment in attached.get(entity_key).into_iter().flatten() {
         // A policy the account does not hold a document for — an AWS-managed one,
         // which AWS owns — carries no statement this gate can read. It is evidence
         // of nothing, and since only an explicit deny refuses here, nothing follows
@@ -195,10 +246,9 @@ pub fn caller<Eng: Send + Sync + 'static>(
             .policy_by_arn(attachment)
             .and_then(default_version_document)
         {
-            caller.documents.push(document);
+            documents.push(document);
         }
     }
-    caller
 }
 
 /// The role name an STS assumed-role session ARN names.
@@ -238,25 +288,6 @@ fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
         return None;
     };
     (named == service).then_some(resource)
-}
-
-/// The inline policy documents one entity holds, from the IAM store's `<entity> ->
-/// <policy name> -> policy` map.
-fn inline_documents(
-    policies: &::std::collections::BTreeMap<
-        String,
-        ::std::collections::BTreeMap<String, iam_store::InlinePolicy>,
-    >,
-    entity_key: &str,
-) -> Vec<String> {
-    policies
-        .get(entity_key)
-        .map(|held| {
-            held.values()
-                .map(|policy| policy.policy_document.clone())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The document of a managed policy's DEFAULT version — the one in force on every entity
