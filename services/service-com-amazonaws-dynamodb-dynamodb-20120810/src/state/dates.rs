@@ -31,3 +31,17 @@ pub fn reported_date(instant: SystemTime) -> DateTime {
         (date.subsec_nanos() / NANOS_PER_MILLISECOND) * NANOS_PER_MILLISECOND,
     )
 }
+
+/// `instant` as TEXT: the date-time form an AWS timestamp takes where one is written into a
+/// document or interpolated into a sentence (`2020-11-04T07:28:34.028Z`), at the same
+/// millisecond resolution [`reported_date`] reports one at.
+///
+/// One place, so an instant a manifest carries and an instant a refusal names read the same
+/// way. An instant too far out to render in that form at all renders as the epoch second it
+/// carries, so the text always names the value in hand.
+pub fn reported_instant_text(instant: SystemTime) -> String {
+    let reported = reported_date(instant);
+    reported
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| reported.secs().to_string())
+}

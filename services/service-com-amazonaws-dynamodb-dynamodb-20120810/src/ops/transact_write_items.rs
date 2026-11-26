@@ -454,8 +454,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order, which is what keeps every reason aligned with the action it is about.
         // Only a defect of the REQUEST refuses the call outright ([`ElementRefusal`]).
         let mut bound: Vec<Result<Bound, String>> = Vec::with_capacity(actions.len());
-        let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
-            std::collections::BTreeSet::new();
         for (at, action) in actions.iter().enumerate() {
             match bind_element(
                 &*self.engine,
@@ -465,12 +463,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
                 action,
                 &names[at],
-                &mut keyed,
             ) {
                 Ok(element) => bound.push(Ok(element)),
                 Err(ElementRefusal::Call(error)) => return Err(error),
                 Err(ElementRefusal::Element(message)) => bound.push(Err(message)),
             }
+        }
+
+        // "Transaction requests cannot include multiple operations on one item": a rule
+        // about the whole transaction, so it is answered only once every action has been
+        // bound to the table it names ([`repeats_an_item`]) — a transaction naming a table
+        // that is not there is refused for the missing table, whichever action names it.
+        if repeats_an_item(&bound) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
+            ));
         }
 
         // A defect an action is found to have while it is BOUND is found before any
@@ -1471,12 +1478,32 @@ impl Outcome {
     }
 }
 
+/// Whether two of the BOUND actions came to one item of one table — "transaction requests
+/// cannot include multiple operations on one item".
+///
+/// Asked of the whole transaction once every action has been bound, which is what puts the
+/// rule BEHIND every refusal an action earns while it is bound: a table this region does not
+/// hold refuses the call wherever in the list it is named, so a transaction that repeats an
+/// item AND names a missing table is answered for the table, exactly as the single-item call
+/// on that table would be.
+///
+/// Only the actions that BOUND address an item at all: one the transaction already found a
+/// defect in never reached a key of its table's own schema, so it is no part of this rule.
+fn repeats_an_item(bound: &[Result<Bound, String>]) -> bool {
+    let mut keyed: std::collections::BTreeSet<(&str, &crate::state::ItemKey)> =
+        std::collections::BTreeSet::new();
+    bound
+        .iter()
+        .flatten()
+        .any(|element| !keyed.insert((element.table.as_str(), &element.prepared.key)))
+}
+
 /// BIND ONE action to its table, writing NOTHING and reading no stored item.
 ///
 /// `name` is the resolved table name the element addresses, settled with the rest of the
-/// request ([`check_element_shape`]), and `keyed` carries the keys the actions before this
-/// one addressed, because "transaction requests cannot include multiple operations on one
-/// item".
+/// request ([`check_element_shape`]). The rule that no two actions may address one item is
+/// about the TRANSACTION rather than about any one action, so it is NOT asked here: the
+/// caller asks it once every action has been bound to the table it names ([`repeats_an_item`]).
 ///
 /// Everything an action can be found to be wrong about WITHOUT the item its key holds is
 /// decided here: the table it names, the policies in force, the values the map it carries
@@ -1487,7 +1514,6 @@ impl Outcome {
 /// Which answer each refusal earns is [`ElementRefusal`]: a defect of the REQUEST refuses
 /// the call, and a failure the action is found to have against the table's own schema
 /// cancels the transaction with this action named in the reason list.
-#[allow(clippy::too_many_arguments)]
 fn bind_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
     store: &Store,
@@ -1496,7 +1522,6 @@ fn bind_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     now: ::std::time::SystemTime,
     action: &Requested<'_>,
     name: &str,
-    keyed: &mut std::collections::BTreeSet<(String, crate::state::ItemKey)>,
 ) -> Result<Bound, ElementRefusal> {
     let name = name.to_string();
     let substitutions = crate::state::Substitutions::new(
@@ -1628,14 +1653,6 @@ fn bind_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         }
     };
 
-    // "Transaction requests cannot include multiple operations on one item."
-    if !keyed.insert((name.clone(), prepared.key.clone())) {
-        return Err(ElementRefusal::Call(
-            crate::scaffolded::Scaffolded::validation(
-                crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
-            ),
-        ));
-    }
     Ok(Bound {
         table: name,
         returns_old_on_failure,

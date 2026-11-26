@@ -34,6 +34,19 @@ pub const MIN_INCREMENTAL_EXPORT_PERIOD: Duration = Duration::from_secs(15 * 60)
 pub const INCREMENTAL_EXPORT_PERIOD_TOO_SHORT_MESSAGE: &str =
     "Difference between export period from time and export period to time is less than 15 minutes";
 
+/// How a period whose two instants are out of ORDER is refused: the fixed sentence DynamoDB
+/// answers such a request with, carried by the modelled `InvalidExportTimeException`.
+///
+/// The period runs FROM its "inclusive start range" TO its "exclusive end range"
+/// (`$ExportFromTime` / `$ExportToTime`), so a start that is not strictly before the end
+/// describes no period at all — a distinct defect from a period that merely runs SHORT
+/// ([`INCREMENTAL_EXPORT_PERIOD_TOO_SHORT_MESSAGE`]), which is why it has its own sentence.
+/// Fixed text with no variable part: it states the two members' order and echoes neither
+/// instant.
+pub const INCREMENTAL_EXPORT_PERIOD_ORDER_MESSAGE: &str =
+    "Incremental export period from time should not be greater or equal to incremental export \
+     period to time";
+
 /// How an INCREMENTAL export that states no period at all is refused: the sentence
 /// DynamoDB answers that request with, under the one it states a request it cannot act on
 /// with ([`INVALID_REQUEST_PREFIX`]).
@@ -189,6 +202,39 @@ impl IncrementalExportWindow {
     }
 }
 
+/// How an incremental export whose period ENDS after the present is refused: the sentence
+/// states the rule the window's end broke — a period cannot reach into the future, because
+/// nothing has been written there yet — and names the instant the request asked for.
+///
+/// The fixed text is AWS's, with its own spacing before the instant; the variable part is
+/// the `ExportToTime` the request carried, rendered as the UTC instant every timestamp of
+/// this service is rendered as ([`reported_instant_text`]). It is the one value a caller
+/// has to correct, so a refusal that named only the rule would leave it guessing which of
+/// the period's two bounds it sent wrong.
+pub fn export_to_time_in_future_message(requested: SystemTime) -> String {
+    format!(
+        "Incremental export period to time cannot be greater than the current time : {}",
+        reported_instant_text(requested)
+    )
+}
+
+/// How an incremental export whose period STARTS before the table's recoverable history is
+/// refused: the sentence states the rule the window's start broke — a period cannot reach
+/// back before the table had any data to change — and names the instant the request asked
+/// for.
+///
+/// The fixed text is AWS's, with its own spacing before the instant; the variable part is
+/// the `ExportFromTime` the request carried ([`reported_instant_text`]). The rule names the
+/// table's creation because that is where the oldest restorable point of a table whose
+/// recovery has been on since it was created stands
+/// ([`PointInTimeRecovery::restorable_window`]).
+pub fn export_from_time_before_history_message(requested: SystemTime) -> String {
+    format!(
+        "Incremental export period from time cannot be less than the table creation time : {}",
+        reported_instant_text(requested)
+    )
+}
+
 /// Why an incremental export cannot be taken as it was asked for.
 #[derive(Debug, Clone)]
 pub enum IncrementalRefusal {
@@ -196,9 +242,9 @@ pub enum IncrementalRefusal {
     /// cannot be taken with — which is the `ValidationException` such an input is.
     Request(RequestError),
     /// A fault of the PERIOD it asked for: an instant outside the table's recovery window,
-    /// or a period shorter than the minimum, each of which is the modelled
-    /// `InvalidExportTimeException` with the sentence carried here.
-    ExportPeriod(&'static str),
+    /// an end that reaches into the future, or a period shorter than the minimum, each of
+    /// which is the modelled `InvalidExportTimeException` with the sentence carried here.
+    ExportPeriod(String),
 }
 
 /// The period an export is taken over, resolved from what the request stated and held to
@@ -216,16 +262,25 @@ pub enum IncrementalRefusal {
 ///   `ExportToTime` resolves to the newest exportable point — "if this is not provided, the
 ///   latest time with data available will be used" — and the view type to the value its own
 ///   member documents ([`DEFAULT_EXPORT_VIEW_TYPE`]);
-/// * both instants must lie inside the table's recovery window — "you can export data from
-///   any time within the point in time recovery window" (the operation's doc) — which is
-///   `InvalidExportTimeException`;
-/// * and the period must span at least [`MIN_INCREMENTAL_EXPORT_PERIOD`], which is that
-///   same error with the sentence DynamoDB states that rule with.
+/// * the period's END may not reach past the present, and its START may not reach back
+///   before the table's data does — "you can export data from any time within the point in
+///   time recovery window" (the operation's doc), whose oldest point is where the table's
+///   recoverable history begins. Each of the two is `InvalidExportTimeException` stating the
+///   rule that bound broke and naming the instant the request sent for it
+///   ([`export_to_time_in_future_message`], [`export_from_time_before_history_message`]);
+/// * what is left outside the window — a start after its newest point, or an end before its
+///   oldest — is that same error with the fixed sentence an instant no window covers earns
+///   ([`INVALID_EXPORT_TIME_MESSAGE`]);
+/// * and the period must RUN — its start strictly before its end
+///   ([`INCREMENTAL_EXPORT_PERIOD_ORDER_MESSAGE`]) — and span at least
+///   [`MIN_INCREMENTAL_EXPORT_PERIOD`], each that same error with the sentence DynamoDB
+///   states that rule with.
 pub fn resolved_incremental_window(
     export_type: &str,
     requested: Option<&RequestedIncrementalExport>,
     earliest: SystemTime,
     latest: SystemTime,
+    now: SystemTime,
 ) -> Result<Option<IncrementalExportWindow>, IncrementalRefusal> {
     let incremental = export_type == EXPORT_TYPE_INCREMENTAL;
     let Some(requested) = requested else {
@@ -269,17 +324,51 @@ pub fn resolved_incremental_window(
     let to = requested
         .export_to_time
         .map_or(latest, at_nearest_timestamp_precision);
-    if from < earliest || from > latest || to < earliest || to > latest {
-        return Err(IncrementalRefusal::ExportPeriod(INVALID_EXPORT_TIME_MESSAGE));
+    // The period ENDS at an instant the table has data up to, so an end past the present
+    // asks for changes nothing has written yet. That is a rule about the CLOCK rather than
+    // about the window the recovery offers — the window's newest point trails the present
+    // ([`PointInTimeRecovery::restorable_window`]) — so it is asked first and states which
+    // bound broke it and the instant that did ([`export_to_time_in_future_message`]).
+    if to > now {
+        return Err(IncrementalRefusal::ExportPeriod(
+            export_to_time_in_future_message(to),
+        ));
     }
-    // The period's own length, which a period that runs backwards fails as surely as one
-    // that is merely short.
+    // The period STARTS at an instant the table has data from, so a start before the oldest
+    // point the window reaches asks for changes made before the table had any history to
+    // change — which is where that history begins ([`PointInTimeRecovery::restorable_window`]
+    // derives it). It states that rule and the instant the request sent
+    // ([`export_from_time_before_history_message`]).
+    if from < earliest {
+        return Err(IncrementalRefusal::ExportPeriod(
+            export_from_time_before_history_message(from),
+        ));
+    }
+    // The two instants' ORDER, which is what makes them a PERIOD at all: a start at or
+    // after the end describes none, so that is answered before either instant is placed
+    // against the window ([`INCREMENTAL_EXPORT_PERIOD_ORDER_MESSAGE`]).
+    if from >= to {
+        return Err(IncrementalRefusal::ExportPeriod(
+            INCREMENTAL_EXPORT_PERIOD_ORDER_MESSAGE.to_string(),
+        ));
+    }
+    // What is left is an end the window has not CAUGHT UP with: the newest restorable point
+    // trails the present ([`PointInTimeRecovery::restorable_window`]), so an end between the
+    // two is an instant no window covers yet even though it is not in the future, which is
+    // the fixed sentence such an instant earns ([`INVALID_EXPORT_TIME_MESSAGE`]). A start
+    // past that point carries its end with it, so this covers both.
+    if to > latest {
+        return Err(IncrementalRefusal::ExportPeriod(
+            INVALID_EXPORT_TIME_MESSAGE.to_string(),
+        ));
+    }
+    // The period's own length, which is asked of a period that HAS a length.
     let spans = to
         .duration_since(from)
         .unwrap_or(Duration::from_secs(0));
     if spans < MIN_INCREMENTAL_EXPORT_PERIOD {
         return Err(IncrementalRefusal::ExportPeriod(
-            INCREMENTAL_EXPORT_PERIOD_TOO_SHORT_MESSAGE,
+            INCREMENTAL_EXPORT_PERIOD_TOO_SHORT_MESSAGE.to_string(),
         ));
     }
     Ok(Some(IncrementalExportWindow {

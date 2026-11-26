@@ -324,6 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 request.incremental_export_specification.as_ref(),
                 earliest,
                 latest,
+                now,
             )
             .map_err(incremental_refusal)?;
             // A capability this emulator cannot write real exported data for is refused as
@@ -584,7 +585,7 @@ fn incremental_refusal(
         crate::state::IncrementalRefusal::ExportPeriod(message) => {
             ExportTableToPointInTimeErrorModeled::InvalidExportTimeException(
                 InvalidExportTimeException {
-                    message: Some(message.to_string()),
+                    message: Some(message),
                 },
             )
             .into()

@@ -61,8 +61,14 @@ const DAY_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 const MIN_PERIOD_SECONDS: f64 = state::MIN_INCREMENTAL_EXPORT_PERIOD.as_secs() as f64;
 const TOO_SHORT: &str = state::INCREMENTAL_EXPORT_PERIOD_TOO_SHORT_MESSAGE;
 
-/// The sentence every instant OUTSIDE the recovery window is refused with.
-const INVALID_EXPORT_TIME: &str = state::INVALID_EXPORT_TIME_MESSAGE;
+/// The sentence a period whose two instants are out of order is refused with.
+const OUT_OF_ORDER: &str = state::INCREMENTAL_EXPORT_PERIOD_ORDER_MESSAGE;
+
+/// One epoch instant as the store reads one a request carried, so a row can state the RULE
+/// the refusal applies and the value it sent rather than a rendering copied beside it.
+fn instant_of(seconds: f64) -> SystemTime {
+    state::at_nearest_timestamp_precision(UNIX_EPOCH + Duration::from_secs_f64(seconds))
+}
 
 /// How long a poll for the window to widen, or for an export to finish, may take before
 /// this suite calls it a hang. Generous slack over the emulator's own transient span: a
@@ -266,36 +272,43 @@ async fn an_incremental_export_period_shorter_than_the_minimum_is_refused() {
 
     // Rows differ in how long the period is, in seconds before the window's newest point:
     // the published minimum and periods either side of it, a period of no length at all and
-    // one that runs backwards. The third column says whether the export is served.
-    let rows: [(&str, f64, f64, bool); 9] = [
-        ("a period of one minute", -60.0, 0.0, false),
-        ("a period of one second", -1.0, 0.0, false),
-        ("a period of no length at all", 0.0, 0.0, false),
+    // one that runs backwards. The third column is the sentence a refused row earns — the
+    // fifteen-minute rule for a period that RUNS and falls short, and the order rule for one
+    // that does not run at all — and the fourth says whether the export is served.
+    let rows: [(&str, f64, f64, Option<&str>); 9] = [
+        ("a period of one minute", -60.0, 0.0, Some(TOO_SHORT)),
+        ("a period of one second", -1.0, 0.0, Some(TOO_SHORT)),
+        (
+            "a period of no length at all",
+            0.0,
+            0.0,
+            Some(OUT_OF_ORDER),
+        ),
         (
             "a period one second short of the minimum",
             -(MIN_PERIOD_SECONDS - 1.0),
             0.0,
-            false,
+            Some(TOO_SHORT),
         ),
         (
             "a period that runs backwards",
             -600.0,
             -1_200.0,
-            false,
+            Some(OUT_OF_ORDER),
         ),
         (
             "the shortest period accepted",
             -MIN_PERIOD_SECONDS,
             0.0,
-            true,
+            None,
         ),
-        ("a sixteen-minute period", -960.0, 0.0, true),
-        ("a period of an hour", -3_600.0, 0.0, true),
-        ("a period of a day", -DAY_SECONDS, 0.0, true),
+        ("a sixteen-minute period", -960.0, 0.0, None),
+        ("a period of an hour", -3_600.0, 0.0, None),
+        ("a period of a day", -DAY_SECONDS, 0.0, None),
     ];
 
     let mut served: Vec<String> = Vec::new();
-    for (case, from_offset, to_offset, accepted) in rows {
+    for (case, from_offset, to_offset, refusal) in rows {
         // The window as it stands for THIS row: its newest point advances with the clock, so
         // each period is placed against the window the call will be held to.
         let (_, latest) = restorable_window(&router, table).await;
@@ -306,7 +319,7 @@ async fn an_incremental_export_period_shorter_than_the_minimum_is_refused() {
             None,
         );
         let (status, answered) = call(&router, "ExportTableToPointInTime", body).await;
-        if accepted {
+        let Some(expected) = refusal else {
             assert_eq!(
                 status, 200,
                 "case {case:?}: a period at or past the minimum is served, got {status} with \
@@ -325,18 +338,17 @@ async fn an_incremental_export_period_shorter_than_the_minimum_is_refused() {
             );
             served.push(export_arn(&answered));
             continue;
-        }
+        };
         assert_eq!(
             (status, error_code(&answered).as_str()),
             (400, "InvalidExportTimeException"),
-            "case {case:?}: a period shorter than the minimum is refused with the modelled \
+            "case {case:?}: a period the rules do not admit is refused with the modelled \
              error, got {status} with {answered}"
         );
         assert_eq!(
             message(&answered),
-            TOO_SHORT,
-            "case {case:?}: the refusal states the fixed sentence of the fifteen-minute \
-             rule, got {}",
+            expected,
+            "case {case:?}: expected {expected:?}, got {}",
             message(&answered)
         );
     }
@@ -359,30 +371,37 @@ async fn an_incremental_period_outside_the_restorable_window_is_refused_for_the_
     enable_recovery(&router, table, Some(35)).await;
     window_spanning(&router, "the periods under test", table, MIN_PERIOD_SECONDS * 4.0).await;
 
-    // Rows differ in WHICH end of the period falls outside the window, and by how far: both
-    // instants are measured off the window the table publishes, so the rows hold whatever
-    // the clock reads.
+    // Rows differ in WHICH bound of the period lies outside what may be exported, and by how
+    // far: both instants are measured off the window the table publishes, so the rows hold
+    // whatever the clock reads. Each bound is refused by the rule it broke, and the sentence
+    // names the instant the request sent for it — a start before the table's history begins,
+    // or an end in the future.
     type Period = fn(f64, f64) -> (f64, f64);
-    let rows: [(&str, Period); 4] = [
+    type Sentence = fn(f64, f64) -> String;
+    let rows: [(&str, Period, Sentence); 4] = [
         (
             "a period starting before the window reaches",
             |earliest, latest| (earliest - 60.0, latest),
+            |from, _| state::export_from_time_before_history_message(instant_of(from)),
         ),
         (
             "a period starting a day before the window reaches",
             |earliest, latest| (earliest - DAY_SECONDS, latest),
+            |from, _| state::export_from_time_before_history_message(instant_of(from)),
         ),
         (
             "a period ending in the future",
             |_, latest| (latest - 3_600.0, latest + 3_600.0),
+            |_, to| state::export_to_time_in_future_message(instant_of(to)),
         ),
         (
             "a period wholly in the future",
             |_, latest| (latest + 3_600.0, latest + 7_200.0),
+            |_, to| state::export_to_time_in_future_message(instant_of(to)),
         ),
     ];
 
-    for (case, period_of) in rows {
+    for (case, period_of, sentence_of) in rows {
         let (earliest, latest) = restorable_window(&router, table).await;
         let (from, to) = period_of(earliest, latest);
         let (status, answered) = call(
@@ -397,11 +416,11 @@ async fn an_incremental_period_outside_the_restorable_window_is_refused_for_the_
             "case {case:?}: an instant outside the window is refused with the modelled \
              error, got {status} with {answered}"
         );
+        let expected = sentence_of(from, to);
         assert_eq!(
             message(&answered),
-            INVALID_EXPORT_TIME,
-            "case {case:?}: the refusal states the fixed sentence of an instant no window \
-             holds, got {}",
+            expected,
+            "case {case:?}: expected {expected:?}, got {}",
             message(&answered)
         );
     }
@@ -418,6 +437,102 @@ async fn an_incremental_period_outside_the_restorable_window_is_refused_for_the_
     assert!(
         !export_arn(&served).is_empty(),
         "case \"a period inside the window\": the export is recorded, got {served}"
+    );
+}
+
+#[tokio::test]
+async fn each_bound_of_an_incremental_period_states_the_rule_it_broke_and_the_instant_it_sent() {
+    let (router, _engine) = emulator_with_s3_and_engine();
+    create_bucket(&router, BUCKET).await;
+    let table = "PeriodBoundSentences";
+    active_table(&router, table).await;
+    enable_recovery(&router, table, Some(35)).await;
+    window_spanning(&router, "the periods under test", table, MIN_PERIOD_SECONDS * 4.0).await;
+
+    /// Which instant of the period the sentence under test names, if either.
+    #[derive(Clone, Copy)]
+    enum Names {
+        From,
+        To,
+        Neither,
+    }
+
+    // Rows differ in the bound that broke and in how far past it the instant sits. The
+    // expected text is written out HERE — the fixed half of each AWS sentence — while the
+    // instant it interpolates is rendered from the value the row sent, so what the row pins
+    // is the sentence and not one run's timestamp.
+    type Period = fn(f64, f64) -> (f64, f64);
+    let rows: [(&str, Period, &str, Names); 6] = [
+        (
+            "an end an hour in the future",
+            |_, latest| (latest - 3_600.0, latest + 3_600.0),
+            "Incremental export period to time cannot be greater than the current time : ",
+            Names::To,
+        ),
+        (
+            "an end a year in the future",
+            |_, latest| (latest - 3_600.0, latest + 31_536_000.0),
+            "Incremental export period to time cannot be greater than the current time : ",
+            Names::To,
+        ),
+        (
+            "a start a minute before the window reaches",
+            |earliest, latest| (earliest - 60.0, latest),
+            "Incremental export period from time cannot be less than the table creation time : ",
+            Names::From,
+        ),
+        (
+            "a start a year before the window reaches",
+            |earliest, latest| (earliest - 365.0 * DAY_SECONDS, latest),
+            "Incremental export period from time cannot be less than the table creation time : ",
+            Names::From,
+        ),
+        (
+            "a period that runs backwards",
+            |_, latest| (latest - 600.0, latest - 1_200.0),
+            "Incremental export period from time should not be greater or equal to incremental \
+             export period to time",
+            Names::Neither,
+        ),
+        (
+            "a period of no length at all",
+            |_, latest| (latest - 600.0, latest - 600.0),
+            "Incremental export period from time should not be greater or equal to incremental \
+             export period to time",
+            Names::Neither,
+        ),
+    ];
+
+    for (case, period_of, sentence, names) in rows {
+        let (earliest, latest) = restorable_window(&router, table).await;
+        let (from, to) = period_of(earliest, latest);
+        let (status, answered) = call(
+            &router,
+            "ExportTableToPointInTime",
+            incremental_body(table, Some(from), Some(to), None),
+        )
+        .await;
+        let expected = match names {
+            Names::From => format!(
+                "{sentence}{}",
+                state::reported_instant_text(instant_of(from))
+            ),
+            Names::To => format!("{sentence}{}", state::reported_instant_text(instant_of(to))),
+            Names::Neither => sentence.to_string(),
+        };
+        assert_eq!(
+            (status, error_code(&answered).as_str(), message(&answered)),
+            (400, "InvalidExportTimeException", expected.clone()),
+            "case {case:?}: expected 400 InvalidExportTimeException with {expected:?}, got \
+             {status} with {answered}"
+        );
+    }
+
+    // A refused export records nothing, so none of the rows above left a task behind.
+    assert_eq!(
+        listed_exports(&router, table).await,
+        Vec::<String>::new(),
+        "every period above is refused, so the catalogue holds no export of this table"
     );
 }
 

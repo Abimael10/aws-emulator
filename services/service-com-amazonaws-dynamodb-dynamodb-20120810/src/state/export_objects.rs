@@ -245,11 +245,10 @@ fn manifest_summary_document(export: &Export, items: usize, files_key: &str) -> 
 }
 
 /// One instant as the manifest carries it: the date-time form an AWS timestamp takes in a
-/// document (`2020-11-04T07:28:34.028Z`).
+/// document (`2020-11-04T07:28:34.028Z`), which is the one rendering of an instant this
+/// service writes ([`super::reported_instant_text`]).
 fn rendered_instant(instant: SystemTime) -> String {
-    super::reported_date(instant)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
+    super::reported_instant_text(instant)
 }
 
 /// One item as DynamoDB JSON: each attribute under its name, in name order so one item

@@ -250,6 +250,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut responses: Vec<ItemResponse> = Vec::with_capacity(input.transact_items.len());
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
+        // Whether any two elements came to one item of one table, which is a rule about the
+        // TRANSACTION rather than about any one element: it is therefore decided BELOW,
+        // once every element has been resolved against the table it names, so a transaction
+        // that also names a table this region does not hold is refused for that table
+        // whichever element carries it.
+        let mut repeats_an_item = false;
         let mut ledger = crate::state::ReadLedger::default();
         // "The aggregate size of the items in the transaction cannot exceed 4 MB"
         // ([`crate::state::MAX_TRANSACTION_SIZE_BYTES`]), and "DynamoDB rejects the entire
@@ -338,11 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let key = table
                 .key_of_transact_key_map(&requested.get.key)
                 .map_err(|refusal| refused_key(at, input.transact_items.len(), refusal))?;
-            if !keyed.insert((name.clone(), key.clone())) {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
-                ));
-            }
+            repeats_an_item |= !keyed.insert((name.clone(), key.clone()));
             let item = table.items.get(&key).cloned();
             // What this `Get` contributes to the transaction's aggregate: the bytes the
             // item it found stores, and nothing for a key that held none.
@@ -384,6 +386,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     projected.as_deref(),
                 )),
             });
+        }
+
+        // "Transaction requests cannot include multiple operations on one item": the rule is
+        // about the whole transaction, so it is answered only once every element has been
+        // resolved against the table it names — a transaction naming a table that is not
+        // there is refused for the missing table, whichever element names it, exactly as the
+        // single-item read of that table would be
+        // ([`crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE`]). Nothing has been debited yet,
+        // so a transaction refused here read nothing and consumed nothing.
+        if repeats_an_item {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
+            ));
         }
 
         // The aggregate the reads above came to, held to the documented transaction quota:
