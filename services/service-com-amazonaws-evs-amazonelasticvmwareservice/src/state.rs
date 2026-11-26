@@ -3742,6 +3742,34 @@ pub fn live_connector_mut<'a>(
         .filter(|connector| connector.is_live())
 }
 
+/// The connector `connector_id` names in this environment that a READ still reports, if
+/// any: the record the environment holds whose own deletion has not come due yet.
+///
+/// This is the form an operation that only REPORTS resolves a connector handle with. A
+/// record this store has not finished with is still a resource of the environment —
+/// "until then a read must still report it as present"
+/// ([`FinishedRecord::is_finished`]), which is why `ListEnvironmentConnectors` reports a
+/// `DELETING` connector and why the connector type such a record occupies is not free for
+/// a new one yet ([`live_connector_of_type`]) — so a read that SELECTS records by the
+/// handle resolves it and reports them, including the entitlements an accepted
+/// environment deletion stopped in place and kept ([`StoredEntitlement::stop`]). Only a
+/// record that has reached `DELETED`, or one this environment never held, resolves to
+/// nothing ("The resource might not be specified correctly, or it may have a `state` of
+/// `DELETED`", `ResourceNotFoundException` doc).
+///
+/// [`live_connector`] draws the line one state earlier, on purpose: a request that ACTS
+/// through a connector may not act through one whose teardown this service has already
+/// accepted, while a read of what that connector tracked is not acting through it at all.
+pub fn reportable_connector<'a>(
+    environment: &'a StoredEnvironment,
+    connector_id: &str,
+) -> Option<&'a StoredConnector> {
+    environment
+        .connectors
+        .get(connector_id)
+        .filter(|connector| !connector.is_finished())
+}
+
 /// The largest page a `@paginated` operation of this service returns when the caller
 /// names no `maxResults`: the top of the modelled `MaxResults` range (1..100).
 pub const MAX_PAGE_SIZE: i32 = 100;

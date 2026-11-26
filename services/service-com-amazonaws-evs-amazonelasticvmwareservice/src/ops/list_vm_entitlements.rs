@@ -9,10 +9,16 @@
 //!
 //! `connectorId` is a required resource handle, so it is RESOLVED against that
 //! environment's connectors before it is used to select records: an id the environment
-//! holds no live connector for names no resource of the request and is refused with
+//! holds no record of names no resource of the request and is refused with
 //! `ResourceNotFoundException`, exactly as [`crate::ops::create_entitlement`] and
-//! [`crate::ops::update_environment_connector`] refuse one. A connector the environment
-//! DOES hold and that carries no entitlement of the requested type is an empty page:
+//! [`crate::ops::update_environment_connector`] refuse one. This read resolves every
+//! record the service still reports ([`crate::state::reportable_connector`]) — a
+//! connector whose teardown has started still exists, so the records it tracked,
+//! including the entitlements an accepted environment deletion stopped in place and kept,
+//! are still reported through it; only one that has reached `DELETED` resolves to
+//! nothing. The operations that ACT through a connector draw that line one state earlier
+//! ([`crate::state::live_connector`]). A connector the environment DOES hold and that
+//! carries no entitlement of the requested type is an empty page:
 //! "Returns existing entitlements for virtual machines associated with the specified
 //! environment and connector" (this operation's doc) — the records are selected by the
 //! pair, once both resources resolve.
@@ -233,17 +239,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // `connectorId` is a required handle on a resource of that environment, not a
-        // free-text label: an id the environment holds no live connector for resolves to
-        // nothing, so the request is refused with the operation's modelled
+        // free-text label: an id the environment holds no record of names no resource of
+        // the request, so it is refused with the operation's modelled
         // `ResourceNotFoundException` naming the connector the REQUEST asked for, rather
         // than answered with an empty page a caller cannot tell from a connector that
-        // has no entitlement yet. A connector that has reached DELETED resolves to
-        // nothing either ("it may have a `state` of `DELETED`",
-        // `ResourceNotFoundException` doc). The connector's TYPE is not a condition here:
-        // this reports the records of a connector the environment holds, whichever type
-        // it is, and only `CreateEntitlement` requires the vCenter appliance the
+        // has no entitlement yet. A record whose deletion has not come due yet is a
+        // resource this service still reports, so it resolves here and the records it
+        // tracked are reported — including the ones an accepted environment deletion
+        // stopped in place and kept. A connector that has reached DELETED resolves to
+        // nothing ("it may have a `state` of `DELETED`", `ResourceNotFoundException`
+        // doc), which is where [`crate::state::reportable_connector`] draws the line; the
+        // operations that ACT through a connector draw it one state earlier
+        // ([`crate::state::live_connector`]). The connector's TYPE is not a condition
+        // here: this reports the records of a connector the environment holds, whichever
+        // type it is, and only `CreateEntitlement` requires the vCenter appliance the
         // entitlement is tracked through.
-        if crate::state::live_connector(environment, &input.connector_id).is_none() {
+        if crate::state::reportable_connector(environment, &input.connector_id).is_none() {
             return Err(ListVmEntitlementsErrorModeled::ResourceNotFoundException(
                 crate::state::connector_not_found(&input.connector_id),
             )

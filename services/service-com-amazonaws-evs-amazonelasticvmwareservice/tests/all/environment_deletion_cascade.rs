@@ -21,11 +21,12 @@
 //!   entitlement's status enum declares nothing between tracking and stopped, so its
 //!   usage tracking stops at once and `stoppedAt` is stamped.
 //! * An entitlement is read through the connector it was created through
-//!   (`ListVmEntitlements`), and a connector that is being torn down resolves to nothing
-//!   ("The resource might not be specified correctly, or it may have a `state` of
+//!   (`ListVmEntitlements`), and a connector that has reached `DELETED` resolves to
+//!   nothing ("The resource might not be specified correctly, or it may have a `state` of
 //!   `DELETED`", `ResourceNotFoundException` doc;
-//!   `tests/all/list_vm_entitlements_connector.rs` owns that rule) — so the entitlements
-//!   of a deleted environment are no longer listable through it.
+//!   `tests/all/list_vm_entitlements_connector.rs` owns that rule, and the in-flight read
+//!   the stopped records are kept for too) — so once the deletion has come due the
+//!   entitlements of the environment are no longer listable through it.
 //!
 //! The harness (`emulator`, `call`, `create_settled`, `settle`) is the one
 //! `environment_lifecycle` already owns, so every test drives the service the way a
@@ -349,35 +350,6 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
             );
         }
 
-        // Over the wire the entitlements are no longer listable at all: the connector
-        // they are read through is being torn down with the environment.
-        let (status, body) = call(
-            &router,
-            "ListVmEntitlements",
-            &json!({
-                "environmentId": environment,
-                "connectorId": vcenter,
-                "entitlementType": WINDOWS_SERVER,
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a list through a connector going away with the environment is \
-             refused, got {status} {body}"
-        );
-        assert_eq!(
-            error_type(&body).rsplit(['#', '/']).next().unwrap_or(""),
-            "ResourceNotFoundException",
-            "case {case:?}: expected a ResourceNotFoundException, got {}",
-            error_type(&body)
-        );
-        assert_eq!(
-            body["resourceId"],
-            json!(vcenter),
-            "case {case:?}: resourceId must echo the requested connector, got {body}"
-        );
-
         // Once the deletion comes due the environment and its connectors are DELETED
         // together: one clock, one `modifiedAt`.
         settle(&router);
@@ -396,6 +368,38 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
             &settled["modifiedAt"],
         )
         .await;
+
+        // And with the connector they are read through DELETED, the stopped entitlements
+        // are no longer listable through it: the record it reached is the one a lookup
+        // resolves to nothing. While the deletion was still in flight the same list
+        // reported the stopped records — `tests/all/list_vm_entitlements_connector.rs`
+        // owns both halves of that rule, at the states this one only passes through.
+        let (status, body) = call(
+            &router,
+            "ListVmEntitlements",
+            &json!({
+                "environmentId": environment,
+                "connectorId": vcenter,
+                "entitlementType": WINDOWS_SERVER,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a list through a connector the environment's deletion has \
+             DELETED is refused, got {status} {body}"
+        );
+        assert_eq!(
+            error_type(&body).rsplit(['#', '/']).next().unwrap_or(""),
+            "ResourceNotFoundException",
+            "case {case:?}: expected a ResourceNotFoundException, got {}",
+            error_type(&body)
+        );
+        assert_eq!(
+            body["resourceId"],
+            json!(vcenter),
+            "case {case:?}: resourceId must echo the requested connector, got {body}"
+        );
 
         // The control environment is untouched by every delete above.
         let control_connectors = listed_connectors(&router, case, &control).await;
@@ -451,7 +455,7 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
 
 /// The epoch milliseconds a reported timestamp carries — awsJson1_0 renders a
 /// `Timestamp` as epoch SECONDS, so this is the stored stamp behind it.
-fn epoch_millis(reported: &Value) -> i64 {
+pub(crate) fn epoch_millis(reported: &Value) -> i64 {
     let seconds = reported
         .as_f64()
         .unwrap_or_else(|| panic!("the reported timestamp {reported} is a number"));

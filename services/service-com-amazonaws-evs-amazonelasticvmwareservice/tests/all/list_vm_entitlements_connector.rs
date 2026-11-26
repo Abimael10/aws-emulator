@@ -5,9 +5,12 @@
 //!
 //! The rule under test: a required resource handle an operation's input carries is
 //! resolved against the store before it selects anything, and one that resolves to no
-//! live resource is refused with the operation's modelled `ResourceNotFoundException`
+//! resource is refused with the operation's modelled `ResourceNotFoundException`
 //! naming that resource — never answered with a success a caller cannot tell from a
-//! resource that holds no records yet. Where it comes from:
+//! resource that holds no records yet. For a read, the records it resolves against are
+//! the ones this service still REPORTS: a connector whose deletion has not come due yet
+//! still exists, so the entitlements it tracked are still reported through it, and only
+//! one that has reached `DELETED` resolves to nothing. Where it comes from:
 //!
 //! * `connectorId` is a **required** member of `ListVmEntitlementsRequest`, patterned
 //!   `^(cnctr-[a-zA-Z0-9]{10})$` (`smithy_query(query="operation",
@@ -26,6 +29,15 @@
 //! * A connector id is scoped to its environment, exactly as
 //!   `UpdateEnvironmentConnector` and `CreateEntitlement` read one
 //!   (`tests/all/connectors.rs`, `tests/all/entitlement_connector.rs`).
+//! * `ConnectorState` declares `DELETING` beside `DELETED`
+//!   (`smithy_query(query="shape", shape="ConnectorState")`), and a `DELETING` record is
+//!   one `ListEnvironmentConnectors` reports and whose connector type is not free for a
+//!   new connector yet — so it is a resource of the environment, while `DELETED` is the
+//!   state the not-found doc above names. `EntitlementStatus` declares `DELETED` and
+//!   `VmEntitlement` carries `stoppedAt` (`smithy_query(query="shape",
+//!   shape="EntitlementStatus,VmEntitlement")`): a stopped entitlement is a record a read
+//!   reports, which is what the entitlements an environment's deletion stops in place are
+//!   kept for (`tests/all/environment_deletion_cascade.rs` owns that cascade).
 //!
 //! The harness (`emulator`, `call`, `create_settled`) is the one
 //! `environment_lifecycle` already owns, so every test drives the service the way a
@@ -35,11 +47,17 @@ use serde_json::{json, Value};
 use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 
 use crate::entitlement_connector::{connector_in, environment_with_vcenter_connector};
-use crate::environment_lifecycle::{call, create_settled, emulator, error_type, Emulator};
+use crate::environment_deletion_cascade::epoch_millis;
+use crate::environment_lifecycle::{call, create_settled, emulator, error_type, settle, Emulator};
 
 /// Every `ConnectorType` the model declares, from the catalog this crate generated from
 /// the model (`smithy_query(query="shape", shape="ConnectorType")`).
 const CONNECTOR_TYPES: &[&str] = evs::ops::types::CONNECTOR_TYPE_VALUES;
+
+/// Every `ConnectorState` the model declares, from the catalog this crate generated from
+/// the model (`smithy_query(query="shape", shape="ConnectorState")`) — the whole class the
+/// resolution rule is stated over.
+const CONNECTOR_STATES: &[&str] = evs::ops::types::CONNECTOR_STATE_VALUES;
 
 /// The type of connector an entitlement is created through.
 const VCENTER: &str = "VCENTER";
@@ -132,6 +150,36 @@ fn force_connector_state(router: &Emulator, environment_id: &str, connector_id: 
         .unwrap_or_else(|| panic!("the environment holds the connector {connector_id}"));
     connector.state = state.to_string();
     connector.pending = None;
+}
+
+/// The `ConnectorState` one stored connector is in, and the one the clock still owes it,
+/// read straight from the store.
+///
+/// An owed change is materialised by a CALL that reads the record and never by the clock
+/// on its own, so what this reports does not depend on how much time has passed since the
+/// call that owed it.
+fn stored_connector_state(
+    router: &Emulator,
+    environment_id: &str,
+    connector_id: &str,
+) -> (String, Option<String>) {
+    let store = evs::state::service_state(&*router.engine)
+        .expect("the in-memory engine carries this service's store");
+    let store = store.lock();
+    let connector = store
+        .environments
+        .get(environment_id)
+        .unwrap_or_else(|| panic!("the store holds the environment {environment_id}"))
+        .connectors
+        .get(connector_id)
+        .unwrap_or_else(|| panic!("the environment holds the connector {connector_id}"));
+    (
+        connector.state.clone(),
+        connector
+            .pending
+            .as_ref()
+            .map(|pending| pending.state.to_string()),
+    )
 }
 
 #[tokio::test]
@@ -424,4 +472,221 @@ async fn an_absent_environment_is_answered_before_the_connector_is_resolved() {
         1,
         "case the real pair: the refused lists must have consumed nothing, got {body}"
     );
+}
+
+/// What the store says became of one environment's entitlements: the `stoppedAt` instant
+/// of each, by virtual machine.
+///
+/// The wire value is asserted against this, so the reported stop is the stored one rather
+/// than a stamp the read made up. Which instant the store writes is the cascade's own rule
+/// (`tests/all/environment_deletion_cascade.rs`).
+fn stored_entitlement_stops(
+    router: &Emulator,
+    environment_id: &str,
+) -> std::collections::BTreeMap<String, Option<i64>> {
+    let store = evs::state::service_state(&*router.engine)
+        .expect("the in-memory engine carries this service's store");
+    let store = store.lock();
+    store
+        .environments
+        .get(environment_id)
+        .unwrap_or_else(|| panic!("the store holds the environment {environment_id}"))
+        .entitlements
+        .values()
+        .map(|entitlement| (entitlement.vm_id.clone(), entitlement.stopped_at_ms))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_connector_resolves_for_a_read_in_every_modelled_state_but_deleted() {
+    // The whole class the resolution rule is stated over: a read resolves the handle
+    // against the records this service still REPORTS, so every `ConnectorState` but the
+    // terminal `DELETED` one resolves and reports the records that connector tracked.
+    // `DELETING` is in that set — the connection is still being torn down, so the record
+    // is still a resource of the environment — and only `DELETED` is the state the
+    // not-found doc names.
+    let router = emulator();
+    assert!(
+        CONNECTOR_STATES.contains(&evs::state::CONNECTOR_DELETED),
+        "the modelled catalog must declare the terminal state, got {CONNECTOR_STATES:?}"
+    );
+    assert!(
+        CONNECTOR_STATES.contains(&evs::state::CONNECTOR_DELETING),
+        "the modelled catalog must declare the teardown state, got {CONNECTOR_STATES:?}"
+    );
+
+    for state in CONNECTOR_STATES {
+        let case = format!("a connector whose state is {state}");
+        let (environment, connector) = environment_with_vcenter_connector(&router, &case).await;
+        let (status, body) = call(
+            &router,
+            "CreateEntitlement",
+            &create_request(&environment, &connector, &["vm-1", "vm-2"]),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the create expected 200, got {status} {body}"
+        );
+
+        force_connector_state(&router, &environment, &connector, state);
+        let (status, body) = call(
+            &router,
+            "ListVmEntitlements",
+            &list_request(&environment, &connector),
+        )
+        .await;
+        if *state == evs::state::CONNECTOR_DELETED {
+            assert_connector_not_found(&case, &connector, status, &body);
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a record this service still reports resolves, got {status} {body}"
+        );
+        let reported = entitlements(&case, &body);
+        assert_eq!(
+            reported.len(),
+            2,
+            "case {case:?}: both stored entitlements are reported, got {body}"
+        );
+        for entitlement in &reported {
+            assert_eq!(
+                entitlement["connectorId"],
+                json!(connector),
+                "case {case:?}: every record carries the connector it was tracked through, \
+                 got {entitlement}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_entitlements_an_environment_deletion_stopped_are_reported_through_its_connector() {
+    // The read those records are KEPT for: deleting the environment stops its
+    // entitlements in place — status `DELETED`, `stoppedAt` stamped — and leaves the
+    // connector they are read through being torn down. A record whose teardown has not
+    // come due yet is still a resource of the environment, so the stop is reported
+    // through it; once that record has reached `DELETED` it resolves to nothing.
+    let router = emulator();
+    let (environment, connector) =
+        environment_with_vcenter_connector(&router, "a deleted environment").await;
+    let (status, body) = call(
+        &router,
+        "CreateEntitlement",
+        &create_request(&environment, &connector, &["vm-1", "vm-2"]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the create: expected 200, got {status} {body}"
+    );
+    // Past the entitlements' own validation, so each record carries the `startedAt` the
+    // stop has to keep.
+    settle(&router);
+
+    let (status, deleted) = call(
+        &router,
+        "DeleteEnvironment",
+        &json!({ "environmentId": environment }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the delete: expected 200, got {status} {deleted}"
+    );
+    assert_eq!(
+        deleted["environment"]["environmentState"],
+        json!("DELETING"),
+        "case the delete: the environment is going away, got {deleted}"
+    );
+    // The instant the deletion was accepted is what it stamped on the records it
+    // stopped; the stamp is read back out of the store, so the assertion below is that
+    // the LIST reports the stored stop and not one it made up.
+    let stored_stops = stored_entitlement_stops(&router, &environment);
+
+    // The deletion left the connector being torn down with the move to DELETED still
+    // owed.
+    let (state, owed) = stored_connector_state(&router, &environment, &connector);
+    assert_eq!(
+        state,
+        evs::state::CONNECTOR_DELETING,
+        "case the delete: the connector is being torn down, got {state} owing {owed:?}"
+    );
+    assert_eq!(
+        owed.as_deref(),
+        Some(evs::state::CONNECTOR_DELETED),
+        "case the delete: the clock owes the connector its deletion, got {owed:?}"
+    );
+    // Held at that state by dropping the change the clock owes it, so the read below is
+    // about a connector being torn down and not a race against the span the deletion
+    // settles after.
+    force_connector_state(
+        &router,
+        &environment,
+        &connector,
+        evs::state::CONNECTOR_DELETING,
+    );
+
+    let case = "the entitlements of an environment going away";
+    let (status, body) = call(
+        &router,
+        "ListVmEntitlements",
+        &list_request(&environment, &connector),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} {body}"
+    );
+    let reported = entitlements(case, &body);
+    assert_eq!(
+        reported.len(),
+        2,
+        "case {case:?}: both stopped records are reported, got {body}"
+    );
+    for entitlement in &reported {
+        assert_eq!(
+            entitlement["status"],
+            json!("DELETED"),
+            "case {case:?}: the record reports the stop, got {entitlement}"
+        );
+        let vm_id = entitlement["vmId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no vmId in {entitlement}"));
+        let stored = stored_stops
+            .get(vm_id)
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: the store holds no record of {vm_id}"));
+        assert_eq!(
+            Some(epoch_millis(&entitlement["stoppedAt"])),
+            stored,
+            "case {case:?}: expected the stored stop {stored:?}, got {entitlement}"
+        );
+        assert!(
+            !entitlement["startedAt"].is_null(),
+            "case {case:?}: a stopped record keeps the startedAt it had, got {entitlement}"
+        );
+        assert_eq!(
+            entitlement["environmentId"],
+            json!(environment),
+            "case {case:?}: the record names the environment it belonged to, got {entitlement}"
+        );
+    }
+
+    // And once the teardown has come due, that connector resolves to nothing: the state
+    // the not-found doc names.
+    force_connector_state(
+        &router,
+        &environment,
+        &connector,
+        evs::state::CONNECTOR_DELETED,
+    );
+    let (status, body) = call(
+        &router,
+        "ListVmEntitlements",
+        &list_request(&environment, &connector),
+    )
+    .await;
+    assert_connector_not_found("the settled deletion", &connector, status, &body);
 }
