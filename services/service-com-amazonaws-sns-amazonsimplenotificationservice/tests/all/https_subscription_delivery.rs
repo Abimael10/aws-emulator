@@ -196,6 +196,37 @@ async fn drain_recorded(emulator: &Emulator, capture_url: &str) -> Vec<Recorded>
         .collect()
 }
 
+/// What the queue at `url` reports it holds: the messages waiting and the messages in flight
+/// (`GetQueueAttributesResult$Attributes`).
+///
+/// The two are read together because together they tell a message that was CONSUMED from one
+/// that is merely invisible for now — a message received and not deleted is still on the queue —
+/// and they say it without waiting any visibility timeout out.
+async fn queue_counts(emulator: &Emulator, url: &str) -> (String, String) {
+    let reported = sqs(
+        emulator,
+        "GetQueueAttributes",
+        &json!({
+            "QueueUrl": url,
+            "AttributeNames": [
+                "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible",
+            ],
+        }),
+    )
+    .await;
+    let attribute = |name: &str| {
+        reported["Attributes"][name]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    (
+        attribute("ApproximateNumberOfMessages"),
+        attribute("ApproximateNumberOfMessagesNotVisible"),
+    )
+}
+
 /// The requests recorded for `path`, waiting until there are at least `expected` of them — or
 /// until the deadline, which is how a case that expects a COUNT fails with what it did see.
 ///
@@ -1341,13 +1372,19 @@ async fn the_links_a_subscriber_is_handed_perform_the_calls_they_write() {
 /// [`SINK_HANDLER`] does. Nothing here reads a clock: how many requests it refuses is state the
 /// case wrote.
 ///
-/// The RECORD is written LAST, after the refusal that request consumed has been taken off the
-/// queue, because the record is what a case sequences on: a case that has collected one
-/// request's record can then empty the refusal queue and load the next phase's refusals onto it
-/// knowing this invocation has already taken what it was owed. Recording FIRST leaves the
-/// consumption still to come, so a straggling invocation of a finished phase can eat a refusal
-/// the next phase loaded — which makes that phase's endpoint take a request a refusal was
-/// waiting for, and nothing in the emulator did it.
+/// Two properties make what a case observes independent of how fast the host interleaves this
+/// handler with the case's own calls:
+///
+/// * the refusals are taken from the queue of the PATH the request addressed
+///   ([`refusals_queue_name`]), so the budget one subscription's case wrote can only ever be
+///   consumed by requests to THAT subscription's endpoint — never by a request to another
+///   subscription, whose own attempts are counted somewhere else;
+/// * the RECORD is written LAST, after the refusal that request consumed has been taken off the
+///   queue, because the record is what a case sequences on: a case that has collected one
+///   request's record knows this invocation has already taken what it was owed. Recording FIRST
+///   leaves the consumption still to come, so a straggling invocation can eat a refusal that was
+///   loaded after it — which makes an endpoint take a request a refusal was waiting for, and
+///   nothing in the emulator did it.
 const UNREADY_SINK_HANDLER: &str = r#"
 import base64
 import json
@@ -1362,12 +1399,13 @@ def lambda_handler(event, context):
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode("utf-8")
     sqs = boto3.client("sqs")
+    owed_url = sqs.get_queue_url(
+        QueueName="{refusals_prefix}" + path.strip("/").replace("/", "-")
+    )["QueueUrl"]
     refused = False
-    owed = sqs.receive_message(QueueUrl="{refusals_url}", MaxNumberOfMessages=1)
+    owed = sqs.receive_message(QueueUrl=owed_url, MaxNumberOfMessages=1)
     for message in owed.get("Messages") or []:
-        sqs.delete_message(
-            QueueUrl="{refusals_url}", ReceiptHandle=message["ReceiptHandle"]
-        )
+        sqs.delete_message(QueueUrl=owed_url, ReceiptHandle=message["ReceiptHandle"])
         refused = True
     sqs.send_message(
         QueueUrl="{queue_url}",
@@ -1377,6 +1415,40 @@ def lambda_handler(event, context):
         return {"statusCode": 503, "body": "the sink cannot take this yet"}
     return {"statusCode": 200, "body": "taken"}
 "#;
+
+/// The prefix of the NAME of the queue an endpoint's owed refusals are written on.
+const REFUSALS_QUEUE_PREFIX: &str = "https-unready-refusals-";
+
+/// The queue the refusals owed to the endpoint at `path` are written on: one queue per path, so
+/// no two subscriptions share a budget. Its name is that path's own segments behind
+/// [`REFUSALS_QUEUE_PREFIX`], which is a name SQS admits — "a queue name can have up to 80
+/// characters … alphanumeric characters, hyphens (-), and underscores (_)"
+/// (`CreateQueueRequest$QueueName`) — and the same derivation [`UNREADY_SINK_HANDLER`] reads it
+/// back through.
+fn refusals_queue_name(path: &str) -> String {
+    format!(
+        "{REFUSALS_QUEUE_PREFIX}{}",
+        path.trim_matches('/').replace('/', "-")
+    )
+}
+
+/// The queue the endpoint at `path` takes its refusals from, holding exactly `refusals` of them:
+/// its url.
+///
+/// The queue is the path's own ([`refusals_queue_name`]) and is written before anything is POSTed
+/// to that endpoint, so what the endpoint is handed is state this case wrote and nothing else.
+async fn given_refusals_owed(emulator: &Emulator, path: &str, refusals: usize) -> String {
+    let (url, _arn) = given_queue(emulator, &refusals_queue_name(path)).await;
+    for owed in 0..refusals {
+        sqs(
+            emulator,
+            "SendMessage",
+            &json!({"QueueUrl": url, "MessageBody": format!("{path}:{owed}")}),
+        )
+        .await;
+    }
+    url
+}
 
 /// The retry policy the TOPIC states for its `http` subscriptions in the case below, and so the
 /// `healthyRetryPolicy` of the effective delivery policy every subscription of it runs under:
@@ -1414,31 +1486,20 @@ const SCHEDULED_ATTEMPTS: usize = OPENING_ATTEMPTS + UNREADY_RETRY_POLICY_RETRIE
 /// row's would, which no number of seconds written here does.
 ///
 /// `index` tells this witness's topic and path from another row's. The witness is owed exactly
-/// the refusals its own schedule's last retry is reached by, on a queue emptied first, so what it
-/// is handed does not depend on what the calling row left there; the deadline bounds only the
-/// case where the witness itself was never POSTed to as the policy states, which this reports as
-/// the failure it is rather than as an absence.
+/// the refusals its own schedule's last retry is reached by, on its PATH's own queue, so what it
+/// is handed cannot be consumed by the calling row's endpoint and does not depend on what that
+/// row left on a queue; the deadline bounds only the case where the witness itself was never
+/// POSTed to as the policy states, which this reports as the failure it is rather than as an
+/// absence.
 async fn recorded_while_a_whole_schedule_runs(
     emulator: &Emulator,
     capture_url: &str,
-    refusals_url: &str,
     sink: &str,
     index: usize,
     path: &str,
 ) -> Vec<Recorded> {
     let witness_path = format!("/unready/witness-{index}");
-    consumed(emulator, refusals_url).await;
-    for owed in 0..SCHEDULED_ATTEMPTS - 1 {
-        sqs(
-            emulator,
-            "SendMessage",
-            &json!({
-                "QueueUrl": refusals_url,
-                "MessageBody": format!("witness-{index}:{owed}"),
-            }),
-        )
-        .await;
-    }
+    given_refusals_owed(emulator, &witness_path, SCHEDULED_ATTEMPTS - 1).await;
     let topic = element(
         &sns(
             emulator,
@@ -1589,31 +1650,23 @@ fn unready_rows() -> Vec<Unready> {
 async fn a_confirmation_is_retried_on_the_clock_until_the_endpoint_takes_it() {
     let emulator = emulator();
     let (capture_url, _capture_arn) = given_queue(&emulator, "https-unready-capture").await;
-    let (refusals_url, _refusals_arn) = given_queue(&emulator, "https-unready-refusals").await;
     let function = "https-unready-sink";
     given_function_running(
         &emulator,
         function,
         &UNREADY_SINK_HANDLER
             .replace("{queue_url}", &capture_url)
-            .replace("{refusals_url}", &refusals_url),
+            .replace("{refusals_prefix}", REFUSALS_QUEUE_PREFIX),
     )
     .await;
     let sink = given_function_url(&emulator, function).await;
 
     for (index, row) in unready_rows().into_iter().enumerate() {
         let case = row.case;
-        // What the endpoint owes in refusals, written before anything is POSTed to it — on a
-        // queue emptied first, so a row is handed exactly what it asked for.
-        consumed(&emulator, &refusals_url).await;
-        for owed in 0..row.refusals {
-            sqs(
-                &emulator,
-                "SendMessage",
-                &json!({"QueueUrl": refusals_url, "MessageBody": format!("{case}:{owed}")}),
-            )
-            .await;
-        }
+        // What the endpoint owes in refusals, written on this PATH's own queue before anything
+        // is POSTed to it, so a row is handed exactly what it asked for whatever another row's
+        // endpoint is doing.
+        let owed_url = given_refusals_owed(&emulator, row.path, row.refusals).await;
         let topic = element(
             &sns(
                 &emulator,
@@ -1644,6 +1697,23 @@ async fn a_confirmation_is_retried_on_the_clock_until_the_endpoint_takes_it() {
              {}",
             row.posts,
             posted.len()
+        );
+        // Every POST the endpoint recorded spent one of the refusals THIS row wrote, until it
+        // had none left to spend: what is still on the row's own queue is the budget the
+        // attempts did not reach. This is the count the POSTs above were decided by, read from
+        // the queue rather than waited for, so a row that was handed anything but its own
+        // budget says so here instead of timing a count out.
+        let (waiting, in_flight) = queue_counts(&emulator, &owed_url).await;
+        let unspent = row.refusals.saturating_sub(row.posts);
+        assert_eq!(
+            (waiting.as_str(), in_flight.as_str()),
+            (unspent.to_string().as_str(), "0"),
+            "case {case:?}: expected the {} POST(s) to have spent {} of the {} refusal(s) owed, \
+             leaving {unspent} waiting and none in flight, the queue reports {waiting} waiting \
+             and {in_flight} in flight",
+            row.posts,
+            row.refusals.min(row.posts),
+            row.refusals
         );
         // Every attempt of ONE request carries that request's own token: what a retry re-sends
         // is the same confirmation rather than a new one.
@@ -1683,7 +1753,6 @@ async fn a_confirmation_is_retried_on_the_clock_until_the_endpoint_takes_it() {
             let further = recorded_while_a_whole_schedule_runs(
                 &emulator,
                 &capture_url,
-                &refusals_url,
                 &sink,
                 index,
                 row.path,
@@ -1759,29 +1828,13 @@ async fn a_read_of_the_capture_queue_consumes_what_it_collected() {
             "case {case:?}: expected the read to collect {expected:?}, got {paths:?}"
         );
 
-        let left = sqs(
-            &emulator,
-            "GetQueueAttributes",
-            &json!({
-                "QueueUrl": url,
-                "AttributeNames": [
-                    "ApproximateNumberOfMessages",
-                    "ApproximateNumberOfMessagesNotVisible",
-                ],
-            }),
-        )
-        .await;
-        for name in [
-            "ApproximateNumberOfMessages",
-            "ApproximateNumberOfMessagesNotVisible",
-        ] {
-            let reported = left["Attributes"][name].as_str().unwrap_or_default();
-            assert_eq!(
-                reported, "0",
-                "case {case:?}: expected the queue to hold nothing once its records were \
-                 collected, it reports {name} as {reported:?} in {left}"
-            );
-        }
+        let (left_waiting, left_in_flight) = queue_counts(&emulator, &url).await;
+        assert_eq!(
+            (left_waiting.as_str(), left_in_flight.as_str()),
+            ("0", "0"),
+            "case {case:?}: expected the queue to hold nothing once its records were collected, \
+             it reports {left_waiting} waiting and {left_in_flight} in flight"
+        );
 
         let again = drain_recorded(&emulator, &url).await;
         assert!(
