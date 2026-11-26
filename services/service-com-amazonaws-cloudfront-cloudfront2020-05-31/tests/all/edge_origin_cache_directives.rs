@@ -81,11 +81,45 @@ struct Row {
     held: bool,
 }
 
+/// The `CustomErrorResponses` element naming every status of `statuses` with `ttl_seconds` as
+/// its `ErrorCachingMinTTL` and no page — which states the caching duration alone, "if you
+/// specify a value for `ResponsePagePath`, you must also specify a value for `ResponseCode`"
+/// being about the pair such an entry carries neither of.
+///
+/// `pub(crate)` so a sibling suite that drives the same configuration over more statuses
+/// ([`crate::edge_error_caching_at_the_published_address`]) builds the element here rather than
+/// writing a second copy of it.
+pub(crate) fn error_caching(statuses: &[u16], ttl_seconds: u64) -> String {
+    let items: String = statuses
+        .iter()
+        .map(|status| {
+            format!(
+                "<CustomErrorResponse><ErrorCode>{status}</ErrorCode>\
+                 <ErrorCachingMinTTL>{ttl_seconds}</ErrorCachingMinTTL>\
+                 </CustomErrorResponse>"
+            )
+        })
+        .collect();
+    format!(
+        "<CustomErrorResponses><Quantity>{}</Quantity><Items>{items}</Items>\
+         </CustomErrorResponses>",
+        statuses.len()
+    )
+}
+
 /// The `DistributionConfig` of a distribution over the function URL `origin` whose behaviour
 /// states the LEGACY per-behaviour TTLs — so the minimum TTL under test is the configuration's own
-/// rather than a cache policy's — and whose `CustomErrorResponses` names [`ERROR`] with an
-/// `ErrorCachingMinTTL` of [`HELD_SECONDS`] and no page, which states the caching duration alone.
-fn config_xml(caller_reference: &str, origin: &str, min_ttl: u64) -> String {
+/// rather than a cache policy's — and whose `CustomErrorResponses` is `custom_error_responses`
+/// ([`error_caching`] builds one).
+///
+/// `pub(crate)` for the same sibling suite, whose rows need the same distribution over a wider
+/// set of statuses.
+pub(crate) fn config_xml(
+    caller_reference: &str,
+    origin: &str,
+    min_ttl: u64,
+    custom_error_responses: &str,
+) -> String {
     format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{caller_reference}</CallerReference>\
@@ -113,10 +147,7 @@ fn config_xml(caller_reference: &str, origin: &str, min_ttl: u64) -> String {
          <MaxTTL>{HELD_SECONDS}</MaxTTL>\
          </DefaultCacheBehavior>\
          <CacheBehaviors><Quantity>0</Quantity></CacheBehaviors>\
-         <CustomErrorResponses><Quantity>1</Quantity><Items><CustomErrorResponse>\
-         <ErrorCode>{ERROR}</ErrorCode>\
-         <ErrorCachingMinTTL>{HELD_SECONDS}</ErrorCachingMinTTL>\
-         </CustomErrorResponse></Items></CustomErrorResponses>\
+         {custom_error_responses}\
          <Comment>what the origin says about storing its answer</Comment>\
          <Enabled>true</Enabled>\
          </DistributionConfig>"
@@ -157,7 +188,15 @@ async fn deployed(
     min_ttl: u64,
 ) -> String {
     let (id, _arn, edge) = topology
-        .created_distribution(case, &config_xml(reference, origin, min_ttl))
+        .created_distribution(
+            case,
+            &config_xml(
+                reference,
+                origin,
+                min_ttl,
+                &error_caching(&[ERROR], HELD_SECONDS),
+            ),
+        )
         .await;
     topology.awaited_deployment(case, &id).await;
     edge.domain
@@ -343,7 +382,12 @@ async fn the_stored_configuration_carries_the_spans_the_rows_are_read_under() {
     let (id, _arn, _domain) = topology
         .created_distribution(
             case,
-            &config_xml("edge-origin-cache-directives-stored", &origin, HELD_SECONDS),
+            &config_xml(
+                "edge-origin-cache-directives-stored",
+                &origin,
+                HELD_SECONDS,
+                &error_caching(&[ERROR], HELD_SECONDS),
+            ),
         )
         .await;
     let (status, raw) = topology
