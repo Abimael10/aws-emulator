@@ -988,8 +988,9 @@ pub fn state_machine_read_denied<Eng: Send + Sync + 'static>(
     key_denied(engine, ctx, region, &key, READ_OF_SEALED_DATA)
 }
 
-/// Why an execution of the state machine `state_machine_arn` identifies cannot be
-/// STARTED under its customer managed key, or `None` when it can be.
+/// What the authorities in force make of the MINT an execution of the state machine
+/// `state_machine_arn` identifies is started with — [`RoleUse::Refused`] with the reason it
+/// cannot be made, [`RoleUse::Allowed`] when it can be.
 ///
 /// Starting an execution seals the execution's data under the state machine's key, and
 /// Step Functions does that AS THE STATE MACHINE'S EXECUTION ROLE: "the IAM role to
@@ -1012,25 +1013,31 @@ pub fn state_machine_read_denied<Eng: Send + Sync + 'static>(
 /// ([`state_machine_key_state_refusal`], [`key_denied`]), which is where this crate
 /// decides it for every operation that touches that data. One question, one place.
 ///
-/// `None` wherever nothing of the kind can be shown: a state machine on an Amazon Web
-/// Services owned key (nothing of any identity's is asked of such a key), an engine
-/// carrying no KMS or no IAM store, an identifier naming no key KMS holds, and a role
-/// IAM holds no record for — each is evidence of nothing, so the start proceeds. Call
-/// it with no store of this service locked.
-fn execution_start_denied<Eng: Send + Sync + 'static>(
+/// [`RoleUse::Unknown`] wherever nothing of the kind can be shown: a state machine on an
+/// Amazon Web Services owned key (nothing of any identity's is asked of such a key), an
+/// engine carrying no KMS or no IAM store, an identifier naming no key KMS holds, and a
+/// role IAM holds no record for — each is evidence of nothing, which is what lets the
+/// identity that signed the request stand in for the role ([`start_denied`]). Call it with
+/// no store of this service locked.
+fn execution_start_use<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     state_machine_arn: &str,
     role_arn: &str,
-) -> Option<KeyRefusal> {
-    let state = super::service_state(engine)?;
+) -> RoleUse {
+    let Some(state) = super::service_state(engine) else {
+        return RoleUse::Unknown;
+    };
     // The guard is released before KMS and IAM are consulted: no store of another
     // service is reached while this one's is held.
     let key = {
         let store = state.lock();
-        state_machine_key(&store, state_machine_arn)?
+        state_machine_key(&store, state_machine_arn)
     };
-    role_key_denied(
+    let Some(key) = key else {
+        return RoleUse::Unknown;
+    };
+    role_use(
         engine,
         region,
         &key,
@@ -1063,11 +1070,17 @@ fn execution_start_denied<Eng: Send + Sync + 'static>(
 ///    relayed (`unrunnable`, which
 ///    [`super::task_authorization::unrunnable_attempt`] answers for exactly the runs whose
 ///    own data is sealed as that role);
-/// 3. the MINT itself, as that role ([`execution_start_denied`]) — so a refusal of it names
+/// 3. the MINT itself, as that role ([`execution_start_use`]) — so a refusal of it names
 ///    the SESSION this service assumed the role under, which is the identity that made the
-///    refused call;
-/// 4. and last the CALLER's own use of the key ([`state_machine_seal_denied`]), which the
-///    `input` this call hands the service to keep is sealed with.
+///    refused call.
+///
+/// The mint is ONE call, so it is judged for ONE identity: where the authorities in force
+/// can be weighed over the role at all, what they say about the role is the whole answer,
+/// and a role they admit starts the execution whatever any other identity holds on the
+/// key. Only where nothing of the kind can be shown for the role does the identity that
+/// signed the request stand in for it ([`state_machine_seal_denied`]) — the approximation
+/// this module's own documentation states, used in place of that decision rather than
+/// beside it.
 ///
 /// Each refusal is the modelled `Kms*` error of the operation and starts nothing. `None`
 /// wherever nothing of the kind can be shown, as each decision above documents — a state
@@ -1090,10 +1103,14 @@ pub fn start_denied<Eng: Send + Sync + 'static>(
     // The relay of the assume's failure carries no metadata tail of its own: that failure
     // is the exception the ASSUME raised, which the service reports as the cause it words
     // it by, not a sentence a KMS answer came back with.
-    unrunnable
-        .map(|failed| KeyRefusal::AccessDenied(failed.cause.clone()))
-        .or_else(|| execution_start_denied(engine, region, state_machine_arn, role_arn))
-        .or_else(|| state_machine_seal_denied(engine, ctx, region, state_machine_arn))
+    if let Some(failed) = unrunnable {
+        return Some(KeyRefusal::AccessDenied(failed.cause.clone()));
+    }
+    match execution_start_use(engine, region, state_machine_arn, role_arn) {
+        RoleUse::Refused(refusal) => Some(refusal),
+        RoleUse::Allowed => None,
+        RoleUse::Unknown => state_machine_seal_denied(engine, ctx, region, state_machine_arn),
+    }
 }
 
 /// Whether the start of an execution of the state machine `arn` names has to ACQUIRE the
@@ -1188,11 +1205,47 @@ fn role_key_denied<Eng: Send + Sync + 'static>(
     role_arn: &str,
     operations: &[&str],
 ) -> Option<KeyRefusal> {
-    let kms = kms_store::service_state(engine)?;
+    match role_use(engine, region, used, role_arn, operations) {
+        RoleUse::Refused(refusal) => Some(refusal),
+        RoleUse::Allowed | RoleUse::Unknown => None,
+    }
+}
+
+/// What the authorities in force make of a ROLE's use of a key — including whether they
+/// can be weighed over it at all.
+///
+/// The three answers are kept apart because a decision TAKEN for the role is the whole
+/// decision about the one KMS call the service makes as that role: nothing stands in for
+/// an identity whose own documents and whose key's policy have already answered. Only
+/// [`RoleUse::Unknown`] — the evidence this module requires being absent — leaves room for
+/// another identity to be weighed instead.
+enum RoleUse {
+    /// Nothing of the kind can be shown: no KMS store beside this service, an identifier
+    /// naming no key KMS holds, a key AWS manages the policy of, or a role this account
+    /// holds no record for.
+    Unknown,
+    /// The authorities in force admit the use.
+    Allowed,
+    /// They refuse it, as KMS words that refusal.
+    Refused(KeyRefusal),
+}
+
+/// The one reading behind [`role_key_denied`], keeping the "no evidence" answer apart
+/// from the "allowed" one.
+fn role_use<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    used: &KeyUse,
+    role_arn: &str,
+    operations: &[&str],
+) -> RoleUse {
+    let Some(kms) = kms_store::service_state(engine) else {
+        return RoleUse::Unknown;
+    };
     // A role the account does not hold is evidence of nothing: there are no documents to
     // weigh against the key's policy, so the use is not refused on them.
     if !super::task_authorization::iam_holds_role(engine, role_arn) {
-        return None;
+        return RoleUse::Unknown;
     }
     // The role's own documents are read BEFORE the KMS store is locked, so the IAM store
     // is never reached while another service's guard is held.
@@ -1200,14 +1253,14 @@ fn role_key_denied<Eng: Send + Sync + 'static>(
     let via_service = super::task_authorization::regional_service_principal(region);
     let store = kms.lock();
     let kms_store::KeyRef::Found(found) = store.resolve(region, &used.key) else {
-        return None;
+        return RoleUse::Unknown;
     };
     // An Amazon Web Services managed key's policy is managed by AWS for the service that
     // owns it, so no identity needs a grant of its own on it.
     if found.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
-        return None;
+        return RoleUse::Unknown;
     }
-    operations.iter().find_map(|operation| {
+    let refusal = operations.iter().find_map(|operation| {
         kms_authorization::authorize_use(
             &caller,
             &store,
@@ -1222,7 +1275,11 @@ fn role_key_denied<Eng: Send + Sync + 'static>(
         )
         .err()
         .map(|why| KeyRefusal::AccessDenied(relayed(&reported_as_session(&why, role_arn))))
-    })
+    });
+    match refusal {
+        Some(refusal) => RoleUse::Refused(refusal),
+        None => RoleUse::Allowed,
+    }
 }
 
 /// `why`, with the principal it names re-spelled as the SESSION Step Functions holds the
