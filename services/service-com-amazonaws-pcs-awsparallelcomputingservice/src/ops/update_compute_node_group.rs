@@ -429,7 +429,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
         }
         if let Some(spot_options) = input.spot_options {
-            group.spot_options = Some(spot_options);
+            // The allocation strategy `SpotOptions$allocationStrategy` documents is applied
+            // here too, so the member a read reports does not depend on which call stored
+            // the spot configuration.
+            group.spot_options = Some(crate::state::stored_spot_options(spot_options));
             changed = true;
         }
         if let Some(scaling) = input.scaling_configuration {

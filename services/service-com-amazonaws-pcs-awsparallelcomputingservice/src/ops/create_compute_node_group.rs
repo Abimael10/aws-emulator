@@ -487,7 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             iam_instance_profile_arn: input.iam_instance_profile_arn,
             scaling_configuration: input.scaling_configuration.into(),
             instance_configs: input.instance_configs,
-            spot_options: input.spot_options,
+            // The allocation strategy `SpotOptions$allocationStrategy` documents is
+            // applied to a spot configuration the request carried, so a later read
+            // reports the strategy the service provisions with.
+            spot_options: input.spot_options.map(crate::state::stored_spot_options),
             slurm_configuration: input.slurm_configuration.map(Into::into),
             node_lifecycle_actions: input.node_lifecycle_actions.map(Into::into),
             error_info: Vec::new(),

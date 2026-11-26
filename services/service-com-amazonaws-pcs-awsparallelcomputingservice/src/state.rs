@@ -158,6 +158,36 @@ pub const SLURMRESTD_PORT: &str = "6820";
 /// The `NetworkType` member a cluster whose control plane is addressed over IPv6 carries.
 pub const NETWORK_TYPE_IPV6: &str = "IPV6";
 
+/// The `NetworkType` member a cluster carries when the request that created it named
+/// none: "The IP address version the cluster uses. The default is IPV4"
+/// (`NetworkingRequest$networkType`, worded identically on `Networking$networkType`).
+/// It is also the version [`ClusterRecord::endpoint`] addresses a control plane over for
+/// every value that is not [`NETWORK_TYPE_IPV6`], so a stored record reports the version
+/// its own endpoints are published on.
+pub const NETWORK_TYPE_IPV4: &str = "IPV4";
+
+/// The `scaleDownIdleTimeInSeconds` a cluster's Slurm configuration carries when the
+/// request named none: "The time (in seconds) before an idle node is scaled down.
+/// Default: 600" (`ClusterSlurmConfigurationRequest$scaleDownIdleTimeInSeconds`, worded
+/// identically on `ClusterSlurmConfiguration` and on
+/// `UpdateClusterSlurmConfigurationRequest`).
+///
+/// A compute node group's member of the same name documents no default of its own — "If
+/// not specified, the cluster-level setting applies" — so a group's stays absent until a
+/// request sets it, and the cluster's is the one that answers for it.
+pub const DEFAULT_SCALE_DOWN_IDLE_TIME_IN_SECONDS: i32 = 600;
+
+/// The `defaultPurgeTimeInDays` an accounting configuration carries when the request named
+/// none: "The default value for defaultPurgeTimeInDays is -1" (`AccountingRequest`,
+/// `Accounting` and `UpdateAccountingRequest` all state it), "A value of -1 means there is
+/// no purge time and records persist as long as the cluster exists".
+pub const DEFAULT_PURGE_TIME_IN_DAYS: i32 = -1;
+
+/// The `SpotAllocationStrategy` a spot configuration carries when the request named none:
+/// "If you don't provide this option, it defaults to price capacity optimized"
+/// (`SpotOptions$allocationStrategy`), spelled as the enum spells that member.
+pub const DEFAULT_SPOT_ALLOCATION_STRATEGY: &str = "price-capacity-optimized";
+
 /// The `maxResults` a list operation serves when the request names none: the
 /// `@default(10)` the model declares on `MaxResults`.
 pub const DEFAULT_PAGE_SIZE: usize = 10;
@@ -1701,8 +1731,37 @@ fn service_validation(message: String) -> ValidationException {
     }
 }
 
+/// The value a stored record carries for a member whose own documentation states what the
+/// service applies when the request names none.
+///
+/// THE RULE: such a member is one the service DOCUMENTS AS SET, so the record a create or
+/// an update leaves behind carries the documented value and every later read reports it —
+/// a request that named the member is stored exactly as it was sent, whatever it named.
+pub fn documented_default<T>(requested: Option<T>, documented: T) -> Option<T> {
+    Some(requested.unwrap_or(documented))
+}
+
+/// The spot configuration a create or an update PERSISTS: the one the request carried,
+/// carrying the allocation strategy its member documents where the request named none
+/// ([`DEFAULT_SPOT_ALLOCATION_STRATEGY`]).
+///
+/// `SpotOptions` is both the request and the response shape, so this is the one place the
+/// documented default is applied for it — a request that carries no spot configuration at
+/// all stores none, because the member it would default is a member of a structure nothing
+/// asked for.
+pub fn stored_spot_options(requested: SpotOptions) -> SpotOptions {
+    SpotOptions {
+        allocation_strategy: documented_default(
+            requested.allocation_strategy,
+            DEFAULT_SPOT_ALLOCATION_STRATEGY.to_string(),
+        ),
+    }
+}
+
 /// The stored Slurm configuration an `UpdateCluster` leaves behind: a member the request
-/// carries replaces the stored one, a member it omits leaves the stored one alone.
+/// carries replaces the stored one, a member it omits leaves the stored one alone — and a
+/// member the model documents as set carries its documented value either way
+/// ([`documented_default`]).
 pub fn apply_slurm_update(
     stored: Option<ClusterSlurmConfiguration>,
     update: UpdateClusterSlurmConfigurationRequest,
@@ -1723,9 +1782,14 @@ pub fn apply_slurm_update(
     if let Some(accounting) = update.accounting {
         let previous = merged.accounting.take();
         merged.accounting = Some(Accounting {
-            default_purge_time_in_days: accounting
-                .default_purge_time_in_days
-                .or_else(|| previous.as_ref().and_then(|a| a.default_purge_time_in_days)),
+            // "The default value for defaultPurgeTimeInDays is -1"
+            // (`UpdateAccountingRequest$defaultPurgeTimeInDays`).
+            default_purge_time_in_days: documented_default(
+                accounting
+                    .default_purge_time_in_days
+                    .or_else(|| previous.as_ref().and_then(|a| a.default_purge_time_in_days)),
+                DEFAULT_PURGE_TIME_IN_DAYS,
+            ),
             // "The default value for mode is NONE" (`AccountingRequest$mode`).
             mode: accounting
                 .mode
@@ -1743,6 +1807,13 @@ pub fn apply_slurm_update(
                 .unwrap_or_else(|| MODE_NONE.to_string()),
         });
     }
+    // "Default: 600" (`UpdateClusterSlurmConfigurationRequest$scaleDownIdleTimeInSeconds`):
+    // a cluster that holds a Slurm configuration holds this member set, whether this update
+    // named it, a previous one did, or none ever did.
+    merged.scale_down_idle_time_in_seconds = documented_default(
+        merged.scale_down_idle_time_in_seconds,
+        DEFAULT_SCALE_DOWN_IDLE_TIME_IN_SECONDS,
+    );
     merged
 }
 
@@ -1971,7 +2042,8 @@ impl From<NetworkingRequest> for Networking {
         Self {
             subnet_ids: request.subnet_ids,
             security_group_ids: request.security_group_ids,
-            network_type: request.network_type,
+            // "The default is IPV4" (`NetworkingRequest$networkType`).
+            network_type: documented_default(request.network_type, NETWORK_TYPE_IPV4.to_string()),
         }
     }
 }
@@ -1979,7 +2051,12 @@ impl From<NetworkingRequest> for Networking {
 impl From<AccountingRequest> for Accounting {
     fn from(request: AccountingRequest) -> Self {
         Self {
-            default_purge_time_in_days: request.default_purge_time_in_days,
+            // "The default value for defaultPurgeTimeInDays is -1"
+            // (`AccountingRequest$defaultPurgeTimeInDays`).
+            default_purge_time_in_days: documented_default(
+                request.default_purge_time_in_days,
+                DEFAULT_PURGE_TIME_IN_DAYS,
+            ),
             mode: request.mode,
         }
     }
@@ -1994,7 +2071,12 @@ impl From<SlurmRestRequest> for SlurmRest {
 impl From<ClusterSlurmConfigurationRequest> for ClusterSlurmConfiguration {
     fn from(request: ClusterSlurmConfigurationRequest) -> Self {
         Self {
-            scale_down_idle_time_in_seconds: request.scale_down_idle_time_in_seconds,
+            // "Default: 600"
+            // (`ClusterSlurmConfigurationRequest$scaleDownIdleTimeInSeconds`).
+            scale_down_idle_time_in_seconds: documented_default(
+                request.scale_down_idle_time_in_seconds,
+                DEFAULT_SCALE_DOWN_IDLE_TIME_IN_SECONDS,
+            ),
             slurm_custom_settings: request.slurm_custom_settings,
             slurmdbd_custom_settings: request.slurmdbd_custom_settings,
             cgroup_custom_settings: request.cgroup_custom_settings,

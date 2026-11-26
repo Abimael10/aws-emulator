@@ -34,6 +34,11 @@ mod idempotent_create_retry;
 #[path = "cluster_lifecycle/recreate_with_a_used_client_token.rs"]
 mod recreate_with_a_used_client_token;
 
+// WHICH members a create and a read report as SET because the model documents the value the
+// service applies for them, declared the same way.
+#[path = "cluster_lifecycle/documented_member_defaults.rs"]
+mod documented_member_defaults;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
