@@ -160,7 +160,7 @@ const ERROR_CASES: &[ErrorCase] = &[
         action: "DescribeOptionGroups",
         params: &[("OptionGroupName", "a-group"), ("EngineName", "mysql")],
         status: 400,
-        code: "ValidationException",
+        code: "InvalidParameterCombination",
     },
     ErrorCase {
         case: "handler refusal: a value one past a documented bound",

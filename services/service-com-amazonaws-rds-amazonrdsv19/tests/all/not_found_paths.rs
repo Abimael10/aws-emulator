@@ -810,7 +810,9 @@ async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region
         );
     }
 
-    // A filter name this operation does not support is refused, not ignored.
+    // A filter name this operation does not support is ACCEPTED and narrows nothing: this
+    // report honours only the names it publishes, so a name outside them is a parameter it
+    // does not apply (see `global_cluster_member_filters.rs`).
     let (status, body) = call(
         &router,
         "DescribeGlobalClusters",
@@ -821,8 +823,13 @@ async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region
     )
     .await;
     assert_eq!(
-        status, 400,
-        "expected an unsupported filter name to be refused, got {status} with {body}"
+        status, 200,
+        "expected an unsupported filter name to be accepted, got {status} with {body}"
+    );
+    assert_eq!(
+        texts(&body, "GlobalClusterIdentifier"),
+        vec!["emu-global-a".to_string(), "emu-global-b".to_string()],
+        "expected the unfiltered report, got {body}"
     );
 }
 

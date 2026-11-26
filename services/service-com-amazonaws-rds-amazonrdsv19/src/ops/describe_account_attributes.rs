@@ -204,9 +204,11 @@ const IAM_ROLES_PER_RESOURCE_QUOTA: i64 = 5;
 const READ_REPLICAS_PER_MASTER_QUOTA: i64 = 15;
 
 /// How many reserved DB instances one account may hold: Amazon RDS's published default
-/// quota ("Reserved DB instances": 40 per Region). This service stores no reservation,
-/// so nothing is used toward it.
-const RESERVED_DB_INSTANCES_QUOTA: i64 = 40;
+/// quota ("Reserved DB instances": 40 per Region), the one
+/// `PurchaseReservedDBInstancesOffering` refuses past
+/// (`crate::state::RESERVED_DB_INSTANCE_QUOTA_PER_REGION`).
+const RESERVED_DB_INSTANCES_QUOTA: i64 =
+    crate::state::RESERVED_DB_INSTANCE_QUOTA_PER_REGION as i64;
 
 /// How many zero-ETL integrations one account may hold: Amazon RDS's published default
 /// quota for integrations, which `DescribeAccountAttributes` reports as the `Integrations`
@@ -521,10 +523,11 @@ fn read_replicas_used(store: &Store, region: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// The active reserved DB instances the region holds. No implemented operation purchases
-/// a reservation, so it holds none.
-fn reserved_db_instances_used(_store: &Store, _region: &str) -> i64 {
-    0
+/// The active reserved DB instances the region holds: the DB instances the reservations
+/// `PurchaseReservedDBInstancesOffering` persisted still reserve, read off the same count
+/// that purchase is refused past, so the report and the refusal cannot disagree.
+fn reserved_db_instances_used(store: &Store, region: &str) -> i64 {
+    count(store.reserved_db_instance_capacity_in(region))
 }
 
 /// The subnets of the DB subnet group that names the most of them.

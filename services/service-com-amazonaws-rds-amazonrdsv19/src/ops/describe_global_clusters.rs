@@ -118,7 +118,7 @@ impl From<DescribeGlobalClustersErrorModeled> for DescribeGlobalClustersError {
     }
 }
 
-/// The filter names this operation accepts.
+/// The filter names this operation NARROWS its report by.
 ///
 /// Its `Filters` member documents one — "This parameter is case-sensitive. Currently, the
 /// only supported filter is `region`. If used, the request returns information about any
@@ -126,9 +126,15 @@ impl From<DescribeGlobalClustersErrorModeled> for DescribeGlobalClustersError {
 /// Services Regions" — and recorded behaviour accepts a second, `db-cluster-id`, which
 /// selects the global cluster a DB CLUSTER belongs to: a filter name of the form the RDS
 /// describe operations publish for naming a DB cluster, matched against the global cluster's
-/// member clusters ([`crate::state::GlobalClusterRecord::has_member_cluster`]). Any other
-/// name is refused rather than ignored, because ignoring it would report global clusters the
-/// caller excluded.
+/// member clusters ([`crate::state::GlobalClusterRecord::has_member_cluster`]).
+///
+/// A name OUTSIDE this list is ACCEPTED and narrows nothing: recorded behaviour answers such
+/// a request HTTP 200 and reports the same global clusters it reports without the filter — the
+/// generic `Filter` shape's own documentation lists the describe operations that honour
+/// filters and this one is not among them, so a filter it does not support is a parameter it
+/// does not apply rather than one it refuses. Narrowing is what this list decides; the
+/// `GlobalClusterIdentifier` PARAMETER is the exact-match lookup, and it still faults for an
+/// identifier no global cluster answers to.
 const SUPPORTED_FILTER_NAMES: [&str; 2] = [REGION_FILTER_NAME, DB_CLUSTER_ID_FILTER_NAME];
 
 /// The filter that selects on the regions a global cluster has members in; see
@@ -139,25 +145,19 @@ const REGION_FILTER_NAME: &str = "region";
 /// [`SUPPORTED_FILTER_NAMES`].
 const DB_CLUSTER_ID_FILTER_NAME: &str = "db-cluster-id";
 
-/// Refuse a filter this operation does not support; see [`SUPPORTED_FILTER_NAMES`].
-fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
-    for filter in filters {
-        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
-            return Err(crate::state::unrecognized_filter_name_message(
-                &filter.name,
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Whether `record` matches `filter`: a global cluster matches a filter when any value the
 /// filter carries selects it, and a request carrying several filters reports the global
 /// clusters every one of them selects.
+///
+/// A filter whose name this operation does not support ([`SUPPORTED_FILTER_NAMES`]) selects
+/// EVERY global cluster, whatever values it carries: it is accepted and narrows nothing.
 fn matches_filter(record: &crate::state::GlobalClusterRecord, filter: &Filter) -> bool {
+    if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+        return true;
+    }
     filter.values.iter().any(|wanted| match filter.name.as_str() {
         DB_CLUSTER_ID_FILTER_NAME => record.has_member_cluster(wanted),
-        // `region` — the only other name `check_filter_names` admits.
+        // `region` — the only other name [`SUPPORTED_FILTER_NAMES`] holds.
         _ => record.has_member_in(wanted),
     })
 }
@@ -207,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeGlobalClustersError::invalid_parameter_value)?;
         let filters = input.filters.unwrap_or_default();
-        check_filter_names(&filters).map_err(DescribeGlobalClustersError::invalid_parameter_value)?;
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeGlobalClustersError::validation)?;
 

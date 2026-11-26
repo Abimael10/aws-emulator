@@ -537,7 +537,8 @@ async fn the_input_members_are_refused_outside_what_they_document() {
     let rows: Vec<RefusalRow> = vec![
         (
             // "OptionGroupName ... Can't be supplied together with EngineName or
-            // MajorEngineVersion."
+            // MajorEngineVersion." Two members that cannot be used together, which is the
+            // parameter COMBINATION failure the Query API publishes its own code for.
             "a name together with an engine",
             "DescribeOptionGroups",
             vec![
@@ -545,7 +546,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("EngineName", "mysql".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterCombination",
         ),
         (
             "a name together with a major version",
@@ -555,7 +556,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("MajorEngineVersion", "8.0".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterCombination",
         ),
         (
             // "MajorEngineVersion ... If specified, then EngineName must also be
@@ -564,10 +565,11 @@ async fn the_input_members_are_refused_outside_what_they_document() {
             "DescribeOptionGroups",
             vec![("MajorEngineVersion", "8.0".to_string())],
             400,
-            "ValidationException",
+            "InvalidParameterCombination",
         ),
         (
-            // "Filters ... This parameter isn't currently supported."
+            // "Filters ... This parameter isn't currently supported." A parameter whose
+            // value this report serves none of, which is the other common client error.
             "a filter, which the member says is unsupported",
             "DescribeOptionGroups",
             vec![
@@ -575,7 +577,7 @@ async fn the_input_members_are_refused_outside_what_they_document() {
                 ("Filters.Filter.1.Values.Value.1", "mysql".to_string()),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             // "MaxRecords ... Constraints: Minimum 20, maximum 100." A value outside the

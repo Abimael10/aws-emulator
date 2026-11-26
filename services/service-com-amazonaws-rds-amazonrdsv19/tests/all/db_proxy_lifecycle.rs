@@ -316,7 +316,10 @@ async fn a_target_group_modification_applies_what_it_states_and_keeps_the_rest()
                 ("ConnectionPoolConfig.MaxIdleConnectionsPercent", "50"),
             ],
             status: 400,
-            code: "InvalidParameterValue",
+            // The pair cannot hold together, which is the parameter COMBINATION failure the
+            // Query API publishes its own code for — unlike the rows above, where one
+            // member's own value is outside the window it documents.
+            code: "InvalidParameterCombination",
         },
         RefusalCase {
             case: "a rename of the one group a proxy has",

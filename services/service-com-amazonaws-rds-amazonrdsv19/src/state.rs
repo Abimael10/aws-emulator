@@ -53,6 +53,9 @@
 //! at most `MAX_REGIONS * DB_CAPACITY_RESERVATION_QUOTA_PER_REGION` DB capacity
 //! reservations — whatever state each is in, and each holding capacity for at most that
 //! region's DB instance allowance —
+//! at most `MAX_REGIONS * RESERVED_DB_INSTANCE_RECORD_QUOTA_PER_REGION` purchased reserved
+//! DB instances, which together reserve at most that region's
+//! `RESERVED_DB_INSTANCE_QUOTA_PER_REGION` DB instances,
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
 //! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups,
 //! `MAX_REGIONS * DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION` cluster parameter groups
@@ -193,6 +196,11 @@ mod engine_settings;
 // reports one: their own concern, because a reservation holds capacity for DB instances
 // rather than being one.
 mod capacity_reservations;
+// RESERVED DB INSTANCES: the offering catalogue this service publishes, and the reservation
+// a purchase of one persists. Its own concern beside the capacity reservations above,
+// because a reserved DB instance is a BILLING commitment over a DB instance class rather
+// than capacity held in an Availability Zone.
+mod reserved_instances;
 mod shard_groups;
 mod snapshots;
 // The tenant databases a DB snapshot CAPTURED, beside the snapshot records themselves:
@@ -214,6 +222,7 @@ pub use event_catalog::*;
 pub use recommendations::*;
 pub use event_subscriptions::*;
 pub use capacity_reservations::*;
+pub use reserved_instances::*;
 pub use engine_settings::*;
 pub use option_groups::*;
 pub use parameter_groups::*;
@@ -245,10 +254,10 @@ pub use custom_engine_versions::{
 pub use db_proxies::{
     check_target_group_name, check_user_auth_config, db_proxy_already_exists_message,
     db_proxy_not_found_message, db_proxy_state_name, db_proxy_unsupported_state_message,
-    default_connection_pool_config, merged_connection_pool_config,
+    default_connection_pool_config, max_above_idle_message, merged_connection_pool_config,
     subnets_span_several_vpcs_message, unreadable_secret_description, user_auth_config_to_info,
     DbProxyRecord, DbProxyTargetGroupRecord,
-    DbProxyTargetRecord, ProxyTargetKey, ProxyTargetRow, RegisteredDatabase,
+    DbProxyTargetRecord, PoolConfigRejection, ProxyTargetKey, ProxyTargetRow, RegisteredDatabase,
     DB_PROXY_TARGET_ALREADY_REGISTERED_MESSAGE, DEFAULT_AUTH_SCHEME_NONE,
     DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP,
     DEFAULT_IDLE_CLIENT_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PERCENT,
@@ -671,6 +680,20 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// would hold it for more than [`DB_INSTANCE_QUOTA_PER_REGION`] of them
     /// ([`Self::reserved_db_instances_in`]).
     pub db_capacity_reservations: BTreeMap<RegionalKey, DbCapacityReservationRecord>,
+    /// The reservations `PurchaseReservedDBInstancesOffering` purchased, by
+    /// `(region, ReservedDBInstanceId)` — the caller's own identifier for the reservation,
+    /// or the one this service minted for a purchase that named none. Ordered, so
+    /// `DescribeReservedDBInstances` pages deterministically within a region.
+    ///
+    /// Bounded by [`RESERVED_DB_INSTANCE_RECORD_QUOTA_PER_REGION`] records per region and by
+    /// [`MAX_REGIONS`] regions, with a second, narrower gate on what those records may
+    /// RESERVE: a purchase is refused once the reservations of a region that still hold
+    /// capacity would reserve more than [`RESERVED_DB_INSTANCE_QUOTA_PER_REGION`] DB
+    /// instances ([`Self::reserved_db_instance_capacity_in`]), the account allowance
+    /// `DescribeAccountAttributes` publishes. The OFFERINGS a purchase resolves against are
+    /// not here: they are published by the service rather than created by a caller, so they
+    /// are reference data ([`published_reserved_offerings`]).
+    pub reserved_db_instances: BTreeMap<RegionalKey, ReservedDbInstanceRecord>,
     /// Custom DB engine versions by `(region, custom_db_engine_version_key)` — the CEVs
     /// the account itself minted, as opposed to the engine versions this service
     /// publishes as reference data. Ordered, so `DescribeDBEngineVersions` reports and
@@ -1136,6 +1159,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         // a backup still waiting for its first replicated snapshot has: `creating` ->
         // `active`. Nothing removes one, so this walk answers no keys.
         self.settle_replicated_instance_backups(region, now);
+        // A reserved DB instance settles against two clocks as well: the state the purchase
+        // owed it, and the retirement its own term makes due
+        // ([`Self::settle_reserved_db_instances`]).
+        self.settle_reserved_db_instances(region, now);
         // An event subscription is in no transient status and owes the clock no
         // transition: it is a notification rule, so a create, a modify and a delete of one
         // are all in force by the time that call answers (see `EventSubscriptionRecord`).
@@ -2261,6 +2288,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.db_security_groups.keys())
             .chain(self.db_shard_groups.keys())
             .chain(self.db_capacity_reservations.keys())
+            .chain(self.reserved_db_instances.keys())
             .chain(self.blue_green_deployments.keys())
             .chain(self.integrations.keys())
             .chain(self.tenant_databases.keys())

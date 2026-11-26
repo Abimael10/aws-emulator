@@ -457,12 +457,30 @@ async fn create_and_modify_resolve_the_engine_version_against_the_report() {
     }
 
     // The same resolution on the modify path, where the engine the version belongs to
-    // is the one the modification leaves the instance on.
+    // is the one the modification leaves the instance on. The instance is created on the
+    // OLDEST build the engine offers and moved to the newest, because an engine version
+    // change is an upgrade: a request naming an earlier build than the one the instance runs
+    // is refused for that, whatever the version resolves to.
     let router = emulator();
     let versions = reported_engine_versions(&router, "postgres").await;
+    let oldest = versions
+        .first()
+        .cloned()
+        .expect("the report lists versions of postgres");
+    let newest = versions
+        .last()
+        .cloned()
+        .expect("the report lists versions of postgres");
     expect_ok(
         "an instance to modify",
-        create_instance(&router, "emu-modver", "postgres", A_CLASS, &[]).await,
+        create_instance(
+            &router,
+            "emu-modver",
+            "postgres",
+            A_CLASS,
+            &params!["EngineVersion" => &oldest],
+        )
+        .await,
     );
     wait_for_settle();
     expect_error(
@@ -491,7 +509,8 @@ async fn create_and_modify_resolve_the_engine_version_against_the_report() {
                 // what this case is about is the version the instance ends up running — the
                 // one it reports once the modification has been applied.
                 "ApplyImmediately" => true,
-                "EngineVersion" => &versions[0],
+                "AllowMajorVersionUpgrade" => true,
+                "EngineVersion" => &newest,
             ],
         )
         .await,
@@ -508,9 +527,8 @@ async fn create_and_modify_resolve_the_engine_version_against_the_report() {
     );
     let stored = text(&body, "EngineVersion");
     assert_eq!(
-        stored, versions[0],
-        "expected the modification to store engine version {}, got {stored:?}",
-        versions[0]
+        stored, newest,
+        "expected the modification to store engine version {newest}, got {stored:?}"
     );
 }
 

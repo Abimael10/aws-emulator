@@ -641,13 +641,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(requested.as_str()),
                 )
                 .map_err(ModifyDBInstanceError::invalid_parameter_combination)?;
-                Some(match resolved {
+                let version = match resolved {
                     Some(entry) => entry.engine_version.to_string(),
                     // An engine the catalogue publishes no available version for:
                     // there is nothing to resolve against, so what the request named
                     // stands.
                     None => requested.clone(),
-                })
+                };
+                // An engine version change is an UPGRADE: "upgrade the DB instance to a
+                // later engine version" is what the member asks for, and Amazon RDS has no
+                // way to take a database back to an earlier build, so a request naming a
+                // build that comes BEFORE the one the instance runs is refused rather than
+                // staged. The two builds are compared by where each sits in the published
+                // order of that engine's releases
+                // ([`crate::ops::describe_db_engine_versions::version_rank`]); a build the
+                // catalogue does not publish — a custom engine version — is comparable to
+                // none of them, so nothing is refused for it.
+                let current = store.db_instances[&key].engine_version.clone();
+                let ranks = current.as_deref().and_then(|current| {
+                    let from =
+                        crate::ops::describe_db_engine_versions::version_rank(&engine, current)?;
+                    let to =
+                        crate::ops::describe_db_engine_versions::version_rank(&engine, &version)?;
+                    Some((current.to_string(), from, to))
+                });
+                if let Some((current, from, to)) = ranks {
+                    if to < from {
+                        return Err(ModifyDBInstanceError::invalid_parameter_combination(
+                            crate::state::cannot_upgrade_engine_version_message(
+                                &engine, &current, &version,
+                            ),
+                        ));
+                    }
+                }
+                Some(version)
             }
             None => None,
         };

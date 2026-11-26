@@ -1600,7 +1600,14 @@ async fn modify_writes_every_supplied_setting_through_to_the_store() {
         "emu-mod",
         "postgres",
         "db.t3.micro",
-        &params!["AllocatedStorage" => 20, "MasterUsername" => "pgadmin"],
+        &params![
+            "AllocatedStorage" => 20,
+            "MasterUsername" => "pgadmin",
+            // Pinned to a build EARLIER than the one the engine provisions by default, so
+            // the engine-version row below names a LATER build: a version change is an
+            // upgrade, and an instance already on the newest build has none to make.
+            "EngineVersion" => "17.2",
+        ],
     )
     .await;
 
@@ -1621,7 +1628,7 @@ async fn modify_writes_every_supplied_setting_through_to_the_store() {
             "DBInstanceClass",
         ),
         ("multi-AZ is turned on", "MultiAZ", "true", "MultiAZ"),
-        ("the engine version changes", "EngineVersion", "17.2", "EngineVersion"),
+        ("the engine version changes", "EngineVersion", "18.3", "EngineVersion"),
         ("the storage type changes", "StorageType", "io1", "StorageType"),
         (
             "the backup window changes",

@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DescribeOptionGroupsError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeOptionGroupsError::invalid_parameter_value)?;
-        check_selection(&input).map_err(DescribeOptionGroupsError::validation)?;
+        check_selection(&input).map_err(SelectionRejection::into_error)?;
         if let Some(engine_name) = &input.engine_name {
             crate::state::check_option_group_engine_name(engine_name)
                 .map_err(DescribeOptionGroupsError::invalid_parameter_value)?;
@@ -221,26 +221,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// * `MajorEngineVersion` "If specified, then EngineName must also be specified."
 /// * `Filters` "This parameter isn't currently supported." — refused rather than
 ///   ignored: silently dropping a filter would report groups the caller excluded.
-fn check_selection(input: &DescribeOptionGroupsInput) -> Result<(), String> {
+///
+/// Each refusal carries the Query API code of its own class ([`SelectionRejection`]): the
+/// first two are members that cannot be used together — the published
+/// `InvalidParameterCombination`, stated as the dependency the member's own documentation
+/// states — and the third is a parameter whose value this operation serves none of.
+fn check_selection(input: &DescribeOptionGroupsInput) -> Result<(), SelectionRejection> {
     if input.option_group_name.is_some()
         && (input.engine_name.is_some() || input.major_engine_version.is_some())
     {
-        return Err(
-            "OptionGroupName can't be supplied together with EngineName or MajorEngineVersion"
+        return Err(SelectionRejection::Combination(
+            "OptionGroupName can't be supplied together with EngineName or MajorEngineVersion."
                 .to_string(),
-        );
+        ));
     }
     if input.major_engine_version.is_some() && input.engine_name.is_none() {
-        return Err(
-            "MajorEngineVersion was specified without EngineName: if MajorEngineVersion is \
-             specified, then EngineName must also be specified"
-                .to_string(),
-        );
+        return Err(SelectionRejection::Combination(
+            MAJOR_ENGINE_VERSION_NEEDS_ENGINE_NAME.to_string(),
+        ));
     }
     if input.filters.as_ref().is_some_and(|filters| !filters.is_empty()) {
-        return Err("Filters isn't currently supported by DescribeOptionGroups".to_string());
+        return Err(SelectionRejection::Value(
+            "Filters isn't currently supported by DescribeOptionGroups".to_string(),
+        ));
     }
     Ok(())
+}
+
+/// How Amazon RDS states the dependency `DescribeOptionGroupsMessage$MajorEngineVersion`
+/// publishes — "if specified, then EngineName must also be specified" — for a request that
+/// carried the one without the other: the whole sentence is fixed text, since neither the
+/// value nor the member path is part of the statement.
+const MAJOR_ENGINE_VERSION_NEEDS_ENGINE_NAME: &str =
+    "If MajorEngineVersion is specified, then EngineName must also be specified.";
+
+/// Why a request's selection members were refused, which decides the Query API code the
+/// refusal carries: members that cannot be used TOGETHER are the published
+/// `InvalidParameterCombination`, and a parameter whose value this operation cannot serve is
+/// `InvalidParameterValue`. The two codes are the common client errors Amazon RDS answers a
+/// bad request with, and the code is what a client branches on.
+enum SelectionRejection {
+    Value(String),
+    Combination(String),
+}
+
+impl SelectionRejection {
+    /// The refusal on this operation's error channel, each class with its own code.
+    fn into_error(self) -> DescribeOptionGroupsError {
+        match self {
+            Self::Value(message) => DescribeOptionGroupsError::invalid_parameter_value(message),
+            Self::Combination(message) => {
+                DescribeOptionGroupsError::invalid_parameter_combination(message)
+            }
+        }
+    }
 }
 
 /// Whether `record` passes the `EngineName` filter: "A filter to only include option

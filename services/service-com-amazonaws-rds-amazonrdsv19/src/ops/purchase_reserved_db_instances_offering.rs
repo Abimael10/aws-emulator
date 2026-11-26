@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseReservedDBInstancesOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseReservedDBInstancesOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Purchases one of the reserved DB instance offerings this service publishes. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurchaseReservedDBInstancesOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The purchase is resolved against the published offering catalogue
+//! ([`crate::state::resolve_reserved_offering`]) and PERSISTS a reservation record carrying
+//! that offering's own class, term, prices and recurring charge, so the reservation this
+//! call answers with is the reservation `DescribeReservedDBInstances` reports afterwards and
+//! neither can report a price no offering publishes.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseReservedDBInstancesOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseReservedDBInstancesOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseReservedDBInstancesOffering"))
+        let region = crate::state::request_region(ctx)
+            .map_err(PurchaseReservedDBInstancesOfferingError::validation)?;
+
+        // "The number of instances to reserve. Default: 1." A count below one reserves
+        // nothing, so it names no reservation at all; the model publishes no `@range` for
+        // the member, which is why the floor is checked here.
+        let db_instance_count = input.db_instance_count.unwrap_or(DEFAULT_DB_INSTANCE_COUNT);
+        if db_instance_count < 1 {
+            return Err(
+                PurchaseReservedDBInstancesOfferingError::invalid_parameter_value(format!(
+                    "Invalid value {db_instance_count} for DBInstanceCount. Must be at least 1"
+                )),
+            );
+        }
+        // The offering id and the caller's own identifier both enter the store, so each is
+        // bounded before any of it is kept, as is the tag list.
+        crate::state::check_free_form(
+            "ReservedDBInstancesOfferingId",
+            &input.reserved_db_instances_offering_id,
+        )
+        .map_err(PurchaseReservedDBInstancesOfferingError::invalid_parameter_value)?;
+        if let Some(requested) = &input.reserved_db_instance_id {
+            crate::state::check_free_form("ReservedDBInstanceId", requested)
+                .map_err(PurchaseReservedDBInstancesOfferingError::invalid_parameter_value)?;
+        }
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(PurchaseReservedDBInstancesOfferingError::invalid_parameter_value)?;
+
+        // The offering being purchased, from the catalogue this service publishes: an id it
+        // never issued is the modelled fault — the offering "does not exist" — and nothing is
+        // stored for it.
+        let offering_id = input.reserved_db_instances_offering_id.clone();
+        let Some(offering) = crate::state::resolve_reserved_offering(&offering_id) else {
+            return Err(
+                PurchaseReservedDBInstancesOfferingErrorModeled::ReservedDBInstancesOfferingNotFoundFault(
+                    ReservedDBInstancesOfferingNotFoundFault {
+                        message: Some(crate::state::reserved_offering_not_found_message(
+                            &offering_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a reservation nothing holds.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // The identifier the reservation is tracked by: the caller's own
+        // ("customer-specified identifier to track this reservation"), or one this service
+        // minted when the request named none, since a reservation has to be addressable by
+        // `DescribeReservedDBInstances` either way.
+        let mint = store.next_mint();
+        let reservation_id = match &input.reserved_db_instance_id {
+            Some(requested) => requested.clone(),
+            None => crate::state::mint_uuid_token("reserved-db-instance", mint),
+        };
+        let key = (region.clone(), reservation_id.clone());
+        // "User already has a reservation with the given identifier": a second purchase
+        // under one identifier is the modelled already-exists fault rather than a silent
+        // overwrite of the first.
+        if store.reserved_db_instances.contains_key(&key) {
+            return Err(
+                PurchaseReservedDBInstancesOfferingErrorModeled::ReservedDBInstanceAlreadyExistsFault(
+                    ReservedDBInstanceAlreadyExistsFault {
+                        message: Some(
+                            crate::state::reserved_db_instance_already_exists_message(
+                                &reservation_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The account's reserved-DB-instance allowance, the one
+        // `DescribeAccountAttributes` publishes: a purchase that would take the DB instances
+        // this Region's live reservations reserve past it is the modelled quota fault.
+        let held = store.reserved_db_instance_capacity_in(&region);
+        let asked = usize::try_from(db_instance_count).unwrap_or_default();
+        if held.saturating_add(asked) > crate::state::RESERVED_DB_INSTANCE_QUOTA_PER_REGION {
+            return Err(quota_exceeded(
+                crate::state::reserved_db_instance_quota_message(held, db_instance_count),
+            ));
+        }
+        // And the two store guards this emulator keeps beside it: how many reservation
+        // RECORDS one Region holds whatever state each is in, and how many regions this
+        // store keeps records for at all. Neither is an AWS allowance, so each message says
+        // which bound was reached.
+        if store.purchased_reserved_db_instances_in(&region).len()
+            >= crate::state::RESERVED_DB_INSTANCE_RECORD_QUOTA_PER_REGION
+        {
+            return Err(quota_exceeded(format!(
+                "this emulator holds at most {} reserved DB instance records in {region}",
+                crate::state::RESERVED_DB_INSTANCE_RECORD_QUOTA_PER_REGION
+            )));
+        }
+        if !store.has_room_for_region(&region) {
+            return Err(quota_exceeded(format!(
+                "this emulator holds records for at most {} regions, and {region} is not one \
+                 of them yet",
+                crate::state::MAX_REGIONS
+            )));
+        }
+
+        // The reservation's own terms are the OFFERING's, copied rather than recomputed, so
+        // what the reservation reports and what the catalogue publishes for the offering it
+        // was bought from cannot differ. The upfront charge is per reserved DB instance, so a
+        // purchase of several is charged for each of them.
+        let record = crate::state::ReservedDbInstanceRecord {
+            reservation_id: reservation_id.clone(),
+            region: region.clone(),
+            offering_id,
+            db_instance_class: offering.db_instance_class.clone().unwrap_or_default(),
+            start_time: crate::state::now_as_wire_timestamp(),
+            duration: offering.duration.unwrap_or_default(),
+            fixed_price: offering.fixed_price.unwrap_or_default() * f64::from(db_instance_count),
+            usage_price: offering.usage_price.unwrap_or_default(),
+            currency_code: offering
+                .currency_code
+                .clone()
+                .unwrap_or_else(|| crate::state::RESERVED_CURRENCY_CODE.to_string()),
+            db_instance_count,
+            product_description: offering.product_description.clone().unwrap_or_default(),
+            offering_type: offering.offering_type.clone().unwrap_or_default(),
+            multi_az: offering.multi_az.unwrap_or_default(),
+            // An accepted purchase reports the state Amazon RDS is in while it takes the
+            // payment for the reservation, and reaches `active` when the transition the clock
+            // owes it comes due. Nothing sleeps: the due instant is stored and the next call
+            // materialises it.
+            state: crate::state::RESERVED_DB_INSTANCE_STATE_PAYMENT_PENDING.to_string(),
+            recurring_charges: offering.recurring_charges.clone().unwrap_or_default(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::RESERVED_DB_INSTANCE_STATE_ACTIVE,
+            )),
+            tags,
+        };
+        let purchased = record.to_wire();
+        store.reserved_db_instances.insert(key, record);
+        Ok(PurchaseReservedDBInstancesOfferingOutput {
+            reserved_db_instance: Some(purchased),
+        })
     }
+}
+
+/// `PurchaseReservedDBInstancesOfferingMessage$DBInstanceCount`'s documented default:
+/// "Default: 1".
+const DEFAULT_DB_INSTANCE_COUNT: i32 = 1;
+
+/// The modelled `ReservedDBInstanceQuotaExceededFault` — "request would exceed the user's DB
+/// Instance quota" — carrying the sentence that says which bound was reached.
+fn quota_exceeded(message: String) -> PurchaseReservedDBInstancesOfferingError {
+    PurchaseReservedDBInstancesOfferingErrorModeled::ReservedDBInstanceQuotaExceededFault(
+        ReservedDBInstanceQuotaExceededFault {
+            message: Some(message),
+        },
+    )
+    .into()
 }

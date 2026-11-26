@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedDBInstancesOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedDBInstancesOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the reserved DB instance offerings this service publishes — the catalogue a
+//! reservation is purchased from. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedDBInstancesOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalogue is published BY the service rather than created by a caller, so it is
+//! reference data derived once from the dimensions a reservation is bought along
+//! ([`crate::state::published_reserved_offerings`]); each selection member of this report
+//! narrows it, and an offering id that was never issued is the modelled 404 rather than an
+//! empty page, which is what lets a caller branch on "no such offering".
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +161,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedDBInstancesOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedDBInstancesOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedDBInstancesOfferings"))
+        // The catalogue is the same in every Region this emulator publishes it for, but the
+        // credential scope is still read, so a malformed one is refused here as it is
+        // everywhere else in this service.
+        let _region = crate::state::request_region(ctx)
+            .map_err(DescribeReservedDBInstancesOfferingsError::validation)?;
+        // This report reads no store at all: the catalogue is reference data rather than
+        // account state. The engine is still held by the operation — the constructor seam
+        // every operation of this service shares — so it is bound here rather than left
+        // unread.
+        let _ = &self.engine;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeReservedDBInstancesOfferingsError::invalid_parameter_value)?;
+        // "Filters — This parameter isn't currently supported": a filter is accepted and
+        // narrows nothing, because this report honours none of them. Only the number of
+        // values is bounded, as it is for every report of this front door.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        crate::state::check_filter_terms(filters)
+            .map_err(DescribeReservedDBInstancesOfferingsError::validation)?;
+
+        // Reference data: no store is reached at all, because no request creates an
+        // offering — see [`crate::state::published_reserved_offerings`].
+        let offerings: Vec<&'static ReservedDBInstancesOffering> =
+            match &input.reserved_db_instances_offering_id {
+                // "Specify this parameter to show only the available offering that matches
+                // the specified reservation identifier." An id this service never issued is
+                // the modelled fault: the offering "does not exist".
+                Some(requested) => {
+                    let Some(offering) = crate::state::resolve_reserved_offering(requested) else {
+                        return Err(
+                        DescribeReservedDBInstancesOfferingsErrorModeled::ReservedDBInstancesOfferingNotFoundFault(
+                            ReservedDBInstancesOfferingNotFoundFault {
+                                message: Some(
+                                    crate::state::reserved_offering_not_found_message(requested),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                    };
+                    vec![offering]
+                }
+                None => crate::state::published_reserved_offerings().iter().collect(),
+            };
+
+        let reported: Vec<(String, ReservedDBInstancesOffering)> = offerings
+            .into_iter()
+            .filter(|offering| matches_selection(offering, &input))
+            .map(|offering| {
+                (
+                    offering
+                        .reserved_db_instances_offering_id
+                        .clone()
+                        .unwrap_or_default(),
+                    offering.clone(),
+                )
+            })
+            .collect();
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeReservedDBInstancesOfferingsError::invalid_parameter_value)?;
+        Ok(DescribeReservedDBInstancesOfferingsOutput {
+            marker: page.next_marker,
+            reserved_db_instances_offerings: Some(page.items),
+        })
     }
+}
+
+/// Whether `offering` passes every selection member the request carried, each as its own
+/// member documents it:
+///
+/// * `DBInstanceClass` — "show only the available offerings matching the specified DB
+///   instance class";
+/// * `Duration` — "specified in years or seconds", so both spellings of a term select it
+///   ([`crate::state::duration_filter_matches`]);
+/// * `ProductDescription` — "show only the available offerings that contain the specified
+///   product description. The results show offerings that partially match the filter
+///   value", so this one is a CONTAINMENT rather than an equality;
+/// * `OfferingType` — "show only the available offerings matching the specified offering
+///   type";
+/// * `MultiAZ` — "whether to show only those reservations that support Multi-AZ".
+///
+/// A member the request left out is no constraint.
+fn matches_selection(
+    offering: &ReservedDBInstancesOffering,
+    input: &DescribeReservedDBInstancesOfferingsInput,
+) -> bool {
+    let class_matches = input
+        .db_instance_class
+        .as_deref()
+        .is_none_or(|wanted| offering.db_instance_class.as_deref() == Some(wanted));
+    let duration_matches = input.duration.as_deref().is_none_or(|wanted| {
+        offering
+            .duration
+            .is_some_and(|published| crate::state::duration_filter_matches(wanted, published))
+    });
+    let description_matches = input.product_description.as_deref().is_none_or(|wanted| {
+        offering
+            .product_description
+            .as_deref()
+            .is_some_and(|published| published.contains(wanted))
+    });
+    let offering_type_matches = input
+        .offering_type
+        .as_deref()
+        .is_none_or(|wanted| offering.offering_type.as_deref() == Some(wanted));
+    let multi_az_matches = input
+        .multi_az
+        .is_none_or(|wanted| offering.multi_az == Some(wanted));
+    class_matches
+        && duration_matches
+        && description_matches
+        && offering_type_matches
+        && multi_az_matches
 }

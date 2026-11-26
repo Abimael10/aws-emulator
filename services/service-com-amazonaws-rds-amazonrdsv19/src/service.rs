@@ -93,7 +93,6 @@ pub mod unresolved_reference;
 pub mod validator_enforced_members;
 
 use api_version::UnsupportedApiVersionOperation;
-use aws_smithy_schema_server::{envelope, Violation};
 use query_error_envelope::{RdsDefinition, RequestIdEnvelopeOperation};
 use service_common::query_boolean_values::QueryBooleanValues;
 use smithy_server_runtime::{
@@ -142,15 +141,41 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// detected: Value '<value>' at '<member>' failed to satisfy constraint: <requirement>`),
 /// which is the text AWS answers that class with — so there is nothing to reword there and
 /// the two cannot drift.
-fn invalid_parameter_value(violations: &[Violation]) -> Option<Refused> {
+///
+/// One rendering inside that clause is NOT the framework's: a `@pattern` requirement is
+/// quoted as the expression the service ADVERTISES rather than as the model writes it, which
+/// is the model's text less the whole-value anchor pair
+/// (`service_common::validation::unanchored`) — the `^` and `$` are how the model turns a
+/// find into a whole-string match, not part of the expression a client re-validates with. The
+/// CHECK still runs the model's pattern as written; only the quoting differs, and it is the
+/// shared one every other service of this tree states that class with
+/// (`service_common::validation_message`), so the sentence here cannot drift from theirs.
+fn invalid_parameter_value(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
     let message = match missing_parameter::message(violations) {
         Some(absent) => absent,
-        None => envelope(violations)?,
+        None => constraint_envelope(refusal)?,
     };
     Some(Refused {
         code: INVALID_PARAMETER_VALUE.to_string(),
         message,
     })
+}
+
+/// The constraint report a request that broke a declared rule is refused with: the shared
+/// envelope over the framework's own clauses, with the `@pattern` quoting above applied.
+///
+/// Only the MESSAGE is taken from the shared statement — the CODE it travels with is the one
+/// its own protocol publishes, and this service's Query API publishes
+/// [`INVALID_PARAMETER_VALUE`] for the whole class ([`invalid_parameter_value`] says why).
+fn constraint_envelope(refusal: &Refusal) -> Option<String> {
+    ::service_common::validation_message::aws_validation_refusal_with(
+        refusal,
+        ::service_common::validation::unanchored,
+    )
+    .map(|stated| stated.message)
 }
 
 /// The `com-amazonaws-rds-amazonrdsv19` emulated service: the generated [`ServiceDefinition`] plus
@@ -277,10 +302,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `InvalidParameterValue` code, and its own sentence for a parameter the request
         // left out (see [`invalid_parameter_value`]); every other refusal keeps the
         // framework's wording.
-        match refusal {
-            Refusal::Invalid(violations) => invalid_parameter_value(violations),
-            _ => None,
-        }
+        invalid_parameter_value(refusal)
     }
 
     fn override_routing_error(

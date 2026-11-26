@@ -219,13 +219,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The settings the request changes, over the ones the group holds. A request
         // carrying no `ConnectionPoolConfig` at all changes nothing and answers the group
-        // as it stands.
+        // as it stands. A refusal carries the Query API code of its own class: a value its
+        // member does not accept is `InvalidParameterValue`, while the two members whose
+        // values cannot hold together are the published parameter-combination failure
+        // (`crate::state::PoolConfigRejection`). Nothing is written for either, so every
+        // other field of the pool configuration keeps the value it held.
         let merged = match &input.connection_pool_config {
             Some(requested) => crate::state::merged_connection_pool_config(
                 &proxy.target_group.connection_pool_config,
                 requested,
             )
-            .map_err(ModifyDBProxyTargetGroupError::invalid_parameter_value)?,
+            .map_err(|rejection| match rejection {
+                crate::state::PoolConfigRejection::Value(message) => {
+                    ModifyDBProxyTargetGroupError::invalid_parameter_value(message)
+                }
+                crate::state::PoolConfigRejection::Combination(message) => {
+                    ModifyDBProxyTargetGroupError::invalid_parameter_combination(message)
+                }
+            })?,
             None => proxy.target_group.connection_pool_config.clone(),
         };
         let now = crate::state::now_as_wire_timestamp();

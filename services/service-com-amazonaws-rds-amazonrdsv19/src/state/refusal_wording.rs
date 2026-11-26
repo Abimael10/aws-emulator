@@ -453,6 +453,21 @@ pub fn member_pattern_violation_message(member_path: &str, value: &str, pattern:
         .unwrap_or_else(|| violation.message())
 }
 
+/// What a request that asks to move a database BACKWARD through its engine's releases is
+/// refused with: the engine, the build the database runs and the build the request named.
+///
+/// `EngineVersion` asks for an upgrade — "upgrade the DB instance to a later engine version"
+/// — and Amazon RDS has no way to take a database to an earlier build, so a request naming
+/// one is refused with the sentence it words every such refusal as, whichever direction the
+/// caller thought they were going: the fixed text `Cannot upgrade `, ` from ` and ` to `, with
+/// the engine and the two builds taken from the request and from the record it addressed.
+///
+/// One wording here rather than in each handler, so a refusal of an instance's downgrade and
+/// one of any other resource's cannot drift.
+pub fn cannot_upgrade_engine_version_message(engine: &str, from: &str, to: &str) -> String {
+    format!("Cannot upgrade {engine} from {from} to {to}")
+}
+
 /// Refuse a `BackupRetentionPeriod` outside the range the addressed resource accepts,
 /// whichever operation carries the member: the creates, the modifications, the restores and
 /// the promotion hold ONE rule, so none of them can drift from the others. `Err` carries the

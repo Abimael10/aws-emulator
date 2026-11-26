@@ -135,6 +135,13 @@ pub const DEFAULT_TARGET_GROUP_RENAME_MESSAGE: &str =
 /// `MaxConnectionsPercent`" — the value in force after this call, not the one the group
 /// held before it.
 ///
+/// The cross-member relation is a different CLASS of refusal from a value outside its own
+/// member's range, and is classified as one ([`PoolConfigRejection`]): `MaxConnectionsPercent`
+/// and `MaxIdleConnectionsPercent` are each acceptable on their own and cannot hold together,
+/// which is the parameter-combination failure the Query API publishes its own code for, and
+/// Amazon RDS states it as the comparison the pair has to satisfy rather than as a range
+/// against the other member's value ([`max_above_idle_message`]).
+///
 /// `MaxIdleConnectionsPercent` is the one member whose value is DERIVED rather than held:
 /// its own doc states it as a default computed from the pool size — "The default value is
 /// half of the value of `MaxConnectionsPercent`. For example, if `MaxConnectionsPercent` is
@@ -147,14 +154,15 @@ pub const DEFAULT_TARGET_GROUP_RENAME_MESSAGE: &str =
 pub fn merged_connection_pool_config(
     held: &ConnectionPoolConfigurationInfo,
     requested: &ConnectionPoolConfiguration,
-) -> Result<ConnectionPoolConfigurationInfo, String> {
+) -> Result<ConnectionPoolConfigurationInfo, PoolConfigRejection> {
     let mut merged = held.clone();
     if let Some(percent) = requested.max_connections_percent {
         check_range(
             "MaxConnectionsPercent",
             percent,
             &MAX_CONNECTIONS_PERCENT_RANGE,
-        )?;
+        )
+        .map_err(PoolConfigRejection::Value)?;
         merged.max_connections_percent = Some(percent);
         merged.max_idle_connections_percent = Some(percent / 2);
     }
@@ -163,14 +171,24 @@ pub fn merged_connection_pool_config(
             "ConnectionBorrowTimeout",
             timeout,
             &CONNECTION_BORROW_TIMEOUT_RANGE,
-        )?;
+        )
+        .map_err(PoolConfigRejection::Value)?;
         merged.connection_borrow_timeout = Some(timeout);
     }
     if let Some(percent) = requested.max_idle_connections_percent {
         let ceiling = merged
             .max_connections_percent
             .unwrap_or(*MAX_CONNECTIONS_PERCENT_RANGE.end());
-        check_range("MaxIdleConnectionsPercent", percent, &(0..=ceiling))?;
+        // The CEILING is the other member's value, so a percentage above it is the PAIR
+        // refusal; the member's own floor is its alone — a negative idle percentage involves
+        // no other member — so it stays a value refusal.
+        if percent > ceiling {
+            return Err(PoolConfigRejection::Combination(max_above_idle_message(
+                ceiling, percent,
+            )));
+        }
+        check_range("MaxIdleConnectionsPercent", percent, &(0..=ceiling))
+            .map_err(PoolConfigRejection::Value)?;
         merged.max_idle_connections_percent = Some(percent);
     }
     if let Some(filters) = &requested.session_pinning_filters {
@@ -178,17 +196,46 @@ pub fn merged_connection_pool_config(
             "SessionPinningFilters",
             filters.len(),
             MAX_SESSION_PINNING_FILTERS,
-        )?;
+        )
+        .map_err(PoolConfigRejection::Value)?;
         for filter in filters {
-            super::check_free_form("SessionPinningFilters", filter)?;
+            super::check_free_form("SessionPinningFilters", filter)
+                .map_err(PoolConfigRejection::Value)?;
         }
         merged.session_pinning_filters = Some(filters.clone());
     }
     if let Some(query) = &requested.init_query {
-        super::check_free_form("InitQuery", query)?;
+        super::check_free_form("InitQuery", query).map_err(PoolConfigRejection::Value)?;
         merged.init_query = Some(query.clone());
     }
     Ok(merged)
+}
+
+/// Why a `ConnectionPoolConfiguration` was refused, which is what decides the Query API code
+/// the refusal carries.
+///
+/// The two classes are the two common client errors Amazon RDS publishes for a bad request:
+/// a value its own member does not accept is `InvalidParameterValue`, and members that cannot
+/// be used together are `InvalidParameterCombination`. The MESSAGE travels with the class, so
+/// a handler cannot pair one class's sentence with the other's code; the handler maps each to
+/// the channel of its own operation.
+#[derive(Debug, Clone)]
+pub enum PoolConfigRejection {
+    /// A value outside the window the member's own documentation publishes.
+    Value(String),
+    /// A pair of members whose values cannot hold together.
+    Combination(String),
+}
+
+/// How Amazon RDS states the one relation `ConnectionPoolConfiguration` publishes BETWEEN two
+/// of its members: `MaxIdleConnectionsPercent` "must be between 0 and the value of
+/// `MaxConnectionsPercent`", stated as the comparison the pair has to satisfy, with both
+/// numbers taken from the values in force for the call.
+pub fn max_above_idle_message(max_connections_percent: i32, max_idle_percent: i32) -> String {
+    format!(
+        "MaxConnectionsPercent {max_connections_percent} must be greater than \
+         MaxIdleConnectionsPercent {max_idle_percent}"
+    )
 }
 
 /// Refuse a connection pool setting outside the range that member's own doc publishes.

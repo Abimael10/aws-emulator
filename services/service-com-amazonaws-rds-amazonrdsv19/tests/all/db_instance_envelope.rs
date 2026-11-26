@@ -908,10 +908,14 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
     create_instance(&router, case, identifier, "postgres", &[("EngineVersion", "15.8")]).await;
     wait_for_settle();
 
+    // The rows run in order against one instance, ASCENDING through the catalogue: an engine
+    // version change is an upgrade, so each row names a build later than the one the row
+    // before it left the instance on. What each row asserts is the RESOLUTION — an exact
+    // build is taken as named, a major version resolves to that family's own build.
     let rows: &[(&str, &str, &str)] = &[
+        ("a major version", "15", "15.17"),
+        ("another major version", "16", "16.13"),
         ("an exact version", "17.2", "17.2"),
-        ("a major version", "16", "16.13"),
-        ("another major version", "15", "15.17"),
     ];
     for (row_case, requested, expected) in rows {
         let modified = expect_ok(
@@ -966,6 +970,7 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
         "describe",
         &described,
         "EngineVersion",
-        "15.17",
+        // The build the last accepted row left the instance on.
+        "17.2",
     );
 }

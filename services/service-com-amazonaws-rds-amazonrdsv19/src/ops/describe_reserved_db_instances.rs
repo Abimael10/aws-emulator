@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedDBInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedDBInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the reservations this account purchased, or the one a request names. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedDBInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it reports is what `PurchaseReservedDBInstancesOffering` persisted
+//! (`crate::state::ReservedDbInstanceRecord`) — never the published offering catalogue,
+//! which `DescribeReservedDBInstancesOfferings` reports: a reservation exists only because
+//! a purchase was served, so a `ReservedDBInstanceId` that names none of them is the
+//! modelled 404 rather than an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +166,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedDBInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedDBInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedDBInstances"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeReservedDBInstancesError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeReservedDBInstancesError::invalid_parameter_value)?;
+        // "Filters — This parameter isn't currently supported": a filter is accepted and
+        // narrows nothing, because this report honours none of them. Only the number of
+        // values is bounded, as it is for every report of this front door.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        crate::state::check_filter_terms(filters)
+            .map_err(DescribeReservedDBInstancesError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the state a
+        // purchase owed the reservation it took payment for, and the retirement its own term
+        // makes due — both owed at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the reservations of the region it was signed
+        // for. "Specify this parameter to show only the reservation that matches the
+        // specified reservation ID"; a value that matches none of them is the modelled
+        // not-found fault, since no such reservation was ever purchased.
+        let candidates: Vec<&crate::state::ReservedDbInstanceRecord> =
+            match &input.reserved_db_instance_id {
+                Some(requested) => {
+                    let found = store
+                        .purchased_reserved_db_instances_in(&region)
+                        .into_iter()
+                        .find(|record| record.reservation_id == *requested);
+                    let Some(record) = found else {
+                        return Err(
+                            DescribeReservedDBInstancesErrorModeled::ReservedDBInstanceNotFoundFault(
+                                ReservedDBInstanceNotFoundFault {
+                                    message: Some(
+                                        crate::state::reserved_db_instance_not_found_message(
+                                            requested,
+                                        ),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    };
+                    vec![record]
+                }
+                None => store.purchased_reserved_db_instances_in(&region),
+            };
+
+        let reported: Vec<(String, ReservedDBInstance)> = candidates
+            .into_iter()
+            .filter(|record| matches_selection(record, &input))
+            .map(|record| (record.reservation_id.clone(), record.to_wire()))
+            .collect();
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeReservedDBInstancesError::invalid_parameter_value)?;
+        Ok(DescribeReservedDBInstancesOutput {
+            marker: page.next_marker,
+            reserved_db_instances: Some(page.items),
+        })
     }
+}
+
+/// Whether `record` passes every selection member the request carried, each as its own
+/// member documents it:
+///
+/// * `ReservedDBInstancesOfferingId` — "show only purchased reservations matching the
+///   specified offering identifier";
+/// * `DBInstanceClass` — "show only those reservations matching the specified DB instances
+///   class";
+/// * `Duration` — "specified in years or seconds", so both spellings of a term select it
+///   ([`crate::state::duration_filter_matches`]);
+/// * `ProductDescription` — "show only those reservations matching the specified product
+///   description", which is an equality here, unlike the offerings report's own member whose
+///   documentation makes it a partial match;
+/// * `OfferingType` — "show only the available offerings matching the specified offering
+///   type";
+/// * `MultiAZ` — "whether to show only those reservations that support Multi-AZ";
+/// * `LeaseId` — "show only the reservation that matches the specified lease ID", matched
+///   against the lease the reservation publishes.
+///
+/// A member the request left out is no constraint.
+fn matches_selection(
+    record: &crate::state::ReservedDbInstanceRecord,
+    input: &DescribeReservedDBInstancesInput,
+) -> bool {
+    let offering_matches = input
+        .reserved_db_instances_offering_id
+        .as_deref()
+        .is_none_or(|wanted| record.offering_id == wanted);
+    let class_matches = input
+        .db_instance_class
+        .as_deref()
+        .is_none_or(|wanted| record.db_instance_class == wanted);
+    let duration_matches = input
+        .duration
+        .as_deref()
+        .is_none_or(|wanted| crate::state::duration_filter_matches(wanted, record.duration));
+    let description_matches = input
+        .product_description
+        .as_deref()
+        .is_none_or(|wanted| record.product_description == wanted);
+    let offering_type_matches = input
+        .offering_type
+        .as_deref()
+        .is_none_or(|wanted| record.offering_type == wanted);
+    let multi_az_matches = input.multi_az.is_none_or(|wanted| record.multi_az == wanted);
+    let lease_matches = input
+        .lease_id
+        .as_deref()
+        .is_none_or(|wanted| record.lease_id() == wanted);
+    offering_matches
+        && class_matches
+        && duration_matches
+        && description_matches
+        && offering_type_matches
+        && multi_az_matches
+        && lease_matches
 }

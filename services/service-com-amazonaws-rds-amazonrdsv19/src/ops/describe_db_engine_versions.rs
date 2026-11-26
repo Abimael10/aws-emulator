@@ -1459,14 +1459,25 @@ const fn docdb_default_level(
 /// * A major version past its COMMUNITY end of life is published through this service's
 ///   own Amazon RDS Extended Support builds, named `<version>-rds.YYYYMMDD` ("Using
 ///   Amazon RDS Extended Support", Amazon RDS User Guide) — the builds that family can
-///   still be created with. That is the MySQL 5.7 and PostgreSQL 11 families; the Aurora,
-///   Amazon DocumentDB and MariaDB families carry service-managed version numbers of their
-///   own and publish no such build line.
+///   still be created with. That is the MySQL 5.7 and PostgreSQL 11 and 13 families; the
+///   Aurora, Amazon DocumentDB and MariaDB families carry service-managed version numbers of
+///   their own and publish no such build line.
 /// * Two engines that are EDITIONS of one database product publish the same major-version
 ///   families, because the edition is the engine and the family is the product release:
 ///   the three Db2 editions, the Oracle single-tenant pair and its multi-tenant (CDB)
 ///   pair, and the Microsoft SQL Server editions — Developer Edition excepted, which RDS
 ///   offers from the 2019 (15.00) release on and so carries no 14.00 family.
+///
+/// And one rule decides which BUILDS of a family are rows, for the engine whose builds are
+/// the community releases of that family's line, `postgres`: every community minor from the
+/// oldest build this catalogue publishes for the family up to the build it has moved to,
+/// rather than a sample of them, because the community numbers a line's releases
+/// consecutively. WHICH of those builds the family is still offered in is each row's own
+/// `Status`, since Amazon RDS deprecates a family's older builds as it moves on (see that
+/// engine's own section below). The other engines publish a per-family build list of their
+/// own choosing — an Aurora family packages a subset of the community releases, and the
+/// MySQL, MariaDB, Oracle, SQL Server and Db2 builds are release artefacts rather than a
+/// consecutive line — so their rows stay the builds the release list names.
 pub(crate) const CATALOG: &[CatalogVersion] = &[
     // --- Aurora MySQL -----------------------------------------------------
     row(
@@ -2607,6 +2618,19 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Major,
         &POSTGRES,
     ),
+    // An RDS for PostgreSQL family is LISTED in every community minor release of its line
+    // from the oldest build this catalogue publishes for it up to the build the family has
+    // moved to, not in a sample of two of them: the community numbers a line's releases
+    // consecutively, so a client that pinned any one of them is naming a release of that
+    // family. WHICH of them the family is still OFFERED in is the row's own `Status`: Amazon
+    // RDS deprecates a family's older builds as it moves on, and those rows are reported only
+    // to a request that asks for every version, while the recent run of the line and the
+    // builds this catalogue has long published as a family's floor are `available` and are the
+    // ones a create may pin.
+    //
+    // SOURCE: the RDS for PostgreSQL release list AWS publishes per major-version family
+    // (`DescribeDBEngineVersions(Engine="postgres")`), whose minors are the community
+    // PostgreSQL releases of that family.
     row(
         "postgres",
         "13.16",
@@ -2616,16 +2640,79 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Neither,
         &POSTGRES,
     ),
+    row(
+        "postgres",
+        "13.17",
+        "13",
+        "postgres13",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "13.18",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "13.19",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "13.20",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "13.21",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "13.22",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
     // The build each RDS for PostgreSQL family has MOVED TO; the Aurora PostgreSQL rows above
     // say why a family's newest row is the build the engine is being created with today and
     // why that row is the family's default.
-    //
-    // SOURCE: the RDS for PostgreSQL release list AWS publishes per major-version family
-    // (`DescribeDBEngineVersions(Engine="postgres")`), whose minors are the community
-    // PostgreSQL releases of that family.
     row(
         "postgres",
         "13.23",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    // PostgreSQL 13's RDS Extended Support builds, in the same `-rds.YYYYMMDD` form as the
+    // MySQL 5.7 and PostgreSQL 11 ones: the 13 line reached its community end of life at
+    // 13.23, so the builds the family is offered in past that release are this service's own
+    // Extended Support builds, and the newest of them is what the family resolves to.
+    row(
+        "postgres",
+        "13.23-rds.20260224",
         "13",
         "postgres13",
         STATUS_AVAILABLE,
@@ -2635,6 +2722,78 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     row(
         "postgres",
         "14.13",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.14",
+        "14",
+        "postgres14",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.15",
+        "14",
+        "postgres14",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.16",
+        "14",
+        "postgres14",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.17",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.18",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.19",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.20",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.21",
         "14",
         "postgres14",
         STATUS_AVAILABLE,
@@ -2653,6 +2812,78 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     row(
         "postgres",
         "15.8",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.9",
+        "15",
+        "postgres15",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.10",
+        "15",
+        "postgres15",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.11",
+        "15",
+        "postgres15",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.12",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.13",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.14",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.15",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "15.16",
         "15",
         "postgres15",
         STATUS_AVAILABLE,
@@ -2688,7 +2919,70 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "postgres",
+        "16.5",
+        "16",
+        "postgres16",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.6",
+        "16",
+        "postgres16",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.7",
+        "16",
+        "postgres16",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
         "16.8",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.9",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.10",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.11",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "16.12",
         "16",
         "postgres16",
         STATUS_AVAILABLE,
@@ -2707,6 +3001,60 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     row(
         "postgres",
         "17.2",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.3",
+        "17",
+        "postgres17",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.4",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.5",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.6",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.7",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "17.8",
         "17",
         "postgres17",
         STATUS_AVAILABLE,
@@ -2998,6 +3346,22 @@ const ENGINES_THAT_RESOLVE_NO_DEFAULT_VERSION: [&str; 1] = [crate::state::DOCDB_
 /// `CreateCustomDBEngineVersion` mints, and any value that is not an engine).
 pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
     ENGINES.iter().find(|facts| facts.engine == engine)
+}
+
+/// Where `engine_version` sits in the order [`CATALOG`] publishes `engine`'s builds in, or
+/// `None` for a version this catalogue does not publish for that engine.
+///
+/// The catalogue lists an engine's rows in ASCENDING version order (see [`CATALOG`]), so
+/// comparing two builds of one engine is comparing where each of them sits in it — which is
+/// what decides whether moving from one to the other is an upgrade. Reading the order off the
+/// one published table is what keeps that decision from needing a second account of how each
+/// engine numbers its releases: the Oracle release-update form, the SQL Server build form and
+/// the upstream dotted forms do not compare the same way as text.
+pub(crate) fn version_rank(engine: &str, engine_version: &str) -> Option<usize> {
+    CATALOG
+        .iter()
+        .filter(|entry| entry.engine.eq_ignore_ascii_case(engine))
+        .position(|entry| entry.engine_version.eq_ignore_ascii_case(engine_version))
 }
 
 /// The catalogue version this service would PROVISION for `engine` when a create or

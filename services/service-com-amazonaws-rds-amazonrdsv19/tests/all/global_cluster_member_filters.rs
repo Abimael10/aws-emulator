@@ -6,8 +6,9 @@
 //! publishes — `region`, which selects a global cluster with a member in one of the named
 //! Amazon Web Services Regions, and `db-cluster-id`, which selects the global cluster a
 //! named member DB CLUSTER belongs to — and a filter that matches nothing is an empty report
-//! rather than a refusal. A filter name the operation does not publish is still refused,
-//! because ignoring it would report global clusters the caller excluded.
+//! rather than a refusal. A filter name the operation does not publish is accepted too, and
+//! narrows nothing: this report honours only the names above, so a name outside them is a
+//! parameter it does not apply rather than one it refuses.
 //!
 //! The table spans what the rule generalises over: each form a DB cluster is named in (the
 //! bare identifier, another case of it, and the ARN), a value naming a cluster that is not a
@@ -22,7 +23,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instances::{call, call_in, emulator, expect_error, expect_ok, texts, REGION};
+use crate::db_instances::{call, call_in, emulator, expect_error, expect_ok, text, texts, REGION};
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -175,7 +176,8 @@ async fn the_db_cluster_id_filter_selects_the_global_database_a_member_belongs_t
 }
 
 /// With no global database at all, a supported filter is still a 200 with an empty list — the
-/// report an empty result set is — and an unsupported filter name is still refused.
+/// report an empty result set is — and a filter name this operation does not support is
+/// accepted too and narrows nothing.
 #[tokio::test]
 async fn a_supported_filter_that_matches_nothing_reports_an_empty_list() {
     let router = emulator();
@@ -194,15 +196,99 @@ async fn a_supported_filter_that_matches_nothing_reports_an_empty_list() {
 
     for name in ["engine", "global-cluster-id", "Region", "db-cluster-name"] {
         let case = format!("the unsupported filter {name:?}");
-        let refused = expect_error(
-            &case,
-            described(&router, &[(name, &["anything"])]).await,
-            400,
-            "InvalidParameterValue",
-        );
+        let body = expect_ok(&case, described(&router, &[(name, &["anything"])]).await);
         assert!(
-            refused.contains(&format!("Unrecognized filter name: {name}")),
-            "case {case:?}: expected the unrecognized-filter refusal naming it, got {refused}"
+            body.contains("<DescribeGlobalClustersResult>"),
+            "case {case:?}: expected the success envelope, got {body}"
         );
     }
+}
+
+/// A filter name this operation does not support is ACCEPTED and does not narrow the report:
+/// the global clusters it answers with are the ones it answers without any filter at all,
+/// whatever values the filter carries — while the `GlobalClusterIdentifier` PARAMETER still
+/// matches exactly and faults for an identifier no global cluster answers to.
+///
+/// The rows span what the rule generalises over: the filter name the generic `Filter` shape
+/// would narrow another report by, one in another case than a supported name, one that names
+/// no member of anything, and a value that names the owned global cluster beside one that was
+/// never created.
+#[tokio::test]
+async fn a_filter_name_this_report_does_not_support_narrows_nothing() {
+    let router = emulator();
+    let global = "emu-global-tolerated";
+
+    expect_ok(
+        "create the global database",
+        call(
+            &router,
+            "CreateGlobalCluster",
+            &[("GlobalClusterIdentifier", global), ("Engine", ENGINE)],
+        )
+        .await,
+    );
+
+    // The report with no filter at all, which every filtered report below must match.
+    let unfiltered = reported(&router, "no filter", &[]).await;
+    assert_eq!(
+        unfiltered,
+        vec![global.to_string()],
+        "case {:?}: expected the owned global database reported, got {unfiltered:?}",
+        "no filter"
+    );
+
+    // (case, the unsupported filter name, the values it carries)
+    let rows: [(&str, &str, &[&str]); 6] = [
+        ("the identifier filter, naming the owned global database", "global-cluster-id", &[global]),
+        ("the identifier filter, naming one never created", "global-cluster-id", &["emu-no-such-global"]),
+        ("a supported name in another case", "Region", &[REGION]),
+        ("a filter of another report", "engine", &[ENGINE]),
+        ("a name that names no member of anything", "not-a-filter", &["anything"]),
+        ("several values, none of which names anything", "global-cluster-id", &["one", "two"]),
+    ];
+
+    for (case, name, values) in rows {
+        let found = reported(&router, case, &[(name, values)]).await;
+        assert_eq!(
+            found, unfiltered,
+            "case {case:?}: an unsupported filter must not narrow the report: expected \
+             {unfiltered:?}, got {found:?}"
+        );
+    }
+
+    // An unsupported filter beside a SUPPORTED one leaves the supported one's narrowing
+    // alone: the region filter still selects on the regions the global database has members
+    // in, so a region it has no member in reports nothing.
+    let found = reported(
+        &router,
+        "an unsupported filter beside a region the global database has no member in",
+        &[("global-cluster-id", &[global]), ("region", &["ap-south-1"])],
+    )
+    .await;
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "case {:?}: expected no global database reported, got {found:?}",
+        "an unsupported filter beside a region the global database has no member in"
+    );
+
+    // The PARAMETER is unchanged by any of that: it matches exactly and faults for an
+    // identifier that names no global cluster.
+    let refused = expect_error(
+        "the identifier parameter naming nothing",
+        call(
+            &router,
+            "DescribeGlobalClusters",
+            &[("GlobalClusterIdentifier", "emu-no-such-global")],
+        )
+        .await,
+        404,
+        "GlobalClusterNotFoundFault",
+    );
+    assert_eq!(
+        text(&refused, "Message"),
+        "Global cluster 'emu-no-such-global' not found",
+        "case {:?}: expected the not-found fault naming the identifier, got {refused}",
+        "the identifier parameter naming nothing"
+    );
 }
