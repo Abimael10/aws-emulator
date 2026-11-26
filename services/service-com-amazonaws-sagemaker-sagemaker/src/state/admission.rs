@@ -148,11 +148,13 @@ pub fn failed_to_download_model_data(location: &crate::state::S3Location) -> Str
 /// ONE sentence for both of the conditions that produce it, because the service itself cannot
 /// tell them apart: a prefix that holds nothing and a listing the documents in force withheld
 /// look the same from the service's side, so the caller is handed every fact needed to tell
-/// them apart rather than a verdict on which it was. A SECOND clause carries what Amazon S3
-/// itself answered when the listing was refused by AUTHORIZATION ([`s3_listing_refusal`]),
-/// which is the one hint distinguishing "the prefix is empty" from "this role may not list the
-/// bucket"; a listing that answered and held nothing carries no such clause, because Amazon S3
-/// refused nothing.
+/// them apart rather than a verdict on which it was. A SECOND clause carries whatever Amazon S3
+/// ITSELF answered about the location, and is what distinguishes the conditions this one
+/// sentence covers: the refusal Amazon S3 answered a listing it withheld on the
+/// identity-based question with ([`s3_listing_refusal`]), and the sentence it named the
+/// absence of the bucket or of the key with ([`crate::state::NoObjectAnswer`]). A listing that
+/// answered and merely held nothing carries no such clause, because Amazon S3 refused nothing
+/// and named nothing about it.
 ///
 /// Every create that resolves an input data source words the refusal this way — the training
 /// creates through [`crate::state::absent_input_objects`], `CreateTransformJob` on its

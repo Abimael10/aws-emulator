@@ -233,6 +233,9 @@ struct Row {
     key: &'static str,
     /// Whether Amazon S3 holds an object under it.
     populated: bool,
+    /// What Amazon S3 itself ANSWERED about the location, which the refusal reports after the
+    /// location sentence — and `None` for a listing that answered and merely held nothing.
+    s3_answer: Option<&'static str>,
 }
 
 /// RULE: `CreateTransformJob` lists the location its `TransformInput` names before it creates
@@ -255,42 +258,51 @@ async fn create_transform_job_lists_the_location_its_input_names() {
             bucket: None,
             key: "one/",
             populated: true,
+            s3_answer: None,
         },
         Row {
             case: "a prefix holding several objects",
             bucket: None,
             key: "many/",
             populated: true,
+            s3_answer: None,
         },
         Row {
             case: "a key naming one object",
             bucket: None,
             key: "one/records.csv",
             populated: true,
+            s3_answer: None,
         },
         Row {
             case: "an empty prefix beside a populated one",
             bucket: None,
             key: "empty/",
             populated: false,
+            s3_answer: None,
         },
         Row {
             case: "an empty prefix deeper under a populated key",
             bucket: None,
             key: "one/records.csv/deeper/",
             populated: false,
+            s3_answer: None,
         },
         Row {
             case: "a prefix nothing was ever written under",
             bucket: None,
             key: "untouched/",
             populated: false,
+            s3_answer: None,
         },
         Row {
             case: "a bucket this account does not hold",
             bucket: Some("transform-prefix-listing-absent"),
             key: "data/",
             populated: false,
+            // Amazon S3 "Error responses": `NoSuchBucket` — "The specified bucket does not
+            // exist".
+            s3_answer: Some("The specified bucket does not exist"),
         },
     ];
 
@@ -360,17 +372,23 @@ async fn create_transform_job_lists_the_location_its_input_names() {
         let bucket = row.bucket.unwrap_or(BUCKET);
         // The refusal AWS words for an input data source it found no object under: the S3 URL
         // the request named, the Region it addressed, the execution role of the model the job
-        // would run and the bucket that role has to be allowed to list.
+        // would run and the bucket that role has to be allowed to list — then whatever Amazon
+        // S3 itself answered about the location, which is nothing for a listing that answered
+        // and merely held no object.
+        let clause = row
+            .s3_answer
+            .map(|answer| format!(" Error message from S3: {answer}"))
+            .unwrap_or_default();
         let expected = format!(
             "No S3 objects found under S3 URL \"{s3_uri}\" given in input data source. Please \
              ensure that the bucket exists in the selected region ({REGION}), that objects \
              exist under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
-             permissions on bucket \"{bucket}\"."
+             permissions on bucket \"{bucket}\".{clause}"
         );
         assert_eq!(
             message, expected,
-            "case {:?}: expected the no-objects refusal naming {s3_uri:?}, the Region, the role \
-             and the bucket, got {message:?}",
+            "case {:?}: expected the no-objects refusal naming {s3_uri:?}, the Region, the role, \
+             the bucket and what Amazon S3 answered, got {message:?}",
             row.case
         );
         // The refusal is PRE-CREATION, so it leaves nothing behind: the name is not taken.

@@ -531,11 +531,12 @@ pub async fn absent_input_objects(
         // A listing that ANSWERED, with no object under the prefix, is the refusal, and so is
         // an answer that NAMES the absence of the bucket or the key itself; one that could not
         // be made at all says nothing (see the doc above). The reading is the one this service
-        // takes of every Amazon S3 location ([`super::location_holds_no_object`]). Amazon S3
-        // refused nothing in that case, so the refusal carries no clause about an
-        // authorization failure.
-        if super::s3_access::location_holds_no_object(&client, &location).await {
-            return Some(refusal(None));
+        // takes of every Amazon S3 location ([`super::location_no_object`]), and it carries
+        // WHICH answer Amazon S3 gave: the clause reporting what Amazon S3 itself said carries
+        // that sentence for an answer that named the absence, and nothing for a listing that
+        // answered and merely held nothing, which Amazon S3 refused nothing about.
+        if let Some(answer) = super::s3_access::location_no_object(&client, &location).await {
+            return Some(refusal(answer.s3_error()));
         }
     }
     None

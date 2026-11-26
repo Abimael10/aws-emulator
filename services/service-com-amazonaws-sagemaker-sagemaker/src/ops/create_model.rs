@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // policies withhold is named as model data that could not be ACCESSED, with
                 // what has to hold for it to be (see `crate::state::admission`).
                 let refusal = match unreadable {
-                    crate::state::UnreadableLocation::NoObject(uri) => {
+                    crate::state::UnreadableLocation::NoObject(uri, _) => {
                         crate::state::could_not_find_model_data(uri)
                     }
                     crate::state::UnreadableLocation::Denied(uri) => {

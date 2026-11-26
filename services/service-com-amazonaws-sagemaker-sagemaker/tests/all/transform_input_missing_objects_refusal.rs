@@ -16,8 +16,9 @@
 //! of them independently: the Region the call is made in, the execution role the stored model
 //! carries, the bucket, and the shape of the location (a prefix nothing was written under, a
 //! key nothing is stored at, a deeper prefix under a stored key, a bucket this account does
-//! not hold). A location that DOES hold an object is accepted, which is what makes the rows
-//! above a refusal of the location rather than of every call.
+//! not hold — whose refusal also reports the sentence Amazon S3 answered about that absence).
+//! A location that DOES hold an object is accepted, which is what makes the rows above a
+//! refusal of the location rather than of every call.
 
 use std::sync::Arc;
 
@@ -158,13 +159,23 @@ fn message(body: &Value) -> String {
 }
 
 /// The sentence AWS words for an input data source it found no object under, built from the
-/// four facts the refusal is made of.
-fn no_objects_found(s3_uri: &str, region: &str, role_arn: &str, bucket: &str) -> String {
+/// four facts the refusal is made of, and then whatever Amazon S3 itself answered about the
+/// location.
+fn no_objects_found(
+    s3_uri: &str,
+    region: &str,
+    role_arn: &str,
+    bucket: &str,
+    s3_answer: Option<&str>,
+) -> String {
+    let clause = s3_answer
+        .map(|answer| format!(" Error message from S3: {answer}"))
+        .unwrap_or_default();
     format!(
         "No S3 objects found under S3 URL \"{s3_uri}\" given in input data source. Please \
          ensure that the bucket exists in the selected region ({region}), that objects exist \
          under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
-         permissions on bucket \"{bucket}\"."
+         permissions on bucket \"{bucket}\".{clause}"
     )
 }
 
@@ -197,6 +208,9 @@ struct Row {
     key: &'static str,
     /// Whether Amazon S3 holds an object under the location.
     populated: bool,
+    /// What Amazon S3 itself ANSWERED about the location, which the refusal reports after the
+    /// location sentence — and `None` for a listing that answered and merely held nothing.
+    s3_answer: Option<&'static str>,
 }
 
 /// RULE: `CreateTransformJob` refuses an input data source holding no object with AWS's
@@ -228,6 +242,7 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
             bucket: "transform-input-east",
             key: "untouched/",
             populated: false,
+            s3_answer: None,
         },
         Row {
             case: "a key nothing is stored at",
@@ -236,6 +251,7 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
             bucket: "transform-input-west",
             key: "sets/does-not-exist.csv",
             populated: false,
+            s3_answer: None,
         },
         Row {
             case: "a deeper prefix under a stored key",
@@ -244,6 +260,7 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
             bucket: "transform-input-south",
             key: "single.csv/deeper/",
             populated: false,
+            s3_answer: None,
         },
         Row {
             case: "a bucket this account does not hold",
@@ -252,6 +269,9 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
             bucket: "transform-input-nowhere",
             key: "data/",
             populated: false,
+            // Amazon S3 "Error responses": `NoSuchBucket` — "The specified bucket does not
+            // exist".
+            s3_answer: Some("The specified bucket does not exist"),
         },
         Row {
             case: "a prefix holding an object",
@@ -260,6 +280,7 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
             bucket: "transform-input-east",
             key: "data/",
             populated: true,
+            s3_answer: None,
         },
         Row {
             case: "a key naming one stored object",
@@ -268,6 +289,7 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
             bucket: "transform-input-south",
             key: "single.csv",
             populated: true,
+            s3_answer: None,
         },
     ];
 
@@ -334,9 +356,9 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
         );
         assert_eq!(
             message(&answered),
-            no_objects_found(&s3_uri, row.region, &role_arn, row.bucket),
-            "case {case:?}: the refusal must name the location, the Region, the model's role \
-             and the bucket, got {:?}",
+            no_objects_found(&s3_uri, row.region, &role_arn, row.bucket, row.s3_answer),
+            "case {case:?}: the refusal must name the location, the Region, the model's role, \
+             the bucket and what Amazon S3 answered, got {:?}",
             message(&answered)
         );
         // The refusal is PRE-CREATION, so the name it was made under is still free.

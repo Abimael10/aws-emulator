@@ -307,8 +307,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // withheld are indistinguishable from the service's side, so the refusal states the
         // whole diagnosis — the S3 URL given in the input data source, the Region the call
         // addressed, the execution role of the model the job runs and the bucket that role has
-        // to be allowed to list (`crate::state::no_s3_objects_found`). `CreateTrainingJob`,
-        // the other create that resolves an input data source, words it the same way
+        // to be allowed to list (`crate::state::no_s3_objects_found`), followed by whatever
+        // Amazon S3 itself answered about the location. `CreateTrainingJob`, the other create
+        // that resolves an input data source, words it the same way
         // (`crate::state::absent_input_objects`).
         let input_uri = input.transform_input.data_source.s3_data_source.s3_uri.clone();
         if let Some(role_arn) = execution_role_arn.as_deref() {
@@ -321,7 +322,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|location| location.bucket)
                     .unwrap_or_default();
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket, None),
+                    crate::state::no_s3_objects_found(
+                        uri,
+                        &region,
+                        role_arn,
+                        &bucket,
+                        unreadable.s3_error(),
+                    ),
                 ));
             }
         }

@@ -175,10 +175,10 @@ pub use admission::{
 pub mod s3_access;
 pub use s3_access::{
     arn_partition, first_unreadable_location, first_unreadable_location_as_role,
-    object_action_is_unauthorized_through, object_name_under, object_read_is_unauthorized,
-    object_write_is_unauthorized, ordinary_name, s3_client, s3_client_through, S3Location,
-    UnreadableLocation, DEFAULT_PARTITION, DELETE_OBJECT_ACTION, GET_OBJECT_ACTION,
-    LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
+    location_no_object, object_action_is_unauthorized_through, object_name_under,
+    object_read_is_unauthorized, object_write_is_unauthorized, ordinary_name, s3_client,
+    s3_client_through, NoObjectAnswer, S3Location, UnreadableLocation, DEFAULT_PARTITION,
+    DELETE_OBJECT_ACTION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
 };
 
 /// The CONTAINER IMAGE slice: the one reading of a container image path a request names, and

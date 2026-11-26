@@ -711,41 +711,49 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
         )
         .await;
 
-    // (case, the input S3 URI, its S3DataType, whether the input holds an object)
-    let rows: Vec<(&str, String, &str, bool)> = vec![
+    // (case, the input S3 URI, its S3DataType, whether the input holds an object, what Amazon
+    // S3 itself answered about the location)
+    let rows: Vec<(&str, String, &str, bool, Option<&str>)> = vec![
         (
             "a prefix objects live under",
             format!("s3://{BUCKET}/input/"),
             "S3Prefix",
             true,
+            None,
         ),
         (
             "an object the bucket holds",
             format!("s3://{BUCKET}/single.csv"),
             "S3Prefix",
             true,
+            None,
         ),
         (
             "a prefix with zero objects under it",
             format!("s3://{BUCKET}/empty-prefix/"),
             "S3Prefix",
             false,
+            None,
         ),
         (
             "a key nothing is stored under",
             format!("s3://{BUCKET}/missing.csv"),
             "S3Prefix",
             false,
+            None,
         ),
         (
             "a bucket that does not exist",
             "s3://sagemaker-no-such-input/data/".to_string(),
             "S3Prefix",
             false,
+            // Amazon S3 "Error responses": `NoSuchBucket` — "The specified bucket does not
+            // exist".
+            Some("The specified bucket does not exist"),
         ),
     ];
 
-    for (index, (case, uri, data_type, readable)) in rows.into_iter().enumerate() {
+    for (index, (case, uri, data_type, readable, s3_answer)) in rows.into_iter().enumerate() {
         let name = format!("transformjob{index}");
         let body = json!({
             "TransformJobName": name,
@@ -784,16 +792,19 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
             .strip_prefix("s3://")
             .and_then(|rest| rest.split('/').next())
             .unwrap_or_default();
+        let clause = s3_answer
+            .map(|answer| format!(" Error message from S3: {answer}"))
+            .unwrap_or_default();
         assert_eq!(
             message(&answered),
             format!(
                 "No S3 objects found under S3 URL \"{uri}\" given in input data source. Please \
                  ensure that the bucket exists in the selected region ({REGION}), that objects \
                  exist under that S3 prefix, and that the role \"{role}\" has \"s3:ListBucket\" \
-                 permissions on bucket \"{bucket}\"."
+                 permissions on bucket \"{bucket}\".{clause}"
             ),
-            "case {case:?}: the refusal must name the location, the Region, the role and the \
-             bucket, got {:?}",
+            "case {case:?}: the refusal must name the location, the Region, the role, the \
+             bucket and what Amazon S3 answered, got {:?}",
             message(&answered)
         );
         assert_eq!(

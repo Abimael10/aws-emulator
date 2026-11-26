@@ -155,10 +155,11 @@ pub fn ordinary_name(name: &str) -> Option<String> {
 ///
 /// Two conditions, because a caller is told different things about them: an object that is
 /// not there at all, and one a policy withholds the read of (see the module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnreadableLocation<'uri> {
-    /// Amazon S3 ANSWERED that the location holds no object.
-    NoObject(&'uri str),
+    /// Amazon S3 ANSWERED that the location holds no object, carrying WHICH of its answers
+    /// that was ([`NoObjectAnswer`]) so a refusal can report it.
+    NoObject(&'uri str, NoObjectAnswer),
     /// A bucket policy that CAN be read WITHHOLDS the read from this principal.
     Denied(&'uri str),
 }
@@ -166,9 +167,48 @@ pub enum UnreadableLocation<'uri> {
 impl<'uri> UnreadableLocation<'uri> {
     /// The location this is about, as the request wrote it.
     #[must_use]
-    pub fn uri(self) -> &'uri str {
+    pub fn uri(&self) -> &'uri str {
         match self {
-            Self::NoObject(uri) | Self::Denied(uri) => uri,
+            Self::NoObject(uri, _) | Self::Denied(uri) => uri,
+        }
+    }
+
+    /// The sentence Amazon S3 itself ANSWERED about this location, for a refusal that reports
+    /// it, and `None` where Amazon S3 answered nothing of its own about it — a listing that
+    /// came back empty, or a read a policy withheld before Amazon S3 was asked.
+    #[must_use]
+    pub fn s3_error(&self) -> Option<&str> {
+        match self {
+            Self::NoObject(_, answer) => answer.s3_error(),
+            Self::Denied(_) => None,
+        }
+    }
+}
+
+/// WHICH answer Amazon S3 gave about a location that holds no object.
+///
+/// A caller is told different things about the two, because Amazon S3 itself says different
+/// things: an answer that NAMES the absence — no such bucket, no such key — is a sentence
+/// Amazon S3 wrote and a refusal reporting what Amazon S3 answered carries it, while a listing
+/// that answered and merely held nothing refused nothing, so there is no answer of Amazon S3's
+/// own to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoObjectAnswer {
+    /// A listing that ANSWERED and holds no object under the location.
+    EmptyListing,
+    /// Amazon S3 ANSWERED that what the location names is not there, with the sentence it
+    /// answered with — taken from that answer rather than written here.
+    Absent(String),
+}
+
+impl NoObjectAnswer {
+    /// The sentence Amazon S3 answered, for a refusal that reports it, and `None` for a
+    /// listing that answered without naming anything.
+    #[must_use]
+    pub fn s3_error(&self) -> Option<&str> {
+        match self {
+            Self::EmptyListing => None,
+            Self::Absent(answer) => Some(answer.as_str()),
         }
     }
 }
@@ -272,8 +312,8 @@ async fn first_unreadable_location_under<'uri>(
         {
             return Some(UnreadableLocation::Denied(uri));
         }
-        if location_holds_no_object(&client, &location).await {
-            return Some(UnreadableLocation::NoObject(uri));
+        if let Some(answer) = location_no_object(&client, &location).await {
+            return Some(UnreadableLocation::NoObject(uri, answer));
         }
     }
     None
@@ -487,16 +527,23 @@ async fn bucket_policy_document(
         .map(str::to_string)
 }
 
-/// Whether Amazon S3 ANSWERED that `location` holds no object: a listing under the location's
-/// key that came back empty, or an answer naming the absence of the bucket or the key itself.
+/// What Amazon S3 ANSWERED about whether `location` holds any object — a listing under the
+/// location's key that came back empty, or an answer naming the absence of the bucket or the
+/// key itself and the sentence it named it with — and `None` when it answers that the location
+/// holds one, or answers nothing this reading can take an absence off.
 ///
 /// The key is read as a PREFIX, which is the one reading that serves both forms a location
 /// takes: a key naming one object lists that object, and a key naming a prefix lists what is
 /// under it. Only one object is asked for, because the question is whether there is any.
-pub async fn location_holds_no_object(
+///
+/// WHICH answer it was travels out of here rather than collapsing into one boolean, because a
+/// refusal that reports what Amazon S3 answered has to carry that answer
+/// ([`NoObjectAnswer`]): a bucket that is not there and a prefix that holds nothing are
+/// different facts for the caller deciding whether to fix the URI or to wait for data.
+pub async fn location_no_object(
     client: &::aws_sdk_s3::Client,
     location: &S3Location,
-) -> bool {
+) -> Option<NoObjectAnswer> {
     let listed = client
         .list_objects_v2()
         .bucket(&location.bucket)
@@ -505,30 +552,41 @@ pub async fn location_holds_no_object(
         .send()
         .await;
     match listed {
-        Ok(listed) => listed.contents().is_empty(),
+        Ok(listed) => listed
+            .contents()
+            .is_empty()
+            .then_some(NoObjectAnswer::EmptyListing),
         Err(error) => {
-            // An answer that NAMES the absence is an answer about the location; every other
-            // failure teaches nothing about it (see the module docs).
-            let absent = error.as_service_error().is_some_and(|service| {
+            // An answer that NAMES the absence is an answer about the location, and the
+            // sentence it carries is Amazon S3's own; every other failure teaches nothing
+            // about the location (see the module docs).
+            let service = error.as_service_error().filter(|service| {
                 service.is_no_such_bucket()
-                    || ::aws_sdk_s3::error::ProvideErrorMetadata::code(service)
+                    || ::aws_sdk_s3::error::ProvideErrorMetadata::code(*service)
                         == Some(NO_SUCH_KEY_CODE)
             });
-            if !absent {
+            let Some(service) = service else {
                 ::tracing::debug!(
                     bucket = ?location.bucket,
                     key = ?location.key,
                     "the location could not be listed, so nothing is refused for it"
                 );
-            }
-            absent
+                return None;
+            };
+            // What Amazon S3 wrote about the absence, and the code it answered under for an
+            // answer carrying no sentence of its own.
+            let answered = ::aws_sdk_s3::error::ProvideErrorMetadata::message(service)
+                .or_else(|| ::aws_sdk_s3::error::ProvideErrorMetadata::code(service))
+                .unwrap_or_default()
+                .to_string();
+            Some(NoObjectAnswer::Absent(answered))
         }
     }
 }
 
 /// The error code Amazon S3 answers a read of an object it does not hold with
 /// (`GetObject`'s `NoSuchKey`), which is the second answer that names the absence of
-/// [`location_holds_no_object`]'s object.
+/// [`location_no_object`]'s object.
 const NO_SUCH_KEY_CODE: &str = "NoSuchKey";
 
 /// Whether the policy on `location`'s bucket WITHHOLDS the read of the object `location`

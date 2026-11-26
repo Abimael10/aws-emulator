@@ -414,23 +414,36 @@ fn metric_names(described: &Value) -> Vec<String> {
     names
 }
 
-/// RULE ONE: the refusal of an input data source that answered no object carries the Amazon S3
-/// authorization clause exactly when the listing was REFUSED, and the location sentence alone
-/// when it merely answered nothing.
+/// RULE ONE: the refusal of an input data source that answered no object carries whatever
+/// Amazon S3 ITSELF answered about the location after the location sentence — the refusal of a
+/// listing it withheld, or the sentence it named an absent bucket with — and the location
+/// sentence alone when the listing answered and merely held nothing.
 ///
-/// The rows differ along WHY the listing answered nothing: a role with no Amazon S3 grant at
-/// all, a role granted the listing of another bucket only, a prefix that holds nothing, and a
-/// bucket that does not exist.
+/// The rows differ along WHAT Amazon S3 answered: a role with no Amazon S3 grant at all, a role
+/// granted the listing of another bucket only, a prefix that holds nothing, and a bucket that
+/// does not exist.
 #[tokio::test]
 async fn the_no_s3_objects_refusal_names_what_s3_answered_when_the_listing_was_refused() {
+    /// What Amazon S3 itself answered about the listing, which is the clause the refusal
+    /// carries after the location sentence.
+    #[derive(PartialEq, Eq)]
+    enum S3Answer {
+        /// Amazon S3 refused the listing on the identity-based question.
+        ListingRefused,
+        /// Amazon S3 answered that the bucket itself is not there (Amazon S3 "Error
+        /// responses": `NoSuchBucket` — "The specified bucket does not exist").
+        NoSuchBucket,
+        /// The listing answered and held no object, so Amazon S3 named nothing of its own.
+        Nothing,
+    }
     /// One row: the case, the grant the role carries, the bucket and prefix the channel reads,
-    /// and whether the refusal has to carry the Amazon S3 authorization clause.
+    /// and what Amazon S3 answered about that listing.
     struct Row {
         case: &'static str,
         grant: Value,
         bucket: &'static str,
         prefix: &'static str,
-        refused_by_s3: bool,
+        s3_answer: S3Answer,
     }
     let rows = vec![
         Row {
@@ -438,28 +451,28 @@ async fn the_no_s3_objects_refusal_names_what_s3_answered_when_the_listing_was_r
             grant: allow(json!("sts:AssumeRole"), json!("*")),
             bucket: "listing-refused",
             prefix: "train/",
-            refused_by_s3: true,
+            s3_answer: S3Answer::ListingRefused,
         },
         Row {
             case: "a role granted the listing of another bucket only",
             grant: allow(json!("s3:ListBucket"), json!("arn:aws:s3:::some-other-bucket")),
             bucket: "listing-refused",
             prefix: "train/",
-            refused_by_s3: true,
+            s3_answer: S3Answer::ListingRefused,
         },
         Row {
             case: "a prefix the bucket holds nothing under",
             grant: every_s3_action_on("listing-refused"),
             bucket: "listing-refused",
             prefix: "nothing-here/",
-            refused_by_s3: false,
+            s3_answer: S3Answer::Nothing,
         },
         Row {
             case: "a bucket that does not exist",
             grant: allow(json!("s3:*"), json!("*")),
             bucket: "no-such-input-bucket",
             prefix: "train/",
-            refused_by_s3: false,
+            s3_answer: S3Answer::NoSuchBucket,
         },
     ];
 
@@ -508,10 +521,12 @@ async fn the_no_s3_objects_refusal_names_what_s3_answered_when_the_listing_was_r
              action",
             row.bucket
         );
-        let expected = if row.refused_by_s3 {
-            format!("{located}{clause}")
-        } else {
-            located
+        let expected = match row.s3_answer {
+            S3Answer::ListingRefused => format!("{located}{clause}"),
+            S3Answer::NoSuchBucket => {
+                format!("{located} Error message from S3: The specified bucket does not exist")
+            }
+            S3Answer::Nothing => located,
         };
         assert_eq!(
             answered_message, expected,
