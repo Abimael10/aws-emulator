@@ -183,7 +183,14 @@ async fn create_instance(
 /// The transition itself is untouched — it is still owed, and still the one the create staged
 /// — so the instance is in exactly the state a caller sees inside the provisioning window,
 /// without the test racing the clock for it.
-fn hold_in_creating(engine: &Arc<engine::InMemoryEngine>, case: &str, identifier: &str) {
+///
+/// `pub(crate)` so the sibling suites of this one test target hold an instance inside its
+/// provisioning window through this helper rather than growing a second copy of it.
+pub(crate) fn hold_in_creating(
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    identifier: &str,
+) {
     /// Longer than any test run, so the status cannot settle under the assertions below.
     const BEYOND_THIS_SUITE: Duration = Duration::from_secs(3_600);
 
