@@ -1060,3 +1060,224 @@ async fn the_deleting_window_is_observable_until_the_teardown_completes() {
         }
     }
 }
+
+/// One recorded event, reduced to `(SourceType, SourceIdentifier, Message)`.
+type LoggedEvent = (String, String, String);
+
+/// Every event this service's log reports now, NEWEST FIRST — the order
+/// `DescribeEvents` answers in — read over the wire like everything else here.
+///
+/// Each member is read as a column and the columns are zipped, so an event that does not
+/// carry every member of the shape cannot pass unnoticed.
+async fn logged_events(emulator: &Emulator, case: &str) -> Vec<LoggedEvent> {
+    let reply = emulator
+        .call("DescribeEvents", &params(&[("MaxRecords", "100")]))
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: DescribeEvents must answer 200, got {} {}",
+        reply.status, reply.body
+    );
+    let identifiers = reply.all("Event/SourceIdentifier");
+    let types = reply.all("Event/SourceType");
+    let messages = reply.all("Event/Message");
+    assert!(
+        identifiers.len() == types.len() && identifiers.len() == messages.len(),
+        "case {case:?}: every event must carry every member of the shape, got {}",
+        reply.body
+    );
+    (0..identifiers.len())
+        .map(|index| {
+            (
+                types[index].to_string(),
+                identifiers[index].to_string(),
+                messages[index].to_string(),
+            )
+        })
+        .collect()
+}
+
+/// `rows`, listed oldest first, as the log reports them: newest first.
+fn newest_first(rows: &[(&str, &str, &str)]) -> Vec<LoggedEvent> {
+    rows.iter()
+        .rev()
+        .map(|(source_type, source_identifier, message)| {
+            (
+                (*source_type).to_string(),
+                (*source_identifier).to_string(),
+                (*message).to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One delete-log row: the case, the group id, the pairs that create it, the pairs the
+/// delete carries, and the events the delete must add to the log, OLDEST FIRST.
+type DeleteLogCase = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str)],
+    &'static [(&'static str, &'static str, &'static str)],
+);
+
+#[tokio::test]
+async fn a_served_delete_records_the_group_and_every_member_it_takes() {
+    // The rule: a served delete records, under the GROUP, the final snapshot it took and
+    // the group's own removal, and under each member cluster it TAKES the event this
+    // service records for a deleted cluster — so a member the request keeps is narrated
+    // nothing, because nothing was done to it. The axis is WHAT the delete takes: the
+    // group's only member, a primary and its replica, the primaries of a partitioned
+    // group, a final snapshot beside them, and a primary the request retains.
+    let cases: [DeleteLogCase; 5] = [
+        (
+            "the group's only member",
+            "log-one-rg",
+            &[("ReplicasPerNodeGroup", "0")],
+            &[],
+            &[
+                ("cache-cluster", "log-one-rg-001", "Cache cluster deleted"),
+                (
+                    "replication-group",
+                    "log-one-rg",
+                    "Replication group deleted",
+                ),
+            ],
+        ),
+        (
+            "a primary and its replica",
+            "log-pair-rg",
+            &[("NumCacheClusters", "2")],
+            &[],
+            &[
+                ("cache-cluster", "log-pair-rg-001", "Cache cluster deleted"),
+                ("cache-cluster", "log-pair-rg-002", "Cache cluster deleted"),
+                (
+                    "replication-group",
+                    "log-pair-rg",
+                    "Replication group deleted",
+                ),
+            ],
+        ),
+        (
+            "the primaries of a partitioned group",
+            "log-shards-rg",
+            &[("NumNodeGroups", "2"), ("ReplicasPerNodeGroup", "0")],
+            &[],
+            &[
+                (
+                    "cache-cluster",
+                    "log-shards-rg-0001-001",
+                    "Cache cluster deleted",
+                ),
+                (
+                    "cache-cluster",
+                    "log-shards-rg-0002-001",
+                    "Cache cluster deleted",
+                ),
+                (
+                    "replication-group",
+                    "log-shards-rg",
+                    "Replication group deleted",
+                ),
+            ],
+        ),
+        (
+            // The final snapshot is named in another case than it is stored under, and the
+            // event names the snapshot this service STORED ("this value is stored as a
+            // lowercase string") rather than the spelling the request carried.
+            "a final snapshot taken before the group goes",
+            "log-final-rg",
+            &[("ReplicasPerNodeGroup", "0")],
+            &[("FinalSnapshotIdentifier", "Log-Final-RG-Parting")],
+            &[
+                ("cache-cluster", "log-final-rg-001", "Cache cluster deleted"),
+                (
+                    "replication-group",
+                    "log-final-rg",
+                    "Snapshot log-final-rg-parting created",
+                ),
+                (
+                    "replication-group",
+                    "log-final-rg",
+                    "Replication group deleted",
+                ),
+            ],
+        ),
+        (
+            // "All of the read replicas are deleted, but the primary node is retained":
+            // only the replica is taken, so only the replica is narrated.
+            "the primary the request retains",
+            "log-retain-rg",
+            &[("NumCacheClusters", "2")],
+            &[("RetainPrimaryCluster", "true")],
+            &[
+                ("cache-cluster", "log-retain-rg-002", "Cache cluster deleted"),
+                (
+                    "replication-group",
+                    "log-retain-rg",
+                    "Replication group deleted",
+                ),
+            ],
+        ),
+    ];
+
+    for (case, id, extra, deleted_with, expected) in cases {
+        // One store per row, so what the delete adds to the log is what this row's group
+        // put there and nothing a previous row left behind.
+        let emulator = Emulator::new();
+        available_group(&emulator, case, id, extra).await;
+        // Every member cluster is read once before the baseline is taken, so a status
+        // change the clock already owes one is materialised — and narrated — BEFORE the
+        // delete rather than by it.
+        let members = emulator.call("DescribeCacheClusters", &params(&[])).await;
+        assert_eq!(
+            members.status, 200,
+            "case {case:?}: DescribeCacheClusters must answer 200, got {} {}",
+            members.status, members.body
+        );
+        let before = logged_events(&emulator, case).await;
+
+        let reply = delete_group(&emulator, id, deleted_with).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: the delete must answer 200, got {} {}",
+            reply.status, reply.body
+        );
+
+        let after = logged_events(&emulator, case).await;
+        assert!(
+            after.len() >= before.len(),
+            "case {case:?}: a delete must not drop events the log already held, got \
+             {after:?} where it held {before:?}"
+        );
+        let added = after.len() - before.len();
+        assert_eq!(
+            after[..added].to_vec(),
+            newest_first(expected),
+            "case {case:?}: expected the delete to record {:?}, got {:?}",
+            newest_first(expected),
+            after[..added].to_vec()
+        );
+        assert_eq!(
+            after[added..].to_vec(),
+            before,
+            "case {case:?}: a delete must leave the log it found as it was, got {:?} where \
+             it held {before:?}",
+            after[added..].to_vec()
+        );
+
+        // The log OUTLIVES the records it narrates: once the teardown has run and neither
+        // the group nor the members it took resolve any more, those same events are still
+        // reported.
+        assert_group_gone(&emulator, case, id).await;
+        let outliving = logged_events(&emulator, case).await;
+        for event in newest_first(expected) {
+            assert!(
+                outliving.contains(&event),
+                "case {case:?}: the log must still report {event:?} once the resources are \
+                 gone, got {outliving:?}"
+            );
+        }
+    }
+}
