@@ -134,6 +134,16 @@ pub fn validate_feature_configurations(
                 ADDITIONAL_CONFIGURATION_MEMBER,
             )?;
         }
+        for additional in feature.additional_configuration.iter().flatten() {
+            let Some(additional_name) = additional.name.as_deref() else {
+                continue;
+            };
+            validate_additional_configuration_entry(
+                DETECTOR_ADDITIONAL_CONFIGURATIONS,
+                additional_name,
+                additional.status.as_deref(),
+            )?;
+        }
     }
     Ok(())
 }
@@ -170,7 +180,7 @@ pub fn validate_member_feature_configurations(
             let Some(additional_name) = additional.name.as_deref() else {
                 continue;
             };
-            validate_feature_entry(
+            validate_additional_configuration_entry(
                 MEMBER_ADDITIONAL_CONFIGURATIONS,
                 additional_name,
                 additional.status.as_deref(),
@@ -275,6 +285,30 @@ pub(super) fn validate_feature_entry(
         }
     }
     Ok(())
+}
+
+/// Refuse one `(name, status)` entry of a feature's `AdditionalConfiguration` list:
+/// the name must be a member of the enum `catalog` the entry's `Name` targets, and
+/// the status, where supplied, a `FeatureStatus` member
+/// ([`validate_feature_entry`]'s rule for the status, which the two lists share).
+///
+/// A name outside the catalog names a configuration NO feature supports, which is
+/// what GuardDuty's own sentence for that refusal states
+/// ([`ADDITIONAL_CONFIGURATION_UNSUPPORTED_MESSAGE`]) — a different class from a
+/// feature name outside `DetectorFeature`, which names a feature instead. The
+/// request boundary refuses such a value first, since every one of these names is
+/// a modelled enum; this is the same rule stated where a handler can reach it, so
+/// the two cannot answer one request differently.
+pub(super) fn validate_additional_configuration_entry(
+    catalog: &[&str],
+    name: &str,
+    status: Option<&str>,
+) -> Result<(), String> {
+    if !catalog.contains(&name) {
+        return Err(ADDITIONAL_CONFIGURATION_UNSUPPORTED_MESSAGE.to_string());
+    }
+    // The name is in the catalog, so only the status rule is left to state.
+    validate_feature_entry(catalog, name, status)
 }
 
 /// Refuse a feature list that would ADD EKS Runtime Monitoring to a configuration
@@ -476,13 +510,14 @@ pub fn apply_feature_configurations(
         let status = feature.status.as_deref().unwrap_or(ENABLED);
         detector.set_feature(name, status, now);
         if let Some(additional) = feature.additional_configuration.as_ref() {
-            let additional_records = additional_configuration_records(
+            merge_additional_configuration_in(
+                &mut detector.features,
+                name,
                 additional
                     .iter()
                     .map(|cfg| (cfg.name.as_deref(), cfg.status.as_deref())),
                 now,
             );
-            set_additional_configuration_in(&mut detector.features, name, additional_records);
         }
     }
     configured
@@ -512,13 +547,14 @@ pub(super) fn apply_member_feature_configurations(
         let status = feature.status.as_deref().unwrap_or(ENABLED);
         member.set_feature(name, status, now);
         if let Some(additional) = feature.additional_configuration.as_ref() {
-            let configured = additional_configuration_records(
+            merge_additional_configuration_in(
+                &mut member.features,
+                name,
                 additional
                     .iter()
                     .map(|cfg| (cfg.name.as_deref(), cfg.status.as_deref())),
                 now,
             );
-            set_additional_configuration_in(&mut member.features, name, configured);
         }
     }
 }
@@ -795,54 +831,47 @@ pub fn set_feature_in(features: &mut Vec<FeatureRecord>, name: &str, status: &st
     }
 }
 
-/// Build one feature's stored additional-configuration set from the `(name,
-/// status)` entries a request gave, keyed by NAME.
+/// Write the `(name, status)` entries a request gave for ONE feature into that
+/// feature's stored additional-configuration set, keyed by NAME.
 ///
 /// Each entry configures one member of the additional-configuration enum, so the
-/// stored set is keyed by that name the way [`set_feature_in`] keys a feature
-/// switch: a repeated name is ONE configuration and the last entry naming it wins,
-/// which is also what keeps the stored set no longer than the enum's own member
-/// list however long the request's list is. An entry naming nothing configures
-/// nothing and is dropped.
-pub(super) fn additional_configuration_records<'a>(
+/// request's list states something about the members it NAMES and nothing about the
+/// rest — the way a `Features` list states something only about the features it
+/// names ([`apply_feature_configurations`]). So each named configuration is written
+/// over the stored one and every configuration the list leaves out keeps the status
+/// it already had, rather than the list replacing the feature's whole stored set.
+///
+/// Keying by name is also what makes a repeated name ONE configuration whose last
+/// entry wins — the entries are written in order — and what keeps the stored set no
+/// longer than the enum's own member list however long the request's list is. An
+/// entry naming nothing configures nothing and is dropped.
+pub(super) fn merge_additional_configuration_in<'a>(
+    features: &mut [FeatureRecord],
+    feature: &str,
     entries: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
     now: i64,
-) -> Vec<AdditionalConfigRecord> {
-    let mut by_name: BTreeMap<&str, AdditionalConfigRecord> = BTreeMap::new();
+) {
     for (name, status) in entries {
         let Some(name) = name else { continue };
-        by_name.insert(
+        set_additional_configuration_status_in(
+            features,
+            feature,
             name,
-            AdditionalConfigRecord {
-                name: name.to_string(),
-                status: status.unwrap_or(ENABLED).to_string(),
-                updated_at_millis: now,
-            },
+            status.unwrap_or(ENABLED),
+            now,
         );
-    }
-    by_name.into_values().collect()
-}
-
-/// Replace one feature's additional configuration in a stored feature list.
-pub(super) fn set_additional_configuration_in(
-    features: &mut [FeatureRecord],
-    name: &str,
-    configured: Vec<AdditionalConfigRecord>,
-) {
-    if let Some(record) = features.iter_mut().find(|f| f.name == name) {
-        record.additional_configuration = configured;
     }
 }
 
 /// Set ONE of a feature's additional configurations in a stored feature list,
 /// leaving that feature's other additional configurations where they are — the
-/// single-switch counterpart of [`set_additional_configuration_in`].
+/// single switch [`merge_additional_configuration_in`] writes a request's entries
+/// through, and the one place an additional configuration is written at all.
 ///
 /// Follows [`set_feature_in`]'s rule for the instant: re-applying the status a
 /// configuration already has changes nothing, `UpdatedAt` included. A configuration
 /// the feature does not carry yet is inserted at its place in the stored order,
-/// which is by NAME — the order [`additional_configuration_records`] builds a
-/// request's set in — so one read reports the set in a total order however it was
+/// which is by NAME, so one read reports the set in a total order however it was
 /// written.
 pub(super) fn set_additional_configuration_status_in(
     features: &mut [FeatureRecord],

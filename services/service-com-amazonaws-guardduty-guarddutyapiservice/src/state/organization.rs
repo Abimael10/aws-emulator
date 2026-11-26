@@ -466,13 +466,20 @@ pub fn validate_org_feature_configurations(
 /// `OrgFeatureAdditionalConfiguration` member, keyed by that name, the way the
 /// feature switches themselves are stored one per `OrgFeature` member
 /// ([`OrganizationConfiguration::set_feature`]) and the way the member side keys the
-/// same switches ([`additional_configuration_records`]): a name a request repeats is
+/// same switches ([`merge_additional_configuration_in`]): a name a request repeats is
 /// ONE configuration and the last entry naming it is the one that lands, as for the
 /// feature switches above. That is also what keeps the stored configuration no
 /// longer than the two model catalogs however long a request's lists are, so every
 /// later walk of it — a read, and the write that carries an auto-enablement onto the
 /// administrator's member accounts — is bounded by the model rather than by the
 /// request.
+///
+/// Keying them by name is what makes this list a PARTIAL update of the feature's
+/// additional configurations too: a list states something about the members it names
+/// and nothing about the rest, so each named configuration is written over the stored
+/// one and every configuration the list leaves out keeps the auto-enablement it
+/// already had — and one named WITHOUT an `AutoEnable`, an optional member
+/// (`smithy_query(shape="OrganizationAdditionalConfiguration")`), keeps it as well.
 pub fn apply_org_feature_configurations(
     configuration: &mut OrganizationConfiguration,
     features: Option<&Vec<crate::ops::types::OrganizationFeatureConfiguration>>,
@@ -493,24 +500,35 @@ pub fn apply_org_feature_configurations(
             continue;
         };
         if let Some(additional) = feature.additional_configuration.as_ref() {
-            let mut by_name: BTreeMap<&str, OrgAdditionalConfigRecord> = BTreeMap::new();
             for configuration in additional {
                 let Some(name) = configuration.name.as_deref() else {
                     continue;
                 };
-                by_name.insert(
-                    name,
+                let auto_enable = configuration.auto_enable.as_deref();
+                if let Some(stored) = record
+                    .additional_configuration
+                    .iter_mut()
+                    .find(|stored| stored.name == name)
+                {
+                    if let Some(auto_enable) = auto_enable {
+                        stored.auto_enable = auto_enable.to_string();
+                    }
+                    continue;
+                }
+                // Held in name order, so one read reports the set in a total order
+                // however it was written — the order the member side keeps its own
+                // additional configurations in.
+                let at = record
+                    .additional_configuration
+                    .partition_point(|stored| stored.name.as_str() < name);
+                record.additional_configuration.insert(
+                    at,
                     OrgAdditionalConfigRecord {
                         name: name.to_string(),
-                        auto_enable: configuration
-                            .auto_enable
-                            .as_deref()
-                            .unwrap_or(AUTO_ENABLE_NONE)
-                            .to_string(),
+                        auto_enable: auto_enable.unwrap_or(AUTO_ENABLE_NONE).to_string(),
                     },
                 );
             }
-            record.additional_configuration = by_name.into_values().collect();
         }
     }
 }

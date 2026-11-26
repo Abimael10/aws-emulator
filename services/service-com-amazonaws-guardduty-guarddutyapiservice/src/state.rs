@@ -2854,6 +2854,46 @@ pub const INVALID_INPUT_PARAMETERS_MESSAGE: &str =
 pub const UNPROCESSABLE_PAYLOAD_MESSAGE: &str =
     "The request is rejected because the JSON could not be processed.";
 
+/// The sentence GuardDuty refuses an `AdditionalConfiguration` entry naming a
+/// configuration the feature it was given for does not support with.
+///
+/// Each entry configures ONE member of the catalog its `Name` targets
+/// (`smithy_query(shape="DetectorAdditionalConfiguration")`, and the same member on
+/// the member-account and organization shapes), so a value outside that catalog
+/// names a configuration no feature supports at all. The refusal is about the
+/// configuration that was asked for rather than about the payload being unreadable,
+/// so it is a class of its own and not [`UNPROCESSABLE_PAYLOAD_MESSAGE`]: it names
+/// neither the feature, nor the value, nor the catalog back at the caller.
+pub const ADDITIONAL_CONFIGURATION_UNSUPPORTED_MESSAGE: &str =
+    "The request was rejected because additional configuration was provided for a feature that does not support it.";
+
+/// Does a refusal path name the `Name` of an entry of a feature's
+/// `AdditionalConfiguration` list?
+///
+/// A path is the wire trail to the member at fault, a list step naming the entry's
+/// 1-based position followed by the collection step — so an entry's name is
+/// `…additionalConfiguration.<position>.member.name`, whichever operation's
+/// `Features` list carries it and however deep that list sits.
+fn names_an_additional_configuration(path: &str) -> bool {
+    let mut steps = path.rsplit('.');
+    steps.next() == Some(NAME_PATH_STEP)
+        && steps.next() == Some(COLLECTION_PATH_STEP)
+        && steps
+            .next()
+            .is_some_and(|position| position.chars().all(|digit| digit.is_ascii_digit()))
+        && steps.next() == Some(ADDITIONAL_CONFIGURATION_PATH_STEP)
+}
+
+/// The wire spelling of the per-feature `AdditionalConfiguration` list, as a refusal
+/// path names it.
+const ADDITIONAL_CONFIGURATION_PATH_STEP: &str = "additionalConfiguration";
+
+/// The wire spelling of an additional configuration's `Name` member.
+const NAME_PATH_STEP: &str = "name";
+
+/// The path step a refusal takes from a collection into one of its elements.
+const COLLECTION_PATH_STEP: &str = "member";
+
 /// How GuardDuty states a refusal the request boundary made: a member the model
 /// requires was absent, or a value fell outside a bound the model declares.
 ///
@@ -2875,6 +2915,17 @@ pub fn constraint_rejection(violations: &[::aws_smithy_schema_server::Violation]
 
     // A value outside an enumerated type's value set is not a value of the member's
     // modelled type at all, so reading the payload into that input is what failed.
+    // An additional-configuration entry naming a value outside the catalog its
+    // `Name` member targets names a configuration NO feature supports, which is
+    // what GuardDuty states ([`ADDITIONAL_CONFIGURATION_UNSUPPORTED_MESSAGE`]):
+    // the refusal is about the configuration asked for, not about the payload
+    // being unreadable, so it is answered before the general enum text below.
+    if violations.iter().any(|violation| {
+        matches!(violation.kind, ViolationKind::EnumValue(_))
+            && names_an_additional_configuration(&violation.path)
+    }) {
+        return ADDITIONAL_CONFIGURATION_UNSUPPORTED_MESSAGE.to_string();
+    }
     if violations
         .iter()
         .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)))
