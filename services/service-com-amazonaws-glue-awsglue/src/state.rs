@@ -306,6 +306,8 @@ mod partition_predicate;
 mod policy_documents;
 mod registered_connection_types;
 mod schema_compatibility;
+mod schema_compatibility_json;
+mod schema_compatibility_protobuf;
 mod schema_definition_canonical;
 mod schema_definition_json;
 mod schema_definition_protobuf;
@@ -364,6 +366,8 @@ pub use partition_predicate::*;
 pub use policy_documents::*;
 pub use registered_connection_types::*;
 pub use schema_compatibility::*;
+pub use schema_compatibility_json::*;
+pub use schema_compatibility_protobuf::*;
 pub use schema_definition_canonical::*;
 pub use schema_definition_json::*;
 pub use schema_definition_protobuf::*;
@@ -3663,18 +3667,20 @@ impl ComAmazonawsGlueAwsglueState {
     }
 
     /// The stored schema set `schema_name` of registry `registry_name`, or the SENTENCE a
-    /// read that resolved its `SchemaId` to that pair is refused with.
+    /// read that resolved `schema_id` to that pair is refused with.
     ///
     /// The container is resolved before what it holds, so the two misses are told apart: a
     /// registry this endpoint holds none of is reported as the REGISTRY being absent
     /// ([`messages::registry_not_found_for_schema`], which names it), and only a registry
-    /// that exists but holds no such schema set is the schema miss
-    /// ([`messages::SCHEMA_NOT_FOUND`]). A client is therefore never told to create a
-    /// schema inside a registry that does not exist.
+    /// that exists but holds no such schema set is the schema miss, which states the ADDRESS
+    /// the read looked the set up by ([`schema_miss`]) exactly as the registry miss beside it
+    /// names the registry. A client is therefore never told to create a schema inside a
+    /// registry that does not exist.
     pub fn schema_or_miss(
         &self,
         registry_name: &str,
         schema_name: &str,
+        schema_id: &SchemaId,
     ) -> Result<&SchemaEntry, String> {
         let Some(registry) = self.registries.get(registry_name) else {
             return Err(messages::registry_not_found_for_schema(registry_name));
@@ -3682,7 +3688,7 @@ impl ComAmazonawsGlueAwsglueState {
         registry
             .schemas
             .get(schema_name)
-            .ok_or_else(|| messages::SCHEMA_NOT_FOUND.to_string())
+            .ok_or_else(|| schema_miss(schema_id))
     }
 
     /// The stored schema set `schema_name` of registry `registry_name`, mutably.

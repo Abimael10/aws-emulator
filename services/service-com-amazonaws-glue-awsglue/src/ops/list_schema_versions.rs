@@ -10,7 +10,10 @@
 //! time, in registration order. "Empty results will be returned if there are no schema
 //! versions available", so a schema set holding none answers an EMPTY list rather than a
 //! refusal, while a `SchemaId` naming no schema set at all is refused with
-//! `EntityNotFoundException`. A reporting operation: it writes nothing.
+//! `EntityNotFoundException`, stating the ADDRESS the listing looked that set up by
+//! ([`crate::state::schema_miss`]). A `MaxResults` outside the range its modelled type
+//! declares is the registry's own input refusal, worded before any handler runs
+//! (`crate::service`). A reporting operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -197,7 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under that name.
         let (registry_name, schema_name) = match reference {
             crate::state::Reference::Local(names) => names,
-            crate::state::Reference::Elsewhere(_) => return Err(schema_not_found()),
+            crate::state::Reference::Elsewhere(_) => {
+                return Err(schema_not_found(&input.schema_id))
+            }
         };
 
         // Absent, the page is the size the member documents as its default — which is
@@ -211,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: the stored versions are projected out and nothing is written.
         let store = state.lock();
         let Some(schema) = store.schema(&registry_name, &schema_name) else {
-            return Err(schema_not_found());
+            return Err(schema_not_found(&input.schema_id));
         };
         let schema_arn = crate::state::schema_arn(&region, &schema.registry_name, &schema.name);
 
@@ -283,10 +288,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const NEXT_TOKEN_MEMBER: &str = "NextToken";
 
 /// This operation's modelled refusal for a `SchemaId` that resolves to a schema set this
-/// endpoint holds none of — the same wording every schema-registry miss answers.
-fn schema_not_found() -> ListSchemaVersionsError {
+/// endpoint holds none of: the refusal reports the ADDRESS the listing looked the set up by
+/// — the three `SchemaId` members as the request sent them — so a caller holding several
+/// schema sets can tell which lookup missed ([`crate::state::schema_miss`]).
+fn schema_not_found(schema_id: &SchemaId) -> ListSchemaVersionsError {
     ListSchemaVersionsErrorModeled::EntityNotFoundException(EntityNotFoundException {
-        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+        message: Some(crate::state::schema_miss(schema_id)),
         from_federation_source: None,
     })
     .into()

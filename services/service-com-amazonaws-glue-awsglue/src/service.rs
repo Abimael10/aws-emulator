@@ -718,6 +718,103 @@ fn as_modelled_member(path: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// The members the SCHEMA REGISTRY holds to its own bounds, in its own error
+// ---------------------------------------------------------------------------
+//
+// The same layering again, over the members the schema registry judges itself. The
+// recordings show the registry answering a value outside one of these members' modelled
+// bounds in the operation's own `InvalidInputException` — the error class its API models and
+// a Glue client matches — and not in the cross-service `ValidationException`, which none of
+// these operations declares. Each sentence is the registry's own
+// (`crate::state::messages`), and every other violation of their inputs keeps the constraint
+// envelope.
+
+/// The schema-registry LISTINGS whose `MaxResults` the registry holds to its own range: the
+/// three operations whose `MaxResults` targets `MaxResultsNumber`
+/// (`smithy_query(query="operation",operation="ListRegistries,ListSchemas,ListSchemaVersions")`).
+///
+/// `QuerySchemaVersionMetadata` is NOT one of them: its `MaxResults` targets a different
+/// shape with a different range (`QuerySchemaVersionMetadataMaxResults`, range 1..50), and no
+/// recording words that member's refusal, so it keeps the boundary's envelope.
+const SCHEMA_REGISTRY_LISTINGS: [&str; 3] = ["ListRegistries", "ListSchemas", "ListSchemaVersions"];
+
+/// The member path a page size is refused at, as the framework's walk spells it.
+const MAX_RESULTS_PATH: &str = "maxResults";
+
+/// The bounds `MaxResultsNumber` declares (`@range(min: 1, max: 100)`), which the sentence
+/// [`SCHEMA_REGISTRY_LISTINGS`] refuse a page size with states.
+const MAX_RESULTS_MINIMUM: i64 = 1;
+const MAX_RESULTS_MAXIMUM: i64 = 100;
+
+/// The operations whose `SchemaDefinition` the registry holds to the `@length` its modelled
+/// type declares: the three whose member targets `SchemaDefinitionString` (length 1..170000)
+/// — `smithy_query(query="operation",operation="CreateSchema,RegisterSchemaVersion,CheckSchemaVersionValidity")`.
+const SCHEMA_DEFINITION_OPERATIONS: [&str; 3] = [
+    "CheckSchemaVersionValidity",
+    "CreateSchema",
+    "RegisterSchemaVersion",
+];
+
+/// The member path a `SchemaDefinition` is refused at, as the framework's walk spells it —
+/// which is also the PARAMETER the registry's sentence names it by.
+const SCHEMA_DEFINITION_PATH: &str = "schemaDefinition";
+
+/// The registry's own sentence for `violations`, or `None` when it words none of them — which
+/// keeps the constraint validator's envelope.
+///
+/// Every violation of the set has to be one this function words, so a request that ALSO broke
+/// a constraint the validator answers keeps that envelope rather than losing the clause to
+/// this sentence; the first one states the refusal, as a service that checks its members one
+/// at a time states it. A `@pattern` violation is none of these: what the registry words here
+/// is the BOUND a member's value was outside of.
+fn schema_registry_bound_message(operation: &str, violations: &[Violation]) -> Option<String> {
+    if violations.is_empty()
+        || !violations
+            .iter()
+            .all(|violation| outside_a_registry_bound(operation, violation))
+    {
+        return None;
+    }
+    violations
+        .iter()
+        .find_map(|violation| registry_bound_message(operation, violation))
+}
+
+/// Whether the registry words this violation itself ([`registry_bound_message`]).
+fn outside_a_registry_bound(operation: &str, violation: &Violation) -> bool {
+    registry_bound_message(operation, violation).is_some()
+}
+
+/// The registry's sentence for the ONE violation `violation` of `operation`, or `None` when
+/// the registry states no bound of its own for that member and class.
+fn registry_bound_message(operation: &str, violation: &Violation) -> Option<String> {
+    match (violation.path.as_str(), &violation.kind) {
+        // A page size outside the range the member's modelled type declares, stated with the
+        // bounds and the value the request sent.
+        (
+            MAX_RESULTS_PATH,
+            ViolationKind::MinValue(_) | ViolationKind::MaxValue(_),
+        ) if SCHEMA_REGISTRY_LISTINGS.contains(&operation) => {
+            Some(crate::state::messages::max_results_outside_range(
+                MAX_RESULTS_MAXIMUM,
+                MAX_RESULTS_MINIMUM,
+                violation.value.as_deref().unwrap_or_default(),
+            ))
+        }
+        // A schema definition outside the length the member's modelled type declares. The
+        // sentence names the parameter and withholds the value, which for this member is a
+        // document of up to the modelled maximum.
+        (
+            SCHEMA_DEFINITION_PATH,
+            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_),
+        ) if SCHEMA_DEFINITION_OPERATIONS.contains(&operation) => Some(
+            crate::state::messages::parameter_length_outside_range(SCHEMA_DEFINITION_PATH),
+        ),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The refusal the framework boundary would answer instead
 // ---------------------------------------------------------------------------
 //
@@ -796,6 +893,22 @@ fn glue_input_validation_table<Eng: Send + Sync + 'static>(
     // ([`in_floating_point_form`]), which the refusal seam cannot do.
     register_input_validation::<
         crate::ops::update_column_statistics_task_settings::UpdateColumnStatisticsTaskSettings<Eng>,
+    >(&mut refusals);
+    // The SCHEMA REGISTRY operations whose own bounds it states itself
+    // ([`schema_registry_bound_message`]): the three listings holding a page size to the
+    // range its modelled type declares, and the three operations holding a `SchemaDefinition`
+    // to that member's modelled length.
+    register_input_validation::<crate::ops::list_registries::ListRegistries<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::list_schemas::ListSchemas<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::list_schema_versions::ListSchemaVersions<Eng>>(
+        &mut refusals,
+    );
+    register_input_validation::<crate::ops::create_schema::CreateSchema<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::register_schema_version::RegisterSchemaVersion<Eng>>(
+        &mut refusals,
+    );
+    register_input_validation::<
+        crate::ops::check_schema_version_validity::CheckSchemaVersionValidity<Eng>,
     >(&mut refusals);
     refusals
 }
@@ -1013,11 +1126,14 @@ enum StatedRefusal {
 ///
 /// The one place the two layers are chosen between, so a wrapped operation cannot word one
 /// of them differently from another: Glue's own requirement sentence when the request
-/// supplied no value for a member Glue states one for, else the constraint envelope; and,
+/// supplied no value for a member Glue states one for, then the schema registry's own
+/// sentence for a member whose value is outside the bound that registry states itself
+/// ([`schema_registry_bound_message`]), else the constraint envelope; and,
 /// for an operation that reports every refusal of its input as its own error
 /// ([`JSON_ENVELOPE_OPERATIONS`]), either of those inside that operation's JSON envelope.
 fn stated_refusal<Op: Operation>(violations: &[Violation]) -> Option<StatedRefusal> {
-    let own = supplies_no_value_message(Op::NAME, violations);
+    let own = supplies_no_value_message(Op::NAME, violations)
+        .or_else(|| schema_registry_bound_message(Op::NAME, violations));
     if JSON_ENVELOPE_OPERATIONS.contains(&Op::NAME) {
         let text = match own {
             Some(sentence) => sentence,

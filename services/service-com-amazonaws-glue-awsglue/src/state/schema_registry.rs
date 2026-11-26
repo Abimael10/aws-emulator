@@ -401,6 +401,22 @@ pub fn schema_reference(
     }
 }
 
+/// The refusal a lookup earns where the `SchemaId` resolves to a schema set this endpoint
+/// holds none of, stated with the ADDRESS the request asked for
+/// ([`messages::schema_not_found_at`]).
+///
+/// The ONE rendering of that address, so two operations addressing a schema set the same way
+/// cannot disagree about how the miss reads. Every part is read off the request, which is
+/// what makes the sentence reproducible: the caller sees the reference it sent, member for
+/// member.
+pub fn schema_miss(schema_id: &SchemaId) -> String {
+    messages::schema_not_found_at(
+        non_empty(schema_id.registry_name.as_deref()),
+        non_empty(schema_id.schema_name.as_deref()),
+        non_empty(schema_id.schema_arn.as_deref()),
+    )
+}
+
 /// The refusal a version read earns where the `SchemaId` resolved a schema set this endpoint
 /// holds but the `SchemaVersionNumber` names no version of it: the recorded sentence plus the
 /// ADDRESS the request asked for ([`messages::schema_version_not_found`]).
@@ -501,9 +517,10 @@ pub struct SchemaEntry {
     /// `SchemaStatus`: [`SCHEMA_STATUS_AVAILABLE`] for every schema set this store holds.
     pub status: String,
     /// `SchemaCheckpoint`, "the version number of the checkpoint (the last time the
-    /// compatibility mode was changed)": the version in force when the mode was last set,
-    /// which at create is the version the create registered — or [`NO_SCHEMA_VERSION`] when
-    /// it registered none.
+    /// compatibility mode was changed)": the version the mode was last set at, which at
+    /// create is the version the create registered — or [`NO_SCHEMA_VERSION`] when it
+    /// registered none — and which an `UpdateSchema` naming a `SchemaVersionNumber` moves to
+    /// that version ([`crate::ops::update_schema`]).
     pub checkpoint: i64,
     /// When the schema set was created, reported as `CreatedTime`.
     pub created_time: SystemTime,

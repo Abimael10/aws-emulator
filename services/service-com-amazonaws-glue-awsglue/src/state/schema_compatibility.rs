@@ -18,7 +18,10 @@
 //! One comparison — can a reader using schema R read data written with schema W? — is a
 //! question about the DATA FORMAT the definitions are written in, answered by that format's
 //! own schema-resolution rules rather than by comparing text. For `AVRO` those rules are
-//! Avro's own, as the `apache-avro` crate implements them.
+//! Avro's own, as the `apache-avro` crate implements them; for `JSON` they are JSON Schema
+//! containment ([`super::schema_compatibility_json`]); for `PROTOBUF` they are the protobuf
+//! language's own field rules over the parsed descriptor
+//! ([`super::schema_compatibility_protobuf`]).
 
 use super::*;
 
@@ -36,16 +39,18 @@ pub const SCHEMA_VERSION_STATUS_FAILURE: &str = "FAILURE";
 pub const DATA_FORMAT_AVRO: &str = "AVRO";
 
 /// The other modelled `DataFormat` whose schema documents are written AS JSON, so a
-/// definition submitted for it is READ as JSON ([`schema_definition_fault`]) even though
-/// what a document of it says about a schema is not decided here.
+/// definition submitted for it is READ as JSON ([`schema_definition_fault`]) and what a
+/// document of it says about a schema's evolution is decided by JSON Schema containment
+/// ([`super::schema_compatibility_json`]).
 ///
 /// Source: `smithy_query shape=DataFormat` (AVRO | JSON | PROTOBUF).
 pub const DATA_FORMAT_JSON: &str = "JSON";
 
 /// The third modelled `DataFormat`, whose schema documents are the source text of a
 /// `.proto` file, so a definition submitted for it is READ as protobuf source
-/// ([`schema_definition_fault`]) — while what a document of it says about a schema's
-/// evolution is not decided here.
+/// ([`schema_definition_fault`]) and what a document of it says about a schema's evolution is
+/// decided by the protobuf language's own field rules
+/// ([`super::schema_compatibility_protobuf`]).
 ///
 /// Source: `smithy_query shape=DataFormat` (AVRO | JSON | PROTOBUF).
 pub const DATA_FORMAT_PROTOBUF: &str = "PROTOBUF";
@@ -274,6 +279,12 @@ pub fn schema_definition_fault(data_format: &str, definition: &str) -> Option<St
 enum ParsedDefinition {
     /// An Avro schema document, as `apache-avro` reads one.
     Avro(::apache_avro::Schema),
+    /// A JSON Schema document, as the JSON reader reads one — compared by containment
+    /// ([`super::json_reader_cannot_read`]).
+    Json(::serde_json::Value),
+    /// A protobuf schema document, as its parser compiles one
+    /// ([`super::protobuf_definition`]).
+    Protobuf(super::ProtobufDefinition),
 }
 
 /// `definition` parsed as `data_format`, or `None` when the pair supports no comparison:
@@ -284,6 +295,12 @@ fn parsed_definition(data_format: &str, definition: &str) -> Option<ParsedDefini
         DATA_FORMAT_AVRO => ::apache_avro::Schema::parse_str(definition)
             .ok()
             .map(ParsedDefinition::Avro),
+        DATA_FORMAT_JSON => ::serde_json::from_str(definition)
+            .ok()
+            .map(ParsedDefinition::Json),
+        DATA_FORMAT_PROTOBUF => {
+            super::protobuf_definition(definition).map(ParsedDefinition::Protobuf)
+        }
         _ => None,
     }
 }
@@ -299,5 +316,22 @@ fn can_read(writers: &ParsedDefinition, readers: &ParsedDefinition) -> Result<()
             ::apache_avro::schema_compatibility::SchemaCompatibility::can_read(writers, readers)
                 .map_err(|error| error.to_string())
         }
+        (ParsedDefinition::Json(writers), ParsedDefinition::Json(readers)) => {
+            match super::json_reader_cannot_read(writers, readers) {
+                Some(difference) => Err(difference),
+                None => Ok(()),
+            }
+        }
+        (ParsedDefinition::Protobuf(writers), ParsedDefinition::Protobuf(readers)) => {
+            match super::protobuf_reader_cannot_read(writers, readers) {
+                Some(difference) => Err(difference),
+                None => Ok(()),
+            }
+        }
+        // Both definitions of one comparison are read as the ONE `DataFormat` recorded on the
+        // schema set they belong to ([`SchemaEntry::compatibility_failure`]), so a pair read
+        // as two different formats cannot arise; it is no failure of the definition being
+        // registered, so it is not reported as one.
+        _ => Ok(()),
     }
 }

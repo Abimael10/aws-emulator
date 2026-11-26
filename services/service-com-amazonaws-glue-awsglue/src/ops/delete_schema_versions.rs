@@ -12,10 +12,11 @@
 //! `InvalidInputException` naming the parameter, the error class a Glue client matches, and
 //! never with the cross-service `ValidationException` this operation does not model.
 //!
-//! Two documented prohibitions refuse the WHOLE request, with nothing deleted: a span that
-//! contains the schema set's check-pointed version ("you have to remove the checkpoint first
-//! using the DeleteSchemaCheckpoint API"), and one that names the schema set's first version
-//! ("the first schema version can only be deleted by the DeleteSchema API"). A named version
+//! Two documented prohibitions refuse the WHOLE request with this operation's modelled
+//! `InvalidInputException` and nothing deleted: a span that contains the schema set's
+//! check-pointed version ("you have to remove the checkpoint first using the
+//! DeleteSchemaCheckpoint API"), and one that names the schema set's first version ("the
+//! first schema version can only be deleted by the DeleteSchema API"). A named version
 //! the schema set does not hold is not an error: it is already absent, so the delete is
 //! idempotent over it.
 //!
@@ -215,20 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "When the range of version numbers contain check pointed version, the API will
         // … not proceed with the deletion. You have to remove the checkpoint first using
         // the DeleteSchemaCheckpoint API before using this API." So the whole request is
-        // refused and nothing is deleted.
+        // refused and nothing is deleted, in the operation's own input error: the span the
+        // request named is one this operation will not act on.
         let checkpoint = schema.checkpoint;
         if checkpoint != crate::state::NO_SCHEMA_VERSION && (lowest..=highest).contains(&checkpoint)
         {
-            return Err(
-                DeleteSchemaVersionsErrorModeled::ConcurrentModificationException(
-                    ConcurrentModificationException {
-                        message: Some(crate::state::messages::schema_version_is_checkpointed(
-                            checkpoint,
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(invalid_input(
+                crate::state::messages::CHECKPOINT_VERSION_NOT_DELETABLE.to_string(),
+            ));
         }
 
         // "You cannot use the DeleteSchemaVersions API to delete the first schema version

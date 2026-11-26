@@ -12,10 +12,12 @@
 //!    `RegistryId` addressed it by — and a `RegistryId` naming a registry this account holds
 //!    none of is the modelled miss (`EntityNotFoundException`, HTTP 400).
 //! 2. An update of a schema set writes the members it carries — the new `Compatibility`, the
-//!    new `Description` — onto the stored schema set, so every later read reports them; an
-//!    update that names neither a `Compatibility` nor a `SchemaVersionNumber` asks for
-//!    nothing and is refused, and a version number naming a version the set does not hold is
-//!    refused as well.
+//!    new `Description` — onto the stored schema set, so every later read reports them, and
+//!    CHECK-POINTS the set at the `SchemaVersionNumber` it names; an update that names neither
+//!    a `Compatibility` nor a `SchemaVersionNumber` asks for nothing and is refused, a version
+//!    number naming a version the set does not hold is refused as well, and a `Compatibility`
+//!    change is refused unless it names the version to check-point it at and asks for a mode
+//!    the set does not already carry.
 //! 3. A version NUMBER is assigned once and never reused: `LatestSchemaVersion` is the number
 //!    the last registration took and `NextSchemaVersion` is one past it, so deleting versions
 //!    frees neither their numbers nor the numbers above them.
@@ -253,6 +255,10 @@ async fn an_update_of_an_absent_registry_is_the_modelled_miss() {
 
 /// An update of a schema set is what every later read of it reports: the new compatibility
 /// mode and the new description, for every value the modelled enum admits.
+///
+/// Each update names the `SchemaVersionNumber` its mode change is check-pointed at, which is
+/// what the service requires of a compatibility change ("Version number required for check
+/// pointing").
 #[tokio::test]
 async fn an_update_of_a_schema_set_is_what_a_later_read_reports() {
     for (index, compatibility) in COMPATIBILITY_VALUES.into_iter().enumerate() {
@@ -274,6 +280,7 @@ async fn an_update_of_a_schema_set_is_what_a_later_read_reports() {
             "UpdateSchema",
             &json!({
                 "SchemaId": { "SchemaName": schema },
+                "SchemaVersionNumber": { "VersionNumber": 1 },
                 "Compatibility": compatibility,
                 "Description": description,
             }),
@@ -363,30 +370,40 @@ async fn an_update_a_schema_set_cannot_act_on_is_refused() {
     }
 }
 
-/// The `SchemaCheckpoint` a schema set carries is the version in force when its definition
-/// was registered: an update validates the version number it names against the versions the
-/// set holds and leaves that checkpoint where it was, which a later read reports and which
-/// the delete of a version then refuses to remove.
+/// The `SchemaCheckpoint` a schema set carries MOVES to the version an update names: the
+/// update validates that number against the versions the set holds, writes it as the
+/// checkpoint, and a later read reports it — which is also the version the delete of a
+/// version then refuses to remove.
 ///
-/// RECORDED behaviour: the recorded read of a schema set whose compatibility and description
-/// this operation updated reports the checkpoint its CREATE set, and replaying that fixture
-/// with the named version written through diverges on `$.SchemaCheckpoint`.
+/// RECORDED behaviour: `UpdateSchema(SchemaId, SchemaVersionNumber={VersionNumber: n})`
+/// check-points the schema set at `n`, `GetSchema` then reports `SchemaCheckpoint = n`, and
+/// `DeleteSchemaVersions` refuses that version with `InvalidInputException` while a
+/// non-checkpoint version deletes with no `SchemaVersionErrors`.
 ///
 /// The rows differ along how the version is named — "the latest version available for the
-/// schema" and an explicit version number — and along whether the update names one at all.
+/// schema" and an explicit version number — and along which version of the set that is.
 #[tokio::test]
-async fn an_update_validates_its_version_number_and_keeps_the_checkpoint() {
-    // (case, the SchemaVersionNumber the update names)
-    let rows: Vec<(&str, Option<Value>)> = vec![
+async fn an_update_moves_the_checkpoint_to_the_version_it_names() {
+    // (case, the SchemaVersionNumber the update names, the checkpoint it moves to)
+    let rows: Vec<(&str, Value, i64)> = vec![
         (
             "the latest version available for the schema",
-            Some(json!({ "LatestVersion": true })),
+            json!({ "LatestVersion": true }),
+            3,
         ),
-        ("an explicit version number", Some(json!({ "VersionNumber": 2 }))),
-        ("no version number at all", None),
+        (
+            "an explicit version number",
+            json!({ "VersionNumber": 2 }),
+            2,
+        ),
+        (
+            "the version the create registered",
+            json!({ "VersionNumber": 1 }),
+            1,
+        ),
     ];
 
-    for (index, (case, named)) in rows.into_iter().enumerate() {
+    for (index, (case, named, moved_to)) in rows.into_iter().enumerate() {
         let router = emulator();
         let schema = format!("checkpointed-schema-{index}");
         // `NONE` accepts any further version without a compatibility check, so the rows vary
@@ -412,25 +429,27 @@ async fn an_update_validates_its_version_number_and_keeps_the_checkpoint() {
             "case {case}: the create check-pointed the version it registered, got {before}"
         );
 
-        let mut body = json!({
-            "SchemaId": { "SchemaName": schema },
-            "Compatibility": "FULL",
-        });
-        if let Some(named) = named {
-            body["SchemaVersionNumber"] = named;
-        }
-        ok(&router, "UpdateSchema", &body).await;
+        ok(
+            &router,
+            "UpdateSchema",
+            &json!({
+                "SchemaId": { "SchemaName": schema },
+                "SchemaVersionNumber": named,
+            }),
+        )
+        .await;
 
         let read = schema_read(&router, &schema).await;
         assert_eq!(
             read["SchemaCheckpoint"],
-            json!(created_checkpoint),
-            "case {case}: the update leaves the checkpoint where the create set it, got {read}"
+            json!(moved_to),
+            "case {case}: the update check-points the set at the version it named, got {read}"
         );
+        // Two reads report the same thing, so the read serves what the update stored.
+        let again = schema_read(&router, &schema).await;
         assert_eq!(
-            read.get("Compatibility").and_then(Value::as_str),
-            Some("FULL"),
-            "case {case}: the update still wrote the mode it carried, got {read}"
+            again["SchemaCheckpoint"], read["SchemaCheckpoint"],
+            "case {case}: two reads of an updated schema set must agree, got {again}"
         );
 
         // "When the range of version numbers contain check pointed version, the API will …
@@ -442,7 +461,7 @@ async fn an_update_validates_its_version_number_and_keeps_the_checkpoint() {
             "DeleteSchemaVersions",
             &json!({
                 "SchemaId": { "SchemaName": schema },
-                "Versions": created_checkpoint.to_string(),
+                "Versions": moved_to.to_string(),
             }),
         )
         .await;
@@ -452,9 +471,113 @@ async fn an_update_validates_its_version_number_and_keeps_the_checkpoint() {
              {refused}"
         );
         assert!(
-            error_code(&refused).contains("ConcurrentModificationException"),
-            "case {case}: expected ConcurrentModificationException, got {refused}"
+            error_code(&refused).contains("InvalidInputException"),
+            "case {case}: expected InvalidInputException, got {refused}"
         );
+        assert_eq!(
+            error_message(&refused),
+            messages::CHECKPOINT_VERSION_NOT_DELETABLE,
+            "case {case}: expected the refusal's own wording, got {refused}"
+        );
+    }
+}
+
+/// A `Compatibility` change is gated on the checkpoint it would be recorded at: a change
+/// carrying no `SchemaVersionNumber` is refused, a change to the mode the schema set already
+/// carries is refused, and each refusal leaves the stored schema set exactly as it was.
+///
+/// The rows differ along which gate the request trips and which mode it asks for — every
+/// value the modelled enum admits is driven through the no-op gate, and a change away from
+/// the stored mode through the checkpoint gate.
+#[tokio::test]
+async fn a_compatibility_change_is_refused_without_a_checkpoint_to_record_it_at() {
+    // (case, the mode the set was created under, the mode the update asks for, the Message)
+    let mut rows: Vec<(String, &str, &str, &str)> = vec![
+        (
+            "a change with no version number to check-point it at".to_string(),
+            "BACKWARD",
+            "FORWARD",
+            messages::SCHEMA_VERSION_CHECKPOINT_MISSING,
+        ),
+        (
+            "a change to another mode, with no version number".to_string(),
+            "NONE",
+            "FULL_ALL",
+            messages::SCHEMA_VERSION_CHECKPOINT_MISSING,
+        ),
+    ];
+    // Every value the modelled enum admits is a no-op against a set already carrying it.
+    for mode in COMPATIBILITY_VALUES {
+        rows.push((
+            format!("the mode the schema set already carries ({mode})"),
+            mode,
+            mode,
+            messages::COMPATIBILITY_ALREADY_SET,
+        ));
+    }
+
+    for (index, (case, created_under, asked, expected)) in rows.into_iter().enumerate() {
+        let router = emulator();
+        let schema = format!("gated-schema-{index}");
+        given_schema(&router, &schema, created_under).await;
+
+        let (status, refused) = call(
+            &router,
+            "UpdateSchema",
+            &json!({
+                "SchemaId": { "SchemaName": schema },
+                "Compatibility": asked,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected 400, got {status} with {refused}"
+        );
+        assert!(
+            error_code(&refused).contains("InvalidInputException"),
+            "case {case}: expected InvalidInputException, got {refused}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            expected,
+            "case {case}: expected the gate's own wording, got {refused}"
+        );
+
+        // The refused update wrote nothing: the set still reports the mode its create
+        // recorded, and the checkpoint that create set.
+        let read = schema_read(&router, &schema).await;
+        assert_eq!(
+            read.get("Compatibility").and_then(Value::as_str),
+            Some(created_under),
+            "case {case}: a refused change must leave the mode as it was, got {read}"
+        );
+        assert_eq!(
+            read["SchemaCheckpoint"],
+            json!(1),
+            "case {case}: a refused change must leave the checkpoint where it was, got {read}"
+        );
+
+        // The same change, naming the version it is check-pointed at, is the one the service
+        // takes — so what the gate refuses is the missing checkpoint and not the change.
+        if expected == messages::SCHEMA_VERSION_CHECKPOINT_MISSING {
+            ok(
+                &router,
+                "UpdateSchema",
+                &json!({
+                    "SchemaId": { "SchemaName": schema },
+                    "Compatibility": asked,
+                    "SchemaVersionNumber": { "VersionNumber": 1 },
+                }),
+            )
+            .await;
+            let read = schema_read(&router, &schema).await;
+            assert_eq!(
+                read.get("Compatibility").and_then(Value::as_str),
+                Some(asked),
+                "case {case}: the check-pointed change must be written, got {read}"
+            );
+        }
     }
 }
 

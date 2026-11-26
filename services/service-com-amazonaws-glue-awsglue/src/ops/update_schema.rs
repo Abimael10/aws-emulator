@@ -4,14 +4,22 @@
 //!
 //! Writes what this request asks to change onto the stored schema set
 //! ([`crate::state::SchemaEntry`]) the `SchemaId` names — its `Compatibility` and its
-//! `Description` — so `GetSchema` serves the new settings afterwards, and validates the
-//! `SchemaVersionNumber` a request names against the versions the set holds. The stored
-//! `SchemaCheckpoint` is left where the create set it: the recorded read of a schema set this
-//! operation updated reports that value, and writing the named version through makes the
-//! recorded `$.SchemaCheckpoint` diverge. "For updating the compatibility setting, the call
-//! will not validate compatibility for the entire set of schema versions with the new
-//! compatibility setting", so the versions already registered are left exactly as they are
-//! and only registrations made AFTER this update are checked against the new mode.
+//! `Description` — so `GetSchema` serves the new settings afterwards, and CHECK-POINTS the
+//! schema set at the `SchemaVersionNumber` the request names: the stored `SchemaCheckpoint`
+//! becomes that version, which is what `GetSchema` then reports and what
+//! `DeleteSchemaVersions` then refuses to delete. A number naming a version the set does not
+//! hold is refused and nothing is written.
+//!
+//! A `Compatibility` change is gated on that checkpoint: "Version number required for check
+//! pointing", so a change submitted with NO `SchemaVersionNumber` is refused with
+//! `InvalidInputException` ([`crate::state::messages::SCHEMA_VERSION_CHECKPOINT_MISSING`]),
+//! and so is a change to the mode the schema set already has
+//! ([`crate::state::messages::COMPATIBILITY_ALREADY_SET`]) — the checkpoint records "the last
+//! time the compatibility mode was changed", and neither of those is a change to record.
+//! "For updating the compatibility setting, the call will not validate compatibility for the
+//! entire set of schema versions with the new compatibility setting", so the versions already
+//! registered are left exactly as they are and only registrations made AFTER this update are
+//! checked against the new mode.
 //!
 //! ## Shape of an operation
 //!
@@ -199,11 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If the value for the VersionNumber (checkpoint) is provided, Compatibility is
         // optional, and this can be used to set/reset a checkpoint for the schema": one of
         // the two has to say what the update is of, so a request carrying neither asks for
-        // nothing and is refused rather than answered with an unchanged schema set. A
-        // request that names a `Compatibility` and NO version number is admitted: the
-        // recorded answer of a schema set whose compatibility and description were updated
-        // reports the checkpoint its CREATE set, so such an update is one the service takes
-        // and the checkpoint is left where it was.
+        // nothing and is refused rather than answered with an unchanged schema set.
         if input.compatibility.is_none() && input.schema_version_number.is_none() {
             return Err(invalid_input(
                 crate::state::SCHEMA_UPDATE_REQUIRES_ONE.to_string(),
@@ -216,41 +220,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(schema_not_found());
         };
 
+        // A `Compatibility` change is what the checkpoint RECORDS — `SchemaCheckpoint` is
+        // "the version number of the checkpoint (the last time the compatibility mode was
+        // changed)" — so the two refusals such a change can earn are answered before anything
+        // is written: a mode the schema set already carries is no change to record, and a
+        // change that names no version to record it at cannot be check-pointed ("Version
+        // number required for check pointing").
+        if let Some(asked) = input.compatibility.as_ref() {
+            if *asked == schema.compatibility {
+                return Err(invalid_input(
+                    crate::state::messages::COMPATIBILITY_ALREADY_SET.to_string(),
+                ));
+            }
+            if input.schema_version_number.is_none() {
+                return Err(invalid_input(
+                    crate::state::messages::SCHEMA_VERSION_CHECKPOINT_MISSING.to_string(),
+                ));
+            }
+        }
+
         // "Version number required for check pointing", and "the API will validate the
         // checkpoint version number for consistency": the version a request NAMES — "the
         // latest version available for the schema" or "the version number of the schema",
         // exactly one of the two, as every other read of that wrapper resolves it — has to be
         // a version this schema set holds, so a number naming one it does not is refused and
-        // nothing is written.
-        //
-        // The stored `SchemaCheckpoint` is NOT moved by an update, whether or not one names a
-        // version. That is RECORDED behaviour rather than a gap: the recorded read of a schema
-        // set whose compatibility and description this operation updated reports the
-        // checkpoint its CREATE set, and replaying that fixture with the named version written
-        // through diverges on `$.SchemaCheckpoint` — so what the service does with the number
-        // here is validate it, and the checkpoint a schema set carries is the version in force
-        // when its definition was registered.
-        if let Some(named) = input.schema_version_number.as_ref() {
-            let held = match (named.latest_version, named.version_number) {
-                (true, None) => schema.latest_version().map(|version| version.version_number),
-                (false, Some(number)) => {
-                    schema.version(number).map(|version| version.version_number)
-                }
-                _ => {
-                    return Err(invalid_input(
-                        crate::state::SCHEMA_VERSION_NUMBER_REQUIRES_ONE.to_string(),
-                    ))
-                }
-            };
-            if held.is_none() {
-                return Err(version_not_found());
+        // nothing is written. The version it resolves to is the set's new `SchemaCheckpoint`:
+        // "this can be used to set/reset a checkpoint for the schema".
+        let checkpoint = match input.schema_version_number.as_ref() {
+            Some(named) => {
+                let held = match (named.latest_version, named.version_number) {
+                    (true, None) => {
+                        schema.latest_version().map(|version| version.version_number)
+                    }
+                    (false, Some(number)) => {
+                        schema.version(number).map(|version| version.version_number)
+                    }
+                    _ => {
+                        return Err(invalid_input(
+                            crate::state::SCHEMA_VERSION_NUMBER_REQUIRES_ONE.to_string(),
+                        ))
+                    }
+                };
+                let Some(held) = held else {
+                    return Err(version_not_found());
+                };
+                Some(held)
             }
-        }
+            None => None,
+        };
 
         // Every member the request CARRIES is written and every member it OMITS is left
         // alone: "If description is not provided, this field will not be updated" is the
         // rule the whole wrapper follows. `UpdatedTime` moves with the write, because the
         // schema set itself has changed.
+        if let Some(checkpoint) = checkpoint {
+            schema.checkpoint = checkpoint;
+        }
         if let Some(compatibility) = input.compatibility.as_ref() {
             schema.compatibility = compatibility.clone();
         }

@@ -293,20 +293,56 @@ pub fn parameter_value_not_valid(parameter: &str) -> String {
     )
 }
 
+/// Any schema-registry operation refusing a member whose value is outside the `@length`
+/// its modelled type declares — the `SchemaDefinition` of a schema create, a version
+/// registration or a validity check, which targets `SchemaDefinitionString` (length
+/// 1..170000).
+///
+/// RECORDED template: the fixed sentence plus ONE variable part, the PARAMETER the registry
+/// names the member by. It states both ends of the bound at once, so a value past the
+/// maximum and one short of the minimum read alike, and it echoes back nothing of the value
+/// the request sent — which for this member is a document of up to 170000 characters.
+pub fn parameter_length_outside_range(parameter: &str) -> String {
+    format!("The resource name contains too many or too few characters. Parameter Name: {parameter}")
+}
+
+/// A schema-registry LISTING whose `MaxResults` is outside the `@range` its modelled type
+/// declares (`MaxResultsNumber`, range 1..100).
+///
+/// RECORDED template: the fixed sentence plus three variable parts — the maximum the member
+/// admits, the value nothing at or below which is served (one below the minimum, which is
+/// how the registry states the lower end), and the `MaxResults` the request sent.
+pub fn max_results_outside_range(maximum: i64, minimum: i64, requested: &str) -> String {
+    format!(
+        "MaxResults cannot be greater than {maximum} (or) less than or equal to {}. \
+         MaxResults: {requested}",
+        minimum.saturating_sub(1)
+    )
+}
+
 /// `DeleteSchemaVersions` whose `Versions` names the schema set's check-pointed
 /// version. Stated by the operation: "When the range of version numbers contain check
 /// pointed version, the API will … not proceed with the deletion. You have to remove
 /// the checkpoint first using the DeleteSchemaCheckpoint API before using this API."
 ///
-/// NOT recorded: what is pinned is the behaviour — the operation's modelled
-/// `ConcurrentModificationException`, with nothing deleted — and a sentence stating that
-/// documented requirement, carrying the check-pointed version the request collided with.
-pub fn schema_version_is_checkpointed(version_number: i64) -> String {
-    format!(
-        "Schema version {version_number} is the checkpoint of this schema and cannot be \
-             deleted. Remove the checkpoint with DeleteSchemaCheckpoint first."
-    )
-}
+/// RECORDED constant, and the whole message: the refusal states the collision in fixed
+/// words and echoes back neither the check-pointed version nor the span the request named.
+pub const CHECKPOINT_VERSION_NOT_DELETABLE: &str = "Cannot delete checkpoint version.";
+
+/// `UpdateSchema` that asks for a new `Compatibility` without naming the
+/// `SchemaVersionNumber` the new mode is check-pointed at. Stated by the operation:
+/// "Version number required for check pointing".
+///
+/// RECORDED constant, and the whole message: it names neither the schema set nor the mode
+/// the request asked for.
+pub const SCHEMA_VERSION_CHECKPOINT_MISSING: &str = "Schema version checkpoint is missing.";
+
+/// `UpdateSchema` that asks for the `Compatibility` the schema set already has: a
+/// compatibility update records "the last time the compatibility mode was changed"
+/// (`SchemaCheckpoint`), so a mode that is not a change is nothing to check-point.
+///
+/// RECORDED constant, and the whole message: it names neither the schema set nor the mode.
+pub const COMPATIBILITY_ALREADY_SET: &str = "Cannot update to the same compatibility setting.";
 
 /// `DeleteSchemaVersions` whose `Versions` names the first version of the schema set.
 /// Stated by the operation: "You cannot use the DeleteSchemaVersions API to delete the
@@ -1762,6 +1798,31 @@ pub const UNSUPPORTED_SOURCE_TABLE_PROPERTIES: &str =
 /// was addressed in — the same shape as the recorded `GetTable` miss. Shared by every
 /// schema lookup, so one operation's miss cannot drift from another's.
 pub const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
+
+/// A schema-registry operation whose `SchemaId` resolves to a schema set this endpoint
+/// holds none of, stated with the ADDRESS the request looked it up by
+/// (`ListSchemaVersions`).
+///
+/// RECORDED template: the fixed sentence [`SCHEMA_NOT_FOUND`], then the three `SchemaId`
+/// members as the request sent them, label by label and in this order — so a caller holding
+/// several schema sets can tell which lookup missed. A member the request did not carry is
+/// spelled `null`; the labels, their order and their spelling are fixed text. The same
+/// address clause the version miss below carries, minus the two members a lookup that names
+/// no version has nothing to say about.
+pub fn schema_not_found_at(
+    registry_name: Option<&str>,
+    schema_name: Option<&str>,
+    schema_arn: Option<&str>,
+) -> String {
+    /// How a member the request did not carry is spelled in the labels below.
+    const ABSENT: &str = "null";
+    format!(
+        "{SCHEMA_NOT_FOUND} RegistryName: {}, SchemaName: {}, SchemaArn: {}",
+        registry_name.unwrap_or(ABSENT),
+        schema_name.unwrap_or(ABSENT),
+        schema_arn.unwrap_or(ABSENT)
+    )
+}
 
 /// A version read addressed by a `SchemaVersionId` no stored version carries
 /// (`GetSchemaVersion`).

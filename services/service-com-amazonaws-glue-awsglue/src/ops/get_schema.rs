@@ -7,7 +7,8 @@
 //! Reports the schema set its `SchemaId` names, read from
 //! [`crate::state::ComAmazonawsGlueAwsglueState::registries`] — so what `CreateSchema`
 //! persisted is what this reports, and a `SchemaId` naming nothing this endpoint holds is
-//! refused with `EntityNotFoundException`.
+//! refused with `EntityNotFoundException`, stating the ADDRESS the read looked the schema set
+//! up by ([`crate::state::schema_miss`]).
 //!
 //! A `SchemaId` addresses a schema set COMPLETELY or it addresses none: by the schema's
 //! own `SchemaArn`, or by its `RegistryName` and `SchemaName` together. A reference naming
@@ -210,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::Reference::Elsewhere(_) => {
                 return Err(GetSchemaErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+                        message: Some(crate::state::schema_miss(&input.schema_id)),
                         from_federation_source: None,
                     },
                 )
@@ -223,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a registry this endpoint holds none of is reported as the REGISTRY being absent
         // rather than as the schema being absent
         // ([`crate::state::ComAmazonawsGlueAwsglueState::schema_or_miss`]).
-        let schema = match store.schema_or_miss(&registry_name, &schema_name) {
+        let schema = match store.schema_or_miss(&registry_name, &schema_name, &input.schema_id) {
             Ok(schema) => schema,
             Err(message) => {
                 return Err(GetSchemaErrorModeled::EntityNotFoundException(

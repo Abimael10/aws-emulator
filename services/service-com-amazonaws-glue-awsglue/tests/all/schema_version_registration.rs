@@ -35,6 +35,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     DEFAULT_REGISTRY_NAME, FIRST_SCHEMA_VERSION, SCHEMA_VERSION_STATUS_AVAILABLE,
+    SCHEMA_VERSION_STATUS_FAILURE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -70,19 +71,27 @@ const PROTOBUF_EVOLVED: &str =
     "syntax = \"proto3\"; message User { string id = 1; string email = 2; }";
 
 /// Every `Compatibility` value the model admits, paired with the `DataFormat` the row's
-/// schema set is created in.
+/// schema set is created in and the `SchemaVersionStatus` the registration below settles at.
 ///
 /// Source: `smithy_query shape=Compatibility` (NONE | DISABLED | BACKWARD | BACKWARD_ALL |
 /// FORWARD | FORWARD_ALL | FULL | FULL_ALL) and `shape=DataFormat` (AVRO | JSON | PROTOBUF).
-const MODES: [(&str, &str); 8] = [
-    ("NONE", "AVRO"),
-    (DISABLED, "AVRO"),
-    ("BACKWARD", "AVRO"),
-    ("BACKWARD_ALL", "JSON"),
-    ("FORWARD", "JSON"),
-    ("FORWARD_ALL", "PROTOBUF"),
-    ("FULL", "PROTOBUF"),
-    ("FULL_ALL", "JSON"),
+///
+/// The STATUS is the verdict the row's evolution earns under its mode, which is a property of
+/// the pair of definitions and not of this suite: the Avro row adds an optional field with a
+/// default and the protobuf row adds a proto3 field, both of which every mode admits, while
+/// the JSON row adds a property to an OPEN content model, which a mode comparing BACKWARD
+/// does not admit (the whole verdict table is
+/// [`crate::schema_compatibility_content_models`]). What this suite is about is that the
+/// version is REGISTERED either way — minted, numbered, listed and readable.
+const MODES: [(&str, &str, &str); 8] = [
+    ("NONE", "AVRO", SCHEMA_VERSION_STATUS_AVAILABLE),
+    (DISABLED, "AVRO", SCHEMA_VERSION_STATUS_AVAILABLE),
+    ("BACKWARD", "AVRO", SCHEMA_VERSION_STATUS_AVAILABLE),
+    ("BACKWARD_ALL", "JSON", SCHEMA_VERSION_STATUS_FAILURE),
+    ("FORWARD", "JSON", SCHEMA_VERSION_STATUS_AVAILABLE),
+    ("FORWARD_ALL", "PROTOBUF", SCHEMA_VERSION_STATUS_AVAILABLE),
+    ("FULL", "PROTOBUF", SCHEMA_VERSION_STATUS_AVAILABLE),
+    ("FULL_ALL", "JSON", SCHEMA_VERSION_STATUS_FAILURE),
 ];
 
 /// The base definition and an evolution of it, in `data_format`.
@@ -186,7 +195,7 @@ fn listed_numbers(case: &str, listed: &[Value]) -> Vec<i64> {
 async fn compatibility_decides_whether_a_version_is_registered() {
     let router = emulator();
 
-    for (mode, data_format) in MODES {
+    for (mode, data_format, settles) in MODES {
         let case = format!("{mode}/{data_format}");
         let schema = format!("payments-{}", mode.to_lowercase());
         let (_, evolved) = definitions(data_format);
@@ -256,8 +265,8 @@ async fn compatibility_decides_whether_a_version_is_registered() {
         );
         assert_eq!(
             text(&case, &body, "Status"),
-            SCHEMA_VERSION_STATUS_AVAILABLE,
-            "case {case}: expected a registered version to be available, got {body}"
+            settles,
+            "case {case}: expected a registered version to settle {settles}, got {body}"
         );
 
         // The version is READ BACK through the id the registration minted: what was
@@ -291,7 +300,7 @@ async fn compatibility_decides_whether_a_version_is_registered() {
         );
         assert_eq!(
             text(&case, &read, "Status"),
-            SCHEMA_VERSION_STATUS_AVAILABLE,
+            settles,
             "case {case}: expected the stored status on the read, got {read}"
         );
         assert!(

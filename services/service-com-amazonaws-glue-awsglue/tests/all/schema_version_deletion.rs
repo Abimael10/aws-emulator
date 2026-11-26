@@ -54,6 +54,11 @@ const VERSIONS_NOT_VALID: &str =
 /// here so this suite pins the wording.
 const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
 
+/// The whole `Message` a span reaching the schema set's check-pointed version is refused
+/// with: fixed text naming neither the version nor the span. Written out here rather than
+/// read from the crate's own constant so this suite pins the wording.
+const CHECKPOINT_NOT_DELETABLE: &str = "Cannot delete checkpoint version.";
+
 /// An Avro record definition, which is what each seeded version carries.
 fn definition(version_number: i64) -> String {
     format!(
@@ -271,7 +276,8 @@ async fn a_versions_value_outside_the_form_is_the_services_own_input_error() {
 
 /// A span that reaches the schema set's check-pointed version refuses the WHOLE request and
 /// deletes nothing — "you have to remove the checkpoint first using the
-/// DeleteSchemaCheckpoint API before using this API".
+/// DeleteSchemaCheckpoint API before using this API" — with the operation's own
+/// `InvalidInputException` and the fixed sentence the service words that collision with.
 ///
 /// The rows differ along where the checkpoint sits relative to the span: at its low end, in
 /// its middle, at its high end, named alone, and outside it (which is served).
@@ -303,12 +309,13 @@ async fn a_span_containing_the_checkpoint_deletes_nothing() {
             "case {case:?}: expected the request to be refused, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("ConcurrentModificationException"),
-            "case {case:?}: expected ConcurrentModificationException, got {body}"
+            error_code(&body).contains("InvalidInputException"),
+            "case {case:?}: expected InvalidInputException, got {body}"
         );
-        assert!(
-            error_message(&body).contains(&checkpoint.to_string()),
-            "case {case:?}: expected the refusal to name the check-pointed version, got {:?}",
+        assert_eq!(
+            error_message(&body),
+            CHECKPOINT_NOT_DELETABLE,
+            "case {case:?}: expected Message {CHECKPOINT_NOT_DELETABLE:?}, got {:?}",
             error_message(&body)
         );
         let held = held_versions(&engine);

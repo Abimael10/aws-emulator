@@ -58,9 +58,16 @@ const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 const SCHEMA_ID_INCOMPLETE: &str =
     "At least one of (registryName and schemaName) or schemaArn has to be provided.";
 
-/// The whole `Message` the schema read answers for a registry that exists but holds no
-/// such schema set.
-const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
+/// The `Message` the schema read answers for a registry that exists but holds no such
+/// schema set: the fixed sentence plus the ADDRESS the read looked the set up by, label by
+/// label, a member the request did not carry spelled `null`. Written out here so this suite
+/// pins the wording.
+fn schema_not_found(registry_name: &str, schema_name: &str) -> String {
+    format!(
+        "Schema is not found. RegistryName: {registry_name}, SchemaName: {schema_name}, \
+         SchemaArn: null"
+    )
+}
 
 /// Names spanning the axis the fold generalises over: an all-lowercase name (already its
 /// own folded form), mixed case, upper case, mixed case carrying the digits and
@@ -639,7 +646,7 @@ async fn the_schema_read_requires_a_complete_reference_and_names_an_absent_regis
                 "SchemaId": { "RegistryName": "payments-registry", "SchemaName": schema },
             }),
             ENTITY_NOT_FOUND,
-            SCHEMA_NOT_FOUND,
+            &schema_not_found("payments-registry", schema),
         )
         .await;
     }
