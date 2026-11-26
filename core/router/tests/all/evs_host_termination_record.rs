@@ -58,6 +58,15 @@ const AMI: &str = "ami-0123456789abcdef0";
 /// asked: the bare metal type an Amazon EVS host runs on.
 const INSTANCE_TYPE: &str = "i4i.metal";
 
+/// The SSH key pair name the host is created with, the pair itself minted through Amazon
+/// EC2's own `CreateKeyPair` ([`ensure_key_pair`]).
+const KEY_NAME: &str = "evs-key";
+
+/// The `KeyType` that pair is minted as: the cheap member of Amazon EC2's modelled
+/// `KeyType` catalog, a host caring only that the ACCOUNT holds the pair its `keyName`
+/// names.
+const KEY_TYPE: &str = "ed25519";
+
 /// The VCF version the environment is created with, one the version catalogue offers.
 const VCF_VERSION: &str = "VCF-5.2.1";
 
@@ -391,6 +400,16 @@ async fn deployed_environment(
     vpc_id: &str,
     subnet_id: &str,
 ) -> String {
+    // The host added below names "the SSH key that is used to access the host", an Amazon
+    // EC2 key pair of the caller's own account that Amazon EVS does not create — so the
+    // account holds it, minted through Amazon EC2 itself.
+    ec2(
+        router,
+        case,
+        "CreateKeyPair",
+        &[("KeyName", KEY_NAME), ("KeyType", KEY_TYPE)],
+    )
+    .await;
     let created = evs(
         router,
         case,
@@ -450,7 +469,7 @@ async fn create_host(
             "environmentId": environment_id,
             "host": {
                 "hostName": host_name,
-                "keyName": "evs-key",
+                "keyName": KEY_NAME,
                 "instanceType": INSTANCE_TYPE,
             },
         }),

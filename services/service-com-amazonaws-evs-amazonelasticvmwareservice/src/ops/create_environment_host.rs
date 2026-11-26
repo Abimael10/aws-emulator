@@ -54,16 +54,18 @@
 //!    ([`crate::state::available_esx_versions`]) is what an asked-for version has to be
 //!    in. A VCF version that catalogue states no versions for leaves nothing to judge a
 //!    requested version against, so nothing is refused for it.
+//! 8. The SSH key pair the host is reached with exists in that same store: `keyName` is
+//!    "the name of the SSH key that is used to access the host" and a host supplies the
+//!    "EC2 SSH keypair name" (`CreateEnvironment$hosts` doc), so it names an Amazon EC2
+//!    key pair of the caller's own account — created there by `CreateKeyPair` or
+//!    `ImportKeyPair`, never by Amazon EVS — and rule 6 holds of it for the same reason
+//!    ([`crate::state::ec2_resources::host_key_pair_failures`]). It is resolved whatever
+//!    the host's placement members say, because a key pair is no placement reference and
+//!    the launch below carries the name onto the instance either way.
 //!
-//! Rules 2 to 7 are evaluated together, so a request that breaks several is refused
+//! Rules 2 to 8 are evaluated together, so a request that breaks several is refused
 //! ONCE with one `ValidationException` whose `fieldList` carries an entry per failure —
 //! the shape `CreateEnvironment` answers with. A refused request adds nothing.
-//!
-//! `keyName` is the one member of a host naming an EC2 resource that is NOT resolved:
-//! the account's Amazon EC2 store holds no key pairs at all — every `…KeyPair` operation
-//! of that service is still a scaffold stub, so nothing can put one there — and a store
-//! that holds no records of a kind is no evidence about any one name, the same reading
-//! this service takes of an EC2 store it cannot read at all.
 //!
 //! `esxVersion` is stored as the version the host RUNS: the one the request named, or
 //! — when it named none — the default ESX version the service's own version catalogue
@@ -317,6 +319,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }],
             ));
         }
+        // The SSH key pair the host is reached with is an EC2 resource of that same
+        // account: `keyName` is "the name of the SSH key that is used to access the host"
+        // and a host supplies the "EC2 SSH keypair name", which Amazon EC2 mints and
+        // Amazon EVS does not — so the name is resolved in the account's own key pair
+        // store, read by name the way EC2 itself reads one. Resolved whatever the
+        // placement members say: it is no placement reference, and the launch below writes
+        // this name onto the instance either way.
+        failures.extend(crate::state::ec2_resources::host_key_pair_failures(
+            &*self.engine,
+            &[crate::state::ec2_resources::HostKeyPairReference {
+                member: "host.keyName",
+                key_name: &input.host.key_name,
+            }],
+        ));
         // "To find the available ESX versions for a particular VCF version, use the
         // GetVersions action" (this operation's doc): a version the request names is one
         // of the versions that catalogue offers for THIS environment's VCF version, and

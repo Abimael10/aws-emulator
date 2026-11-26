@@ -63,6 +63,12 @@
 //!    neither, so they are the caller's own, judged exactly as rule 7 judges the
 //!    network ([`crate::state::ec2_resources::host_placement_failures`]). An entry
 //!    refused by rule 1 names both mechanisms, so neither of its references is resolved.
+//!    The `keyName` of every entry resolves there too: it is the "EC2 SSH keypair name"
+//!    the member doc below asks each host for, so it names an Amazon EC2 key pair of the
+//!    caller's own account — minted there by `CreateKeyPair` or `ImportKeyPair`, never by
+//!    Amazon EVS — and it is resolved whatever an entry's placement members say, a key
+//!    pair being no placement reference
+//!    ([`crate::state::ec2_resources::host_key_pair_failures`]).
 //! 10. A `hostName` an entry of `hosts` names is free: "DNS hostnames for hosts must be
 //!    unique across Amazon EVS environments and within VCF"
 //!    (`HostInfoForCreate$hostName` doc), and the hosts this create adds TAKE their
@@ -485,6 +491,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .collect();
             failures.extend(crate::state::ec2_resources::host_placement_failures(
+                &*self.engine,
+                &references,
+            ));
+        }
+        // The SSH key pair each entry names is a resource of that same account too: a host
+        // supplies the "EC2 SSH keypair name" (this operation's `hosts` doc), which Amazon
+        // EC2 mints and Amazon EVS does not, so the name is resolved in the account's own
+        // key pair store — read by name the way EC2 itself reads one. Resolved for every
+        // entry, whatever its placement members say: a key pair is no placement reference,
+        // and the launch of a host writes this name onto its instance either way.
+        {
+            let members: Vec<String> = host_member_prefixes
+                .iter()
+                .map(|member_prefix| format!("{member_prefix}.keyName"))
+                .collect();
+            let references: Vec<crate::state::ec2_resources::HostKeyPairReference<'_>> = input
+                .hosts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .zip(members.iter())
+                .map(
+                    |(host, member)| crate::state::ec2_resources::HostKeyPairReference {
+                        member,
+                        key_name: host.key_name.as_str(),
+                    },
+                )
+                .collect();
+            failures.extend(crate::state::ec2_resources::host_key_pair_failures(
                 &*self.engine,
                 &references,
             ));

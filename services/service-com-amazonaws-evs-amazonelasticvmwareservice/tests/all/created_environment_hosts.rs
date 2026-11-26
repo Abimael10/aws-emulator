@@ -38,7 +38,8 @@ use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::environment_lifecycle::{
-    call, error_type, register_network, vlans_with_prefix, REGION, ZONE,
+    call, error_type, register_key_pair, register_network, vlans_with_prefix, HOST_KEY_PAIR_NAME,
+    REGION, ZONE,
 };
 // The ec2Query client and the XML readers the sibling EC2-facing suites already own:
 // this suite asks Amazon EC2 the same questions they do.
@@ -70,6 +71,10 @@ impl Emulator {
         crate::premium_support_entitlement::grant_premium_support(&engine);
         router.register_service(evs::EmulatedService::new(Arc::clone(&engine)));
         router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
+        // The SSH key pair the host entries here name, in the account's own EC2 key pair
+        // store: a `hosts` entry's `keyName` names a key pair of the caller's account. A
+        // row that names another pair holds that one too.
+        register_key_pair(&engine, HOST_KEY_PAIR_NAME);
         Self { router, engine }
     }
 
@@ -430,6 +435,7 @@ async fn a_create_that_carries_hosts_adds_them_to_the_environment() {
             ),
         };
         let hosts = four_hosts(&prefix, row.key_name, row.instance_type, &extra, &at);
+        register_key_pair(&emulator.engine, row.key_name);
         let request = emulator.create_request(
             &format!("hosts-env-{index}"),
             row.vcf_version,

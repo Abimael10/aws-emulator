@@ -31,7 +31,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::{call, error_type, register_network, vlans_with_prefix, REGION};
+use crate::environment_lifecycle::{
+    call, error_type, register_key_pair, register_network, vlans_with_prefix, HOST_KEY_PAIR_NAME,
+    REGION,
+};
 
 /// Long enough for the transitions the two services owe a new environment, host and
 /// instance to come due (each span is under a second by construction).
@@ -62,6 +65,10 @@ impl Emulator {
             ),
         );
         router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
+        // The SSH key pair the host fixtures here name, in the account's own EC2 key pair
+        // store: a host's `keyName` names a key pair of the caller's account. A row that
+        // names another pair holds that one too ([`Emulator::create_host`]).
+        register_key_pair(&engine, HOST_KEY_PAIR_NAME);
         Self { router, engine }
     }
 
@@ -120,6 +127,9 @@ impl Emulator {
     }
 
     /// Add one host and answer the `host` object the create reported.
+    ///
+    /// The account holds the SSH key pair the host names, because `keyName` names a key
+    /// pair of the caller's own Amazon EC2 store.
     async fn create_host(
         &self,
         environment: &str,
@@ -127,6 +137,7 @@ impl Emulator {
         key_name: &str,
         instance_type: &str,
     ) -> Value {
+        register_key_pair(&self.engine, key_name);
         let request = json!({
             "environmentId": environment,
             "host": {

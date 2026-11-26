@@ -58,6 +58,15 @@ const INSTANCE_TYPE: &str = "i4i.metal";
 /// The SSH key pair name every host is created with.
 const KEY_NAME: &str = "evs-key";
 
+/// The `KeyType` the account's key pair is minted as: the cheap member of Amazon EC2's
+/// modelled `KeyType` catalog, a host caring only that the ACCOUNT holds the pair its
+/// `keyName` names.
+const KEY_TYPE: &str = "ed25519";
+
+/// The code Amazon EC2 answers a create of a key pair name the account already holds
+/// (`InvalidKeyPair.Duplicate`), which is how [`ensure_key_pair`] stays idempotent.
+const DUPLICATE_KEY_PAIR_CODE: &str = "InvalidKeyPair.Duplicate";
+
 /// The VCF version the environments are created with, one the version catalogue offers and
 /// one that installs VCF — the mode in which an environment adds the `hosts` it was created
 /// with.
@@ -304,6 +313,31 @@ async fn create_placement_group(
     group_id
 }
 
+/// The SSH key pair the account holds, minted through Amazon EC2's own `CreateKeyPair`.
+///
+/// A host's `keyName` is "the name of the SSH key that is used to access the host" — an
+/// Amazon EC2 key pair of the caller's own account, which Amazon EVS does not create — so
+/// every environment and host below names a pair that really is in that account's key pair
+/// store. Idempotent: a second call for a name the account already holds is Amazon EC2's
+/// own duplicate refusal and nothing else, so a test that deploys several environments
+/// mints the pair once.
+async fn ensure_key_pair(router: &MultiServiceRouter, case: &str) {
+    let (status, body) = ec2_call(
+        router,
+        "CreateKeyPair",
+        &[("KeyName", KEY_NAME), ("KeyType", KEY_TYPE)],
+    )
+    .await;
+    if status == 200 {
+        return;
+    }
+    assert!(
+        body.contains(DUPLICATE_KEY_PAIR_CODE),
+        "case {case:?}: CreateKeyPair {KEY_NAME:?} expected HTTP 200 or \
+         {DUPLICATE_KEY_PAIR_CODE}, got {status} with {body}"
+    );
+}
+
 /// An Amazon EVS environment deployed into its own network, waited for until it reports the
 /// state a host can be added to; `hosts` is the `hosts` member the create carries, when it
 /// carries one.
@@ -315,6 +349,8 @@ async fn deployed_environment(
     hosts: Option<Value>,
 ) -> String {
     let (vpc_id, subnet_id) = create_network(router, case, base).await;
+    // Every host this environment takes, now or later, names the account's key pair.
+    ensure_key_pair(router, case).await;
     let mut request = json!({
         "environmentName": name,
         "vpcId": vpc_id,

@@ -33,7 +33,8 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::environment_lifecycle::{
-    call, error_type, register_network, vlans_with_prefix, REGION, ZONE,
+    call, error_type, register_key_pair, register_network, vlans_with_prefix, HOST_KEY_PAIR_NAME,
+    REGION, ZONE,
 };
 
 /// Long enough for the transitions the two services owe a new environment to come due
@@ -78,6 +79,9 @@ impl Emulator {
             ),
         );
         router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
+        // The SSH key pair every host fixture here names, in the account's own EC2 key
+        // pair store: a host's `keyName` names a key pair of the caller's account.
+        register_key_pair(&engine, HOST_KEY_PAIR_NAME);
         Self { router, engine }
     }
 

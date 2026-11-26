@@ -26,7 +26,11 @@
 //! `placementGroupId` is "the unique ID of the placement group where the host is placed"
 //! and a `dedicatedHostId` "the unique ID of the Amazon EC2 Dedicated Host", and Amazon
 //! EVS creates neither of them, so whether the account holds them is EC2's fact to state
-//! and is asked of the same store ([`host_placement_failures`]).
+//! and is asked of the same store ([`host_placement_failures`]). The SSH key pair a host
+//! is reached with is one more such resource — a host entry supplies the "EC2 SSH keypair
+//! name" (`CreateEnvironment$hosts` doc) and Amazon EC2 is where a key pair is created —
+//! so the name is resolved in that same store, by name, the way EC2 itself resolves one
+//! ([`host_key_pair_failures`]).
 //!
 //! A store this emulator cannot read at all — an engine that is not the in-memory one —
 //! is EVIDENCE OF NOTHING and so refuses nothing: every function here answers `None`
@@ -387,6 +391,68 @@ pub fn host_placement_failures<Eng: Send + Sync + 'static>(
         }
     }
     failures
+}
+
+/// The clause stated for a `keyName` the account's own Amazon EC2 store holds no key pair
+/// for.
+///
+/// `member` is the PATH of the member that named it, so one clause serves every operation
+/// that accepts a host — `CreateEnvironmentHost`'s single `host` and `CreateEnvironment`'s
+/// `hosts` entries. Stated in the same form as [`invalid_security_group_clause`], the
+/// clause of the other member that is named at a path per entry: it is the same kind of
+/// failure, a member naming an Amazon EC2 resource of the caller's account that the
+/// account does not hold.
+pub fn invalid_key_pair_clause(member: &str, key_name: &str) -> ValidationExceptionField {
+    super::field_failure_stated(
+        member,
+        format!(
+            "The key pair name {key_name} given for {member} is not valid or does not \
+             exist. Please verify the key pair name exists and is valid."
+        ),
+    )
+}
+
+/// The SSH key pair ONE requested host names, and the path of the member that named it, so
+/// a refusal names the member the caller wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct HostKeyPairReference<'a> {
+    /// The path of the `keyName` member this name came from — `host.keyName` for
+    /// `CreateEnvironmentHost`, `hosts[<index>].keyName` for a `CreateEnvironment` entry.
+    pub member: &'a str,
+    /// The `keyName` the host supplied.
+    pub key_name: &'a str,
+}
+
+/// Every failure of the precondition that the SSH key pair each requested host names is a
+/// key pair the account's own Amazon EC2 store holds.
+///
+/// `keyName` is "the name of the SSH key that is used to access the host"
+/// (`HostInfoForCreate$keyName`) and a host entry supplies the "EC2 SSH keypair name"
+/// (`CreateEnvironment$hosts` doc): a key pair is an Amazon EC2 resource of the caller's
+/// own account, minted by `CreateKeyPair` or `ImportKeyPair`, and Amazon EVS creates none —
+/// so a name that names no key pair of the account names no key the host could be reached
+/// with, exactly as a `placementGroupId` names no group to place it in
+/// ([`host_placement_failures`]) and `vpcId` no VPC to deploy into ([`network_failures`]).
+/// The lookup is EC2's own resolution of a key pair NAME
+/// ([`ec2::ComAmazonawsEc2Amazonec2State::key_pair_id_for_name`]), so one reading of a name
+/// serves both services — including its case sensitivity.
+///
+/// An unreadable EC2 store reports no failure at all, the "evidence of nothing" answer
+/// every function here gives for it. An EMPTY store is not that case: it is a readable
+/// store stating the account holds no key pair of that name.
+pub fn host_key_pair_failures<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    key_pairs: &[HostKeyPairReference<'_>],
+) -> Vec<ValidationExceptionField> {
+    let Some(state) = ec2_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    key_pairs
+        .iter()
+        .filter(|reference| store.key_pair_id_for_name(reference.key_name).is_none())
+        .map(|reference| invalid_key_pair_clause(reference.member, reference.key_name))
+        .collect()
 }
 
 /// The clause stated for a route server peer id the account's own Amazon EC2 store holds
