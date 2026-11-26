@@ -82,8 +82,13 @@ const DELETE_TABLE: &str = "DeleteTable";
 const GET_PARTITIONS: &str = "GetPartitions";
 
 /// The Glue action that writes the partitions of a table, which a statement that writes a
-/// PARTITIONED table's data registers them with.
+/// PARTITIONED table's data registers them with, and which `MSCK REPAIR TABLE` registers the
+/// partitions it discovered with.
 const BATCH_CREATE_PARTITION: &str = "BatchCreatePartition";
+
+/// The Glue action that writes a table's DEFINITION, which `ALTER TABLE … ADD COLUMNS` and
+/// `REPLACE COLUMNS` are.
+const UPDATE_TABLE: &str = "UpdateTable";
 
 /// The resource portion of the ARN of the catalog itself.
 const CATALOG_RESOURCE: &str = "catalog";
@@ -275,6 +280,15 @@ fn catalog_statement_action(
         }
         CatalogStatement::ShowPartitions { target } => {
             (GET_PARTITIONS, table_arns(account, region, target))
+        }
+        CatalogStatement::ChangeTableColumns(change) => {
+            (UPDATE_TABLE, table_arns(account, region, &change.target))
+        }
+        CatalogStatement::ChangeTableProperties { target, .. } => {
+            (UPDATE_TABLE, table_arns(account, region, target))
+        }
+        CatalogStatement::RepairTable { target } => {
+            (BATCH_CREATE_PARTITION, table_arns(account, region, target))
         }
     }
 }

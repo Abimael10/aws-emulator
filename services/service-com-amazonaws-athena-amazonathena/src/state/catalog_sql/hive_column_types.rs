@@ -34,10 +34,6 @@ use super::grammar::{significant_tokens, word_is};
 /// statement is read — the declaration itself is put back by the caller.
 const READABLE_TYPE: &str = "string";
 
-/// How many columns one declaration this reader will walk may carry: the bound on the work
-/// one submitted statement can ask of it.
-const MAX_DECLARED_COLUMNS: usize = 1_024;
-
 /// `sql` with every column type the general parser cannot read made readable, and the text
 /// each such column was declared with, keyed by its position in the declaration — or `None`
 /// when the statement declares no such type, which is every statement the parser already
@@ -91,40 +87,11 @@ struct DeclaredType {
 /// The types the columns of a `CREATE TABLE`'s declaration list are written with, in
 /// declaration order, or `None` for a statement that declares no column list at all.
 fn declared_columns(tokens: &[TokenWithSpan]) -> Option<Vec<DeclaredType>> {
-    let mut rest = after_table_name(tokens)?;
-    // The column list itself.
-    let (first, inside) = rest.split_first()?;
-    if !matches!(first.token, Token::LParen) {
-        return None;
-    }
-    rest = inside;
-    let mut columns: Vec<DeclaredType> = Vec::new();
-    let mut depth = 0usize;
-    let mut term: Vec<&TokenWithSpan> = Vec::new();
-    for token in rest {
-        match &token.token {
-            Token::LParen | Token::Lt => depth += 1,
-            Token::ShiftLeft => depth += 2,
-            Token::RParen | Token::Gt if depth > 0 => depth -= 1,
-            Token::ShiftRight if depth > 1 => depth -= 2,
-            // The `)` that closes the column list, which is where the declaration ends.
-            Token::RParen => {
-                columns.push(declared_type(&term)?);
-                return Some(columns);
-            }
-            Token::Comma if depth == 0 => {
-                columns.push(declared_type(&term)?);
-                if columns.len() > MAX_DECLARED_COLUMNS {
-                    return None;
-                }
-                term.clear();
-                continue;
-            }
-            _ => {}
-        }
-        term.push(token);
-    }
-    None
+    let rest = after_table_name(tokens)?;
+    // The list is split at the commas of its outermost level by the reader both statements
+    // that declare a column list share ([`super::declaration_list`]).
+    let (terms, _) = super::declaration_list::column_terms(rest)?;
+    terms.iter().map(|term| declared_type(term)).collect()
 }
 
 /// What is left after `CREATE [EXTERNAL] TABLE [IF NOT EXISTS] <name>`, or `None` for tokens

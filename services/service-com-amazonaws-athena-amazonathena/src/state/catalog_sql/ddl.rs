@@ -1151,6 +1151,138 @@ pub fn register_partitions(
     Ok(())
 }
 
+/// Change the COLUMN LIST of a table the catalog holds, as an `ALTER TABLE … ADD COLUMNS`
+/// or `REPLACE COLUMNS` declares it.
+///
+/// The declared columns are appended to the ones the table already declares, or — for the
+/// replacing form — are the whole list from now on, which is how a client DROPS a column and
+/// how it changes a column's declared type. Nothing else about the entry moves: the data
+/// under the table's location is not rewritten, so what a read of it answers is decided by
+/// the new declaration over the objects that are already there.
+///
+/// The write is the catalog's own definition write ([`glue_state::TableEntry::apply_input`]),
+/// so the entry a later read reports — Glue's own reads included — is the changed one, its
+/// `UpdateTime` moves and the definition it replaced is kept as the version it was current
+/// under, exactly as `AWSGlue.UpdateTable` keeps it.
+pub fn change_table_columns(
+    store: &mut glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    change: &statement::ColumnChange,
+    now: SystemTime,
+) -> Result<StoredResultSet, Failure> {
+    let target = &change.target;
+    let Some(database) = store.database_mut(catalog_id, &target.database) else {
+        // The statement is one the Hive DDL engine performs, so a database it cannot
+        // resolve is that engine's own semantic error.
+        return Err(Failure::hive_database_not_found(&target.database));
+    };
+    let Some(table) = database.tables.get_mut(&target.table) else {
+        return Err(Failure::table_not_found(target));
+    };
+    let mut input = table.to_table_input();
+    let mut storage = input.storage_descriptor.take().unwrap_or_default();
+    let declared: Vec<GlueColumn> = change.columns.iter().map(glue_column).collect();
+    let columns = if change.replaces {
+        declared
+    } else {
+        let mut held = storage.columns.take().unwrap_or_default();
+        held.extend(declared);
+        held
+    };
+    // No column list the catalog holds carries ONE NAME TWICE: the metastore refuses the
+    // whole task rather than storing such a list, whether the second declaration of a name
+    // collides with a column the table already held or with another of the statement's own.
+    if let Some(column) = one_name_twice(&columns) {
+        return Err(Failure::duplicate_column(&column));
+    }
+    storage.columns = Some(columns);
+    input.storage_descriptor = Some(storage);
+    // The definition this write replaces is archived where the catalog has room for it,
+    // exactly as its own update does.
+    let archive = table.can_archive_version();
+    table.apply_input(&input, now, archive);
+    Ok(StoredResultSet::default())
+}
+
+/// The first column name `columns` carries TWICE, or `None` for a list that carries each of
+/// its names once. Compared without regard to case, the way the catalog addresses a column
+/// name.
+fn one_name_twice(columns: &[GlueColumn]) -> Option<String> {
+    let mut held: Vec<String> = Vec::with_capacity(columns.len());
+    for column in columns {
+        let name = glue_state::fold_name(&column.name);
+        if held.contains(&name) {
+            return Some(column.name.clone());
+        }
+        held.push(name);
+    }
+    None
+}
+
+/// Set the PROPERTIES of a table the catalog holds, as an `ALTER TABLE … SET TBLPROPERTIES`
+/// declares them.
+///
+/// The statement "adds custom or predefined metadata properties to a table and sets their
+/// assigned values", so each property it names is written over whatever the entry held for
+/// it and every other property the entry carries is left where it was. The write is the
+/// catalog's own definition write, exactly as a column change is
+/// ([`change_table_columns`]).
+pub fn change_table_properties(
+    store: &mut glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    target: &Relation,
+    properties: &[(String, String)],
+    now: SystemTime,
+) -> Result<StoredResultSet, Failure> {
+    let Some(database) = store.database_mut(catalog_id, &target.database) else {
+        return Err(Failure::hive_database_not_found(&target.database));
+    };
+    let Some(table) = database.tables.get_mut(&target.table) else {
+        return Err(Failure::table_not_found(target));
+    };
+    let mut input = table.to_table_input();
+    let mut parameters = input.parameters.take().unwrap_or_default();
+    for (key, value) in properties {
+        parameters.insert(key.clone(), value.clone());
+    }
+    input.parameters = Some(parameters);
+    let archive = table.can_archive_version();
+    table.apply_input(&input, now, archive);
+    Ok(StoredResultSet::default())
+}
+
+/// Where the data of `table` lives and what its PARTITION KEYS are, which is what the
+/// partitions under that location are discovered against — or the refusal for a name the
+/// catalog holds nothing for.
+///
+/// A table that declares no partition key has no partition to discover, and neither has one
+/// whose entry records no location, so both answer with nothing to scan.
+pub fn partitioned_location(
+    store: &glue_state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    target: &Relation,
+) -> Result<Option<(String, Vec<String>)>, Failure> {
+    let Some(database) = store.database(catalog_id, &target.database) else {
+        return Err(Failure::hive_database_not_found(&target.database));
+    };
+    let Some(table) = database.tables.get(&target.table) else {
+        return Err(Failure::table_not_found(target));
+    };
+    let keys: Vec<String> = partition_key_columns(table)
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let location = table
+        .storage_descriptor
+        .as_ref()
+        .and_then(|storage| storage.location.clone())
+        .filter(|location| !location.is_empty());
+    Ok(location.map(|location| (location, keys)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

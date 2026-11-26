@@ -15,7 +15,7 @@
 //! against a file's schema: a file carrying a column the table does not declare contributes
 //! nothing for it, and a column the table declares that the file does not carry is NULL.
 
-use ::std::collections::{HashMap, HashSet};
+use ::std::collections::HashSet;
 
 use ::parquet::file::reader::{FileReader, SerializedFileReader};
 use ::parquet::record::{Field, Row};
@@ -105,13 +105,25 @@ pub struct Limits {
 /// the Parquet file the table says it is cannot be opened as one at all.
 ///
 /// BOUNDED before anything is decoded, in this order: the STORED size of the body, which no
-/// read can be cheaper than; then the declarations of every row group ACCUMULATED — the rows
-/// it holds and the bytes its chunks decode to — so a file of many individually-conforming
-/// groups is refused as surely as one oversized group, and the buffers the reader allocates
-/// from those declarations are bounded by what the query may still decode. Then STREAMING:
-/// the reader decodes one record at a time and each is handed over as it is read, so a caller
-/// that charges a record against a budget stops the read at the first one over it rather than
+/// read can be cheaper than and which also bounds every byte the reader will ever READ out of
+/// the object; then the declarations of every row group ACCUMULATED — the rows it holds and
+/// the bytes its chunks decode to — so a file of many individually-conforming groups is
+/// refused as surely as one oversized group, and the buffers the reader allocates from those
+/// declarations are bounded by what the query may still decode. Then STREAMING: the reader
+/// decodes one record at a time and each is handed over as it is read, so a caller that
+/// charges a record against a budget stops the read at the first one over it rather than
 /// after the whole object is decoded.
+///
+/// What is NOT bounded here is the declaration one PAGE inside a column chunk carries, which
+/// is the size the format's own reader reserves its decompression buffer at: that declaration
+/// is readable only through the crate's page-header type and thrift decoder, which this
+/// release does not make public (its `experimental` feature does not expose them either), and
+/// the alternative — a hand-written decoder for the format's own header over caller-supplied
+/// bytes — would be a worse exposure than the one it closes. What holds instead: the bytes
+/// the reader READS are the stored object's, bounded above; the format states a page's
+/// declaration as a 32-bit count, so one page's reservation is bounded by the format itself;
+/// the reservation is capacity rather than written memory; and the whole read runs inside the
+/// query's own deadline (`super::super::super::query_engine::MAX_QUERY_DEADLINE`).
 pub fn for_each_record(
     body: &[u8],
     relation: &Relation,
@@ -162,20 +174,109 @@ fn declared(count: i64) -> usize {
     usize::try_from(count).unwrap_or(usize::MAX)
 }
 
-/// The values one record holds, keyed by the name each was written under, folded the way the
-/// Data Catalog folds a column name — so a file that spells a column in another case still
-/// fills it, exactly as a JSON document's member does.
+/// The leaves one record holds, in the order the FILE declares them: the name each was
+/// written under, folded the way the Data Catalog folds a column name — so a file that spells
+/// a column in another case still fills it, exactly as a JSON document's member does — and
+/// what it holds.
 ///
-/// A leaf carrying no value at all is left out: a column the record holds no value for is
-/// NULL, which is the same answer as one the file does not carry.
-pub fn values_of(record: &Row) -> HashMap<String, Cell> {
-    let mut values: HashMap<String, Cell> = HashMap::new();
-    for (name, field) in record.get_column_iter() {
-        if let Some(cell) = cell_of(field) {
-            values.insert(glue_state::fold_name(name), cell);
+/// The order is the file's own, because a reader resolving its columns by POSITION rather
+/// than by name reads the leaf at a column's own place in the file
+/// ([`super::DataSource`]); a leaf carrying no value at all is still one leaf, so a column
+/// the record holds no value for is NULL without shifting the leaves beside it.
+pub fn leaves_of(record: &Row) -> Vec<RecordLeaf> {
+    record
+        .get_column_iter()
+        .map(|(name, field)| RecordLeaf {
+            name: glue_state::fold_name(name),
+            held: held_value(field),
+        })
+        .collect()
+}
+
+/// ONE leaf of a Parquet record: the column name it was written under and the value it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordLeaf {
+    /// The name the file declares the leaf under, folded.
+    pub name: String,
+    /// What it holds, or `None` for a leaf holding no value at all.
+    pub held: Option<LeafValue>,
+}
+
+/// One leaf's value, with the TYPE the file stores it as.
+///
+/// The stored type is what decides whether a column may be read from this leaf at all: a file
+/// is self-describing, so the type a read reinterprets the bytes under is the file's own and
+/// not the one the catalog happens to declare ([`LeafType`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafValue {
+    /// The data it holds.
+    pub cell: Cell,
+    /// The type the file stores it as.
+    pub stored: LeafType,
+}
+
+/// The type one Parquet leaf is STORED as, as the format's own type names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafType {
+    /// A boolean.
+    Boolean,
+    /// A 32-bit integer.
+    Int32,
+    /// A 64-bit integer.
+    Int64,
+    /// A single-precision number.
+    Float,
+    /// A double-precision number.
+    Double,
+    /// A byte array, which is what text and binary data are stored as.
+    ByteArray,
+    /// Any other leaf: a calendar value, an exact-numeric value, or a nested group, list or
+    /// map. What the catalog may declare over such a leaf is not decided here.
+    Other,
+}
+
+impl LeafType {
+    /// The name the Parquet format gives this type, which is how a failure about the leaf
+    /// names the type the file stores it as.
+    ///
+    /// [`Self::Other`] is not one of the format's own type names: it stands for every leaf
+    /// whose type this reader does not tell apart (a calendar value, an exact-numeric value,
+    /// a nested group, list or map), so it is named by what it is rather than by another
+    /// type's name — no refusal reports one today, because what a declaration over such a
+    /// leaf may be is not decided here.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Boolean => "BOOLEAN",
+            Self::Int32 => "INT32",
+            Self::Int64 => "INT64",
+            Self::Float => "FLOAT",
+            Self::Double => "DOUBLE",
+            Self::ByteArray => "BINARY",
+            Self::Other => "UNKNOWN",
         }
     }
-    values
+}
+
+/// One leaf as the value and stored type it carries, or `None` for a leaf holding no value.
+fn held_value(field: &Field) -> Option<LeafValue> {
+    Some(LeafValue {
+        cell: cell_of(field)?,
+        stored: stored_type(field),
+    })
+}
+
+/// The type the file stores `field` as.
+fn stored_type(field: &Field) -> LeafType {
+    match field {
+        Field::Bool(..) => LeafType::Boolean,
+        Field::Byte(..) | Field::Short(..) | Field::Int(..) | Field::UByte(..)
+        | Field::UShort(..) | Field::UInt(..) => LeafType::Int32,
+        Field::Long(..) | Field::ULong(..) => LeafType::Int64,
+        Field::Float(..) => LeafType::Float,
+        Field::Double(..) => LeafType::Double,
+        Field::Str(..) | Field::Bytes(..) => LeafType::ByteArray,
+        _ => LeafType::Other,
+    }
 }
 
 /// One value a Parquet record carries, as the data it holds.

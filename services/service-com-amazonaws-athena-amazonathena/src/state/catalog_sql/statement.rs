@@ -86,6 +86,9 @@ pub const SUBSTATEMENT_EXECUTE: &str = "EXECUTE";
 /// of the object store.
 pub const SUBSTATEMENT_UNLOAD: &str = "UNLOAD";
 
+/// The `SubstatementType` of a statement that changes a table's definition.
+pub const SUBSTATEMENT_ALTER_TABLE: &str = "ALTER_TABLE";
+
 /// The `format` property of a statement that writes its output: which file format the
 /// objects it writes are written in.
 ///
@@ -423,6 +426,35 @@ pub enum CatalogStatement {
         /// The table whose partitions are listed.
         target: Relation,
     },
+    /// `ALTER TABLE … ADD COLUMNS` / `REPLACE COLUMNS`: changes the column list of a table
+    /// the catalog already holds.
+    ChangeTableColumns(ColumnChange),
+    /// `ALTER TABLE … SET TBLPROPERTIES`: adds properties to a table the catalog already
+    /// holds, and sets their values.
+    ChangeTableProperties {
+        /// The table whose properties change.
+        target: Relation,
+        /// The properties the statement sets, in the order it listed them.
+        properties: Vec<(String, String)>,
+    },
+    /// `MSCK REPAIR TABLE`: registers the partitions the table's own location holds the data
+    /// of and the catalog has no record of.
+    RepairTable {
+        /// The table whose partitions are registered.
+        target: Relation,
+    },
+}
+
+/// An `ALTER TABLE … ADD COLUMNS` or `REPLACE COLUMNS` statement, as the columns it states.
+#[derive(Debug, Clone)]
+pub struct ColumnChange {
+    /// The table whose column list changes.
+    pub target: Relation,
+    /// The columns it declares, in declaration order.
+    pub columns: Vec<DeclaredColumn>,
+    /// Whether the declared columns REPLACE the table's column list rather than being
+    /// appended to it.
+    pub replaces: bool,
 }
 
 /// The pattern a `SHOW TABLES` or `SHOW VIEWS` statement narrows its answer by.
@@ -596,6 +628,12 @@ pub fn read_parsed(
         if let Some(reading) = table_with_hive_types(sql, context) {
             return reading;
         }
+        // A statement that changes a table's COLUMN LIST is one of that grammar's too: the
+        // general parser reads only the singular `ADD COLUMN` form, so the plural declaration
+        // list is read off the tokens (see [`super::hive_alter_table`]).
+        if let Some(reading) = column_change(sql, context) {
+            return reading;
+        }
         return Reading {
             statements: None,
             statement_type: None,
@@ -660,6 +698,31 @@ fn table_with_hive_types(sql: &str, context: &QueryContext) -> Option<Reading> {
         substatement_type,
         counts_rows: false,
         plan,
+    })
+}
+
+/// The reading of a statement that changes a table's COLUMN LIST, or `None` for text that is
+/// no such statement.
+///
+/// The statement is the Hive DDL's own, so it is a DDL statement performed against the Data
+/// Catalog: what it declares is read off the submitted tokens
+/// ([`super::hive_alter_table`]), and the table it names is resolved against the query's
+/// context exactly as every other relation is.
+fn column_change(sql: &str, context: &QueryContext) -> Option<Reading> {
+    let change = super::hive_alter_table::read_column_change(sql)?;
+    let target = relation_from(&change.name, &change.written, change.at, context)?;
+    Some(Reading {
+        statements: Some(1),
+        statement_type: Some(STATEMENT_TYPE_DDL),
+        substatement_type: Some(SUBSTATEMENT_ALTER_TABLE),
+        counts_rows: false,
+        plan: Plan::Catalog(Box::new(CatalogStatement::ChangeTableColumns(
+            ColumnChange {
+                target,
+                columns: change.columns,
+                replaces: change.replaces,
+            },
+        ))),
     })
 }
 
@@ -968,6 +1031,10 @@ fn statement_type_of(statement: &SqlStatement) -> &'static str {
         | SqlStatement::CreateSchema { .. }
         | SqlStatement::CreateDatabase { .. }
         | SqlStatement::AlterTable { .. }
+        // `MSCK REPAIR TABLE` registers the partitions a table's location holds the data of,
+        // which changes the table's own DEFINITION in the catalog: Athena serves it among its
+        // DDL statements.
+        | SqlStatement::Msck { .. }
         | SqlStatement::Drop { .. }
         | SqlStatement::Truncate { .. } => STATEMENT_TYPE_DDL,
         _ => STATEMENT_TYPE_UTILITY,
@@ -1002,7 +1069,7 @@ fn substatement_type_of(statement: &SqlStatement) -> Option<&'static str> {
         SqlStatement::CreateDatabase { .. } | SqlStatement::CreateSchema { .. } => {
             SUBSTATEMENT_CREATE_DATABASE
         }
-        SqlStatement::AlterTable { .. } => "ALTER_TABLE",
+        SqlStatement::AlterTable { .. } => SUBSTATEMENT_ALTER_TABLE,
         SqlStatement::Truncate { .. } => "TRUNCATE_TABLE",
         SqlStatement::Drop { object_type, .. } => match object_type {
             ObjectType::Table => SUBSTATEMENT_DROP_TABLE,
@@ -1201,6 +1268,21 @@ fn read_plan(statement: SqlStatement, context: &QueryContext) -> Plan {
                 None => Plan::Engine,
             }
         }
+        // The PARTITIONS of a table are catalog records, so the statement that REGISTERS the
+        // ones its location holds the data of is answered from the catalog as well, over the
+        // objects under that location.
+        SqlStatement::Msck { table_name, .. } => match relation_of(table_name, context) {
+            Some(target) => Plan::Catalog(Box::new(CatalogStatement::RepairTable { target })),
+            None => Plan::Engine,
+        },
+        // The PROPERTIES of a table are catalog records too: the statement that sets them
+        // writes the table's entry and reads no data at all.
+        SqlStatement::AlterTable {
+            name, operations, ..
+        } => match property_change(name, operations, context) {
+            Some(statement) => Plan::Catalog(Box::new(statement)),
+            None => Plan::Engine,
+        },
         // A table over data that already exists is a CATALOG entry: the statement
         // registers where the data lives and how to read it, and writes no rows.
         SqlStatement::CreateTable(create) if defines_an_external_table(create) => {
@@ -1294,6 +1376,34 @@ fn read_plan(statement: SqlStatement, context: &QueryContext) -> Plan {
             }))
         }
     }
+}
+
+/// The property change an `ALTER TABLE` states, or `None` for an alteration that sets no
+/// table property — every other form of that statement is left as it was read.
+///
+/// `ALTER TABLE <name> SET TBLPROPERTIES ('<key>' = '<value>', …)` is the documented way to
+/// add properties to a table and set their values, and a table's properties decide how its
+/// data is read, so the statement is performed against the catalog entry those properties
+/// live on.
+fn property_change(
+    name: &ObjectName,
+    operations: &[::sqlparser::ast::AlterTableOperation],
+    context: &QueryContext,
+) -> Option<CatalogStatement> {
+    use ::sqlparser::ast::AlterTableOperation;
+    let [AlterTableOperation::SetTblProperties { table_properties }] = operations else {
+        return None;
+    };
+    let target = relation_of(name, context)?;
+    // EVERY option the clause lists has to be a property this reader can read, or the
+    // statement is not this one: a write that set some of what it was asked to set and
+    // reported success for all of it would be a partial write reported as a complete one.
+    let properties: Vec<(String, String)> = table_properties
+        .iter()
+        .map(key_value)
+        .collect::<Option<Vec<(String, String)>>>()?;
+    (!properties.is_empty())
+        .then_some(CatalogStatement::ChangeTableProperties { target, properties })
 }
 
 /// The database `name` addresses, given the catalog an unqualified name resolves
@@ -1520,7 +1630,8 @@ fn unescaped(text: &str) -> String {
     resolved
 }
 
-/// The SerDe parameter one `ROW FORMAT DELIMITED` clause sets: each clause of that row/// format names one separator or escape of the text the table holds, and the catalog
+/// The SerDe parameter one `ROW FORMAT DELIMITED` clause sets: each clause of that row
+/// format names one separator or escape of the text the table holds, and the catalog
 /// records it as the SerDe parameter Hive reads it back from.
 fn delimiter_parameter(delimiter: &HiveDelimiter) -> &'static str {
     match delimiter {
@@ -1857,22 +1968,37 @@ fn idents_of(name: &ObjectName) -> Vec<&Ident> {
 fn relation_of(name: &ObjectName, context: &QueryContext) -> Option<Relation> {
     let parts = idents_of(name);
     let at = Position::of(parts.first()?);
-    let (catalog, database, table) = match parts.as_slice() {
+    let parts: Vec<String> = parts.iter().map(|part| part.value.clone()).collect();
+    relation_from(&parts, &name.to_string(), at, context)
+}
+
+/// The relation the name PARTS `parts` address, given the context an unqualified name
+/// resolves against, or `None` for parts that address no catalog relation.
+///
+/// `written` is the name as the statement wrote it and `at` where it wrote it, which is what
+/// a refusal about the name reports and what a rewrite of the statement replaces. Reached by
+/// [`relation_of`] for a name the parser read, and by the reader of a statement the parser
+/// cannot read ([`column_change`]), so both resolve a name by ONE rule.
+fn relation_from(
+    parts: &[String],
+    written: &str,
+    at: Position,
+    context: &QueryContext,
+) -> Option<Relation> {
+    let (catalog, database, table) = match parts {
         [table] => (
             context.catalog.clone(),
             context.database.clone(),
-            table.value.clone(),
+            table.clone(),
         ),
         [database, table] => (
             context.catalog.clone(),
-            database.value.clone(),
-            table.value.clone(),
+            database.clone(),
+            table.clone(),
         ),
-        [catalog, database, table] => (
-            catalog.value.clone(),
-            database.value.clone(),
-            table.value.clone(),
-        ),
+        [catalog, database, table] => {
+            (catalog.clone(), database.clone(), table.clone())
+        }
         _ => return None,
     };
     if table.is_empty() || database.is_empty() {
@@ -1882,7 +2008,7 @@ fn relation_of(name: &ObjectName, context: &QueryContext) -> Option<Relation> {
         catalog,
         database: glue_state::fold_name(&database),
         table: glue_state::fold_name(&table),
-        written: name.to_string(),
+        written: written.to_string(),
         at,
     })
 }
@@ -2301,6 +2427,26 @@ mod tests {
                 "SHOW PARTITIONS sales.events",
                 "show partitions sales.events",
             ),
+            (
+                "the partitions the data under one table's location is laid out under",
+                "MSCK REPAIR TABLE sales.events",
+                "repair table sales.events",
+            ),
+            (
+                "columns appended to a table's own column list",
+                "ALTER TABLE sales.events ADD COLUMNS (label string, n bigint)",
+                "add columns of sales.events: label string,n bigint",
+            ),
+            (
+                "a table's whole column list replaced",
+                "ALTER TABLE \"sales\".\"events\" REPLACE COLUMNS (id bigint)",
+                "replace columns of sales.events: id bigint",
+            ),
+            (
+                "a property set on a table",
+                "ALTER TABLE sales.events SET TBLPROPERTIES ('classification' = 'parquet')",
+                "set properties of sales.events: classification=parquet",
+            ),
             // `INSERT INTO` writes its rows into a table the catalog already holds, so it is
             // planned as the query it writes plus that table as its destination.
             (
@@ -2388,6 +2534,31 @@ mod tests {
                     CatalogStatement::ShowPartitions { target } => {
                         format!("show partitions {}.{}", target.database, target.table)
                     }
+                    CatalogStatement::ChangeTableColumns(change) => format!(
+                        "{} columns of {}.{}: {}",
+                        if change.replaces { "replace" } else { "add" },
+                        change.target.database,
+                        change.target.table,
+                        change
+                            .columns
+                            .iter()
+                            .map(|column| format!("{} {}", column.name, column.data_type))
+                            .collect::<Vec<String>>()
+                            .join(",")
+                    ),
+                    CatalogStatement::RepairTable { target } => {
+                        format!("repair table {}.{}", target.database, target.table)
+                    }
+                    CatalogStatement::ChangeTableProperties { target, properties } => format!(
+                        "set properties of {}.{}: {}",
+                        target.database,
+                        target.table,
+                        properties
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<String>>()
+                            .join(",")
+                    ),
                 },
                 Plan::Relations(relational) => format!(
                     "relations {}",

@@ -14,6 +14,8 @@
 mod iceberg_tables;
 /// The records one object of the columnar Parquet format holds.
 pub(super) mod parquet_objects;
+/// Whether a column may be read from the leaf a self-describing object stores for it.
+mod stored_types;
 /// The compression one TEXT object at a table's location carries.
 mod text_codecs;
 
@@ -88,6 +90,15 @@ const TABLE_TYPE_PROPERTY: &str = "table_type";
 /// The value [`TABLE_TYPE_PROPERTY`] carries for a table of the Iceberg open table
 /// format.
 const ICEBERG_TABLE_TYPE: &str = "ICEBERG";
+
+/// The table property that says a Parquet object's columns are resolved by their POSITION in
+/// the file rather than by their name.
+///
+/// Source: the property Athena documents for reading a Parquet table by index
+/// (`parquet.column.index.access`), which the SerDe reads as a boolean. Without it, a column
+/// is resolved by NAME — the default, and what makes a renamed or reordered column list still
+/// read the right leaf.
+const PARQUET_INDEX_ACCESS_PROPERTY: &str = "parquet.column.index.access";
 
 /// The table property that records WHERE an Iceberg table's current metadata file is: the
 /// one object every read of such a table has to go through, because the table's schema,
@@ -207,6 +218,10 @@ pub struct DataSource {
     /// and not what its location happens to hold ([`iceberg_tables`]). `None` for a Hive
     /// table, whose data is every object at its location.
     iceberg_metadata: Option<String>,
+    /// Whether a Parquet object's leaves are resolved by their POSITION in the file rather
+    /// than by the column's name, which is what this table's own properties declare
+    /// ([`PARQUET_INDEX_ACCESS_PROPERTY`]).
+    index_access: bool,
     /// How the objects there are decoded. For an Iceberg table — which is read through its
     /// metadata rather than through this entry — each data file is decoded as the format its
     /// own manifest entry names, and this is the format Iceberg writes one in by default.
@@ -552,6 +567,8 @@ impl DataSource {
             location,
             iceberg_metadata,
             decoder,
+            index_access: property(&table_parameters, PARQUET_INDEX_ACCESS_PROPERTY)
+                .is_some_and(|declared| declared.trim().eq_ignore_ascii_case("true")),
             skip_header_lines: table_parameters
                 .get(SKIP_HEADER_PROPERTY)
                 .and_then(|lines| lines.parse().ok())
@@ -1008,17 +1025,13 @@ impl DataSource {
     /// object belongs to no partition of this table. The key names are matched FOLDED, the
     /// way the catalog holds every name it stores.
     fn hive_partition_values(&self, key: &str) -> Option<Vec<String>> {
-        let mut segments = key.split('/');
-        let mut values = Vec::with_capacity(self.partition_keys);
-        for column in self.columns.iter().skip(self.data_columns()) {
-            let wanted = glue_state::fold_name(&column.name);
-            let found = segments.by_ref().find_map(|segment| {
-                let (name, value) = segment.split_once('=')?;
-                (glue_state::fold_name(name) == wanted).then(|| value.to_string())
-            })?;
-            values.push(found);
-        }
-        Some(values)
+        let keys: Vec<String> = self
+            .columns
+            .iter()
+            .skip(self.data_columns())
+            .map(|column| column.name.clone())
+            .collect();
+        hive_path_values(key, &keys)
     }
 
     /// How many of [`Self::columns`] the objects' own records carry values for: every column
@@ -1194,15 +1207,22 @@ impl DataSource {
                     limits,
                     |record| {
                         budget.charge_row(&self.relation, width)?;
-                        let values = parquet_objects::values_of(record);
+                        let leaves = parquet_objects::leaves_of(record);
                         budget.charge_decoded(
                             &self.relation,
-                            values
-                                .values()
-                                .map(parquet_objects::Cell::size)
+                            leaves
+                                .iter()
+                                .filter_map(|leaf| leaf.held.as_ref())
+                                .map(|held| held.cell.size())
                                 .fold(0usize, usize::saturating_add),
                         )?;
-                        rows.push(self.parquet_row(&materialised, metadata, partition, &values));
+                        rows.push(self.parquet_row(
+                            &materialised,
+                            metadata,
+                            partition,
+                            &leaves,
+                            &held,
+                        )?);
                         Ok(())
                     },
                 )?;
@@ -1212,41 +1232,80 @@ impl DataSource {
     }
 
     /// One Parquet record as the row it holds: one value per MATERIALISED column, each read
-    /// out of the record by its column's own NAME, followed by what the hidden metadata
-    /// columns of the object it was read from carry.
+    /// out of the record's own leaves, followed by what the hidden metadata columns of the
+    /// object it was read from carry.
+    ///
+    /// WHICH leaf a column reads is the table's own declaration: by the column's NAME, which
+    /// is how Hive's Parquet SerDe resolves one and what makes a reordered or renamed column
+    /// list still read the right leaf, or — where the table declares index access
+    /// ([`PARQUET_INDEX_ACCESS_PROPERTY`]) — by the column's POSITION, which reads whatever
+    /// leaf sits at that place in the file. A column no leaf answers for is NULL, and a leaf
+    /// the column's declared type cannot be read from fails the read
+    /// ([`stored_types::refusal`]).
     fn parquet_row(
         &self,
         materialised: &[usize],
         metadata: &[::rusqlite::types::Value],
         partition: &[String],
-        values: &HashMap<String, parquet_objects::Cell>,
-    ) -> Vec<::rusqlite::types::Value> {
-        materialised
+        leaves: &[parquet_objects::RecordLeaf],
+        split: &Split<'_>,
+    ) -> Result<Vec<::rusqlite::types::Value>, Failure> {
+        let mut row: Vec<::rusqlite::types::Value> = Vec::with_capacity(
+            materialised.len().saturating_add(metadata.len()),
+        );
+        for position in materialised {
+            let Some(column) = self.columns.get(*position) else {
+                continue;
+            };
+            // A partition key's value is the partition's, not the object's: a Parquet
+            // file at a partition's location carries no leaf for it.
+            if let Some(value) = self.partition_value(*position, partition) {
+                row.push(self.cell(column, value));
+                continue;
+            }
+            let held = self.leaf_of(leaves, column, *position);
+            let Some(held) = held else {
+                row.push(self.cell(column, None));
+                continue;
+            };
+            // The file says what type it stores the leaf as, so whether this column may be
+            // read from it at all is decided before the value is read as that column's type.
+            if let Some(refusal) =
+                stored_types::refusal(split.at, split.body.len(), column, held)
+            {
+                return Err(refusal);
+            }
+            match &held.cell {
+                // Binary data is held as the bytes the object carries: a binary
+                // column's value is not text, so it is never read through one.
+                parquet_objects::Cell::Bytes(data)
+                    if engine_type(&column.data_type) == TYPE_BLOB =>
+                {
+                    row.push(::rusqlite::types::Value::Blob(data.clone()));
+                }
+                held => row.push(self.cell(column, Some(&held.text()))),
+            }
+        }
+        row.extend(metadata.iter().cloned());
+        Ok(row)
+    }
+
+    /// The leaf the column at `position` reads, or `None` when the record holds no value for
+    /// it; see [`Self::parquet_row`] for which leaf that is.
+    fn leaf_of<'l>(
+        &self,
+        leaves: &'l [parquet_objects::RecordLeaf],
+        column: &DeclaredColumn,
+        position: usize,
+    ) -> Option<&'l parquet_objects::LeafValue> {
+        if self.index_access {
+            return leaves.get(position).and_then(|leaf| leaf.held.as_ref());
+        }
+        let wanted = glue_state::fold_name(&column.name);
+        leaves
             .iter()
-            .filter_map(|position| {
-                self.columns.get(*position).map(|column| (*position, column))
-            })
-            .map(|(position, column)| {
-                // A partition key's value is the partition's, not the object's: a Parquet
-                // file at a partition's location carries no leaf for it.
-                if let Some(value) = self.partition_value(position, partition) {
-                    return self.cell(column, value);
-                }
-                let held = values.get(&glue_state::fold_name(&column.name));
-                match held {
-                    // Binary data is held as the bytes the object carries: a binary
-                    // column's value is not text, so it is never read through one.
-                    Some(parquet_objects::Cell::Bytes(data))
-                        if engine_type(&column.data_type) == TYPE_BLOB =>
-                    {
-                        ::rusqlite::types::Value::Blob(data.clone())
-                    }
-                    Some(held) => self.cell(column, Some(&held.text())),
-                    None => self.cell(column, None),
-                }
-            })
-            .chain(metadata.iter().cloned())
-            .collect()
+            .find(|leaf| leaf.name == wanted)
+            .and_then(|leaf| leaf.held.as_ref())
     }
 
     /// One record as the row it holds: one value per MATERIALISED column, in the table's
@@ -1587,6 +1646,31 @@ fn partition_splits(
         .collect()
 }
 
+/// The partition values the object path `key` names for the partition keys `keys`: for each
+/// key in order, the value of the `<key>=<value>` path component naming it.
+///
+/// `None` when the path names no value for one of the keys, which is what says the object
+/// belongs to no partition of the table. The key names are matched FOLDED, the way the
+/// catalog holds every name it stores.
+///
+/// This is the inverse of [`hive_partition_location`], and the one rule both the READ of a
+/// table whose partitions the catalog does not hold and the DISCOVERY of the partitions a
+/// `MSCK REPAIR TABLE` registers go through — so what a repair registers is exactly what a
+/// read would have looked for.
+pub(super) fn hive_path_values(key: &str, keys: &[String]) -> Option<Vec<String>> {
+    let mut segments = key.split('/');
+    let mut values = Vec::with_capacity(keys.len());
+    for name in keys {
+        let wanted = glue_state::fold_name(name);
+        let found = segments.by_ref().find_map(|segment| {
+            let (name, value) = segment.split_once('=')?;
+            (glue_state::fold_name(name) == wanted).then(|| value.to_string())
+        })?;
+        values.push(found);
+    }
+    Some(values)
+}
+
 /// Where Hive keeps the partition `values` of a table at `table_location`: one directory per
 /// partition key under it, each named `<key>=<value>`.
 ///
@@ -1678,8 +1762,31 @@ fn is_hidden(key: &str) -> bool {
 /// compressed stream its own key names — because to the reader both are the same thing: a
 /// split it could not open.
 fn cannot_open_split(split: &str, reason: &str) -> Failure {
+    split_failure(split, None, reason)
+}
+
+/// The same failure for a split the reader DID open and could not read through: the BYTE
+/// RANGE of the object the read was given is named beside it, which is how Hive names the
+/// split it was reading when something in it stopped the read.
+pub(super) fn cannot_read_split(split: &str, length: usize, reason: &str) -> Failure {
+    split_failure(split, Some(length), reason)
+}
+
+/// Where in its object a split begins. One object of a table's location is ONE split here —
+/// nothing divides an object into several — so a read of it begins at the object's first
+/// byte.
+const SPLIT_OFFSET: usize = 0;
+
+/// Hive's wording for a split a read could not get through, which both failures above are
+/// reported in: the class, the object, the byte range of it the read was given where that
+/// range is known, and what stopped the read.
+fn split_failure(split: &str, length: Option<usize>, reason: &str) -> Failure {
+    let range = match length {
+        Some(length) => format!(" (offset={SPLIT_OFFSET}, length={length})"),
+        None => String::new(),
+    };
     Failure::user(format!(
-        "HIVE_CANNOT_OPEN_SPLIT: Error opening Hive split {split}: {reason}"
+        "HIVE_CANNOT_OPEN_SPLIT: Error opening Hive split {split}{range}: {reason}"
     ))
 }
 

@@ -30,12 +30,16 @@
 pub mod data;
 /// The statements the Data Catalog performs.
 pub mod ddl;
+/// The TERMS a parenthesised declaration list of Hive's DDL holds.
+mod declaration_list;
 /// Why an unregistered relation fails on the relation: the database the catalog carries.
 mod default_database;
 /// The type one expression of a statement has, resolved against the catalog at plan time.
 pub mod expression_types;
 /// What Athena says about text its query grammar cannot read as a statement.
 pub mod grammar;
+/// The `ALTER TABLE` column changes Hive's DDL grammar takes beyond the general parser.
+pub mod hive_alter_table;
 /// The `CREATE DATABASE` clauses Hive's DDL grammar takes beyond the general parser.
 pub mod hive_database;
 /// The column types Hive's DDL grammar takes beyond the general parser.
@@ -464,6 +468,21 @@ impl Failure {
         )
     }
 
+    /// An `ALTER TABLE … ADD COLUMNS` declares a column the table already declares, or a
+    /// column list that would carry one name twice.
+    ///
+    /// The statement is the HIVE DDL engine's, so it reports that engine's own task failure
+    /// (see [`Self::ddl_task`]): the metastore's sentence for a column list that would carry
+    /// one name twice, with the column the statement declared as its only variable part. The
+    /// task line carries that same sentence rather than an exception rendering, because no
+    /// exception rendering is recorded for this condition and none is invented here.
+    pub fn duplicate_column(column: &str) -> Self {
+        Self::ddl_task(
+            duplicate_column_sentence(column),
+            duplicate_column_sentence(column),
+        )
+    }
+
     /// A statement the HIVE DDL engine performs names a database the catalog does not
     /// hold.
     ///
@@ -809,6 +828,12 @@ fn hive_database_absent_diagnostic(database: &str) -> String {
 /// the statement named as its only variable part.
 fn database_already_exists_sentence(database: &str) -> String {
     format!("Database {database} already exists")
+}
+
+/// The sentence the metastore states a column list that would carry ONE NAME TWICE in, with
+/// the column the statement declared as its only variable part.
+fn duplicate_column_sentence(column: &str) -> String {
+    format!("Duplicate column name: {column}")
 }
 
 /// What a failed DDL task WROTE about a table that is ALREADY THERE: the metastore raises
@@ -1771,9 +1796,23 @@ fn perform<Eng: Send + Sync + 'static>(
         | CatalogStatement::DropTable { target, .. }
         | CatalogStatement::ShowCreateView { target } => (target.catalog.clone(), target.at),
         CatalogStatement::ShowRelations { schema, .. } => (schema.catalog.clone(), schema.at),
-        CatalogStatement::ShowPartitions { target } => (target.catalog.clone(), target.at),
+        CatalogStatement::ShowPartitions { target }
+        | CatalogStatement::RepairTable { target } => (target.catalog.clone(), target.at),
+        CatalogStatement::ChangeTableColumns(change) => {
+            (change.target.catalog.clone(), change.target.at)
+        }
+        CatalogStatement::ChangeTableProperties { target, .. } => {
+            (target.catalog.clone(), target.at)
+        }
     };
     let catalog_id = catalog_id_of(engine, &catalog, at)?;
+    // The partitions a `MSCK REPAIR TABLE` registers are the ones the OBJECTS under the
+    // table's location are laid out under, so this statement reads the object store between
+    // two reads of the catalog rather than inside one: the guard of each store is taken and
+    // released on its own, so no two are ever held at once.
+    if let CatalogStatement::RepairTable { target } = statement {
+        return repair_table(engine, &catalog_id, target, now);
+    }
     // An external table's LOCATION has to name storage the table can be registered over:
     // a bucket the object store holds, and a FOLDER inside it. Both halves are validated
     // here, before the catalog entry the statement would define is resolved, because what
@@ -1834,7 +1873,106 @@ fn perform<Eng: Send + Sync + 'static>(
         CatalogStatement::ShowPartitions { target } => {
             ddl::show_partitions(&store, &catalog_id, target)
         }
+        CatalogStatement::ChangeTableColumns(change) => {
+            ddl::change_table_columns(&mut store, &catalog_id, change, now)
+        }
+        CatalogStatement::ChangeTableProperties { target, properties } => {
+            ddl::change_table_properties(&mut store, &catalog_id, target, properties, now)
+        }
+        // Performed before the catalog's guard was taken, because it reads the object store
+        // as well.
+        CatalogStatement::RepairTable { .. } => Ok(StoredResultSet::default()),
     }
+}
+
+/// Register the partitions the OBJECTS under one table's location are laid out under, which
+/// is what `MSCK REPAIR TABLE` does.
+///
+/// The statement is the documented way to make Hive-style partition directories readable
+/// after data was loaded into them: every directory under the table's location whose path
+/// names a value for each of the table's partition keys is a partition of it, and the ones
+/// the catalog has no record of are registered — so a later read of the table scans them and
+/// `SHOW PARTITIONS` reports them. A partition the catalog already holds is left exactly as
+/// it is, and a table that declares no partition key, or whose entry records no location, has
+/// nothing to discover.
+///
+/// Each store is read under its OWN guard, in turn: the catalog says where to look and what
+/// the keys are, the object store says which directories are there, and the catalog then
+/// takes the records.
+fn repair_table<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    catalog_id: &str,
+    target: &Relation,
+    now: SystemTime,
+) -> Result<StoredResultSet, Failure> {
+    let Some(state) = glue_state::service_state(engine) else {
+        return Err(Failure::emulator(CATALOG_UNREACHABLE));
+    };
+    let partitioned = {
+        let store = state.lock();
+        ddl::partitioned_location(&store, catalog_id, target)?
+    };
+    let Some((location, keys)) = partitioned else {
+        return Ok(StoredResultSet::default());
+    };
+    let discovered = discovered_partitions(engine, &location, &keys)?;
+    let mut store = state.lock();
+    ddl::register_partitions(&mut store, catalog_id, target, &discovered, now)?;
+    Ok(StoredResultSet::default())
+}
+
+/// The partitions the objects under `location` are laid out under: for every object there,
+/// the values its own path names for the partition keys `keys`, and the directory those
+/// values name.
+///
+/// The layout is Hive's own — one `<key>=<value>` directory per key, in key order — which is
+/// the layout a read of a registered partition looks under and the one a statement that
+/// writes a partitioned table lays its objects out in ([`data::hive_partition_location`]), so
+/// discovery and reading share one rule. An object whose path names no value for one of the
+/// keys belongs to no partition of the table and is passed over, exactly as a read of the
+/// table passes over it.
+///
+/// BOUNDED by what the catalog could take anyway: how many objects the caller put at the
+/// location is the caller's choice, so the walk stops once it has found as many distinct
+/// partitions as one table may hold
+/// ([`glue_state::MAX_PARTITIONS_PER_TABLE`]) — past that the catalog would
+/// take no further record, so nothing is held for one.
+fn discovered_partitions<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    location: &str,
+    keys: &[String],
+) -> Result<Vec<(Vec<String>, String)>, Failure> {
+    let Some((bucket_name, prefix)) = data::parse_s3_uri(location) else {
+        return Err(Failure::location_not_readable(location));
+    };
+    let Some(state) = s3_state::service_state(engine) else {
+        return Err(Failure::emulator(OBJECT_STORE_UNREACHABLE));
+    };
+    let store = state.lock();
+    let Some(bucket) = store.bucket(&bucket_name) else {
+        return Err(Failure::location_not_readable(location));
+    };
+    let mut discovered: Vec<(Vec<String>, String)> = Vec::new();
+    let mut held: HashSet<Vec<String>> = HashSet::new();
+    for (key, _) in bucket.objects() {
+        if discovered.len() >= glue_state::MAX_PARTITIONS_PER_TABLE {
+            break;
+        }
+        if !data::under_prefix(key, &prefix) {
+            continue;
+        }
+        let Some(values) = data::hive_path_values(key, keys) else {
+            continue;
+        };
+        // Many objects live under ONE partition directory, so each partition is discovered
+        // once however many of them it holds.
+        if !held.insert(values.clone()) {
+            continue;
+        }
+        let at = data::hive_partition_location(location, keys, &values);
+        discovered.push((values, at));
+    }
+    Ok(discovered)
 }
 
 /// Whether `statement` is a `DROP TABLE` whose name the DATA CATALOG holds no database
