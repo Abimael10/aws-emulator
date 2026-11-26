@@ -425,6 +425,23 @@ pub fn addresses_connections(path: &str) -> bool {
         .any(|segment| segment == CONNECTIONS_SEGMENT)
 }
 
+/// Whether `path` addresses that same space BENEATH A BASE PATH, which is how it is addressed
+/// on a CUSTOM DOMAIN NAME: the mapping's key stands where the stage stands on an api's own
+/// endpoint, and "the API mapping key" is a path of ANY number of segments, so the binding can
+/// sit at any depth there rather than within the first two segments [`addresses_connections`]
+/// reads.
+///
+/// Read only where a custom domain name's own mappings are resolved
+/// ([`crate::service::invoke::custom_domain_arrival`]): the whole space is
+/// ApiGatewayManagementApi's on every host of this service, and that service claims it at any
+/// depth, so a reading of this question that stopped at the second segment would make two
+/// services claim one request.
+pub fn addresses_connections_under_a_base_path(path: &str) -> bool {
+    path_segments(path)
+        .into_iter()
+        .any(|segment| segment == CONNECTIONS_SEGMENT)
+}
+
 /// The first non-empty path segment: the stage name of an invoke path.
 pub fn first_segment(path: &str) -> Option<&str> {
     path_segments(path).into_iter().next()

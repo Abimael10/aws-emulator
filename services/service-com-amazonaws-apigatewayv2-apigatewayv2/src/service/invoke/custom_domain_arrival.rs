@@ -172,8 +172,15 @@ fn addressed_record<'s, 'p>(
 /// names the plane it spells — so it is served there, under whatever host it arrived on, and no
 /// mapping is read for it. (This service's own modelled control-plane path space is refused
 /// ahead of this reading, by [`super::resolve`], for the same reason.)
+///
+/// The `@connections` space is read at ANY depth here
+/// ([`crate::service::data_plane::addresses_connections_under_a_base_path`]), not within the
+/// first two segments as it is on an api's own endpoint: a custom domain name's base path
+/// stands where the stage stands and is a path of any length, and the service that owns the
+/// space claims it at any depth — so a narrower reading would leave two services claiming one
+/// request, which the router answers `500 AmbiguousService`.
 fn addresses_another_plane(path: &str) -> bool {
-    if super::addresses_connections(path) {
+    if crate::service::data_plane::addresses_connections_under_a_base_path(path) {
         return true;
     }
     super::split_first_segment(path).is_some_and(|(first, _rest)| {

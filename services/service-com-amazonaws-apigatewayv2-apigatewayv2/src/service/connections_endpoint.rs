@@ -17,9 +17,16 @@
 //! ([`super::invoke`], [`super::websocket`]): an `execute-api` endpoint serves a stage of an
 //! api it holds whose deployment has been released, and an addressing that resolves to no
 //! such stage is not the caller's to invoke — `403` `Forbidden`
-//! ([`super::data_plane::FORBIDDEN_MESSAGE`]). The FIRST segment of an invoke path is the
-//! stage name, so an addressing that carries no segment in front of the `@connections`
-//! binding resolves no stage at all and is one of those.
+//! ([`super::data_plane::FORBIDDEN_MESSAGE`]).
+//!
+//! What resolves is the host together with the WHOLE path in front of the `@connections`
+//! binding, because that binding is served on the complete path to a deployed stage: on an
+//! api's own endpoint that path is the stage NAME ("the stage name is typically appended to
+//! this URI to form a complete path to a deployed API stage", `Api$ApiEndpoint`), and on a
+//! custom domain name it is a BASE PATH that domain maps to a stage. So an addressing carrying
+//! no segment at all names no stage, and one carrying a segment beyond the stage names a path
+//! UNDER that stage rather than the stage's own endpoint — neither resolves a stage, and both
+//! are refused.
 
 use std::any::Any;
 
@@ -80,8 +87,7 @@ fn addressed(engine: &dyn Any, host: Option<&str>, prefix: &str) -> Option<Addre
 /// request is served on and the resource it is authorized against are one answer: an
 /// addressing that resolves a deployed stage is the caller's to invoke, and every other is
 /// not — including one whose invoke path carries NO segment in front of the modelled binding,
-/// since the first segment of an `execute-api` invoke path is the stage name, so a path
-/// without one names no stage and the endpoint serves nothing.
+/// and one that carries a segment beyond the stage ([`resolved`] states what resolves).
 fn judged_in(store: &ServiceStore, host: Option<&str>, prefix: &str) -> EndpointAuthority {
     match resolved_in(store, host, prefix) {
         Some(_stage) => EndpointAuthority::Deployed,
@@ -96,6 +102,11 @@ fn resolved_in(store: &ServiceStore, host: Option<&str>, prefix: &str) -> Option
 
 /// The stage one already-read `addressing` resolves — the api it names and the stage path left
 /// after it — so the verdict and the resource are one resolution read once.
+///
+/// The WHOLE path in front of the modelled binding is what resolves, not its first segment: the
+/// `@connections` space is bound on the complete path to a deployed stage, so a path carrying
+/// anything BEYOND what names that stage addresses something under the stage instead of the
+/// stage itself, and resolves no stage at all.
 fn resolved<'s>(
     store: &'s ServiceStore,
     host: Option<&str>,
@@ -103,21 +114,27 @@ fn resolved<'s>(
 ) -> Option<AddressedStage> {
     let (addressed_api, stage_path) = addressing;
     let segments = path_segments(stage_path);
-    let stage_name = *segments.first()?;
 
     // A custom domain name's BASE PATH is the other addressing that reaches a stage: the
-    // mapping on that path names the api and the stage, and the host names the domain.
-    if let Some(domain) = host
-        .map(host_name)
-        .and_then(|name| store.domain_names.get(name))
-    {
+    // mapping on that path names the api and the stage, and the host names the domain. The
+    // whole path has to BE that base path — the root one included, which is the mapping a
+    // domain name carrying no key occupies — and a request on a name of this account reaches
+    // that name's own mappings alone, so a path none of them occupies resolves no stage rather
+    // than falling back on a stage name of some other api.
+    if let Some(domain) = addressed_domain_name(store, host) {
         let base_path = segments.join("/");
-        if let Some(mapping) = domain.api_mapping_for_key(&base_path, None) {
-            return served_stage(store, &mapping.api_id, &mapping.stage);
-        }
+        return domain
+            .api_mapping_for_key(&base_path, None)
+            .and_then(|mapping| served_stage(store, &mapping.api_id, &mapping.stage));
     }
 
-    // Otherwise the FIRST segment is the stage name, of the api the endpoint NAMES.
+    // Otherwise the path is the stage NAME of the api the endpoint names, and nothing else:
+    // "the stage name is typically appended to this URI to form a complete path to a deployed
+    // API stage" (`Api$ApiEndpoint`), so one segment names a stage, none names no stage, and a
+    // segment beyond it is a path under the stage rather than the stage's own endpoint.
+    let [stage_name] = segments[..] else {
+        return None;
+    };
     match addressed_api {
         // An addressing that names an api id answers for THAT api alone, whether or not this
         // emulator holds it: an endpoint of an api that does not exist serves no stage.
@@ -130,6 +147,34 @@ fn resolved<'s>(
             .keys()
             .find_map(|api_id| served_stage(store, api_id, stage_name)),
     }
+}
+
+/// The custom domain name of this account the request's `host` addresses, or `None` when it
+/// addresses none.
+///
+/// Which host stands for a record is the one reading both front doors of a custom domain name
+/// share ([`super::domain_name_socket::host_names_domain_name`]: the name itself, compared as a
+/// DNS name is, or one label under a wildcard record's suffix), and the two kinds of host no
+/// record stands for are the ones that plane's own arrival reading excludes
+/// ([`super::invoke::custom_domain_arrival`]): an ADDRESS of this emulator, which is the only
+/// endpoint a client on this machine can reach and is no name a customer can point anywhere,
+/// and a host in a zone AWS publishes its OWN endpoints in, which is where an api's `execute-api`
+/// endpoint lives.
+fn addressed_domain_name<'s>(
+    store: &'s ServiceStore,
+    host: Option<&str>,
+) -> Option<&'s crate::state::DomainName> {
+    let addressed = host?;
+    let name = host_name(addressed);
+    if name.is_empty() || ::emulator_server::is_loopback_host(name) {
+        return None;
+    }
+    if ::service_common::data_plane_addressing::addresses_an_aws_endpoint(addressed) {
+        return None;
+    }
+    store.domain_names.values().find(|record| {
+        super::domain_name_socket::host_names_domain_name(&record.domain_name, name)
+    })
 }
 
 /// The api the addressing NAMES, and the stage path left after it.
