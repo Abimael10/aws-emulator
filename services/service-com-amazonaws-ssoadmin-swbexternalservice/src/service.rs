@@ -51,6 +51,13 @@
 //!   answered in the `Message` member every error shape of this model declares. Routing,
 //!   status, the error code and the text itself all stay with the framework.
 
+//!
+//! One further route this service serves is not a modelled operation at all: the portal icon
+//! of an application-provider catalog entry, which `DisplayData$IconUrl` locates for a client
+//! to fetch. It is claimed in `can_handle` and answered in `override_routing_error`, both
+//! implemented in [`provider_icon`].
+
+pub mod provider_icon;
 pub mod refusal;
 
 use smithy_server_runtime::{
@@ -96,7 +103,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // name shared by several services, or access-key-id-based routing.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            None => {
+                // The portal icon of an application-provider catalog entry
+                // (`DisplayData$IconUrl`) is fetched by whatever browser or portal renders
+                // that provider's tile: anonymously, with no credential scope and no
+                // `X-Amz-Target` to name this service by — only the path this service itself
+                // published. A GET (or a HEAD, which asks what that asset is) of exactly
+                // that path is therefore claimed here, so the icon is reachable at the URL
+                // this service reported; every other path still needs the routing key above.
+                provider_icon::claims(parts.method.as_str(), &parts.uri.to_string())
+            }
         }
     }
 
@@ -129,12 +145,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. This endpoint serves ONE route the Smithy model does
+        // not describe: the portal icon of an application-provider catalog entry, which
+        // `DisplayData$IconUrl` locates for a client to fetch. IAM Identity Center serves it
+        // unauthenticated from its own asset host, which is what this seam gives: the router
+        // consults it before it authenticates anything, so an anonymous fetch reaches the
+        // icon the same way it does on AWS (see [`provider_icon`]).
+        //
+        // Every other unrouted request keeps the protocol-correct default for this service's
+        // envelope (query -> 400 InvalidAction text/xml, awsJson -> 404, rpcv2Cbor -> 404,
+        // rest -> 501).
+        provider_icon::served(req)
     }
 
     fn override_framework_error(

@@ -1,40 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The application-provider catalog's PUBLISHED data, end to end over the `awsJson1_1`
-//! wire: `ListApplicationProviders` and `DescribeApplicationProvider` report what the
-//! catalog record holds and nothing it does not.
+//! The application-provider catalog's PUBLISHED icons, end to end over the `awsJson1_1`
+//! wire and over the address those icons are fetched at: `ListApplicationProviders` and
+//! `DescribeApplicationProvider` report where a client fetches an entry's portal icon, and
+//! this emulator answers there.
 //!
 //! The rules under test:
 //!
-//! 1. `DisplayData$IconUrl` is per-provider PUBLISHED catalog data, carried on the record
-//!    ([`state::BuiltInApplicationProvider::icon_url`]): a read reports it verbatim for an
-//!    entry the catalog publishes an icon asset for, and reports NO `IconUrl` member for an
-//!    entry it publishes none for (the member is optional in the model:
-//!    `smithy_query(query="shape", shape="DisplayData")` — `DisplayName` 1..100, `IconUrl`
-//!    1..768 matching `^(http|https)://.*$`, `Description` 1..128, all three optional). It
-//!    is never computed from the provider id, so two entries publish two unrelated asset
-//!    ids and an entry that publishes none gets no invented one.
-//! 2. The catalog is published in its OWN order, and the enumeration reports it in that
+//! 1. `DisplayData$IconUrl` is reported for exactly the entries the catalogue publishes an
+//!    icon for ([`state::BuiltInApplicationProvider::publishes_icon`]) and for no other (the
+//!    member is optional in the model: `smithy_query(query="shape", shape="DisplayData")` —
+//!    `DisplayName` 1..100, `IconUrl` 1..768 matching `^(http|https)://.*$`, `Description`
+//!    1..128, all three optional).
+//! 2. A reported `IconUrl` leads back to THE ENDPOINT THE REQUEST ARRIVED AT: its scheme and
+//!    authority are the endpoint's, never a host this emulator does not serve, and the path
+//!    names the entry whose icon it is. A client following it reaches this emulator and is
+//!    answered the entry's icon — a real PNG under the media type it is announced with —
+//!    while an address naming an entry that publishes no icon, or no catalogue entry at all,
+//!    is answered "nothing here".
+//! 3. The catalogue is published in its OWN order, and the enumeration reports it in that
 //!    order: the entry at a given position is the same entry on every call, and the
 //!    discover-then-inspect flow — enumerate, then describe the ARN the enumeration
 //!    reported — comes back with THAT entry, member for member, through the one projection
 //!    both reads share.
 //!
-//! The tables span what the rules generalise over: every entry of the catalog (read from
+//! The tables span what the rules generalise over: every entry of the catalogue (read from
 //! the crate so the test tracks it rather than restating it), entries that publish an icon
 //! and entries that do not, both id forms (`catalog/<Name>` and a service slug), the
-//! positions a client picks an entry by (the head of the catalog and the last entry of a
+//! positions a client picks an entry by (the head of the catalogue and the last entry of a
 //! page), and entries the recorded cases cite (`custom`, `catalog/Statuspage`) beside
 //! entries they do not (`glue`, `catalog/Zoom`, `athena`).
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints and
-//! the `X-Amz-Target` routing are exercised rather than bypassed. The harness is the one
-//! `ssoadmin_permission_sets.rs` owns.
+//! the `X-Amz-Target` routing are exercised rather than bypassed — and so is the anonymous
+//! fetch of an icon, which carries no credential scope and no `X-Amz-Target` at all. The
+//! harness is the one `ssoadmin_permission_sets.rs` owns.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::application_providers::EMULATOR_BASE;
 use crate::ssoadmin_permission_sets::{call, router};
 
 /// The members a listed entry and a described provider must agree on: one catalog, two
@@ -46,23 +52,10 @@ const PROVIDER_MEMBERS: &[&str] = &[
     "ResourceServerConfig",
 ];
 
-/// The fixed text of a provider's published portal icon URL, around the one variable part
-/// the catalog record carries for that entry.
-///
-/// SOURCE: recorded `DescribeApplicationProvider` behavior — a provider's `IconUrl` is
-/// `https://static.global.sso.amazonaws.com/app-<the entry's published asset id>/icons/default.png`.
-/// Stated here so the expectation is the published FORM and the record supplies only the
-/// asset id, rather than the production helper being compared against itself.
-const ICON_URL_PREFIX: &str = "https://static.global.sso.amazonaws.com/app-";
-const ICON_URL_SUFFIX: &str = "/icons/default.png";
-
-/// The portal icon URL the catalog publishes for `provider`, composed from the record's
-/// asset id, or `None` for an entry the catalog publishes no icon asset for.
-fn published_icon_url(provider: &state::BuiltInApplicationProvider) -> Option<String> {
-    provider
-        .icon_asset_id
-        .map(|asset_id| format!("{ICON_URL_PREFIX}{asset_id}{ICON_URL_SUFFIX}"))
-}
+/// The first eight bytes of every PNG file (RFC 2083 section 3.1): what an icon fetch must
+/// answer, stated here so the expectation is the FORMAT and not the renderer compared
+/// against itself.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// The ARN of the built-in provider `id` in the partition the emulator serves.
 fn provider_arn(id: &str) -> String {
@@ -77,6 +70,38 @@ async fn describe(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
         &json!({"ApplicationProviderArn": arn}),
     )
     .await
+}
+
+/// One ANONYMOUS fetch of an address a provider read handed out — no SigV4, no
+/// `X-Amz-Target`, exactly what a browser rendering a portal tile sends — as
+/// `(status, media type, body)`.
+///
+/// The URL's own path is what is dispatched: a client of the emulator reaches this process
+/// at the endpoint the URL names, so the path is what identifies the asset.
+async fn fetch(
+    router: &MultiServiceRouter,
+    method: &str,
+    url: &str,
+    case: &str,
+) -> (u16, String, Vec<u8>) {
+    let path = url
+        .split_once("://")
+        .and_then(|(_scheme, rest)| rest.find('/').map(|at| rest[at..].to_string()))
+        .unwrap_or_else(|| panic!("case {case:?}: expected a URL with a path, got {url:?}"));
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .body(bytes::Bytes::new())
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let media_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, media_type, response.into_body().to_vec())
 }
 
 /// One page of `ListApplicationProviders`, `MaxResults` entries at a time when one is
@@ -132,8 +157,8 @@ async fn list_all(router: &MultiServiceRouter) -> Vec<Value> {
 }
 
 /// RULE 1 — over EVERY entry of the catalog, on both reads: `IconUrl` is reported exactly
-/// when the record publishes an icon asset, and then it is the record's published URL
-/// verbatim.
+/// when the catalogue publishes an icon for the entry, and then it is the address this
+/// emulator serves that entry's icon at.
 #[tokio::test]
 async fn an_icon_url_is_reported_exactly_for_the_entries_that_publish_one() {
     let router = router();
@@ -144,9 +169,9 @@ async fn an_icon_url_is_reported_exactly_for_the_entries_that_publish_one() {
     for provider in state::BUILT_IN_APPLICATION_PROVIDERS {
         let case = provider.id;
         let arn = provider_arn(case);
-        match published_icon_url(provider) {
-            Some(_) => published += 1,
-            None => unpublished += 1,
+        match provider.publishes_icon {
+            true => published += 1,
+            false => unpublished += 1,
         }
         let entry = listed
             .iter()
@@ -159,17 +184,17 @@ async fn an_icon_url_is_reported_exactly_for_the_entries_that_publish_one() {
         );
 
         for read in [&entry["DisplayData"], &described["DisplayData"]] {
-            match published_icon_url(provider) {
+            match provider.icon_url(EMULATOR_BASE) {
                 Some(expected) => {
                     assert_eq!(
                         read["IconUrl"].as_str(),
                         Some(expected.as_str()),
-                        "case {case:?}: expected the published IconUrl {expected:?}, got {read}"
+                        "case {case:?}: expected the IconUrl {expected:?}, got {read}"
                     );
                     assert!(
                         (1..=768).contains(&expected.chars().count())
                             && expected.starts_with("https://"),
-                        "case {case:?}: a published IconUrl is 1..768 characters matching \
+                        "case {case:?}: an IconUrl is 1..768 characters matching \
                          ^(http|https)://.*$, got {expected:?}"
                     );
                 }
@@ -208,77 +233,182 @@ async fn an_icon_url_is_reported_exactly_for_the_entries_that_publish_one() {
     );
 }
 
-/// RULE 1 — a published icon URL is the ENTRY's own data: the asset id comes from the
-/// record, not from the provider id, so entries whose ids share a prefix or a form carry
-/// unrelated asset ids and an entry with no published asset carries none.
+/// RULE 2 — every `IconUrl` a read reports is an address on THIS EMULATOR'S endpoint,
+/// naming the entry whose icon it is: no entry of the catalogue, whichever id form it
+/// carries, is reported with an address on a host this emulator does not serve.
 ///
-/// The rows name the entries the recorded cases cite and entries they do not.
+/// Asserted over every entry the enumeration reports, which is the table RULE 1's own rows
+/// are drawn from.
 #[tokio::test]
-async fn a_published_icon_url_carries_the_entrys_own_asset_id() {
+async fn every_reported_icon_url_is_addressed_on_this_emulators_endpoint() {
     let router = router();
+    let listed = list_all(&router).await;
+    let mut addressed = 0usize;
 
-    // SOURCE: recorded `DescribeApplicationProvider` behavior — see [`ICON_URL_PREFIX`]:
-    // the asset id is the entry's own published data. The rows are read from the crate's
-    // catalog, so this test states the FORM and the record states the value.
-
-    let mut asset_ids: Vec<String> = Vec::new();
-    for id in [
-        "custom",
-        "catalog/Statuspage",
-        "glue",
-        "athena",
-        "catalog/Zoom",
-        "catalog/15Five",
-    ] {
-        let arn = provider_arn(id);
-        let record = state::built_in_application_provider(&arn)
-            .unwrap_or_else(|| panic!("case {id:?}: the catalog must hold {arn}"));
-        let (status, body) = describe(&router, &arn).await;
-        assert_eq!(status, 200, "case {id:?}: expected 200, got {status} {body}");
-        let reported = body["DisplayData"]["IconUrl"].as_str();
-
-        match record.icon_asset_id {
-            Some(asset_id) => {
-                let expected = format!("{ICON_URL_PREFIX}{asset_id}{ICON_URL_SUFFIX}");
-                assert_eq!(
-                    reported,
-                    Some(expected.as_str()),
-                    "case {id:?}: expected the entry's published icon {expected:?}, got \
-                     {reported:?}"
-                );
-                asset_ids.push(asset_id.to_string());
-            }
-            None => assert_eq!(
-                reported, None,
-                "case {id:?}: the catalog publishes no icon asset for this entry, so none \
-                 may be reported, got {reported:?}"
-            ),
-        }
-        // The whole-provider envelope reports the same icon as the flat member.
+    for entry in &listed {
+        let arn = entry["ApplicationProviderArn"].as_str().unwrap_or_default();
+        let Some(icon_url) = entry["DisplayData"]["IconUrl"].as_str() else {
+            continue;
+        };
+        addressed += 1;
+        let id = arn
+            .split_once(":sso::aws:applicationProvider/")
+            .map(|(_prefix, id)| id)
+            .unwrap_or_else(|| panic!("case {arn:?}: expected a provider ARN"));
         assert_eq!(
-            body["ApplicationProvider"]["DisplayData"]["IconUrl"].as_str(),
-            reported,
-            "case {id:?}: the reported provider must carry the same icon as the flat \
-             member, got {body}"
+            icon_url,
+            state::provider_icon_url(EMULATOR_BASE, id),
+            "case {arn:?}: expected the icon address on the endpoint the read arrived at, got \
+             {icon_url:?}"
+        );
+        // The path this emulator serves the icon on reads the entry back out of the address,
+        // so the address and the route cannot name two different entries.
+        assert_eq!(
+            state::provider_icon_route(icon_url),
+            Some(id),
+            "case {arn:?}: expected the address to name this entry, got {icon_url:?}"
         );
     }
 
     assert!(
-        asset_ids.len() > 1,
-        "the rows must cover more than one published asset id for the per-entry rule to be \
-         observable, got {asset_ids:?}"
-    );
-    let mut distinct = asset_ids.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    assert_eq!(
-        distinct.len(),
-        asset_ids.len(),
-        "each entry publishes its own asset id, got {asset_ids:?}"
+        addressed > 1,
+        "the catalogue must report more than one icon address for this rule to be observable, \
+         got {addressed}"
     );
 }
 
-/// RULE 2 — the enumeration reports the catalog in the catalog's own published order, and
+/// RULE 2 — a client that FOLLOWS a reported `IconUrl` is answered that entry's icon: a
+/// real PNG, under the media type it is announced with, the same bytes on every fetch and a
+/// different image per entry. A `HEAD` of the same address reports what the asset is with
+/// no body.
+///
+/// The rows name entries the recorded cases cite (`custom`, `catalog/Statuspage`) and
+/// entries they do not (`catalog/DuoNetworkGateway`, `catalog/DruvaInSync`, `catalog/Zoom`),
+/// spanning both id forms.
+#[tokio::test]
+async fn a_reported_icon_url_is_served_by_this_emulator() {
+    let router = router();
+    let mut images: Vec<Vec<u8>> = Vec::new();
+
+    for id in [
+        "custom",
+        "catalog/Statuspage",
+        "catalog/DuoNetworkGateway",
+        "catalog/DruvaInSync",
+        "catalog/Zoom",
+    ] {
+        let arn = provider_arn(id);
+        let (status, described) = describe(&router, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case {id:?}: DescribeApplicationProvider expected 200, got {status} {described}"
+        );
+        let icon_url = described["DisplayData"]["IconUrl"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {id:?}: expected a reported IconUrl, got {described}"))
+            .to_string();
+
+        let (status, media_type, body) = fetch(&router, "GET", &icon_url, id).await;
+        assert_eq!(
+            status, 200,
+            "case {id:?}: fetching {icon_url:?} expected 200, got {status} with {} bytes",
+            body.len()
+        );
+        assert_eq!(
+            media_type,
+            state::PROVIDER_ICON_MEDIA_TYPE,
+            "case {id:?}: expected the icon announced as {:?}, got {media_type:?}",
+            state::PROVIDER_ICON_MEDIA_TYPE
+        );
+        assert!(
+            body.starts_with(&PNG_SIGNATURE),
+            "case {id:?}: expected PNG bytes, got {} bytes starting {:?}",
+            body.len(),
+            body.get(..PNG_SIGNATURE.len())
+        );
+
+        // The same address answers the same image on a later fetch: the icon is the
+        // catalogue's data, not something a fetch invents.
+        let (_, _, again) = fetch(&router, "GET", &icon_url, id).await;
+        assert_eq!(
+            again, body,
+            "case {id:?}: every fetch of one address must answer the same image"
+        );
+        assert!(
+            !images.contains(&body),
+            "case {id:?}: each entry must be served an image of its own"
+        );
+        images.push(body.clone());
+
+        // A client asking only WHAT the asset is gets its type and its size, and no body.
+        let (status, media_type, probed) = fetch(&router, "HEAD", &icon_url, id).await;
+        assert_eq!(
+            status, 200,
+            "case {id:?}: a HEAD of {icon_url:?} expected 200, got {status}"
+        );
+        assert_eq!(
+            media_type,
+            state::PROVIDER_ICON_MEDIA_TYPE,
+            "case {id:?}: a HEAD must announce the asset's media type, got {media_type:?}"
+        );
+        assert!(
+            probed.is_empty(),
+            "case {id:?}: a HEAD answers no body, got {} bytes",
+            probed.len()
+        );
+    }
+
+    assert!(
+        images.len() > 1,
+        "the rows must cover more than one served icon for the per-entry rule to be \
+         observable, got {}",
+        images.len()
+    );
+}
+
+/// RULE 2 — an address that names no icon of this catalogue is answered "nothing here", and
+/// nothing is invented for it.
+///
+/// The rows span the ways such an address can fail: an entry the catalogue publishes no icon
+/// for, ids the catalogue does not hold in either form, and a path of the right shape under
+/// no provider at all.
+#[tokio::test]
+async fn an_address_naming_no_published_icon_is_answered_nothing() {
+    let router = router();
+
+    let unpublished = state::BUILT_IN_APPLICATION_PROVIDERS
+        .iter()
+        .find(|provider| !provider.publishes_icon)
+        .expect("the catalogue must hold an entry that publishes no icon");
+    for case in [
+        unpublished.id,
+        "catalog/NoSuchApplication",
+        "no-such-service",
+    ] {
+        let url = state::provider_icon_url(EMULATOR_BASE, case);
+        let (status, _media_type, body) = fetch(&router, "GET", &url, case).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 for {url:?}, got {status} with {} bytes",
+            body.len()
+        );
+        assert!(
+            !body.starts_with(&PNG_SIGNATURE),
+            "case {case:?}: no image may be served for an address naming no published icon"
+        );
+    }
+
+    // The plane itself, with no entry under it, is not an icon address at all.
+    let bare = format!("{EMULATOR_BASE}/_aws/{}", state::PROVIDER_ICON_PLANE);
+    let (status, _media_type, body) = fetch(&router, "GET", &bare, "the bare plane").await;
+    assert_ne!(
+        status, 200,
+        "case {bare:?}: the plane itself names no icon, got {status} with {} bytes",
+        body.len()
+    );
+}
+
+/// RULE 3 — the enumeration reports the catalog in the catalog's own published order, and
 /// describing the ARN a position reported comes back with THAT entry: the
 /// discover-then-inspect flow. The rows are the positions a client picks an entry by.
 #[tokio::test]

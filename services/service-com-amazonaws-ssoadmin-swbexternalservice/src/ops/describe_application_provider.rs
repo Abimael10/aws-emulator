@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (ctx, &self.engine);
+        let _ = &self.engine;
         // A pure READ of a fixed catalogue: there is no per-account state to reach, and
         // nothing here writes.
         let Some(provider) =
@@ -193,7 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let provider_shape = provider.to_shape_under_arn(input.application_provider_arn);
+        // The icon of the reported entry is served on the endpoint THIS request arrived at
+        // (`crate::state::provider_icon_url`), so the address a client is handed leads back
+        // to the endpoint it is already talking to.
+        let endpoint_base = ctx.endpoint();
+        let provider_shape =
+            provider.to_shape_under_arn(input.application_provider_arn, endpoint_base.as_str());
         Ok(DescribeApplicationProviderOutput {
             // The entry as the modelled `ApplicationProvider`, under the ARN as ASKED
             // FOR: the catalog is keyed by provider id, so the partition the caller

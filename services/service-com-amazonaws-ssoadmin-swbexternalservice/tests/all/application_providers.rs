@@ -11,8 +11,8 @@
 //! `DescribeApplicationProvider` answers from): every entry exactly once, in the
 //! CATALOGUE'S OWN order (the order of a service-published catalogue is the service's
 //! data, not something this read imposes), every entry carrying the `DisplayData` the
-//! record holds (`DisplayName`, `Description`, and the published `https` `IconUrl` of the
-//! entries the catalogue publishes an icon for) and a
+//! record holds (`DisplayName`, `Description`, and \u2014 for the entries the catalogue
+//! publishes an icon for \u2014 the `IconUrl` address THIS EMULATOR serves that icon at) and a
 //! `ResourceServerConfig` exactly when the entry publishes access scopes. The enumeration
 //! is PAGED: a response carries at most the effective page size — the caller's
 //! `MaxResults` when it named one, this service's default page size
@@ -37,6 +37,12 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{call, error_code, router, seeded_instance_arn};
+
+/// The base URL this emulator reports itself at when it is not served on a socket
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]): what `ctx.endpoint()` answers an
+/// in-process call, and so the endpoint every address a read of this harness hands out is
+/// composed on. Shared with the suites that assert on those addresses.
+pub(crate) const EMULATOR_BASE: &str = smithy_server_runtime::UNSERVED_URL_BASE;
 
 /// The model's `MaxResults` bounds for this operation: `range(min: 1, max: 100)`
 /// (`smithy_query(query="operation", operation="ListApplicationProviders")`).
@@ -354,9 +360,9 @@ async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
 }
 
 /// RULE — `DisplayData` carries the record's display name, its display name as an
-/// application as the description, and the provider's PUBLISHED portal icon URL only when
-/// the catalogue publishes one for the entry, each inside the member's modelled length
-/// (`DisplayName` 1..100, `Description` 1..128, `IconUrl` 1..768 matching
+/// application as the description, and — only for an entry the catalogue publishes an icon
+/// for — the address THIS EMULATOR serves that entry's icon at, each inside the member's
+/// modelled length (`DisplayName` 1..100, `Description` 1..128, `IconUrl` 1..768 matching
 /// `^(http|https)://.*$`).
 ///
 /// The description rule holds for EVERY entry, whichever of the two id forms it carries:
@@ -400,9 +406,9 @@ pub(crate) fn assert_display_data(
     );
 
     // `IconUrl` is reported exactly when the catalogue PUBLISHES an icon for the entry:
-    // the published URL verbatim, and no member at all otherwise.
+    // the address this emulator serves that entry's icon at, and no member at all otherwise.
     // `application_provider_published_icons.rs` owns the suite that states this rule.
-    let Some(published) = provider.icon_url() else {
+    let Some(published) = provider.icon_url(EMULATOR_BASE) else {
         assert!(
             display_data["IconUrl"].is_null(),
             "case {id:?}: the catalogue publishes no icon for this entry, so none may be \
@@ -415,11 +421,13 @@ pub(crate) fn assert_display_data(
     });
     assert_eq!(
         icon_url, published,
-        "case {id:?}: expected the record's published IconUrl {published:?}, got {icon_url:?}"
+        "case {id:?}: expected the entry's icon on this emulator's endpoint {published:?}, got \
+         {icon_url:?}"
     );
     assert!(
-        icon_url.starts_with("https://"),
-        "case {id:?}: IconUrl must match ^(http|https)://.*$, got {icon_url:?}"
+        icon_url.starts_with(&format!("{EMULATOR_BASE}/")),
+        "case {id:?}: an IconUrl must lead back to the endpoint the request arrived at \
+         ({EMULATOR_BASE}), got {icon_url:?}"
     );
     assert!(
         (1..=768).contains(&icon_url.chars().count()),
@@ -461,9 +469,9 @@ pub(crate) fn assert_resource_server_config(
     }
 }
 
-/// RULE — a provider's published icon URL is the catalogue record's own data, so it is
-/// STABLE across reads and DISTINCT per provider: no two entries that publish an icon
-/// share one.
+/// RULE — a provider's icon URL is composed from the catalogue record and the endpoint the
+/// read arrived at, so it is STABLE across reads and DISTINCT per provider: no two entries
+/// that publish an icon share one.
 #[tokio::test]
 async fn every_published_icon_url_is_stable_and_its_own() {
     let router = router();
@@ -483,7 +491,7 @@ async fn every_published_icon_url_is_stable_and_its_own() {
         total,
         state::BUILT_IN_APPLICATION_PROVIDERS
             .iter()
-            .filter(|provider| provider.icon_url().is_some())
+            .filter(|provider| provider.publishes_icon)
             .count(),
         "an IconUrl is reported for exactly the entries the catalogue publishes one for, \
          got {total}"

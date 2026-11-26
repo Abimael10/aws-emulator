@@ -60,6 +60,12 @@ pub use tag_requests::*;
 mod sign_in_options;
 pub use sign_in_options::*;
 
+/// Where a client fetches the portal icon of an application-provider catalog entry, and the
+/// image this emulator serves there. Re-exported, so `crate::state::provider_icon_url` and
+/// friends stay the paths the two provider reads and the serving route ask them through.
+mod provider_icons;
+pub use provider_icons::*;
+
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
 ///
 /// IAM Identity Center allows ONE instance per account, so the emulator seeds exactly
@@ -4163,11 +4169,17 @@ pub struct BuiltInApplicationProvider {
     /// provider — empty for a provider that exposes no resource server, which is then
     /// reported with no `ResourceServerConfig` at all rather than an empty one.
     pub scopes: &'static [BuiltInAccessScope],
-    /// The asset id in the provider's published portal icon URL
-    /// (`DisplayData$IconUrl`), or `None` for a provider the catalog publishes no icon
-    /// asset for — `IconUrl` is an optional member and no rule derives the asset id from
-    /// the provider id, so it is carried per entry ([`BuiltInApplicationProvider::icon_url`]).
-    pub icon_asset_id: Option<&'static str>,
+    /// Whether the catalog publishes a portal ICON for this entry — `DisplayData$IconUrl`,
+    /// which is optional in the model and reported only for an entry that has one.
+    ///
+    /// Per-entry published data, not something derived from the id: a pre-integrated
+    /// application of the IAM Identity Center catalog is a portal tile and carries the
+    /// application's icon, where an Amazon Web Services managed provider — an API an
+    /// identity propagates into rather than a tile a user clicks — carries none. WHERE the
+    /// icon is fetched is not stored at all: the address is composed per read from the
+    /// endpoint the request arrived at ([`provider_icon_url`]), because a URL this emulator
+    /// hands a caller has to lead back to the endpoint that caller is talking to.
+    pub publishes_icon: bool,
 }
 
 /// One IAM Identity Center access scope of a provider's resource server, as
@@ -4196,21 +4208,6 @@ impl BuiltInAccessScope {
     }
 }
 
-/// The host every provider icon of the IAM Identity Center portal is served from.
-///
-/// SOURCE: recorded behavior — a provider's `DisplayData$IconUrl` is an `https` URL under
-/// this static asset host, of the form `https://<host>/app-<asset id>/icons/default.png`.
-/// The asset id is the provider's OWN published data: no rule derives it from the provider
-/// id, so an entry carries the published URL it has and no URL at all otherwise
-/// ([`BuiltInApplicationProvider::icon_url`]).
-const PROVIDER_ICON_HOST: &str = "static.global.sso.amazonaws.com";
-
-/// The published portal icon URL of the provider whose published asset id is `asset_id`:
-/// `https://<icon host>/app-<asset id>/icons/default.png`.
-fn provider_icon_url(asset_id: &str) -> String {
-    format!("https://{PROVIDER_ICON_HOST}/app-{asset_id}/icons/default.png")
-}
-
 /// The portal description of an application provider: its display name followed by this
 /// word.
 ///
@@ -4232,27 +4229,22 @@ const FEDERATION_SAML: &str = "SAML";
 const FEDERATION_OAUTH: &str = "OAUTH";
 
 impl BuiltInApplicationProvider {
-    /// This provider with `icon_asset_id` as the published asset id of its portal icon.
-    pub const fn with_icon_asset_id(mut self, icon_asset_id: &'static str) -> Self {
-        self.icon_asset_id = Some(icon_asset_id);
-        self
-    }
-
-    /// This provider's `DisplayData$IconUrl` — the published icon URL of its portal asset
-    /// ([`provider_icon_url`]) — or `None` for a provider the catalog publishes no icon
-    /// asset for.
-    pub fn icon_url(&self) -> Option<String> {
-        self.icon_asset_id.map(provider_icon_url)
+    /// This provider's `DisplayData$IconUrl` — the address THIS emulator serves its portal
+    /// icon at, on `endpoint_base`, the endpoint the reading request arrived at
+    /// ([`provider_icon_url`]) — or `None` for a provider the catalog publishes no icon for.
+    pub fn icon_url(&self, endpoint_base: &str) -> Option<String> {
+        self.publishes_icon
+            .then(|| provider_icon_url(endpoint_base, self.id))
     }
 
     /// This provider's `DisplayData`: the display name from the record, the description
-    /// composed from it, and the published icon URL only when the record carries one —
-    /// `IconUrl` is optional in the model, and an entry the catalog publishes no icon for
-    /// is reported without it rather than with an invented one.
-    pub fn display_data(&self) -> DisplayData {
+    /// composed from it, and the icon URL only for an entry the catalog publishes an icon
+    /// for — `IconUrl` is optional in the model, and an entry that publishes none is
+    /// reported without it rather than with an invented one.
+    pub fn display_data(&self, endpoint_base: &str) -> DisplayData {
         DisplayData {
             display_name: Some(self.display_name.to_string()),
-            icon_url: self.icon_url(),
+            icon_url: self.icon_url(endpoint_base),
             description: Some(self.description()),
         }
     }
@@ -4314,8 +4306,8 @@ impl BuiltInApplicationProvider {
     /// projection `ListApplicationProviders` reports, holding exactly what
     /// `DescribeApplicationProvider` reports for the same entry, under this provider's ARN
     /// in the `aws` partition.
-    pub fn to_shape(&self) -> ApplicationProvider {
-        self.to_shape_under_arn(self.arn())
+    pub fn to_shape(&self, endpoint_base: &str) -> ApplicationProvider {
+        self.to_shape_under_arn(self.arn(), endpoint_base)
     }
 
     /// This provider as the modeled `ApplicationProvider` shape, reported under
@@ -4325,11 +4317,15 @@ impl BuiltInApplicationProvider {
     /// ([`built_in_application_provider`] matches on the id alone), so a read that was
     /// ASKED about one partition reports the entry under the ARN it was asked about; an
     /// enumeration, which is asked about no ARN at all, reports [`Self::arn`].
-    pub fn to_shape_under_arn(&self, application_provider_arn: String) -> ApplicationProvider {
+    pub fn to_shape_under_arn(
+        &self,
+        application_provider_arn: String,
+        endpoint_base: &str,
+    ) -> ApplicationProvider {
         ApplicationProvider {
             application_provider_arn,
             federation_protocol: Some(self.federation_protocol.to_string()),
-            display_data: Some(self.display_data()),
+            display_data: Some(self.display_data(endpoint_base)),
             resource_server_config: self.resource_server_config(),
         }
     }
@@ -4345,7 +4341,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// publishes — where it has one — its resource server's access scopes.
 ///
 /// The applications under such a provider are created by the Amazon Web Services service
-/// that owns it, not by the customer, so none of them is customer managed.
+/// that owns it, not by the customer, so none of them is customer managed. It is an API an
+/// identity propagates into rather than a portal tile a user clicks, so the catalog
+/// publishes no icon for it.
 const fn aws_managed_provider(
     id: &'static str,
     display_name: &'static str,
@@ -4357,13 +4355,15 @@ const fn aws_managed_provider(
         customer_managed: false,
         display_name,
         scopes,
-        icon_asset_id: None,
+        publishes_icon: false,
     }
 }
 
 /// The CUSTOM application provider: the one provider whose applications the CUSTOMER
 /// creates and manages, over OAuth 2.0 — the provider `CreateApplication` mints an
 /// application under ([`BuiltInApplicationProvider::accepts_customer_managed_application`]).
+///
+/// Its applications ARE portal tiles, so the catalog publishes an icon for it.
 const fn customer_managed_provider(
     id: &'static str,
     display_name: &'static str,
@@ -4375,7 +4375,7 @@ const fn customer_managed_provider(
         customer_managed: true,
         display_name,
         scopes,
-        icon_asset_id: None,
+        publishes_icon: true,
     }
 }
 
@@ -4383,6 +4383,8 @@ const fn customer_managed_provider(
 /// 2.0 application whose ARN id is `catalog/<Name>` and which exposes no resource server
 /// of its own (the application is the relying party, not an API an identity propagates
 /// into).
+///
+/// A pre-integrated application is a PORTAL TILE, so the catalog publishes an icon for it.
 const fn catalog_application(
     id: &'static str,
     display_name: &'static str,
@@ -4394,7 +4396,7 @@ const fn catalog_application(
         customer_managed: false,
         display_name,
         scopes: &[],
-        icon_asset_id: None,
+        publishes_icon: true,
     }
 }
 
@@ -4422,33 +4424,25 @@ const fn catalog_application(
 /// rule derives, and it is published in the order written here — a service-published
 /// catalog's order is its own data, which is why no read of it sorts. The order written
 /// here leads with the entries the recorded catalog publishes first
-/// (`catalog/Statuspage`, `catalog/DuoNetworkGateway`, `catalog/DruvaInSync`), so the
-/// first page a client sees is the published one; the entries after them are the ones this
-/// emulator publishes, in the order written here, which is not the published order of any
-/// larger catalog.
+/// (`catalog/Statuspage`, `catalog/DuoNetworkGateway`, `catalog/DruvaInSync`, then the
+/// Glue provider), so the first page a client sees is the published one; the entries after
+/// them are the ones this emulator publishes, in the order written here, which is not the
+/// published order of any larger catalog.
 /// What IS a rule — every entry carries a `DisplayData` whose `Description` is its display
 /// name as an application ([`BuiltInApplicationProvider::description`]) and whose
-/// `IconUrl` is the published portal icon URL of the asset id the entry carries, reported
-/// only when it carries one ([`BuiltInApplicationProvider::icon_url`]); an id of one of the
-/// two forms above; and a `ResourceServerConfig` exactly when it publishes access scopes —
-/// holds for every entry here, and for any entry added to it.
+/// `IconUrl` is the address THIS emulator serves that entry's icon at, reported only for an
+/// entry the catalog publishes an icon for ([`BuiltInApplicationProvider::icon_url`]); an id
+/// of one of the two forms above; and a `ResourceServerConfig` exactly when it publishes
+/// access scopes — holds for every entry here, and for any entry added to it.
 ///
 /// A provider exists in every partition the ARN pattern admits, so the lookup
 /// ([`built_in_application_provider`]) matches on the id and not on the whole ARN.
 pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
     // ---- The head of the published catalog --------------------------------------------
     // The entries the recorded catalog publishes first, in the order it publishes them.
-    catalog_application("catalog/Statuspage", "Statuspage")
-        .with_icon_asset_id("d77638588eff9057"),
+    catalog_application("catalog/Statuspage", "Statuspage"),
     catalog_application("catalog/DuoNetworkGateway", "Duo Network Gateway"),
     catalog_application("catalog/DruvaInSync", "DruvaInSync"),
-    // ---- The custom (customer managed) provider ---------------------------------------
-    customer_managed_provider("custom", "SSO Custom Application Provider", &[])
-        .with_icon_asset_id("efbe0dd582ec4f87"),
-    // ---- AWS managed providers -------------------------------------------------------
-    aws_managed_provider("athena", "Amazon Athena", &[]),
-    aws_managed_provider("emr", "Amazon EMR", &[]),
-    aws_managed_provider("emr-serverless", "Amazon EMR Serverless", &[]),
     aws_managed_provider(
         "glue",
         "AWS Glue",
@@ -4458,6 +4452,10 @@ pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
             long_description: "Grants access to read and write data through AWS Glue",
         }],
     ),
+    // ---- AWS managed providers -------------------------------------------------------
+    aws_managed_provider("athena", "Amazon Athena", &[]),
+    aws_managed_provider("emr", "Amazon EMR", &[]),
+    aws_managed_provider("emr-serverless", "Amazon EMR Serverless", &[]),
     aws_managed_provider(
         "lakeformation",
         "AWS Lake Formation",
@@ -4486,6 +4484,8 @@ pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
             long_description: "Grants access to read and write Amazon S3 data through access grants",
         }],
     ),
+    // ---- The custom (customer managed) provider ---------------------------------------
+    customer_managed_provider("custom", "SSO Custom Application Provider", &[]),
     // ---- The application catalog -----------------------------------------------------
     catalog_application("catalog/15Five", "15Five"),
     catalog_application("catalog/AbsorbLMS", "Absorb LMS"),

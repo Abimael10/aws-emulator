@@ -165,7 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (ctx, &self.engine);
+        let _ = &self.engine;
+
+        // The address a reported `DisplayData$IconUrl` is served at is on the endpoint THIS
+        // request arrived at (`crate::state::provider_icon_url`), so a client that renders a
+        // provider tile fetches the icon back from this emulator rather than from a host it
+        // does not serve.
+        let endpoint_base = ctx.endpoint();
+        let endpoint_base = endpoint_base.as_str();
 
         // A `NextToken` this service did not issue for THIS enumeration is a bad
         // request, not an empty page: answering an empty page would silently end a
@@ -188,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // data and is therefore stable across calls without this read sorting it.
         let catalog = crate::state::BUILT_IN_APPLICATION_PROVIDERS
             .iter()
-            .map(|provider| (provider.arn(), provider.to_shape()));
+            .map(|provider| (provider.arn(), provider.to_shape(endpoint_base)));
 
         // Paged like every other enumeration of this service: at most the caller's
         // `MaxResults`, and at most the default page size when the caller named none, with
