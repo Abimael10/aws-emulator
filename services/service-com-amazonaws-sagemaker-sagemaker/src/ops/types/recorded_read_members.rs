@@ -26,7 +26,7 @@
 //! operation's input).
 //!
 //! Nothing here decides a VALUE: every member is written from what the reading operation
-//! passes in (`ops::describe_feature_group`, `ops::describe_hub`,
+//! passes in (`ops::describe_domain`, `ops::describe_feature_group`, `ops::describe_hub`,
 //! `ops::describe_training_job`), which reads it off the stored resource. Nor can anything
 //! here panic: no value is indexed, sliced, unwrapped or arithmetic, and a member reported
 //! only for some resources is written under an `if let` over an `Option`.
@@ -35,7 +35,7 @@ use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 
 use super::{
-    Channel, DeployedImage, DescribeFeatureGroupOutput, DescribeHubOutput,
+    Channel, DeployedImage, DescribeDomainOutput, DescribeFeatureGroupOutput, DescribeHubOutput,
     DescribeTrainingJobOutput, OutputDataConfig, ResourceConfig, UserContext,
 };
 
@@ -62,6 +62,50 @@ macro_rules! recorded_member {
             $index,
         )
     };
+}
+
+/// `DescribeDomain`'s answer: the modelled response, plus the member the recorded service
+/// carries for every Studio domain — how the domain's non-EFS traffic is routed, beside the
+/// modelled `AppNetworkAccessType` that names the mode routing it that way.
+///
+/// The modelled members keep the indices the model gives them (0..=23); the recorded one is
+/// appended after them.
+#[derive(Debug, Clone)]
+pub struct DescribeDomainRecordedOutput {
+    /// Every member `DescribeDomainResponse` declares.
+    pub modelled: DescribeDomainOutput,
+    /// The access the domain's apps have beyond its EFS traffic, as
+    /// `crate::state::app_network_access` projects it from the domain's own access type.
+    pub app_network_access: String,
+}
+
+impl DescribeDomainRecordedOutput {
+    const M_APP_NETWORK_ACCESS: Schema = recorded_member!(
+        "DescribeDomainResponse",
+        "AppNetworkAccess",
+        ShapeType::String,
+        24
+    );
+
+    /// The modelled response beside the access the domain it read is routed with. Every
+    /// domain carries an access type — the create resolves one for a request that named none
+    /// (`crate::state::DEFAULT_APP_NETWORK_ACCESS_TYPE`) — so this member is reported for
+    /// the life of the domain rather than only for some of them.
+    #[must_use]
+    pub fn new(modelled: DescribeDomainOutput, app_network_access: String) -> Self {
+        Self {
+            modelled,
+            app_network_access,
+        }
+    }
+}
+
+impl SerializableStruct for DescribeDomainRecordedOutput {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        self.modelled.serialize_members(s)?;
+        s.write_string(&Self::M_APP_NETWORK_ACCESS, self.app_network_access.as_str())?;
+        Ok(())
+    }
 }
 
 /// `DescribeFeatureGroup`'s answer: the modelled response, plus the three online-store

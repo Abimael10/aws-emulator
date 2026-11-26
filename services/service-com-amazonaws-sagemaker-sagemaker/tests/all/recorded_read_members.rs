@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end wire tests for the members a SageMaker READ answers with that this service's
-//! on-disk Smithy model does not declare, and for the two modelled members of a training
-//! job's read that the service RESOLVES rather than echoes.
+//! on-disk Smithy model does not declare — a feature group's online store, a hub's
+//! provenance, a training job's run and a Studio domain's app network access — and for the
+//! two modelled members of a training job's read that the service RESOLVES rather than
+//! echoes.
 //!
 //! Every case goes over the wire (`POST /` with `X-Amz-Target: SageMaker.<Op>`,
 //! `awsJson1_1`) through the same `MultiServiceRouter` the production router uses, on the
@@ -524,6 +526,196 @@ async fn a_training_job_reports_the_metric_set_of_the_algorithm_it_runs() {
         Some(&stated_metrics),
         "case stated-metrics: the request's own metric set must be kept, got {described:?}"
     );
+}
+
+/// An execution role inside `RoleArn`'s modelled pattern, for the `DefaultUserSettings`
+/// every `CreateDomain` carries.
+const STUDIO_EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/service-role/StudioRole";
+
+/// A `CreateDomain` request: the members a SageMaker AI domain must carry — the name, the
+/// authentication mode, the execution role and the network its traffic goes through — with
+/// `extra`'s members laid over it.
+fn domain_body(name: &str, extra: Value) -> Value {
+    let mut body = json!({
+        "DomainName": name,
+        "AuthMode": "IAM",
+        "DefaultUserSettings": { "ExecutionRole": STUDIO_EXECUTION_ROLE },
+        "VpcId": "vpc-0a1b2c3d",
+        "SubnetIds": ["subnet-0a1b2c3d"],
+    });
+    for (member, value) in extra.as_object().expect("a JSON object of extra members") {
+        body[member.as_str()] = value.clone();
+    }
+    body
+}
+
+/// The access a domain whose `AppNetworkAccessType` is `access_type` is routed with, as the
+/// read must report it; `None` is a create that stated no type, which the member's own doc
+/// documents as defaulting to `PublicInternetOnly`.
+///
+/// Written here rather than asked of the implementation, over the whole catalogue
+/// `AppNetworkAccessType` declares (`smithy_query(query="shape",
+/// shape="AppNetworkAccessType")`: `PublicInternetOnly` | `VpcOnly`).
+fn expected_access(access_type: Option<&str>) -> &'static str {
+    match access_type {
+        // All traffic is through the VPC and subnets the create named, so nothing reaches
+        // the internet directly.
+        Some("VpcOnly") => "VpcOnly",
+        // Non-EFS traffic is through the VPC SageMaker manages, which allows direct
+        // internet access.
+        _ => "DirectInternetOnly",
+    }
+}
+
+/// RULE: `DescribeDomain` reports how a domain's non-EFS traffic is routed under the member
+/// the service serves for it, `AppNetworkAccess`, beside the modelled `AppNetworkAccessType`
+/// that names the mode routing it that way — projected from the access type the domain
+/// carries, which is the one its create named or, for a create that named none, the type the
+/// member documents as its default.
+#[tokio::test]
+async fn describe_domain_reports_the_access_the_domain_is_routed_with() {
+    // Rows span the whole `AppNetworkAccessType` catalogue, stated and left unsaid, and
+    // differ along what else the create carries: the subnet count, the KMS key, the tag
+    // propagation and the security-group management the VPC-only mode admits.
+    let rows: Vec<(&str, Option<&str>, Value)> = vec![
+        ("no-access-type-stated", None, json!({})),
+        (
+            "public-internet-only",
+            Some("PublicInternetOnly"),
+            json!({ "AppNetworkAccessType": "PublicInternetOnly" }),
+        ),
+        (
+            "vpc-only",
+            Some("VpcOnly"),
+            json!({ "AppNetworkAccessType": "VpcOnly" }),
+        ),
+        (
+            "vpc-only-with-service-managed-security-groups",
+            Some("VpcOnly"),
+            json!({
+                "AppNetworkAccessType": "VpcOnly",
+                "AppSecurityGroupManagement": "Service",
+                "SubnetIds": ["subnet-0a1b2c3d", "subnet-1a2b3c4d", "subnet-2b3c4d5e"],
+            }),
+        ),
+        (
+            "no-access-type-stated-with-every-other-optional-member",
+            None,
+            json!({
+                "HomeEfsFileSystemCreation": "Enabled",
+                "TagPropagation": "ENABLED",
+                "KmsKeyId": "alias/studio-efs",
+                "Tags": [{ "Key": "team", "Value": "ml" }],
+            }),
+        ),
+    ];
+
+    for (case, access_type, extra) in rows {
+        let emulator = Emulator::new();
+        let created = emulator.ok("CreateDomain", &domain_body(case, extra)).await;
+        let domain_id = str_field(&created, "DomainId");
+
+        let described = emulator
+            .ok("DescribeDomain", &json!({ "DomainId": domain_id }))
+            .await;
+        assert_eq!(
+            described.get("AppNetworkAccess").and_then(Value::as_str),
+            Some(expected_access(access_type)),
+            "case {case:?}: AppNetworkAccess must report the access the domain is routed \
+             with, got {described:?}"
+        );
+        // The member the model DOES declare is still reported beside it, carrying the type
+        // the create named or the documented default.
+        assert_eq!(
+            described.get("AppNetworkAccessType").and_then(Value::as_str),
+            Some(access_type.unwrap_or("PublicInternetOnly")),
+            "case {case:?}: AppNetworkAccessType, got {described:?}"
+        );
+        // And no other member of the projection is displaced by it.
+        assert_eq!(
+            str_field(&described, "DomainName"),
+            case,
+            "case {case:?}: the modelled members must survive, got {described:?}"
+        );
+        assert_eq!(
+            str_field(&described, "DomainId"),
+            domain_id,
+            "case {case:?}: the domain reads back under its own id, got {described:?}"
+        );
+    }
+}
+
+/// RULE: the access a domain is reported as routed with follows the access type the domain
+/// CARRIES for the whole life of the domain, so an `UpdateDomain` that moves the domain from
+/// one mode to the other moves the reported access with it, and an update that changes
+/// something else leaves it as it stands.
+#[tokio::test]
+async fn an_updated_domain_reports_the_access_its_new_mode_routes_it_with() {
+    // Rows cross the catalogue in both directions, add the update that re-states the mode
+    // the domain already has, and the update that touches another member entirely. The last
+    // column is the access type the domain carries after the update.
+    let rows: Vec<(&str, Option<&str>, Value, Option<&str>)> = vec![
+        (
+            "default-to-vpc-only",
+            None,
+            json!({ "AppNetworkAccessType": "VpcOnly" }),
+            Some("VpcOnly"),
+        ),
+        (
+            "vpc-only-to-public-internet-only",
+            Some("VpcOnly"),
+            json!({ "AppNetworkAccessType": "PublicInternetOnly" }),
+            Some("PublicInternetOnly"),
+        ),
+        (
+            "public-internet-only-to-vpc-only",
+            Some("PublicInternetOnly"),
+            json!({ "AppNetworkAccessType": "VpcOnly" }),
+            Some("VpcOnly"),
+        ),
+        (
+            "mode-restated",
+            Some("VpcOnly"),
+            json!({ "AppNetworkAccessType": "VpcOnly" }),
+            Some("VpcOnly"),
+        ),
+        (
+            "another-member-updated",
+            Some("VpcOnly"),
+            json!({ "TagPropagation": "ENABLED" }),
+            Some("VpcOnly"),
+        ),
+    ];
+
+    for (case, created_with, update, after) in rows {
+        let emulator = Emulator::new();
+        let extra = match created_with {
+            Some(access_type) => json!({ "AppNetworkAccessType": access_type }),
+            None => json!({}),
+        };
+        let created = emulator.ok("CreateDomain", &domain_body(case, extra)).await;
+        let domain_id = str_field(&created, "DomainId");
+
+        let mut request = json!({ "DomainId": domain_id });
+        for (member, value) in update.as_object().expect("a JSON object of members") {
+            request[member.as_str()] = value.clone();
+        }
+        emulator.ok("UpdateDomain", &request).await;
+
+        let described = emulator
+            .ok("DescribeDomain", &json!({ "DomainId": domain_id }))
+            .await;
+        assert_eq!(
+            described.get("AppNetworkAccess").and_then(Value::as_str),
+            Some(expected_access(after)),
+            "case {case:?}: the updated domain's AppNetworkAccess, got {described:?}"
+        );
+        assert_eq!(
+            described.get("AppNetworkAccessType").and_then(Value::as_str),
+            after,
+            "case {case:?}: the updated domain's AppNetworkAccessType, got {described:?}"
+        );
+    }
 }
 
 /// Register `name` through the implemented `CreateAlgorithm`, with `metrics` as its

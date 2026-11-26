@@ -2,8 +2,10 @@
 
 //! @op DescribeDomain
 //! IMPLEMENTED: replays the Studio domain `CreateDomain` stored in `crate::state`,
-//! materialising the status transition the clock already owed. This is the ONLY file to
-//! touch for this operation.
+//! materialising the status transition the clock already owed. The answer carries the
+//! members `DescribeDomainResponse` declares plus the one the service serves beside them,
+//! `AppNetworkAccess` (see `super::types::DescribeDomainRecordedOutput`). This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DescribeDomain<Eng>
 {
     type Input = DescribeDomainInput;
-    type Output = DescribeDomainOutput;
+    type Output = DescribeDomainRecordedOutput;
     type Error = DescribeDomainError;
 
     const NAME: &'static str = "DescribeDomain";
@@ -242,6 +244,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tag_propagation: Some(domain.tag_propagation.clone()),
             default_space_settings: domain.default_space_settings.clone(),
         };
+        // Beside the modelled `AppNetworkAccessType` above, the service reports the ACCESS
+        // that type puts the domain's apps in. Projected from the stored type on every read,
+        // so a domain reports the access it carries for its whole life, including after an
+        // `UpdateDomain` has moved it from one mode to the other.
+        let output = DescribeDomainRecordedOutput::new(
+            output,
+            crate::state::app_network_access(&domain.app_network_access_type).to_string(),
+        );
         let arn = domain.arn.clone();
         drop(store);
 

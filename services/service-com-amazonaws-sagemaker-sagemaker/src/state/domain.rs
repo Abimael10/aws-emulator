@@ -63,6 +63,38 @@ pub const DOMAIN_DEFAULT_PAGE_SIZE: i32 = 10;
 /// traffic. The default value is PublicInternetOnly."
 pub const DEFAULT_APP_NETWORK_ACCESS_TYPE: &str = "PublicInternetOnly";
 
+/// The other member of `AppNetworkAccessType`'s catalogue beside the default above
+/// (`smithy_query(query="shape",shape="AppNetworkAccessType")`: `PublicInternetOnly` |
+/// `VpcOnly`) — the mode whose traffic is entirely the customer's VPC's. Named once here so
+/// every reader that asks which mode a domain is in weighs the same value.
+pub const APP_NETWORK_ACCESS_TYPE_VPC_ONLY: &str = "VpcOnly";
+
+/// The two values the app network ACCESS of a domain takes: the access a domain in the
+/// VPC SageMaker manages has — "Non-EFS traffic is through a VPC managed by Amazon
+/// SageMaker AI, which allows direct internet access" — and the access a domain whose
+/// traffic is entirely the customer's VPC's has, which reaches nothing beyond it: "All
+/// traffic is through the specified VPC and subnets".
+pub const APP_NETWORK_ACCESS_DIRECT_INTERNET_ONLY: &str = "DirectInternetOnly";
+/// See [`APP_NETWORK_ACCESS_DIRECT_INTERNET_ONLY`].
+pub const APP_NETWORK_ACCESS_VPC_ONLY: &str = "VpcOnly";
+
+/// How a domain's non-EFS traffic is routed, in the vocabulary a read reports the domain's
+/// app network ACCESS in: a domain confined to the VPC its create named reaches only that
+/// VPC and its subnets, and a domain in the VPC SageMaker manages reaches the internet
+/// directly.
+///
+/// PROJECTED from the domain's own access type rather than stored beside it, so a domain
+/// whose type an update changes reports the access that type puts it in from the next read
+/// on, and no second copy of the one fact can drift from it.
+#[must_use]
+pub fn app_network_access(app_network_access_type: &str) -> &'static str {
+    if app_network_access_type == APP_NETWORK_ACCESS_TYPE_VPC_ONLY {
+        APP_NETWORK_ACCESS_VPC_ONLY
+    } else {
+        APP_NETWORK_ACCESS_DIRECT_INTERNET_ONLY
+    }
+}
+
 /// `HomeEfsFileSystemCreation`'s documented default: "Indicates whether to create a home
 /// EFS file system for the domain. Defaults to Enabled."
 pub const DEFAULT_HOME_EFS_FILE_SYSTEM_CREATION: &str = "Enabled";
