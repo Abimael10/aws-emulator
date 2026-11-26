@@ -245,11 +245,15 @@ const DEFAULT_BUFFER_INTERVAL: Duration = Duration::from_secs(300);
 /// this span instead, so what a producer put is at the destination by the time it reads the
 /// destination back to verify its own delivery.
 ///
-/// A CHOSEN span, and minutes rather than seconds: a configuration asking for a couple of
-/// minutes of buffering gets exactly the batching and the latency it asked for — a client
-/// can watch its records being held and then arrive as one object per window — while no
-/// configuration can park data in this process for longer than that.
-pub const MAX_BUFFER_HOLD: Duration = Duration::from_secs(150);
+/// A CHOSEN span, and the one thing it has to be is a span a client can WAIT OUT: a buffer's
+/// records are observable only once they are AT the destination, so a producer that puts a
+/// record and then reads the destination back — and every pipeline whose records pass through
+/// a stream on their way to the consumer that checks them — has to find them there inside one
+/// short poll loop. Tens of seconds is such a span; minutes is not, whatever a destination
+/// asked for. It still sits well above the batching windows a configuration asks for in
+/// seconds, so a client that asks for one gets exactly the batching and the latency it asked
+/// for: those are honoured to the second, and only a window of MINUTES is improved on.
+pub const MAX_BUFFER_HOLD: Duration = Duration::from_secs(20);
 
 /// How long after a stream's buffer opens — the instant the oldest record it holds landed
 /// — the delivery comes due once the buffer holds at least `BufferingHints$SizeInMBs` of
