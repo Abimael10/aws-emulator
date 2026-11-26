@@ -538,8 +538,14 @@ async fn the_commands_a_client_sends_read_the_keyspace_they_wrote() {
         ("flushall", &["FLUSHALL"], Resp::Status("OK".to_string())),
         ("dbsize after flushall", &["DBSIZE"], Resp::Integer(0)),
         ("select the one database", &["SELECT", "0"], Resp::Status("OK".to_string())),
+        // A verb this server does not serve is quoted back as the client WROTE it, followed
+        // by the arguments it began with — the engine's own template.
         ("an unknown command", &["NOSUCHCOMMAND"], Resp::Error(
-            "ERR unknown command 'nosuchcommand', with args beginning with: ".to_string(),
+            "ERR unknown command 'NOSUCHCOMMAND', with args beginning with: ".to_string(),
+        )),
+        ("an unknown command with arguments", &["NoSuchCommand", "first", "second"], Resp::Error(
+            "ERR unknown command 'NoSuchCommand', with args beginning with: 'first' 'second' "
+                .to_string(),
         )),
         ("a command with the wrong arity", &["GET"], Resp::Error(
             "ERR wrong number of arguments for 'get' command".to_string(),
@@ -1547,5 +1553,75 @@ async fn the_socket_a_cache_was_served_on_closes_with_the_cache() {
             ),
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// How many bytes of the arguments the `unknown command` refusal quotes back, which is the
+/// engine's own bound on that list.
+const QUOTED_ARGUMENT_BYTES: usize = 128;
+
+#[tokio::test]
+async fn a_refusal_quotes_the_words_the_client_sent_on_one_line() {
+    let emulator = Emulator::new();
+    let (address, port) = cluster_endpoint(&emulator, "quoting", &[("Engine", "redis")]).await;
+    let mut session = open("quoting", &address, &port).await;
+    // One argument past what the refusal quotes, so the row below reads where it stops.
+    let long_argument = "a".repeat(QUOTED_ARGUMENT_BYTES * 2);
+    let quoted_prefix = "a".repeat(QUOTED_ARGUMENT_BYTES);
+    // The axis: what the client's own words carry — their case, their count, a newline
+    // inside one (a RESP bulk string may hold any byte), and a length past the bound. Every
+    // row is a verb this server does not serve, which is the refusal that quotes the request
+    // back.
+    let rows: Vec<(&str, Vec<String>, String)> = vec![
+        (
+            "the case the client wrote",
+            vec!["NoSuchCommand".to_string()],
+            "ERR unknown command 'NoSuchCommand', with args beginning with: ".to_string(),
+        ),
+        (
+            "the arguments it began with",
+            vec![
+                "NOSUCHCOMMAND".to_string(),
+                "first".to_string(),
+                "second".to_string(),
+            ],
+            "ERR unknown command 'NOSUCHCOMMAND', with args beginning with: 'first' 'second' "
+                .to_string(),
+        ),
+        (
+            "a newline inside the verb",
+            vec!["NO\r\nCOMMAND".to_string()],
+            "ERR unknown command 'NO  COMMAND', with args beginning with: ".to_string(),
+        ),
+        (
+            "a newline inside an argument",
+            vec!["NOSUCHCOMMAND".to_string(), "two\nlines".to_string()],
+            "ERR unknown command 'NOSUCHCOMMAND', with args beginning with: 'two lines' "
+                .to_string(),
+        ),
+        (
+            "an argument past what the refusal quotes",
+            vec!["NOSUCHCOMMAND".to_string(), long_argument, "left out".to_string()],
+            format!(
+                "ERR unknown command 'NOSUCHCOMMAND', with args beginning with: \
+                 '{quoted_prefix}' "
+            ),
+        ),
+    ];
+    for (what, sent, expected) in rows {
+        let arguments: Vec<&str> = sent.iter().map(String::as_str).collect();
+        let answered = command(what, &mut session, &arguments).await;
+        assert_eq!(
+            answered,
+            Resp::Error(expected.clone()),
+            "case {what}: the refusal must read {expected:?}, got {answered:?}"
+        );
+        // One refusal is ONE reply: a newline that reached the wire would have ended it
+        // early and left the rest of it looking like the answer to this PING.
+        assert_eq!(
+            command(what, &mut session, &["PING"]).await,
+            Resp::Status("PONG".to_string()),
+            "case {what}: the session must still be in step after the refusal"
+        );
     }
 }

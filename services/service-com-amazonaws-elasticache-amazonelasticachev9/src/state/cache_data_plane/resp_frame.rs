@@ -60,7 +60,7 @@ impl Reply {
     fn frame(self) -> OwnedFrame {
         match self {
             Self::Status(status) => OwnedFrame::SimpleString(status.into_bytes()),
-            Self::Error(error) => OwnedFrame::Error(error),
+            Self::Error(error) => OwnedFrame::Error(one_line(error)),
             Self::Integer(value) => OwnedFrame::Integer(value),
             Self::Bulk(bytes) => OwnedFrame::BulkString(bytes),
             Self::Nil => OwnedFrame::Null,
@@ -69,6 +69,20 @@ impl Reply {
             }
         }
     }
+}
+
+/// One error message as the wire may carry it: with the newlines in it mapped to spaces.
+///
+/// An error reply is one LINE — `-<message>\r\n` — so a newline inside the message would end
+/// the reply early and leave the rest of it looking like a reply of its own. A refusal that
+/// quotes a client's own bytes back (a verb this server does not serve, a key a user may not
+/// reach) can carry any byte that client sent, so what the engine does with those two
+/// characters is done here: the trailing ones are dropped and the rest become spaces, for
+/// every error reply, rather than leaving each refusal to remember it.
+fn one_line(message: String) -> String {
+    message
+        .trim_end_matches(['\r', '\n'])
+        .replace(['\r', '\n'], " ")
 }
 
 /// The bytes `reply` goes on the wire as.

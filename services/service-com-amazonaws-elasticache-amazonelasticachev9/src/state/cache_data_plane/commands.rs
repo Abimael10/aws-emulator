@@ -150,6 +150,36 @@ pub fn arity_satisfied(spec: &CommandSpec, arguments: &[Vec<u8>]) -> bool {
     }
 }
 
+/// How many bytes of the arguments the `unknown command` refusal quotes back: the engine's
+/// own bound on that list, past which the rest of the command line is left out.
+const UNKNOWN_COMMAND_ARGUMENT_BYTES: usize = 128;
+
+/// The engine's own error for a verb it does not serve, quoting the request back: the VERB as
+/// the client wrote it, and then the arguments it began with, each quoted, up to
+/// [`UNKNOWN_COMMAND_ARGUMENT_BYTES`] of them.
+///
+/// A client is told what IT sent — the engine quotes the tokens off the request rather than a
+/// case-folded reading of them — so the quoted words in the refusal are the words the client
+/// wrote, and the "args beginning with" list really lists them.
+pub fn unknown_command(arguments: &[Vec<u8>]) -> Reply {
+    let verb = arguments.first().map(|verb| text(verb)).unwrap_or_default();
+    let mut began = String::new();
+    for argument in arguments.iter().skip(1) {
+        if began.len() >= UNKNOWN_COMMAND_ARGUMENT_BYTES {
+            break;
+        }
+        let room = UNKNOWN_COMMAND_ARGUMENT_BYTES - began.len();
+        let quoted = text(argument);
+        let kept: String = quoted.chars().take(room).collect();
+        began.push('\'');
+        began.push_str(&kept);
+        began.push_str("' ");
+    }
+    Reply::Error(format!(
+        "ERR unknown command '{verb}', with args beginning with: {began}"
+    ))
+}
+
 /// The engine's own error for a command given the wrong number of arguments.
 pub fn wrong_arity(name: &str) -> Reply {
     Reply::Error(format!(
@@ -457,9 +487,7 @@ pub fn execute(
         // Every command in the catalog is either answered above or by the session; a name
         // that reaches here is one the catalog carries and nothing serves, which is an
         // honest `unknown command` rather than a silent success.
-        other => Reply::Error(format!(
-            "ERR unknown command '{other}', with args beginning with: "
-        )),
+        _unserved => unknown_command(arguments),
     }
 }
 
@@ -477,9 +505,11 @@ fn object_command(
 ) -> Reply {
     let subcommand = text(&arguments[1]).to_ascii_lowercase();
     if !matches!(subcommand.as_str(), "encoding" | "refcount" | "idletime") {
+        // The subcommand AS THE CLIENT WROTE IT: the engine quotes the token off the request
+        // rather than a case-folded reading of it.
         return Reply::Error(format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{subcommand}'. Try OBJECT \
-             HELP."
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try OBJECT HELP.",
+            text(&arguments[1])
         ));
     }
     if arguments.len() != 3 {

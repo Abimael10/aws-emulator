@@ -233,12 +233,8 @@ impl Session {
             );
         }
         let Some(spec) = commands::spec(&name) else {
-            return (
-                Some(Reply::Error(format!(
-                    "ERR unknown command '{name}', with args beginning with: "
-                ))),
-                false,
-            );
+            // Quoted back as the client sent it ([`commands::unknown_command`]).
+            return (Some(commands::unknown_command(arguments)), false);
         };
         if !commands::arity_satisfied(spec, arguments) {
             return (Some(commands::wrong_arity(&name)), false);
@@ -449,10 +445,7 @@ impl Session {
                 .map(Reply::text)
                 .collect(),
             ),
-            other => Reply::Error(format!(
-                "ERR Unknown subcommand or wrong number of arguments for '{other}'. Try SLOWLOG \
-                 HELP."
-            )),
+            _unknown => unknown_subcommand(arguments, "SLOWLOG"),
         }
     }
 
@@ -600,10 +593,7 @@ impl Session {
                 "id={} addr={} name={} resp=2",
                 self.connection_id, self.client_address, self.client_name
             )),
-            other => Reply::Error(format!(
-                "ERR Unknown subcommand or wrong number of arguments for '{other}'. Try CLIENT \
-                 HELP."
-            )),
+            _unknown => unknown_subcommand(arguments, "CLIENT"),
         }
     }
 
@@ -643,8 +633,9 @@ impl Session {
                  through ModifyCacheParameterGroup"
                     .to_string(),
             ),
-            other => Reply::Error(format!(
-                "ERR Unknown CONFIG subcommand or wrong number of arguments for '{other}'"
+            _unknown => Reply::Error(format!(
+                "ERR Unknown CONFIG subcommand or wrong number of arguments for '{}'",
+                as_sent(arguments)
             )),
         }
     }
@@ -743,13 +734,14 @@ impl Session {
                 }
                 _ => Reply::Error("ERR Invalid slot".to_string()),
             },
-            other => Reply::Error(format!(
-                "ERR This instance has cluster support {} — unknown CLUSTER subcommand '{other}'",
+            _unknown => Reply::Error(format!(
+                "ERR This instance has cluster support {} — unknown CLUSTER subcommand '{}'",
                 if facts.cluster_enabled {
                     "enabled"
                 } else {
                     "disabled"
-                }
+                },
+                as_sent(arguments)
             )),
         }
     }
@@ -775,10 +767,29 @@ fn command_command(arguments: &[Vec<u8>]) -> Reply {
                 })
                 .collect(),
         ),
-        Some(other) => Reply::Error(format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{other}'. Try COMMAND HELP."
-        )),
+        Some(_unknown) => unknown_subcommand(arguments, "COMMAND"),
     }
+}
+
+/// The engine's own refusal of a subcommand a container command does not have: the
+/// subcommand AS THE CLIENT WROTE IT, and the container command's own name.
+///
+/// A client is told back what it sent — the engine quotes the token off the request rather
+/// than a case-folded reading of it — so a client that reads the quoted word out of the
+/// refusal finds the word it wrote there.
+fn unknown_subcommand(arguments: &[Vec<u8>], container: &str) -> Reply {
+    Reply::Error(format!(
+        "ERR Unknown subcommand or wrong number of arguments for '{}'. Try {container} HELP.",
+        as_sent(arguments)
+    ))
+}
+
+/// The subcommand token of `arguments` as the client wrote it, for a refusal that quotes it.
+fn as_sent(arguments: &[Vec<u8>]) -> String {
+    arguments
+        .get(1)
+        .map(|argument| String::from_utf8_lossy(argument).to_string())
+        .unwrap_or_default()
 }
 
 /// One command's `COMMAND INFO` entry: its name, arity, flags and key positions.

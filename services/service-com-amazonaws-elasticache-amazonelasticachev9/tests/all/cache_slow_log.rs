@@ -33,20 +33,27 @@ const FAMILY: &str = "redis7";
 /// The bottom of the `slowlog-log-slower-than` range the published catalog states for that
 /// family (`0-`), which records every command: "a value of zero forces the logging of every
 /// command".
-const EVERY_COMMAND: &str = "0";
+///
+/// `pub(crate)` for the reason the helpers below are: a second suite that needs a cache whose
+/// engine records every command states the same bottom of the same range.
+pub(crate) const EVERY_COMMAND: &str = "0";
 
 /// A threshold no command of this emulator reaches: a minute, in microseconds. Nothing waits
 /// for it — it is the row showing a command that was not slow is not recorded.
 const NO_COMMAND: &str = "60000000";
 
-/// Create a cache parameter group holding the slow-log parameters a case states, then a
-/// cluster running under it, and answer a RESP session on the address it published.
-async fn session_on(
+/// Create a cache parameter group holding the slow-log parameters a case states, and answer
+/// its name.
+///
+/// `pub(crate)` for the reason the rest of this suite's helpers are: a second suite that runs
+/// a cache under a stated slow-log policy states it the same way, and a second copy of this
+/// setup would be a second thing to keep correct.
+pub(crate) async fn recording_parameter_group(
     emulator: &Emulator,
     case: &str,
     threshold: &str,
     depth: &str,
-) -> Session {
+) -> String {
     let group = format!("{case}-parameters");
     let created = emulator
         .call(
@@ -92,6 +99,20 @@ async fn session_on(
         "case {case}: the slow-log parameters must be set, got {} {}",
         modified.status, modified.body
     );
+    group
+}
+
+/// Create that parameter group, then a cluster running under it, and answer a RESP session on
+/// the address it published.
+///
+/// `pub(crate)` for the reason [`recording_parameter_group`] is.
+pub(crate) async fn session_on(
+    emulator: &Emulator,
+    case: &str,
+    threshold: &str,
+    depth: &str,
+) -> Session {
+    let group = recording_parameter_group(emulator, case, threshold, depth).await;
     let created = emulator
         .call(
             "CreateCacheCluster",
@@ -128,7 +149,9 @@ async fn session_on(
 }
 
 /// The entries `SLOWLOG GET` reports, each as the arguments of the command it recorded.
-async fn recorded(case: &str, session: &mut Session) -> Vec<Vec<String>> {
+///
+/// `pub(crate)` for the reason [`recording_parameter_group`] is.
+pub(crate) async fn recorded(case: &str, session: &mut Session) -> Vec<Vec<String>> {
     // `-1` asks for every entry the log holds rather than one page of them.
     let answered = command(case, session, &["SLOWLOG", "GET", "-1"]).await;
     let Resp::Array(entries) = answered else {
