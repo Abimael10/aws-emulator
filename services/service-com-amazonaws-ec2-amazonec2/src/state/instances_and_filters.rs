@@ -1194,7 +1194,23 @@ impl ComAmazonawsEc2Amazonec2State {
         // A VPC BPA exclusion `CreateVpcBlockPublicAccessExclusion` answered as
         // `create-in-progress` reaches `create-complete` once its due instant has passed,
         // whether or not anybody called — the same contract as a `pending` VPC's move
-        // above.
+        // above. An exclusion a `DeleteVpcBlockPublicAccessExclusion` left
+        // `delete-in-progress` reaches `delete-complete` on the same terms, which is the END
+        // of the exclusion: its record leaves the store then rather than being left behind
+        // for a describe to report an exclusion that exempts nothing.
+        let deleted: Vec<String> = self
+            .vpc_block_public_access_exclusions
+            .iter()
+            .filter(|(_, record)| {
+                record.pending.as_ref().is_some_and(|pending| {
+                    now >= pending.due_at && pending.to == VPC_BPA_EXCLUSION_STATE_DELETE_COMPLETE
+                })
+            })
+            .map(|(exclusion_id, _)| exclusion_id.clone())
+            .collect();
+        for exclusion_id in deleted {
+            self.remove_vpc_block_public_access_exclusion(&exclusion_id);
+        }
         for record in self.vpc_block_public_access_exclusions.values_mut() {
             let due = record
                 .pending
@@ -1550,31 +1566,80 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         });
         // The end of a Network Access Scope analysis `StartNetworkInsightsAccessScopeAnalysis`
-        // answered as `running`: at its due instant the analysis reaches the terminal
-        // `AnalysisStatus` the start recorded for it, whether or not anybody called again —
-        // the same contract as a `pending` VPC's move above.
-        for record in self.network_insights_access_scope_analyses.values_mut() {
-            let Some(pending) = record
-                .pending
-                .as_ref()
-                .filter(|pending| now >= pending.due_at)
-                .cloned()
+        // answered as `running`: at its due instant the analysis is RUN against the stored
+        // network and reaches the terminal `AnalysisStatus` the start recorded for it,
+        // whether or not anybody called again — the same contract as a `pending` VPC's move
+        // above. The analyses due are collected first because analyzing one borrows the
+        // network interfaces, groups, ACLs and routes it reads — and at most
+        // [`MAX_SCOPE_ANALYSES_PER_CLOCK_PASS`] of them are run in ONE pass, so the work this
+        // call does is bounded whatever the store holds: an analysis left over is still due
+        // and is run by the next pass, which is the same answer a caller would have got had
+        // it called then.
+        let due_scope_analyses: Vec<(String, String, String)> = self
+            .network_insights_access_scope_analyses
+            .iter()
+            .filter_map(|(analysis_id, record)| {
+                record
+                    .pending
+                    .as_ref()
+                    .filter(|pending| now >= pending.due_at)?;
+                Some((
+                    analysis_id.clone(),
+                    record
+                        .view
+                        .network_insights_access_scope_id
+                        .clone()
+                        .unwrap_or_default(),
+                    // The Region the analysis was started in, which its own ARN names: that
+                    // is where a prefix list a security group rule names is read from.
+                    crate::state::reachability_trace::path_region(
+                        record
+                            .view
+                            .network_insights_access_scope_analysis_arn
+                            .as_deref(),
+                    ),
+                ))
+            })
+            .take(MAX_SCOPE_ANALYSES_PER_CLOCK_PASS)
+            .collect();
+        for (analysis_id, scope_id, region) in due_scope_analyses {
+            // The findings are read off the network as it stands at the due instant — the
+            // interfaces, security groups, network ACLs and routes each candidate path runs
+            // through — so an analysis reports what the stored network admits.
+            let outcome =
+                self.analyze_network_insights_access_scope(&scope_id, &analysis_id, &region);
+            let Some(record) = self
+                .network_insights_access_scope_analyses
+                .get_mut(&analysis_id)
             else {
+                continue;
+            };
+            let Some(pending) = record.pending.take() else {
                 continue;
             };
             record.view.status = Some(pending.to.to_string());
             // "The analysis end date" (`NetworkInsightsAccessScopeAnalysis$EndDate`): the
             // analysis ended when the move fell due, not when somebody next asked about it.
             record.view.end_date = Some(system_time_to_date_time(pending.at));
-            record.view.status_message = Some(ANALYSIS_UNSUPPORTED_STATUS_MESSAGE.to_string());
+            // "The status message": this analysis produced a result, so there is no failure
+            // to report; "the warning message" says so when the report is PARTIAL.
+            record.view.status_message = None;
+            record.view.warning_message = outcome
+                .partial
+                .then(|| ACCESS_SCOPE_ANALYSIS_PARTIAL_WARNING.to_string());
             // "Indicates whether there are findings"
-            // (`NetworkInsightsAccessScopeAnalysis$FindingsFound`): nothing analyzed this
-            // scope, so whether it has findings was never determined — which is exactly
-            // what the `FindingsFound` catalog's `unknown` member says. `AnalyzedEniCount`
-            // stays at the zero the start reported for the same reason: no network interface
-            // was analyzed.
-            record.view.findings_found = Some(FINDINGS_FOUND_UNKNOWN.to_string());
-            record.pending = None;
+            // (`NetworkInsightsAccessScopeAnalysis$FindingsFound`), answered by what the
+            // analysis found, with "the number of network interfaces analyzed" beside it.
+            record.view.findings_found = Some(
+                if outcome.findings.is_empty() {
+                    FINDINGS_FOUND_FALSE
+                } else {
+                    FINDINGS_FOUND_TRUE
+                }
+                .to_string(),
+            );
+            record.view.analyzed_eni_count = Some(outcome.analyzed_eni_count);
+            record.findings = outcome.findings;
         }
         // The end of a path analysis `StartNetworkInsightsAnalysis` answered as `running`,
         // on the same contract as the access scope analysis above: at its due instant the

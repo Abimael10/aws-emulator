@@ -470,6 +470,19 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
                 ),
             })
         }
+        ViolationKind::EnumValue(allowed) if crate::state::is_ek_pub_key_catalog(allowed) => {
+            // A value outside the catalog the FORM or the TYPE of a NitroTPM endorsement key
+            // is named by ("the required public endorsement key format" / "… key type",
+            // `GetInstanceTpmEkPubRequest$KeyFormat` / `$KeyType`) is a parameter carrying a
+            // value the service cannot use, which EC2 answers its own `InvalidParameterValue`
+            // for rather than as a validation clause — in the one sentence it words for this
+            // error class ([`crate::state::EK_PUB_KEY_REFUSAL_MESSAGE`]), which is fixed text,
+            // so nothing of the request is echoed into it.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::EK_PUB_KEY_REFUSAL_MESSAGE.to_string(),
+            })
+        }
         ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
             if crate::state::range_refused_as_invalid_request(input_being_read().as_deref()) =>
         {

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcBlockPublicAccessExclusion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcBlockPublicAccessExclusion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcBlockPublicAccessExclusion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the VPC Block Public Access exclusion the request names: the exclusion is left in
+//! the non-terminal `delete-in-progress` state carrying the instant it was deleted, with the
+//! clock owing it `delete-complete`, at which point its record leaves
+//! [`crate::state`] and the VPC or subnet it exempted can be given an exclusion again. The
+//! one answer is the record as the store now holds it, so this call and
+//! `DescribeVpcBlockPublicAccessExclusions` cannot report one exclusion differently.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +137,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcBlockPublicAccessExclusion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcBlockPublicAccessExclusionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcBlockPublicAccessExclusion"))
+        // `ctx` carries request metadata only: the exclusion is named by id, and everything
+        // this operation reports is read off the record the store already holds.
+        let _ = ctx;
+        use crate::state;
+
+        // `ExclusionId` is `@required` but modelled `clientOptional`, so a request that left
+        // it out reaches this handler as an empty string rather than being refused at the
+        // boundary — EC2's `MissingParameter`, worded the way the modify of the same
+        // exclusion words it.
+        if input.exclusion_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter exclusionId",
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST" (`DryRun`): a question about the CALLER, answered
+        // once the request's own form has been read and before anything is resolved or
+        // written.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called — an exclusion its create left `create-in-progress` is
+        // `create-complete` once that instant has passed, and one an earlier delete left
+        // `delete-in-progress` is gone — so those moves are applied before this write reads
+        // the store.
+        store.materialize_due_transitions();
+
+        // "The ID of the exclusion" (`ExclusionId`): an id this account holds no exclusion
+        // under has nothing to delete, refused by the one place this crate words that
+        // refusal.
+        let Some(deleting) =
+            store.begin_vpc_block_public_access_exclusion_deletion(&input.exclusion_id)
+        else {
+            return Err(state::invalid_vpc_bpa_exclusion_id_not_found(
+                &input.exclusion_id,
+            ));
+        };
+
+        // "Details about an exclusion"
+        // (`DeleteVpcBlockPublicAccessExclusionResult$VpcBlockPublicAccessExclusion`): the
+        // record as it now stands in the store — going away, carrying the resource ARN it
+        // has always reported — so this call and every later reader of the exclusion agree.
+        Ok(DeleteVpcBlockPublicAccessExclusionOutput {
+            vpc_block_public_access_exclusion: Some(deleting),
+        })
     }
 }

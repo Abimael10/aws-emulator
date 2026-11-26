@@ -163,14 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "Deletes the specified Network Access Scope analysis": an id that resolves to no
-        // analysis of the account is refused rather than answered as a delete that happened.
+        // analysis of the account is refused rather than answered as a delete that happened —
+        // in the two ways EC2 tells those apart. A value outside the ISSUED long id form
+        // ([`crate::state::issued_long_id_is_well_formed`]) — a suffix of another length, an
+        // upper-case or non-hexadecimal suffix, another resource's id, the all-zero
+        // placeholder a mint counting from one can never produce, free text — is no analysis
+        // id at all, so EC2 states that the id it was given is not a valid one; a value in
+        // that form names an analysis this account may once have held, so one it holds none
+        // under is this resource's own not-found code.
+        if !state::issued_long_id_is_well_formed(
+            state::NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX,
+            &analysis_id,
+        ) {
+            return Err(state::invalid_network_insights_access_scope_analysis_id_value(
+                &analysis_id,
+            ));
+        }
         if !store
             .network_insights_access_scope_analyses
             .contains_key(&analysis_id)
         {
-            return Err(state::invalid_network_insights_access_scope_analysis_id_value(
-                &analysis_id,
-            ));
+            return Err(
+                state::invalid_network_insights_access_scope_analysis_id_not_found(&analysis_id),
+            );
         }
 
         // The request is one that would have succeeded, so the dry run stops HERE: "If you

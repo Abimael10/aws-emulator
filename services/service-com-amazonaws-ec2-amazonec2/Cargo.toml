@@ -40,7 +40,8 @@ base64 = "0.22"
 # real zlib stream. Pure Rust, like the other codecs here.
 flate2 = "1"
 # The 2048-bit RSA key pair `CreateKeyPair` generates: the operation hands the caller the
-# private half, so the key has to be a real key.
+# private half, so the key has to be a real key. The NitroTPM endorsement key
+# `GetInstanceTpmEkPub` reports comes from the same generator, in both key types it publishes.
 aws-lc-rs = "1"
 # The PKCS#1 `RSAPrivateKey` an RSA key pair's PEM private key is ("an unencrypted PEM
 # encoded PKCS#1 private key"), read out of the PKCS#8 `aws-lc-rs` encodes a key as; its

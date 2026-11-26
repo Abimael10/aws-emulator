@@ -13,10 +13,11 @@
 //!    and the analysis is gone for every later caller —
 //!    `DescribeNetworkInsightsAccessScopeAnalyses`, which reads the same store, no longer
 //!    reports it and no longer resolves its id;
-//! 2. an id this account holds no analysis under is REFUSED — whatever its form, including
-//!    the id of an analysis an earlier call already deleted — with EC2's
-//!    `InvalidParameterValue` stating that the `NetworkInsightsAccessScopeAnalysisId` it was
-//!    given is not a valid one, and nothing is removed;
+//! 2. an id this account holds no analysis under is REFUSED — in the two ways EC2 tells those
+//!    apart: a value outside the issued id form gets `InvalidParameterValue` stating that the
+//!    `NetworkInsightsAccessScopeAnalysisId` it was given is not a valid one, while a value in
+//!    that form, including the id of an analysis an earlier call already deleted, gets this
+//!    resource's own `.NotFound` — and nothing is removed;
 //! 3. a `DryRun` reports `DryRunOperation` and removes nothing, while `DryRun=false` is an
 //!    ordinary delete — and a dry run naming an analysis the account does not hold is refused
 //!    with that reason instead.
@@ -220,7 +221,8 @@ fn refusal_message(case: &str, body: &str) -> String {
         .to_string()
 }
 
-/// The refusal every id this account holds no analysis under gets from this operation.
+/// The refusal every value OUTSIDE the issued analysis id form gets from this operation: the
+/// mint could never have produced it, so it is no analysis id at all.
 fn unresolvable_message(analysis_id: &str) -> String {
     format!("NetworkInsightsAccessScopeAnalysisId ({analysis_id}) is not valid")
 }
@@ -576,8 +578,9 @@ async fn an_analysis_id_that_names_no_analysis_is_refused() {
 }
 
 /// RULE 2: a delete is not idempotent — the analysis is gone after the first call, so a
-/// second call naming the same id names no analysis of the account and gets the same refusal
-/// any other unresolvable id gets, naming that id. One row per tag set.
+/// second call naming the same id names no analysis of the account. That id is one the service
+/// ISSUED, so the refusal is this resource's own not-found code naming it, rather than the
+/// value refusal a form the mint could never have produced gets. One row per tag set.
 #[tokio::test]
 async fn deleting_the_same_analysis_twice_refuses_the_second_call() {
     for (case, tags) in TAG_ROWS {
@@ -598,12 +601,13 @@ async fn deleting_the_same_analysis_twice_refuses_the_second_call() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_PARAMETER_VALUE,
-            "case {case:?}: the second delete expected {INVALID_PARAMETER_VALUE}, got {body}"
+            INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND,
+            "case {case:?}: the second delete expected \
+             {INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND}, got {body}"
         );
         assert_eq!(
             error_message(&body),
-            unresolvable_message(&analysis_id),
+            format!("{analysis_id} does not exist"),
             "case {case:?}: the second delete must name {analysis_id}, got {body}"
         );
         assert_eq!(

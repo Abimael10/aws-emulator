@@ -36,8 +36,10 @@ use crate::support::{
 };
 
 /// The AMI every launch template in this suite names, in the long id form Amazon EC2 issues
-/// one in.
-const IMAGE_ID: &str = "ami-00000000000000091";
+/// one in. The account holds no image for it, and the id is chosen ABOVE every id that
+/// service's mint hands out, so a published-catalogue row added later cannot come to hold it
+/// and give this suite's launches an image whose facts it never meant to exercise.
+const IMAGE_ID: &str = "ami-0ffffffffffffffff";
 
 /// The instance type every launch template in this suite names.
 const INSTANCE_TYPE: &str = "t3.micro";

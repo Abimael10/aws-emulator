@@ -162,15 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can either specify individual tag keys or register all tag keys in the
         // current Region. You must specify either IncludeAllTagsOfInstance or
-        // InstanceTagKeys in the request" (`RegisterInstanceTagAttributeRequest`): the two
-        // are alternatives, so naming both has no single reading and naming neither asks
-        // for nothing at all.
-        if include_all && !requested_keys.is_empty() {
-            return Err(Scaffolded::invalid_parameter_combination(
-                "The request must specify either IncludeAllTagsOfInstance or \
-                 InstanceTagKeys, not both",
-            ));
-        }
+        // InstanceTagKeys in the request" (`RegisterInstanceTagAttributeRequest`): AT LEAST
+        // ONE of the two, so a request that names NEITHER asks for nothing at all. A
+        // request that names both is read by the member that ASKS for something: the flag's
+        // `true` registers every tag key of the Region, which subsumes any key named beside
+        // it, and its other value asks for nothing here, leaving the named keys to decide —
+        // the same reading the deregister of the same attribute makes of its own `false`.
         if !include_all && requested_keys.is_empty() {
             return Err(Scaffolded::missing_parameter(
                 "The request must specify either IncludeAllTagsOfInstance or \

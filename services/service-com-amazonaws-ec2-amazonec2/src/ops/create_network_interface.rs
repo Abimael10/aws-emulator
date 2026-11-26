@@ -321,8 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cidr_block = subnet.cidr_block.clone().unwrap_or_default();
 
         // "The IDs of the security groups" (`Groups`). A group has to exist and has to be a
-        // group of the interface's own VPC — a security group only applies within its VPC —
-        // and the list is held to the number AWS documents per network interface.
+        // group the interface's own VPC can use — one created in that VPC, or one
+        // `AssociateSecurityGroupVpc` has associated with it, which is the crate's one
+        // reading of that question ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_usable_in_vpc`])
+        // — and the list is held to the number AWS documents per network interface.
         let requested_groups = state::deduplicate_ids(input.groups.as_deref().unwrap_or_default());
         if requested_groups.len() > state::MAX_SECURITY_GROUPS_PER_INSTANCE {
             return Err(state::invalid_parameter_value(format!(
@@ -332,13 +334,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 max = state::MAX_SECURITY_GROUPS_PER_INSTANCE,
             )));
         }
+        let now = ::std::time::Instant::now();
         let mut groups: Vec<GroupIdentifier> = Vec::with_capacity(requested_groups.len());
         for group_id in &requested_groups {
-            let Some(group) = store
-                .security_groups
-                .get(group_id)
-                .filter(|group| group.vpc_id.as_deref() == Some(vpc_id.as_str()))
-            else {
+            if !store.security_group_usable_in_vpc(group_id, &vpc_id, now) {
+                return Err(state::invalid_group_not_found(group_id));
+            }
+            let Some(group) = store.security_groups.get(group_id) else {
                 return Err(state::invalid_group_not_found(group_id));
             };
             groups.push(GroupIdentifier {

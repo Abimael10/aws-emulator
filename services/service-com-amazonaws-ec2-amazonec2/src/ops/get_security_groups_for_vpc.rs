@@ -258,40 +258,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Gets security groups that can be associated by the Amazon Web Services account
         // making the request with network interfaces in the specified VPC"
-        // (`GetSecurityGroupsForVpc`): a group can be used by an interface in a VPC when it
-        // was created in that VPC, or when `AssociateSecurityGroupVpc` has associated it
-        // with that VPC and the association has reached `associated` — which is why the
+        // (`GetSecurityGroupsForVpc`): which groups those are is the crate's one reading of
+        // that question
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_usable_in_vpc`]) —
+        // the group was created in that VPC, or `AssociateSecurityGroupVpc` has associated
+        // it with that VPC and the association has reached `associated`. Which is why the
         // report names each group's `PrimaryVpcId`, "the VPC ID in which the security group
         // was created" (`SecurityGroupForVpc$PrimaryVpcId`), rather than the VPC asked
-        // about. An association the clock has not established yet carries nothing, so the
-        // group it names is not usable in the VPC yet either.
+        // about.
         //
         // Every comparison is charged to ONE budget, so the product of candidate groups,
         // filters, values and value length is bounded however the caller combines them —
         // which is also what bounds how long this holds the store's lock.
         let now = ::std::time::Instant::now();
-        let usable: std::collections::BTreeSet<String> = store
-            .security_group_vpc_associations
-            .iter()
-            .filter(|((_, vpc_id), record)| {
-                vpc_id.as_str() == input.vpc_id
-                    && record.state_at(now)
-                        == crate::state::SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED
-            })
-            .map(|((group_id, _), _)| group_id.clone())
-            .collect();
         let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
         let mut selected: Vec<SecurityGroupForVpc> = Vec::new();
         for group in store.security_groups.values() {
             if budget.exhausted() {
                 break;
             }
-            let created_here = group.vpc_id.as_deref() == Some(input.vpc_id.as_str());
-            let associated = group
-                .group_id
-                .as_deref()
-                .is_some_and(|group_id| usable.contains(group_id));
-            if !created_here && !associated {
+            let usable = group.group_id.as_deref().is_some_and(|group_id| {
+                store.security_group_usable_in_vpc(group_id, &input.vpc_id, now)
+            });
+            if !usable {
                 continue;
             }
             let reported = security_group_for_vpc(group);

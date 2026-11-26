@@ -726,6 +726,17 @@ pub const VPC_BPA_EXCLUSION_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress
 /// `create-complete` member, the state the clock owes a `create-in-progress` one.
 pub const VPC_BPA_EXCLUSION_STATE_CREATE_COMPLETE: &str = "create-complete";
 
+/// An exclusion AWS is taking down: that same enum's `delete-in-progress` member, which is
+/// what `DeleteVpcBlockPublicAccessExclusion` answers with until [`TRANSITION_DELAY`] has
+/// passed.
+pub const VPC_BPA_EXCLUSION_STATE_DELETE_IN_PROGRESS: &str = "delete-in-progress";
+
+/// An exclusion that has been taken down: that same enum's `delete-complete` member, the
+/// state the clock owes a `delete-in-progress` one — at which instant the exclusion stops
+/// excluding anything and its record leaves the store
+/// ([`ComAmazonawsEc2Amazonec2State::remove_vpc_block_public_access_exclusion`]).
+pub const VPC_BPA_EXCLUSION_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
 /// The `ResourceType` a `CreateVpcBlockPublicAccessExclusion` tag specification may name:
 /// the exclusion it creates (the modelled `ResourceType` enum's
 /// `vpc-block-public-access-exclusion` member).
@@ -759,11 +770,12 @@ pub const INVALID_VPC_BPA_EXCLUSION_ID_NOT_FOUND: &str =
 /// What a VPC BPA exclusion is applied to: "a mode that can be applied to a single VPC or
 /// subnet" (`VpcBlockPublicAccessExclusion`).
 ///
-/// The modelled shape carries no member for it — the exclusion reports its own ARN, not
-/// the excluded resource's id — so it is stored beside the record under the same id, the
-/// way [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds what a [`Vpc`] has no member
-/// for. Which resource an exclusion covers is what makes a second exclusion for the same
-/// VPC or subnet a conflict, and what a delete has to know to release it.
+/// The modelled shape carries no ID member for it — the exclusion reports the excluded
+/// resource as the ARN on its `ResourceArn` — so the id is stored beside the record under
+/// the same id, the way [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds what a
+/// [`Vpc`] has no member for. Which resource an exclusion covers is what makes a second
+/// exclusion for the same VPC or subnet a conflict, what the ARN it reports names, and what
+/// a delete has to know to release it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionTarget {
     /// "A VPC ID" (`CreateVpcBlockPublicAccessExclusionRequest$VpcId`).
@@ -872,11 +884,15 @@ pub fn vpc_bpa_exclusion_limit_exceeded<E>() -> Scaffolded<E> {
 
 /// Refuse an exclusion id a request named that the account holds no exclusion under: HTTP
 /// 400 [`INVALID_VPC_BPA_EXCLUSION_ID_NOT_FOUND`].
+///
+/// Worded by the one place this crate words a missing resource id ([`id_not_found`]), naming
+/// the resource by the `ResourceType` word the model publishes for it
+/// ([`RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION`]) and the id the REQUEST carried.
 pub fn invalid_vpc_bpa_exclusion_id_not_found<E>(exclusion_id: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(
+    id_not_found(
         INVALID_VPC_BPA_EXCLUSION_ID_NOT_FOUND,
-        400,
-        format!("The VPC Block Public Access exclusion ID '{exclusion_id}' does not exist"),
+        &format!("{RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION} ID"),
+        exclusion_id,
     )
 }
 
@@ -926,15 +942,21 @@ impl ComAmazonawsEc2Amazonec2State {
         let view = VpcBlockPublicAccessExclusion {
             exclusion_id: Some(exclusion_id.clone()),
             internet_gateway_exclusion_mode: Some(spec.internet_gateway_exclusion_mode.to_string()),
-            // "The ARN of the exclusion" (`VpcBlockPublicAccessExclusion$ResourceArn`),
-            // which the `resource-arn` filter of the describe calls "the Amazon Resource
-            // Name (ARN) of a exclusion" too: an EC2 ARN in the Region the request was
-            // signed for, under the `vpc-block-public-access-exclusion` resource type the
-            // modelled `ResourceType` catalog publishes for this resource.
+            // "The ARN of the exclusion" (`VpcBlockPublicAccessExclusion$ResourceArn`): the
+            // ARN of the RESOURCE the exclusion is applied to — the VPC or the subnet it
+            // excludes — which is the only resource the shape names no id member for, and
+            // what a client reconciling exclusions against its network reads to tell which
+            // VPC or subnet one covers. An EC2 ARN in the Region the request was signed
+            // for, under the excluded resource's own `ResourceType` word
+            // ([`ExclusionTarget::resource_type`]).
             resource_arn: Some(::engine::emulator_arn(
                 "ec2",
                 &spec.region,
-                &format!("{RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION}/{exclusion_id}"),
+                &format!(
+                    "{resource_type}/{resource_id}",
+                    resource_type = spec.target.resource_type(),
+                    resource_id = spec.target.resource_id(),
+                ),
             )),
             state: Some(VPC_BPA_EXCLUSION_STATE_CREATE_IN_PROGRESS.to_string()),
             // "The reason for the current exclusion state": nothing has gone wrong with
@@ -959,6 +981,57 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         stored
+    }
+
+    /// Start the deletion of the exclusion `exclusion_id` names and answer it as it now
+    /// stands, or `None` when the account holds no exclusion of that id.
+    ///
+    /// "Delete a VPC Block Public Access (BPA) exclusion"
+    /// (`DeleteVpcBlockPublicAccessExclusion`): the exclusion is left in the non-terminal
+    /// [`VPC_BPA_EXCLUSION_STATE_DELETE_IN_PROGRESS`] with the clock owing it
+    /// [`VPC_BPA_EXCLUSION_STATE_DELETE_COMPLETE`] one [`TRANSITION_DELAY`] later — the span
+    /// every other clock-owed move of this crate takes — so a caller reading straight after
+    /// the call still sees the exclusion going away, and no second call is needed to finish
+    /// it. "When the exclusion was deleted"
+    /// (`VpcBlockPublicAccessExclusion$DeletionTimestamp`) is recorded here, which is when
+    /// the delete was asked for.
+    ///
+    /// The ONE way a delete is started, so the operation that asks for one and the clock
+    /// that completes it cannot report one exclusion differently.
+    pub fn begin_vpc_block_public_access_exclusion_deletion(
+        &mut self,
+        exclusion_id: &str,
+    ) -> Option<VpcBlockPublicAccessExclusion> {
+        let record = self.vpc_block_public_access_exclusions.get_mut(exclusion_id)?;
+        let now = system_time_to_date_time(SystemTime::now());
+        record.view.state = Some(VPC_BPA_EXCLUSION_STATE_DELETE_IN_PROGRESS.to_string());
+        record.view.deletion_timestamp = Some(now);
+        record.view.last_update_timestamp = Some(now);
+        record.pending = Some(ExclusionTransition::starting_now(
+            VPC_BPA_EXCLUSION_STATE_DELETE_COMPLETE,
+        ));
+        Some(record.view.clone())
+    }
+
+    /// Take the exclusion `exclusion_id` names OUT of the store and answer it as it was last
+    /// reported, or `None` when the account holds no exclusion of that id.
+    ///
+    /// The ONE way an exclusion leaves the store, reached by the clock when a started
+    /// deletion falls due: a deleted exclusion exempts nothing, so its record goes rather
+    /// than being left behind for `DescribeVpcBlockPublicAccessExclusions` to report, and
+    /// the resource it covered can be given an exclusion again. The tag bytes the record
+    /// held go back to the store's budget on exactly the terms the insert took them on.
+    pub fn remove_vpc_block_public_access_exclusion(
+        &mut self,
+        exclusion_id: &str,
+    ) -> Option<VpcBlockPublicAccessExclusion> {
+        let record = self
+            .vpc_block_public_access_exclusions
+            .remove(exclusion_id)?;
+        self.release_stored_bytes(tag_list_bytes(
+            record.view.tags.as_deref().unwrap_or_default(),
+        ));
+        Some(record.view)
     }
 }
 

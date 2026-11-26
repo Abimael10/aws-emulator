@@ -602,44 +602,21 @@ async fn a_deregister_reaches_only_the_region_it_was_signed_for() {
 /// answers — the same ones the register answers for the same bad request, since the two
 /// requests carry the same attribute — and none of them writes anything.
 ///
-/// The rows differ along what makes the request bad: both members of the attribute in one
-/// request, neither of them, no attribute at all, a key with no characters, a key one
-/// character past the published bound, and a dry run of each of the deregister's two modes.
+/// The rows differ along what makes the request bad: no attribute at all, a key with no
+/// characters, a key one character past the published bound, and a dry run of each of the
+/// deregister's two modes. A request that names BOTH members is not among them, and neither is
+/// one that names the flag alone whichever value it carries: the attribute requires at least
+/// one of its two members and the flag asks for every tag key of the Region, so both are
+/// served rather than refused (`instance_event_notification_attribute_modes`).
 #[tokio::test]
 async fn a_bad_deregister_is_refused_with_the_ec2_error_code_for_it() {
     let router = emulator();
     let seeded = Registration::of(&["Name"]);
     register(&router, "the refusal table's key", REGION, &register_keys(&["Name"])).await;
 
-    let mut both = deregister_all();
-    both.extend(register_keys(&["Name"]));
-    let mut both_on = vec![param("InstanceTagAttribute.IncludeAllTagsOfInstance", "true")];
-    both_on.extend(register_keys(&["Name"]));
     let past_bound: String = std::iter::repeat_n('k', MAX_KEY_CHARS + 1).collect();
     // (case, the deregister's form fields, the HTTP status, the EC2 error code)
-    let cases: [(&str, Vec<Param>, u16, &str); 8] = [
-        (
-            "both members of the attribute",
-            both,
-            400,
-            ec2::state::INVALID_PARAMETER_COMBINATION,
-        ),
-        (
-            // The flag carries the other value, which this request has no reading for —
-            // but it is still the flag, named beside a tag key.
-            "both members of the attribute, with the flag the other way round",
-            both_on,
-            400,
-            ec2::state::INVALID_PARAMETER_COMBINATION,
-        ),
-        (
-            // `true` is not a value this request has a reading for: "Specify `false` to
-            // deregister all tag keys", so the request names neither member.
-            "neither member of the attribute",
-            vec![param("InstanceTagAttribute.IncludeAllTagsOfInstance", "true")],
-            400,
-            ec2::state::MISSING_PARAMETER,
-        ),
+    let cases: [(&str, Vec<Param>, u16, &str); 5] = [
         (
             // `InstanceTagAttribute` is a modelled `@required` member, so the boundary
             // validator refuses a request without it BEFORE the handler runs — with the
@@ -836,27 +813,19 @@ async fn the_number_of_regions_the_store_registers_keys_for_is_bounded() {
 /// Every refusal these two operations make, each with the EC2 error code and HTTP status it
 /// answers — and none of them writes anything.
 ///
-/// The rows differ along what makes the request bad: both members of the attribute in one
-/// request ("You must specify either IncludeAllTagsOfInstance or InstanceTagKeys"), neither
-/// of them, an attribute that is not in the request at all, a key with no characters, and a
-/// dry run of each operation.
+/// The rows differ along what makes the request bad: a request that names neither member of
+/// the attribute, an attribute that is not in the request at all, a key with no characters,
+/// and a dry run of each operation. A request that names BOTH members is not among them: the
+/// attribute requires at least one of the two, so naming both is served rather than refused
+/// (`instance_event_notification_attribute_modes`).
 #[tokio::test]
 async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
     let router = emulator();
     let seeded = Registration::of(&["Name"]);
     register(&router, "the refusal table's key", REGION, &register_keys(&["Name"])).await;
 
-    let mut both = register_all();
-    both.extend(register_keys(&["Stage"]));
     // (case, the action, its form fields, the HTTP status, the EC2 error code)
-    let cases: [(&str, &str, Vec<Param>, u16, &str); 6] = [
-        (
-            "both members of the attribute",
-            REGISTER,
-            both,
-            400,
-            ec2::state::INVALID_PARAMETER_COMBINATION,
-        ),
+    let cases: [(&str, &str, Vec<Param>, u16, &str); 5] = [
         (
             "neither member of the attribute",
             REGISTER,

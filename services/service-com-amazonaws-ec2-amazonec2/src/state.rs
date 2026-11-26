@@ -3074,7 +3074,25 @@ pub use amazon_resource_names::*;
 /// `crate::state::<item>` like any primitive of this module.
 mod reachability_trace;
 pub use reachability_trace::*;
+/// Running a Network Access Scope ANALYSIS — the findings a scope has, read off the stored
+/// network interfaces, security groups, network ACLs and routes — in a file of its own rather
+/// than as more lines beside the scope record. Everything it declares is re-exported below,
+/// so a handler reaches it as `crate::state::<item>` like any primitive of this module.
+mod access_scope_analysis;
+pub use access_scope_analysis::*;
 mod nat_gateways_and_vpn_connections;
+/// The NitroTPM endorsement key one instance holds, and the two published forms
+/// `GetInstanceTpmEkPub` reports it in — in a file of its own rather than as more lines beside
+/// the instance record. Everything it declares is re-exported below, so a handler reaches it
+/// as `crate::state::<item>` like any primitive of this module.
+pub mod instance_tpm;
+pub use instance_tpm::*;
+/// The AWS Local Zones a Region publishes and the zone groups this account has opted in to —
+/// the only part of a zone a caller can move — in a file of its own rather than as more lines
+/// beside the Availability Zone record. Everything it declares is re-exported below, so a
+/// handler reaches it as `crate::state::zones_in_region` like any primitive of this module.
+pub mod local_zones;
+pub use local_zones::*;
 /// The CloudWatch series a NAT gateway publishes about the traffic it carries — the namespace
 /// and dimension it is published under, the catalog of its metrics, and the clock the windows
 /// are published on — in a file of its own rather than as more lines beside the gateway

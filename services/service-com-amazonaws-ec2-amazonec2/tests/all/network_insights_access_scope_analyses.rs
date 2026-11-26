@@ -11,9 +11,8 @@
 //!    THAT STORE: the scope id and the tags the request sets round-trip, and the members the
 //!    service owns (the analysis id, its ARN, its status and its start date) are derived
 //!    rather than taken;
-//! 2. the CLOCK, not a caller, ends an analysis — `running` -> `failed`, carrying the reason
-//!    this emulator produced no findings and the end date of the due instant, and never
-//!    findings or an analyzed-interface count that nothing computed;
+//! 2. the CLOCK, not a caller, ends an analysis — `running` -> `succeeded`, carrying whether
+//!    the scope has findings, the interfaces it analyzed and the end date of the due instant;
 //! 3. one `ClientToken` names one analysis, and reusing it for a different request is
 //!    refused with `IdempotentParameterMismatch`;
 //! 4. `NetworkInsightsAccessScopeAnalysisIds`, `NetworkInsightsAccessScopeId`, the
@@ -37,9 +36,8 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use ec2::ops::types::{ANALYSIS_STATUS_VALUES, FINDINGS_FOUND_VALUES};
 use ec2::state::{
-    AccessScopePaths, ANALYSIS_STATUS_FAILED, ANALYSIS_STATUS_RUNNING,
-    ANALYSIS_UNSUPPORTED_STATUS_MESSAGE,
-    ComAmazonawsEc2Amazonec2State as Ec2State, FINDINGS_FOUND_UNKNOWN,
+    AccessScopePaths, ANALYSIS_STATUS_RUNNING, ANALYSIS_STATUS_SUCCEEDED,
+    ComAmazonawsEc2Amazonec2State as Ec2State, FINDINGS_FOUND_FALSE,
     IDEMPOTENT_PARAMETER_MISMATCH, INVALID_FILTER, MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES,
     NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX, NetworkInsightsAccessScopeAnalysisSpec,
     RESOURCE_COUNT_EXCEEDED, RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS,
@@ -432,11 +430,12 @@ async fn a_scope_carries_every_analysis_started_against_it() {
 
 /// RULE 2: an analysis is `running` when the start answers — the span is never zero, so a
 /// caller reading straight after the call still sees it — and the CLOCK moves it to the
-/// terminal `failed` status, carrying why no findings were produced and the end date of the
-/// due instant. Nothing reports findings or an analyzed-interface count that nothing
-/// computed.
+/// terminal `succeeded` status, carrying whether the scope has findings, the interfaces it
+/// analyzed and the end date of the due instant. An account holding no network interface has
+/// no path to match, so the analysis succeeds reporting no findings rather than a reason it
+/// has none.
 #[tokio::test]
-async fn the_clock_ends_the_analysis_with_the_reason_nothing_analyzed_it() {
+async fn the_clock_ends_the_analysis_with_what_it_found() {
     let case = "the clock ends the analysis";
     let (router, engine) = super::ec2_query::emulator();
     let scope_id = seed_scope(&engine);
@@ -472,18 +471,18 @@ async fn the_clock_ends_the_analysis_with_the_reason_nothing_analyzed_it() {
     .await;
     let ended = only(case, &body);
     assert_eq!(
-        ended.status, ANALYSIS_STATUS_FAILED,
+        ended.status, ANALYSIS_STATUS_SUCCEEDED,
         "case {case:?}: expected the terminal status the clock owes the analysis, got {ended:?}"
     );
     assert_eq!(
         ended.status_message.as_deref(),
-        Some(ANALYSIS_UNSUPPORTED_STATUS_MESSAGE),
-        "case {case:?}: expected the reason no findings were produced, got {ended:?}"
+        None,
+        "case {case:?}: an analysis that produced a result reports no failure, got {ended:?}"
     );
     assert_eq!(
         ended.findings_found.as_deref(),
-        Some(FINDINGS_FOUND_UNKNOWN),
-        "case {case:?}: whether the scope has findings was never determined, got {ended:?}"
+        Some(FINDINGS_FOUND_FALSE),
+        "case {case:?}: an account with no network interface has no path to match, got {ended:?}"
     );
     assert!(
         FINDINGS_FOUND_VALUES.contains(&ended.findings_found.clone().unwrap_or_default().as_str()),
@@ -493,7 +492,7 @@ async fn the_clock_ends_the_analysis_with_the_reason_nothing_analyzed_it() {
     assert_eq!(
         ended.analyzed_eni_count.as_deref(),
         Some("0"),
-        "case {case:?}: no network interface was analyzed, so the count stands at none, got \
+        "case {case:?}: the account holds no network interface, so none was analyzed, got \
          {ended:?}"
     );
     let end_date = ended
@@ -706,8 +705,13 @@ async fn an_id_the_account_does_not_hold_is_refused() {
         );
     }
 
-    // The start resolves the scope the same way.
-    for scope in [UNKNOWN_SCOPE_ID, "not-a-scope"] {
+    // The start ACTS on the one scope it is given, so an id it cannot resolve is refused the
+    // way an acting operation refuses one: a value the mint could never have issued — which a
+    // hand-written id above everything it has reached is — is not a scope id at all.
+    for (scope, expected) in [
+        (UNKNOWN_SCOPE_ID, ec2::state::INVALID_PARAMETER_VALUE),
+        ("not-a-scope", ec2::state::INVALID_PARAMETER_VALUE),
+    ] {
         let (status, body) = start(&router, &start_params(scope, "unknown-scope", &[])).await;
         assert_eq!(
             status, 400,
@@ -715,8 +719,8 @@ async fn an_id_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidNetworkInsightsAccessScopeId.NotFound",
-            "case {scope:?}: expected InvalidNetworkInsightsAccessScopeId.NotFound, got {body}"
+            expected,
+            "case {scope:?}: expected {expected}, got {body}"
         );
         assert_eq!(
             stored_count(&engine),
@@ -747,18 +751,18 @@ async fn the_enumerated_filters_select_and_every_other_name_is_refused() {
     // (case, filter name, values, is the analysis reported?)
     let while_running: [(&str, &str, &[&str], bool); 6] = [
         ("its own status", "status", &[ANALYSIS_STATUS_RUNNING], true),
-        ("another status", "status", &[ANALYSIS_STATUS_FAILED], false),
+        ("another status", "status", &[ANALYSIS_STATUS_SUCCEEDED], false),
         (
             "either status (values are OR-ed)",
             "status",
-            &[ANALYSIS_STATUS_FAILED, ANALYSIS_STATUS_RUNNING],
+            &[ANALYSIS_STATUS_SUCCEEDED, ANALYSIS_STATUS_RUNNING],
             true,
         ),
         ("a status wildcard", "status", &["run*"], true),
         (
             "findings-found, which a running analysis does not carry",
             "findings-found",
-            &[FINDINGS_FOUND_UNKNOWN],
+            &[FINDINGS_FOUND_FALSE],
             false,
         ),
         ("a findings wildcard", "findings-found", &["*"], false),
@@ -786,12 +790,17 @@ async fn the_enumerated_filters_select_and_every_other_name_is_refused() {
     // Once the clock has ended it, the same two filters select on what it reports NOW.
     past_the_transition().await;
     let when_ended: [(&str, &str, &[&str], bool); 4] = [
-        ("the ended status", "status", &[ANALYSIS_STATUS_FAILED], true),
+        (
+            "the ended status",
+            "status",
+            &[ANALYSIS_STATUS_SUCCEEDED],
+            true,
+        ),
         ("the status it left", "status", &[ANALYSIS_STATUS_RUNNING], false),
         (
             "the findings it reports",
             "findings-found",
-            &[FINDINGS_FOUND_UNKNOWN],
+            &[FINDINGS_FOUND_FALSE],
             true,
         ),
         ("other findings", "findings-found", &["true"], false),
@@ -822,7 +831,7 @@ async fn the_enumerated_filters_select_and_every_other_name_is_refused() {
         &router,
         "DescribeNetworkInsightsAccessScopeAnalyses",
         &filters(&[
-            ("status", &[ANALYSIS_STATUS_FAILED]),
+            ("status", &[ANALYSIS_STATUS_SUCCEEDED]),
             ("findings-found", &["true"]),
         ]),
     )
@@ -842,7 +851,7 @@ async fn the_enumerated_filters_select_and_every_other_name_is_refused() {
         ),
         ("tag-key", &["Name"]),
         ("tag:Name", &["audit"]),
-        ("Status", &[ANALYSIS_STATUS_FAILED]),
+        ("Status", &[ANALYSIS_STATUS_SUCCEEDED]),
         ("", &[]),
     ];
     let expected_message = format!(

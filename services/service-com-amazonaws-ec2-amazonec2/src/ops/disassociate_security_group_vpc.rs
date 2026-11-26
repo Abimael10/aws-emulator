@@ -187,17 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot disassociate the security group if any Elastic network interfaces in
         // the associated VPC are still associated with the security group"
         // (`DisassociateSecurityGroupVpc`): an interface in that VPC using the group still
-        // depends on the association, so taking it down is refused with the code and the
-        // wording EC2 answers a dependency with — naming the GROUP the request named and
-        // nothing else, as every other dependency refusal of this crate does.
+        // depends on the association, so taking it down is refused with the association's own
+        // in-use code and the sentence that documented condition states.
         if !store
             .network_interfaces_in_vpc_with_security_group(&input.vpc_id, &input.group_id)
             .is_empty()
         {
-            return Err(state::dependency_violation(format!(
-                "resource {group_id} has a dependent object",
-                group_id = input.group_id,
-            )));
+            return Err(state::security_group_vpc_association_in_use());
         }
 
         // DryRun sits AFTER every id has been resolved and every refusal asked, and BEFORE

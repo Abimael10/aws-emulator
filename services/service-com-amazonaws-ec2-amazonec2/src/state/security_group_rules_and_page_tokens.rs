@@ -1786,6 +1786,33 @@ pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATING: &str = "disassoci
 /// pair holds the group in no VPC and may be associated again.
 pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
 
+/// The code EC2 answers a disassociate that a network interface still depends on:
+/// `SecurityGroupVpcAssociationInUse`, the association's own in-use code rather than the
+/// generic `DependencyViolation`.
+pub const SECURITY_GROUP_VPC_ASSOCIATION_IN_USE: &str = "SecurityGroupVpcAssociationInUse";
+
+/// The sentence EC2 answers beside [`SECURITY_GROUP_VPC_ASSOCIATION_IN_USE`]: the condition
+/// the operation's own documentation states — "you cannot disassociate the security group if
+/// any Elastic network interfaces in the associated VPC are still associated with the security
+/// group" (`DisassociateSecurityGroupVpc`).
+///
+/// FIXED text: it names neither the group nor the VPC, so nothing of the request is
+/// interpolated into it.
+pub const SECURITY_GROUP_VPC_ASSOCIATION_IN_USE_MESSAGE: &str =
+    "You cannot disassociate the security group if any Elastic network interfaces in the \
+     associated VPC are still associated with the security group";
+
+/// Refuse a disassociate while an interface in that VPC is still using the group: HTTP 400
+/// [`SECURITY_GROUP_VPC_ASSOCIATION_IN_USE`] with
+/// [`SECURITY_GROUP_VPC_ASSOCIATION_IN_USE_MESSAGE`].
+pub fn security_group_vpc_association_in_use<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        SECURITY_GROUP_VPC_ASSOCIATION_IN_USE,
+        400,
+        SECURITY_GROUP_VPC_ASSOCIATION_IN_USE_MESSAGE,
+    )
+}
+
 /// The largest number of security group VPC associations this in-memory store holds.
 ///
 /// A capacity bound in the same style as [`MAX_SECURITY_GROUPS`], not an AWS quota: each
@@ -1968,6 +1995,41 @@ impl ComAmazonawsEc2Amazonec2State {
                 self.security_group_vpc_association_view(group_id, vpc_id, record, now)
             })
             .collect()
+    }
+
+    /// Whether the account's security group `group_id` may be applied to a network interface
+    /// in the VPC `vpc_id` at `now`.
+    ///
+    /// "Gets security groups that can be associated by the Amazon Web Services account
+    /// making the request with network interfaces in the specified VPC"
+    /// (`GetSecurityGroupsForVpc`): a group can be used by an interface in a VPC when it was
+    /// CREATED in that VPC, or when `AssociateSecurityGroupVpc` has associated it with that
+    /// VPC and the association has reached
+    /// [`SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED`] — an association the clock has not
+    /// established yet carries nothing, so the group it names is not usable in the VPC yet
+    /// either.
+    ///
+    /// The ONE definition of that rule, so every operation that applies a group to an
+    /// interface scopes the same set of groups, and a group a caller associated with a
+    /// second VPC is usable there as soon as `DescribeSecurityGroupVpcAssociations` reports
+    /// the association established.
+    pub fn security_group_usable_in_vpc(
+        &self,
+        group_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> bool {
+        let Some(group) = self.security_groups.get(group_id) else {
+            return false;
+        };
+        if group.vpc_id.as_deref() == Some(vpc_id) {
+            return true;
+        }
+        self.security_group_vpc_associations
+            .get(&(group_id.to_string(), vpc_id.to_string()))
+            .is_some_and(|record| {
+                record.state_at(now) == SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED
+            })
     }
 }
 

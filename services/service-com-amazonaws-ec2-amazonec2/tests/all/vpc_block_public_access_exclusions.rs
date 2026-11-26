@@ -300,17 +300,22 @@ async fn a_create_stores_the_exclusion_and_the_describe_reports_it() {
             "case {case:?}: expected the requested mode, got {:?}",
             created.internet_gateway_exclusion_mode
         );
-        // "The ARN of the exclusion" (`VpcBlockPublicAccessExclusion$ResourceArn`): an EC2
-        // ARN of the Region the request was signed for, under the resource type the modelled
-        // `ResourceType` catalog publishes for this resource.
+        // "The ARN of the exclusion" (`VpcBlockPublicAccessExclusion$ResourceArn`): the ARN
+        // of the RESOURCE the exclusion exempts — the VPC or the subnet the create named — in
+        // the Region the request was signed for, under that resource's own `ResourceType`
+        // word, which is what lets a client tell which network an exclusion covers
+        // (`vpc_block_public_access_exclusion_targets` spans that rule).
         let expected_arn = format!(
-            "arn:aws:ec2:{REGION}:{account}:{RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION}/{id}",
+            "arn:aws:ec2:{REGION}:{account}:{resource_type}/{target_id}",
             account = engine::emulator_account_id(),
-            id = created.exclusion_id,
+            resource_type = match target {
+                Target::Vpc => ec2::state::RESOURCE_TYPE_VPC,
+                Target::Subnet => ec2::state::RESOURCE_TYPE_SUBNET,
+            },
         );
         assert_eq!(
             created.resource_arn, expected_arn,
-            "case {case:?}: expected the exclusion's own ARN {expected_arn:?}, got {:?}",
+            "case {case:?}: expected the excluded resource's ARN {expected_arn:?}, got {:?}",
             created.resource_arn
         );
         assert_eq!(

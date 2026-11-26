@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkInsightsAccessScopeAnalysisFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkInsightsAccessScopeAnalysisFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkInsightsAccessScopeAnalysisFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the findings the analysis the request names produced: the paths of the stored
+//! network that matched its Network Access Scope, recorded on the analysis when the clock ran
+//! it ([`crate::state::ComAmazonawsEc2Amazonec2State::analyze_network_insights_access_scope`])
+//! and paged over in the order it found them, beside the analysis's own status — so a caller
+//! polling this sees the same status `DescribeNetworkInsightsAccessScopeAnalyses` reports and
+//! the findings that status accounts for.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +143,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkInsightsAccessScopeAnalysisFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkInsightsAccessScopeAnalysisFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkInsightsAccessScopeAnalysisFindings"))
+        // `ctx` carries request metadata only: the analysis is named by id, and the findings
+        // it reports are the ones the store already holds for it.
+        let _ = ctx;
+        use crate::state;
+
+        // `NetworkInsightsAccessScopeAnalysisId` is `@required` but modelled
+        // `clientOptional`, so a request that left it out reaches this handler as an empty
+        // string rather than being refused at the boundary — EC2's `MissingParameter`.
+        if input.network_insights_access_scope_analysis_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter networkInsightsAccessScopeAnalysisId",
+            ));
+        }
+
+        // "The token for the next page of results" (`NextToken`) — anything else is refused
+        // rather than read as a cursor, before the store is consulted.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request" (`DryRun`): answered once the request's own form has been read
+        // and before anything is resolved.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // The move the clock owes a running analysis fell due whether or not anybody called:
+        // an analysis whose due instant has passed has been RUN against the network, so
+        // applying that here reports the findings a later caller would have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the Network Access Scope analysis"
+        // (`NetworkInsightsAccessScopeAnalysisId`): an id this account holds no analysis
+        // under has no findings, refused with this resource's own not-found code — the one
+        // wording every READ of this surface answers for an id it cannot resolve, whatever
+        // its form, which is what `DescribeNetworkInsightsAccessScopeAnalyses` answers too.
+        let Some(record) = store
+            .network_insights_access_scope_analyses
+            .get(&input.network_insights_access_scope_analysis_id)
+        else {
+            return Err(
+                state::invalid_network_insights_access_scope_analysis_id_not_found(
+                    &input.network_insights_access_scope_analysis_id,
+                ),
+            );
+        };
+
+        // The findings in the order the analysis recorded them, which is both the stable
+        // paging order and what the cursor below names a position in: a finding's id carries
+        // its position in the report, so a token always advances.
+        let findings = &record.findings;
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => findings.partition_point(|finding| {
+                finding.finding_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = findings.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`GetNetworkInsightsAccessScopeAnalysisFindingsMaxResults`, `range 1..1000`): the
+        // model's range is refused by the boundary validator before this handler runs, so a
+        // request that names none gets the largest page the model publishes and the
+        // `NextToken` path behaves the same either way.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when a finding follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|finding| finding.finding_id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(GetNetworkInsightsAccessScopeAnalysisFindingsOutput {
+            network_insights_access_scope_analysis_id: record
+                .view
+                .network_insights_access_scope_analysis_id
+                .clone(),
+            // "The status of Network Access Scope Analysis" (`AnalysisStatus`), read off the
+            // analysis itself, so a caller polling the findings sees the same status
+            // `DescribeNetworkInsightsAccessScopeAnalyses` reports.
+            analysis_status: record.view.status.clone(),
+            analysis_findings: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
 }
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`GetNetworkInsightsAccessScopeAnalysisFindingsMaxResults`, `range 1..1000`).
+const MAX_PAGE_SIZE: usize = 1_000;

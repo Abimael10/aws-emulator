@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstanceTpmEkPub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstanceTpmEkPub`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstanceTpmEkPub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the public endorsement key of the NitroTPM the instance the request names holds:
+//! real key material, minted once per instance and held in [`crate::state`]
+//! ([`crate::state::InstanceEndorsementKeys`]), so two reads of one instance answer the same
+//! key and no two instances share one. Both published key types are reported, in either
+//! published format — the X.509 `SubjectPublicKeyInfo` OpenSSL reads and the TPM 2.0
+//! `TPMT_PUBLIC` structure `tpm2-tools` reads — both derived from the one stored key, base64
+//! encoded as the member documents. An instance whose type or AMI offers no NitroTPM holds no
+//! endorsement key, so such a request is refused rather than answered.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +144,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstanceTpmEkPub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstanceTpmEkPubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstanceTpmEkPub"))
+        use crate::state;
+
+        // The endorsement key is a fact of the instance, and the instance a request can ask
+        // about is one of the Region it was signed for: EC2 is reached through a regional
+        // endpoint, so an id naming an instance of another Region names no instance here.
+        let region = state::request_region(ctx.parts());
+        let state_handle = state::require_service_state(&*self.engine)?;
+
+        // All three `@required` members are modelled `clientOptional`, so a request that left
+        // one out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("instanceId", input.instance_id.as_str()),
+            ("keyFormat", input.key_format.as_str()),
+            ("keyType", input.key_type.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // Everything the request is held to is read under the store lock, which is then
+        // RELEASED before any key is minted: the guard lives in this block and nothing below
+        // holds it.
+        let (instance_id, already_held) = {
+            let mut store = state_handle.lock();
+            // A move the clock already owed a record of this store fell due whether or not
+            // anybody called — an instance whose launch settled a moment ago is `running` —
+            // so those moves are applied before this call reads it.
+            store.materialize_due_transitions();
+
+            // "The ID of the instance for which to get the public endorsement key"
+            // (`$InstanceId`), resolved through the crate's reading of a request-named
+            // instance an operation LOOKS UP: a value outside the form EC2 issues is
+            // `InvalidInstanceID.Malformed`, and every id inside it the account holds no
+            // instance under is `InvalidInstanceID.NotFound`.
+            let instance =
+                state::require_looked_up_instance_record(&store, &region, &input.instance_id)?;
+            let instance_id = instance.instance_id.clone();
+            // A NitroTPM is presented to the guest only where the instance TYPE offers the
+            // device and the AMI is "configured for NitroTPM support" (`Image$TpmSupport`):
+            // an instance without one holds no endorsement key at all, so the request is
+            // refused rather than answered with key material no TPM created.
+            if !store.instance_has_nitro_tpm(instance) {
+                return Err(state::invalid_parameter_value(format!(
+                    "NitroTPM is not enabled for instance '{instance_id}'"
+                )));
+            }
+
+            // "Specify this parameter to verify whether the request will succeed, without
+            // actually making the request" (`$DryRun`), answered AFTER the instance has been
+            // resolved and the refusals above asked, and before anything is minted: the flag
+            // asks whether the request WOULD have succeeded, so one that would have been
+            // refused is refused with that reason instead.
+            if input.dry_run == Some(true) {
+                return Err(state::dry_run_operation());
+            }
+
+            let already_held = store.holds_instance_endorsement_keys(&instance_id);
+            (instance_id, already_held)
+        };
+
+        // The key this instance's TPM holds is minted on the FIRST ask and never changes
+        // after. Minting it is hundreds of milliseconds of CPU, so — exactly as
+        // `CreateKeyPair` mints its key pair — it runs on the blocking pool with the store
+        // lock released: `spawn_blocking(..).await` is a real await point, so one key cannot
+        // starve the worker that serves health checks and every other request, and no other
+        // request waits on the store while it runs.
+        if !already_held {
+            let minted =
+                ::tokio::task::spawn_blocking(state::InstanceEndorsementKeys::generate).await;
+            let minted = match minted {
+                Ok(Some(minted)) => minted,
+                // No key material was produced, so this is reported as the server fault it is
+                // rather than answered with a key nothing generated.
+                Ok(None) => {
+                    return Err(state::internal_error(format!(
+                        "the endorsement key of instance '{instance_id}' could not be generated"
+                    )))
+                }
+                // A panic or a cancellation on the pool says nothing about the request.
+                Err(error) => {
+                    ::tracing::error!(
+                        operation = Self::NAME,
+                        error = %error,
+                        "the endorsement key generation did not complete"
+                    );
+                    return Err(state::internal_error(format!(
+                        "the endorsement key of instance '{instance_id}' could not be generated"
+                    )));
+                }
+            };
+            // Another request for the same instance may have minted one while this key was
+            // being generated: the one the store already holds WINS, so two reads of one
+            // instance still answer the same key.
+            state_handle
+                .lock()
+                .record_instance_endorsement_keys(&instance_id, minted);
+        }
+
+        // The key as the store holds it, rendered in the format the request asked for — "the
+        // returned key is base64 encoded" (`$KeyFormat`), which is what the member carries.
+        let key_value = state_handle
+            .lock()
+            .instance_endorsement_keys(&instance_id)
+            .and_then(|keys| keys.key_value(&input.key_type, &input.key_format))
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the endorsement key of instance '{instance_id}' could not be encoded as \
+                     a {format} {key_type} key",
+                    format = input.key_format,
+                    key_type = input.key_type,
+                ))
+            })?;
+
+        Ok(GetInstanceTpmEkPubOutput {
+            // The id read back off the stored record rather than echoed from the request, so
+            // the response names the instance the service resolved.
+            instance_id: Some(instance_id),
+            key_format: Some(input.key_format),
+            key_type: Some(input.key_type),
+            key_value: Some(::base64::Engine::encode(
+                &::base64::engine::general_purpose::STANDARD,
+                key_value,
+            )),
+        })
     }
 }

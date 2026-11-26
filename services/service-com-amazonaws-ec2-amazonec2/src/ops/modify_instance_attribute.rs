@@ -701,10 +701,17 @@ fn resolved_change(
                 )));
             }
             let vpc_id = store.instance_vpc_id(instance);
+            let now = ::std::time::Instant::now();
             let mut groups: Vec<GroupIdentifier> = Vec::with_capacity(requested.len());
             for group_id in &requested {
-                let Some(group) = store.security_groups.get(group_id).filter(|group| {
-                    vpc_id.is_none() || group.vpc_id.as_deref() == vpc_id.as_deref()
+                let Some(group) = store.security_groups.get(group_id).filter(|_| {
+                    // A group has to be one the instance's own VPC can use — one created in
+                    // that VPC, or one `AssociateSecurityGroupVpc` has associated with it,
+                    // the crate's one reading of that question — while an instance this
+                    // store places in no VPC scopes the group set to nothing.
+                    vpc_id.as_deref().is_none_or(|vpc_id| {
+                        store.security_group_usable_in_vpc(group_id, vpc_id, now)
+                    })
                 }) else {
                     return Err(state::invalid_group_not_found(group_id));
                 };

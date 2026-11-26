@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyAvailabilityZoneGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyAvailabilityZoneGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyAvailabilityZoneGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the opt-in status this account holds for the zone group the request names, stored
+//! in [`crate::state`] and reported by `DescribeAvailabilityZones` as the `OptInStatus` of
+//! every zone of that group — which is also what decides whether those zones are reported at
+//! all to a request that did not ask for every zone. The groups a request may name are the
+//! published Local Zone groups of the Region it was signed for; a standard Availability Zone's
+//! group is not one of them, its status always being `opt-in-not-required`.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +136,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyAvailabilityZoneGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyAvailabilityZoneGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyAvailabilityZoneGroup"))
+        // `ctx` carries the Region whose zone group the request names; the group itself is
+        // named by the request.
+        use crate::state;
+
+        // Both `@required` members are modelled `clientOptional`, so a request that left one
+        // out reaches this handler as an empty string rather than being refused at the
+        // boundary. A parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            ("groupName", input.group_name.as_str()),
+            ("optInStatus", input.opt_in_status.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+
+        // "Indicates whether to opt in to the zone group" (`OptInStatus`), whose modelled
+        // `ModifyAvailabilityZoneOptInStatus` catalog publishes the values a request may ask
+        // for; a spelling outside it is refused with the code EC2 answers a parameter value
+        // it cannot accept with.
+        let opt_in = match input.opt_in_status.as_str() {
+            state::OPT_IN_STATUS_OPTED_IN => true,
+            state::OPT_IN_STATUS_NOT_OPTED_IN => false,
+            requested => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{requested}' for optInStatus. Valid values are \
+                     '{allowed}'",
+                    allowed = MODIFY_AVAILABILITY_ZONE_OPT_IN_STATUS_VALUES.join("', '"),
+                )));
+            }
+        };
+
+        let region = state::request_region(ctx.parts());
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+
+        // "The name of the Availability Zone group, Local Zone group, or Wavelength Zone
+        // group" (`GroupName`): a name that is no opt-in zone group of this Region names
+        // nothing to opt in to. The groups are the published ones the Region's zones belong
+        // to ([`crate::state::local_zone_group_names`]), so the group a caller reads off
+        // `DescribeAvailabilityZones` is exactly the one this accepts — and a standard
+        // Availability Zone's group is not one of them, that zone's status "always [having]
+        // the value of `opt-in-not-required`".
+        if !state::local_zone_group_names(&region)
+            .iter()
+            .any(|group| group == &input.group_name)
+        {
+            return Err(state::invalid_az_group_not_found());
+        }
+
+        // DryRun sits AFTER every parameter has been resolved and BEFORE the write: the flag
+        // asks whether the request WOULD have succeeded, so one that would have been refused
+        // is refused with that reason instead, and one that would have succeeded leaves
+        // state untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        store.set_zone_group_opt_in(&input.group_name, opt_in);
+
+        // "Is true if the request succeeds, and an error otherwise" (`Return`): the opt-in
+        // the request asked for is the one the store now holds, which is what every later
+        // `DescribeAvailabilityZones` reports for the group's zones — including a request
+        // that asks for the status the account already held, which changes nothing and
+        // succeeds all the same.
+        Ok(ModifyAvailabilityZoneGroupOutput {
+            r#return: Some(true),
+        })
     }
 }

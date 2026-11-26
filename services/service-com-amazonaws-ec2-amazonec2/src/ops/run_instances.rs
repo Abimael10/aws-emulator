@@ -2220,11 +2220,11 @@ fn refuse_incompatible_security_groups(
         return Ok(());
     };
     for (group_id, group_name) in named {
-        let held = match (group_id.as_deref(), group_name.as_deref()) {
+        let resolved_group_id = match (group_id.as_deref(), group_name.as_deref()) {
             (Some(group_id), _) => store
                 .security_groups
                 .get(group_id)
-                .map(|group| (group_id.to_string(), group.vpc_id.clone()))
+                .map(|_| group_id.to_string())
                 .ok_or_else(|| crate::state::invalid_group_not_found(group_id))?,
             (None, Some(group_name)) => store
                 .security_groups
@@ -2233,12 +2233,7 @@ fn refuse_incompatible_security_groups(
                     group.group_name.as_deref() == Some(group_name)
                         && group.vpc_id.as_deref() == Some(vpc_id.as_str())
                 })
-                .map(|group| {
-                    (
-                        group.group_id.clone().unwrap_or_default(),
-                        group.vpc_id.clone(),
-                    )
-                })
+                .map(|group| group.group_id.clone().unwrap_or_default())
                 .ok_or_else(|| {
                     // The name was resolved IN the launch subnet's VPC, so the sentence names
                     // the network the lookup was scoped to: a name is only a name INSIDE one
@@ -2257,8 +2252,18 @@ fn refuse_incompatible_security_groups(
                 })?,
             (None, None) => continue,
         };
-        let (resolved_group_id, group_vpc_id) = held;
-        if group_vpc_id.as_deref() != Some(vpc_id.as_str()) {
+        // A security group is applied to the instance's primary network interface, which
+        // sits in the subnet's VPC: a group that VPC cannot use could never be applied to
+        // this instance. "Usable" is the crate's one reading of that question
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_usable_in_vpc`]) —
+        // the group was created in that VPC, or `AssociateSecurityGroupVpc` has associated
+        // it with that VPC — and EC2 refuses a launch that names any other group
+        // `InvalidParameter`, naming the group and the subnet that do not meet.
+        if !store.security_group_usable_in_vpc(
+            &resolved_group_id,
+            vpc_id.as_str(),
+            ::std::time::Instant::now(),
+        ) {
             return Err(crate::scaffolded::Scaffolded::service_error(
                 crate::state::INVALID_PARAMETER,
                 400,

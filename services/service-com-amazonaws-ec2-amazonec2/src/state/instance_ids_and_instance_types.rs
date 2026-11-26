@@ -1121,6 +1121,11 @@ pub struct AvailabilityZoneRecord {
     pub network_border_group: String,
     /// `availability-zone`, `local-zone` or `wavelength-zone`.
     pub zone_type: &'static str,
+    /// The zone this one hangs off, for a Local Zone or a Wavelength Zone: "the name of the
+    /// zone that handles some of the Local Zone or Wavelength Zone control plane operations"
+    /// (`AvailabilityZone$ParentZoneName`), with its id beside it
+    /// (`$ParentZoneId`). `None` for a standard Availability Zone, which has no parent.
+    pub parent_zone: Option<(String, String)>,
     /// `available`, `unavailable`, `constrained`, …
     pub state: &'static str,
     /// `opt-in-not-required`, `opted-in` or `not-opted-in`.
@@ -1142,8 +1147,9 @@ pub struct AvailabilityZoneRecord {
 impl AvailabilityZoneRecord {
     /// This zone as the modelled `AvailabilityZone` shape.
     ///
-    /// `ParentZoneName`/`ParentZoneId` are absent because only a Local Zone or a
-    /// Wavelength Zone has a parent zone. `GroupLongName`, `Geography` and
+    /// `ParentZoneName`/`ParentZoneId` are absent unless the zone HAS a parent, which only a
+    /// Local Zone or a Wavelength Zone has ([`Self::parent_zone`]). `GroupLongName`,
+    /// `Geography` and
     /// `SubGeography` are the display data AWS publishes for the zone's Region
     /// ([`super::availability_zone_display`]), reported as the model shapes them — each
     /// geography as the one-entry LIST the model declares (`AvailabilityZone$Geography`:
@@ -1167,8 +1173,14 @@ impl AvailabilityZoneRecord {
                     })
                     .collect(),
             ),
-            parent_zone_name: None,
-            parent_zone_id: None,
+            parent_zone_name: self
+                .parent_zone
+                .as_ref()
+                .map(|(zone_name, _)| zone_name.clone()),
+            parent_zone_id: self
+                .parent_zone
+                .as_ref()
+                .map(|(_, zone_id)| zone_id.clone()),
             group_long_name: self.group_long_name.clone(),
             geography: self.geography.clone().map(|name| {
                 vec![AvailabilityZoneGeography {
@@ -1201,7 +1213,14 @@ impl AvailabilityZoneRecord {
                 .map_or_else(Vec::new, |long_name| vec![long_name]),
             "message" => self.messages.iter().map(String::as_str).collect(),
             "opt-in-status" => vec![self.opt_in_status],
-            "parent-zone-id" | "parent-zone-name" => Vec::new(),
+            "parent-zone-id" => self
+                .parent_zone
+                .as_ref()
+                .map_or_else(Vec::new, |(_, zone_id)| vec![zone_id.as_str()]),
+            "parent-zone-name" => self
+                .parent_zone
+                .as_ref()
+                .map_or_else(Vec::new, |(zone_name, _)| vec![zone_name.as_str()]),
             "region-name" => vec![self.region_name.as_str()],
             "state" => vec![self.state],
             "zone-id" => vec![self.zone_id.as_str()],
@@ -1244,6 +1263,7 @@ pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord>
                 // A standard Availability Zone's network border group is the Region.
                 network_border_group: region.to_string(),
                 zone_type: ZONE_TYPE_AVAILABILITY_ZONE,
+                parent_zone: None,
                 state: ZONE_STATE_AVAILABLE,
                 opt_in_status: OPT_IN_NOT_REQUIRED,
                 messages: Vec::new(),

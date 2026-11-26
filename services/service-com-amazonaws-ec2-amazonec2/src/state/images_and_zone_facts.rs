@@ -1003,6 +1003,11 @@ pub const BOOT_MODE_LEGACY_BIOS: &str = "legacy-bios";
 /// (`Image$ImdsSupport`).
 pub const IMDS_SUPPORT_V2: &str = "v2.0";
 
+/// "If the image is configured for NitroTPM support, the value is `v2.0`"
+/// (`Image$TpmSupport`), which is the one value `TpmSupportValues` publishes
+/// ([`crate::ops::types::TPM_SUPPORT_VALUES_VALUES`]).
+pub const IMAGE_TPM_SUPPORT_V2: &str = "v2.0";
+
 /// "This value is set to `windows` for Windows AMIs; otherwise, it is blank"
 /// (`Image$Platform`), whose modelled `PlatformValues` enum publishes the single value
 /// `Windows` — so that is the value a stored image carries.
@@ -2451,6 +2456,34 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
             ),
             ..published_amazon_image(
                 "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "x86_64",
+                "2024-11-13T07:36:19.000Z",
+            )
+        },
+        // The NitroTPM-preconfigured build of that same Windows release: Amazon publishes
+        // one per Windows AMI family under the `TPM-` name prefix, "configured for NitroTPM
+        // support", which is the AMI a client launches to use the virtual trusted platform
+        // module ("NitroTPM", Amazon EC2 User Guide). Its `TpmSupport` is the one value
+        // `TpmSupportValues` publishes ([`IMAGE_TPM_SUPPORT_V2`]) and its boot mode is
+        // `uefi`, because NitroTPM is offered to a UEFI-booting AMI only — so the row
+        // carries what a launch of it has to satisfy rather than only the name.
+        ImageSpec {
+            description: "Microsoft Windows Server 2022 Full Locale English with NitroTPM \
+                          AMI provided by Amazon"
+                .to_string(),
+            platform: Some(IMAGE_PLATFORM_WINDOWS.to_string()),
+            platform_details: PLATFORM_DETAILS_WINDOWS.to_string(),
+            usage_operation: USAGE_OPERATION_WINDOWS.to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
+            tpm_support: Some(IMAGE_TPM_SUPPORT_V2.to_string()),
+            root_device_name: WINDOWS_ROOT_DEVICE_NAME.to_string(),
+            root_volume_size: WINDOWS_ROOT_VOLUME_SIZE,
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-windows-latest/TPM-Windows_Server-2022-English-Full-Base"
+                    .to_string(),
+            ),
+            ..published_amazon_image(
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
                 "x86_64",
                 "2024-11-13T07:36:19.000Z",
             )

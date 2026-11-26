@@ -1312,12 +1312,12 @@ async fn a_disassociate_the_service_cannot_satisfy_is_refused_and_writes_nothing
     );
     assert_eq!(
         error_code(&held_body),
-        "DependencyViolation",
-        "case {case:?}: expected DependencyViolation, got body {held_body}"
+        ec2::state::SECURITY_GROUP_VPC_ASSOCIATION_IN_USE,
+        "case {case:?}: expected the association's own in-use code, got body {held_body}"
     );
     assert_eq!(
         error_message(&held_body),
-        format!("resource {group} has a dependent object"),
+        ec2::state::SECURITY_GROUP_VPC_ASSOCIATION_IN_USE_MESSAGE,
         "case {case:?}: unexpected message, got body {held_body}"
     );
     let after_dependency = reported(case, &router, &[]).await;

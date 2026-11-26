@@ -167,10 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation reports a Region's zones and persists nothing, so it never
-        // reaches the engine on `self`.
-        let _ = &self.engine;
-
         // "Checks whether you have the required permissions for the action, without
         // actually making the request... If you have the required permissions, the
         // error response is DryRunOperation." Every caller of this emulator holds
@@ -180,9 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The Region the caller signed for is the Region whose zones it is asking
-        // about: EC2 is a regional service reached through a regional endpoint.
+        // about: EC2 is a regional service reached through a regional endpoint. Which zones
+        // the ACCOUNT sees there is read from the store, because a Local Zone is reported
+        // against the opt-in status the account's `ModifyAvailabilityZoneGroup` calls left
+        // its group in — a READ: the report is derived from that state and writes nothing.
         let region = crate::state::request_region(ctx.parts());
-        let zones = crate::state::availability_zones_in_region(&region);
+        let zones = crate::state::require_service_state(&*self.engine)?
+            .lock()
+            .zones_in_region(&region);
 
         // `ZoneNames` and `ZoneIds` select by the two identifiers one zone has, so a
         // zone named by either selector is reported. Each entry must name a zone of
@@ -240,11 +241,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
+        // "Include all Availability Zones, Local Zones, and Wavelength Zones regardless of
+        // your opt in status. If you do not use this parameter, the results include only the
+        // zones for the Regions where you have chosen the option to opt in"
+        // (`AllAvailabilityZones`): a zone whose group this account has not opted in to is
+        // withheld unless the request asks for every zone, through the one reading of that
+        // rule ([`crate::state::zone_is_reported_without_opt_in`]). A zone the request named
+        // by `ZoneNames` or `ZoneIds` was still resolved against every zone the Region
+        // publishes above, so naming one is answered about the zone rather than as a value
+        // the Region does not have.
+        let all_zones = input.all_availability_zones.unwrap_or(false);
+        let reported = |zone: &crate::state::AvailabilityZoneRecord| {
+            all_zones || crate::state::zone_is_reported_without_opt_in(zone.opt_in_status)
+        };
+
         Ok(DescribeAvailabilityZonesOutput {
             availability_zones: Some(
                 zones
                     .iter()
-                    .filter(|zone| selected_by_identifier(zone) && matches_every_filter(zone))
+                    .filter(|zone| {
+                        reported(zone) && selected_by_identifier(zone) && matches_every_filter(zone)
+                    })
                     .map(crate::state::AvailabilityZoneRecord::to_availability_zone)
                     .collect(),
             ),

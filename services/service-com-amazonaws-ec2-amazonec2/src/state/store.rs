@@ -3596,6 +3596,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// request was signed for and a Region with no entry is one the account has never
     /// modified.
     pub vpc_block_public_access_options: BTreeMap<String, VpcBlockPublicAccessOptionsRecord>,
+    /// The zone groups this account has opted in to, by `GroupName` — see
+    /// [`super::local_zones`]. A group with no entry is one the account has not opted in to,
+    /// which is where every Local Zone group starts, and a standard Availability Zone's group
+    /// is not held here at all: such a zone "always has the value of `opt-in-not-required`"
+    /// (`AvailabilityZone$OptInStatus`), so there is nothing to opt in to.
+    pub opted_in_zone_groups: BTreeSet<String>,
+    /// The NitroTPM endorsement keys each instance holds, by instance id — see
+    /// [`super::instance_tpm`]. An instance with no entry is one nothing has asked the
+    /// endorsement key of yet; the key is minted on the first ask and never changes after,
+    /// so every later read of one instance answers the same key.
+    pub instance_endorsement_keys: BTreeMap<String, InstanceEndorsementKeys>,
     /// Every import image task the account has started, by `ImportTaskId` — see the module
     /// docs. Ordered by id, which is the order `DescribeImportImageTasks` reports and pages
     /// over.
@@ -4382,6 +4393,12 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has modified no Region's VPC BPA options, so every Region
             // reports the default state and the `off` mode without a record of its own.
             vpc_block_public_access_options: BTreeMap::new(),
+            // A fresh account has opted in to no zone group, so every Local Zone AWS
+            // publishes reports `not-opted-in` and is withheld from a describe that did not
+            // ask for every zone.
+            opted_in_zone_groups: BTreeSet::new(),
+            // A fresh account holds no instance, so there is no endorsement key to report.
+            instance_endorsement_keys: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             // A fresh account has started no export image task, so it has none to report and
             // none to cancel.

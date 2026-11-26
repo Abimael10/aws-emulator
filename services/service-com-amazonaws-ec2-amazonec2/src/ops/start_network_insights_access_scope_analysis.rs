@@ -204,15 +204,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The ID of the Network Access Scope" (`NetworkInsightsAccessScopeId`): an id that
-        // names no scope of the account is refused rather than analyzed.
-        if replayed.is_none()
-            && !store
+        // names no scope of the account is refused rather than analyzed — in the two ways EC2
+        // tells those apart, the same split `DeleteNetworkInsightsAccessScope` makes of the
+        // same member. A value this service could never have ISSUED is not one this operation
+        // can resolve at all, so it states that the id it was given is not a valid one; an id
+        // it DID issue whose scope has since gone is this resource's own not-found code.
+        if replayed.is_none() {
+            if !store.id_was_issued(
+                state::NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX,
+                &input.network_insights_access_scope_id,
+            ) {
+                return Err(state::invalid_network_insights_access_scope_id_value(
+                    &input.network_insights_access_scope_id,
+                ));
+            }
+            if !store
                 .network_insights_access_scopes
                 .contains_key(&input.network_insights_access_scope_id)
-        {
-            return Err(state::invalid_network_insights_access_scope_id_not_found(
-                &input.network_insights_access_scope_id,
-            ));
+            {
+                return Err(state::invalid_network_insights_access_scope_id_not_found(
+                    &input.network_insights_access_scope_id,
+                ));
+            }
         }
 
         // A count ceiling first, then the byte budget: a record count on its own admits

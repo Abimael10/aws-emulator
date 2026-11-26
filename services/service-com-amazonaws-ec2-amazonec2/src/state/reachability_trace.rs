@@ -732,8 +732,9 @@ fn analysis_security_group_rule(
 ///
 /// Read through the crate's one ARN reader ([`arn_region`]), so the field this takes is the
 /// field the published format gives it; a stored path's ARN names the Region its create was
-/// signed for.
-fn path_region(arn: Option<&str>) -> String {
+/// signed for, and so does a stored analysis's
+/// ([`super::access_scope_analysis`] reads it for the same reason).
+pub(super) fn path_region(arn: Option<&str>) -> String {
     arn.and_then(arn_region)
         .unwrap_or(DEFAULT_REGION)
         .to_string()

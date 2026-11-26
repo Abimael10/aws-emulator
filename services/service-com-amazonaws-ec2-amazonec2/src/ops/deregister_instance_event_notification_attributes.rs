@@ -143,21 +143,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_keys = attribute.instance_tag_keys.as_deref().unwrap_or_default();
         // "Indicates whether to deregister all tag keys in the current Region. Specify
         // `false` to deregister all tag keys"
-        // (`DeregisterInstanceTagAttributeRequest$IncludeAllTagsOfInstance`): `false` is the
-        // value that asks for something here, the mirror of the register's `true`.
-        let deregister_all = attribute.include_all_tags_of_instance == Some(false);
+        // (`DeregisterInstanceTagAttributeRequest$IncludeAllTagsOfInstance`): the flag's
+        // `false` is the ask for every tag key of the Region, and NAMED KEYS are what a
+        // request that names them asks for — so a request carrying both takes out exactly the
+        // keys it named and leaves every other where it is, and only a request that names no
+        // key reads the flag as the ask for all of them.
+        let deregister_all =
+            requested_keys.is_empty() && attribute.include_all_tags_of_instance == Some(false);
 
         // "You can either specify individual tag keys or deregister all tag keys in the
         // current Region. You must specify either IncludeAllTagsOfInstance or
-        // InstanceTagKeys in the request" (`DeregisterInstanceTagAttributeRequest`): the two
-        // are alternatives, so a request carrying the flag AT ALL beside a tag key has no
-        // single reading, and one that names neither asks for nothing at all.
-        if attribute.include_all_tags_of_instance.is_some() && !requested_keys.is_empty() {
-            return Err(Scaffolded::invalid_parameter_combination(
-                "The request must specify either IncludeAllTagsOfInstance or \
-                 InstanceTagKeys, not both",
-            ));
-        }
+        // InstanceTagKeys in the request" (`DeregisterInstanceTagAttributeRequest`): AT
+        // LEAST ONE of the two, so a request that names both is served and only one that
+        // names NEITHER — no key, and no flag asking for every key — asks for nothing at all.
         if !deregister_all && requested_keys.is_empty() {
             return Err(Scaffolded::missing_parameter(
                 "The request must specify either IncludeAllTagsOfInstance or \

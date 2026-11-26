@@ -302,29 +302,20 @@ pub const ANALYSIS_STATUS_RUNNING: &str = "running";
 
 /// An analysis that did not produce a result: the `AnalysisStatus` enum's `failed` member.
 ///
-/// The terminal status the clock owes every analysis this emulator starts — see
-/// [`ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`] and the module docs.
+/// The terminal status an analysis of a path this emulator does not trace reaches — see
+/// [`PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`].
 pub const ANALYSIS_STATUS_FAILED: &str = "failed";
 
 /// An analysis that produced its result: the `AnalysisStatus` enum's `succeeded` member
 /// (`smithy_query(query="shape",shape="AnalysisStatus")`).
 ///
-/// The terminal status a PATH analysis this emulator traced reaches: the verdict is read off
-/// the stored security groups, network ACLs and routes
-/// ([`ComAmazonawsEc2Amazonec2State::trace_stored_network_insights_path`]), so the analysis has
-/// a result to report rather than a reason it has none.
+/// The terminal status an analysis this emulator ran reaches, whether of a PATH — the verdict
+/// read off the stored security groups, network ACLs and routes
+/// ([`ComAmazonawsEc2Amazonec2State::trace_stored_network_insights_path`]) — or of an access
+/// SCOPE, whose findings are read off the same network
+/// ([`ComAmazonawsEc2Amazonec2State::analyze_network_insights_access_scope`]): the analysis
+/// has a result to report rather than a reason it has none.
 pub const ANALYSIS_STATUS_SUCCEEDED: &str = "succeeded";
-
-/// "The status message" (`NetworkInsightsAccessScopeAnalysis$StatusMessage`) of an analysis
-/// this emulator could not run.
-///
-/// A Network Access Scope analysis evaluates the account's real network against the scope;
-/// this emulator runs no such evaluation, so the analysis ends in
-/// [`ANALYSIS_STATUS_FAILED`] carrying this reason rather than reporting findings, an
-/// analyzed interface count or a `succeeded` status that nothing computed.
-pub const ANALYSIS_UNSUPPORTED_STATUS_MESSAGE: &str =
-    "This emulator does not perform Network Access Scope reachability analysis, so no \
-     findings were produced for this scope.";
 
 /// The `FindingsFound` enum's `unknown` member: whether the scope has findings was never
 /// determined, which is what an analysis that did not run can say about it.
@@ -460,6 +451,11 @@ pub struct NetworkInsightsAccessScopeAnalysisRecord {
     pub view: NetworkInsightsAccessScopeAnalysis,
     /// The move the clock owes this analysis, while one is owed.
     pub pending: Option<AnalysisTransition>,
+    /// What the analysis FOUND, once the clock has run it: the paths of the stored network
+    /// that matched the scope ([`ComAmazonawsEc2Amazonec2State::analyze_network_insights_access_scope`]),
+    /// which is what `GetNetworkInsightsAccessScopeAnalysisFindings` reports and pages over.
+    /// Empty while the analysis is still running, and for one that matched nothing.
+    pub findings: Vec<crate::ops::types::AccessScopeAnalysisFinding>,
 }
 
 /// What a writer must say to store a Network Access Scope analysis; everything else about
@@ -717,8 +713,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// status it starts in, the move the clock owes it, the token that names it and the
     /// bytes it charges cannot be built two ways. An analysis is answered in the
     /// non-terminal `running` status, so the clock owes it its terminal
-    /// [`ANALYSIS_STATUS_FAILED`] one [`TRANSITION_DELAY`] later (the module docs say why
-    /// that is the terminal status this emulator can honestly reach).
+    /// [`ANALYSIS_STATUS_SUCCEEDED`] one [`TRANSITION_DELAY`] later, at which instant the
+    /// scope is analyzed against the stored network and the findings it matched are recorded
+    /// on the record ([`Self::analyze_network_insights_access_scope`]).
     ///
     /// The ceiling is enforced HERE as well as by
     /// [`Self::has_network_insights_access_scope_analysis_capacity`], so a writer that
@@ -770,7 +767,10 @@ impl ComAmazonawsEc2Amazonec2State {
             analysis_id.clone(),
             NetworkInsightsAccessScopeAnalysisRecord {
                 view,
-                pending: Some(AnalysisTransition::starting_now(ANALYSIS_STATUS_FAILED)),
+                pending: Some(AnalysisTransition::starting_now(ANALYSIS_STATUS_SUCCEEDED)),
+                // The findings are what the analysis produces when the clock RUNS it, so an
+                // analysis that has only just started has none to report.
+                findings: Vec::new(),
             },
         );
         self.network_insights_access_scope_analysis_client_tokens

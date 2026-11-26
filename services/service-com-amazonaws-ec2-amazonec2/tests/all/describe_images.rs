@@ -692,9 +692,14 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec!["legacy-i386-image"],
         ),
         (
+            // Both published Windows AMIs — the plain one and the NitroTPM-preconfigured
+            // build — restore their root volume at the Windows root device name.
             "block-device-mapping.device-name",
             vec!["/dev/sda1".into()],
-            vec!["Windows_Server-2022-English-Full-Base-2024.11.13"],
+            vec![
+                "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
+            ],
         ),
         ("block-device-mapping.device-name", vec!["/dev/sdh".into()], vec![]),
         (
@@ -708,9 +713,13 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec!["Windows_Server-2022-English-Full-Base-2024.11.13"],
         ),
         (
+            // Both published Windows AMIs restore a 30 GiB root volume.
             "block-device-mapping.volume-size",
             vec!["30".into()],
-            vec!["Windows_Server-2022-English-Full-Base-2024.11.13"],
+            vec![
+                "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
+            ],
         ),
         (
             "block-device-mapping.volume-type",
@@ -736,9 +745,14 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             ],
         ),
         (
+            // Both published Windows AMIs are builds of the same release, so they carry the
+            // same `CreationDate`.
             "creation-date",
             vec!["2024-11-13T07:36:19.000Z".into()],
-            vec!["Windows_Server-2022-English-Full-Base-2024.11.13"],
+            vec![
+                "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
+            ],
         ),
         (
             "description",
@@ -872,6 +886,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec!["windows".into()],
             vec![
                 "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
                 "app-windows-image",
             ],
         ),
@@ -880,6 +895,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec!["Windows".into()],
             vec![
                 "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
                 "app-windows-image",
             ],
         ),
@@ -894,9 +910,14 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
             vec!["vendor-appliance-image"],
         ),
         (
+            // Amazon publishes a parameter per Windows AMI family, the NitroTPM-preconfigured
+            // build included.
             "public-ssm-parameter-name",
             vec!["/aws/service/ami-windows-latest/*".into()],
-            vec!["Windows_Server-2022-English-Full-Base-2024.11.13"],
+            vec![
+                "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "TPM-Windows_Server-2022-English-Full-Base-2024.11.13",
+            ],
         ),
         (
             "ramdisk-id",

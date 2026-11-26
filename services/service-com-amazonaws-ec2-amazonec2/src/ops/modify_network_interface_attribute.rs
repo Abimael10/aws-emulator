@@ -511,10 +511,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "Changes the security groups for the network interface. The new set of
                 // groups you specify replaces the current set. You must specify at least
                 // one group … You must specify the ID of the security group, not the name"
-                // (`Groups`). A group has to be a group of the interface's OWN VPC — a
-                // security group only applies within its VPC — and the set is held to the
-                // number AWS documents per interface: the same resolution
-                // `CreateNetworkInterface` makes of the same member.
+                // (`Groups`). A group has to be one the interface's OWN VPC can use — one
+                // created in that VPC, or one `AssociateSecurityGroupVpc` has associated
+                // with it — and the set is held to the number AWS documents per interface:
+                // the same resolution `CreateNetworkInterface` makes of the same member,
+                // through the crate's one reading of that question
+                // ([`crate::state::ComAmazonawsEc2Amazonec2State::security_group_usable_in_vpc`]).
                 let requested =
                     state::deduplicate_ids(input.groups.as_deref().unwrap_or_default());
                 if requested.len() > state::MAX_SECURITY_GROUPS_PER_INSTANCE {
@@ -525,12 +527,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         max = state::MAX_SECURITY_GROUPS_PER_INSTANCE,
                     )));
                 }
+                let now = ::std::time::Instant::now();
                 let mut groups: Vec<GroupIdentifier> = Vec::with_capacity(requested.len());
                 for group_id in &requested {
                     let Some(group) = store
                         .security_groups
                         .get(group_id)
-                        .filter(|group| group.vpc_id.as_deref() == Some(vpc_id.as_str()))
+                        .filter(|_| store.security_group_usable_in_vpc(group_id, &vpc_id, now))
                     else {
                         return Err(state::invalid_group_not_found(group_id));
                     };
