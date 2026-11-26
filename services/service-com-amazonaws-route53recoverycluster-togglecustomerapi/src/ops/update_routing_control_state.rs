@@ -218,26 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(UpdateRoutingControlStateErrorModeled::AccessDeniedException)?;
 
         // The modelled `RoutingControlState` value set is enforced at the boundary
-        // before this handler runs; parsing it again here keeps the stored state a
-        // typed switch rather than whatever string arrived.
+        // before this handler runs, so this branch answers no request the framework lets
+        // through; parsing it again here keeps the stored state a typed switch rather than
+        // whatever string arrived, and the refusal it would state is the one its sibling
+        // handler states
+        // ([`crate::service::handler_refusal::routing_control_state_outside_value_set`]).
         let Some(new_state) =
             crate::state::RoutingControlState::from_wire(&input.routing_control_state)
         else {
             return Err(UpdateRoutingControlStateErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "RoutingControlState must satisfy enum value set: [{}]",
-                        ROUTING_CONTROL_STATE_VALUES.join(", ")
-                    ),
-                    reason: Some("fieldValidationFailed".to_string()),
-                    fields: Some(vec![ValidationExceptionField {
-                        name: "RoutingControlState".to_string(),
-                        message: format!(
-                            "Member must satisfy enum value set: [{}]",
-                            ROUTING_CONTROL_STATE_VALUES.join(", ")
-                        ),
-                    }]),
-                },
+                crate::service::handler_refusal::routing_control_state_outside_value_set(
+                    "RoutingControlState",
+                ),
             )
             .into());
         };
@@ -272,11 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.safety_rules_to_override.as_deref(),
         ) {
             return Err(
-                UpdateRoutingControlStateErrorModeled::ValidationException(ValidationException {
-                    message: violation.message,
-                    reason: Some("other".to_string()),
-                    fields: None,
-                })
+                UpdateRoutingControlStateErrorModeled::ValidationException(
+                    crate::service::handler_refusal::safety_rule_violation(violation),
+                )
                 .into(),
             );
         }
@@ -301,13 +291,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled `ResourceNotFoundException` for a `RoutingControlArn` the control
-/// plane minted no routing control for, worded in the one place this service words it.
+/// This operation's channel for the `ResourceNotFoundException` a `RoutingControlArn` the
+/// control plane minted no routing control for is refused with: the refusal itself is the
+/// one [`crate::service::handler_refusal::routing_control_not_found`] states for every
+/// handler, and only the wrap into this operation's error enum is local.
 fn not_found(routing_control_arn: &str) -> UpdateRoutingControlStateError {
-    UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::routing_control_not_found_message(routing_control_arn),
-        resource_id: routing_control_arn.to_string(),
-        resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE.to_string(),
-    })
+    UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(
+        crate::service::handler_refusal::routing_control_not_found(routing_control_arn),
+    )
     .into()
 }

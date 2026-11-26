@@ -213,13 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let plane = stores.lock();
         let Some(control) = plane.routing_control(&input.routing_control_arn) else {
             return Err(GetRoutingControlStateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::routing_control_not_found_message(
-                        &input.routing_control_arn,
-                    ),
-                    resource_id: input.routing_control_arn.clone(),
-                    resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE.to_string(),
-                },
+                crate::service::handler_refusal::routing_control_not_found(
+                    &input.routing_control_arn,
+                ),
             )
             .into());
         };

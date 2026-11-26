@@ -272,17 +272,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut batch_cluster: Option<String> = None;
 
         for entry in entries {
+            // The modelled `RoutingControlState` value set is enforced at the boundary
+            // before this handler runs, so this branch answers no request the framework
+            // lets through; parsing the value again here keeps the stored state a typed
+            // switch rather than whatever string arrived, and the refusal it would state is
+            // the one its sibling handler states
+            // ([`crate::service::handler_refusal::routing_control_state_outside_value_set`]).
             let Some(new_state) =
                 crate::state::RoutingControlState::from_wire(&entry.routing_control_state)
             else {
-                return Err(validation_exception(
-                    format!(
-                        "RoutingControlState must satisfy enum value set: [{}]",
-                        ROUTING_CONTROL_STATE_VALUES.join(", ")
-                    ),
-                    "fieldValidationFailed",
-                    "UpdateRoutingControlStateEntries.RoutingControlState",
-                ));
+                return Err(
+                    UpdateRoutingControlStatesErrorModeled::ValidationException(
+                        crate::service::handler_refusal::routing_control_state_outside_value_set(
+                            "UpdateRoutingControlStateEntries.RoutingControlState",
+                        ),
+                    )
+                    .into(),
+                );
             };
 
             if resolved
@@ -302,14 +308,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(cluster) = plane.cluster_of(&entry.routing_control_arn) else {
                 return Err(
                     UpdateRoutingControlStatesErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: crate::state::routing_control_not_found_message(
-                                &entry.routing_control_arn,
-                            ),
-                            resource_id: entry.routing_control_arn.clone(),
-                            resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE
-                                .to_string(),
-                        },
+                        crate::service::handler_refusal::routing_control_not_found(
+                            &entry.routing_control_arn,
+                        ),
                     )
                     .into(),
                 );
@@ -342,11 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             plane.safety_rule_violation(&resolved, input.safety_rules_to_override.as_deref())
         {
             return Err(
-                UpdateRoutingControlStatesErrorModeled::ValidationException(ValidationException {
-                    message: violation.message,
-                    reason: Some("other".to_string()),
-                    fields: None,
-                })
+                UpdateRoutingControlStatesErrorModeled::ValidationException(
+                    crate::service::handler_refusal::safety_rule_violation(violation),
+                )
                 .into(),
             );
         }
@@ -401,9 +400,13 @@ fn entry_resources(entries: &[UpdateRoutingControlStateEntry]) -> Vec<&str> {
     resources
 }
 
-/// A modelled `ValidationException` (HTTP 400) naming the member that was wrong, in
-/// the shape the boundary validator reports one: a message, the `reason` code, and
-/// the offending member in `fields`.
+/// A modelled `ValidationException` (HTTP 400) for a refusal only THIS operation can
+/// answer — a batch that names one routing control twice, or one spanning two clusters —
+/// naming the member that was wrong in the shape the boundary validator reports one: a
+/// message, the `reason` code, and the offending member in `fields`.
+///
+/// A refusal a sibling handler can answer too is not stated here but in
+/// [`crate::service::handler_refusal`], so the two cannot drift apart.
 fn validation_exception(
     message: String,
     reason: &str,

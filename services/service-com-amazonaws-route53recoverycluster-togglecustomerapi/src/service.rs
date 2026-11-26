@@ -50,6 +50,8 @@ use std::sync::Arc;
 pub mod authorization;
 /// The HTTP status this API answers a modelled failure with.
 pub mod error_status;
+/// The modelled refusals this API's handlers construct, each shaped and worded in one place.
+pub mod handler_refusal;
 /// How this service words a request the framework refused before any handler ran.
 pub mod refusal;
 /// The ARN form every handler holds a caller-supplied ARN to before it consults any store.
