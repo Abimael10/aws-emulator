@@ -65,9 +65,9 @@ pub const REGISTRY_ID: &str = "000000000000";
 ///
 /// It is the host every repository of that registry is addressed under ON AWS, so it is the
 /// spelling a client's own reference may be written in, which a pull reads back — and never
-/// the authority this registry PUBLISHES for a repository, which is the endpoint this
-/// emulator answers that caller's registry requests at
-/// ([`published_registry_authority`]), because no listener of this emulator answers for a
+/// the authority this registry PUBLISHES for a repository
+/// ([`published_registry_authority_in`]), which is that same layout over the zone this
+/// emulator announces its own names in, because no listener of this emulator answers for a
 /// name AWS serves.
 pub fn registry_host_in(region: &str) -> String {
     let suffix = match region {

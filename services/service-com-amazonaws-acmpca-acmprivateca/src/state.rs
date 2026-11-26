@@ -255,6 +255,20 @@ pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
 /// `FAILED`), or is waiting to be restored (`DELETED`).
 pub const REVOCABLE_STATUSES: &[&str] = &[STATUS_ACTIVE, STATUS_DISABLED];
 
+/// The statuses a private CA's certificates can exist in: the one it reaches once its own
+/// certificate has been imported ([`STATUS_ACTIVE`]) and the ones it rests in afterwards
+/// ([`STATUS_DISABLED`], [`STATUS_EXPIRED`]).
+///
+/// Every other status is one no certificate of that CA was issued in — it is still being
+/// created ([`STATUS_CREATING`]), still waiting for its own certificate
+/// ([`STATUS_PENDING_CERTIFICATE`]), never got one ([`STATUS_FAILED`]), or has been withdrawn
+/// from service by a deletion ([`STATUS_DELETED`]) — so a request for a certificate such a CA
+/// holds no record of is answered about the authority's STATE
+/// ([`not_in_state_to_have_issued_message`]) rather than about a certificate that could not
+/// have been there (`CertificateAuthority::could_have_issued_certificates`).
+pub const STATUSES_CERTIFICATES_CAN_EXIST_IN: &[&str] =
+    &[STATUS_ACTIVE, STATUS_DISABLED, STATUS_EXPIRED];
+
 /// What Amazon Web Services Private CA answers when the private CA a request names is not
 /// in a status it could have issued the certificates the request is about from (for a
 /// revocation, [`REVOCABLE_STATUSES`]): one sentence about the CA, fixed text around the
@@ -1291,6 +1305,19 @@ impl CertificateAuthorityRecord {
     /// refused with the modelled `InvalidStateException`.
     pub fn is_deleted(&self) -> bool {
         self.status == STATUS_DELETED
+    }
+
+    /// Whether this CA rests in a status a certificate of its own could exist in
+    /// ([`STATUSES_CERTIFICATES_CAN_EXIST_IN`]).
+    ///
+    /// A private CA issues nothing until its own certificate has been imported and it has
+    /// become `ACTIVE`, so a request that names a certificate of a CA still on its way there
+    /// is answered about the AUTHORITY's state rather than about a certificate
+    /// ([`not_in_state_to_have_issued_message`]) — while the certificates such a CA does
+    /// hold (its own, signed during a root bring-up) are served as they always were, because
+    /// a CA serves what it holds whatever status it rests in.
+    pub fn could_have_issued_certificates(&self) -> bool {
+        STATUSES_CERTIFICATES_CAN_EXIST_IN.contains(&self.status.as_str())
     }
 
     /// Whether this CA's status allows `UpdateCertificateAuthority`

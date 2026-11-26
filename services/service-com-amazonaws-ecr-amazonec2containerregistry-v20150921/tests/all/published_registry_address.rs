@@ -355,7 +355,8 @@ async fn every_reported_repository_uri_names_this_registry_in_a_zone_this_emulat
         let router = emulator();
         for name in REPOSITORY_NAMES {
             let case = format!("{}, repository {name}", endpoint.case);
-            // The address this caller is handed, plus the repository's own name.
+            // This registry's own name in the zone this caller is answered in, plus the
+            // repository's own name.
             let expected = endpoint.repository_uri(name);
 
             let created = call_at(
@@ -372,8 +373,8 @@ async fn every_reported_repository_uri_names_this_registry_in_a_zone_this_emulat
                  {created_uri:?}"
             );
 
-            // The two parts a reader splits the value into: the address it dials, and the
-            // repository path it composes a tag, a digest or a registry v2 path on.
+            // The two parts a reader splits the value into: the registry host it names, and
+            // the repository path it composes a tag, a digest or a registry v2 path on.
             let (authority, path) = created_uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
@@ -389,9 +390,14 @@ async fn every_reported_repository_uri_names_this_registry_in_a_zone_this_emulat
                 "case {case:?}: {created_uri:?} names the host AWS publishes for this \
                  registry, which nothing here answers on"
             );
+            assert!(
+                !authority.contains(':'),
+                "case {case:?}: expected no port in the authority of {created_uri:?}, got \
+                 {authority:?}"
+            );
             for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
                 assert!(
-                    !authority.to_ascii_lowercase().contains(suffix),
+                    !authority.to_ascii_lowercase().ends_with(suffix),
                     "case {case:?}: {created_uri:?} carries a name under {suffix:?} — a zone \
                      AWS publishes its own endpoints in, which this emulator does not answer \
                      in"
@@ -404,8 +410,8 @@ async fn every_reported_repository_uri_names_this_registry_in_a_zone_this_emulat
             );
 
             // Which registry holds the repository is reported by the members that carry
-            // that identity, read off the stored record: they are LABELS, so no endpoint
-            // moves them.
+            // that identity, read off the stored record — the same record the address is
+            // composed from, so the three agree.
             let registry_id = text(&case, &created, "/repository/registryId");
             assert_eq!(
                 registry_id, REGISTRY_ID,
@@ -694,9 +700,9 @@ async fn the_login_url_never_names_a_zone_aws_publishes_its_own_endpoints_in() {
 
 /// The Regions the table below holds repositories in: two commercial Regions and one of a
 /// partition with a DNS suffix of its own, none of them the Region this suite's other rows
-/// are signed for. The Region keys the stored record and names its ARN, so an address that
-/// took anything from the record rather than from the endpoint the call arrived on shows up
-/// here.
+/// are signed for. The Region keys the stored record, names its ARN and is the Region label
+/// the published URI carries, so a URI that took anything from the endpoint the call arrived
+/// on rather than from the record shows up here.
 const HOLDING_REGIONS: [&str; 3] = ["us-west-2", "eu-west-1", "cn-north-1"];
 
 /// The label run every Amazon ECR registry HOST carries between the owning account's id and
@@ -754,7 +760,7 @@ async fn the_published_address_names_the_registry_that_holds_the_repository() {
                 );
                 for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
                     assert!(
-                        !authority.to_ascii_lowercase().contains(suffix),
+                        !authority.to_ascii_lowercase().ends_with(suffix),
                         "case {case:?}: {created_uri:?} carries a name under {suffix:?} — a \
                          zone AWS publishes its own endpoints in, which this emulator does \
                          not answer in"

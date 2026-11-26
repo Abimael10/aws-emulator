@@ -99,8 +99,9 @@
 //! labels, the Region, then the zone the registry is served in. That reading is what says
 //! which Region's registry a client dialled ([`dialled_registry_region`]), and this
 //! registry's `/v2` data plane claims a request whatever host it arrived on
-//! (`crate::service::registry_v2`), so both a reference written on AWS's spelling and one
-//! written on the address this service reported reach the very repository they name.
+//! (`crate::service::registry_v2`), so both a reference written on AWS's spelling — which is
+//! the spelling this service reports ([`repository_uri`]) — and one written on an address
+//! this emulator is reached at reach the very repository they name.
 
 /// The endpoint this emulator answers THIS caller's registry requests at: the address the
 /// registry URL a `docker login` of that caller is pointed at is built on
@@ -414,8 +415,7 @@ pub const PARTITION_DNS_SUFFIXES: [(&str, &str); 6] = [
 /// the registry's address, which here is the address this emulator answers the registry API
 /// on, because that URL is DIALLED as it is handed over, with the credential the token
 /// carries, and the endpoint the caller already reached is the one address this service
-/// knows it can reach. A repository's own URI is published on that same endpoint, with the
-/// repository's name as its path, which is the form that member carries ([`repository_uri`]).
+/// knows it can reach.
 pub fn registry_login_url(announced_endpoint: &str) -> String {
     format!("https://{announced_endpoint}")
 }

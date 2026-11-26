@@ -37,8 +37,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    at, emulator_served_at, given_layer_in_region, ok_in_region, registry_get, registry_host_in,
-    REGISTRY_ID,
+    at, emulator_served_at, given_layer_in_region, ok_in_region, registry_get, REGISTRY_ID,
 };
 
 // The zones AWS publishes its own endpoints in are the sibling suite's list, imported rather
@@ -51,7 +50,7 @@ const DOCKER_V2_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v
 /// The media type of the config blob a Docker v2 manifest references.
 const DOCKER_CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
 
-/// The label run every Amazon ECR registry HOST carries between the owning account's id and
+/// The label run every Amazon ECR registry host carries between the owning account's id and
 /// the Region, as the registry URL format `AuthorizationData$proxyEndpoint` documents spells
 /// it (`https://aws_account_id.dkr.ecr.region.amazonaws.com`). Every address this registry
 /// publishes for a repository carries it; what differs from AWS's own spelling is the ZONE
@@ -188,7 +187,7 @@ fn assert_published_as_the_registry_name(
     );
     for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
         assert!(
-            !authority.to_ascii_lowercase().contains(suffix),
+            !authority.to_ascii_lowercase().ends_with(suffix),
             "case {case:?}: {uri:?} carries a name under {suffix:?} — a zone AWS publishes its \
              own endpoints in, which this emulator does not answer in"
         );
@@ -227,9 +226,9 @@ async fn every_operation_publishes_a_repository_under_its_registrys_name_in_the_
                 );
                 assert_ne!(
                     created_uri,
-                    format!("{}/{name}", registry_host_in(region)),
-                    "case {case:?}: {created_uri:?} is the address AWS publishes for this \
-                     registry, which nothing here answers on"
+                    format!("{}/{name}", served_authority(served.base)),
+                    "case {case:?}: {created_uri:?} is the address this emulator happens to be \
+                     served at, which is no registry's identity"
                 );
 
                 // The identity the authority carries is reported beside it as well, off the

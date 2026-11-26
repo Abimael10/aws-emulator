@@ -269,7 +269,7 @@ impl Derived {
 }
 
 /// One deployment: where the emulator is served, the Region the stack is made in, what the
-/// template declares, and the authority the published address must therefore carry.
+/// template declares, and therefore the registry whose host the published address carries.
 struct Row {
     case: &'static str,
     /// The address this emulator is SERVED at for this row, which is the endpoint a caller
@@ -407,9 +407,8 @@ fn assert_registry_uri(case: &str, row: &Row, uri: &str, repository: &str) {
     assert_eq!(
         authority,
         published_authority(row).as_str(),
-        "case {case:?}: expected the registry authority this emulator publishes a repository \
-         of {:?} at, for a deployment served at {:?}, as the authority of {uri:?}, got \
-         {authority:?}",
+        "case {case:?}: expected the host of the registry holding a repository of {:?}, for a \
+         deployment served at {:?}, as the authority of {uri:?}, got {authority:?}",
         row.region,
         row.served_base
     );
@@ -429,9 +428,8 @@ fn assert_registry_uri(case: &str, row: &Row, uri: &str, repository: &str) {
 }
 
 /// Every address a client picks the repository up at — the stack's published attribute, the
-/// registry's own read, and the image of the revision the stack registered — is the address
-/// this emulator answers registry requests at, and the registry that HOLDS the repository is
-/// reported beside the address.
+/// registry's own read, and the image of the revision the stack registered — names the registry
+/// that HOLDS the repository, which is also what is reported beside the address.
 #[tokio::test]
 async fn a_published_repository_uri_names_the_registry_that_holds_it() {
     // The registry id reported beside the address is an account id: "the 12-digit ID of the

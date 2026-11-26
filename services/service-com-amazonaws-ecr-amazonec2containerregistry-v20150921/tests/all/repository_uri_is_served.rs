@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The address a repository is published at where BOTH endpoints move: the one a caller
-//! REACHED this emulator on and the one this emulator is SERVED at.
+//! The addresses a repository and a `docker login` are published at where BOTH endpoints move:
+//! the one a caller REACHED this emulator on and the one this emulator is SERVED at.
 //!
 //! The rule under test: **`Repository$repositoryUri` is this registry's own host — the owning
 //! account, the two fixed labels and the repository's Region — written over the zone this
@@ -104,8 +104,8 @@ const PAIRINGS: &[Pairing] = &[
 ];
 
 /// The Regions the rows hold repositories in: a commercial Region and one of a partition with
-/// a DNS suffix of its own. The Region keys the stored record and names its ARN, so a
-/// published address that took the Region from the record shows up here.
+/// a DNS suffix of its own. The Region keys the stored record, names its ARN and is the Region
+/// label the published URI carries.
 const HOLDING_REGIONS: [&str; 2] = ["us-west-2", "cn-north-1"];
 
 /// The repository names the rows span: the shortest the pattern allows and one carrying a
@@ -179,7 +179,7 @@ fn text(case: &str, body: &Value, pointer: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_published_address_pairs_the_reached_endpoint_with_the_served_one() {
+async fn the_repository_uri_names_its_registry_and_the_login_url_pairs_the_two_endpoints() {
     for pairing in PAIRINGS {
         let router = emulator_served_at(pairing.served_base);
         for region in HOLDING_REGIONS {

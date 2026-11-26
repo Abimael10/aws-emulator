@@ -79,6 +79,14 @@
 //! * `RequestInProgressException` (HTTP 400) — Your request is already in progress.
 //! * `ResourceNotFoundException` (HTTP 400) — A resource such as a private CA, S3 bucket,
 //!   certificate, audit report, or policy cannot be found.
+//!
+//! ## Which refusal a certificate this CA cannot serve earns
+//!
+//! A certificate the CA HOLDS is served whatever status the authority rests in: serving one
+//! needs no signing key. For an ARN it holds no record of, the answer is about the AUTHORITY
+//! when that CA has not reached a status its certificates could exist in — it has issued
+//! nothing, so nothing could be missing — and about the CERTIFICATE once it has
+//! (`crate::state::STATUSES_CERTIFICATES_CAN_EXIST_IN`).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -202,24 +210,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A CA that still serves its certificates answers ABOUT the certificate the
-        // request names, so that certificate is resolved on the CA FIRST and an ARN this CA
-        // holds no record of is the absence of that CERTIFICATE, whatever status the
-        // authority rests in and whether or not it has signed anything yet. Serving a
-        // certificate the CA already holds needs no signing key, so nothing about the
-        // authority is judged past this point.
+        // request names, so that certificate is resolved on the CA FIRST: a certificate the
+        // CA HOLDS is served whatever status the authority rests in, because serving one
+        // needs no signing key.
         //
         // A certificate ARN carries the ARN of the CA that issued it as its prefix, so one
         // CA's certificate never resolves against another's: under the CA the request
         // names, such an ARN is one more certificate that CA holds no record of.
-        if issuing_ca_arn != ca_arn {
-            return Err(not_found(
-                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
-            ));
-        }
+        let could_have_issued = record.could_have_issued_certificates();
+        let held = (issuing_ca_arn == ca_arn)
+            .then(|| record.certificates.get(&certificate_arn))
+            .flatten();
 
-        // `RequestInProgressException` is kept for the one thing it says — a certificate
-        // this CA really is minting, which a caller may retry for (below).
-        let Some(certificate) = record.certificates.get(&certificate_arn) else {
+        // For a certificate the CA holds NO record of, which answer it is depends on the
+        // AUTHORITY: a CA that has not reached a status its certificates could exist in has
+        // issued nothing at all, so the request is answered about its state rather than
+        // about a certificate that could not have been there
+        // (`crate::state::STATUSES_CERTIFICATES_CAN_EXIST_IN`). Once the CA has been
+        // activated, the absence of a certificate is the absence of that CERTIFICATE.
+        let Some(certificate) = held else {
+            if !could_have_issued {
+                return Err(invalid_state(
+                    crate::state::not_in_state_to_have_issued_message(&ca_arn),
+                ));
+            }
             return Err(not_found(
                 crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
             ));

@@ -18,10 +18,12 @@
 //! at, and never a zone AWS publishes its own endpoints in, which resolves at genuine AWS
 //! infrastructure or nowhere near here. A consumer of
 //! `ContainerProperties$image` ("The image used to start a container") PULLS what it reads, so
-//! an address published there that nothing here answers on takes the pull out of the emulated
-//! environment while every other member of the definition looks healthy. The image itself is a
-//! value the REGISTRATION supplied, so AWS Batch owes it back verbatim; what has to lead back
-//! to this process is the address Amazon ECR authored for it.
+//! an address published there that addresses no repository of this registry takes the pull
+//! nowhere while every other member of the definition looks healthy. The image itself is a
+//! value the REGISTRATION supplied, so AWS Batch owes it back verbatim; what has to name this
+//! registry's repository is the address Amazon ECR authored for it. The URL a `docker login`
+//! is pointed at is the other half — an address this process is REACHED at — and each row
+//! reads that it names no zone AWS publishes its own endpoints in.
 //!
 //! Beside the address, each row reads the member set the same response reports for the
 //! container it describes: AWS Batch answers a `networkConfiguration` with its
@@ -36,10 +38,12 @@
 //!
 //! The rows differ along what the rule generalises over: the address this emulator is SERVED
 //! at (an IPv4 socket, the loopback name with a port, and a host an operator chose with and
-//! without a port), the endpoint the Amazon ECR call ARRIVED on
+//! without a port), which the published registry address must not move with, the endpoint the
+//! Amazon ECR call ARRIVED on
 //! (this service's own endpoint host, and the registry
-//! host AWS publishes — neither of them a name this emulator answers on), the Region the calls
-//! are made in, the repository name (plain, namespaced, and the punctuation
+//! host AWS publishes), the Region the calls
+//! are made in — whose registry the published authority names — the repository name (plain,
+//! namespaced, and the punctuation
 //! `RepositoryName`'s pattern allows), how the registration ADDRESSES the image (the bare URI,
 //! which is the untagged form, a tag, a digest) and the `assignPublicIp` the Fargate
 //! registration names. Every row DIALS the published authority, and the last test follows the
@@ -321,8 +325,8 @@ fn authorization(service: &str, region: &str) -> String {
 }
 
 /// The authority of the address this emulator is served at, host and port: what a caller
-/// reaches this process at, read off the served base itself rather than imported, so an
-/// address built on anything else fails these rows.
+/// reaches this process at, read off the served base itself rather than imported, so a zone
+/// taken from anything else fails these rows.
 fn served_authority(served_base: &str) -> &str {
     served_base
         .split_once("://")
@@ -376,7 +380,6 @@ fn assert_dialable_authority(
          ({:?}), got {authority:?}",
         served_authority(served_base)
     );
-    assert_no_aws_endpoint_zone(case, address, &lowered);
     authority.to_string()
 }
 
@@ -573,7 +576,7 @@ async fn given_image(
 }
 
 #[tokio::test]
-async fn a_read_back_job_definition_names_a_registry_address_this_emulator_serves() {
+async fn a_read_back_job_definition_names_the_registry_address_amazon_ecr_published() {
     for row in ROWS {
         let case = row.case;
         let emulator = Emulator::new(row);

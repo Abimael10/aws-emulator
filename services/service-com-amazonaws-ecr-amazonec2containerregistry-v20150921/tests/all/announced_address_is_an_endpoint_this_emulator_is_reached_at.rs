@@ -47,10 +47,12 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{at, emulator_served_at, given_layer_in_region, registry_get, REGISTRY_ID};
+use crate::wire::{
+    at, emulator_served_at, given_layer_in_region, registry_get, REGISTRY_ID,
+};
 
 // The zones AWS publishes its own endpoints in are a sibling suite's list, imported rather
-// than re-spelled, so the suites cannot drift on what an announced address may not name.
+// than re-spelled, so the suites cannot drift on what a DIALLED address may not name.
 use crate::published_registry_address::AWS_ENDPOINT_DNS_SUFFIXES;
 
 /// The media type a Docker v2 manifest is pushed and served under.
@@ -59,7 +61,7 @@ const DOCKER_V2_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v
 /// The media type of the config blob a Docker v2 manifest references.
 const DOCKER_CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
 
-/// The label run every Amazon ECR registry HOST carries between the owning account's id and
+/// The label run every Amazon ECR registry host carries between the owning account's id and
 /// the Region, as the registry URL format `AuthorizationData$proxyEndpoint` documents spells it
 /// (`https://aws_account_id.dkr.ecr.region.amazonaws.com`). Every repository address this
 /// registry publishes carries it, over a zone of this emulator's own; the URL a `docker login`
@@ -149,8 +151,8 @@ const PAIRINGS: &[Pairing] = &[
 ];
 
 /// The Regions the rows hold repositories in: a commercial Region and one of a partition with a
-/// DNS suffix of its own. The Region keys the stored record and names its ARN, so an announced
-/// address that took the Region from the record shows up here.
+/// DNS suffix of its own. The Region keys the stored record and names its ARN, and it is the
+/// Region label the published URI carries, so a URI built on anything else shows up here.
 const HOLDING_REGIONS: [&str; 2] = ["eu-west-1", "cn-north-1"];
 
 /// The repository names the rows span — the shortest the pattern allows and one carrying a
@@ -330,7 +332,7 @@ fn dialled_endpoint(pairing: &Pairing, case: &str, url: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_announced_address_is_an_endpoint_this_emulator_is_reached_at_and_nothing_composed() {
+async fn a_published_uri_names_the_registry_and_a_login_url_an_endpoint_answered_on() {
     for pairing in PAIRINGS {
         for region in HOLDING_REGIONS {
             let router = emulator_served_at(pairing.served_base);

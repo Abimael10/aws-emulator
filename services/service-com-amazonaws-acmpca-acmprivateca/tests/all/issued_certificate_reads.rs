@@ -3,16 +3,17 @@
 //! Which refusal `GetCertificate` answers for a certificate it cannot serve.
 //!
 //! The rule under test: once the private CA a request names has been resolved, a certificate
-//! read reports on the CERTIFICATE the request names, which it resolves on that CA BEFORE
-//! the authority's own status is judged — so a certificate ARN the CA holds no record of is
-//! the absence of that certificate (HTTP 400 `ResourceNotFoundException` with the service's
-//! one fixed sentence, which names no ARN), in every status the CA still serves its
-//! certificates in, whether or not its key has signed anything yet. Which refusal a read
-//! answers therefore does NOT change as the CA is activated. The sentence about the
-//! AUTHORITY's state is reserved for a CA that serves none of its certificates at all — one
-//! withdrawn from service by a deletion until it is restored — where it is answered for the
-//! certificate the CA does hold as much as for one it does not, which is the same stage
-//! `RevokeCertificate` judges the authority at.
+//! it HOLDS is served whatever status that CA rests in — serving one needs no signing key —
+//! while for an ARN the CA holds no record of the answer follows the AUTHORITY's status. A CA
+//! that has not reached a status its certificates could exist in has issued nothing at all, so
+//! the read is refused HTTP 400 `InvalidStateException` with the service's one sentence about
+//! the authority, built out of the `CertificateAuthorityArn` the request carried: that covers a
+//! CA still being created, one still waiting for its own certificate, one whose creation
+//! failed, and one a deletion has withdrawn from service — where it is answered for the
+//! certificate the CA does hold as much as for one it does not. Once the CA's own certificate
+//! has been imported and it can have issued (ACTIVE, and the statuses it rests in afterwards),
+//! an ARN it holds no record of is the absence of that CERTIFICATE (HTTP 400
+//! `ResourceNotFoundException` with the service's one fixed sentence, which names no ARN).
 //!
 //! `RequestInProgressException` keeps the one thing it says: the certificate asked for is
 //! still being minted, so the same request later succeeds.
@@ -56,21 +57,23 @@ fn not_ready_sentence(ca_arn: &str) -> String {
 }
 
 /// Every `CertificateAuthorityStatus` the model declares, against whether a CA resting in it
-/// still SERVES the certificates it holds.
+/// still SERVES the certificates it holds, and whether a certificate of that CA could exist
+/// at all — which is what decides the refusal an ARN it holds no record of earns.
 ///
 /// A deletion withdraws a private CA from service until it is restored — "the CA won't be
 /// permanently deleted until the restoration period has passed"
-/// (`DeleteCertificateAuthority` docs) — so nothing it holds is reached through it; a CA in
-/// any other status answers about the certificate a request names, whether it could still
-/// sign one in that status or not.
-const READS_BY_STATUS: &[(&str, bool)] = &[
-    (STATUS_CREATING, true),
-    (STATUS_PENDING_CERTIFICATE, true),
-    (STATUS_ACTIVE, true),
-    (STATUS_DISABLED, true),
-    (STATUS_EXPIRED, true),
-    (STATUS_FAILED, true),
-    (STATUS_DELETED, false),
+/// (`DeleteCertificateAuthority` docs) — so nothing it holds is reached through it. A CA in
+/// any other status serves what it holds; what differs is whether it has reached a status its
+/// certificates could exist in (`STATUSES_CERTIFICATES_CAN_EXIST_IN`), which it does once its
+/// own certificate has been imported.
+const READS_BY_STATUS: &[(&str, bool, bool)] = &[
+    (STATUS_CREATING, true, false),
+    (STATUS_PENDING_CERTIFICATE, true, false),
+    (STATUS_ACTIVE, true, true),
+    (STATUS_DISABLED, true, true),
+    (STATUS_EXPIRED, true, true),
+    (STATUS_FAILED, true, false),
+    (STATUS_DELETED, false, false),
 ];
 
 /// The ways a certificate ARN under `ca_arn` names no certificate that CA holds: serials of
@@ -156,7 +159,7 @@ async fn reports_the_certificate_as_absent(
 
 /// Require `GetCertificate` to report the AUTHORITY's state, with the service's sentence for
 /// it built out of the CA ARN the request carried.
-async fn reports_the_authority_as_withdrawn(
+async fn reports_the_authority_as_not_in_state(
     emulator: &Emulator,
     case: &str,
     ca_arn: &str,
@@ -221,7 +224,10 @@ fn the_not_ready_sentence_interpolates_only_the_authority_arn() {
 /// [`READS_BY_STATUS`] spans the whole enum, so a member the model gains cannot go untested.
 #[test]
 fn the_status_table_spans_the_status_enum() {
-    let mut covered: Vec<&str> = READS_BY_STATUS.iter().map(|(status, _)| *status).collect();
+    let mut covered: Vec<&str> = READS_BY_STATUS
+        .iter()
+        .map(|(status, _, _)| *status)
+        .collect();
     covered.sort_unstable();
     let mut declared: Vec<&str> = CERTIFICATE_AUTHORITY_STATUS_VALUES.to_vec();
     declared.sort_unstable();
@@ -233,11 +239,12 @@ fn the_status_table_spans_the_status_enum() {
 }
 
 /// Every status a private CA can rest in, crossed with every way a certificate ARN fails to
-/// resolve on it: the answer names the CERTIFICATE while the CA still serves its
-/// certificates, and names the AUTHORITY — for the certificate it does hold as much as for
-/// one it does not — once a deletion has withdrawn it from service.
+/// resolve on it: the answer names the CERTIFICATE once the CA has reached a status its
+/// certificates could exist in, and names the AUTHORITY's state while it has not — and for the
+/// certificate the CA does hold as much as for one it does not once a deletion has withdrawn
+/// it from service.
 #[tokio::test]
-async fn an_unknown_certificate_is_not_found_while_the_ca_still_serves_its_certificates() {
+async fn which_refusal_a_read_answers_follows_the_status_the_authority_rests_in() {
     let emulator = Emulator::new();
     let case = "certificate reads by status";
     let (ca_arn, _certificate) = active_ca(&emulator, "read-statuses").await;
@@ -255,7 +262,7 @@ async fn an_unknown_certificate_is_not_found_while_the_ca_still_serves_its_certi
         "case {case:?}: expected the PEM the CA issued, got {certificate:?}"
     );
 
-    for (status, serves) in READS_BY_STATUS {
+    for (status, serves, certificates_can_exist) in READS_BY_STATUS {
         let row = format!("a certificate read on a {status} CA");
         force_status(&emulator, &ca_arn, status, &row);
 
@@ -269,23 +276,23 @@ async fn an_unknown_certificate_is_not_found_while_the_ca_still_serves_its_certi
         ));
         rows.push(("another authority's certificate ARN", foreign.clone()));
 
-        // A CA still in service answers for the certificate the request named; one withdrawn
-        // from service answers for itself, before any certificate ARN is resolved.
+        // A CA that has reached a status its certificates could exist in answers for the
+        // certificate the request named; one that has not answers for its own state, as does
+        // one withdrawn from service, before any certificate ARN is resolved.
         for (named, certificate_arn) in &rows {
             let case = format!("{row} naming {named}");
-            if *serves {
+            if *certificates_can_exist {
                 reports_the_certificate_as_absent(&emulator, &case, &ca_arn, certificate_arn)
                     .await;
             } else {
-                reports_the_authority_as_withdrawn(&emulator, &case, &ca_arn, certificate_arn)
+                reports_the_authority_as_not_in_state(&emulator, &case, &ca_arn, certificate_arn)
                     .await;
             }
         }
 
         // The certificate the CA did issue is served in every status it still serves its
-        // certificates in, and is refused for the AUTHORITY in the one status that serves
-        // none — which is what says the authority is judged before the certificate is
-        // resolved there, and after it everywhere else.
+        // certificates in — whether or not that status is one a certificate could have been
+        // issued in — and is refused for the AUTHORITY in the one status that serves none.
         let case = format!("{row}: the certificate the CA holds");
         if *serves {
             let served = emulator
@@ -297,15 +304,16 @@ async fn an_unknown_certificate_is_not_found_while_the_ca_still_serves_its_certi
                  stored, got {served:?}"
             );
         } else {
-            reports_the_authority_as_withdrawn(&emulator, &case, &ca_arn, &held).await;
+            reports_the_authority_as_not_in_state(&emulator, &case, &ca_arn, &held).await;
         }
     }
 }
 
 /// A CA whose key has signed nothing — still being created, or settled and waiting for its
-/// certificate — answers for the CERTIFICATE, whichever certificate ARN is asked of it.
+/// certificate — has issued nothing that could be missing, so it answers for the AUTHORITY's
+/// state, whichever certificate ARN is asked of it.
 #[tokio::test]
-async fn a_ca_that_has_signed_nothing_reports_an_unknown_certificate_as_the_absent_one() {
+async fn a_ca_that_has_signed_nothing_reports_the_authority_as_not_in_state() {
     let emulator = Emulator::new();
     // Two authorities: one read while creation has not settled yet, one read after it has.
     let creating = created_ca(&emulator, "creating-root").await;
@@ -342,15 +350,17 @@ async fn a_ca_that_has_signed_nothing_reports_an_unknown_certificate_as_the_abse
         rows.push(("a certificate another authority issued", leaf.clone()));
         for (row, certificate_arn) in rows {
             let case = format!("{stage}: {row}");
-            reports_the_certificate_as_absent(&emulator, &case, ca_arn, &certificate_arn).await;
+            reports_the_authority_as_not_in_state(&emulator, &case, ca_arn, &certificate_arn)
+                .await;
         }
     }
 }
 
-/// Every status a CA that HAS signed something rests in answers the absence of the
-/// CERTIFICATE too, and the certificate it did issue stays served through them.
+/// A CA that HAS signed something answers for the CERTIFICATE once it has reached a status
+/// its certificates could exist in, still answers for its own STATE while it has not, and
+/// serves the certificate it did issue through all of them.
 #[tokio::test]
-async fn a_ca_that_has_signed_reports_an_unknown_certificate_as_the_absent_one() {
+async fn a_ca_that_has_signed_answers_for_the_certificate_once_it_could_have_issued() {
     let emulator = Emulator::new();
     let (active, _) = active_ca(&emulator, "served-root").await;
 
@@ -402,15 +412,21 @@ async fn a_ca_that_has_signed_reports_an_unknown_certificate_as_the_absent_one()
         )
         .await;
 
-    // (the stage, the CA it is read on, the status that CA is put into first)
-    let stages: &[(&str, &str, Option<&str>)] = &[
-        ("a CA that signed its own root certificate", signing.as_str(), None),
-        ("an active CA", active.as_str(), None),
-        ("a disabled CA", active.as_str(), Some("DISABLED")),
-        ("an active CA again", active.as_str(), Some("ACTIVE")),
+    // (the stage, the CA it is read on, the status that CA is put into first, whether a
+    // certificate of that CA could exist in the status it then rests in)
+    let stages: &[(&str, &str, Option<&str>, bool)] = &[
+        (
+            "a CA that signed its own root certificate",
+            signing.as_str(),
+            None,
+            false,
+        ),
+        ("an active CA", active.as_str(), None, true),
+        ("a disabled CA", active.as_str(), Some("DISABLED"), true),
+        ("an active CA again", active.as_str(), Some("ACTIVE"), true),
     ];
 
-    for (stage, ca_arn, status) in stages {
+    for (stage, ca_arn, status, certificates_can_exist) in stages {
         if let Some(status) = status {
             emulator
                 .ok(
@@ -427,7 +443,13 @@ async fn a_ca_that_has_signed_reports_an_unknown_certificate_as_the_absent_one()
         }
         for (row, certificate_arn) in rows {
             let case = format!("{stage}: {row}");
-            reports_the_certificate_as_absent(&emulator, &case, ca_arn, &certificate_arn).await;
+            if *certificates_can_exist {
+                reports_the_certificate_as_absent(&emulator, &case, ca_arn, &certificate_arn)
+                    .await;
+            } else {
+                reports_the_authority_as_not_in_state(&emulator, &case, ca_arn, &certificate_arn)
+                    .await;
+            }
         }
         // The certificate the active CA did issue is still served in that status.
         emulator
@@ -437,9 +459,10 @@ async fn a_ca_that_has_signed_reports_an_unknown_certificate_as_the_absent_one()
 }
 
 /// The ONE certificate a CA without its own certificate can have issued is the root
-/// certificate it signs for itself: before it is asked for one every ARN on it is the
-/// absence of a certificate, that certificate is then minted asynchronously and served, and
-/// any other ARN on the same CA is still the absence of a certificate.
+/// certificate it signs for itself: before it is asked for one every ARN on it is answered
+/// for the AUTHORITY's state, that certificate is then minted asynchronously and served —
+/// because a CA serves what it holds — and any other ARN on the same CA is still answered for
+/// the authority's state.
 #[tokio::test]
 async fn the_root_certificate_a_pending_ca_signs_for_itself_is_minted_then_served() {
     let emulator = Emulator::new();
@@ -454,10 +477,10 @@ async fn the_root_certificate_a_pending_ca_signs_for_itself_is_minted_then_serve
         case,
     );
 
-    // Before it has signed anything, every certificate ARN on it is an absent certificate.
+    // Before it has signed anything, every certificate ARN on it is answered for its state.
     for (row, certificate_arn) in unresolvable_certificate_arns(&arn) {
         let row = format!("{case}: {row}, before it signed anything");
-        reports_the_certificate_as_absent(&emulator, &row, &arn, &certificate_arn).await;
+        reports_the_authority_as_not_in_state(&emulator, &row, &arn, &certificate_arn).await;
     }
 
     let root_arn = string(
@@ -502,18 +525,19 @@ async fn the_root_certificate_a_pending_ca_signs_for_itself_is_minted_then_serve
         "case {case:?}: a certificate the CA did issue is served whatever status it is in"
     );
 
-    // Any OTHER ARN on that same CA is the absence of a certificate now.
+    // Any OTHER ARN on that same CA is still answered for the authority's state: the CA is
+    // still waiting for its own certificate, so nothing else could be there.
     for (row, certificate_arn) in unresolvable_certificate_arns(&arn) {
         let row = format!("{case}: {row}, after it signed one");
-        reports_the_certificate_as_absent(&emulator, &row, &arn, &certificate_arn).await;
+        reports_the_authority_as_not_in_state(&emulator, &row, &arn, &certificate_arn).await;
     }
 }
 
 /// Taking its own certificate is what makes a CA's key one that can sign for others, and it
-/// changes NOTHING about which refusal a read answers: the same ARN is the absence of a
-/// certificate before the import and after it.
+/// is what turns the refusal a read answers for an ARN the CA holds no record of: the
+/// authority's state before the import, the absence of that certificate after it.
 #[tokio::test]
-async fn taking_its_own_certificate_leaves_the_refusal_a_read_answers_alone() {
+async fn taking_its_own_certificate_turns_the_state_refusal_into_the_absent_certificate_one() {
     let emulator = Emulator::new();
     let case = "imported";
     let arn = created_ca(&emulator, "imported-root").await;
@@ -522,7 +546,7 @@ async fn taking_its_own_certificate_leaves_the_refusal_a_read_answers_alone() {
     let rows = unresolvable_certificate_arns(&arn);
     for (row, certificate_arn) in &rows {
         let row = format!("{case}: {row}, before its certificate");
-        reports_the_certificate_as_absent(&emulator, &row, &arn, certificate_arn).await;
+        reports_the_authority_as_not_in_state(&emulator, &row, &arn, certificate_arn).await;
     }
 
     let own = own_ca_certificate(&emulator, case, &arn).await;

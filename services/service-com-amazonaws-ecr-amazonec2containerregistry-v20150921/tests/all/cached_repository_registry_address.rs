@@ -17,13 +17,13 @@
 //! `ecr:` resource of a grant, a `docker login` and an image reference from.
 //!
 //! What this suite adds to its siblings — `crate::repository_registry_uri`, which reads the
-//! rule across the Region and the repository name, and `crate::published_registry_address`,
-//! which reads it across the endpoint a call arrived on for a repository a CLIENT created —
-//! is the repository no `CreateRepository` call ever named: "a pull through cache rule
-//! provides a way to cache images from an upstream registry source in your Amazon ECR private
-//! registry" (`CreatePullThroughCacheRule`), so the mirror the registry creates on the first
-//! covered read is published by the same rule as any other repository, and the path that
-//! MINTED it changes nothing about its address.
+//! rule across the endpoint a call arrived on, the address this emulator is served at, the
+//! Region and the repository name for a repository a CLIENT created — is the repository no
+//! `CreateRepository` call ever named: "a pull through cache rule provides a way to cache
+//! images from an upstream registry source in your Amazon ECR private registry"
+//! (`CreatePullThroughCacheRule`), so the mirror the registry creates on the first covered
+//! read is published by the same rule as any other repository, and the path that MINTED it
+//! changes nothing about its address.
 //!
 //! The class the rule generalises over is the Region the mirror is held in (and so the
 //! partition), crossed with how deep the rule's prefix and the cached path are and the tag
@@ -47,14 +47,6 @@ use crate::wire::{
 /// publishes carries it, over a zone of this emulator's own. Spelled out here rather than
 /// imported so a published address that lost that spelling fails this suite.
 const REGISTRY_LABEL_RUN: &str = ".dkr.ecr.";
-
-/// The DNS suffixes AWS publishes its own endpoints under, spelled out here rather than
-/// imported so a published address slipping into one of them fails these rows.
-///
-/// Source: `service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`, the tree's one
-/// list of them.
-const AWS_ENDPOINT_DNS_SUFFIXES: [&str; 4] =
-    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
 
 /// The upstream these rules cache from, and the `UpstreamRegistry` that URL belongs to:
 ///
@@ -251,20 +243,13 @@ async fn a_cached_repositorys_published_uri_names_the_registry_that_minted_it() 
         assert_ne!(
             authority,
             registry_host_in(mirror.region),
-            "case {case:?}: {uri:?} names the host AWS publishes for this registry, which \
-             resolves nowhere near this process"
+            "case {case:?}: expected {uri:?} to name the host of the registry holding the \
+             mirror, got {authority:?}"
         );
         assert!(
             authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
             "case {case:?}: expected the registry host spelling in {authority:?}"
         );
-        for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
-            assert!(
-                !authority.to_ascii_lowercase().contains(suffix),
-                "case {case:?}: {uri:?} carries a name under {suffix:?} — a zone AWS \
-                 publishes its own endpoints in, which this emulator does not answer in"
-            );
-        }
 
         // What the value is FOR: the reference a client writes from it (`<uri>:<tag>`),
         // dialled the way a container client dials one — the authority as the host, the
@@ -309,9 +294,8 @@ struct ReadingEndpoint {
 }
 
 /// The endpoints the second test reads each mirror on: this service's own regional endpoint
-/// host (a name AWS publishes, so the served address stands in its place), the emulator's own
-/// socket, a loopback name on another port, and a host of THIS service an operator serves the
-/// emulator at.
+/// host, the emulator's own socket, a loopback name on another port, and a host of THIS
+/// service an operator serves the emulator at.
 const READING_ENDPOINTS: &[ReadingEndpoint] = &[
     ReadingEndpoint {
         case: "this service's own regional endpoint host",
