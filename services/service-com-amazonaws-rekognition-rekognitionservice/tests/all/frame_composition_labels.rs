@@ -7,15 +7,17 @@
 //! THE RULE UNDER TEST: `DetectLabels` reports one label per general-label taxonomy ENTITY the
 //! submitted frame's own pixels establish — "for each object, scene, and concept the API
 //! returns one or more labels" — so a frame no object was located in is reported by the
-//! concepts its measured COMPOSITION establishes: one unbroken surface where no step in it is
-//! steep enough to be a boundary, a repeat where its parts hold the same tone over again, and
-//! a single tone where one colour family covers it. Each concept is reported at the share or
-//! agreement measured for it, with the category the published taxonomy puts it in and every
-//! ancestor above it as a unique label of its own, and a colour's own name is never a label
-//! name: a colour is a property OF the picture and is reported under
-//! `ImageProperties.DominantColors`. A frame whose composition establishes nothing is reported
-//! with an empty list, and a frame an object WAS located in is reported by that object and its
-//! own taxonomy chain.
+//! concepts its measured COMPOSITION establishes: how much of it is one unbroken surface where
+//! no step is steep enough to be a boundary, how closely its parts hold the same tone over
+//! again, and how much of it one colour family covers. All three are measured off every such
+//! frame and each is reported at the share or agreement measured for it, with the category the
+//! published taxonomy puts it in and every ancestor above it as a unique label of its own; the
+//! only floor a reported concept clears is the request's own `MinConfidence`, 55 percent where
+//! it names none, so a frame a concept comes out of weakly is reported by what the frame's
+//! other statistics establish rather than by nothing at all. A colour's own name is never a
+//! label name: a colour is a property OF the picture and is reported under
+//! `ImageProperties.DominantColors`. A frame an object WAS located in is reported by that
+//! object and its own taxonomy chain.
 //!
 //! Every frame below is DRAWN by the test from known tones, so each assertion compares the
 //! service's answer against what the test PUT in the frame. The table spans what the rule
@@ -55,13 +57,9 @@ const SIMPLIFIED_COLORS: [&str; 12] = [
     "pink", "brown",
 ];
 
-/// The floors a measured composition concept clears before it is reported, as the service
-/// measures them: how much of a frame must carry no boundary before it is one unbroken
-/// surface, how closely its parts must agree before its content repeats, and how much of it
-/// one colour family must cover before it carries a single tone.
-const SURFACE_SHARE: f64 = 99.0;
-const PATTERN_AGREEMENT: f64 = 95.0;
-const MONOCHROME_SHARE: f64 = 90.0;
+// A measured composition concept clears no floor of this service's own: it is reported at
+// whatever share or agreement was measured for it, and the only floor applied to it is the
+// request's own `MinConfidence` below.
 
 /// The confidence floor a request naming no `MinConfidence` is narrowed to: "if MinConfidence
 /// is not specified, the operation returns labels with a confidence values greater than or
@@ -193,15 +191,12 @@ fn expected_category(name: &str) -> &'static str {
     }
 }
 
-/// The floor the concept of `name` is reported above, where it is one of the composition
-/// concepts.
+/// The floor every concept of an answer narrowed by no `MinConfidence` of its own clears,
+/// where the name is one of the composition concepts.
 fn floor_of(name: &str) -> Option<f64> {
-    match name {
-        TEXTURE => Some(SURFACE_SHARE),
-        PATTERN => Some(PATTERN_AGREEMENT),
-        MONOCHROME => Some(MONOCHROME_SHARE),
-        _ => None,
-    }
+    [TEXTURE, PATTERN, MONOCHROME]
+        .contains(&name)
+        .then_some(DEFAULT_MIN_CONFIDENCE)
 }
 
 /// What every answer must hold whatever the frame: a label per entity, each named from the
@@ -264,8 +259,9 @@ fn assert_reported_well(case: &str, labels: &[Value]) {
         if let Some(floor) = floor_of(&name) {
             assert!(
                 measured >= floor,
-                "case {case:?}: {name:?} is reported at the share measured for it, which \
-                 clears {floor}, got {measured}"
+                "case {case:?}: {name:?} is reported at the share measured for it, and this \
+                 request named no floor of its own, so it clears the default {floor}, \
+                 got {measured}"
             );
             assert_eq!(
                 label.get("Parents").and_then(Value::as_array),
@@ -299,42 +295,52 @@ struct Composed {
 /// one, a flat frame in a colour two families share a hue with, a flat frame of another size, a
 /// flat frame in the other encoded format, a graded frame whose steps are drifts but whose
 /// colours are mixed, a finely repeated frame, a coarsely banded frame whose parts disagree,
-/// and a frame split between two colours.
+/// and a frame split between two colours. Each row names the concepts the drawn composition
+/// establishes ABOVE the default floor of 55 percent: a concept the frame measures weakly is
+/// measured all the same and left out of the answer by that floor.
 fn composed_frames() -> Vec<Composed> {
+    // A frame drawn FLAT carries no boundary, holds its one content in every part of itself,
+    // and is covered by one colour family: all three concepts measure 100 on it.
+    let flat_composition = vec![TEXTURE, PATTERN, MONOCHROME];
     vec![
         Composed {
             case: "a frame drawn flat in one chromatic colour",
             bytes: colour_bytes(&flat(64, 64, [200, 30, 30]), ImageFormat::Png),
-            expected: vec![TEXTURE, MONOCHROME],
+            expected: flat_composition.clone(),
         },
         Composed {
             case: "the same frame in the other format the service reads",
             bytes: colour_bytes(&flat(64, 64, [200, 30, 30]), ImageFormat::Jpeg),
-            expected: vec![TEXTURE, MONOCHROME],
+            expected: flat_composition.clone(),
         },
         Composed {
             case: "a frame drawn flat in one achromatic colour",
             bytes: colour_bytes(&flat(96, 96, [255, 255, 255]), ImageFormat::Png),
-            expected: vec![TEXTURE, MONOCHROME],
+            expected: flat_composition.clone(),
         },
         Composed {
             case: "a larger frame drawn flat in a colour two families share a hue with",
             bytes: colour_bytes(&flat(200, 120, [120, 70, 20]), ImageFormat::Png),
-            expected: vec![TEXTURE, MONOCHROME],
+            expected: flat_composition.clone(),
         },
         Composed {
             case: "a frame graded from dark to light, whose colours are mixed",
             bytes: grey_bytes(&graded(120, 60), ImageFormat::Png),
-            expected: vec![TEXTURE],
+            // Every step of a grade is a drift rather than a boundary, and the grey middle of
+            // it covers more of the frame than its dark and light ends; its parts depart too
+            // far from its own mean tone for the repeat to clear the floor.
+            expected: vec![TEXTURE, MONOCHROME],
         },
         Composed {
             case: "a frame drawn flat but for a speck too small to break its surface",
             bytes: colour_bytes(&split(400, 50, 1, [20, 20, 20], [40, 180, 60]), ImageFormat::Png),
-            expected: vec![TEXTURE, MONOCHROME],
+            expected: flat_composition.clone(),
         },
         Composed {
             case: "a finely repeated frame, whose parts hold the same tone over again",
             bytes: grey_bytes(&striped(120, 120, 2, 40, 215), ImageFormat::Png),
+            // Bands two rows apart leave no pixel without a boundary beside it, and the two
+            // tones split the frame evenly between two colour families.
             expected: vec![PATTERN],
         },
         Composed {
@@ -345,19 +351,26 @@ fn composed_frames() -> Vec<Composed> {
         Composed {
             case: "a coarsely banded frame, whose parts each hold a tone of their own",
             bytes: grey_bytes(&striped(120, 120, 30, 40, 215), ImageFormat::Png),
-            expected: Vec::new(),
+            // The bands leave most of the frame unbroken, while its parts each hold a tone of
+            // their own and the two tones split it evenly: neither the repeat nor the single
+            // tone clears the floor.
+            expected: vec![TEXTURE],
         },
         Composed {
             case: "a frame split between two colours",
             bytes: colour_bytes(&split(100, 50, 40, [30, 60, 220], [220, 30, 30]), ImageFormat::Png),
-            expected: Vec::new(),
+            // Only the one column where the colours meet is a boundary, the larger of them
+            // covers three fifths of the frame, and its parts depart from its mean colour by
+            // less than half the scale.
+            expected: vec![TEXTURE, MONOCHROME, PATTERN],
         },
     ]
 }
 
 /// A frame no object was located in is reported by the concepts its own composition
-/// establishes, each at the share or agreement measured for it — and by nothing where its
-/// composition establishes nothing.
+/// establishes, each at the share or agreement measured for it, and never by nothing: a frame
+/// is composed somehow whatever it holds, so at least one of the three readings taken off it
+/// clears the floor a request naming no `MinConfidence` is narrowed to.
 #[tokio::test]
 async fn the_composition_of_a_frame_is_reported_as_the_concepts_it_establishes() {
     let router = harness();
@@ -378,6 +391,11 @@ async fn the_composition_of_a_frame_is_reported_as_the_concepts_it_establishes()
             reported, expected,
             "case {case:?}: expected the concepts the drawn composition establishes, \
              got {labels:?}"
+        );
+        assert!(
+            !labels.is_empty(),
+            "case {case:?}: a frame is composed somehow, so it is reported by the concepts \
+             measured in it and never by nothing, got {labels:?}"
         );
         assert!(
             reply.string("LabelModelVersion").is_some(),

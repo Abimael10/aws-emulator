@@ -338,9 +338,9 @@ fn assert_close(case: &str, what: &str, measured: f64, expected: f64) {
 
 /// One label per ENTITY measured in the image, with every ancestor it brings with it and an
 /// instance per measured face. A frame no face was located in is reported by the concepts its
-/// own composition establishes instead — a flat frame is one unbroken surface of a single tone
-/// — and never by the names of the colours covering it. The same answer whichever format the
-/// image was encoded in and however it was submitted.
+/// own composition establishes instead — a flat frame is one unbroken surface, holding the one
+/// content over again, of a single tone — and never by the names of the colours covering it.
+/// The same answer whichever format the image was encoded in and however it was submitted.
 #[tokio::test]
 async fn labels_report_the_entities_measured_in_the_image() {
     let router = harness();
@@ -359,13 +359,13 @@ async fn labels_report_the_entities_measured_in_the_image() {
             "a flat light image",
             Portrait::blank(240, 240, 205),
             0,
-            vec![TEXTURE, MONOCHROME],
+            FLAT_COMPOSITION.to_vec(),
         ),
         (
             "a flat dark image",
             Portrait::blank(240, 240, 15),
             0,
-            vec![TEXTURE, MONOCHROME],
+            FLAT_COMPOSITION.to_vec(),
         ),
     ];
 
@@ -521,8 +521,13 @@ async fn every_reported_label_carries_each_modelled_list_member() {
             true,
         ),
         (
-            "a frame of two colours, whose composition establishes nothing",
+            "a frame of two colours, reported by its own composition",
             json!({ "Image": bytes_image(&two_colours) }),
+            true,
+        ),
+        (
+            "the same frame narrowed to a floor above every confidence measured in it",
+            json!({ "Image": bytes_image(&two_colours), "MinConfidence": PERCENT_MAX }),
             false,
         ),
         (
@@ -1365,7 +1370,11 @@ async fn a_measured_colour_is_named_from_the_simplified_colour_names() {
         reported.sort();
         assert_eq!(
             reported,
-            vec![MONOCHROME.to_string(), TEXTURE.to_string()],
+            {
+                let mut flat = FLAT_COMPOSITION.map(str::to_string).to_vec();
+                flat.sort();
+                flat
+            },
             "case {case:?}: the frame's colour is a property of it and no entity in it, so it \
              is reported by the composition a flat frame has and not by its colour's name, \
              got {labels:?}"
@@ -1612,9 +1621,9 @@ fn graded(width: u32, height: u32) -> GrayImage {
     })
 }
 
-/// The concepts a frame drawn FLAT in one colour establishes: one unbroken surface, of a single
-/// colour family.
-const FLAT_COMPOSITION: [&str; 2] = [TEXTURE, MONOCHROME];
+/// The concepts a frame drawn FLAT in one colour establishes: one unbroken surface, holding
+/// that one content over and over again, of a single colour family.
+const FLAT_COMPOSITION: [&str; 3] = [TEXTURE, PATTERN, MONOCHROME];
 
 /// One row of the vocabulary table: the frame the test drew, how it is submitted, which
 /// analyses are asked for, and the entities this service measures in it.
@@ -1657,21 +1666,31 @@ fn drawn_frames() -> Vec<Drawn> {
             bytes: colour_png(&two_colour(100, 50, 40, [30, 60, 220], [220, 30, 30])),
             staged_as: None,
             features: None,
-            reported: Vec::new(),
+            // Only the one column where the two colours meet is a boundary, the larger
+            // colour covers more than half the frame, and the frame's parts each depart from
+            // its own mean colour by less than half the scale: all three clear the default
+            // floor of 55 percent.
+            reported: vec![TEXTURE, MONOCHROME, PATTERN],
         },
         Drawn {
             what: "a frame graded from dark to light",
             bytes: encode(&graded(120, 60), ImageFormat::Png),
             staged_as: None,
             features: None,
-            reported: vec![TEXTURE],
+            // Every step in a grade is a drift rather than a boundary, and the grey band in
+            // the middle of it covers more of the frame than the dark and light ends do; its
+            // parts depart too far from its mean tone for the repeat to clear the floor.
+            reported: vec![TEXTURE, MONOCHROME],
         },
         Drawn {
             what: "a banded frame, whose bands are edges the measurement reads",
             bytes: encode(&banded_tones(120, 120, &[40, 215, 40, 215]), ImageFormat::Png),
             staged_as: None,
             features: None,
-            reported: Vec::new(),
+            // The bands leave most of the frame unbroken, but each part of it holds a tone of
+            // its own and the two tones split it evenly, so neither the repeat nor the single
+            // tone clears the floor.
+            reported: vec![TEXTURE],
         },
         Drawn {
             what: "a frame no object was located in, with both analyses asked for",

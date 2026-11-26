@@ -50,9 +50,9 @@
 //! An entity an image carries that no measurement here reads — an apparel item, an animal, a
 //! named object — is reported by nothing: recognising it needs a trained classifier over the
 //! whole published taxonomy, and no such classifier runs in this process (see
-//! [`super::face_detection`] on what a classifier would be needed for), so a frame in which
-//! nothing at all was measured is answered with an EMPTY label list rather than with a name
-//! nothing measured.
+//! [`super::face_detection`] on what a classifier would be needed for). What IS read of every
+//! frame is how that frame is composed, so a frame no object was located in is still reported
+//! by the concepts its own statistics establish rather than by a name nothing measured.
 
 use crate::ops::types::{Instance, Label, LabelCategory, Parent};
 

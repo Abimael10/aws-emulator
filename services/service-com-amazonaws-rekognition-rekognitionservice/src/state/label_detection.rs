@@ -44,27 +44,35 @@
 //! The second reads how the frame is COMPOSED, which its own gradient and colour statistics
 //! establish without a classifier, and which the published taxonomy holds concepts for in its
 //! colour-and-composition category ([`label_taxonomy::COLORS_AND_COMPOSITION_CATEGORY`]).
-//! "For each object, scene, and concept the API returns one or more labels", and a frame in
-//! which no object was located is a picture of its own composition, so what is reported for it
-//! is the concepts that composition establishes:
+//! "For each object, scene, and concept the API returns one or more labels", and how a frame is
+//! composed is a concept OF that frame whatever else it carries, so a frame in which no object
+//! was located is reported by all three readings below, each as its own concept and each at the
+//! share or agreement measured for it:
 //!
-//! * [`label_taxonomy::TEXTURE`] — one unbroken surface fills the frame: the share of it
-//!   carrying no step steep enough, in any colour channel, to be a boundary between two things
-//!   ([`BOUNDARY_GRADIENT`]) clears [`SURFACE_SHARE`], and that share is the confidence
-//!   reported for it.
-//! * [`label_taxonomy::PATTERN`] — a frame whose surface IS broken but whose parts hold the
-//!   same content over again: the parts of the frame agree on their own measured colour to
-//!   within [`PATTERN_AGREEMENT`], and that agreement is the confidence.
-//! * [`label_taxonomy::MONOCHROME`] — one colour family covers the frame: the share of it
-//!   carrying the family most of it carries clears [`MONOCHROME_SHARE`], and that share is the
-//!   confidence. The measurement reads the frame's colours; the name reported is the concept's,
-//!   because a colour family is a property OF the picture and is reported under
-//!   `ImageProperties`, where the model puts a property.
+//! * [`label_taxonomy::TEXTURE`] — how much of the frame is one unbroken surface: the share of
+//!   it carrying no step steep enough, in any colour channel, to be a boundary between two
+//!   things ([`BOUNDARY_GRADIENT`]), which is the confidence reported for it.
+//! * [`label_taxonomy::PATTERN`] — how closely the parts of the frame hold the same content
+//!   over again: how little each part's own measured colour departs from the whole frame's,
+//!   which is the confidence. A frame drawn in one tone is the limiting case of a repeat, its
+//!   parts holding that one content over and over, and measures the complete agreement it has.
+//! * [`label_taxonomy::MONOCHROME`] — how much of the frame one colour family covers: the share
+//!   of it carrying the family most of it carries, which is the confidence. The measurement
+//!   reads the frame's colours; the name reported is the concept's, because a colour family is
+//!   a property OF the picture and is reported under `ImageProperties`, where the model puts a
+//!   property.
 //!
-//! A frame none of the measurements above reads anything in — one whose surface is broken,
-//! whose parts disagree and whose colours are mixed — is answered with an EMPTY label list, the
-//! answer for an image in which nothing was found, and never with a refusal: a refusal here is
-//! reserved for an image that could not be read at all. Every label reported carries all six
+//! No reading is silenced by a floor of this service's own. A concept measured WEAKLY is
+//! reported at the weak confidence measured for it, because how confident a reported label has
+//! to be is the REQUEST's to say: "Amazon Rekognition doesn't return any labels with confidence
+//! lower than this specified value … If MinConfidence is not specified, the operation returns
+//! labels with a confidence values greater than or equal to 55 percent" (`MinConfidence`'s own
+//! documentation), which is applied with the rest of the narrowing in [`narrowed`]. An ordinary
+//! photographic frame — one whose detail breaks its surface, whose parts differ and whose
+//! colours are mixed — is therefore answered with the concepts its own statistics establish,
+//! and not with the empty list of an image carrying nothing: an empty `Labels` is what is left
+//! when the request's own narrowing keeps none of what was measured, and a refusal is reserved
+//! for an image that could not be read at all. Every label reported carries all six
 //! members `Label` models, built in one place ([`super::label_taxonomy`]): the category the
 //! published taxonomy puts it in, every ancestor above it, the instances located for it, and
 //! the EMPTY `Aliases` list this emulator has nothing to report in.
@@ -157,25 +165,13 @@ const COLOR_BUCKET_SHIFT: u32 = 8 - COLOR_BUCKET_LEVELS.trailing_zeros();
 /// every gradient here is measured on.
 const BOUNDARY_GRADIENT: f64 = 8.0;
 
-/// How much of a frame must carry no boundary at all before the frame is one unbroken SURFACE
-/// rather than a picture of something: a percentage of the pixels a gradient can be measured
-/// at.
-pub const SURFACE_SHARE: f32 = 99.0;
-
-/// How closely the parts of a frame must agree on their own measured tone before its content
-/// REPEATS across it rather than differing from one part to the next, as a percentage.
-pub const PATTERN_AGREEMENT: f32 = 95.0;
-
-/// How many parts across and down a frame is divided into to measure that agreement.
+/// How many parts across and down a frame is divided into to measure how closely its parts
+/// agree on their own tone.
 const PATTERN_PARTS: usize = 4;
 
 /// How many colour channels a measured pixel carries, which the composition measurements read
 /// one by one: a step one channel alone carries is a step all the same.
 const CHANNELS: usize = 3;
-
-/// How much of a frame one colour family must cover before the frame carries a SINGLE tone
-/// rather than mixed colours, as a percentage of its pixels.
-pub const MONOCHROME_SHARE: f32 = 90.0;
 
 /// The number of colour buckets: [`COLOR_BUCKET_LEVELS`] cubed.
 const COLOR_BUCKETS: usize =
@@ -401,8 +397,9 @@ fn excluded(filters: &Option<Vec<String>>, values: &[&str], inclusive: bool) -> 
 /// [`label_taxonomy::FACE`] entity carrying an instance per measured face, and otherwise the
 /// composition concepts the frame's own statistics establish ([`composition_entities`]) — each
 /// with the ancestor labels the taxonomy expansion brings with it, "the response includes the
-/// all ancestors for a label", "where every ancestor is a unique label". An empty list when
-/// nothing at all was measured.
+/// all ancestors for a label", "where every ancestor is a unique label". A frame carries a
+/// composition whatever it holds, so an answer here names at least one entity; what the
+/// REQUEST then keeps of it is [`narrowed`]'s to say.
 ///
 /// A frame an object was located IN is a picture of that object, so its composition is not
 /// what is reported for it; a frame no object was located in is a picture of its own
@@ -459,12 +456,13 @@ struct Composition {
 }
 
 /// The composition concepts a frame's own statistics establish, in the order they are
-/// measured: at most the surface or the repeat across it — a frame is one or the other, since
-/// a repeat is a repeat OF something and an unbroken surface holds nothing to repeat — and the
-/// single tone covering it.
+/// measured: how much of it is one unbroken surface, how closely its parts hold the same
+/// content over again, and how much of it one colour family covers.
 ///
-/// A frame whose surface is broken, whose parts disagree and whose colours are mixed
-/// establishes none of them, and measures to the empty list.
+/// ALL THREE are reported, each at the share or agreement measured for it, however weakly one
+/// of them comes out: a frame is composed somehow whatever it holds, and the floor a reported
+/// concept has to clear is the request's own `MinConfidence` ([`narrowed`]) and never one this
+/// service keeps to itself.
 fn composition_entities(plane: &Plane) -> Vec<Measured> {
     let measured = composition_of(plane);
     let concept = |name: &'static str, confidence: f32| Measured {
@@ -474,16 +472,11 @@ fn composition_entities(plane: &Plane) -> Vec<Measured> {
         // which is not an instance of a common object located in it.
         instances: Vec::new(),
     };
-    let mut entities = Vec::new();
-    if measured.unbroken >= SURFACE_SHARE {
-        entities.push(concept(label_taxonomy::TEXTURE, measured.unbroken));
-    } else if measured.agreement >= PATTERN_AGREEMENT {
-        entities.push(concept(label_taxonomy::PATTERN, measured.agreement));
-    }
-    if measured.one_family >= MONOCHROME_SHARE {
-        entities.push(concept(label_taxonomy::MONOCHROME, measured.one_family));
-    }
-    entities
+    vec![
+        concept(label_taxonomy::TEXTURE, measured.unbroken),
+        concept(label_taxonomy::PATTERN, measured.agreement),
+        concept(label_taxonomy::MONOCHROME, measured.one_family),
+    ]
 }
 
 /// How one frame is composed, measured off its own pixels.

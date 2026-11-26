@@ -15,9 +15,10 @@
 //! object was located in, the concepts its measured composition establishes. The measured
 //! COLOURS of the frame are a property of the picture rather than an entity in it, so a
 //! colour's own name is reported under `ImageProperties.DominantColors` alone and never as a
-//! label. An image nothing above measures anything in is answered with an EMPTY `Labels` list,
-//! which is what was measured; a refusal is reserved for an image this service could not read
-//! at all, one modelled error per reason.
+//! label. A frame is composed somehow whatever it holds, so an image this service decoded is
+//! answered with the concepts measured in it; an EMPTY `Labels` list is what is left when the
+//! request's own narrowing keeps none of them, and a refusal is reserved for an image this
+//! service could not read at all, one modelled error per reason.
 //!
 //! `Features` selects the two analyses, and a request naming none asks for `GENERAL_LABELS`
 //! — "if no option is specified GENERAL_LABELS is used by default". `ImageProperties` is
