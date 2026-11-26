@@ -13,10 +13,12 @@
 //! status is the only thing the call changes, the record reports it to every later reader,
 //! a call that names the status the certificate already carries changes nothing at all, and
 //! a changing call moves the certificate to its next `customerVersion` and stamps it as
-//! last modified. A status AWS IoT uses internally is refused `InvalidRequestException`
-//! (400) — "Setting the status to PENDING_TRANSFER or PENDING_ACTIVATION will result in an
-//! exception being thrown" — and an id the account holds no certificate under is refused
-//! `ResourceNotFoundException` (404).
+//! last modified. A status move this operation will not make is refused
+//! `CertificateStateException` (406) — a status AWS IoT uses internally as the target
+//! ("Setting the status to PENDING_TRANSFER or PENDING_ACTIVATION will result in an
+//! exception being thrown"), and a move OUT OF a terminal status — and an id the account
+//! holds no certificate under is refused `ResourceNotFoundException` (404). The guards
+//! themselves are pinned by the suite `tests/all/certificate_status_guards.rs`.
 //!
 //! The tables span what the rule generalises over rather than one request: every status
 //! the modelled `CertificateStatus` enum carries
@@ -331,7 +333,8 @@ async fn updating_a_certificate_is_idempotent() {
 
     // "This operation is idempotent": the second call to the same status leaves the record
     // exactly as the first one left it — the customer version and the last-modified
-    // instant included.
+    // instant included. That holds for the terminal status too: a repeat moves the
+    // certificate nowhere, so it is served rather than refused.
     for new_status in settable_statuses() {
         let label = format!("twice to {new_status}");
         let id = emulator.issue(&label, true).await;
@@ -362,7 +365,8 @@ async fn updating_a_certificate_to_an_internal_status_is_refused() {
     let emulator = Emulator::new();
 
     // "PENDING_TRANSFER and PENDING_ACTIVATION are statuses used internally by IoT. They
-    // are not intended for developer use": the request is refused and the certificate is
+    // are not intended for developer use": the request is refused as the status move this
+    // operation will not make — `CertificateStateException` (406) — and the certificate is
     // left exactly as it was, whichever status it was in.
     for set_as_active in [false, true] {
         for new_status in INTERNAL_CERTIFICATE_STATUSES {
@@ -372,17 +376,20 @@ async fn updating_a_certificate_to_an_internal_status_is_refused() {
 
             let refused = emulator.update(&id, new_status).await;
             assert_eq!(
-                refused.status, 400,
-                "case {label:?}: an internal status must be refused 400, got {refused:?}"
+                refused.status, 406,
+                "case {label:?}: an internal status must be refused 406, got {refused:?}"
             );
             assert_eq!(
                 refused.error_code.as_deref(),
-                Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
-                "case {label:?}: expected InvalidRequestException, got {refused:?}"
+                Some("CertificateStateException"),
+                "case {label:?}: expected CertificateStateException, got {refused:?}"
             );
-            assert!(
-                refused.message().contains(new_status),
-                "case {label:?}: the refusal must name the status it refused, got {refused:?}"
+            let expected =
+                format!("Not allowed to update to {new_status} status using UpdateCertificate call");
+            assert_eq!(
+                refused.message(),
+                expected,
+                "case {label:?}: expected {expected:?}, got {refused:?}"
             );
 
             let after = emulator.describe(&id).await;

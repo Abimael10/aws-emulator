@@ -284,7 +284,8 @@ impl AttributeFilter {
     /// an `attributeValue` with no `attributeName` names no attribute to compare it
     /// against, so there is no set of things it could mean. Refusing it is the
     /// modelled answer; ignoring it and listing everything would report things the
-    /// caller did not ask for.
+    /// caller did not ask for. The sentence names the member the request had to carry
+    /// for the one it did carry to mean anything, and no value from the request.
     fn of(
         name: Option<&str>,
         value: Option<&str>,
@@ -304,7 +305,8 @@ impl AttributeFilter {
             (None, Some(_)) => Err(ListThingsErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(
-                        "attributeValue can only be used with attributeName".to_string(),
+                        "An attributeName is required to search for Things by attributeValue."
+                            .to_string(),
                     ),
                 },
             )

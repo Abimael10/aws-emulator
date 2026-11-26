@@ -553,7 +553,9 @@ async fn an_attribute_value_without_an_attribute_name_is_refused() {
 
     // `attributeValue` names no attribute to compare against on its own, so there is
     // no set of things it could select: the modelled `InvalidRequestException` (HTTP
-    // 400) is the answer, not a listing of everything.
+    // 400) is the answer, not a listing of everything. The sentence names the member the
+    // request had to carry and no value from the request, so it is the same for every row.
+    let expected_message = "An attributeName is required to search for Things by attributeValue.";
     for value in ["red", "", "a=b[c]"] {
         let label = format!("attributeValue={value:?} with no attributeName");
         let listed = emulator
@@ -567,6 +569,11 @@ async fn an_attribute_value_without_an_attribute_name_is_refused() {
             listed.error_code.as_deref(),
             Some("InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/"),
             "case {label:?}: must be refused InvalidRequestException, got {listed:?}"
+        );
+        assert_eq!(
+            listed.body.get("message").and_then(Value::as_str),
+            Some(expected_message),
+            "case {label:?}: expected {expected_message:?}, got {listed:?}"
         );
     }
 }

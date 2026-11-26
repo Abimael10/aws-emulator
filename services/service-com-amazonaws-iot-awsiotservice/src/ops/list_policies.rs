@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the policies this account's policy registry holds
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::policies`]) — "Lists your
+//! policies" — so every entry is the record `CreatePolicy` persisted, and a policy
+//! `DeletePolicy` removed is reported by nobody.
+//!
+//! A PURE read: nothing here writes, so a caller that lists the registry twice sees the
+//! same registry.
+//!
+//! The listing's order is the policy's CREATION, in the direction `ascendingOrder` names,
+//! and a page is resumed through the opaque `marker` every paginated listing of this
+//! service issues ([`crate::state::page_of`]), so a token is read one way.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +115,31 @@ impl From<ListPoliciesErrorModeled> for ListPoliciesError {
     }
 }
 
+/// Where the policy named `policy_name` and created at `creation_date` sits in a policy
+/// listing, as a row that sorts ASCENDING in that listing's own order whichever direction
+/// it runs.
+///
+/// `ListPolicies$ascendingOrder` is "Specifies the order for results. If true, the results
+/// are returned in ascending creation order", so the creation instant is the ordering key
+/// and the flag is its direction; the row is that key in the one position encoding every
+/// position-ordered listing of this service shares
+/// ([`crate::state::position_listing_row`]), so one pager walks it. The policy NAME only
+/// makes the order total — it breaks a tie between two policies created in the same
+/// microsecond, the same way in both directions — so a page boundary names exactly one
+/// position.
+fn policy_listing_row(
+    policy_name: &str,
+    creation_date: ::std::time::SystemTime,
+    ascending_order: bool,
+) -> String {
+    let created_at = creation_date
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| {
+            u64::try_from(since_epoch.as_micros()).unwrap_or(u64::MAX)
+        });
+    crate::state::position_listing_row(created_at, ascending_order, policy_name)
+}
+
 /// The `ListPolicies` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +176,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicies"))
+        // Every value this listing reports was recorded when its policy was created, so
+        // the read needs no request metadata of its own.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPoliciesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `pageSize` is modelled `range 1..250` and documents no default, so a request
+        // that names none gets the largest page the model admits. The clamp is defensive
+        // rather than load-bearing: it keeps the page inside the modelled range without
+        // depending on a validation performed outside this module.
+        let page_size = input
+            .page_size
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |page_size| {
+                page_size.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+            }) as usize;
+
+        // A pure read of the policy registry: "Lists your policies", so nothing here
+        // writes.
+        let store = state.lock();
+
+        // One row per policy the registry holds, in the listing's own total order.
+        let mut rows: Vec<String> = store
+            .policies
+            .values()
+            .map(|policy| {
+                policy_listing_row(
+                    &policy.policy_name,
+                    policy.creation_date,
+                    input.ascending_order,
+                )
+            })
+            .collect();
+        rows.sort();
+
+        // One page of that order, resumed after the position the caller's own marker names
+        // ([`crate::state::page_of`]) — the same paging every other paginated listing of
+        // this service uses. The scope carries the direction, because that is what decides
+        // which order the rows are in: a marker issued in one direction is refused in the
+        // other rather than resuming a position computed over a differently ordered row
+        // set. A marker this listing never issued is the modelled
+        // `InvalidRequestException` (HTTP 400).
+        let scope = format!(
+            "policies/{direction}",
+            direction = if input.ascending_order { "a" } else { "d" }
+        );
+        let resume_after = match input.marker.as_deref() {
+            None => None,
+            Some(marker) => {
+                let Some(resume_after) = crate::state::decode_page_marker(marker, &scope) else {
+                    return Err(ListPoliciesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "marker is not a continuation token of this listing".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                Some(resume_after)
+            }
+        };
+        let (page, next_marker) =
+            crate::state::page_of(rows, &scope, resume_after.as_deref(), page_size);
+
+        // One `Policy` per row, built from the registry's OWN record, so the name and the
+        // ARN this listing reports and the ones `GetPolicy` reports are one value — never
+        // an entry assembled from the row alone.
+        let policies: Vec<Policy> = page
+            .iter()
+            .filter_map(|row| crate::state::position_listing_row_name(row))
+            .filter_map(|policy_name| store.policies.get(policy_name))
+            .map(|policy| Policy {
+                policy_name: Some(policy.policy_name.clone()),
+                policy_arn: Some(policy.policy_arn.clone()),
+            })
+            .collect();
+
+        Ok(ListPoliciesOutput {
+            // `Policies` carries no length constraint, so an account holding no policy
+            // answers with an EMPTY list rather than an absent member: "you hold none" is
+            // an answer, not a missing one.
+            policies: Some(policies),
+            // "The marker for the next set of results, or null if there are no additional
+            // results."
+            next_marker,
+        })
     }
 }

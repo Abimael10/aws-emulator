@@ -182,11 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not exist cannot govern anything: the modelled
         // `ResourceNotFoundException` (HTTP 404) rather than a 200 recording an
         // attachment to nothing. The sentence an attach states is fixed text and names
-        // no value ([`crate::state::missing_attached_policy_message`]).
+        // no value ([`crate::state::policy_not_found_message`]).
         if !store.policies.contains_key(&input.policy_name) {
             return Err(AttachPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::missing_attached_policy_message()),
+                    message: Some(crate::state::policy_not_found_message()),
                 },
             )
             .into());

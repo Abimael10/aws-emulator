@@ -115,18 +115,20 @@ pub fn missing_policy_message(policy_name: &str) -> String {
     format!("Policy {policy_name} does not exist")
 }
 
-/// The message an ATTACH of a policy to a target or principal refuses a `policyName`
-/// the account holds no policy under with.
+/// The message an operation that resolves a `policyName` to NOTHING refuses it with when
+/// AWS words that miss as fixed text.
 ///
-/// AWS words this one after the policy it could not resolve rather than after the name
-/// it was given, so the sentence is entirely fixed text with NO variable part — the
-/// requested name is not echoed — unlike [`missing_policy_message`], which the
-/// operations addressing the policy RECORD state a miss with. Shared by
-/// `AttachPolicy` and its deprecated twin `AttachPrincipalPolicy`
-/// (`smithy_query(query="operation",operation="AttachPolicy,AttachPrincipalPolicy")`
-/// models `ResourceNotFoundException`, HTTP 404, on both), so the one write states one
-/// wording whichever name it is called by.
-pub fn missing_attached_policy_message() -> String {
+/// AWS IoT words a policy miss per operation: the operations addressing the policy RECORD
+/// state the requested name ([`missing_policy_message`]), while an ATTACH of a policy to a
+/// target or principal, and the DELETE of the policy
+/// ([`super::ComAmazonawsIotAwsiotserviceState::delete_policy`]), word it after the policy
+/// they could not resolve rather than after the name they were given — so the sentence is
+/// entirely fixed text with NO variable part and the requested name is not echoed. Shared
+/// by `AttachPolicy`, its deprecated twin `AttachPrincipalPolicy` and `DeletePolicy`
+/// (`smithy_query(query="operation",operation="AttachPolicy,AttachPrincipalPolicy,DeletePolicy")`
+/// models `ResourceNotFoundException`, HTTP 404, on all three), so one wording is stated
+/// once.
+pub fn policy_not_found_message() -> String {
     "Policy not found".to_string()
 }
 

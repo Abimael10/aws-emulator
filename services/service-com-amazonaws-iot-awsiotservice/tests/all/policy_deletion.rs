@@ -333,10 +333,17 @@ fn non_default_versions_message(policy_name: &str) -> String {
     )
 }
 
-/// The sentence every operation addressing ONE policy refuses a name the registry does
-/// not hold with.
+/// The sentence every operation addressing ONE policy RECORD refuses a name the registry
+/// does not hold with.
 fn missing_message(policy_name: &str) -> String {
     format!("Policy {policy_name} does not exist")
+}
+
+/// The sentence the DELETE refuses a name the registry does not hold with: AWS words this
+/// one after the policy it could not resolve rather than after the name it was given, so
+/// the whole sentence is fixed text and carries no part of the request.
+fn delete_missing_message() -> String {
+    "Policy not found".to_string()
 }
 
 /// Which kind of target a row attaches the policy to: the forms
@@ -735,7 +742,7 @@ async fn a_policy_the_registry_does_not_hold_is_refused_not_found() {
         );
         assert_eq!(
             refused.text("message"),
-            Some(missing_message(name)),
+            Some(delete_missing_message()),
             "case {name:?}: unexpected not-found message, got {refused:?}"
         );
     }

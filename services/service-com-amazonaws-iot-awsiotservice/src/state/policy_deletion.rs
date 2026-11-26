@@ -27,7 +27,9 @@
 /// the status from the state rather than restating the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDeletionRefusal {
-    /// A name the account holds no policy under: `ResourceNotFoundException` (HTTP 404).
+    /// A name the account holds no policy under: `ResourceNotFoundException` (HTTP 404),
+    /// stated in the fixed sentence AWS words a policy it cannot resolve with
+    /// ([`super::policy_not_found_message`]) — the delete echoes no requested name.
     NotFound(String),
     /// A policy at least one target still names: `DeleteConflictException` (HTTP 409).
     AttachedPrincipals(String),
@@ -84,7 +86,7 @@ impl super::ComAmazonawsIotAwsiotserviceState {
     pub fn policy_deletion_refusal(&self, policy_name: &str) -> Option<PolicyDeletionRefusal> {
         let Some(policy) = self.policies.get(policy_name) else {
             return Some(PolicyDeletionRefusal::NotFound(
-                super::missing_policy_message(policy_name),
+                super::policy_not_found_message(),
             ));
         };
 
@@ -133,7 +135,7 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             return Err(refusal);
         }
         self.policies.remove(policy_name).ok_or_else(|| {
-            PolicyDeletionRefusal::NotFound(super::missing_policy_message(policy_name))
+            PolicyDeletionRefusal::NotFound(super::policy_not_found_message())
         })
     }
 }

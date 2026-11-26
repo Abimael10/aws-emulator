@@ -3390,14 +3390,14 @@ pub mod certificates;
 pub use certificates::{
     active_certificate_deletion_message, attached_policies_deletion_message, certificate_arn,
     certificate_id, certificate_listing_row, certificate_listing_row_id, certificate_listing_rows,
-    internal_certificate_status_message, mint_keys_and_certificate,
-    mint_keys_and_certificate_valid_until, missing_certificate_message,
+    mint_keys_and_certificate, mint_keys_and_certificate_valid_until, missing_certificate_message,
+    unmodifiable_current_status_message, unsettable_target_status_message,
     CertificateDeletionRefusal, CertificateStatusUpdateRefusal, MintedKeysAndCertificate,
     RegisteredCertificate, CERTIFICATE_MODE_DEFAULT, CERTIFICATE_STATUS_ACTIVE,
     CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_STATUS_PENDING_TRANSFER,
     CERTIFICATE_STATUS_REVOKED, DEFAULT_CERTIFICATE_PAGE_SIZE,
     FIRST_CERTIFICATE_CUSTOMER_VERSION, INTERNAL_CERTIFICATE_STATUSES, MAX_CERTIFICATES,
-    PROVISIONING_CLAIM_VALIDITY,
+    PROVISIONING_CLAIM_VALIDITY, TERMINAL_CERTIFICATE_STATUSES,
 };
 
 // The CERTIFICATE SIGNING REQUEST a caller hands `CreateCertificateFromCsr` — what this
@@ -3448,8 +3448,8 @@ pub mod policy_attachments;
 pub use policy_attachments::{
     attachment_listing_row, attachment_listing_row_policy_name, attachment_listing_rows,
     decode_page_marker, encode_page_marker, invalid_cognito_identity_pool_id_message,
-    missing_attached_policy_message, missing_certificate_target_message, missing_policy_message,
-    names_an_arn, page_of, parse_policy_target,
+    missing_certificate_target_message, missing_policy_message, names_an_arn, page_of,
+    parse_policy_target, policy_not_found_message,
     PolicyAttachment, PolicyAttachmentLimit, PolicyAttachments, PolicyTarget, PolicyTargetRefusal,
     ResolvedPolicyTarget, MAX_ATTACHED_TARGETS, MAX_LIST_PAGE_SIZE, MAX_POLICIES_PER_TARGET,
 };

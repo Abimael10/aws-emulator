@@ -12,18 +12,18 @@
 //! ([`crate::state::ComAmazonawsIotAwsiotserviceState::update_certificate_status`]) —
 //! "Updates the status of the specified certificate. This operation is idempotent" — and
 //! this handler maps its refusal onto the modelled error class: an id the account holds no
-//! certificate under is `ResourceNotFoundException` (HTTP 404), and a `newStatus` AWS IoT
-//! uses internally is `InvalidRequestException` (HTTP 400) — a class and a sentence this
-//! emulator chooses from the documented rule, because AWS publishes the rule ("Setting the
-//! status to PENDING_TRANSFER or PENDING_ACTIVATION will result in an exception being
-//! thrown") without the wording or the class it states it in.
+//! certificate under is `ResourceNotFoundException` (HTTP 404), while a status move this
+//! operation will not make is `CertificateStateException` (HTTP 406, "The certificate
+//! operation is not allowed") — the class this model declares for a certificate operation
+//! it refuses. Two moves are refused that way: one TO a status AWS IoT keeps to itself
+//! ("Setting the status to PENDING_TRANSFER or PENDING_ACTIVATION will result in an
+//! exception being thrown"), and one OUT OF a status a certificate cannot leave, which
+//! revocation is — while a call naming the status the certificate already carries moves it
+//! nowhere, so it is served and writes nothing, as the idempotence above requires.
 //!
 //! Whether the caller MAY update the certificate is not decided here: this emulator
 //! evaluates no permissions for any operation, so the modelled `UnauthorizedException` is
-//! unreachable from this handler, as are the throttling and service-health refusals. So is
-//! the modelled `CertificateStateException`, which is the class a refusal that depends on
-//! the certificate's CURRENT status answers with: every status this operation admits may
-//! be set from every other one, because it is what a caller sets the status with.
+//! unreachable from this handler, as are the throttling and service-health refusals.
 //!
 //! ## Shape of an operation
 //!
@@ -249,9 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(crate::state::CertificateStatusUpdateRefusal::NotFound(_)) => {
                     "no-such-certificate"
                 }
-                Err(crate::state::CertificateStatusUpdateRefusal::InternalStatus(_)) => {
-                    "internal-status"
+                Err(crate::state::CertificateStatusUpdateRefusal::UnsettableTargetStatus(_)) => {
+                    "unsettable-target-status"
                 }
+                Err(
+                    crate::state::CertificateStatusUpdateRefusal::UnmodifiableCurrentStatus(_),
+                ) => "unmodifiable-current-status",
             },
         );
 
@@ -265,9 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ResourceNotFoundException { message },
                     )
                 }
-                crate::state::CertificateStatusUpdateRefusal::InternalStatus(_) => {
-                    UpdateCertificateErrorModeled::InvalidRequestException(
-                        InvalidRequestException { message },
+                // Both halves of the status guard are refusals of a status MOVE, which is
+                // what this model's `CertificateStateException` reports.
+                crate::state::CertificateStatusUpdateRefusal::UnsettableTargetStatus(_)
+                | crate::state::CertificateStatusUpdateRefusal::UnmodifiableCurrentStatus(_) => {
+                    UpdateCertificateErrorModeled::CertificateStateException(
+                        CertificateStateException { message },
                     )
                 }
             }
