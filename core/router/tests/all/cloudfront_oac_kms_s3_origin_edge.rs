@@ -298,6 +298,26 @@ fn create_bucket(
     );
 }
 
+/// The `ServerSideEncryptionConfiguration` that makes SSE-KMS under `key_reference` a bucket's
+/// DEFAULT encryption — the one shape of that document, so no suite spells it a second time.
+///
+/// `key_reference` is the key in either form the member takes
+/// (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`: "the Amazon Web Services KMS key ID or
+/// the Amazon Resource Name (ARN) of the KMS key"), and `aws:kms` is the `SSEAlgorithm` a KMS
+/// key id is "allowed if and only if" named beside.
+///
+/// `pub(crate)` so every suite that configures an origin bucket's default encryption sends the
+/// same document.
+pub(crate) fn sse_kms_default_encryption_document(key_reference: &str) -> String {
+    format!(
+        "<ServerSideEncryptionConfiguration><Rule>\
+         <ApplyServerSideEncryptionByDefault>\
+         <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>{key_reference}</KMSMasterKeyID>\
+         </ApplyServerSideEncryptionByDefault></Rule>\
+         </ServerSideEncryptionConfiguration>"
+    )
+}
+
 /// `s3:PutBucketEncryption`, making SSE-KMS under `key_arn` the bucket's default — the
 /// configuration an origin bucket holding encrypted objects carries.
 fn put_bucket_encryption(
@@ -306,13 +326,7 @@ fn put_bucket_encryption(
     bucket: &str,
     key_arn: &str,
 ) {
-    let configuration = format!(
-        "<ServerSideEncryptionConfiguration><Rule>\
-         <ApplyServerSideEncryptionByDefault>\
-         <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>{key_arn}</KMSMasterKeyID>\
-         </ApplyServerSideEncryptionByDefault></Rule>\
-         </ServerSideEncryptionConfiguration>"
-    );
+    let configuration = sse_kms_default_encryption_document(key_arn);
     let stored = s3(
         router,
         "PUT",

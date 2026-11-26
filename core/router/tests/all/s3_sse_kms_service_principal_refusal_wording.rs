@@ -45,6 +45,8 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::cloudfront_oac_kms_s3_origin_edge::sse_kms_default_encryption_document;
+
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
@@ -288,13 +290,7 @@ fn create_bucket(router: &Emulator, case: &str, bucket: &str) {
 /// `s3:PutBucketEncryption`, making SSE-KMS under `key_arn` the bucket's default — the
 /// configuration an origin bucket holding encrypted objects carries.
 fn put_bucket_encryption(router: &Emulator, case: &str, bucket: &str, key_arn: &str) {
-    let configuration = format!(
-        "<ServerSideEncryptionConfiguration><Rule>\
-         <ApplyServerSideEncryptionByDefault>\
-         <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>{key_arn}</KMSMasterKeyID>\
-         </ApplyServerSideEncryptionByDefault></Rule>\
-         </ServerSideEncryptionConfiguration>"
-    );
+    let configuration = sse_kms_default_encryption_document(key_arn);
     let stored = s3(
         router,
         "PUT",

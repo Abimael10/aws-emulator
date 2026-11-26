@@ -288,7 +288,10 @@ async fn create_distribution(
 }
 
 /// The `DomainName` `GetDistribution` reports for `id`.
-async fn read_domain_name(router: &MultiServiceRouter, id: &str) -> String {
+///
+/// `pub(crate)` so every suite that holds a published address to the one a READ reports asks
+/// the same question of the same operation.
+pub(crate) async fn read_domain_name(router: &MultiServiceRouter, id: &str) -> String {
     let read = call(
         router,
         "cloudfront",

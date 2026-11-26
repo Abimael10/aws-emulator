@@ -65,7 +65,7 @@ use super::cloudfront_oac_s3_origin_edge::{
 /// The AWS-managed cache policy `Managed-CachingDisabled`, whose TTLs are all zero: every
 /// viewer request under it reaches the origin, so each beat's answer is that fetch's own rather
 /// than one the edge held from the beat before.
-const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
+pub(crate) const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 
 /// The bucket both objects live in, and the one origin of the one distribution below.
 const BUCKET: &str = "dialled-edge-sse-kms-origin";
@@ -82,23 +82,23 @@ const SSE_S3_BODY: &str = "the object stored under S3's own keys";
 /// (`smithy_query(query="operation",operation="PutObject")` binds `ServerSideEncryption` to
 /// `x-amz-server-side-encryption` and `SSEKMSKeyId` to
 /// `x-amz-server-side-encryption-aws-kms-key-id`).
-const SSE_KMS: &str = "aws:kms";
+pub(crate) const SSE_KMS: &str = "aws:kms";
 const SSE_S3: &str = "AES256";
-const ALGORITHM_HEADER: &str = "x-amz-server-side-encryption";
+pub(crate) const ALGORITHM_HEADER: &str = "x-amz-server-side-encryption";
 const KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
 
 /// The IAM action a read that serves an SSE-KMS object's bytes performs on the object's key.
-const DECRYPT_ACTION: &str = "kms:Decrypt";
+pub(crate) const DECRYPT_ACTION: &str = "kms:Decrypt";
 
 /// The code and the message Amazon S3 refuses a read nothing in force granted with (Amazon S3
 /// "Error responses"), and the status that code carries ("403 Forbidden", same published list).
 /// Both texts are entirely fixed: such a refusal names no principal, no key and no action.
-const ACCESS_DENIED: &str = "AccessDenied";
-const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
-const ACCESS_DENIED_STATUS: u16 = 403;
+pub(crate) const ACCESS_DENIED: &str = "AccessDenied";
+pub(crate) const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// What the edge reports as the outcome of an answer the ORIGIN produced for this request.
-const MISS: &str = "Miss from cloudfront";
+pub(crate) const MISS: &str = "Miss from cloudfront";
 
 /// CloudFront, Amazon S3 and KMS mounted on one engine exactly as the router mounts them: the
 /// distribution, its origin access control and its published address are CloudFront's, the
@@ -108,7 +108,7 @@ const MISS: &str = "Miss from cloudfront";
 /// through it, and the listener it opens carries that request's own handle into it), so the
 /// origin fetch the edge makes reaches the S3 mounted here and the decrypt it needs reaches
 /// this KMS.
-fn emulator_with_kms(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn emulator_with_kms(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -147,7 +147,7 @@ async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answ
 
 /// `kms:CreateKey`, answering the new key's ARN — the customer-managed key the origin object is
 /// stored under, created through KMS's own operation rather than planted in a store.
-async fn created_key(router: &MultiServiceRouter, case: &str) -> String {
+pub(crate) async fn created_key(router: &MultiServiceRouter, case: &str) -> String {
     let created = kms(
         router,
         "CreateKey",
@@ -175,7 +175,12 @@ async fn created_key(router: &MultiServiceRouter, case: &str) -> String {
 }
 
 /// `kms:PutKeyPolicy`, replacing the key's own document with the one this beat is about.
-async fn put_key_policy(router: &MultiServiceRouter, case: &str, key_arn: &str, document: &str) {
+pub(crate) async fn put_key_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    key_arn: &str,
+    document: &str,
+) {
     let stored = kms(
         router,
         "PutKeyPolicy",
@@ -198,7 +203,7 @@ fn account_root() -> String {
 
 /// The `Enable IAM User Permissions` statement a key's default policy carries, kept by every
 /// beat so the key stays manageable and the account's own writes go through.
-fn root_statement() -> Value {
+pub(crate) fn root_statement() -> Value {
     json!({
         "Sid": "Enable IAM User Permissions",
         "Effect": "Allow",
@@ -210,21 +215,37 @@ fn root_statement() -> Value {
 
 /// A key policy of [`root_statement`] plus whichever grant this beat adds beside it.
 fn key_policy(grant: Option<Value>) -> String {
-    let statements: Vec<Value> = match grant {
-        Some(grant) => vec![root_statement(), grant],
-        None => vec![root_statement()],
-    };
-    json!({"Version": "2012-10-17", "Statement": statements}).to_string()
+    key_policy_with(grant.into_iter().collect())
+}
+
+/// A key policy of [`root_statement`] plus every statement the caller adds beside it — the
+/// general form [`key_policy`] names one grant of.
+pub(crate) fn key_policy_with(statements: Vec<Value>) -> String {
+    let mut all = vec![root_statement()];
+    all.extend(statements);
+    json!({"Version": "2012-10-17", "Statement": all}).to_string()
 }
 
 /// The grant a beat writes: the CloudFront service principal, the decrypt a read of an SSE-KMS
 /// object performs, and the `Condition` (when the beat scopes it) that decides which fetches it
 /// governs.
-fn edge_grant(condition: Option<Value>) -> Value {
+pub(crate) fn edge_grant(condition: Option<Value>) -> Value {
+    service_grant(CLOUDFRONT_PRINCIPAL, "Allow", DECRYPT_ACTION, condition)
+}
+
+/// One key-policy statement about a SERVICE principal: its `Effect`, the action it names and
+/// the `Condition` that decides which uses it governs. [`edge_grant`] is this statement for the
+/// principal and the action an origin-access-control fetch of an SSE-KMS object is decided for.
+pub(crate) fn service_grant(
+    principal: &str,
+    effect: &str,
+    action: &str,
+    condition: Option<Value>,
+) -> Value {
     let mut statement = json!({
-        "Effect": "Allow",
-        "Principal": {"Service": CLOUDFRONT_PRINCIPAL},
-        "Action": DECRYPT_ACTION,
+        "Effect": effect,
+        "Principal": {"Service": principal},
+        "Action": action,
         "Resource": "*",
     });
     if let Some(condition) = condition {
@@ -235,7 +256,7 @@ fn edge_grant(condition: Option<Value>) -> Value {
 
 /// A distribution that is not the one this suite creates: the ARN the re-scoped beat binds its
 /// grant to.
-fn another_distribution_arn() -> String {
+pub(crate) fn another_distribution_arn() -> String {
     format!(
         "arn:aws:cloudfront::{}:distribution/E2NOTTHISONE",
         engine::emulator_account_id()
@@ -244,7 +265,7 @@ fn another_distribution_arn() -> String {
 
 /// The text of `<name>…</name>` in a dialled answer's body, or the empty string — the members
 /// of the origin's own `<Error>` document.
-fn element(body: &str, name: &str) -> String {
+pub(crate) fn element(body: &str, name: &str) -> String {
     body.split_once(&format!("<{name}>"))
         .and_then(|(_before, rest)| rest.split_once(&format!("</{name}>")))
         .map_or(String::new(), |(text, _after)| text.to_string())
