@@ -1908,6 +1908,12 @@ impl SourceApiAssociationRecord {
         self.merge_pending() || self.deletion_pending()
     }
 
+    /// Whether the `SourceApiAssociationStatus` this association reports is a TERMINAL
+    /// one ([`merge_status_terminal`]), i.e. whether the service has finished with it.
+    pub fn status_terminal(&self) -> bool {
+        merge_status_terminal(&self.status)
+    }
+
     /// Schedule this association's deletion at `now`.
     ///
     /// The deletion is SCHEDULED rather than performed, so the association is left in
@@ -1967,35 +1973,50 @@ impl SourceApiAssociationRecord {
     /// activity on that API cannot postpone an owed merge and leave the association
     /// non-terminal for as long as a caller keeps changing the source schema.
     ///
-    /// A merge the clock ALREADY owes this association is the very merge this call is
-    /// asking for, so the initiation COALESCES into it: nothing is scheduled a second
-    /// time, the owed due instant is not pushed out, and the answer is the non-terminal
-    /// status the association already carries ([`MERGE_SCHEDULED`]). One merge stays owed
-    /// at a time either way, and a caller that initiates a merge straight after the
-    /// create that scheduled one is answered the merge it asked for rather than a
-    /// conflict with itself.
-    ///
-    /// An association whose DELETION the clock still owes is being destroyed and has no
-    /// schema left to merge, and that deletion is a modification that genuinely conflicts
-    /// with this one, so the call is refused rather than overwriting the status the
-    /// deletion left behind.
+    /// An association the service has NOT finished with — one whose
+    /// `SourceApiAssociationStatus` is not a terminal one ([`merge_status_terminal`]):
+    /// a merge it still owes, or the deletion that is destroying it — already has an
+    /// operation in progress, so initiating another is refused for the whole of that
+    /// window ([`ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE`]) rather than coalescing
+    /// into the owed one. Serializing merges is what the refusal is for: a caller told
+    /// 200 takes it to mean the merge it asked for is the one now pending, which a merge
+    /// that was folded into somebody else's is not. Only an association in a terminal
+    /// status admits a new merge — which the clock reaches with no further call, so the
+    /// guard clears by itself.
     pub fn start_merge(
         &mut self,
         now: SystemTime,
         source_schema_due: Option<SystemTime>,
     ) -> Result<String, AssociationRefusal> {
-        if self.deletion_pending() {
+        if !self.status_terminal() {
             return Err(AssociationRefusal::ConcurrentModification(
-                associations_being_updated_message(&self.merged_api_id),
+                ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE.to_string(),
             ));
         }
-        if self.merge_pending() {
-            return Ok(self.status.clone());
+        self.schedule_merge(now, source_schema_due);
+        Ok(self.status.clone())
+    }
+
+    /// Schedule a merge of the source API's schema into the Merged API that NO call asked
+    /// for — the one an `AUTO_MERGE` association owes once its source API changed
+    /// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::prompt_auto_merge`]) —
+    /// and the write [`Self::start_merge`] performs once it has admitted the call.
+    ///
+    /// Scheduling is all it does: the merge comes due one [`MERGE_SPAN`] after the
+    /// schema creation it depends on, if any ([`merge_due_instant`]), and [`Self::settle`]
+    /// materialises it.
+    ///
+    /// A modification the clock already owes is left exactly where it is: a change that
+    /// arrives while a merge is owed is carried BY that merge rather than postponing it,
+    /// however many changes arrive, and an association whose deletion is owed is being
+    /// destroyed and has no schema left to merge.
+    pub fn schedule_merge(&mut self, now: SystemTime, source_schema_due: Option<SystemTime>) {
+        if self.modification_pending() {
+            return;
         }
         self.merge_due_at = Some(merge_due_instant(now, source_schema_due));
         self.status = MERGE_SCHEDULED.to_string();
         self.status_detail = MERGE_SCHEDULED_DETAIL.to_string();
-        Ok(self.status.clone())
     }
 
     /// Apply the configuration choices an update asks this association for, or report
@@ -3262,6 +3283,16 @@ pub fn invalid_association_id_message(association_id: &str) -> String {
 }
 
 /// The text `ConcurrentModificationException` (HTTP 409) carries when the modification
+/// already in progress is one the ADDRESSED association itself owes.
+///
+/// AppSync states this refusal about the association the call names rather than about the
+/// Merged API behind it — a merge initiated on an association the service has not
+/// finished with ([`merge_status_terminal`]) is answered with it — and the sentence
+/// interpolates no request value, so it is entirely fixed text.
+pub const ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE: &str =
+    "This association currently has an operation in progress, please wait until that is complete";
+
+/// The text `ConcurrentModificationException` (HTTP 409) carries when the modification
 /// already in progress is one of a Merged API's SOURCE-API ASSOCIATIONS.
 ///
 /// AppSync scopes this conflict to the contended resource rather than reporting it as an
@@ -3337,6 +3368,23 @@ pub const MERGE_SUCCESS: &str = "MERGE_SUCCESS";
 /// could not be performed, because the source API's schema cannot be combined with the
 /// one the Merged API holds ([`combine_type_definitions`] states when it cannot).
 pub const MERGE_FAILED: &str = "MERGE_FAILED";
+
+/// The `SourceApiAssociationStatus` an `AUTO_MERGE` association carries when the merge
+/// its source API's change should have scheduled could not be scheduled at all. Source:
+/// the `SourceApiAssociationStatus` enum.
+pub const AUTO_MERGE_SCHEDULE_FAILED: &str = "AUTO_MERGE_SCHEDULE_FAILED";
+
+/// Whether `status` is a `SourceApiAssociationStatus` the service owes the association
+/// nothing after: a merge that was performed ([`MERGE_SUCCESS`]), one that could not be
+/// ([`MERGE_FAILED`]), or one that was never scheduled ([`AUTO_MERGE_SCHEDULE_FAILED`]).
+///
+/// Every other value of the enum names work that is still to come — a merge that is
+/// scheduled or running, or a deletion — so it is a status the service is not finished
+/// with, which is what an operation refusing a concurrent modification goes on
+/// ([`SourceApiAssociationRecord::start_merge`]).
+pub fn merge_status_terminal(status: &str) -> bool {
+    [MERGE_SUCCESS, MERGE_FAILED, AUTO_MERGE_SCHEDULE_FAILED].contains(&status)
+}
 
 /// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_SCHEDULED`].
 pub const MERGE_SCHEDULED_DETAIL: &str =

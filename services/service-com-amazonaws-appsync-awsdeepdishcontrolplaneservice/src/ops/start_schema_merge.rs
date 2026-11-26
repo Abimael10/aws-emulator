@@ -9,15 +9,19 @@
 //! later and the clock materialises it
 //! ([`crate::state::SourceApiAssociationRecord::settle`]), so the status answered is the
 //! non-terminal `MERGE_SCHEDULED` and the association reaches `MERGE_SUCCESS` with no
-//! further call. A merge the clock already owes is the merge this call initiates, so
-//! re-initiating neither pushes that due instant out nor leaves two merges owed.
+//! further call.
+//!
+//! An association the service has not finished with already has an operation in progress,
+//! so a merge initiated on it is refused `ConcurrentModificationException` (409) for the
+//! whole of that non-terminal window — the merge it still owes, or the deletion that is
+//! destroying it ([`crate::state::SourceApiAssociationRecord::start_merge`] states the
+//! rule). The guard clears by itself: the clock carries the owed work to a terminal status
+//! with no further call, and only then does this operation accept one.
 //!
 //! The pair is resolved by the rule this operation and `GetSourceApiAssociation` share
 //! ([`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::resolve_association`]):
 //! a Merged API identifier nothing can name is a bad request, and an `associationId`
-//! that names no association OF that Merged API is not found. An association whose
-//! DELETION the clock still owes is being destroyed, so initiating a merge on it is
-//! refused as the modification already in progress it is.
+//! that names no association OF that Merged API is not found.
 //!
 //! ## Shape of an operation
 //!

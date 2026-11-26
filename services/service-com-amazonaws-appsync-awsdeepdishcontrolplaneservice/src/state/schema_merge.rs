@@ -77,12 +77,18 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// merge carried until `StartSchemaMerge` asks for the next.
     ///
     /// Scheduling is all this does, exactly as the call that asks for a merge does
-    /// ([`super::SourceApiAssociationRecord::start_merge`], whose coalescing this shares):
+    /// ([`super::SourceApiAssociationRecord::schedule_merge`], the write both go through):
     /// the merge comes due one span later, carries the source API as it stands at THAT
     /// instant, and is materialised by the clock — so a change made while a merge is already
     /// owed is carried by that merge rather than postponing it, however many changes arrive.
     /// An association whose deletion the clock owes is being destroyed and has no schema left
     /// to merge, which is the one case nothing is scheduled.
+    ///
+    /// Nothing ASKED for this merge, so nothing is refused here: a source API that changed
+    /// while its association was already non-terminal needs no answer, which is why this
+    /// schedules the merge directly rather than through the guarded initiation
+    /// ([`super::SourceApiAssociationRecord::start_merge`]) a caller's `StartSchemaMerge`
+    /// takes.
     ///
     /// `source_api` names the API that changed in either form a request can name one by, so a
     /// call that addressed its API by ARN prompts exactly the merges a call that addressed it
@@ -101,7 +107,7 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             {
                 continue;
             }
-            let _ = association.start_merge(now, source_schema_due);
+            association.schedule_merge(now, source_schema_due);
         }
     }
 

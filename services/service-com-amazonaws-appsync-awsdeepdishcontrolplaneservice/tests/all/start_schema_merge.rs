@@ -4,29 +4,26 @@
 //! schema into the Merged API it is associated with, and the refusal of a pair that
 //! names no such association.
 //!
-//! Four rules are asserted here, each over a TABLE or a class of inputs rather than over
+//! Three rules are asserted here, each over a TABLE or a class of inputs rather than over
 //! the single request that exposed the defect:
 //!
-//! 1. initiating a merge answers 200 with the non-terminal `SourceApiAssociationStatus`
-//!    the association is left in (`MERGE_SCHEDULED`), which the clock then carries to
-//!    `MERGE_SUCCESS` with no further call — whether the association had settled first or
-//!    still owes a merge, in which case the initiation coalesces into the owed merge
-//!    rather than conflicting with it. Over a table spanning the `MergeType` the
-//!    association was configured with, an association that had already merged once (so the
-//!    merge date MOVES, rather than being reported before the merge ran), and a run of
-//!    re-initiations issued while the merge is owed;
-//! 2. an initiation that coalesces does not POSTPONE the merge it coalesced into: an
-//!    association re-initiated over and over while its merge is owed still reaches a
-//!    terminal status;
-//! 3. a `(mergedApiIdentifier, associationId)` pair that names no association of that
+//! 1. initiating a merge on an association the service has FINISHED with answers 200 with
+//!    the non-terminal `SourceApiAssociationStatus` it is left in (`MERGE_SCHEDULED`),
+//!    which the clock then carries to `MERGE_SUCCESS` with no further call — over a table
+//!    spanning the `MergeType` the association was configured with, and asserted twice per
+//!    row, so the merge date MOVES rather than being reported before the merge ran;
+//! 2. a `(mergedApiIdentifier, associationId)` pair that names no association of that
 //!    Merged API is refused 404 `NotFoundException`, and an identifier that cannot name
 //!    an API at all 400 `BadRequestException` — over a table spanning an unmintable
 //!    identifier, an API this account does not hold, an `associationId` never minted,
 //!    one in another form entirely, and a real association addressed under the wrong
 //!    Merged API. A refused call schedules nothing;
-//! 4. an association whose deletion the clock still owes is being destroyed, so a merge
+//! 3. an association whose deletion the clock still owes is being destroyed, so a merge
 //!    initiated on it is refused 409 `ConcurrentModificationException` and the deletion
 //!    the refusal left alone still comes due.
+//!
+//! The whole non-terminal window that refusal belongs to — every modification in progress,
+//! not only a deletion — is the `schema_merge_concurrency_guard` suite's rule.
 //!
 //! The harness (`router`, `call`, `create_api`, `create_pair`) is the one the
 //! association suites already carry, so every assertion goes through the router the
@@ -39,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::source_api_association::{
     associate_path, await_terminal_merge, call, create_api, create_pair, read_association, router,
-    Answer, MERGE_DEADLINE, POLL_SPACING, TERMINAL_MERGE_STATUSES,
+    Answer, MERGE_DEADLINE, POLL_SPACING,
 };
 
 /// `StartSchemaMerge`'s path.
@@ -134,11 +131,6 @@ async fn start_merge(
     .await
 }
 
-/// How many times a row re-initiates the merge while the association still owes one: a
-/// RUN rather than a single repeat, so an initiation accepted while a merge is owed is
-/// asserted to be the rule and not one tolerated repeat.
-const RE_INITIATIONS: usize = 4;
-
 /// Assert one accepted initiation: HTTP 200 and a `sourceApiAssociationStatus` that is a
 /// modelled enum value, and the non-terminal status an initiated merge leaves the
 /// association in.
@@ -166,50 +158,29 @@ fn assert_scheduled(answer: &Answer, case: &str, when: &str) {
 }
 
 #[tokio::test]
-async fn a_merge_is_scheduled_whether_the_association_owes_one_already_or_has_settled() {
+async fn a_merge_initiated_on_a_settled_association_is_scheduled_and_performed() {
     let router = router();
 
     for case in cases() {
         let (merged_api_id, association_id) = associate(&router, &case).await;
 
-        // Creating the association SCHEDULED a merge, so a merge initiated now is the
-        // merge the service already owes this association: the call is accepted and
-        // answers the non-terminal status that merge leaves behind — and so is every
-        // re-initiation that arrives while the merge is still owed, which coalesces into
-        // the same one rather than conflicting with it.
-        for round in 0..=RE_INITIATIONS {
-            let answer = start_merge(&router, &merged_api_id, &association_id).await;
-            assert_scheduled(
-                &answer,
-                case.label,
-                &format!("initiation {round} while the create's merge is owed"),
-            );
-        }
-
-        // The initiations left a merge owed, so the clock performs it with no further
-        // call.
+        // Creating the association SCHEDULED a merge, which the clock performs with no
+        // further call: that is the association a merge can be initiated on.
         let settled =
             await_terminal_merge(&router, case.label, &merged_api_id, &association_id).await;
         let date_before = settled["lastSuccessfulMergeDate"].clone();
         assert!(
             date_before.as_f64().is_some_and(|epoch| epoch > 0.0),
-            "case {:?}: expected a merge date once the owed merge ran, got {date_before:?}",
+            "case {:?}: expected a merge date once the create's merge ran, got {date_before:?}",
             case.label
         );
 
-        // On an association that HAS settled the same call schedules a fresh merge and
-        // answers the same non-terminal status, and re-initiating while that one is owed
-        // is accepted too.
-        for round in 0..=RE_INITIATIONS {
-            let answer = start_merge(&router, &merged_api_id, &association_id).await;
-            assert_scheduled(
-                &answer,
-                case.label,
-                &format!("initiation {round} on the association that merged once"),
-            );
-        }
+        // On that association the call schedules a fresh merge and answers the
+        // non-terminal status it leaves behind.
+        let answer = start_merge(&router, &merged_api_id, &association_id).await;
+        assert_scheduled(&answer, case.label, "on the association that merged once");
 
-        // The merge those calls left owed is a NEW merge: the clock performs it with no
+        // The merge that call left owed is a NEW merge: the clock performs it with no
         // further call, and the date moves past the one the first merge left.
         let after =
             await_terminal_merge(&router, case.label, &merged_api_id, &association_id).await;
@@ -222,51 +193,6 @@ async fn a_merge_is_scheduled_whether_the_association_owes_one_already_or_has_se
             case.label
         );
     }
-}
-
-/// An initiation that coalesces into the merge already owed does not POSTPONE it: the
-/// association is re-initiated again and again for as long as its status is non-terminal,
-/// and still reaches a terminal status — an initiation that pushed the owed due instant
-/// out would keep the association non-terminal for as long as a caller kept asking.
-///
-/// A wait on the CONDITION, not on a fixed time: the loop looks again until the
-/// association reports a terminal status or the suite's generous deadline passes.
-#[tokio::test]
-async fn re_initiating_a_merge_does_not_postpone_the_one_already_owed() {
-    let router = router();
-    let case = Case {
-        label: "re-initiated while owed",
-        config: None,
-    };
-    let (merged_api_id, association_id) = associate(&router, &case).await;
-
-    let deadline = tokio::time::Instant::now() + MERGE_DEADLINE;
-    let terminal = loop {
-        let association =
-            read_association(&router, case.label, &merged_api_id, &association_id).await;
-        let status = association["sourceApiAssociationStatus"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if TERMINAL_MERGE_STATUSES.contains(&status.as_str()) {
-            break association;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "case {:?}: expected the merge the clock owes to have been performed while the \
-             association was re-initiated, got {association:?}",
-            case.label
-        );
-        let answer = start_merge(&router, &merged_api_id, &association_id).await;
-        assert_scheduled(&answer, case.label, "re-initiated while the merge is owed");
-        tokio::time::sleep(POLL_SPACING).await;
-    };
-    assert_eq!(
-        terminal["sourceApiAssociationStatus"].as_str(),
-        Some(state::MERGE_SUCCESS),
-        "case {:?}: expected the coalesced merge to have been performed, got {terminal:?}",
-        case.label
-    );
 }
 
 /// `DisassociateSourceGraphqlApi`'s path — the call that schedules the association's
@@ -299,8 +225,8 @@ async fn a_merge_on_an_association_being_deleted_is_refused() {
 
     // While the deletion the call scheduled is still owed, the association is being
     // destroyed: that is a modification in progress, so a merge initiated on it is
-    // refused with the status the model gives that error and the text that scopes the
-    // conflict to the Merged API whose associations are being updated.
+    // refused with the status the model gives that error and the service's own text for
+    // an association that already has an operation in progress.
     let refused = call(
         &router,
         "POST",
@@ -319,7 +245,7 @@ async fn a_merge_on_an_association_being_deleted_is_refused() {
     );
     assert_eq!(
         refused.body["message"].as_str(),
-        Some(state::associations_being_updated_message(&merged_api_id).as_str()),
+        Some(state::ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE),
         "case deleting: expected the association-scoped concurrent-modification text, got {:?}",
         refused.body["message"]
     );

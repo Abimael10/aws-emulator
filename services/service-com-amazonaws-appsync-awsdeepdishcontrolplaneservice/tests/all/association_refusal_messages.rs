@@ -13,9 +13,11 @@
 //!    change the refusal;
 //! 2. a modification of a Merged API's source-API associations that is still in
 //!    progress refuses the next one 409 `ConcurrentModificationException` whose message
-//!    names THAT Merged API — asserted over every association operation that can meet
-//!    the conflict (`StartSchemaMerge`, `UpdateSourceApiAssociation`), with the
-//!    contended Merged API named by either identifier form;
+//!    names THAT Merged API — asserted for the association operation whose refusal is
+//!    scoped that way (`UpdateSourceApiAssociation`), over rows whose contended Merged
+//!    API differs, so a constant message cannot satisfy them all. `StartSchemaMerge`
+//!    scopes its own conflict to the ADDRESSED ASSOCIATION instead, which the
+//!    `schema_merge_concurrency_guard` suite asserts;
 //! 3. a create that finds the pair already associated is refused 400
 //!    `BadRequestException` with the duplicate sentence — never the retryable conflict —
 //!    whatever the clock still owes on the association it found, and the association it
@@ -46,13 +48,6 @@ fn from_the_merged_side(merged_api_identifier: &str) -> String {
 /// association OF a Merged API.
 fn association_path(merged_api_identifier: &str, association_id: &str) -> String {
     format!("/v1/mergedApis/{merged_api_identifier}/sourceApiAssociations/{association_id}")
-}
-
-/// `StartSchemaMerge`'s path.
-fn merge_path(merged_api_identifier: &str, association_id: &str) -> String {
-    format!(
-        "/v1/mergedApis/{merged_api_identifier}/sourceApiAssociations/{association_id}/merge"
-    )
 }
 
 /// `ListSourceApiAssociations`' path, used to prove a refused request stored nothing.
@@ -229,7 +224,8 @@ async fn an_api_on_the_wrong_side_is_refused_by_the_type_that_side_requires() {
     }
 }
 
-/// Which association operation a row makes its conflicting call through.
+/// One row of the conflict table: the label, and the configuration the conflicting
+/// `UpdateSourceApiAssociation` asks for — the refusal is the same whatever it asks.
 ///
 /// Every row runs into the same modification: the deletion a disassociate scheduled,
 /// which leaves the association modifiable by nobody until it comes due.
@@ -237,38 +233,28 @@ async fn an_api_on_the_wrong_side_is_refused_by_the_type_that_side_requires() {
 /// The two creates are NOT here: a pair that is already associated leaves a create
 /// nothing to do whatever the clock still owes, so it answers the duplicate refusal
 /// rather than a conflict (asserted in
-/// `a_duplicate_association_is_a_bad_request_rather_than_a_conflict`).
-#[derive(Debug, Clone, Copy)]
-enum Conflicting {
-    /// `StartSchemaMerge`.
-    StartMerge,
-    /// `UpdateSourceApiAssociation`.
-    Update,
-}
-
-/// One row of the conflict table: which operation runs into the modification the clock
-/// still owes.
+/// `a_duplicate_association_is_a_bad_request_rather_than_a_conflict`). Neither is
+/// `StartSchemaMerge`: its conflict is stated about the association it addresses rather
+/// than about the Merged API behind it (asserted in `schema_merge_concurrency_guard`).
 #[derive(Debug)]
 struct ConflictCase {
     label: &'static str,
-    through: Conflicting,
+    /// The `description` the refused update asks for, or `None` when it asks for none.
+    description: Option<&'static str>,
 }
 
-/// The conflict table: every operation that can meet a modification of a Merged API's
-/// associations already in progress, with the contended Merged API named by either
-/// identifier form.
-///
-/// The merge and the update meet it while the scheduled DELETION is owed, a merge or an
-/// update being what the scheduled merge already is or configures.
+/// The conflict table: the operation that can meet a modification of a Merged API's
+/// associations already in progress, over rows whose contended Merged API differs and
+/// whose request asks for different things.
 fn conflict_cases() -> Vec<ConflictCase> {
     vec![
         ConflictCase {
-            label: "merge while the deletion is owed",
-            through: Conflicting::StartMerge,
+            label: "update while the deletion is owed",
+            description: Some("while the deletion is owed"),
         },
         ConflictCase {
-            label: "update while the deletion is owed",
-            through: Conflicting::Update,
+            label: "update that asks for nothing while the deletion is owed",
+            description: None,
         },
     ]
 }
@@ -280,20 +266,17 @@ async fn conflicting_call(
     merged: &Api,
     association_id: &str,
 ) -> Answer {
-    match case.through {
-        Conflicting::StartMerge => {
-            call(router, "POST", &merge_path(&merged.id, association_id), None).await
-        }
-        Conflicting::Update => {
-            call(
-                router,
-                "POST",
-                &association_path(&merged.id, association_id),
-                Some(json!({"description": "while the deletion is owed"})),
-            )
-            .await
-        }
+    let mut body = json!({});
+    if let Some(description) = case.description {
+        body["description"] = json!(description);
     }
+    call(
+        router,
+        "POST",
+        &association_path(&merged.id, association_id),
+        Some(body),
+    )
+    .await
 }
 
 #[tokio::test]
