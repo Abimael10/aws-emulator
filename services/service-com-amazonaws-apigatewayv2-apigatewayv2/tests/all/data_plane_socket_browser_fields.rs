@@ -99,7 +99,12 @@ const REPORTS_THE_ORIGIN: &str = "import json\n\
 
 /// Every `Access-Control-*` field an answer carries, sorted, so a row asserts the WHOLE
 /// decoration rather than a subset of it.
-fn decoration(answered: &Answered) -> Vec<(String, String)> {
+///
+/// `pub(crate)` with [`expected`] below, because every suite that asserts what an api's
+/// `CorsConfiguration` decorated an answer with reads that decoration off the answer the same
+/// way — `published_endpoint_cors_browser_fields` drives the same rule at the address an api
+/// PUBLISHES.
+pub(crate) fn decoration(answered: &Answered) -> Vec<(String, String)> {
     let mut carried: Vec<(String, String)> = answered
         .headers
         .iter()
@@ -111,7 +116,7 @@ fn decoration(answered: &Answered) -> Vec<(String, String)> {
 }
 
 /// `pairs` as a sorted decoration, for a row to state what the answer must carry.
-fn expected(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn expected(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut owned: Vec<(String, String)> = pairs
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))

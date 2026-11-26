@@ -43,3 +43,34 @@ The host:port, api ids, markers, the specific origin strings and the MaxAge numb
 6. OPTIONS the same url with Origin + Access-Control-Request-Method: GET (+ Access-Control-Request-Headers: content-type) and no OPTIONS route — expect 200/204 with the configuration's origin/methods/headers/max-age.
 7. Create a second api with route 'ANY /{proxy+}' AuthorizationType='AWS_IAM' and send the same unsigned preflight — expect HTTP 403 with body exactly {"message":"Forbidden"}; observe a 403 whose body is 'cross-site origin' and is not JSON.
 8. Replay apigatewayv2.deploy-apigatewayv2-3-cdk-http-api-cors-lambda-default-route-serves-then-destroys, apigatewayv2.http-api-cors-preflight-caught-by-any-route-is-authorized, apigatewayv2.http-api-cors-configuration-overrides-backend-cors-headers and apigatewayv2.http-api-cors-preflight-origin-allowlist-and-delete.
+
+## Resolution
+
+Cause 1: FIXED, and PINNED by a test — the refusal this report was filed against is gone from the
+tree the report was written against (`9b3ec711`) by the time it was picked up, and all four checks
+replay as passing. The gate was never in `src/service/invoke.rs`: the address an HTTP api publishes
+is a SOCKET of this service's own (`src/service/invoke_plane_socket.rs`), and the endpoint serving it
+re-applied the core's browser (`Origin` / `Sec-Fetch-Site`) reading to every request on it and
+answered the plain-text `403` itself, before any record of the api was read. That reading is now
+scoped by what the socket being served STANDS FOR (`src/service/websocket/endpoint_http.rs`'s
+`Arrival`): it is still applied, exactly as a core HTTP listener applies it, wherever the address may
+be addressed at something other than an api's own data plane, and it is not applied where the
+socket's own record has already resolved the request to an invoke of an api of this account. The
+router still reads those fields for every request it NAMES AN OPERATION for, and `src/service.rs`
+leaves such an invoke unnamed so its routing seam answers it with the api's own records and the
+`CorsConfiguration`'s decoration.
+
+What this change adds is the evidence, over a real connection to the address the control plane
+publishes: `tests/all/published_endpoint_cors_browser_fields.rs`. An `Origin` decides nothing about
+whether the published address serves a request — the route's function answers it and reports the
+origin it was given, for an origin the configuration admits, one it does not, the `null` origin, and
+each `Sec-Fetch-Site` classification beside them — and the only Origin-dependent difference is the
+`Access-Control-*` decoration, which REPLACES the `Access-Control-*` fields the function returned for
+itself (a field of the function's that is not one of those reaches the client untouched) and is
+absent entirely for an origin `AllowOrigins` does not hold. A preflight no route matches is the
+gateway's own `204` carrying the configuration's origin, methods, headers and `MaxAge`; one an
+`ANY /{proxy+}` route matches is routed and authorized like any other request, so an unsigned caller
+earns `403` `{"message":"Forbidden"}` as JSON — never a transport-level refusal — with that same
+decoration on it; and `DeleteCorsConfiguration` leaves the api serving the same body with no
+`Access-Control-*` field at all, the preflight the gateway used to answer going back to the api's own
+`404` `{"message":"Not Found"}`.

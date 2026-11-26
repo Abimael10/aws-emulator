@@ -208,7 +208,11 @@ async fn get(case: &str, authority: &str, path: &str) -> Answered {
 /// This service and AWS Lambda on one engine, with this emulator taken to be SERVED on a port —
 /// which is what makes an api publish a socket of its own rather than the endpoint a request
 /// arrived at.
-fn served_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` with [`member`] and [`announced_parts`] below, because every suite that drives
+/// the address an api PUBLISHES stands one up the same way and reads the published value the
+/// same way.
+pub(crate) fn served_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (mut emulator, engine) = emulator_with_lambda();
     emulator.set_url_base(EndpointUrl::parse(SERVED_AT).expect("a well-formed endpoint"));
     (emulator, engine)
@@ -328,7 +332,7 @@ async fn given_api(
 }
 
 /// One string member of an answer.
-fn member(case: &str, answer: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, answer: &Value, name: &str) -> String {
     answer
         .get(name)
         .and_then(Value::as_str)
@@ -339,7 +343,7 @@ fn member(case: &str, answer: &Value, name: &str) -> String {
 /// The authority and base path a client builds the invoke URL from, asserted to be the address
 /// this emulator publishes an api's data plane at: a loopback socket it can dial, with the api
 /// behind the reserved data-plane path.
-fn announced_parts(case: &str, api_id: &str, announced: &str) -> (String, String) {
+pub(crate) fn announced_parts(case: &str, api_id: &str, announced: &str) -> (String, String) {
     let rest = announced.strip_prefix("https://").unwrap_or_else(|| {
         panic!("case {case:?}: an HTTP api must announce an https endpoint, got {announced:?}")
     });
