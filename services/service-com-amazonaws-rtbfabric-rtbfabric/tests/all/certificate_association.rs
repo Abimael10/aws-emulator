@@ -21,7 +21,11 @@
 //!   completes;
 //! * every refusal for a gateway or a certificate this store does not hold is the
 //!   service's one not-found: HTTP 404 with fixed text naming nothing from the
-//!   request.
+//!   request;
+//! * `clientToken` is an `@idempotencyToken`, so a token already presented to
+//!   `AssociateCertificate` and carrying DIFFERENT parameters is refused with the
+//!   service's `ValidationException` (400) and stores nothing, while the same token
+//!   restating the same parameters is answered as the first call was.
 //!
 //! The tables span what the rules generalise over: every member of the modelled
 //! `GatewayType` enum plus a create that names none, and certificate ARNs spanning
@@ -745,6 +749,102 @@ async fn what_a_repeated_association_does_follows_the_record_status() {
             after.body["associatedAt"], before.body["associatedAt"],
             "case {case:?}: expected the repeat to leave the record alone, got {:?}",
             after.body["associatedAt"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_client_token_carrying_a_different_certificate_is_refused() {
+    // One token is presented twice in every row; what differs between the two calls
+    // is the certificate, spanning the partitions the modelled `AcmCertificateArn`
+    // pattern admits — beside the gateway the call addresses, the one parameter this
+    // operation takes.
+    const TOKEN: &str = "token-associate-reused";
+    for (first, second) in [(0usize, 1usize), (1, 2), (2, 0)] {
+        let (first_case, first_arn) = CERTIFICATE_ARNS[first];
+        let (second_case, second_arn) = CERTIFICATE_ARNS[second];
+        let case = format!("{first_case} then {second_case} under one token");
+        let case = case.as_str();
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .responder_gateway(case, "token-responder", Some("EXTERNAL"))
+            .await;
+
+        let associated = fabric.associate(&gateway_id, first_arn, TOKEN).await;
+        assert_eq!(
+            associated.status, 200,
+            "case {case:?}: expected AssociateCertificate to answer 200, got {} {:?}",
+            associated.status, associated.body
+        );
+        let stored = fabric.get_association(&gateway_id, first_arn).await;
+
+        // The same token restating the same parameters is the retry a client token
+        // is there for: it is answered with the record the first call left.
+        let replay = fabric.associate(&gateway_id, first_arn, TOKEN).await;
+        assert_eq!(
+            replay.status, 200,
+            "case {case:?}: expected the retry under the same token to answer 200, got {} {:?}",
+            replay.status, replay.body
+        );
+        assert_eq!(
+            text(&replay.body, "acmCertificateArn"),
+            first_arn,
+            "case {case:?}: expected the retry to answer for {first_arn:?}, got {:?}",
+            replay.body["acmCertificateArn"]
+        );
+
+        // The same token carrying a DIFFERENT certificate is refused, rather than
+        // associating a second certificate under a token already spent. The service
+        // models no `IdempotentParameterMismatch`, so the refusal is its
+        // `ValidationException` (400).
+        let refused = fabric.associate(&gateway_id, second_arn, TOKEN).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected the reused token to be refused with 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            refused.code
+        );
+        let expected_message = format!(
+            "clientToken {TOKEN} was already used for a AssociateCertificate request \
+             with different parameters"
+        );
+        assert_eq!(
+            refused.message(),
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {:?}",
+            refused.message()
+        );
+
+        // The refused call stored nothing for the certificate it carried, and left
+        // the association the token WAS presented for exactly as it was.
+        let unstored = fabric.get_association(&gateway_id, second_arn).await;
+        assert_not_found(case, &unstored, &[&gateway_id, second_arn]);
+        let unchanged = fabric.get_association(&gateway_id, first_arn).await;
+        assert_eq!(
+            unchanged.body["associatedAt"], stored.body["associatedAt"],
+            "case {case:?}: expected the refused call to leave the first record alone, got {:?}",
+            unchanged.body["associatedAt"]
+        );
+
+        // The refusal belongs to the spent token, not to the certificate: under a
+        // token of its own the second certificate associates.
+        let accepted = fabric
+            .associate(&gateway_id, second_arn, "token-associate-second")
+            .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case:?}: expected a token of its own to associate {second_arn:?}, got {} {:?}",
+            accepted.status, accepted.body
+        );
+        assert_eq!(
+            text(&accepted.body, "status"),
+            CERTIFICATE_STATUS_PENDING_ASSOCIATION,
+            "case {case:?}: expected the fresh association to be pending, got {:?}",
+            accepted.body["status"]
         );
     }
 }

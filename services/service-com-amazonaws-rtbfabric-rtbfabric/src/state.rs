@@ -277,8 +277,9 @@ pub struct ResponderGateway {
     pub external_inbound_endpoint: Option<String>,
     pub description: Option<String>,
     pub tags: HashMap<String, String>,
-    /// Every `@idempotencyToken` an accepted change of this gateway's
-    /// configuration was presented under, exactly as
+    /// Every `@idempotencyToken` a change this gateway took was presented under —
+    /// a change of its configuration, or a certificate association, neither of
+    /// which mints an id of its own — exactly as
     /// [`RequesterGateway::accepted_updates`] holds the other kind's.
     pub accepted_updates: AcceptedUpdates,
     pub created_at: SystemTime,

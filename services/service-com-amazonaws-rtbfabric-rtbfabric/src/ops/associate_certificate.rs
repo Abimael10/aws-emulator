@@ -8,7 +8,10 @@
 //! certificate) pair and read back by `GetCertificateAssociation`. A pair whose
 //! association is already in force is answered as it stands, and one whose removal
 //! is accepted but not yet complete -> `ConflictException` (409): that record still
-//! holds the pair until the clock settles the removal.
+//! holds the pair until the clock settles the removal. `clientToken` is an
+//! `@idempotencyToken`, so the same token presented again with a DIFFERENT
+//! certificate is refused with `ValidationException` (400) rather than associating a
+//! second certificate under a token the caller had already spent.
 //!
 //! ## Shape of an operation
 //!
@@ -204,19 +207,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // This operation mints no id: the (gateway, certificate) pair IS the
-        // association's identity, so a retry — with the caller's `clientToken` or
-        // without it — addresses the record already there rather than making a
-        // second one. That is what the token would otherwise buy, and it holds for a
-        // retry that carries a fresh token too.
+        // `clientToken` is an `@idempotencyToken`: the same token carrying
+        // DIFFERENT parameters is refused rather than serving parameters the caller
+        // did not send under a token they had already spent. The model declares no
+        // `IdempotentParameterMismatch`, so the refusal is this operation's
+        // `ValidationException` (400), exactly as the creates and updates of this
+        // service refuse it. This operation mints no id, so — like those updates —
+        // the record of the call lives ON the gateway it addressed, and is let go of
+        // with it: the gateway the call named is what the record is looked up
+        // through, and `acmCertificateArn` is the one parameter two calls reaching
+        // the same record can differ in.
+        let fingerprint = crate::state::parameter_fingerprint(&format!(
+            "acmCertificateArn={:?}",
+            input.acm_certificate_arn
+        ));
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_token);
+        if gateway.accepted_updates.classify(&token, &fingerprint) == crate::state::Retry::Mismatch
+        {
+            return Err(AssociateCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "clientToken {} was already used for a {} request with different parameters",
+                        input.client_token,
+                        Self::NAME,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The (gateway, certificate) pair IS the association's identity, so a retry
+        // of the same association — under the token it was first presented with, or
+        // under a fresh one — addresses the record already there rather than making
+        // a second one. That is what the same token with the same parameters asks
+        // for, and it holds for a retry that carries a fresh token too.
         let key = (input.gateway_id.clone(), input.acm_certificate_arn.clone());
         if let Some(existing) = store.certificate_associations.get(&key) {
             if existing.association_in_force() {
-                return Ok(AssociateCertificateOutput {
+                let output = AssociateCertificateOutput {
                     gateway_id: existing.gateway_id.clone(),
                     acm_certificate_arn: existing.acm_certificate_arn.clone(),
                     status: existing.status.clone(),
-                });
+                };
+                retain_client_token(&mut store, &input.gateway_id, token, fingerprint);
+                return Ok(output);
             }
             if existing.disassociation_pending() {
                 // The removal of this very association is accepted and still
@@ -256,6 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Association is asynchronous: the certificate is in place once the clock
         // makes the transition due, and a caller reading straight after this call
         // still sees the pending status.
+        retain_client_token(&mut store, &input.gateway_id, token, fingerprint);
         let association = crate::state::CertificateAssociation {
             gateway_id: input.gateway_id,
             acm_certificate_arn: input.acm_certificate_arn,
@@ -271,5 +306,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.certificate_associations.insert(key, association);
         Ok(output)
+    }
+}
+
+/// Retain the `clientToken` a served call was presented under on the gateway it
+/// addressed, so a later call reusing that token with other parameters is
+/// recognised as the mismatch it is.
+///
+/// The token records the call this gateway served, not the association it carried,
+/// so a repeat that was answered with the record already in force is retained
+/// exactly as one that stored a fresh association. The gateway is the one the call
+/// found above — a store that no longer holds it has nothing to retain the record
+/// on, and nothing was served either.
+fn retain_client_token(
+    store: &mut crate::state::ComAmazonawsRtbfabricRtbfabricState,
+    gateway_id: &str,
+    token: [u8; 32],
+    fingerprint: [u8; 32],
+) {
+    if let Some(gateway) = store.responder_gateways.get_mut(gateway_id) {
+        gateway.accepted_updates.accept(token, fingerprint);
     }
 }
