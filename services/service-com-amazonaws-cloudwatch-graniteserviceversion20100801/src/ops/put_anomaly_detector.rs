@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .anomaly_detectors
             .get(&detector_key)
             .and_then(|stored| stored.detector.anomaly_detector_id.clone())
-            .unwrap_or_else(crate::state::minted_anomaly_detector_id);
+            .unwrap_or_else(|| crate::state::minted_anomaly_detector_id(now_secs));
 
         store.anomaly_detectors.insert(
             detector_key,

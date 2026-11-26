@@ -1382,7 +1382,7 @@ impl State {
                     &form,
                     None,
                     None,
-                    super::minted_anomaly_detector_id(),
+                    super::minted_anomaly_detector_id(now_secs),
                     now_secs,
                 ),
             );

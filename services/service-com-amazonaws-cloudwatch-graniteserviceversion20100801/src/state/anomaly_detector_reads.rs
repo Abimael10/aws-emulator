@@ -164,11 +164,14 @@ pub fn detector_account_id(named: Option<&str>) -> String {
 /// "The unique identifier of the anomaly detector." (`AnomalyDetector$AnomalyDetectorId`) — an
 /// opaque value the SERVICE mints, so nothing in it comes from the request: two models created
 /// for identical definitions carry different identifiers, and a model deleted and created again
-/// never reproduces the identifier it had. The minted bytes and the uuid rendering are the ones
-/// every other identity this service mints uses ([`super::alarm_reads::minted_bytes`],
-/// `service_common::uuid_from_random_bytes`), and the form is inside the modelled
-/// `AnomalyDetectorId` (length 1..128, pattern `^[A-Za-z0-9_./:%()+-]+$`).
+/// never reproduces the identifier it had.
+///
+/// Through [`super::alarm_reads::minted_identity`], the ONE minting of an identity of this
+/// service, so a model's identifier carries the same `<uuid>/<epoch-millis>` form as every other
+/// identity this service mints — the uuid of the write that minted it and the instant that write
+/// happened at, `now_secs`. That form is inside the modelled `AnomalyDetectorId` (length 1..128,
+/// pattern `^[A-Za-z0-9_./:%()+-]+$`), whose character set admits the separator and the digits.
 #[must_use]
-pub fn minted_anomaly_detector_id() -> String {
-    ::service_common::uuid_from_random_bytes(super::alarm_reads::minted_bytes())
+pub fn minted_anomaly_detector_id(now_secs: f64) -> String {
+    super::alarm_reads::minted_identity(now_secs)
 }

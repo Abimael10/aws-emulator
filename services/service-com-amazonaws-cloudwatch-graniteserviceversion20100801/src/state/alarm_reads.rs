@@ -43,12 +43,29 @@ impl StoredAlarm {
 /// milliseconds. One minting for every resource whose reads carry a creation identity (a metric
 /// alarm, an alarm mute rule), so no two of them report the identity in different forms.
 ///
+/// Through [`minted_identity`], the ONE minting of an identity of this service, so the form a
+/// creation identity carries and the form the identifier of an anomaly detection model carries
+/// cannot drift apart.
+pub fn alarm_creation_id(now_secs: f64) -> String {
+    minted_identity(now_secs)
+}
+
+/// The ONE form every identity this service mints takes: `<uuid>/<epoch-millis>` — a uuid
+/// identifying the write that minted it, and the instant that write happened at in
+/// milliseconds.
+///
+/// Every value this service mints to name a resource or the write that created one goes through
+/// this minting — the creation identity a metric alarm and an alarm mute rule report
+/// ([`alarm_creation_id`]), and the identifier a write mints for an anomaly detection model
+/// ([`super::anomaly_detector_reads::minted_anomaly_detector_id`]) — so no two of them are
+/// shaped differently and nothing has to know which resource an identity came from to parse it.
+///
 /// The uuid is minted from this process's own opaque bytes ([`minted_bytes`]) and rendered by
 /// the workspace's ONE rendering of 16 opaque bytes as a version-4 uuid, so neither the version
 /// and variant bits nor the hyphenated layout is spelled out here. Nothing in it comes from the
-/// request: two resources created with identical configuration carry different creation
-/// identities, and re-creating one never reproduces the id it had.
-pub fn alarm_creation_id(now_secs: f64) -> String {
+/// request: two resources created with identical configuration carry different identities, and
+/// re-creating one never reproduces the identity it had.
+pub(crate) fn minted_identity(now_secs: f64) -> String {
     format!(
         "{}/{}",
         ::service_common::uuid_from_random_bytes(minted_bytes()),
