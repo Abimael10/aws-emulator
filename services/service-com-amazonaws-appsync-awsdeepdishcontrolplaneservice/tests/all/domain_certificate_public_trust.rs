@@ -92,14 +92,18 @@ fn router() -> MultiServiceRouter {
 
 /// One certificate authority of this suite's own making: the certificate it is known by and
 /// the key it signs with. Locally generated, so no client's trust store carries it.
-struct Authority {
+///
+/// Reachable from the sibling suite that drives the whole custom-domain lifecycle
+/// (`crate::domain_refusal_leaves_no_association`), so one reading of "an authority of the
+/// caller's own making" serves both.
+pub(crate) struct Authority {
     certificate: rcgen::Certificate,
     key: rcgen::KeyPair,
 }
 
 impl Authority {
     /// A self-signed root authority under `common_name`.
-    fn root(common_name: &str) -> Self {
+    pub(crate) fn root(common_name: &str) -> Self {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
         let certificate = params_signed(authority_params(common_name), &key, None);
         Self { certificate, key }
@@ -107,7 +111,7 @@ impl Authority {
 
     /// An intermediate authority under `common_name` that THIS authority signed, so a leaf
     /// under it reaches the root through one more certificate.
-    fn subordinate(&self, common_name: &str) -> Self {
+    pub(crate) fn subordinate(&self, common_name: &str) -> Self {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
         let certificate = params_signed(authority_params(common_name), &key, Some(self));
         Self { certificate, key }
@@ -116,7 +120,7 @@ impl Authority {
     /// A real certificate covering `names` that this authority signed, as the PEM pair the
     /// import and the upload both take: the leaf and the private key that matches it. The
     /// first name is also the subject common name.
-    fn signs(&self, names: &[&str]) -> (String, String) {
+    pub(crate) fn signs(&self, names: &[&str]) -> (String, String) {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key pair");
         let mut params = rcgen::CertificateParams::new(
             names
@@ -136,7 +140,7 @@ impl Authority {
     }
 
     /// This authority's own certificate, as a chain carries it.
-    fn pem(&self) -> String {
+    pub(crate) fn pem(&self) -> String {
         self.certificate.pem()
     }
 }
@@ -172,7 +176,7 @@ fn params_signed(
 
 /// Import `material` into Certificate Manager with `chain` as the authorities offered with it,
 /// and answer the ARN it was stored under.
-async fn imported_material(
+pub(crate) async fn imported_material(
     router: &MultiServiceRouter,
     case: &str,
     material: (String, String),
@@ -197,7 +201,7 @@ async fn imported_material(
 }
 
 /// The custom domain names the account's listing reports.
-async fn listed_domains(router: &MultiServiceRouter) -> Vec<String> {
+pub(crate) async fn listed_domains(router: &MultiServiceRouter) -> Vec<String> {
     let answer = appsync_call(router, "GET", DOMAIN_NAMES_PATH, None).await;
     assert_eq!(
         answer.status, 200,

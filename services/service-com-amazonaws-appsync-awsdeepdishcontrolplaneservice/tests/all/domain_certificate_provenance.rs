@@ -50,6 +50,10 @@ pub const CERTIFICATE_INVALID: &str = "Certificate is invalid.";
 /// that READ one — what a refused create leaves behind.
 pub const DOMAIN_NOT_FOUND_ON_READ: &str = "Domain name not found";
 
+/// AppSync's fixed text for the same condition on the operations that CHANGE a custom domain
+/// or the API association it carries, which AppSync words with the sentence's full stop.
+pub const DOMAIN_NOT_FOUND_ON_CHANGE: &str = "Domain name not found.";
+
 /// `CreateDomainName`'s path.
 pub const DOMAIN_NAMES_PATH: &str = "/v1/domainnames";
 
