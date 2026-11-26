@@ -27,17 +27,22 @@
 //!
 //! The wire harness, the create helpers and the route table are the crate's own.
 
-use crate::distribution_identifier_reads_no_form::{live, Live, NO_SUCH_DISTRIBUTION, OPS};
+use crate::distribution_identifier_reads_no_form::{live, NO_SUCH_DISTRIBUTION, OPS};
 use crate::distribution_lifecycle::{call, emulator, API_VERSION};
 
 /// The caller reference the live distribution of this suite is created under, which one row
 /// then submits where its identifier belongs.
 const REFERENCE: &str = "id-alphabet";
 
-/// Every value this suite submits that is written in NO alphabet CloudFront issues an
-/// identifier in, so no route can read it as an identifier at all.
-fn unreadable(live: &Live) -> Vec<(String, String)> {
-    let held = &live.distribution_id;
+/// Every value written in NO alphabet CloudFront issues an identifier in, so no route can read
+/// it as an identifier at all: `held` is an identifier the account really issued, written here
+/// in ways it never was, and `reference` is the caller reference that distribution was created
+/// under — a value of the request document submitted where an identifier belongs.
+///
+/// `pub(crate)` so a suite about one route addressed by a distribution identifier varies the
+/// same forms as the one that drives them through every such route, rather than carrying its
+/// own spelling of them.
+pub(crate) fn unreadable(held: &str, reference: &str) -> Vec<(String, String)> {
     vec![
         (
             "the distribution's own identifier in lower case".to_string(),
@@ -54,7 +59,7 @@ fn unreadable(live: &Live) -> Vec<(String, String)> {
         ("a bare word".to_string(), "not-an-identifier".to_string()),
         (
             "the distribution's caller reference rather than its identifier".to_string(),
-            REFERENCE.to_string(),
+            reference.to_string(),
         ),
         (
             "a domain name rather than an identifier".to_string(),
@@ -78,7 +83,7 @@ async fn a_value_written_in_no_identifier_alphabet_is_the_identifier_that_cannot
 
     for op in OPS {
         let expected = format!("{} format is invalid", op.member());
-        for (case, id) in unreadable(&live) {
+        for (case, id) in unreadable(&live.distribution_id, REFERENCE) {
             let case = format!("{op:?} with {case} ({id:?})");
             let answer = op.send(&router, &id).await;
             assert_eq!(
