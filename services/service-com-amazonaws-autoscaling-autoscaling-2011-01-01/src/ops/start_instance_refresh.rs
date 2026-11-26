@@ -337,7 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             };
             (
-                group.active_instances().cloned().collect::<Vec<_>>(),
+                crate::state::members_to_replace(group, input.preferences.as_ref())
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 target_template.cloned(),
                 crate::state::declared_instance_types(target_policy),
             )
@@ -400,21 +402,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // What the refresh RECORDS is the group as it stands now, against the store the
-        // record is kept in: the instances it holds at this instant, minus the ones the
-        // matching pass above found already running the configuration the refresh would
-        // give them — an instance that joined the group since that pass was never matched,
-        // so it is one the refresh replaces — and the preferences resolved against the
-        // configuration the group now carries
+        // record is kept in: the members its preferences have it replace at this instant
+        // ([`crate::state::refresh_members`], which leaves out the ones they say to ignore),
+        // minus the ones the matching pass above found already running the configuration the
+        // refresh would give them — an instance that joined the group since that pass was
+        // never matched, so it is one the refresh replaces — and the preferences resolved
+        // against the configuration the group now carries
         // ([`crate::state::refresh_preferences`] for each member the request left out).
-        let pending_instance_ids: Vec<String> = group
-            .active_instances()
-            .map(|instance| instance.instance_id.clone())
-            .filter(|instance_id| {
-                matched
-                    .as_ref()
-                    .is_none_or(|skipped| !skipped.contains(instance_id))
-            })
-            .collect();
+        let pending_instance_ids: Vec<String> =
+            crate::state::members_to_replace(group, input.preferences.as_ref())
+                .map(|instance| instance.instance_id.clone())
+                .filter(|instance_id| {
+                    matched
+                        .as_ref()
+                        .is_none_or(|skipped| !skipped.contains(instance_id))
+                })
+                .collect();
         let instances_at_start = i32::try_from(pending_instance_ids.len()).unwrap_or(i32::MAX);
         let preferences =
             crate::state::refresh_preferences::effective(input.preferences.as_ref(), group);

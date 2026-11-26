@@ -338,6 +338,15 @@ pub use refresh_plan::{
     RefreshReplacement, RefreshStop, ReplacementPhase, ReplacementWindow, STEPS_PER_REPLACEMENT,
 };
 
+/// WHICH members of a group an instance refresh replaces: the behaviour it runs under for a
+/// member protected from scale in or parked in `Standby` — replace it, leave it alone, or
+/// wait for the condition to be cleared.
+pub mod refresh_members;
+
+pub use refresh_members::{
+    members_to_replace, MemberBehavior, MemberDisposition, WaitedCondition, MEMBER_CONDITION_WAIT,
+};
+
 /// The scaling policies a CloudWatch ALARM drives: the notifications this service receives
 /// from the alarms whose actions name its policies, and what receiving one performs.
 pub mod alarm_driven_policies;

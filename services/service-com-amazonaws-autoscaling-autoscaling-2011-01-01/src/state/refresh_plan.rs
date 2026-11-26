@@ -58,10 +58,10 @@ use std::time::SystemTime;
 use crate::ops::types::DesiredConfiguration;
 
 use super::{
-    AutoScalingState, FailedLifecycleStep, GroupLaunch, InstanceLifecycle,
-    InstanceLifecycleChange, LaunchDestination, StoredGroup, StoredInstanceRefresh,
-    INSTANCE_REFRESH_REPLACEMENT, LAUNCH_TRANSITION, LIFECYCLE_TRANSITION, REFRESH_FAILED,
-    REFRESH_IN_PROGRESS, REFRESH_ROLLBACK_FAILED, UNPLACED_INSTANCE_MESSAGE,
+    refresh_members::NextRefreshMember, AutoScalingState, FailedLifecycleStep, GroupLaunch,
+    InstanceLifecycle, InstanceLifecycleChange, LaunchDestination, StoredGroup,
+    StoredInstanceRefresh, INSTANCE_REFRESH_REPLACEMENT, LAUNCH_TRANSITION, LIFECYCLE_TRANSITION,
+    REFRESH_FAILED, REFRESH_IN_PROGRESS, REFRESH_ROLLBACK_FAILED, UNPLACED_INSTANCE_MESSAGE,
 };
 
 /// What the status reason of a refresh Amazon EC2 could not place a replacement for says.
@@ -233,8 +233,17 @@ impl AutoScalingState {
             // Nothing in flight: the next instance's replacement starts with the move the
             // window makes room with.
             None => {
-                let Some(instance_id) = refresh.pending_instance_ids.first().cloned() else {
-                    return false;
+                // WHICH member it replaces next is what its preferences decide: one they say
+                // to leave alone is not among them at all, and one they say to wait on is
+                // passed over while the refresh replaces the members it may
+                // ([`super::refresh_members`]).
+                let instance_id = match self.next_refresh_member(index) {
+                    NextRefreshMember::Member(instance_id) => instance_id,
+                    NextRefreshMember::Waiting(condition) => {
+                        self.wait_for_refresh_member(index, condition, due);
+                        return true;
+                    }
+                    NextRefreshMember::None => return false,
                 };
                 let launched = match window {
                     ReplacementWindow::Surge => {
