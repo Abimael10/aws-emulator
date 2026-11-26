@@ -26,7 +26,9 @@
 //! >    `ConflictUnhandled` field error carrying the row as the server holds it, with nothing
 //! >    written. A resolver asking for no detection applies its write as it stands.
 //! > 3. Each ACCEPTED write advances the version exactly once, so writes of one item made at the
-//! >    same time are handed consecutive versions, one each, and none of them is lost.
+//! >    same time are handed consecutive versions, one each, and none of them is lost. Each of
+//! >    them is answered the row ITS own turn committed — the writes accepted before it and its
+//! >    own change, and nothing of the turns that followed.
 //! > 4. A delta sync answers the rows changed AFTER the moment it is given — the tombstones among
 //! >    them, so a removal can be observed — beside the `startedAt` a client carries into its
 //! >    next sync and the `nextToken` that continues the page it read.
@@ -105,6 +107,11 @@ const SCHEMA: &str = "schema { query: Query mutation: Mutation }\n\
 /// the exception its client raised.
 const CONFLICT_UNHANDLED: &str = "ConflictUnhandled";
 const CONDITION_REFUSED: &str = "DynamoDB:ConditionalCheckFailedException";
+
+/// The sentence a conflict that was not resolved is reported with: fixed text, carrying nothing
+/// of the request or of the row — the row the server holds travels beside it, in the error's own
+/// `data`.
+const CONFLICT_REJECTED: &str = "Conflict resolver rejects mutation.";
 
 #[tokio::test]
 async fn every_write_stamps_the_items_own_version_and_the_moment_it_changed() {
@@ -743,6 +750,265 @@ async fn every_refusal_carries_the_row_as_it_stands_when_it_is_made() {
         expected,
         vec![(2, "v2".to_string()), (3, "v3".to_string())],
         "case {case:?}: expected each refusal to carry the row as it stood when it was made"
+    );
+}
+
+/// A version OTHER than the stored one is what makes a write a conflict, whichever side of the
+/// stored one it falls on, and a conflict no handler resolves writes NOTHING.
+///
+/// The cases above assert the rule over a version the row has moved past by one; the rows here
+/// span what the comparison generalises over — a version behind the stored one, one the item has
+/// never reached, and the version no count ever holds — across the three writes that detection
+/// covers and both configurations that reject one. Every row is made against the SAME item,
+/// because a rejected write leaves the row untouched: what each refusal reads is the row the case
+/// started from, down to the moment of its last accepted write.
+#[tokio::test]
+async fn any_version_other_than_the_stored_one_is_a_conflict_that_writes_nothing() {
+    let suite = setup("other-versions").await;
+    let case = "the row every rejected write is made against";
+    let id = "post-other-version";
+    seeded(&suite, case, id).await;
+    // One accepted write over the version the row stands at, so the stored row carries an
+    // attribute beside its title — a refusal has to carry the whole row, not the one member the
+    // write was built around — and stands at a version the rows below state on either side of.
+    let moved = posted(
+        &suite.api,
+        case,
+        &format!(
+            "mutation M($id: ID!, $field: String!, $value: String!, $v: Int!) \
+             {{ mergePost(id: $id, field: $field, value: $value, expectedVersion: $v) \
+             {SELECTION} }}"
+        ),
+        json!({"id": id, "field": "delta", "value": "server", "v": 2}),
+    )
+    .await;
+    assert_eq!(
+        (
+            errors(&moved),
+            moved["data"]["mergePost"]["_version"].as_i64()
+        ),
+        (Vec::<Value>::new(), Some(3)),
+        "case {case:?}: the write the rows are made against must take the row to version 3, got \
+         {moved}"
+    );
+    let before = stored_row(&suite.router, id).await;
+
+    /// One stale write: what it is called, the field it drives, and the document and variables
+    /// it is driven with.
+    struct Stale<'a> {
+        case: &'a str,
+        field: &'a str,
+        query: String,
+        variables: Value,
+    }
+    let update = |field: &str| {
+        format!(
+            "mutation M($id: ID!, $title: String!, $v: Int!) \
+             {{ {field}(id: $id, title: $title, expectedVersion: $v) {SELECTION} }}"
+        )
+    };
+    let delete = |field: &str| {
+        format!(
+            "mutation M($id: ID!, $v: Int!) \
+             {{ {field}(id: $id, expectedVersion: $v) {SELECTION} }}"
+        )
+    };
+    let rows = [
+        Stale {
+            case: "an update stating the version just before the stored one",
+            field: "updatePost",
+            query: update("updatePost"),
+            variables: json!({"title": "behind", "v": 2}),
+        },
+        Stale {
+            case: "an update stating a version the item has never reached",
+            field: "updatePost",
+            query: update("updatePost"),
+            variables: json!({"title": "ahead", "v": 9}),
+        },
+        Stale {
+            case: "an update stating the version no count ever holds",
+            field: "updatePost",
+            query: update("updatePost"),
+            variables: json!({"title": "none", "v": 0}),
+        },
+        Stale {
+            case: "a put over a key that holds a row, stating a version it has moved past",
+            field: "putPost",
+            query: update("putPost"),
+            variables: json!({"title": "put", "v": 1}),
+        },
+        Stale {
+            case: "a delete stating the version just before the stored one",
+            field: "deletePost",
+            query: delete("deletePost"),
+            variables: json!({"v": 2}),
+        },
+        Stale {
+            case: "a delete AUTOMERGE cannot compose, stating a version ahead of the stored one",
+            field: "deletePostMerging",
+            query: delete("deletePostMerging"),
+            variables: json!({"v": 9}),
+        },
+    ];
+    for row in &rows {
+        let case = row.case;
+        let mut variables = row.variables.clone();
+        variables["id"] = json!(id);
+        let body = posted(&suite.api, case, &row.query, variables).await;
+        let reported = errors(&body);
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected exactly one field error, got {body}"
+        );
+        let error = &reported[0];
+        assert_eq!(
+            (
+                error["errorType"].as_str(),
+                error["message"].as_str(),
+                error["path"].clone(),
+                body["data"][row.field].clone(),
+            ),
+            (
+                Some(CONFLICT_UNHANDLED),
+                Some(CONFLICT_REJECTED),
+                json!([row.field]),
+                Value::Null,
+            ),
+            "case {case:?}: expected one {CONFLICT_UNHANDLED} error on the refused field, got \
+             {body}"
+        );
+        // The refusal carries the row as the SERVER holds it: every attribute of it, at the
+        // version actually stored.
+        carries(
+            case,
+            "the refusal's own data",
+            &error["data"],
+            &json!({"id": id, "title": "v2", "delta": "server", "_version": 3}),
+        );
+        // And nothing was written: the row is the one the case started from, the moment of its
+        // last accepted write included, with no deletion marker and no reaping marker.
+        let held = stored_row(&suite.router, id).await;
+        assert_eq!(
+            held, before,
+            "case {case:?}: expected the stored row left exactly as it was, got {held}"
+        );
+    }
+}
+
+/// Each write that merges is composed against the row as it stands when ITS turn comes, so what
+/// it is answered is the row that turn committed.
+///
+/// The case above asserts the versions concurrent merges are handed; the rule here is what each
+/// of them READS back: the writer stamped the Nth version after the one the item was taken to
+/// carries exactly the N merged attributes committed up to and including its own — never a
+/// partial view of a shared base, and never an attribute a later turn added. The rows differ in
+/// how many merges are in flight at once.
+#[tokio::test]
+async fn every_merge_in_flight_answers_the_row_its_own_turn_committed() {
+    let suite = setup("committed-merges").await;
+    let query = format!(
+        "mutation M($id: ID!, $field: String!, $value: String!, $v: Int!) \
+         {{ mergePost(id: $id, field: $field, value: $value, expectedVersion: $v) \
+         {SELECTION} }}"
+    );
+    // Every writer states the version the row has already moved past, so each of them is a
+    // conflict the resolver's AUTOMERGE composes, and each composes a DIFFERENT attribute, so
+    // which merges one answer carries is visible in it.
+    let writer = |case: &'static str, id: &'static str, field: &'static str| {
+        let query = query.clone();
+        let api = &suite.api;
+        async move {
+            let body = posted(
+                api,
+                case,
+                &query,
+                json!({"id": id, "field": field, "value": field, "v": 1}),
+            )
+            .await;
+            (field, body)
+        }
+    };
+
+    let two = "two merges of one item in flight at once";
+    let pair = "post-committed-pair";
+    seeded(&suite, two, pair).await;
+    let (first, second) = tokio::join!(writer(two, pair, "alpha"), writer(two, pair, "beta"));
+    committed(&suite, two, pair, &[first, second]).await;
+
+    let three = "three merges of one item in flight at once";
+    let trio = "post-committed-trio";
+    seeded(&suite, three, trio).await;
+    let (first, second, third) = tokio::join!(
+        writer(three, trio, "alpha"),
+        writer(three, trio, "beta"),
+        writer(three, trio, "gamma"),
+    );
+    committed(&suite, three, trio, &[first, second, third]).await;
+}
+
+/// Assert what the merges in flight at once over one item were answered: consecutive versions
+/// after the one the item was seeded at, one each, and each answer the row that writer's own turn
+/// committed — the merges accepted before it and its own, and nothing of the turns that followed.
+///
+/// `answered` pairs each writer's own attribute with the document it was served.
+async fn committed(suite: &Suite, case: &str, id: &str, answered: &[(&str, Value)]) {
+    /// The version [`seeded`] leaves the item at, which every merge here is counted from.
+    const SEEDED_VERSION: i64 = 2;
+
+    let composed: Vec<&str> = answered.iter().map(|(field, _)| *field).collect();
+    let mut versions: Vec<i64> = Vec::new();
+    for (field, body) in answered {
+        assert_eq!(
+            errors(body),
+            Vec::<Value>::new(),
+            "case {case:?}: every merged write is accepted, got {body}"
+        );
+        let row = &body["data"]["mergePost"];
+        let version = row["_version"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a version, got {body}"));
+        versions.push(version);
+        let carried: Vec<&str> = composed
+            .iter()
+            .copied()
+            .filter(|name| !row[*name].is_null())
+            .collect();
+        let turns = usize::try_from(version - SEEDED_VERSION).unwrap_or_default();
+        assert_eq!(
+            (row["title"].as_str(), row[*field].as_str(), carried.len()),
+            (Some("v2"), Some(*field), turns),
+            "case {case:?}: the writer of {field:?} stamped version {version} must be answered \
+             the {turns} merges its own turn committed, got {row} carrying {carried:?}"
+        );
+    }
+    versions.sort_unstable();
+    let expected: Vec<i64> = (1..=i64::try_from(answered.len()).unwrap_or_default())
+        .map(|at| SEEDED_VERSION + at)
+        .collect();
+    assert_eq!(
+        versions, expected,
+        "case {case:?}: expected each accepted merge to advance the version once, got \
+         {versions:?} from {answered:?}"
+    );
+
+    // And the row the TABLE holds is where those turns left it: every attribute they composed,
+    // the server's own title, and the last version handed out.
+    let held = stored_row(&suite.router, id).await;
+    for field in &composed {
+        assert_eq!(
+            held[*field]["S"].as_str(),
+            Some(*field),
+            "case {case:?}: expected the stored row to carry every merged attribute, got {held}"
+        );
+    }
+    let last = expected.last().copied().unwrap_or_default().to_string();
+    assert_eq!(
+        (held["_version"]["N"].as_str(), held["title"]["S"].as_str()),
+        (Some(last.as_str()), Some("v2")),
+        "case {case:?}: expected the stored row at version {last} under the server's own title, \
+         got {held}"
     );
 }
 
