@@ -5,12 +5,19 @@
 //!
 //! The rule under test: **`CreateTransformJob` LISTS the Amazon S3 location
 //! `TransformInput.DataSource.S3DataSource.S3Uri` names before it creates anything.** A
-//! location Amazon S3 answers holds no object is refused HTTP 400 `ValidationException`
-//! carrying the diagnosis AWS words for an input data source it found nothing under — the S3
-//! URL, the Region the call addressed, the execution role of the model the job would run and
-//! the bucket that role has to be allowed to list — and no job of that name exists afterwards,
-//! because the refusal is pre-creation, while the same call against a location that holds
-//! objects is accepted and the job it created runs to a status that is not `Failed`.
+//! location Amazon S3 answers holds no object is refused HTTP 400 `ValidationException` and no
+//! job of that name exists afterwards, because the refusal is pre-creation, while the same
+//! call against a location that holds objects is accepted and the job it created runs to a
+//! status that is not `Failed`.
+//!
+//! WHICH sentence the refusal states follows what the service settled about the location: a
+//! LOCATION (an `S3Uri` ending in the key delimiter) whose listing ANSWERED and held nothing
+//! is a prefix read and found absent, stated with the S3 URL and the Region and nothing to
+//! re-check, while an answer that names the absence of the bucket itself leaves "nothing
+//! there" and "not allowed to look" indistinguishable, so it carries the whole diagnosis AWS
+//! words for an input data source — the S3 URL, the Region the call addressed, the execution
+//! role of the model the job would run, the bucket that role has to be allowed to list, and
+//! what Amazon S3 itself answered.
 //!
 //! The rule spans three services over ONE engine — Amazon S3 for the dataset, IAM for the
 //! role the job reads under, and the SageMaker control plane — so neither crate's own test
@@ -370,25 +377,33 @@ async fn create_transform_job_lists_the_location_its_input_names() {
         );
         let message = error_message(&answered);
         let bucket = row.bucket.unwrap_or(BUCKET);
-        // The refusal AWS words for an input data source it found no object under: the S3 URL
-        // the request named, the Region it addressed, the execution role of the model the job
-        // would run and the bucket that role has to be allowed to list — then whatever Amazon
-        // S3 itself answered about the location, which is nothing for a listing that answered
-        // and merely held no object.
-        let clause = row
-            .s3_answer
-            .map(|answer| format!(" Error message from S3: {answer}"))
-            .unwrap_or_default();
-        let expected = format!(
-            "No S3 objects found under S3 URL \"{s3_uri}\" given in input data source. Please \
-             ensure that the bucket exists in the selected region ({REGION}), that objects \
-             exist under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
-             permissions on bucket \"{bucket}\".{clause}"
-        );
+        // What the service settled about the location decides the sentence: a location whose
+        // listing answered and merely held nothing is a prefix that is not there, while an
+        // answer naming the absence of the bucket carries the whole diagnosis AWS words for an
+        // input data source — the S3 URL the request named, the Region it addressed, the
+        // execution role of the model the job would run and the bucket that role has to be
+        // allowed to list — and then what Amazon S3 itself answered.
+        let expected = match row.s3_answer {
+            None if s3_uri.ends_with('/') => format!(
+                "S3 prefix \"{s3_uri}\" given in input data source does not exist. Please ensure \
+                 that the bucket exists in the selected region ({REGION}) and that objects \
+                 exist under that S3 prefix."
+            ),
+            answer => {
+                let clause = answer
+                    .map(|answer| format!(" Error message from S3: {answer}"))
+                    .unwrap_or_default();
+                format!(
+                    "No S3 objects found under S3 URL \"{s3_uri}\" given in input data source. \
+                     Please ensure that the bucket exists in the selected region ({REGION}), \
+                     that objects exist under that S3 prefix, and that the role \"{role_arn}\" \
+                     has \"s3:ListBucket\" permissions on bucket \"{bucket}\".{clause}"
+                )
+            }
+        };
         assert_eq!(
             message, expected,
-            "case {:?}: expected the no-objects refusal naming {s3_uri:?}, the Region, the role, \
-             the bucket and what Amazon S3 answered, got {message:?}",
+            "case {:?}: expected the refusal the service settled for {s3_uri:?}, got {message:?}",
             row.case
         );
         // The refusal is PRE-CREATION, so it leaves nothing behind: the name is not taken.

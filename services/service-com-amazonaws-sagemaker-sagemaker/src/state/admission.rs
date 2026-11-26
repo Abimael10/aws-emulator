@@ -9,8 +9,10 @@
 //!
 //! * the execution role the resource would RUN AS ([`execution_role_is_unassumable`]);
 //! * the Amazon S3 location its work would READ, asked through [`crate::state::s3_access`]
-//!   and worded per resource family ([`could_not_access_model_data`] for the hosting
-//!   creates, [`no_s3_objects_found`] for the ones that resolve an input data source);
+//!   and worded per resource family and per condition ([`could_not_access_model_data`] for the
+//!   hosting creates, [`no_s3_objects_found`] for the ones that resolve an input data source,
+//!   and [`s3_input_prefix_does_not_exist`] for the batch-transform input location whose
+//!   listing answered and held nothing — see [`transform_input_refusal`]);
 //! * the network placement it asks for ([`SECURITY_GROUPS_NOT_SPECIFIED`]).
 //!
 //! One QUESTION about the role, several SENTENCES: the recorded refusals word an
@@ -156,9 +158,10 @@ pub fn failed_to_download_model_data(location: &crate::state::S3Location) -> Str
 /// answered and merely held nothing carries no such clause, because Amazon S3 refused nothing
 /// and named nothing about it.
 ///
-/// Every create that resolves an input data source words the refusal this way — the training
-/// creates through [`crate::state::absent_input_objects`], `CreateTransformJob` on its
-/// `TransformInput` — so no two of them tell a caller different things about the same fact.
+/// Every create that resolves an input data source words THIS refusal the same way — the
+/// training creates through [`crate::state::absent_input_objects`], `CreateTransformJob` for
+/// every input condition it cannot settle ([`transform_input_refusal`]) — so no two of them
+/// tell a caller different things about the same fact.
 #[must_use]
 pub fn no_s3_objects_found(
     s3_url: &str,
@@ -175,6 +178,77 @@ pub fn no_s3_objects_found(
          permissions on bucket \"{bucket}\".{}",
         refused.unwrap_or_default()
     )
+}
+
+/// The delimiter an Amazon S3 key name prefix that names a LOCATION ends with: "A key name
+/// prefix might look like this: `s3://bucketname/exampleprefix/`"
+/// (`TransformS3DataSource$S3Uri`'s own doc, which writes a location's prefix with it and an
+/// object's key without it).
+pub const S3_PREFIX_DELIMITER: char = '/';
+
+/// Whether `s3_url` names a LOCATION — a prefix objects live UNDER — rather than a key name
+/// prefix an object's own key is matched against.
+///
+/// The one reading of that difference, which is the one the documented form of an `S3Uri`
+/// gives it ([`S3_PREFIX_DELIMITER`]): a value ending in the delimiter names everything below
+/// it, while one that does not is matched against keys themselves.
+#[must_use]
+pub fn names_an_s3_location(s3_url: &str) -> bool {
+    s3_url.ends_with(S3_PREFIX_DELIMITER)
+}
+
+/// How a batch transform words an input LOCATION whose listing it READ and found holding
+/// nothing: the S3 URL AS THE CALLER SENT IT, and the Region the call addressed — the two
+/// facts that decide whether the location is the one the caller meant.
+///
+/// A location whose listing ANSWERED is a fact the service settled: there is nothing under
+/// that prefix, so what the caller is told is that the prefix is not there — no permission to
+/// re-check and no second condition to rule out, which is what [`no_s3_objects_found`] is for.
+/// Keeping the two apart is what makes this refusal a TERMINAL answer: a client that reads the
+/// permission diagnosis as a grant that has not taken effect yet, and retries on it, settles on
+/// this one instead of waiting out its own window for a prefix that will never fill.
+#[must_use]
+pub fn s3_input_prefix_does_not_exist(s3_url: &str, region: &str) -> String {
+    format!(
+        "S3 prefix \"{s3_url}\" given in input data source does not exist. Please ensure that \
+         the bucket exists in the selected region ({region}) and that objects exist under that \
+         S3 prefix."
+    )
+}
+
+/// WHICH sentence a batch transform refuses the input location `unreadable` with, for the
+/// condition this emulator's own Amazon S3 and the documents in force ANSWERED about it.
+///
+/// Two conditions, two sentences, because the service settled different things about them:
+///
+/// * a LOCATION ([`names_an_s3_location`]) whose listing answered and holds nothing is a
+///   prefix the service read and found absent ([`s3_input_prefix_does_not_exist`]);
+/// * everything else — a key name prefix no object is matched by, a listing Amazon S3 answered
+///   the absence of the bucket or the key to, and one the documents in force withheld — leaves
+///   the service unable to tell "nothing there" from "not allowed to look", so the caller is
+///   handed the whole diagnosis ([`no_s3_objects_found`]) with whatever Amazon S3 itself
+///   answered.
+///
+/// Stated here once, beside both sentences, so the operations that resolve a `TransformInput`
+/// cannot word the same condition differently.
+#[must_use]
+pub fn transform_input_refusal(
+    unreadable: &crate::state::UnreadableLocation<'_>,
+    region: &str,
+    role_arn: &str,
+) -> String {
+    let uri = unreadable.uri();
+    let answered_empty = matches!(
+        unreadable,
+        crate::state::UnreadableLocation::NoObject(_, crate::state::NoObjectAnswer::EmptyListing)
+    );
+    if answered_empty && names_an_s3_location(uri) {
+        return s3_input_prefix_does_not_exist(uri, region);
+    }
+    let bucket = crate::state::S3Location::parse(uri)
+        .map(|location| location.bucket)
+        .unwrap_or_default();
+    no_s3_objects_found(uri, region, role_arn, &bucket, unreadable.s3_error())
 }
 
 /// The session name SageMaker assumes an execution role under, which is what the Amazon S3
@@ -361,7 +435,79 @@ pub fn vpc_placement_refusal(
 
 #[cfg(test)]
 mod tests {
-    use super::vpc_placement_refusal;
+    use super::{transform_input_refusal, vpc_placement_refusal};
+    use crate::state::{NoObjectAnswer, UnreadableLocation};
+
+    /// RULE: which sentence an input location is refused with follows what the service settled
+    /// about it — a LOCATION whose listing answered and held nothing is a prefix that does not
+    /// exist, and every condition the service cannot tell apart carries the whole diagnosis.
+    ///
+    /// The rows differ along what the rule generalises over: the form of the URI (a location
+    /// ending in the delimiter, a key name prefix that does not), and which answer the reading
+    /// carried (an empty listing, an absence Amazon S3 named, a read the documents withheld).
+    #[test]
+    fn an_input_location_states_what_the_service_settled() {
+        let region = "eu-west-2";
+        let role = "arn:aws:iam::000000000000:role/reader";
+        // (case, what the reading answered, whether the refusal states the prefix is absent)
+        let rows: [(&str, UnreadableLocation<'_>, bool); 5] = [
+            (
+                "a location whose listing answered and held nothing",
+                UnreadableLocation::NoObject("s3://set/empty/", NoObjectAnswer::EmptyListing),
+                true,
+            ),
+            (
+                "a deeper location whose listing answered and held nothing",
+                UnreadableLocation::NoObject("s3://set/one/two/", NoObjectAnswer::EmptyListing),
+                true,
+            ),
+            (
+                "a key name prefix no object is matched by",
+                UnreadableLocation::NoObject("s3://set/absent.csv", NoObjectAnswer::EmptyListing),
+                false,
+            ),
+            (
+                "an absence Amazon S3 itself named",
+                UnreadableLocation::NoObject(
+                    "s3://nowhere/data/",
+                    NoObjectAnswer::Absent("The specified bucket does not exist".to_string()),
+                ),
+                false,
+            ),
+            (
+                "a read the documents in force withhold",
+                UnreadableLocation::Denied("s3://set/fenced/"),
+                false,
+            ),
+        ];
+
+        for (case, unreadable, states_absence) in rows {
+            let uri = unreadable.uri().to_string();
+            let refusal = transform_input_refusal(&unreadable, region, role);
+            assert!(
+                refusal.contains(&uri),
+                "case {case:?}: the refusal names the location as the caller wrote it, got \
+                 {refusal:?}"
+            );
+            assert!(
+                refusal.contains(region),
+                "case {case:?}: the refusal names the Region the call addressed, got {refusal:?}"
+            );
+            let absent = refusal.contains("does not exist") && !refusal.contains(role);
+            assert!(
+                absent == states_absence,
+                "case {case:?}: expected the prefix-absent sentence={states_absence}, got \
+                 {refusal:?}"
+            );
+            if !states_absence {
+                assert!(
+                    refusal.contains(role) && refusal.contains("s3:ListBucket"),
+                    "case {case:?}: a condition the service cannot tell apart carries the whole \
+                     diagnosis, got {refusal:?}"
+                );
+            }
+        }
+    }
 
     /// One placement a request can ask for, and whether this service refuses it.
     struct Row {

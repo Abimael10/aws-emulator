@@ -682,10 +682,12 @@ async fn a_bucket_policy_that_withholds_the_read_refuses_the_model() {
 }
 
 /// RULE: `CreateTransformJob` is refused, with nothing stored, when the input location its
-/// `TransformInput` names holds no object — the job would have nothing to transform, and the
-/// refusal hands back every fact needed to diagnose it: the S3 URL, the Region, the model's
-/// execution role and the bucket that role has to be allowed to list — and accepted when it
-/// holds one.
+/// `TransformInput` names holds no object — the job would have nothing to transform — and
+/// accepted when it holds one. A LOCATION (an `S3Uri` ending in the key delimiter) whose
+/// listing answered and held nothing is stated to be a prefix that does not exist; every
+/// other condition hands back the whole diagnosis — the S3 URL, the Region, the model's
+/// execution role, the bucket that role has to be allowed to list and what Amazon S3
+/// answered — because the service cannot tell those conditions apart.
 #[tokio::test]
 async fn a_transform_job_whose_input_holds_no_object_is_refused() {
     let emulator = Emulator::new();
@@ -795,16 +797,26 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
         let clause = s3_answer
             .map(|answer| format!(" Error message from S3: {answer}"))
             .unwrap_or_default();
-        assert_eq!(
-            message(&answered),
+        let expected = if s3_answer.is_none() && uri.ends_with('/') {
+            format!(
+                "S3 prefix \"{uri}\" given in input data source does not exist. Please ensure \
+                 that the bucket exists in the selected region ({REGION}) and that objects \
+                 exist under that S3 prefix."
+            )
+        } else {
             format!(
                 "No S3 objects found under S3 URL \"{uri}\" given in input data source. Please \
                  ensure that the bucket exists in the selected region ({REGION}), that objects \
                  exist under that S3 prefix, and that the role \"{role}\" has \"s3:ListBucket\" \
                  permissions on bucket \"{bucket}\".{clause}"
-            ),
-            "case {case:?}: the refusal must name the location, the Region, the role, the \
-             bucket and what Amazon S3 answered, got {:?}",
+            )
+        };
+        assert_eq!(
+            message(&answered),
+            expected,
+            "case {case:?}: the refusal must state what the service settled about the location, \
+             naming it, the Region and — where the condition is one it cannot tell apart — the \
+             role, the bucket and what Amazon S3 answered, got {:?}",
             message(&answered)
         );
         assert_eq!(

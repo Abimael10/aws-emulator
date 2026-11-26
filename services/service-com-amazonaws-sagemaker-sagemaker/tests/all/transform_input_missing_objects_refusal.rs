@@ -5,12 +5,19 @@
 //! mounted on ONE shared engine.
 //!
 //! THE RULE UNDER TEST: a create that resolves an Amazon S3 input data source and finds no
-//! object under it refuses the call 400 `ValidationException` with the whole diagnosis — the
-//! S3 URL the request named, the Region the call addressed, the execution role of the model
-//! the job would run, and the bucket taken off that URL, which is the resource `s3:ListBucket`
-//! is granted on. One sentence for both conditions it covers, because a prefix that holds
-//! nothing and a listing the documents in force withheld are indistinguishable from the
-//! service's side.
+//! object under it refuses the call 400 `ValidationException`, and WHICH sentence it states
+//! follows what the service settled about the location:
+//!
+//! * a LOCATION — an `S3Uri` ending in the key delimiter, the form `TransformS3DataSource$S3Uri`
+//!   writes a key name prefix in — whose listing ANSWERED and holds nothing is a prefix the
+//!   service read and found absent, so the refusal states that the prefix does not exist, with
+//!   the S3 URL the request named and the Region the call addressed and nothing to re-check;
+//! * every other condition — a key name prefix no object is matched by, an answer naming the
+//!   absence of the bucket, a listing the documents in force withheld — leaves "nothing there"
+//!   and "not allowed to look" indistinguishable from the service's side, so the refusal
+//!   carries the whole diagnosis: the S3 URL, the Region, the execution role of the model the
+//!   job would run, the bucket taken off that URL (the resource `s3:ListBucket` is granted on)
+//!   and whatever Amazon S3 itself answered.
 //!
 //! Every variable part comes from the REQUEST and from stored state, so the table varies all
 //! of them independently: the Region the call is made in, the execution role the stored model
@@ -177,6 +184,32 @@ fn no_objects_found(
          under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
          permissions on bucket \"{bucket}\".{clause}"
     )
+}
+
+/// The sentence a LOCATION the listing read and found holding nothing is refused with: the S3
+/// URL the request named and the Region the call addressed.
+fn prefix_does_not_exist(s3_uri: &str, region: &str) -> String {
+    format!(
+        "S3 prefix \"{s3_uri}\" given in input data source does not exist. Please ensure that \
+         the bucket exists in the selected region ({region}) and that objects exist under that \
+         S3 prefix."
+    )
+}
+
+/// The refusal the rule under test words for the location `s3_uri`, given what Amazon S3
+/// answered about it: a location whose listing merely held nothing states the prefix is not
+/// there, and every other condition carries the whole diagnosis.
+fn expected_refusal(
+    s3_uri: &str,
+    region: &str,
+    role_arn: &str,
+    bucket: &str,
+    s3_answer: Option<&str>,
+) -> String {
+    if s3_answer.is_none() && s3_uri.ends_with('/') {
+        return prefix_does_not_exist(s3_uri, region);
+    }
+    no_objects_found(s3_uri, region, role_arn, bucket, s3_answer)
 }
 
 /// One `CreateTransformJob` request over the location `s3_uri`.
@@ -356,9 +389,10 @@ async fn a_transform_input_holding_no_object_is_refused_with_the_whole_diagnosis
         );
         assert_eq!(
             message(&answered),
-            no_objects_found(&s3_uri, row.region, &role_arn, row.bucket, row.s3_answer),
-            "case {case:?}: the refusal must name the location, the Region, the model's role, \
-             the bucket and what Amazon S3 answered, got {:?}",
+            expected_refusal(&s3_uri, row.region, &role_arn, row.bucket, row.s3_answer),
+            "case {case:?}: the refusal must state what the service settled about the location, \
+             naming it, the Region and — where the condition is one it cannot tell apart — the \
+             model's role, the bucket and what Amazon S3 answered, got {:?}",
             message(&answered)
         );
         // The refusal is PRE-CREATION, so the name it was made under is still free.
