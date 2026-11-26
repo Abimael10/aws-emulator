@@ -44,12 +44,13 @@ use crate::tag_attachment::tag_resource;
 pub(crate) const MISSING_SLI_CONFIG: &str =
     "Either SliConfig or RequestBasedSliConfig must be populated";
 
-/// The sentence a create whose `Name` is already stored is refused with: FIXED text for an
-/// identifier that is already taken, naming neither the resource nor the identifier — unlike
-/// every refusal this service words about one particular objective, which states that
-/// objective's ARN.
-pub(crate) const SAME_IDENTIFIER_ALREADY_EXISTS: &str =
-    "A resource with the same identifier already exists";
+/// The sentence a create whose `Name` is already stored is refused with: the capitalised
+/// resource type, the ARN that addresses the objective the name already names in single
+/// quotes, and the predicate for an identifier a create cannot mint again — the same sentence
+/// shape every refusal this service words about one particular objective takes.
+pub(crate) fn slo_already_exists(name: &str) -> String {
+    format!("Slo with arn '{}' already exists.", slo_arn(name))
+}
 
 /// The sentence the `ConflictException` shape itself is DOCUMENTED with
 /// (`smithy_query(query="shape",shape="ConflictException")`). A shape's documentation is not
@@ -341,21 +342,22 @@ async fn an_update_that_switches_the_evaluation_kind_states_the_direction() {
 }
 
 /// Assert that `message` is the whole sentence of the taken-identifier conflict class — the
-/// fixed text for an identifier that is already taken, naming neither the resource nor the
-/// identifier the create sent — and not the error shape's documentation.
+/// capitalised resource type, the ARN that addresses the objective the name already names,
+/// and the predicate — and not the error shape's documentation.
 ///
 /// `pub(crate)` so the sibling suites that assert the same rule over their own rows check it
 /// through this one spelling rather than a second copy.
 pub(crate) fn assert_name_already_taken(label: &str, name: &str, message: &str) {
+    let expected = slo_already_exists(name);
     assert_eq!(
-        message, SAME_IDENTIFIER_ALREADY_EXISTS,
-        "case {label}: expected {SAME_IDENTIFIER_ALREADY_EXISTS:?}, got {message:?}"
+        message, expected,
+        "case {label}: expected {expected:?}, got {message:?}"
     );
-    // The sentence is fixed text: neither the identifier the create sent nor the ARN that
-    // addresses the record holding it reaches the message.
+    // The sentence addresses the objective the identifier already names, so the ARN that
+    // addresses it is in it.
     assert!(
-        !message.contains(name) && !message.contains(&slo_arn(name)),
-        "case {label}: expected a sentence naming no identifier, got {message:?}"
+        message.contains(&slo_arn(name)),
+        "case {label}: expected a sentence naming the objective's ARN, got {message:?}"
     );
     assert_ne!(
         message, CONFLICT_SHAPE_DOC,
@@ -430,17 +432,18 @@ async fn a_create_whose_identifier_is_taken_is_refused_with_that_classs_sentence
             );
             let message = answer["Message"].as_str().unwrap_or_default();
             assert_name_already_taken(&label, name, message);
-            // The only variable part is none: nothing of the refused request's own body
+            // The only variable part is the ARN: nothing of the refused request's own body
             // reaches the sentence.
             assert!(
                 !message.contains("description"),
                 "case {label}: expected a sentence carrying nothing of the request's body, \
                  got {message:?}"
             );
-            // That ARN is NOT in the sentence: the fixed text names no record of the store.
+            // The ARN it names IS the one the record the store holds under that name reports,
+            // so the sentence addresses the objective the identifier collided with.
             assert!(
-                !message.contains(&stored_arn),
-                "case {label}: expected a sentence naming no record, got {message:?}"
+                message.contains(&stored_arn),
+                "case {label}: expected a sentence naming {stored_arn:?}, got {message:?}"
             );
         }
 
@@ -544,10 +547,9 @@ async fn every_loser_of_a_create_race_reads_the_same_sentence() {
             let message = loser["Message"].as_str().unwrap_or_default();
             assert_name_already_taken(&label, name, message);
             assert!(
-                !message.contains("racer") && !message.contains(&stored_arn),
-                "case {label}: expected the fixed sentence, carrying neither the admitted \
-                 objective's ARN {stored_arn:?} nor anything of the refused body, got \
-                 {message:?}"
+                !message.contains("racer") && message.contains(&stored_arn),
+                "case {label}: expected the sentence about the admitted objective's ARN \
+                 {stored_arn:?}, carrying nothing of the refused body, got {message:?}"
             );
         }
 

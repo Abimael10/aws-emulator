@@ -4,10 +4,10 @@
 //! wrong.
 //!
 //! The rule under test: the two ways a name can be wrong are worded by two DIFFERENT error
-//! classes, and each states its own class's sentence:
+//! classes, and each states its own class's sentence about the objective the request named:
 //!
-//! * a create under a name the store ALREADY HOLDS states the FIXED sentence for an
-//!   identifier that is already taken, naming neither the resource nor the identifier;
+//! * a create under a name the store ALREADY HOLDS states the predicate for an identifier
+//!   that is already taken, naming the objective that name addresses by its ARN;
 //! * a read of a name the store does NOT hold states the same sentence shape with the
 //!   predicate for a resource that is not there — the capitalised type name, the ARN that
 //!   addresses the objective in single quotes and the predicate, closed by a period.
@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::refusal_prose::SAME_IDENTIFIER_ALREADY_EXISTS;
+use crate::refusal_prose::slo_already_exists;
 use crate::resource_tags::{slo_arn, SLO_RESOURCE_TYPE};
 use crate::slo_evaluation_kind::request_based_sli_config;
 use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config};
@@ -94,8 +94,8 @@ fn name_not_held(arn: &str) -> String {
     format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist.")
 }
 
-/// RULE: the conflict a taken name earns states the fixed sentence of its own error class for
-/// an identifier that is already taken, naming neither the resource nor the identifier.
+/// RULE: the conflict a taken name earns states its own error class's predicate about the
+/// objective that name already addresses, naming it by the ARN the stored record reports.
 #[tokio::test]
 async fn a_taken_name_is_refused_with_the_taken_identifier_sentence() {
     for row in rows() {
@@ -134,9 +134,10 @@ async fn a_taken_name_is_refused_with_the_taken_identifier_sentence() {
             row.case
         );
         let message = answer["Message"].as_str().unwrap_or_default().to_string();
+        let taken = slo_already_exists(&row.name);
         assert_eq!(
-            message, SAME_IDENTIFIER_ALREADY_EXISTS,
-            "case {}: expected {SAME_IDENTIFIER_ALREADY_EXISTS:?}, got {message:?}",
+            message, taken,
+            "case {}: expected {taken:?}, got {message:?}",
             row.case
         );
 
@@ -214,7 +215,7 @@ async fn a_name_the_store_does_not_hold_is_refused_about_that_objective() {
         );
         assert_ne!(
             message,
-            SAME_IDENTIFIER_ALREADY_EXISTS,
+            slo_already_exists(&row.name),
             "case {}: expected the sentence for a resource that is not there, got {message:?}",
             row.case
         );

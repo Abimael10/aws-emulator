@@ -979,21 +979,21 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
     }
 }
 
-/// What a create whose identifier is already stored is refused with: FIXED text stating that
-/// the identifier the request named is taken, and naming neither the resource type nor the
-/// identifier itself.
-///
-/// The refusal is about the IDENTIFIER the caller sent, which the caller already holds — it is
-/// what it has to change to get a create through — so the sentence carries no variable part,
-/// unlike this service's refusals about one particular SLO it cannot resolve
-/// ([`slo_arn_sentence`]), which address that SLO by ARN.
-pub const SAME_IDENTIFIER_ALREADY_EXISTS: &str = "A resource with the same identifier already exists";
+/// The predicate [`slo_arn_sentence`] states about an SLO a create cannot mint because the
+/// store already holds one under that identity.
+const SLO_ALREADY_EXISTS: &str = "already exists";
 
-/// The modelled `ConflictException` a create is refused with when the identifier it sent is
-/// already stored ([`SAME_IDENTIFIER_ALREADY_EXISTS`]).
-pub fn slo_already_exists() -> ConflictException {
+/// The modelled `ConflictException` a create is refused with when the identifier it sent
+/// already names a stored SLO, which `arn` addresses.
+///
+/// Worded in the ONE sentence this service states about one particular SLO
+/// ([`slo_arn_sentence`]): the capitalised type name, the ARN of the objective the identifier
+/// already names, and the predicate. The ARN is the STORED record's own, so no region the
+/// refused request happened to be signed in reaches the sentence — what the caller is told
+/// about is the objective it collided with.
+pub fn slo_already_exists(arn: &str) -> ConflictException {
     ConflictException {
-        message: SAME_IDENTIFIER_ALREADY_EXISTS.to_string(),
+        message: slo_arn_sentence(arn, SLO_ALREADY_EXISTS),
     }
 }
 

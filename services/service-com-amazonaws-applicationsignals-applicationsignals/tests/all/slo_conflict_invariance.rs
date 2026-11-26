@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::refusal_prose::{assert_name_already_taken, SAME_IDENTIFIER_ALREADY_EXISTS};
+use crate::refusal_prose::{assert_name_already_taken, slo_already_exists};
 use crate::slo_evaluation_kind::request_based_sli_config;
 use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config};
 
@@ -74,10 +74,10 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// RULE: every refused create reads the one fixed sentence of the conflict class, and nothing
-/// of the refused request or of the stored record reaches it.
+/// RULE: every refused create reads the one sentence of the conflict class about the
+/// objective its identifier already names, and nothing of the refused request reaches it.
 #[tokio::test]
-async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
+async fn every_taken_identifier_refusal_reads_one_sentence_about_that_objective() {
     let mut messages: Vec<(&str, &str, String)> = Vec::new();
 
     for row in rows() {
@@ -111,8 +111,9 @@ async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
         );
         let message = answer["Message"].as_str().unwrap_or_default().to_string();
         assert_name_already_taken(row.case, row.name, &message);
-        // Nothing of the REFUSED request is in the sentence, and nothing of the stored record.
-        for withheld in ["a different description", "95", "team"] {
+        // Nothing of the REFUSED request's own body is in the sentence; what it names is the
+        // objective the identifier already addresses, by the ARN the stored record reports.
+        for withheld in ["a different description", "team"] {
             assert!(
                 !message.contains(withheld),
                 "case {}: expected a sentence carrying no {withheld:?}, got {message:?}",
@@ -120,8 +121,8 @@ async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
             );
         }
         assert!(
-            !message.contains(&stored_arn),
-            "case {}: expected a sentence naming no record, got {message:?}",
+            message.contains(&stored_arn),
+            "case {}: expected a sentence naming {stored_arn:?}, got {message:?}",
             row.case
         );
         messages.push((row.case, row.name, message));
@@ -158,14 +159,14 @@ async fn every_taken_identifier_refusal_reads_one_fixed_sentence() {
         );
     }
 
-    // One sentence over every row, byte for byte: the fixed sentence of the taken-identifier
-    // conflict class.
-    for (case, _name, message) in &messages {
+    // One sentence per identifier, byte for byte, whatever the refused create carried: the
+    // conflict class's sentence about the objective that identifier already names.
+    for (case, name, message) in &messages {
+        let expected = slo_already_exists(name);
         assert_eq!(
             message.as_str(),
-            SAME_IDENTIFIER_ALREADY_EXISTS,
-            "case {case}: expected every refused create to read \
-             {SAME_IDENTIFIER_ALREADY_EXISTS:?}, got {message:?}"
+            expected,
+            "case {case}: expected every refused create to read {expected:?}, got {message:?}"
         );
     }
 }
