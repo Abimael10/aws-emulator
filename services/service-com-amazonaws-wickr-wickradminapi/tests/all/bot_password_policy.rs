@@ -472,10 +472,17 @@ async fn a_challenge_that_meets_the_policy_creates_a_bot_that_reads_back() {
                 read[member]
             );
         }
-        assert!(
-            read["uname"].as_str().is_some_and(|uname| !uname.is_empty()),
-            "case {case:?}: a bot is known by a uname, got {read}"
-        );
+        // A bot that has not signed in carries none of the three values a sign-in
+        // mints, its username hash among them (see `bot_sign_in_projection.rs`).
+        for member in ["uname", "pubkey", "lastLogin"] {
+            assert_eq!(
+                read[member],
+                Value::Null,
+                "case {case:?}: GetBot must report no {member} for a bot that has not \
+                 signed in, got {}",
+                read[member]
+            );
+        }
         // The password itself is never reported back, whatever it was.
         let serialized = read.to_string();
         assert!(
