@@ -63,6 +63,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Why this account's state held the delete back, as the store beside the records states
+/// it (`crate::state::provisioning_templates`).
+use crate::state::provisioning_templates::ProvisioningTemplateDeletionRefusal as Refusal;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -99,6 +103,34 @@ impl From<DeleteProvisioningTemplateErrorModeled> for DeleteProvisioningTemplate
     fn from(modeled: DeleteProvisioningTemplateErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Record this state-changing call for attribution: the operation, the identity the
+/// request PRESENTED (the SigV4 access key id, a public identifier and never a secret),
+/// the request target, the template the call named and how the call ended.
+///
+/// A delete is the one call that makes a template stop existing — its versions with it —
+/// so without a record nothing about it is observable afterwards. Every request-derived
+/// field goes through [`crate::state::audit_field`], which bounds it and strips the
+/// control characters that would otherwise forge a second record; the subscriber supplies
+/// the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    template_name: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteProvisioningTemplate",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        template_name = %crate::state::audit_field(template_name),
+        outcome,
+        "state-changing operation"
+    );
 }
 
 /// The `DeleteProvisioningTemplate` operation.
@@ -144,29 +176,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let _ = ctx;
 
         // A template's VERSIONS live inside its record, so deleting the template takes
-        // them with it: there is no version left pointing at a template that is gone.
-        // A name the account holds no template under is the modelled
-        // `ResourceNotFoundException` (HTTP 404), which this operation declares.
-        let removed = state
+        // them with it: there is no version left pointing at a template that is gone. What
+        // may hold the delete back, and what removing one does, is stated once beside the
+        // records it reads (`crate::state::provisioning_templates`): a name the account
+        // holds no template under is the modelled `ResourceNotFoundException` (HTTP 404),
+        // and a template a registered CA certificate still names for auto registration is
+        // the modelled `DeleteConflictException` (HTTP 409), with nothing removed.
+        let deleted = state
             .lock()
-            .provisioning_templates
-            .remove(&input.template_name);
-        if removed.is_none() {
-            return Err(
-                DeleteProvisioningTemplateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            crate::state::provisioning_templates::UNDELETABLE_MISSING_TEMPLATE_MESSAGE
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            .delete_provisioning_template(&input.template_name);
+
+        // What the call DID, which is the one thing a later reader cannot recover: a
+        // removed template leaves nothing behind to be read.
+        audit(
+            ctx,
+            &input.template_name,
+            match &deleted {
+                Ok(_) => "deleted",
+                Err(Refusal::NotFound(_)) => "no-such-template",
+                Err(Refusal::AssociatedWithCaCertificates(_)) => "ca-certificates-associated",
+            },
+        );
+
+        // Each refusal is reported as the error class the model declares for it, with the
+        // one sentence the state words it in, rather than as a hollow success.
+        if let Err(refusal) = deleted {
+            let message = Some(refusal.message().to_string());
+            return Err(match refusal {
+                Refusal::NotFound(_) => {
+                    DeleteProvisioningTemplateErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                Refusal::AssociatedWithCaCertificates(_) => {
+                    DeleteProvisioningTemplateErrorModeled::DeleteConflictException(
+                        DeleteConflictException { message },
+                    )
+                }
+            }
+            .into());
         }
+
+        // The operation's output shape carries no members: a successful delete reports
+        // nothing, and that the template is gone is read back through
+        // `DescribeProvisioningTemplate`.
         Ok(DeleteProvisioningTemplateOutput {})
     }
 }

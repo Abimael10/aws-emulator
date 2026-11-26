@@ -132,6 +132,126 @@ pub fn missing_template_for_version_message(template_name: &str) -> String {
 pub const UNDELETABLE_MISSING_TEMPLATE_MESSAGE: &str =
     "Unable to delete template, template not found";
 
+/// How a DELETE of a template refuses one a registered CA certificate still names for the
+/// just-in-time provisioning of the device certificates it signs.
+///
+/// A CA certificate's `registrationConfig` "holds the template a device certificate
+/// auto-registered under this CA is provisioned with"
+/// (`smithy_query(query="shape",shape="RegistrationConfig")`), so a template that
+/// configuration names is wired into that CA's auto-registration path: deleting it would
+/// leave the CA pointing at a template that no longer exists, and every later enrolment
+/// through it with nothing to apply. The fixed text states the relation that holds the
+/// template back — "one or more CAs", because the refusal holds while ANY of them names it
+/// — and the one variable part is the template the request named.
+pub fn template_associated_with_cas_message(template_name: &str) -> String {
+    format!(
+        "The template {template_name} cannot be deleted as it is associated with one or more \
+         CAs for auto registration."
+    )
+}
+
+/// Why a provisioning template was NOT deleted.
+///
+/// Each variant names the modelled error class the refusal answers with
+/// (`smithy_query(query="operation",operation="DeleteProvisioningTemplate")`), so the
+/// handler chooses the status from the state rather than restating the rule — the shape
+/// [`super::policy_deletion::PolicyDeletionRefusal`] takes for the policy family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisioningTemplateDeletionRefusal {
+    /// A name the account holds no template under: `ResourceNotFoundException` (HTTP 404),
+    /// stated in the sentence a DELETE words its own miss with
+    /// ([`UNDELETABLE_MISSING_TEMPLATE_MESSAGE`]).
+    NotFound(String),
+    /// A template at least one registered CA certificate still names for auto
+    /// registration: `DeleteConflictException` (HTTP 409).
+    AssociatedWithCaCertificates(String),
+}
+
+impl ProvisioningTemplateDeletionRefusal {
+    /// The message the refusal states, whichever class it names.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotFound(message) | Self::AssociatedWithCaCertificates(message) => message,
+        }
+    }
+}
+
+impl super::ComAmazonawsIotAwsiotserviceState {
+    /// Every registered CA certificate whose `registrationConfig` names `template_name`,
+    /// by `certificateId`.
+    ///
+    /// The relation is read out of the CA records themselves rather than recorded a second
+    /// time beside the template, so whatever wrote a CA's `registrationConfig` is what the
+    /// relation reports, and a template cannot be held back by a reference the CA registry
+    /// no longer holds. The comparison is the name's own: `TemplateName` is modelled
+    /// `pattern ^[0-9A-Za-z_-]+$`, so neither side can carry whitespace or differ in case
+    /// and still name one template.
+    pub fn ca_certificates_provisioning_with(&self, template_name: &str) -> Vec<String> {
+        self.ca_certificates
+            .values()
+            .filter(|certificate| {
+                certificate
+                    .registration_config
+                    .as_ref()
+                    .and_then(|configuration| configuration.template_name.as_deref())
+                    .is_some_and(|named| named == template_name)
+            })
+            .map(|certificate| certificate.certificate_id.clone())
+            .collect()
+    }
+
+    /// Whether anything in this account's state holds the delete of `template_name` back.
+    ///
+    /// Answers `None` when the template may be deleted, so a reader can state the guard
+    /// without removing anything.
+    pub fn provisioning_template_deletion_refusal(
+        &self,
+        template_name: &str,
+    ) -> Option<ProvisioningTemplateDeletionRefusal> {
+        if !self.provisioning_templates.contains_key(template_name) {
+            return Some(ProvisioningTemplateDeletionRefusal::NotFound(
+                UNDELETABLE_MISSING_TEMPLATE_MESSAGE.to_string(),
+            ));
+        }
+        // A CA whose `registrationConfig` names the template holds it back whatever that
+        // CA's own `autoRegistrationStatus` says: the configuration is the reference, and
+        // a CA registered with auto registration disabled has it enabled again by an
+        // update of the record, without the template being named a second time.
+        if !self.ca_certificates_provisioning_with(template_name).is_empty() {
+            return Some(
+                ProvisioningTemplateDeletionRefusal::AssociatedWithCaCertificates(
+                    template_associated_with_cas_message(template_name),
+                ),
+            );
+        }
+        None
+    }
+
+    /// Delete the provisioning template recorded under `template_name`, answering the
+    /// record that was removed, or the reason this account's state held it back.
+    ///
+    /// The guard is read under the same lock as the write, so a CA registered concurrently
+    /// cannot have its template deleted between the check and the removal. The name is the
+    /// template's identity and its key in the store, and a template's VERSIONS live inside
+    /// its record, so removing that one record is the whole write: no version is left
+    /// pointing at a template that is gone, and the name is free for a later create.
+    pub fn delete_provisioning_template(
+        &mut self,
+        template_name: &str,
+    ) -> Result<RegisteredProvisioningTemplate, ProvisioningTemplateDeletionRefusal> {
+        if let Some(refusal) = self.provisioning_template_deletion_refusal(template_name) {
+            return Err(refusal);
+        }
+        self.provisioning_templates
+            .remove(template_name)
+            .ok_or_else(|| {
+                ProvisioningTemplateDeletionRefusal::NotFound(
+                    UNDELETABLE_MISSING_TEMPLATE_MESSAGE.to_string(),
+                )
+            })
+    }
+}
+
 /// The message the operations that LOOK UP one version of a template refuse a `versionId`
 /// the template does not hold with: the reader of one version, and the re-pointing of the
 /// version in effect (`UpdateProvisioningTemplate$defaultVersionId`).

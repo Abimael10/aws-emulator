@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCACertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCACertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCACertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +100,34 @@ impl From<DeleteCACertificateErrorModeled> for DeleteCACertificateError {
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the
+/// request PRESENTED (the SigV4 access key id, a public identifier and never a secret),
+/// the request target, the CA certificate the call named and how the call ended.
+///
+/// A delete is the one call that makes a registered CA stop existing, so without a record
+/// nothing about it is observable afterwards — the record it removed is gone. Every
+/// request-derived field goes through [`crate::state::audit_field`], which bounds it and
+/// strips the control characters that would otherwise forge a second record; the
+/// subscriber supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    certificate_id: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteCACertificate",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        certificate_id = %crate::state::audit_field(certificate_id),
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteCACertificate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +164,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCACertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCACertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCACertificate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteCACertificateErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // "Deletes a registered CA certificate": the id is the record's identity and its
+        // key in the account's CA registry, and what may hold the delete back is the
+        // account's own state, so the whole decision and the whole write happen under one
+        // lock beside the records they read (`crate::state::ca_certificates`) and no caller
+        // can observe the registry in between.
+        let deleted = state.lock().delete_ca_certificate(&input.certificate_id);
+
+        // What the call DID, which is the one thing a later reader cannot recover: a
+        // removed CA certificate leaves nothing behind to be read.
+        audit(
+            ctx,
+            &input.certificate_id,
+            match &deleted {
+                Ok(_) => "deleted",
+                Err(crate::state::ca_certificates::CaCertificateDeletionRefusal::NotFound(_)) => {
+                    "no-such-ca-certificate"
+                }
+                Err(crate::state::ca_certificates::CaCertificateDeletionRefusal::Active(_)) => {
+                    "ca-certificate-active"
+                }
+            },
+        );
+
+        // Each refusal is reported as the error class the model declares for it, with the
+        // one sentence the state words it in, rather than as a hollow success.
+        if let Err(refusal) = deleted {
+            let message = Some(refusal.message().to_string());
+            return Err(match refusal {
+                crate::state::ca_certificates::CaCertificateDeletionRefusal::NotFound(_) => {
+                    DeleteCACertificateErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                crate::state::ca_certificates::CaCertificateDeletionRefusal::Active(_) => {
+                    DeleteCACertificateErrorModeled::CertificateStateException(
+                        CertificateStateException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // The operation's output shape carries no members: a successful delete reports
+        // nothing, and that the CA certificate is gone is read back through
+        // `DescribeCACertificate`.
+        Ok(DeleteCACertificateOutput {})
     }
 }

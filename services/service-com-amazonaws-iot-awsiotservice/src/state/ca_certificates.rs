@@ -312,7 +312,86 @@ pub fn ca_registry_full_message() -> String {
     format!("this emulator registers at most {MAX_CA_CERTIFICATES} CA certificates")
 }
 
+/// The sentence every operation that addresses ONE registered CA certificate refuses an id
+/// the account's CA registry holds none under with.
+///
+/// The CA family words its miss after the RESOURCE the request addressed — the CA
+/// certificate the account was asked for — rather than after the `certificateId` member the
+/// DEVICE certificate family names its own miss by ([`super::missing_certificate_message`]):
+/// the two registries are reached through different URIs and answer for different
+/// resources, so the id is not part of this text.
+pub const MISSING_CA_CERTIFICATE_MESSAGE: &str = "Requested CA Certificate does not exist.";
+
+/// The message a delete refuses a CA certificate whose status is
+/// [`CA_CERTIFICATE_STATUS_ACTIVE`] with.
+///
+/// An ACTIVE CA is one the account still auto-registers and validates device certificates
+/// against, so it is deactivated before it is removed — the same precondition the DEVICE
+/// certificate family states ([`super::active_certificate_deletion_message`]) — and the
+/// sentence names the CA by the id the request carried, because the caller's next step,
+/// `UpdateCACertificate`, takes that same id.
+pub fn active_ca_certificate_deletion_message(certificate_id: &str) -> String {
+    format!("Certificate must be deactivated (not ACTIVE) before deletion. Id: {certificate_id}")
+}
+
+/// Why a CA certificate was NOT deleted.
+///
+/// Each variant names the modelled error class the refusal answers with
+/// (`smithy_query(query="operation",operation="DeleteCACertificate")`), so the handler
+/// chooses the status from the state rather than restating the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaCertificateDeletionRefusal {
+    /// An id the account's CA registry holds none under: `ResourceNotFoundException`
+    /// (HTTP 404).
+    NotFound(String),
+    /// A CA certificate whose status is [`CA_CERTIFICATE_STATUS_ACTIVE`]:
+    /// `CertificateStateException` (HTTP 406), the one state this operation models.
+    Active(String),
+}
+
+impl CaCertificateDeletionRefusal {
+    /// The message the refusal states, whichever class it names.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotFound(message) | Self::Active(message) => message,
+        }
+    }
+}
+
 impl super::ComAmazonawsIotAwsiotserviceState {
+    /// Delete the CA certificate recorded under `certificate_id`, answering the record that
+    /// was removed, or the reason the account's state held it back.
+    ///
+    /// "Deletes a registered CA certificate" (`DeleteCACertificate`): the id is the
+    /// record's identity and its key in the registry, so removing that one record is the
+    /// whole write — every later reader of the registry stops reporting it, and the
+    /// `registrationConfig` it carried stops holding the provisioning template that
+    /// configuration named back ([`super::provisioning_templates`]).
+    ///
+    /// What holds it back is the account's own state: an id the registry holds nothing
+    /// under, and a record still in [`CA_CERTIFICATE_STATUS_ACTIVE`] — the status this
+    /// operation models `CertificateStateException` ("The certificate operation is not
+    /// allowed", HTTP 406) for, the same precondition the DEVICE certificate family states
+    /// ([`super::ComAmazonawsIotAwsiotserviceState::delete_certificate`]).
+    pub fn delete_ca_certificate(
+        &mut self,
+        certificate_id: &str,
+    ) -> Result<RegisteredCaCertificate, CaCertificateDeletionRefusal> {
+        let Some(certificate) = self.ca_certificates.get(certificate_id) else {
+            return Err(CaCertificateDeletionRefusal::NotFound(
+                MISSING_CA_CERTIFICATE_MESSAGE.to_string(),
+            ));
+        };
+        if certificate.status == CA_CERTIFICATE_STATUS_ACTIVE {
+            return Err(CaCertificateDeletionRefusal::Active(
+                active_ca_certificate_deletion_message(certificate_id),
+            ));
+        }
+        self.ca_certificates.remove(certificate_id).ok_or_else(|| {
+            CaCertificateDeletionRefusal::NotFound(MISSING_CA_CERTIFICATE_MESSAGE.to_string())
+        })
+    }
+
     /// Register the CA certificate `request` carries, answering the record that was
     /// written, or the reason the request or the account's state refused it.
     ///
