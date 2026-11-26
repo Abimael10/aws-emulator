@@ -1965,16 +1965,57 @@ pub fn resolve_engine_version(
 }
 
 /// The `ValidationException` payload for a member that must name an instance type the
-/// service publishes and does not.
+/// service publishes and does not, naming the member the value was carried in.
 ///
-/// `InstanceTypeString`'s pattern `^.*\..*\.search$` admits any value of that shape,
-/// so a value outside `OpenSearchPartitionInstanceType` — the model's record of which
-/// instance types exist — names no instance type at all, which is a malformed request
-/// rather than a listing with nothing in it.
+/// For a member whose value a request RESOLVES an instance type by — a limit read's URI
+/// label — a value the catalog carries no entry for names no instance type at all, so
+/// there is nothing to report limits for. A member that merely NARROWS a listing is not
+/// resolved this way: there the value selects entries, and a read asking for zone
+/// information about it is refused as the zones answer it
+/// ([`az_unsupported_instance_type`]).
 pub fn unknown_instance_type(member: &str, value: &str) -> ValidationException {
     ValidationException {
         message: Some(format!("{member} is not a known instance type: {value}")),
     }
+}
+
+/// The FIXED text of the refusal an instance type gets when the request asked the service
+/// to resolve it against an Availability Zone and no zone offers it.
+///
+/// It ends in the space-and-colon the value follows immediately, and it names neither the
+/// member the value was carried in nor a zone: the sentence states the zone's answer about
+/// the type, and the only variable part is the instance type itself.
+const AZ_UNSUPPORTED_INSTANCE_TYPE: &str = "The AZ doesn't support instance type :";
+
+/// The `ValidationException` payload for an instance type that no Availability Zone
+/// offers, which is what a read asking for ZONE information about a named type is refused
+/// with.
+///
+/// An instance type the service publishes no catalog entry for
+/// ([`publishes_instance_type`]) is hardware no zone has, so there are no zones to report
+/// it as offered in and the read cannot be answered. The value is echoed exactly as the
+/// request carried it.
+pub fn az_unsupported_instance_type(instance_type: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("{AZ_UNSUPPORTED_INSTANCE_TYPE}{instance_type}")),
+    }
+}
+
+/// The refusal for an instance type whose Availability Zones a request asked for and that
+/// no zone offers, or `None` when there is nothing to resolve against a zone.
+///
+/// `zones` is the zone list the answer would carry — `None` for a read that did NOT ask
+/// for zone information, which resolves no instance type against a zone at all and so
+/// grades nothing. This is the ONE statement of the rule: the type is graded against the
+/// zones exactly when the request asked the service to report them, and a request that
+/// named no instance type pairs none with a zone.
+pub fn az_unsupported_instance_type_refusal(
+    zones: Option<&[String]>,
+    instance_type: Option<&str>,
+) -> Option<ValidationException> {
+    zones?;
+    let instance_type = instance_type?;
+    (!publishes_instance_type(instance_type)).then(|| az_unsupported_instance_type(instance_type))
 }
 
 /// The modelled refusal for an instance type the engine release in play does not

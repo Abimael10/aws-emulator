@@ -205,20 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(ListInstanceTypeDetailsErrorModeled::ValidationException)?;
 
         // "An optional parameter that lists information for a given instance type" —
-        // the filter narrows the listing to that one instance type.
-        // `InstanceTypeString`'s pattern admits any `<family>.<size>.search` value, so
-        // one the service publishes no instance type for names nothing at all and is a
-        // malformed request; one that IS published but is not offered on this version
-        // names an instance type that exists, so the listing it narrows is simply
-        // empty.
-        if let Some(instance_type) = input.instance_type.as_deref() {
-            if !crate::state::publishes_instance_type(instance_type) {
-                return Err(ListInstanceTypeDetailsErrorModeled::ValidationException(
-                    crate::state::unknown_instance_type("InstanceType", instance_type),
-                )
-                .into());
-            }
-        }
+        // the filter NARROWS the listing to that one instance type and decides nothing
+        // else: `InstanceTypeString`'s pattern admits any `<family>.<size>.search` value,
+        // and whether the catalog publishes an entry for the value or not, the listing it
+        // narrows is simply the entries it names. The value is graded only where the
+        // request asks the service to resolve it against an Availability Zone, below.
 
         // "The name of the domain" — an optional scope whose ONLY effect on this read is
         // which Region's Availability Zones are reported: the catalog itself is the named
@@ -262,6 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .retrieve_a_zs
             .unwrap_or(false)
             .then(|| crate::state::region_availability_zones(&region));
+
+        // Asking for the Availability Zones of a NAMED instance type asks the service to
+        // RESOLVE that type against the Region's zones: the answer says which of them
+        // offer it. A value the catalog publishes no instance type for names hardware no
+        // zone has, so there is no zone that offers it and the read is refused rather than
+        // answered with a zone list for nothing. Stated once the zones the type would be
+        // resolved against are known, and only for a read that asked for them: a read
+        // carrying no retrieve-AZ flag resolves nothing against a zone, so there the same
+        // value is not graded and merely narrows the published listing.
+        if let Some(refusal) = crate::state::az_unsupported_instance_type_refusal(
+            availability_zones.as_deref(),
+            input.instance_type.as_deref(),
+        ) {
+            return Err(ListInstanceTypeDetailsErrorModeled::ValidationException(refusal).into());
+        }
 
         let selected: Vec<&'static str> = crate::state::offered_instance_types(version)
             .into_iter()

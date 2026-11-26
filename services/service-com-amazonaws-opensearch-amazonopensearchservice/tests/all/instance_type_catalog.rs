@@ -24,8 +24,10 @@
 //!   what the family can serve; a feature available on one release stays available on a
 //!   later one;
 //! * the `instanceType` filter reports exactly the entry it names, over a table of
-//!   types drawn from the listing, answers an empty listing for a published type the
-//!   release does not offer, and refuses a value that names no published instance type;
+//!   types drawn from the listing, and answers an empty listing for a type the release
+//!   does not offer and for a value that names no published instance type at all — the
+//!   filter decides what is reported and is graded only where the read asks for the
+//!   type's Availability Zones ([`super::instance_type_az_resolution`]);
 //! * the release's catalog is reported COMPLETE in a single answer, with no `NextToken`
 //!   member at all, over a table of page sizes: `MaxResults` does not bound what is
 //!   reported and no token is ever handed out, while a `MaxResults` outside the modelled
@@ -1018,8 +1020,10 @@ async fn instance_type_filter_reports_exactly_that_type() {
         );
     }
 
-    // A value of the member's own shape that names no published instance type is a
-    // malformed request: the published catalog is the record of which types exist.
+    // A value of the member's own shape that names no published instance type selects no
+    // entry, so the listing it narrows is empty: the filter decides what is REPORTED and
+    // is graded only where the read asks the service to resolve it against an Availability
+    // Zone, which is [`super::instance_type_az_resolution`]'s subject.
     for unknown in [
         "nosuch.large.search",
         "m5.nosuch.search",
@@ -1027,16 +1031,15 @@ async fn instance_type_filter_reports_exactly_that_type() {
         "r6g.large.search.search",
     ] {
         let answer = list(&emulator, version, &format!("instanceType={unknown}")).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {unknown}: expected HTTP 400, got {} {:?}",
-            answer.status, answer.body
+        let empty = details(&answer, unknown);
+        assert!(
+            empty.is_empty(),
+            "case {unknown}: expected an empty listing, got {empty:?}"
         );
-        assert_eq!(
-            error_code(&answer),
-            "ValidationException",
-            "case {unknown}: expected the modelled validation refusal, got {:?}",
-            answer.body
+        assert!(
+            answer.body["NextToken"].is_null(),
+            "case {unknown}: an empty listing carries no NextToken, got {:?}",
+            answer.body["NextToken"]
         );
     }
 
