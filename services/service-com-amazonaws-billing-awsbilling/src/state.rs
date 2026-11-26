@@ -1273,10 +1273,14 @@ impl ComAmazonawsBillingAwsbillingState {
     /// The stored view `arn` names when it is one this account may edit or
     /// delete: an existing `CUSTOM` view.
     ///
-    /// `None` covers both inputs AWS collapses into one refusal — an ARN no
-    /// view is stored under, and one naming a view that is not `CUSTOM` (the
-    /// account's `PRIMARY` view) — so eligibility is decided without revealing
-    /// which of the two it was.
+    /// `None` is the answer for both an ARN no view is stored under and one
+    /// naming a stored view that is not `CUSTOM` (the account's `PRIMARY`
+    /// view), so this says only whether the view is eligible. An operation
+    /// whose model declares `ResourceNotFoundException` separates the two,
+    /// checking `billing_views` for the ARN first and answering
+    /// [`unresolved_billing_view_arn`] when it holds nothing there; one that
+    /// declares no such error (`DeleteBillingView`) has only the eligibility
+    /// refusal to make.
     pub fn custom_view(&self, arn: &str) -> Option<&BillingView> {
         self.billing_views
             .get(arn)

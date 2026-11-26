@@ -112,28 +112,37 @@ async fn the_default_primary_view_carries_every_documented_member() {
     }
 
     // A read reports the same description every time, and a REFUSED write leaves
-    // it where it was: the rows are the ways a caller can try to move it.
-    let refused: Vec<(&str, Value)> = vec![
+    // it where it was: the rows are the ways a caller can try to move it, each
+    // with the refusal its input earns — a stored view that is not CUSTOM is
+    // ineligible (400), an ARN nothing is stored under does not exist (404).
+    let refused: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a rename of the PRIMARY view",
             json!({ "arn": PRIMARY_ARN, "name": "renamed" }),
+            400,
+            "ValidationException",
         ),
         (
             "a new description for the PRIMARY view",
             json!({ "arn": PRIMARY_ARN, "description": "mine now" }),
+            400,
+            "ValidationException",
         ),
         (
             "an update of an ARN no view is stored under",
             json!({ "arn": ABSENT_ARN, "description": "mine now" }),
+            404,
+            "ResourceNotFoundException",
         ),
     ];
-    for (case, request) in refused {
+    for (case, request, expected_status, expected_code) in refused {
         let before = get_view(&router, case, PRIMARY_ARN).await;
         let (status, body) = call(&router, "UpdateBillingView", &request).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected the write to be refused, got {status} {body:?}"
+            (expected_status, expected_code),
+            "case {case:?}: expected the write to be refused {expected_status} \
+             {expected_code}, got {status} {body:?}"
         );
         let after = get_view(&router, case, PRIMARY_ARN).await;
         assert_eq!(

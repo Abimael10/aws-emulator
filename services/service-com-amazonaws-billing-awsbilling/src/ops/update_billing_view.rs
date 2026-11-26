@@ -6,9 +6,11 @@
 //! the request actually CHANGES the view's definition (its data filter
 //! expression), and answers with the ARN and that instant. An ARN
 //! outside the caller's own account is an `AccessDeniedException` (403); an ARN
-//! that names no existing `CUSTOM` view of this account — absent, or the
-//! account's `PRIMARY` view — is a `ValidationException` (400), because only a
-//! `CUSTOM` view may be edited and eligibility is decided before existence. A
+//! of the caller's own account that no view is stored under is a
+//! `ResourceNotFoundException` (404), the one form this crate answers for the
+//! view a request identifies by its own `arn`; an ARN naming a stored view that
+//! is not `CUSTOM` — the account's `PRIMARY` view — is a `ValidationException`
+//! (400), because only a `CUSTOM` view may be edited. A
 //! view whose health status is anything other than `HEALTHY` is refused with
 //! `BillingViewHealthStatusException` (400) before anything is written, as every
 //! operation that writes a stored view is.
@@ -222,11 +224,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // Eligibility is decided BEFORE existence: only a `CUSTOM` view may be
-        // edited, so an ARN that names no `CUSTOM` view of this account — absent
-        // or the account's `PRIMARY` view — is one refusal, and the modeled
-        // `ResourceNotFoundException` would tell a caller which of the two it
-        // was.
+        // Existence comes first, because the two inputs are different refusals:
+        // an `arn` of this account that no view is stored under is the modeled
+        // `ResourceNotFoundException` (404) this operation declares — "The
+        // specified ARN in the request doesn't exist" — answered in this
+        // service's one form for the view a request identifies by its own `arn`
+        // (`crate::state::unresolved_billing_view_arn`), so an unresolvable
+        // own-account ARN draws the same refusal whichever operation resolved
+        // it, read or write.
+        if !state.billing_views.contains_key(&input.arn) {
+            return Err(UpdateBillingViewErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved_billing_view_arn(&input.arn),
+            )
+            .into());
+        }
+        // Only a view this account DOES hold can be ineligible: a stored view
+        // that is not `CUSTOM` is refused for what it IS, which is the
+        // lifecycle writers' `ValidationException`
+        // (`crate::state::not_a_custom_view`).
         if state.custom_view(&input.arn).is_none() {
             return Err(UpdateBillingViewErrorModeled::ValidationException(
                 crate::state::not_a_custom_view(&input.arn, "edited"),

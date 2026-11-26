@@ -18,9 +18,10 @@
 //! 4. A filter that names resources by identifier resolves every entry: one
 //!    that names no view of this account refuses the whole request (400)
 //!    instead of silently dropping out of the result set.
-//! 5. Only a `CUSTOM` view may be edited or deleted, and eligibility is decided
-//!    before existence: an absent ARN and the account's `PRIMARY` view are the
-//!    same `ValidationException` (400).
+//! 5. Only a `CUSTOM` view may be edited or deleted: a stored view that is not
+//!    `CUSTOM` is a `ValidationException` (400), while an ARN no view is stored
+//!    under is the `ResourceNotFoundException` (404) of every operation that
+//!    declares one.
 //!
 //! The harness (`call`, `emulator`, …) is the one `billing_views.rs` owns.
 
@@ -563,17 +564,18 @@ async fn only_a_custom_view_may_be_edited_or_deleted() {
     let router = emulator();
 
     // (case, operation, the ARN, the request members beside `arn`, expected
-    // status, expected code). The two refused kinds — an ARN no view is stored
-    // under, and the account's PRIMARY view — are ONE answer, so a caller
-    // cannot tell them apart.
+    // status, expected code). A STORED view that is not CUSTOM is refused for
+    // what it is; `UpdateBillingView` declares `ResourceNotFoundException`, so
+    // an ARN nothing is stored under is that 404 instead, while
+    // `DeleteBillingView` declares no such error and has only this refusal.
     let rows: Vec<(&str, &str, String, Value, u16, &str)> = vec![
         (
             "update an absent ARN",
             "UpdateBillingView",
             ABSENT_ARN.to_string(),
             json!({ "name": "renamed" }),
-            400,
-            "ValidationException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "update the PRIMARY view",
@@ -626,10 +628,17 @@ async fn only_a_custom_view_may_be_edited_or_deleted() {
             (expected_status, expected_code),
             "case {case:?}: expected {expected_status} {expected_code}, got {status} {body:?}"
         );
+        // The eligibility refusal states the rule; the not-found refusal is
+        // this service's ARN-validation sentence instead.
+        let stated = message(&body);
+        let expected_sentence = if expected_code == "ValidationException" {
+            stated.contains("Custom Billing View")
+        } else {
+            stated == format!("[{arn}] is an invalid billing view arn")
+        };
         assert!(
-            message(&body).contains("Custom Billing View"),
-            "case {case:?}: the refusal states the eligibility rule, got {:?}",
-            message(&body)
+            expected_sentence,
+            "case {case:?}: the refusal states its own rule, got {stated:?}"
         );
     }
 
