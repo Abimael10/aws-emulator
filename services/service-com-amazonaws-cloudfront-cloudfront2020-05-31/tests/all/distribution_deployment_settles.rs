@@ -108,15 +108,20 @@ fn with_members(row: &Config, extra: &str) -> String {
 }
 
 /// The id and the current version token of one distribution.
-struct Stored {
-    id: String,
-    etag: String,
+///
+/// `pub(crate)` so a sibling suite about the same rule reuses this staging rather than
+/// standing up a second copy of it.
+pub(crate) struct Stored {
+    pub(crate) id: String,
+    pub(crate) etag: String,
 }
 
 /// Create one distribution and report what it was minted as, having waited out the deployment
 /// its create owes it: a row that then MUTATES the distribution starts from a deployed one, so
 /// the status it reads afterwards is the one its own call produced.
-async fn deployed(router: &MultiServiceRouter, case: &str, row: &Config) -> Stored {
+///
+/// `pub(crate)`: see [`Stored`].
+pub(crate) async fn deployed(router: &MultiServiceRouter, case: &str, row: &Config) -> Stored {
     let created = create_distribution(router, &row.xml()).await;
     assert_eq!(
         created.status, 201,
@@ -135,7 +140,9 @@ async fn deployed(router: &MultiServiceRouter, case: &str, row: &Config) -> Stor
 /// The continuous deployment a promotion ends: a deployed primary, a staging copy of it, a
 /// policy routing to that copy, and the primary updated to name the policy. Reports the
 /// `(primary, staging)` pair at their current versions.
-async fn continuous_deployment(
+///
+/// `pub(crate)`: see [`Stored`].
+pub(crate) async fn continuous_deployment(
     router: &MultiServiceRouter,
     case: &str,
     reference: &str,

@@ -141,11 +141,27 @@ impl CachedEdgeResponse {
 /// How many cached responses one distribution's edge holds at once.
 ///
 /// A real edge cache is bounded by the storage of an edge location; this emulator holds
-/// its cache in memory beside the distribution, so it is bounded by an entry count and
-/// the least recently filled entry is dropped to make room. The bound is this emulator's
+/// its cache in memory beside the distribution, so it is bounded by an entry count and a
+/// byte count ([`MAX_EDGE_CACHE_BYTES`]), and the least recently filled entry is dropped
+/// to make room. The bound is this emulator's
 /// own, not CloudFront's: eviction is invisible to a caller except as a cache MISS, which
 /// is a thing CloudFront answers too.
 pub const MAX_EDGE_CACHE_ENTRIES: usize = 256;
+
+/// How many bytes of origin answers one distribution's edge holds at once.
+///
+/// What bounds this cache is its SIZE AS A WHOLE, never the size of one object: CloudFront
+/// decides whether an answer may be held from its status and the cache behaviour's TTL, so
+/// an object the behaviour admits is held — and served from the cache on the next request
+/// for it — whatever its byte count. A real edge location evicts to make room for a large
+/// object; this cache does the same, dropping the entry filled longest ago until the new
+/// one fits ([`StoredDistribution::store_edge_response`]), so a multi-megabyte object is a
+/// cache HIT the second time it is fetched rather than a permanent MISS.
+///
+/// The number is this emulator's own, not CloudFront's (whose maximum cacheable object is
+/// far larger than a process holds): it is what one distribution's cache may add to this
+/// process, and it bounds the cache more tightly than the entry count alone did.
+pub const MAX_EDGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The most path-pattern comparisons one invalidation makes against the edge cache before
 /// it empties the cache instead ([`StoredDistribution::invalidate_edge_cache`]).
@@ -412,7 +428,11 @@ pub struct StoredDistribution {
     /// [`STATUS_IN_PROGRESS`] until [`StoredDistribution::deployed_due`], then
     /// [`STATUS_DEPLOYED`].
     pub status: String,
-    /// The instant this distribution's current configuration is owed to be `Deployed`.
+    /// The instant this distribution's current configuration is owed to be `Deployed`: the
+    /// deadline its CREATE set, and `now` for a reconfiguration of a distribution whose
+    /// create deadline has already passed — a write never restarts the span or postpones a
+    /// deployment the clock already owes
+    /// ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::apply_config`]).
     pub deployed_due: SystemTime,
     /// `Distribution$LastModifiedTime`: when the configuration last changed.
     pub last_modified_time: SystemTime,
@@ -595,18 +615,39 @@ impl StoredDistribution {
 
     /// Hold `entry` in this distribution's edge cache under `key`.
     ///
-    /// Bounded by [`MAX_EDGE_CACHE_ENTRIES`]: once the cache is full the entry filled
-    /// longest ago makes room for the new one.
+    /// Bounded by [`MAX_EDGE_CACHE_ENTRIES`] and by [`MAX_EDGE_CACHE_BYTES`]: while either
+    /// bound would be exceeded once `entry` is held, the entry filled longest ago is dropped
+    /// to make room for it, exactly as an edge location evicts to store a new object. The
+    /// SIZE of the object is therefore never a reason not to hold it — an answer the cache
+    /// behaviour admits is held whatever its byte count — and an entry larger than the whole
+    /// cache is the one case nothing can make room for, so it is served to this viewer and
+    /// not held.
     pub fn store_edge_response(&mut self, key: String, entry: CachedEdgeResponse) {
-        while self.edge_cache.len() >= MAX_EDGE_CACHE_ENTRIES {
+        if entry.body.len() > MAX_EDGE_CACHE_BYTES {
+            return;
+        }
+        let mut held_bytes: usize = self
+            .edge_cache
+            .iter()
+            .filter(|(held_key, _)| **held_key != key)
+            .map(|(_, held)| held.body.len())
+            .sum();
+        let replacing = self.edge_cache.contains_key(&key);
+        let mut held_entries = self.edge_cache.len() + usize::from(!replacing);
+        while held_entries > MAX_EDGE_CACHE_ENTRIES
+            || held_bytes.saturating_add(entry.body.len()) > MAX_EDGE_CACHE_BYTES
+        {
             let oldest = self
                 .edge_cache
                 .iter()
+                .filter(|(held_key, _)| **held_key != key)
                 .min_by_key(|(_, held)| held.stored_at)
-                .map(|(held_key, _)| held_key.clone());
+                .map(|(held_key, held)| (held_key.clone(), held.body.len()));
             match oldest {
-                Some(held_key) => {
+                Some((held_key, bytes)) => {
                     self.edge_cache.remove(&held_key);
+                    held_bytes = held_bytes.saturating_sub(bytes);
+                    held_entries = held_entries.saturating_sub(1);
                 }
                 None => break,
             }

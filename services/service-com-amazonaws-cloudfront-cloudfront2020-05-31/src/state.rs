@@ -31,9 +31,11 @@
 //!
 //! Several things in here are owed by the CLOCK rather than by a call:
 //!
-//! * a distribution CloudFront has just created or reconfigured is `InProgress` until
-//!   its configuration has propagated, and is `Deployed` after
-//!   ([`PROPAGATION_DELAY`]);
+//! * a distribution CloudFront has just CREATED is `InProgress` until its configuration has
+//!   propagated, and is `Deployed` after ([`PROPAGATION_DELAY`]); a RECONFIGURATION of one
+//!   that has already propagated is in force at the instant the call applied it, so the
+//!   write's own answer reports the transient status and the next read reports the terminal
+//!   one ([`ComAmazonawsCloudfrontCloudfront20200531State::apply_config`]);
 //! * a streaming (RTMP) distribution is `InProgress` and `Deployed` on the same rule, for
 //!   the same reason ([`PROPAGATION_DELAY`]);
 //! * an invalidation is `InProgress` until its batch finishes, and `Completed` after — and

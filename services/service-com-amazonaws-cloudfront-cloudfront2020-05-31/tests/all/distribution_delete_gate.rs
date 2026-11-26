@@ -180,10 +180,14 @@ async fn delete_lands_only_on_a_disabled_and_deployed_distribution() {
         let etag = match row.reach {
             Reach::AsCreated => created_etag,
             Reach::ByUpdate => {
-                // An update is accepted at any status, so the created distribution is
-                // deployed first only to keep the row's own wait the only one that
-                // matters.
-                tokio::time::sleep(past_propagation()).await;
+                // An update is accepted at any status, and it does not restart the
+                // propagation the CREATE owes the distribution: a row that deletes while the
+                // configuration is still propagating therefore issues its update inside that
+                // window, and a row that deletes a deployed distribution waits the window out
+                // first, so the status it then reads is the one its own update left behind.
+                if row.deployed {
+                    tokio::time::sleep(past_propagation()).await;
+                }
                 set_enabled(&router, &id, &base, row.enabled, &created_etag).await
             }
         };

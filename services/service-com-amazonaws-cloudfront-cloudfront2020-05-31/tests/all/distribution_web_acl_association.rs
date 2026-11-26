@@ -32,9 +32,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    STATUS_DEPLOYED, STATUS_IN_PROGRESS,
-};
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::STATUS_DEPLOYED;
 
 use crate::distribution_lifecycle::{
     awaited_deployment, call, config, config_table, get_distribution, is_version_token, Answer,
@@ -167,8 +165,8 @@ const REMOVALS: &[Removal] = &[
 
 /// A disassociation clears the stored web ACL whatever it held and however it got there,
 /// leaves the rest of the configuration alone, mints a version the distribution then
-/// reports, and sends it back into propagation; the version it replaced no longer
-/// satisfies an `If-Match`, and asking again is the same answer again.
+/// reports, and reports the transient status in its own answer; the version it replaced no
+/// longer satisfies an `If-Match`, and asking again is the same answer again.
 #[tokio::test]
 async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
     for row in REMOVALS {
@@ -267,7 +265,10 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
         );
 
         // The one record answers every read: no web ACL, the version the call minted, and
-        // the propagation its new configuration is owed.
+        // the status the record stands at once the write has been applied. The propagation
+        // the create owed this record is already behind it (waited out above) and the
+        // disassociation does not restart it, so the configuration this call stored is in
+        // force at the instant it applied it.
         let (stored, read_etag, status) = read_back(&router, &id, case).await;
         assert_eq!(
             stored, "",
@@ -278,9 +279,9 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
             "case {case}: expected GetDistribution at version {cleared_etag:?}, got {read_etag:?}"
         );
         assert_eq!(
-            status, STATUS_IN_PROGRESS,
-            "case {case}: expected the reconfigured distribution to report \
-             {STATUS_IN_PROGRESS}, got {status:?}"
+            status, STATUS_DEPLOYED,
+            "case {case}: expected the read after the disassociation to report \
+             {STATUS_DEPLOYED}, got {status:?}"
         );
         // Nothing else about the configuration moved: it still reads back as the one the
         // create submitted, the association aside.

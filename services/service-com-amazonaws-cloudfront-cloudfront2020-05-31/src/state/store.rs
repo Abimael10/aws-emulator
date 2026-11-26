@@ -2336,9 +2336,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     ///
     /// The stored configuration becomes the one submitted with the service's own members
     /// resolved into it ([`resolve_distribution_config`]), `LastModifiedTime` becomes
-    /// `now`, the version token is freshly minted, and the distribution goes back to
-    /// [`STATUS_IN_PROGRESS`] with a new propagation deadline — the new configuration has
-    /// to reach the edge locations before it is deployed again.
+    /// `now`, the version token is freshly minted, and the distribution reports
+    /// [`STATUS_IN_PROGRESS`] to the caller that made this call: the answer to the write is
+    /// where the transient status is observed, as it is for a create.
+    ///
+    /// The propagation deadline is NOT restarted by the write — it stays the one the record
+    /// already carried, and for a record whose deadline has passed, a distribution that is
+    /// already deployed, the configuration is owed at the instant it was applied, which is
+    /// `now`. So the first read a caller makes after a write reports the terminal status
+    /// ([`StoredDistribution::settle`] materialises it): a configuration this store has
+    /// already applied is not reported as still propagating by a later call, or a caller
+    /// driving a workflow of several writes and polling `GetDistribution` for `Deployed`
+    /// between them would wait out one poll interval per write for a propagation that has
+    /// finished. A distribution still inside the propagation its CREATE owes it keeps that
+    /// deadline, since that record has never reached the edge locations at all.
     ///
     /// `None` when the store holds no such distribution, checked BEFORE the mint so a
     /// version token is never spent on a distribution that is not there.
@@ -2362,7 +2373,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.last_modified_time = now;
         stored.etag = etag;
         stored.status = STATUS_IN_PROGRESS.to_string();
-        stored.deployed_due = now + PROPAGATION_DELAY;
+        stored.deployed_due = stored.deployed_due.max(now);
         Some(stored)
     }
 
