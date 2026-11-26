@@ -808,6 +808,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record — see the three members below.
         let lock = object.reported_object_lock();
 
+        // The SSE-KMS encryption context this object's data key is bound to, reported on
+        // `x-amz-server-side-encryption-context` the way a HEAD of the same object reports
+        // it ([`super::head_object`]): `GetObjectOutput` declares no member for it
+        // (`smithy_query(query="operation",operation="GetObject")`), so it is recorded for
+        // the serializer to write
+        // ([`crate::service::wire::note_reported_encryption_context`]), and the two reads
+        // cannot disagree about the context the object's bytes were wrapped under.
+        crate::service::wire::note_reported_encryption_context(
+            crate::state::sse_kms::reported_encryption_context(
+                &input.bucket,
+                &input.key,
+                &object.encryption,
+            ),
+        );
+
         Ok(GetObjectOutput {
             // `Content-Length` is the length of the body actually being returned, which for
             // a part- or range-scoped read is the span's own length rather than the object's.

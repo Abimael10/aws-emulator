@@ -677,6 +677,55 @@ pub fn reported_encryption_context(
     Some(::aws_smithy_types::base64::encode(&document))
 }
 
+/// The header a write supplies additional encryption-context pairs in, and every answer
+/// ABOUT such an object reports the context its data key is bound to on
+/// (`PutObjectRequest$SSEKMSEncryptionContext` and `PutObjectOutput$SSEKMSEncryptionContext`
+/// are both bound to it).
+pub const ENCRYPTION_CONTEXT_HEADER: &str = "x-amz-server-side-encryption-context";
+
+/// The `<Message>` S3 refuses a context header that is not an encoded string-string map with:
+/// the FIXED sentence that refusal carries, which states the RULE the value broke and names
+/// the header class rather than the value — the value travels in the `<ArgumentValue>` beside
+/// it.
+pub const ENCRYPTION_CONTEXT_MESSAGE: &str = "The header 'x-amz-server-side-encryption-context' \
+     shall be Base64-encoded UTF-8 string holding JSON which represents a string-string map";
+
+/// Whether `header` is a value [`ENCRYPTION_CONTEXT_HEADER`] may carry: "a Base64-encoded
+/// string holding a UTF-8 encoded JSON of additional encryption context key-value pairs"
+/// (`PutObjectRequest$SSEKMSEncryptionContext`) — so the value has to be Base64 of UTF-8 text
+/// that reads back as a JSON OBJECT every one of whose values is a string, which is the map
+/// KMS takes as an encryption context.
+///
+/// ONE place for the rule, so every write that accepts the header refuses the same values
+/// with the same sentence, and the pairs a later read reports
+/// ([`reported_encryption_context`]) are pairs a write was admitted for rather than a value
+/// nothing could read back.
+#[must_use]
+pub fn encryption_context_is_well_formed(header: &str) -> bool {
+    let Ok(decoded) = ::aws_smithy_types::base64::decode(header) else {
+        return false;
+    };
+    let Ok(text) = ::std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let Ok(::serde_json::Value::Object(pairs)) = ::serde_json::from_str::<::serde_json::Value>(text)
+    else {
+        return false;
+    };
+    pairs.values().all(::serde_json::Value::is_string)
+}
+
+/// The value of [`ENCRYPTION_CONTEXT_HEADER`] a write carried that the header may NOT carry,
+/// or `None` for a write that carried a well-formed one or none at all
+/// ([`encryption_context_is_well_formed`]).
+///
+/// What a refusal of such a write echoes in its `<ArgumentValue>`, so the caller is told
+/// which value broke the rule the sentence states.
+#[must_use]
+pub fn malformed_encryption_context(header: Option<&str>) -> Option<&str> {
+    header.filter(|value| !encryption_context_is_well_formed(value))
+}
+
 /// The pairs an object's stored `SSEKMSEncryptionContext` names: "a Base64-encoded string
 /// holding a UTF-8 encoded JSON of additional encryption context key-value pairs"
 /// (`PutObjectRequest$SSEKMSEncryptionContext`), decoded.

@@ -504,6 +504,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // And the context has to be the MAP that member carries, judged by the one rule every
+        // write that accepts the header is judged by
+        // ([`crate::state::sse_kms::malformed_encryption_context`]) — so an upload is never
+        // initiated under a context no reader could decode.
+        if let Some(value) = crate::state::sse_kms::malformed_encryption_context(
+            requested.kms_encryption_context.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_HEADER,
+                Some(value),
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_MESSAGE,
+            ));
+        }
+
         // "The tag-set for the object. The tag-set must be encoded as URL Query
         // parameters" (`CreateMultipartUploadRequest$Tagging`) — read as the URL-encoded
         // query string it is declared to be and judged against an OBJECT's published

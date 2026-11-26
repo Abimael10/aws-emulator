@@ -18,6 +18,34 @@ Issue-Commit: d86755c0f73584fec4314e4e117b5b920040171c
 
 # s3: 4 net-new causes — no static-website endpoint is served (and the AWS website host is announced instead), CopyObject accepts a specific ETag in If-None-Match, HeadObject omits the stored SSE-KMS encryption context, and aws-chunked trailer checksums/names are never validated
 
+## Resolution
+
+Causes 2, 3 and 4 are FIXED: their replay keys
+(`s3.copy-object-under-if-none-match-policy`,
+`s3.put-object-sse-kms-encryption-context-round-trips-then-malformed-rejected`,
+`s3.s3-chunked-upload-trailer-checksum-mismatch-rejected-object-absent` and
+`s3.s3-chunked-upload-trailer-name-mismatch-rejected-object-absent`) pass.
+
+Cause 1 is DECLINED as a blocker outside the service crates, and its seven keys
+(`s3.e2e-website-deployment`,
+`s3.website-endpoint-serves-index-and-error-documents-and-refuses-writes`,
+`s3.s3-website-hosting-bare-folder-path-redirects-to-trailing-slash`,
+`s3.s3-website-hosting-get-rejected-for-a-bucket-never-configured`,
+`s3.s3-website-hosting-missing-key-with-no-error-document-is-rejected-with-the-default-error-page`,
+`s3.s3-website-hosting-redirect-all-requests-to-answers-301-to-the-target-host`,
+`s3.s3-ssec-and-endpoint-enforcement-website-routing-rule-on-404-redirects-missing-keys`)
+remain failing. The website SURFACE is served — `src/service/website_endpoint.rs`,
+reachable on the emulator's own endpoint under `/_aws/s3-website/<bucket>` — but an
+ANNOUNCED website HOST cannot be added from a service crate: the core serves its one
+data port with a single TLS listener (`vendor/server/src/lib.rs:1323`, configured at
+`:1253`) while a website endpoint is an `http://` host, and the same file computes
+exactly one published address for that port (`vendor/server/src/lib.rs:1261-1264`) with
+no seam for a service to announce a second. The same absence stays recorded, with its own
+keys, in
+`issues/things-that-do-not-work/20261118T010000Z-s3-the-rest-endpoint-serves-no-plaintext-http-and-no-website-endpoint.md`
+and `issues/things-that-do-not-work/20261121T221736Z-s3-2-net-new-causes-a-prefix-suffix.md`.
+
+
 > _Note: this issue was identified against the code base at commit `d86755c0f73584fec4314e4e117b5b920040171c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

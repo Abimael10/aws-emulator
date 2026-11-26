@@ -245,6 +245,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The context a session is created under has to be the MAP that member carries, judged
+        // before anything is recorded and by the one rule every write that accepts the header is
+        // judged by ([`crate::state::sse_kms::malformed_encryption_context`]): a session's
+        // encryption settings are what "Amazon S3 will use … to protect new objects in the
+        // directory bucket", so a context no reader could decode would be inherited by every
+        // object written in that session.
+        if let Some(value) = crate::state::sse_kms::malformed_encryption_context(
+            input.ssekms_encryption_context.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_HEADER,
+                Some(value),
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_MESSAGE,
+            ));
+        }
+
         // The ENCRYPTION the session is created under, settled while the bucket is held:
         // "Amazon S3 will use the encryption settings values from the CreateSession request
         // to protect new objects in the directory bucket", and the CLI and the SDKs "use

@@ -421,6 +421,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // The Object Lock MODE, RETAIN-UNTIL DATE, LEGAL HOLD and EVENT HOLD are not in this
         // list either: they are the lock the destination version is stored with, recorded on
         // it below exactly as `PutObject` records its own.
+        //
+        // What IS refused here is the one FORM of a destination precondition S3 does not
+        // implement: `If-None-Match` "expects the '*' (asterisk) character"
+        // (`CopyObjectRequest$IfNoneMatch`), so a specific entity tag in it asks for a copy
+        // conditioned on WHICH representation the destination holds — functionality the
+        // header implies and the operation does not implement
+        // ([`crate::state::if_none_match_is_unsupported`]). Refused before anything is read
+        // or written, so no destination object is created.
+        if crate::state::if_none_match_is_unsupported(input.if_none_match.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented_header(
+                crate::state::IF_NONE_MATCH_CONDITION,
+            ));
+        }
 
         // The CUSTOMER-PROVIDED key this copy presents for the SOURCE object, read off the
         // three `x-amz-copy-source-` members that carry it through the one rule every call of
@@ -566,6 +579,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                     ),
                 ));
             }
+        }
+
+        // And the context has to be the MAP that member carries, judged by the one rule every
+        // write that accepts the header is judged by
+        // ([`crate::state::sse_kms::malformed_encryption_context`]), so nothing is stored
+        // under a context no reader could decode.
+        if let Some(value) = crate::state::sse_kms::malformed_encryption_context(
+            requested.kms_encryption_context.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_HEADER,
+                Some(value),
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_MESSAGE,
+            ));
         }
 
         // "Specifies whether the metadata is copied from the source object or replaced

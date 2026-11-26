@@ -463,6 +463,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // one of them carries is the client's own for the same bytes, which is neither
         // verified nor echoed.
 
+        // One FORM of a precondition is refused here, though: `If-None-Match` "expects the
+        // '*' (asterisk) character" (`PutObjectRequest$IfNoneMatch`), so a specific entity
+        // tag in it asks for a write conditioned on WHICH representation the key holds —
+        // functionality the header implies and the operation does not implement, refused
+        // through the one rule every write carrying that member is judged by
+        // ([`crate::state::if_none_match_is_unsupported`]) and before anything is stored.
+        if crate::state::if_none_match_is_unsupported(input.if_none_match.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented_header(
+                crate::state::IF_NONE_MATCH_CONDITION,
+            ));
+        }
+
         // The CUSTOMER-PROVIDED key this write asks the object to be encrypted under. WHETHER
         // the bucket it addresses serves that encryption form at all comes first: a DIRECTORY
         // bucket does not, so the ASK is refused with the restriction that kind of bucket
@@ -691,6 +703,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
                     ),
                 ));
             }
+        }
+
+        // And the context itself has to be the MAP that member is declared to carry: "a
+        // Base64-encoded string holding a UTF-8 encoded JSON of additional encryption context
+        // key-value pairs" (`PutObjectRequest$SSEKMSEncryptionContext`) — anything else is a
+        // value KMS could never be handed as an encryption context, so the write is refused
+        // `InvalidArgument` with the sentence that refusal publishes and the value echoed
+        // beside it ([`crate::state::sse_kms::ENCRYPTION_CONTEXT_MESSAGE`]), and nothing is
+        // stored under a context no reader could decode.
+        if let Some(value) = crate::state::sse_kms::malformed_encryption_context(
+            requested.kms_encryption_context.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_HEADER,
+                Some(value),
+                crate::state::sse_kms::ENCRYPTION_CONTEXT_MESSAGE,
+            ));
         }
 
         // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores

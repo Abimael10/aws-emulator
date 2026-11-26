@@ -697,6 +697,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the renderer `GetObject` reports it through — see the three members below.
         let lock = object.reported_object_lock();
 
+        // The SSE-KMS encryption context this object's data key is bound to, which an answer
+        // about the object reports on `x-amz-server-side-encryption-context`: the pairs the
+        // write supplied plus the entry S3 binds naming what was encrypted
+        // ([`crate::state::sse_kms::reported_encryption_context`]) — the same value the write
+        // was answered with, so a caller can read back the context its data was wrapped
+        // under. `HeadObjectOutput` declares no member for it
+        // (`smithy_query(query="operation",operation="HeadObject")`), so it is recorded for
+        // the serializer to write, the way the other headers no member binds are
+        // ([`crate::service::wire::note_reported_encryption_context`]).
+        crate::service::wire::note_reported_encryption_context(
+            crate::state::sse_kms::reported_encryption_context(
+                &input.bucket,
+                &input.key,
+                &object.encryption,
+            ),
+        );
+
         Ok(HeadObjectOutput {
             e_tag: Some(object.etag.clone()),
             // "The size of the body in bytes" (`HeadObjectOutput$ContentLength`) — of the

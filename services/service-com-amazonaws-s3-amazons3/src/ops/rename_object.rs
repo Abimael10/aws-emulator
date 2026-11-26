@@ -244,6 +244,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_key: source_key.clone(),
         };
 
+        // The DESTINATION's `If-None-Match` "expects the `*` character (asterisk)"
+        // (`RenameObjectRequest$DestinationIfNoneMatch`), so a specific entity tag in it asks
+        // for a rename conditioned on WHICH representation the destination holds —
+        // functionality the header implies and the operation does not implement, refused
+        // through the one rule every write carrying that member is judged by
+        // ([`crate::state::if_none_match_is_unsupported`]) and before anything is moved.
+        if crate::state::if_none_match_is_unsupported(input.destination_if_none_match.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented_header(
+                crate::state::IF_NONE_MATCH_CONDITION,
+            ));
+        }
+
         // Everything this rename decides is decided under ONE guard, so no reader can see
         // the destination written while the source is still there, and two concurrent
         // renames under one client token cannot both be read as the first.

@@ -373,9 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // parts to assemble arrive as the `@httpPayload` member `MultipartUpload`.
         // What this emulator cannot carry out faithfully, refused rather than answered with
         // an object that would claim it: `RequestPayer` asks to be charged for the request,
-        // which nothing here does, and `If-None-Match` "expects the '*' (asterisk) character"
-        // (`CompleteMultipartUploadRequest$IfNoneMatch`) — any other value asks for a
-        // conditional S3 itself answers `NotImplemented`.
+        // which nothing here does.
         //
         // The checksum members are NOT in this list: each carries the client's own value for
         // bytes this emulator holds, judged against the checksum this completion computes
@@ -386,6 +384,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "CompleteMultipartUpload with {unserved}"
             )));
+        }
+
+        // And the one FORM of a precondition S3 does not implement: `If-None-Match` "expects
+        // the '*' (asterisk) character" (`CompleteMultipartUploadRequest$IfNoneMatch`), so a
+        // specific entity tag in it asks for a completion conditioned on WHICH representation
+        // the key holds — functionality the header implies and the operation does not
+        // implement, refused through the one rule every write carrying that member is judged
+        // by ([`crate::state::if_none_match_is_unsupported`]) and with the sentence that
+        // refusal publishes, before the upload is assembled.
+        if crate::state::if_none_match_is_unsupported(input.if_none_match.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented_header(
+                crate::state::IF_NONE_MATCH_CONDITION,
+            ));
         }
 
         // The CUSTOMER-PROVIDED key this completion presents, read through the one rule every
@@ -952,21 +963,9 @@ const ENTITY_TOO_SMALL_MESSAGE: &str = "Your proposed upload is smaller than the
 /// The feature `input` asks for that this emulator does not serve, if any — named for the
 /// 501 that refuses it, the way `UploadPart` and `AbortMultipartUpload` name their own.
 fn unserved_feature(input: &CompleteMultipartUploadInput) -> Option<&'static str> {
-    [
-        (input.request_payer.is_some(), "RequestPayer"),
-        (
-            // "Expects the '*' (asterisk) character"
-            // (`CompleteMultipartUploadRequest$IfNoneMatch`): any other value asks for a
-            // conditional on a tag, which S3 itself does not serve on this operation.
-            input
-                .if_none_match
-                .as_deref()
-                .is_some_and(|value| value.trim() != "*"),
-            "an If-None-Match other than '*'",
-        ),
-    ]
-    .into_iter()
-    .find_map(|(asked, name)| asked.then_some(name))
+    [(input.request_payer.is_some(), "RequestPayer")]
+        .into_iter()
+        .find_map(|(asked, name)| asked.then_some(name))
 }
 
 /// The `Checksum*` members of this request, as the store's one mapping from member to

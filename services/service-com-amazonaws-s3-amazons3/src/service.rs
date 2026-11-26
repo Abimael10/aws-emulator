@@ -1601,6 +1601,14 @@ fn front_door<Eng: Send + Sync + 'static>(
         chunked_upload::REFUSE_UNFRAMED_CHUNKED_BODY,
         Box::new(chunked_upload::RefuseUnframedChunkedBody::new()),
     );
+    // And the refusal a framed write earns for the TRAILING DATA its body carried: trailing
+    // headers that are not the ones `x-amz-trailer` declared, or a trailing checksum that is
+    // not a digest of the payload received ([`chunked_upload`]). Held here for the same reason
+    // and under a key of the same kind: it stands in front of every write of this service.
+    table.add_operation(
+        chunked_upload::REFUSE_MALFORMED_TRAILER,
+        Box::new(chunked_upload::RefuseMalformedTrailer::new()),
+    );
     // And the refusal a request earns for the CREDENTIAL it presents — a session whose
     // principal no longer exists — held here for the same reason and under a key of the same
     // kind ([`withdrawn_credential`]): it stands in front of every operation of this service,
@@ -2451,12 +2459,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 return Some(refusal);
             }
         }
+        // And a framed write whose TRAILING DATA is not what it declared is refused below, after
+        // the CREDENTIAL the request presents.
         // A request whose CREDENTIAL resolves to no principal at all — a session of a role the
         // account no longer holds — is refused for the credential, whichever operation its
         // address names and before any policy is read: resolving the signing key is what
         // stands in front of every authorization decision. See [`withdrawn_credential`].
         if self.presents_a_withdrawn_credential(req) {
             return self.door.get(withdrawn_credential::REFUSE_WITHDRAWN_CREDENTIAL);
+        }
+        // And a framed write whose TRAILING DATA is not what it declared — a trailing header
+        // other than the one `x-amz-trailer` named, or a trailing checksum that is not a
+        // digest of the payload those chunks decoded to — is refused for that trailer,
+        // whichever operation its address names and before anything is stored: the trailing
+        // checksum is the only integrity signal a streamed upload carries, so a value that
+        // does not describe the bytes cannot be stored as though it did. AFTER the credential
+        // above, because in the signed streaming forms the trailing data is itself covered by
+        // the chunk signature chain, so what a badly signed request is told is about its
+        // credential. See [`chunked_upload`].
+        if chunked_upload::trailer_refusal().is_some() {
+            if let Some(refusal) = self.door.get(chunked_upload::REFUSE_MALFORMED_TRAILER) {
+                return Some(refusal);
+            }
         }
         // A request addressing a bucket by a name S3 can address no bucket by is refused for
         // the NAME, whichever operation its address names; see
@@ -2789,6 +2813,14 @@ impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng
     }
 
     fn wire_protocol(&self, req: &RtRequest) -> smithy_server_runtime::WireProtocol<'_> {
+        // The TRAILER the body of this request arrived with, read once here for the reason
+        // [`chunked_upload`] gives: the framework decides the protocol before it strips the
+        // `aws-chunked` framing off the body, so this is the one seam this service is handed
+        // the request with its body AS IT ARRIVED, and the trailing headers exist nowhere
+        // after it. Recorded as a request-scoped note the routing seam reads
+        // ([`EmulatedService::override_operation`]); what it decides is nothing about the
+        // protocol, which is the entry's own answer below.
+        chunked_upload::remember_framed_body(req);
         self.entry.wire_protocol(req)
     }
 }

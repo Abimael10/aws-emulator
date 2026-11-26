@@ -2839,6 +2839,59 @@ fn with_allow_header(mut response: Response, methods: Option<String>) -> Respons
     response
 }
 
+::std::thread_local! {
+    /// The SSE-KMS encryption context the answer now being built reports about the object it
+    /// is about, or `None`.
+    ///
+    /// A request-scoped note, held under the same discipline as the notes above: the handler
+    /// records it as the last thing it does, the serializer TAKES it before anything that can
+    /// fail, and every request this service deserializes clears whatever this thread may
+    /// still hold. It exists because the answers that report this context on a STORED object
+    /// — a read and a metadata read — bind no member for it: `GetObjectOutput` and
+    /// `HeadObjectOutput` declare no `SSEKMSEncryptionContext`
+    /// (`smithy_query(query="operation",operation="GetObject,HeadObject")`), while the WRITES
+    /// that answer the same value do ([`crate::state::sse_kms::reported_encryption_context`]),
+    /// so the handler cannot hand this one to the serializer as output.
+    static REPORTED_ENCRYPTION_CONTEXT: ::std::cell::RefCell<Option<String>> =
+        const { ::std::cell::RefCell::new(None) };
+}
+
+/// Record the encryption context the answer to this request reports about the object it is
+/// about — the whole context that object's data key is bound to
+/// ([`crate::state::sse_kms::reported_encryption_context`]), or `None` for an object whose
+/// write supplied none, which reports no context at all.
+pub fn note_reported_encryption_context(context: Option<String>) {
+    REPORTED_ENCRYPTION_CONTEXT.with(|slot| slot.replace(context));
+}
+
+/// The note for the response now being serialized, TAKEN rather than read, so a note one
+/// response left behind can never describe a later one.
+fn reported_encryption_context() -> Option<String> {
+    REPORTED_ENCRYPTION_CONTEXT.with(|slot| slot.take())
+}
+
+/// Drop whatever note this thread may still hold, called at the START of every request this
+/// service deserializes.
+fn forget_any_unanswered_encryption_context() {
+    let _ = reported_encryption_context();
+}
+
+/// `response` with the encryption context the answer reports about its object
+/// ([`crate::state::sse_kms::ENCRYPTION_CONTEXT_HEADER`]), for a response whose handler
+/// recorded one, and unchanged for every other.
+fn with_encryption_context_header(mut response: Response, context: Option<String>) -> Response {
+    let Some(context) = context else {
+        return response;
+    };
+    // A value a header map refuses is dropped rather than turning a served response into a
+    // transport failure; Base64 text never is.
+    let _ = response.headers_mut().try_insert(
+        crate::state::sse_kms::ENCRYPTION_CONTEXT_HEADER,
+        context,
+    );
+    response
+}
+
 /// `response` re-sent with `status`, keeping every header the serializer wrote, or unchanged
 /// for a status no HTTP response can carry (neither of this module's two ever is) or a
 /// response whose status is not the 200 the promotion is from.
@@ -3467,6 +3520,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // and the methods a 405 advertises (see [`ALLOW_HEADER`]).
         forget_any_unanswered_representation();
         forget_any_unanswered_allowed_methods();
+        // And the encryption context an answer about a stored object reports, under the same
+        // discipline (see [`REPORTED_ENCRYPTION_CONTEXT`]).
+        forget_any_unanswered_encryption_context();
         // The ACCESS POINT this request was addressed THROUGH, when its address reaches one
         // ([`Self::addressed_access_point`]), recorded for the decision taken on the path it
         // names: an access point has a policy of its own, and that policy governs the
@@ -3838,6 +3894,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // The same for the two notes only a refusal carries.
         let _ = not_modified_representation();
         let _ = allowed_methods();
+        // And the encryption context this answer reports about the object it is about, which
+        // a SUCCESS is what carries (see [`REPORTED_ENCRYPTION_CONTEXT`]).
+        let encryption_context = reported_encryption_context();
         if UNWRAPPED_XML_OUTPUT_OPERATIONS.contains(&operation_name) {
             if let Some(body) =
                 unwrapped_document(output, output_schema).map_err(ProtocolError::Serde)?
@@ -3872,21 +3931,19 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // retrieval one operation INITIATED is the 202 its documentation states. A
         // timestamp header the model binds in the `date-time` format is re-rendered in it.
         // An output that binds nothing to the body answers with no body at all.
-        Ok(with_request_correlation(
-            without_unbound_body(
-                with_date_time_timestamp_headers(with_accepted_status(
-                    with_partial_content_status(with_second_resolution_timestamps(
-                        with_served_root_element(
-                            with_attribute_members(response),
-                            operation_name,
-                        ),
-                        output_schema,
-                    )),
-                    operation_name,
-                    accepted,
+        let served = without_unbound_body(
+            with_date_time_timestamp_headers(with_accepted_status(
+                with_partial_content_status(with_second_resolution_timestamps(
+                    with_served_root_element(with_attribute_members(response), operation_name),
+                    output_schema,
                 )),
-                output_schema,
-            ),
+                operation_name,
+                accepted,
+            )),
+            output_schema,
+        );
+        Ok(with_request_correlation(
+            with_encryption_context_header(served, encryption_context),
             correlation,
         ))
     }
@@ -3905,6 +3962,10 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // The same for the two notes a refusal of its own carries.
         let representation = not_modified_representation();
         let allowed = allowed_methods();
+        // And for the one only a served answer carries: a refusal reports nothing about an
+        // object's encryption, so the note is taken and dropped here rather than left to
+        // describe a later response (see [`REPORTED_ENCRYPTION_CONTEXT`]).
+        let _ = reported_encryption_context();
         // A read whose caller already holds the current representation is answered with the
         // bare status, the validators of that representation and the version it is held as,
         // and NO document: see [`NOT_MODIFIED_STATUS`].

@@ -15,7 +15,11 @@
 //!   write is refused `NoSuchKey` (404): what the condition named is not there at all.
 //! * "Uploads the object only if the object key name does not already exist in the bucket
 //!   specified. Otherwise, Amazon S3 returns a 412 Precondition Failed error"
-//!   (`PutObjectRequest$IfNoneMatch`).
+//!   (`PutObjectRequest$IfNoneMatch`), whose value "expects the '*' (asterisk) character" —
+//!   so the wildcard is the only form of that condition there is, and a specific entity tag in
+//!   it asks for functionality the operation does not implement, which is the `NotImplemented`
+//!   (501) pinned over every write carrying the member by
+//!   [`super::conditional_write_wildcard_only`] and asserted on the one-shot write here.
 //!
 //! A precondition that does not hold carries the code and the sentence Amazon S3's list of
 //! error codes publishes for it, and a refused write leaves the object the key holds exactly
@@ -29,7 +33,8 @@
 //! the same rule.
 
 use service_com_amazonaws_s3_amazons3::state::{
-    NO_SUCH_KEY_CODE, NO_SUCH_KEY_MESSAGE, PRECONDITION_FAILED_CODE, PRECONDITION_FAILED_MESSAGE,
+    NOT_IMPLEMENTED_CODE, NOT_IMPLEMENTED_HEADER_MESSAGE, NO_SUCH_KEY_CODE, NO_SUCH_KEY_MESSAGE,
+    PRECONDITION_FAILED_CODE, PRECONDITION_FAILED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -193,12 +198,20 @@ async fn a_conditional_write_is_served_when_it_holds_and_refused_when_it_does_no
                 read.body.len()
             );
         } else {
-            // WHICH refusal depends on why the condition does not hold: an `If-Match` at a
+            // WHICH refusal depends on why the condition does not hold: an `If-None-Match`
+            // naming a specific entity tag asks for a conditional the operation does not
+            // implement at all (the member "expects the '*' (asterisk) character"), so it is
+            // refused for the HEADER rather than as a precondition; an `If-Match` at a
             // key holding no live object names the entity tag of nothing at all, so what the
             // caller is told is that the key is not there (404 `NoSuchKey`); every other
             // condition that does not hold is the 412 of a failed precondition.
-            let (status, code, message) = match (*member, *key_holds_an_object) {
-                ("if-match", false) => (404, NO_SUCH_KEY_CODE, NO_SUCH_KEY_MESSAGE),
+            let (status, code, message) = match (*member, *tag, *key_holds_an_object) {
+                ("if-none-match", named, _) if named != Tag::Asterisk => (
+                    501,
+                    NOT_IMPLEMENTED_CODE,
+                    NOT_IMPLEMENTED_HEADER_MESSAGE,
+                ),
+                ("if-match", _, false) => (404, NO_SUCH_KEY_CODE, NO_SUCH_KEY_MESSAGE),
                 _ => (412, PRECONDITION_FAILED_CODE, PRECONDITION_FAILED_MESSAGE),
             };
             assert_eq!(

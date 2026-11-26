@@ -418,6 +418,30 @@ pub fn unmet_write_precondition(
 /// of any ETag" (`DeleteObjectRequest$IfMatch`).
 pub const ANY_ENTITY_TAG: &str = "*";
 
+/// Whether the `If-None-Match` a WRITE carries asks for a conditional the service does not
+/// implement — which is any value but [`ANY_ENTITY_TAG`].
+///
+/// Every write member bound to that header is documented with the same sentence: "expects the
+/// '*' (asterisk) character" (`PutObjectRequest$IfNoneMatch`,
+/// `CopyObjectRequest$IfNoneMatch`, `CompleteMultipartUploadRequest$IfNoneMatch`, and
+/// `RenameObjectRequest$DestinationIfNoneMatch` as "expects the `*` character (asterisk)").
+/// The wildcard is the only form there is: what the member asks is that the addressed key
+/// hold NOTHING ([`unmet_write_precondition`]), and a specific entity tag asks instead for a
+/// write conditioned on WHICH representation the key holds — functionality the request's
+/// header implies and the operation does not implement, which S3 answers
+/// [`crate::state::NOT_IMPLEMENTED_CODE`] for ([`crate::scaffolded::Scaffolded::not_implemented_header`]),
+/// before anything is written.
+///
+/// The value is compared with its surrounding whitespace trimmed, the way every other
+/// entity-tag condition in this module reads one; the quotes HTTP wraps a tag in are not
+/// trimmed, because a quoted `"*"` is a tag of its own and not the wildcard.
+///
+/// ONE place for the rule, so every write that carries the member refuses the same values.
+#[must_use]
+pub fn if_none_match_is_unsupported(if_none_match: Option<&str>) -> bool {
+    if_none_match.is_some_and(|value| value.trim() != ANY_ENTITY_TAG)
+}
+
 /// The conditional DELETE member a request carries that does NOT hold against the object
 /// version it addresses, named by its header, or `None` when every one of them holds —
 /// `held` being that version, or `None` when the request addresses nothing the store holds.
@@ -1560,24 +1584,50 @@ pub fn verify_declared_integrity(
     }
     for (algorithm, declared) in checksums.pairs() {
         let Some(declared) = declared else { continue };
-        let Some(expected) = checksum_digest(algorithm, body) else {
-            continue;
-        };
-        let decoded = ::aws_smithy_types::base64::decode(declared.trim()).map_err(|_| {
-            IntegrityRejection::MalformedChecksum {
-                algorithm: algorithm.to_string(),
-            }
-        })?;
-        if decoded.len() != expected.len() {
-            return Err(IntegrityRejection::MalformedChecksum {
-                algorithm: algorithm.to_string(),
-            });
+        verify_declared_checksum(algorithm, declared, body)?;
+    }
+    Ok(())
+}
+
+/// Whether the Base64 checksum `declared` under the `ChecksumAlgorithm` value `algorithm`
+/// describes `body`.
+///
+/// The one comparison every declared checksum of this service is judged by, whichever part of
+/// the request carried it: a `Checksum*` member of a write
+/// ([`verify_declared_integrity`] hands each of them over here) and the trailing header a
+/// framed body sends one in — "if you specify `x-amz-trailer` … the checksum is sent in the
+/// trailing header" ([`crate::service::chunked_upload`] judges that one), which says exactly
+/// the same thing about the bytes as the up-front member does and so earns the same answer.
+///
+/// The SHAPE is judged first — a digest of the wrong width, or text that is not Base64 at
+/// all, cannot be the digest of anything, so it is [`IntegrityRejection::MalformedChecksum`]
+/// before any comparison — and only then is the value compared against the digest of the
+/// bytes actually received, which is [`IntegrityRejection::ChecksumMismatch`] when it differs.
+/// An algorithm this emulator cannot compute ([`checksum_digest`]) is left unjudged rather
+/// than refused: no comparison is possible, so neither answer would be a true statement about
+/// the value.
+pub fn verify_declared_checksum(
+    algorithm: &str,
+    declared: &str,
+    body: &[u8],
+) -> Result<(), IntegrityRejection> {
+    let Some(expected) = checksum_digest(algorithm, body) else {
+        return Ok(());
+    };
+    let decoded = ::aws_smithy_types::base64::decode(declared.trim()).map_err(|_| {
+        IntegrityRejection::MalformedChecksum {
+            algorithm: algorithm.to_string(),
         }
-        if decoded != expected {
-            return Err(IntegrityRejection::ChecksumMismatch {
-                algorithm: algorithm.to_string(),
-            });
-        }
+    })?;
+    if decoded.len() != expected.len() {
+        return Err(IntegrityRejection::MalformedChecksum {
+            algorithm: algorithm.to_string(),
+        });
+    }
+    if decoded != expected {
+        return Err(IntegrityRejection::ChecksumMismatch {
+            algorithm: algorithm.to_string(),
+        });
     }
     Ok(())
 }
