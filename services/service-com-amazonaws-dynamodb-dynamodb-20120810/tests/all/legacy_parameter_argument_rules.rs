@@ -102,10 +102,12 @@ async fn a_filter_over_a_key_attribute_names_the_member_it_was_stated_through() 
     // "A FilterExpression does not allow key attributes. You cannot define a filter
     // expression based on a partition key or a sort key" (`Query$FilterExpression`), and
     // the legacy map states the same filter one generation back — so the rule holds for
-    // both, and what differs is the member the refusal NAMES. The rows vary the generation
-    // the filter was stated in, which key attribute it mentioned (the table's partition
-    // key, its sort key, the index's own key) and whether the read was addressed at the
-    // table or at the index.
+    // both, and what differs is the member the refusal NAMES. The key attributes in force
+    // are the ones of the key schema the read is ADDRESSED THROUGH: the index's when the
+    // request names one, the table's own otherwise. The rows vary the generation the
+    // filter was stated in, which key attribute it mentioned (the table's partition key,
+    // its sort key, the index's own key) and whether the read was addressed at the table
+    // or at the index.
     let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "a legacy filter on the table's partition key",
@@ -139,17 +141,6 @@ async fn a_filter_over_a_key_attribute_names_the_member_it_was_stated_through() 
             "gsk",
         ),
         (
-            "a legacy filter on the table's key, on an index query",
-            json!({
-                "TableName": TABLE,
-                "IndexName": INDEX,
-                "KeyConditions": equals("gsk", "g1"),
-                "QueryFilter": equals("pk", "k1"),
-            }),
-            "QueryFilter",
-            "pk",
-        ),
-        (
             "a legacy filter mentioning a key beside a non-key entry",
             json!({
                 "TableName": TABLE,
@@ -163,6 +154,9 @@ async fn a_filter_over_a_key_attribute_names_the_member_it_was_stated_through() 
             "QueryFilter",
             "sk",
         ),
+        // The other reading: an attribute that is only a key of a schema this read does
+        // NOT go through is an ordinary attribute of that walk, so an index query may
+        // filter on the TABLE's key attributes — covered by the controls below.
         // The other generation keeps its own name: a request that filtered through the
         // expression member is told about that member, spelled as the sentence about it
         // spells it.
@@ -203,9 +197,10 @@ async fn a_filter_over_a_key_attribute_names_the_member_it_was_stated_through() 
         );
     }
 
-    // The CONTROLS: the rule is about a filter naming a key of the read it narrows, so a
-    // legacy filter over a non-key attribute is served, and a scan — which states no key
-    // condition at all — may filter on a key attribute.
+    // The CONTROLS: the rule is about a filter naming a key of the SCHEMA the read
+    // narrows, so a legacy filter over a non-key attribute is served, a scan — which
+    // states no key condition at all — may filter on a key attribute, and an index query
+    // may filter on a key attribute of the TABLE that the index does not key by.
     for (case, operation, request) in [
         (
             "a legacy filter over a non-key attribute",
@@ -214,6 +209,27 @@ async fn a_filter_over_a_key_attribute_names_the_member_it_was_stated_through() 
                 "TableName": TABLE,
                 "KeyConditions": equals("pk", "k1"),
                 "QueryFilter": equals("a", "x"),
+            }),
+        ),
+        (
+            "a legacy filter on the table's partition key, on an index query",
+            "Query",
+            json!({
+                "TableName": TABLE,
+                "IndexName": INDEX,
+                "KeyConditions": equals("gsk", "g1"),
+                "QueryFilter": equals("pk", "k1"),
+            }),
+        ),
+        (
+            "an expression filter on the table's sort key, on an index query",
+            "Query",
+            json!({
+                "TableName": TABLE,
+                "IndexName": INDEX,
+                "KeyConditionExpression": "gsk = :g",
+                "FilterExpression": "sk = :s",
+                "ExpressionAttributeValues": {":g": {"S": "g1"}, ":s": {"S": "s1"}},
             }),
         ),
         (

@@ -867,7 +867,9 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     // transaction ([`cancelled_by_element`]), exactly as the same defect
                     // does in a `TransactWriteItems` `Update` — the documented 400 KB
                     // ceiling excepted, which refuses the call ([`update_outcome`]).
-                    let touched = clauses.apply(&mut item).map_err(update_outcome)?;
+                    let touched = clauses
+                        .apply(&mut item, crate::state::UpdateTarget::of(before.as_ref()))
+                        .map_err(update_outcome)?;
                     for attribute in touched.attributes() {
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()

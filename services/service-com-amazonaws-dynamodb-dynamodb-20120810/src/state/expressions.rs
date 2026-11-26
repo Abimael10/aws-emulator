@@ -19,6 +19,8 @@ mod operands;
 pub use operands::*;
 mod request_shape;
 mod legacy_conditions;
+mod value_algebra;
+pub use value_algebra::*;
 pub use legacy_conditions::*;
 use request_shape::*;
 
@@ -614,6 +616,34 @@ pub fn states_redundant_parentheses(tokens: &[GroupToken]) -> bool {
 /// travelled in.
 fn unknown_function(member: &str, name: &str) -> RequestError {
     invalid_expression_member(member, &format!("Invalid function name; function: {name}"))
+}
+
+/// Whether a call to `inner` may stand where `enclosing`'s operand list states an
+/// operand.
+///
+/// A function's operand is a value or a document path to read one from — "if_not_exists
+/// (path, operand)" and "list_append (operand, operand)"
+/// (`UpdateItem$UpdateExpression`) — and the ONE nesting that reference writes is the
+/// one that fills a list that may not be there yet, `list_append`'s operand read through
+/// `if_not_exists`. Every other call written in an operand position is a function used
+/// where the grammar states none ([`function_used_this_way`]).
+fn function_nests_in(inner: &str, enclosing: &str) -> bool {
+    (inner, enclosing) == ("if_not_exists", "list_append")
+}
+
+/// The refusal a function used in a position this grammar does not state one in earns,
+/// naming the function that is used that way as the request spelled it.
+///
+/// Told apart from a name the grammar does not know at all ([`unknown_function`]): the
+/// identifier names one of this language's functions, and what is wrong is WHERE it was
+/// written.
+fn function_used_this_way(member: &str, name: &str) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "The function is not allowed to be used this way in an expression; function: {name}"
+        ),
+    )
 }
 
 /// Whether a NAME an expression writes out is one of DynamoDB's reserved words, refused
@@ -1948,10 +1978,10 @@ const DELETE_OPERAND: ValueOperand = ValueOperand {
 ///
 /// The one place that question is answered, beside the one that answers which members
 /// carry the validation envelope ([`envelopes_expression_refusals`]): an update written
-/// as an expression spells `ADD` or `DELETE`, while the legacy `AttributeUpdates` map
-/// names its action per attribute instead — so a refusal about one of its values has no
-/// operator to state and falls back to the class sentence
-/// ([`INCORRECT_UPDATE_OPERAND_TYPE_MESSAGE`]).
+/// as an expression spells `ADD` or `DELETE` inside the text it carries, while the legacy
+/// `AttributeUpdates` map names its action per attribute instead — so a refusal about one
+/// of its values is stated as a defect of that parameter value
+/// ([`unsupported_action_type`]) rather than of an operand of an expression.
 fn writes_an_operator(member: &str) -> bool {
     member == UPDATE_EXPRESSION_MEMBER
 }
@@ -1961,8 +1991,11 @@ fn writes_an_operator(member: &str) -> bool {
 /// the name of the type set that operator allows, each read off the request, behind the
 /// expression member that carried them.
 ///
-/// Stated for a member that writes an operator ([`writes_an_operator`]); the legacy map
-/// has none to name, so its values earn the class sentence above.
+/// Stated that way for a member that writes an operator ([`writes_an_operator`]). The
+/// LEGACY per-attribute map writes no operator inside a text — it names its action per
+/// attribute — so AWS reports the same fact as a defect of the parameter VALUE that
+/// entry carried: the action it asked for and the `AttributeValue` type that value is,
+/// both read off the request ([`unsupported_action_type`]).
 fn incorrect_update_operand_type_for(
     member: &str,
     operator: &str,
@@ -1970,7 +2003,7 @@ fn incorrect_update_operand_type_for(
     value: &AttributeValue,
 ) -> RequestError {
     if !writes_an_operator(member) {
-        return incorrect_update_operand_type();
+        return unsupported_action_type(operator, value);
     }
     invalid_expression_member(
         member,
@@ -1980,6 +2013,24 @@ fn incorrect_update_operand_type_for(
             operand_type_name(value)
         ),
     )
+}
+
+/// The refusal a LEGACY `AttributeUpdates` entry earns whose value is a type its action
+/// is not defined over: the action the entry named and the union member tag of the value
+/// it carried, inside the validation envelope every refusal about a value an input
+/// member carried is stated in.
+///
+/// A fact of the REQUEST alone — the entry's `Action` and the type of its `Value` — so
+/// it is the same refusal whatever the addressed item holds at that attribute, and
+/// whether it holds anything at all. The type is spelled with the tag the
+/// `AttributeValue` union names that member with ([`attribute_value_type`]), which is
+/// the vocabulary this family of clauses spells a type with.
+fn unsupported_action_type(action: &str, value: &AttributeValue) -> RequestError {
+    refused(format!(
+        "One or more parameter values were invalid: {action} action is not supported for the \
+         type {}",
+        attribute_value_type(value)
+    ))
 }
 
 /// AWS's fixed text for an update operand that reads an attribute the item does not
@@ -2345,291 +2396,6 @@ fn check_room_for(
         ));
     }
     Ok(())
-}
-
-/// The refusal for a collection past [`MAX_COLLECTION_MEMBERS`], whether a request sent
-/// it or an update's own `ADD`/`list_append` built it.
-fn too_many_members(name: &str, members: usize) -> RequestError {
-    RequestError::Validation(format!(
-        "Attribute {name} holds {members} members, more than this emulator's maximum of \
-         {MAX_COLLECTION_MEMBERS}"
-    ))
-}
-
-/// A set member's canonical sort key, so that members compare and deduplicate by the
-/// VALUE they denote: two `N` spellings of one number share one key.
-fn canonical_number(text: &str) -> String {
-    NumberKey::parse(text).map_or_else(|| text.to_string(), |number| number.canonical_text())
-}
-
-/// Whether two sets hold the same members. A DynamoDB set is unordered, so this is
-/// member-wise rather than position-wise.
-///
-/// Both sides are SORTED by `key` rather than walked pairwise: the member count comes
-/// from the request, so a pairwise walk would cost the product of two caller-chosen
-/// counts, where sorting costs `n log n`.
-fn same_members<'v, T: 'v, K: Ord>(
-    left: &'v [T],
-    right: &'v [T],
-    key: impl Fn(&'v T) -> K,
-) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let key = &key;
-    let mut mine: Vec<K> = left.iter().map(key).collect();
-    let mut theirs: Vec<K> = right.iter().map(key).collect();
-    mine.sort_unstable();
-    theirs.sort_unstable();
-    mine == theirs
-}
-
-/// How two attribute values order, or `None` when DynamoDB documents no order between
-/// them: "For type Number, value comparisons are numeric. String value comparisons for
-/// greater than, equals, or less than are based on ASCII character code values. For
-/// Binary, DynamoDB treats each byte of the binary data as unsigned when it compares
-/// binary values" (the `AttributeValueList` doc) — and nothing for the other types, or
-/// across types.
-pub(crate) fn compare_values(left: &AttributeValue, right: &AttributeValue) -> Option<Ordering> {
-    match (left, right) {
-        (AttributeValue::S(mine), AttributeValue::S(theirs)) => Some(mine.cmp(theirs)),
-        (AttributeValue::B(mine), AttributeValue::B(theirs)) => Some(mine.cmp(theirs)),
-        (AttributeValue::N(mine), AttributeValue::N(theirs)) => {
-            Some(NumberKey::parse(mine)?.cmp(&NumberKey::parse(theirs)?))
-        }
-        _ => None,
-    }
-}
-
-/// `begins_with (path, operand)` — "true if the attribute specified by path begins
-/// with a particular substring", which only a string or binary value can.
-fn begins_with_value(value: &AttributeValue, prefix: &AttributeValue) -> bool {
-    match (value, prefix) {
-        (AttributeValue::S(text), AttributeValue::S(prefix)) => text.starts_with(prefix.as_str()),
-        (AttributeValue::B(bytes), AttributeValue::B(prefix)) => bytes.starts_with(prefix),
-        _ => false,
-    }
-}
-
-/// `contains (path, operand)` — "true if the attribute specified by path is: A String
-/// that contains a particular substring, [or] A Set that contains a particular
-/// element". A list is searched for the element too, the way `CONTAINS` reads it.
-///
-/// A binary value is a sequence of BYTES, and "DynamoDB treats each byte of the binary
-/// data as unsigned when it compares binary values" (`AttributeValueList`), so a `B`
-/// haystack contains a `B` needle when the needle's bytes appear in it as a contiguous
-/// run — any byte value included, `0x00` among them.
-fn contains_value(haystack: &AttributeValue, needle: &AttributeValue) -> bool {
-    match (haystack, needle) {
-        (AttributeValue::S(text), AttributeValue::S(part)) => text.contains(part.as_str()),
-        (AttributeValue::B(bytes), AttributeValue::B(part)) => contains_bytes(bytes, part),
-        (AttributeValue::Ss(members), AttributeValue::S(member)) => members.contains(member),
-        (AttributeValue::Ns(members), AttributeValue::N(member)) => {
-            members.iter().any(|stored| numbers_equal(stored, member))
-        }
-        (AttributeValue::Bs(members), AttributeValue::B(member)) => members.contains(member),
-        (AttributeValue::L(members), needle) => members
-            .iter()
-            .any(|stored| attribute_values_equal(stored, needle)),
-        _ => false,
-    }
-}
-
-/// Whether `part` appears in `bytes` as a contiguous run of bytes. The empty run is in
-/// every sequence, the way the empty string is a substring of every string.
-///
-/// Both lengths are the CALLER's — the haystack is a stored `B` value and the needle an
-/// operand the request carried — so the search is the linear-time one `str::contains`
-/// uses for text (`memchr::memmem`), and what one evaluation costs is the SUM of the two
-/// lengths rather than their product.
-fn contains_bytes(bytes: &[u8], part: &[u8]) -> bool {
-    if part.is_empty() {
-        return true;
-    }
-    if part.len() > bytes.len() {
-        return false;
-    }
-    ::memchr::memmem::find(bytes, part).is_some()
-}
-
-/// `size (path)` — the length of the value at a path: bytes for a string or binary
-/// value, members for a set, elements for a list, entries for a map. Nothing else has
-/// a documented size.
-fn size_of_value(value: &AttributeValue) -> Option<i64> {
-    Some(match value {
-        AttributeValue::S(text) => byte_len(text.len()),
-        AttributeValue::B(bytes) => byte_len(bytes.len()),
-        AttributeValue::Ss(members) => byte_len(members.len()),
-        AttributeValue::Ns(members) => byte_len(members.len()),
-        AttributeValue::Bs(members) => byte_len(members.len()),
-        AttributeValue::L(values) => byte_len(values.len()),
-        AttributeValue::M(entries) => byte_len(entries.len()),
-        AttributeValue::N(_) | AttributeValue::Bool(_) | AttributeValue::Null(_) => return None,
-    })
-}
-
-/// Add or subtract two `N` values, reporting the canonical text of the result.
-///
-/// The arithmetic is exact decimal arithmetic (the `bigdecimal` crate), rounded to the
-/// documented 38 significant digits, so `SET n = n + :v` and `ADD n :v` answer what
-/// DynamoDB answers rather than what binary floating point would. The result is
-/// rendered through [`canonical_number_text`], the same canonicalization a written
-/// number goes through, so a computed number is refused by the rule it breaks and
-/// stored in the one form every read reports.
-///
-/// The rule a COMPUTED number breaks is stated on its own ([`unenveloped`]): no input
-/// member carried that number — the expression asked for it — so there is no member for
-/// the validation envelope to report a constraint on.
-pub fn number_arithmetic(
-    left: &str,
-    right: &str,
-    subtract: bool,
-) -> Result<String, RequestError> {
-    let left_value = parse_decimal(left)?;
-    let right_value = parse_decimal(right)?;
-    let result = if subtract {
-        left_value - right_value
-    } else {
-        left_value + right_value
-    };
-    let precision = u64::try_from(MAX_SIGNIFICANT_DIGITS).unwrap_or(38);
-    let (digits, scale) = result.with_prec(precision).as_bigint_and_exponent();
-    // `digits * 10^-scale` is the value, which is exactly what an `N` text spells.
-    canonical_number_text(&format!("{digits}e{}", -scale)).map_err(unenveloped)
-}
-
-/// One operand of that arithmetic. The canonical text is what reaches the decimal
-/// parser, so only one spelling of a number ever does, and a text that denotes no
-/// number this store can hold is refused by the rule it breaks.
-fn parse_decimal(text: &str) -> Result<BigDecimal, RequestError> {
-    let canonical = canonical_number_text(text)?;
-    BigDecimal::from_str(&canonical)
-        .map_err(|_| number_rejection(text, NumberFault::NotNumeric))
-}
-
-/// The members of a set value, as the member-wise set operations below walk them.
-enum SetMembers<'a> {
-    Strings(&'a [String]),
-    Numbers(&'a [String]),
-    Binaries(&'a [Vec<u8>]),
-}
-
-/// A value's set members, or `None` when it is not a set at all.
-fn set_members(value: &AttributeValue) -> Option<SetMembers<'_>> {
-    match value {
-        AttributeValue::Ss(members) => Some(SetMembers::Strings(members)),
-        AttributeValue::Ns(members) => Some(SetMembers::Numbers(members)),
-        AttributeValue::Bs(members) => Some(SetMembers::Binaries(members)),
-        _ => None,
-    }
-}
-
-/// How many members a set holds, for the empty-set refusal.
-fn set_len(value: &AttributeValue) -> Option<usize> {
-    Some(match set_members(value)? {
-        SetMembers::Strings(members) | SetMembers::Numbers(members) => members.len(),
-        SetMembers::Binaries(members) => members.len(),
-    })
-}
-
-/// The members a union would hold at most, refused past [`MAX_COLLECTION_MEMBERS`]
-/// BEFORE the union is built: a repeated `ADD` must not grow one stored set past the
-/// ceiling every value is admitted under.
-fn check_union_members(stored: usize, incoming: usize) -> Result<(), RequestError> {
-    let total = stored.saturating_add(incoming);
-    if total > MAX_COLLECTION_MEMBERS {
-        return Err(too_many_members("the set being added to", total));
-    }
-    Ok(())
-}
-
-/// `ADD`'s set form: "If the existing data type is a set and if Value is also a set,
-/// then Value is added to the existing set". Both sets must hold the same primitive
-/// type, and a member the set already holds is not added twice.
-///
-/// Membership is tested against a SORTED index of the stored members rather than by
-/// scanning them per incoming member: both counts come from the request, so a scan per
-/// member would cost their product.
-fn set_union(
-    existing: &AttributeValue,
-    addition: &AttributeValue,
-) -> Result<AttributeValue, RequestError> {
-    match (existing, addition) {
-        (AttributeValue::Ss(stored), AttributeValue::Ss(incoming)) => {
-            check_union_members(stored.len(), incoming.len())?;
-            let mut held: BTreeSet<&str> = stored.iter().map(String::as_str).collect();
-            let mut members = stored.clone();
-            for member in incoming {
-                if held.insert(member.as_str()) {
-                    members.push(member.clone());
-                }
-            }
-            Ok(AttributeValue::Ss(members))
-        }
-        (AttributeValue::Ns(stored), AttributeValue::Ns(incoming)) => {
-            check_union_members(stored.len(), incoming.len())?;
-            let mut held: BTreeSet<String> = stored.iter().map(|text| canonical_number(text)).collect();
-            let mut members = stored.clone();
-            for member in incoming {
-                if held.insert(canonical_number(member)) {
-                    members.push(member.clone());
-                }
-            }
-            Ok(AttributeValue::Ns(members))
-        }
-        (AttributeValue::Bs(stored), AttributeValue::Bs(incoming)) => {
-            check_union_members(stored.len(), incoming.len())?;
-            let mut held: BTreeSet<&[u8]> = stored.iter().map(Vec::as_slice).collect();
-            let mut members = stored.clone();
-            for member in incoming {
-                if held.insert(member.as_slice()) {
-                    members.push(member.clone());
-                }
-            }
-            Ok(AttributeValue::Bs(members))
-        }
-        (_held, _incoming) => Err(incorrect_update_operand_type()),
-    }
-}
-
-/// `DELETE`'s set form: "those values are subtracted from the old set". An empty
-/// result is no set at all, so the attribute goes away with its last member. The
-/// members to remove are indexed first, for the reason [`set_union`] gives.
-fn set_difference(
-    existing: &AttributeValue,
-    removal: &AttributeValue,
-) -> Result<Option<AttributeValue>, RequestError> {
-    let remaining = match (existing, removal) {
-        (AttributeValue::Ss(stored), AttributeValue::Ss(removed)) => {
-            let gone: BTreeSet<&str> = removed.iter().map(String::as_str).collect();
-            let members: Vec<String> = stored
-                .iter()
-                .filter(|member| !gone.contains(member.as_str()))
-                .cloned()
-                .collect();
-            (!members.is_empty()).then_some(AttributeValue::Ss(members))
-        }
-        (AttributeValue::Ns(stored), AttributeValue::Ns(removed)) => {
-            let gone: BTreeSet<String> = removed.iter().map(|text| canonical_number(text)).collect();
-            let members: Vec<String> = stored
-                .iter()
-                .filter(|member| !gone.contains(&canonical_number(member)))
-                .cloned()
-                .collect();
-            (!members.is_empty()).then_some(AttributeValue::Ns(members))
-        }
-        (AttributeValue::Bs(stored), AttributeValue::Bs(removed)) => {
-            let gone: BTreeSet<&[u8]> = removed.iter().map(Vec::as_slice).collect();
-            let members: Vec<Vec<u8>> = stored
-                .iter()
-                .filter(|member| !gone.contains(member.as_slice()))
-                .cloned()
-                .collect();
-            (!members.is_empty()).then_some(AttributeValue::Bs(members))
-        }
-        (_held, _removed) => return Err(incorrect_update_operand_type()),
-    };
-    Ok(remaining)
 }
 
 /// One operand of a condition: a document path, a literal value, or `size (path)`.
@@ -3017,6 +2783,34 @@ impl SetOperand {
     }
 }
 
+/// Which item an update is applied to: one the addressed key already HOLDS, or the one
+/// the update is about to add there ("adds a new item to the table if it does not
+/// already exist" — `UpdateItem`'s own doc).
+///
+/// What it decides is where a DOCUMENT PATH is resolved. A path reaches into the item
+/// the update edits, so a step that reaches no container the next step can read
+/// addresses no location OF THAT ITEM and the update is refused
+/// ([`DocumentPath::addresses_a_location`]) — a statement about a STORED image. A key
+/// that holds no item has none: there is no stored value for the path to be invalid
+/// for, so the update is applied as the create it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateTarget {
+    /// The item the addressed key holds.
+    StoredItem,
+    /// The item this update would add at a key that holds none.
+    NewItem,
+}
+
+impl UpdateTarget {
+    /// Which of the two a caller holding the stored item (or nothing) is applying to.
+    pub fn of(stored: Option<&Item>) -> Self {
+        match stored {
+            Some(_) => Self::StoredItem,
+            None => Self::NewItem,
+        }
+    }
+}
+
 /// The update one request states, from `UpdateExpression` or from the legacy
 /// `AttributeUpdates` map, parsed once and then applied to the stored item.
 #[derive(Debug, Clone)]
@@ -3229,19 +3023,35 @@ impl ParsedUpdate {
     /// first clause written. A value past the documented item ceiling is worded as the
     /// UPDATE path words that quota ([`stated_for_an_update`]): the item that crossed it
     /// is the one this change would leave behind.
-    pub fn apply(&self, item: &mut Item) -> Result<UpdateOutcome, RequestError> {
+    ///
+    /// `target` says whether the item is one the table HOLDS: the document paths of an
+    /// update are resolved against the item it edits, and a key that holds no item has
+    /// no stored image for a path to be invalid for
+    /// ([`UpdateTarget`], [`DocumentPath::addresses_a_location`]).
+    pub fn apply(
+        &self,
+        item: &mut Item,
+        target: UpdateTarget,
+    ) -> Result<UpdateOutcome, RequestError> {
         let before = item.clone();
         let mut changed: Vec<DocumentPath> = Vec::new();
         let mut members_written = 0usize;
         let mut removals: Vec<&DocumentPath> = Vec::new();
         let mut writes: Vec<&UpdateAction> = Vec::new();
         for action in &self.actions {
-            // Every action addresses a location of the item it is applied to, and a path
-            // whose steps before the last reach no container the last step can read
+            // Every action addresses a location of the STORED item it is applied to, and a
+            // path whose steps before the last reach no container the last step can read
             // addresses none ([`DocumentPath::addresses_a_location`]) — whichever action
             // states it, and whether or not applying it would have changed anything. So
             // the update is refused rather than served as the no-op it would otherwise be.
-            if !action.path().addresses_a_location(&before) {
+            //
+            // Asked of a STORED item alone: the rule is about the item the update edits,
+            // and an update of a key that holds none is the create it is — the item it
+            // leaves behind is built here, so a clause that WRITES still needs the
+            // location it writes into ([`DocumentPath::set`] refuses a parent that is not
+            // there) while a clause that only takes something away has nothing to do.
+            if target == UpdateTarget::StoredItem && !action.path().addresses_a_location(&before)
+            {
                 return Err(action.path().invalid());
             }
             match action {
@@ -4279,15 +4089,27 @@ impl<'a> ExprParser<'a> {
     }
 
     /// One operand position the signature declares as a document PATH: a `:placeholder`
-    /// written there names no location at all — a rule about the operands of a call the
-    /// expression `closed`, like the two below it.
+    /// written there names no location at all, and neither does a CALL to one of this
+    /// language's functions — both are refused naming the function whose position needs
+    /// a path, a rule about the operands of a call the expression `closed`, like the two
+    /// below it.
+    ///
+    /// A word that NAMES a function and opens no call is an attribute name like any
+    /// other ([`Self::peek_call`] reads a call as the word with this grammar's `(` just
+    /// after it), so `if_not_exists(if_not_exists, :v)` reads the attribute that word
+    /// names.
     fn function_path(
         &mut self,
         function: &str,
         closed: bool,
     ) -> Result<DocumentPath, RequestError> {
         self.argument(|parser| {
-            if closed && matches!(parser.peek(), Some(ExprToken::Placeholder(_))) {
+            if closed
+                && (matches!(parser.peek(), Some(ExprToken::Placeholder(_)))
+                    || parser
+                        .peek_call()
+                        .is_some_and(|name| function_signature(&name).is_some()))
+            {
                 return Err(requires_document_path(parser.member, function));
             }
             parser.path()
@@ -4463,12 +4285,30 @@ impl<'a> ExprParser<'a> {
 
     /// `set_operand := :value | if_not_exists '(' path ',' set_operand ')'
     ///              | list_append '(' set_operand ',' set_operand ')' | path`
+    ///
+    /// Read at the TOP of a `SET` value, where no function encloses the operand.
     fn set_operand(&mut self) -> Result<SetOperand, RequestError> {
+        self.set_operand_of(None)
+    }
+
+    /// The same operand, read at the position ONE function's operand list states it in:
+    /// `enclosing` names that function, and is `None` where the operand is the value's own
+    /// (or one side of its arithmetic).
+    ///
+    /// A function's operand states a value or the location one is read from, so a CALL
+    /// written there is a function used where the grammar takes neither
+    /// ([`function_nests_in`]) — the one nesting the update-expression reference writes
+    /// excepted. Such a call is refused naming the function that is used that way rather
+    /// than evaluated, so an expression AWS reads as malformed never writes an item.
+    fn set_operand_of(&mut self, enclosing: Option<&str>) -> Result<SetOperand, RequestError> {
         if let Some(name) = self.peek_call() {
             // The two functions a `SET` value may call, each held to its documented
             // signature like every other call this service reads.
             if !matches!(name.as_str(), "if_not_exists" | "list_append") {
                 return Err(unknown_function(self.member, &name));
+            }
+            if enclosing.is_some_and(|enclosing| !function_nests_in(&name, enclosing)) {
+                return Err(function_used_this_way(self.member, &name));
             }
             self.at += 2;
             self.descend()?;
@@ -4478,12 +4318,15 @@ impl<'a> ExprParser<'a> {
                 "if_not_exists" => {
                     let path = self.function_path(&name, stated.is_some())?;
                     self.expect(&ExprToken::Comma)?;
-                    SetOperand::IfNotExists(path, Box::new(self.set_operand()?))
+                    SetOperand::IfNotExists(path, Box::new(self.set_operand_of(Some(&name))?))
                 }
                 _ => {
-                    let first = self.set_operand()?;
+                    let first = self.set_operand_of(Some(&name))?;
                     self.expect(&ExprToken::Comma)?;
-                    SetOperand::ListAppend(Box::new(first), Box::new(self.set_operand()?))
+                    SetOperand::ListAppend(
+                        Box::new(first),
+                        Box::new(self.set_operand_of(Some(&name))?),
+                    )
                 }
             };
             self.depth -= 1;

@@ -265,7 +265,9 @@ async fn updated_old_reports_the_touched_attributes_as_they_stood() {
 
 /// RULE: a type `ADD` cannot combine with what the attribute HOLDS is still refused, so the
 /// list form above is one more data type the action combines and not a dropped rule. The
-/// refusal names neither operand, which is how this service words that class.
+/// refusal names neither operand, which is how this service words that class — told apart
+/// from a VALUE of a type the action is not defined over at all, which is the parameter-value
+/// refusal naming the action and that type (`tests/all/legacy_action_value_domains.rs`).
 #[tokio::test]
 async fn an_add_the_stored_type_cannot_combine_with_is_refused() {
     let router = emulator();
@@ -273,7 +275,9 @@ async fn an_add_the_stored_type_cannot_combine_with_is_refused() {
     seeded(&router, "mismatched").await;
 
     // Each row: the entry, and why the stored type cannot take it — a list onto a map, a
-    // set onto a number, one set type onto another, and a scalar onto a list.
+    // set onto a number, one set type onto another, and a number onto a list. Every value
+    // here is one the action IS defined over, so what refuses each row is the type the item
+    // holds at that attribute.
     for (case, updates) in [
         (
             "a list added onto a stored map",
@@ -288,8 +292,8 @@ async fn an_add_the_stored_type_cannot_combine_with_is_refused() {
             json!({"ss": {"Action": "ADD", "Value": {"NS": ["1"]}}}),
         ),
         (
-            "a string added onto a stored list",
-            json!({"l": {"Action": "ADD", "Value": {"S": "x"}}}),
+            "a number added onto a stored list",
+            json!({"l": {"Action": "ADD", "Value": {"N": "1"}}}),
         ),
     ] {
         let (status, body) = call(

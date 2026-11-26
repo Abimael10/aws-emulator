@@ -898,7 +898,9 @@ fn update_item(
     // What a clause DOES is decided against the value the stored item already holds — an
     // operand of the wrong type for it is the stored data's answer to the statement — so
     // from here every refusal is one the statement earned at its table ([`at_table`]).
-    let touched = clauses.apply(&mut item).map_err(at_table(name))?;
+    let touched = clauses
+        .apply(&mut item, crate::state::UpdateTarget::of(before.as_ref()))
+        .map_err(at_table(name))?;
     for attribute in touched.attributes() {
         if attribute.as_str() == partition_key.as_str()
             || Some(attribute.as_str()) == sort_key.as_deref()

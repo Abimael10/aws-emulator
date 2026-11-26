@@ -15,7 +15,9 @@
 //!    so the operand-type sentence would point a caller at a signature that is not what is
 //!    wrong ("contains (path, operand) ... The path and the operand must be distinct; for
 //!    example, contains (a, a) returns an error" — the `ConditionExpression` function
-//!    reference, stated of "this operator or function" generally).
+//!    reference, stated of "this operator or function" generally). The rule is asked
+//!    BEFORE the rules about the TYPE a position holds, so even `attribute_type`, whose
+//!    second position takes a type NAME, states this defect for a path repeated there.
 //!
 //! 2. An expression whose text ENDS where the grammar still needs a token — inside a call,
 //!    after a separator, after an operand, before a bound, before a closing parenthesis —
@@ -196,6 +198,29 @@ async fn an_operator_relating_a_location_to_itself_is_refused_for_non_distinctne
             request: json!({"TableName": TABLE, "Key": key(),
                             "ConditionExpression": "begins_with(s, s)"}),
             expected: enveloped(&non_distinct("ConditionExpression", "begins_with", "[s]")),
+        },
+        Row {
+            // The type test is read for this rule on the same footing, BEFORE the rule
+            // about what its second position holds: the position takes a type NAME, and a
+            // path written there is the location the first operand already addresses, so
+            // the defect is the non-distinctness and not the operand's kind.
+            case: "a delete's condition type-testing an aliased path against itself",
+            operation: "DeleteItem",
+            request: json!({"TableName": TABLE, "Key": key(),
+                            "ConditionExpression": "attribute_type(#a.#b, #a.#b)",
+                            "ExpressionAttributeNames": {"#a": "m", "#b": "leaf"}}),
+            expected: enveloped(&non_distinct(
+                "ConditionExpression",
+                "attribute_type",
+                "[m, leaf]",
+            )),
+        },
+        Row {
+            case: "a scan's filter type-testing a nested path against itself",
+            operation: "Scan",
+            request: json!({"TableName": TABLE,
+                            "FilterExpression": "attribute_type(m.leaf, m.leaf)"}),
+            expected: non_distinct("FilterExpression", "attribute_type", "[m, leaf]"),
         },
         Row {
             case: "a put's condition comparing an attribute with itself",

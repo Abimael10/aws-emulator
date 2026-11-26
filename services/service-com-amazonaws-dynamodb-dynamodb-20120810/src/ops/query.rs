@@ -581,22 +581,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(table.key_schema.as_slice(), |index| index.key_schema);
         let condition = KeyCondition::resolve(table, schema, comparisons).map_err(lift)?;
         // "A FilterExpression does not allow key attributes. You cannot define a
-        // filter expression based on a partition key or a sort key": which attributes
-        // the filter reads comes from the filter this request stated — in either
-        // generation of the member that states it — judged against EVERY key schema the
-        // read is addressed through: the table's own, and the index's when the request
-        // named one. An index query reads items of the table, so the table's key
-        // attributes are primary key attributes there too.
+        // filter expression based on a partition key or a sort key": the key attributes
+        // in force are the ones of the key schema this read is ADDRESSED THROUGH — the
+        // index's when the request names one, the table's own otherwise — because that
+        // is the schema whose keys select what the read walks. An attribute that is only
+        // a key of a schema this read does not go through (a base-table key attribute on
+        // an index query) is an ordinary attribute of that walk, so a filter may narrow
+        // on it.
+        //
+        // Read in the order the key schema DECLARES its elements, so a filter naming
+        // more than one of them is refused for the partition key it named before the
+        // sort key, whatever the attributes are called.
         //
         // The sentence names the member the REQUEST filtered through
         // ([`crate::state::ReadFilter::stated_member`]), so a request that stated its
         // filter the legacy way is told about the map it sent rather than about an
         // expression member it never sent.
         let filter_attributes: ::std::collections::BTreeSet<String> = filter.attributes();
-        if let Some(key) = filter_attributes
-            .iter()
-            .find(|attribute| table.is_table_key(attribute) || condition.is_key(attribute))
-        {
+        if let Some(key) = condition.key_named_among(&filter_attributes) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "{} can only contain non-primary key attributes: Primary key attribute: {key}",
                 filter.stated_member()
@@ -1236,7 +1238,7 @@ struct KeyCondition {
     /// Every key attribute that schema declares, in the order it declares them. Kept
     /// whether or not the condition constrains each of them, because they are key
     /// attributes of the schema being read either way — which is what a
-    /// `FilterExpression` may not name ([`Self::is_key`]).
+    /// `FilterExpression` may not name ([`Self::key_named_among`]).
     key_names: Vec<String>,
     partition: crate::state::AttributeValueKey,
     /// The equality conditions on the key attributes the comparison below does not
@@ -1627,11 +1629,21 @@ impl KeyCondition {
         })
     }
 
-    /// Whether `attribute` is a key attribute of the schema this query reads, which is
-    /// what a `FilterExpression` may not name — whether or not the condition constrains
-    /// it.
-    fn is_key(&self, attribute: &str) -> bool {
-        self.key_names.iter().any(|name| name == attribute)
+    /// The first key attribute of the schema this query reads that `filtered` names, or
+    /// `None` when it names none of them: what a `FilterExpression` may not speak of —
+    /// whether or not the condition constrains it.
+    ///
+    /// Answered in the order the SCHEMA declares its elements rather than in the order the
+    /// filter's attributes happen to be collected, so a filter naming both of a schema's
+    /// key attributes is refused for the partition key it named.
+    fn key_named_among<'n>(
+        &'n self,
+        filtered: &::std::collections::BTreeSet<String>,
+    ) -> Option<&'n str> {
+        self.key_names
+            .iter()
+            .map(String::as_str)
+            .find(|name| filtered.contains(*name))
     }
 }
 

@@ -18,8 +18,8 @@
 //! 4. every clause of one update resolves its document paths against the item as it
 //!    stood BEFORE the update, and `UPDATED_NEW` reports the value at each path the
 //!    expression NAMED;
-//! 5. `size()` of a String is its length in UTF-8 BYTES, which is what the condition a
-//!    write is gated by compares;
+//! 5. `size()` of a String is its length in UTF-16 CODE UNITS, which is what the condition
+//!    a write is gated by compares;
 //! 6. a modeled error names itself on the wire by its API-version-qualified shape id,
 //!    and the error CLASS follows what the caller can do about the request: a parameter
 //!    the caller must change is a `ValidationException`, and a limit on the work one
@@ -774,24 +774,26 @@ async fn writes_past_the_end_of_one_list_append_in_the_order_of_their_indices() 
 }
 
 #[tokio::test]
-async fn size_of_a_string_counts_utf8_bytes() {
+async fn size_of_a_string_counts_utf16_code_units() {
     let router = emulator();
     create_active_table(&router, "Sizes", &[("pk", "HASH", "S")]).await;
 
-    // One row per byte width a UTF-8 character can take, plus a mixture and the empty
-    // string: `(the string, its bytes, its characters)`. `size` "returns the length of
-    // the string in bytes" (the `size` function's own documentation), so the rows where
-    // the two counts differ are what tells the rule apart from counting characters.
+    // One row per width a character can take, plus a mixture and the empty string:
+    // `(the string, its UTF-16 code units, its UTF-8 bytes)`. `size` of a String is its
+    // length in the code units the characters are carried in, so the rows where the two
+    // counts differ are what tells that rule apart from counting the transfer bytes: a
+    // character of the basic multilingual plane is ONE code unit whatever its encoding
+    // needs, and one outside that plane is the two a surrogate pair spells it with.
     let strings: Vec<(&str, i64, i64)> = vec![
         ("", 0, 0),
         ("ascii", 5, 5),
-        ("é", 2, 1),
-        ("日本語", 9, 3),
-        ("a\u{00e9}\u{65e5}\u{1f600}", 1 + 2 + 3 + 4, 4),
-        ("\u{1f600}\u{1f600}", 8, 2),
+        ("é", 1, 2),
+        ("日本語", 3, 9),
+        ("a\u{00e9}\u{65e5}\u{1f600}", 1 + 1 + 1 + 2, 1 + 2 + 3 + 4),
+        ("\u{1f600}\u{1f600}", 4, 8),
     ];
-    for (text, bytes, characters) in strings {
-        let key = format!("len-{bytes}");
+    for (text, units, bytes) in strings {
+        let key = format!("len-{units}-{bytes}");
         ok(
             &router,
             "PutItem",
@@ -799,33 +801,33 @@ async fn size_of_a_string_counts_utf8_bytes() {
                    "Item": {"pk": {"S": &key}, "s": {"S": text}}}),
         )
         .await;
-        // A conditional write gated on the BYTE count lands.
+        // A conditional write gated on the CODE UNIT count lands.
         ok(
             &router,
             "PutItem",
             json!({"TableName": "Sizes",
                    "Item": {"pk": {"S": &key}, "s": {"S": text}, "ok": {"BOOL": true}},
                    "ConditionExpression": "size(s) = :n",
-                   "ExpressionAttributeValues": {":n": {"N": bytes.to_string()}}}),
+                   "ExpressionAttributeValues": {":n": {"N": units.to_string()}}}),
         )
         .await;
-        // The same write gated on the CHARACTER count lands only where the two agree.
+        // The same write gated on the UTF-8 BYTE count lands only where the two agree.
         let (status, body) = call(
             &router,
             "PutItem",
             json!({"TableName": "Sizes",
                    "Item": {"pk": {"S": &key}, "s": {"S": text}},
                    "ConditionExpression": "size(s) = :n",
-                   "ExpressionAttributeValues": {":n": {"N": characters.to_string()}}}),
+                   "ExpressionAttributeValues": {":n": {"N": bytes.to_string()}}}),
         )
         .await;
-        let expected_status = if bytes == characters { 200 } else { 400 };
+        let expected_status = if bytes == units { 200 } else { 400 };
         assert_eq!(
             status, expected_status,
-            "case {text:?} ({bytes} bytes, {characters} characters): expected HTTP \
-             {expected_status} for a condition on the character count, got {status} {body}"
+            "case {text:?} ({units} code units, {bytes} bytes): expected HTTP \
+             {expected_status} for a condition on the byte count, got {status} {body}"
         );
-        // And the inequalities read the byte count too.
+        // And the inequalities read the code unit count too.
         for (comparison, holds) in [
             (format!("size(s) < :{}", "n"), false),
             ("size(s) <= :n".to_string(), true),
@@ -838,14 +840,14 @@ async fn size_of_a_string_counts_utf8_bytes() {
                 json!({"TableName": "Sizes",
                        "Item": {"pk": {"S": &key}, "s": {"S": text}},
                        "ConditionExpression": comparison,
-                       "ExpressionAttributeValues": {":n": {"N": bytes.to_string()}}}),
+                       "ExpressionAttributeValues": {":n": {"N": units.to_string()}}}),
             )
             .await;
             let expected_status = if holds { 200 } else { 400 };
             assert_eq!(
                 status, expected_status,
-                "case {text:?} {comparison:?} against its {bytes} bytes: expected HTTP \
-                 {expected_status}, got {status} {body}"
+                "case {text:?} {comparison:?} against its {units} code units: expected \
+                 HTTP {expected_status}, got {status} {body}"
             );
         }
     }

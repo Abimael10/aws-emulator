@@ -326,18 +326,6 @@ fn refusal_rows() -> Vec<RefusalRow> {
                 .to_string(),
         },
         RefusalRow {
-            case: "an index query filtering on one of the TABLE's key attributes",
-            operation: "Query",
-            body: json!({"TableName": TABLE, "IndexName": "ByGpkAll",
-                         "KeyConditionExpression": "gpk = :g",
-                         "FilterExpression": "sk = :s",
-                         "ExpressionAttributeValues": {":g": {"S": "g1"},
-                                                       ":s": {"S": "a"}}}),
-            message: "Filter Expression can only contain non-primary key attributes: \
-                      Primary key attribute: sk"
-                .to_string(),
-        },
-        RefusalRow {
             case: "an index query filtering on one of the INDEX's key attributes",
             operation: "Query",
             body: json!({"TableName": TABLE, "IndexName": "ByGpkAll",

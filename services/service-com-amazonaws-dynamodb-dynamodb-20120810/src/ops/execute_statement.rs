@@ -998,7 +998,9 @@ fn update_item(
     }
 
     let mut item = before.clone().unwrap_or_default();
-    let touched = clauses.apply(&mut item).map_err(lift)?;
+    let touched = clauses
+        .apply(&mut item, crate::state::UpdateTarget::of(before.as_ref()))
+        .map_err(lift)?;
     for attribute in touched.attributes() {
         if attribute.as_str() == partition_key.as_str()
             || Some(attribute.as_str()) == sort_key.as_deref()

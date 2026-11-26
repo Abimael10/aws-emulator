@@ -1656,7 +1656,7 @@ fn resolve_element(
             // it BUILDS the item trips exactly when the item the change would leave is past
             // the quota in its own bytes ([`refused_update_outcome`]).
             let touched = applied
-                .apply(&mut item)
+                .apply(&mut item, crate::state::UpdateTarget::of(before.as_ref()))
                 .map_err(crate::state::refused_in_element)
                 .map_err(refused_update_outcome)?;
             for attribute in touched.attributes() {

@@ -582,7 +582,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             update.stated_paths(),
         )
         .map_err(lift)?;
-        let touched = update.apply(&mut item).map_err(lift)?;
+        let touched = update
+            .apply(&mut item, crate::state::UpdateTarget::of(before.as_ref()))
+            .map_err(lift)?;
         // "Edits an existing item's attributes, OR ADDS A NEW ITEM to the table if it
         // does not already exist" (this operation's doc): an update that STATES clauses
         // adds the item at its key only where one of those clauses gave it a value, so an
