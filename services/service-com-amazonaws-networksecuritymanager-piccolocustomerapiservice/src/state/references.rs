@@ -92,3 +92,17 @@ pub(super) fn is_entity_version(value: &str) -> bool {
         && !value.starts_with('0')
         && value.bytes().all(|byte| byte.is_ascii_digit())
 }
+
+/// The unversioned identifier and the version a version-qualified identifier names —
+/// `None` when the value carries no version suffix.
+///
+/// Beside [`is_entity_version`] rather than in either snapshot module, so the snapshot
+/// lookup of every entity reads "`<identifier>`:`<version>`" exactly as the reference
+/// graph does.
+pub(super) fn version_qualified(identifier: &str) -> Option<(&str, u32)> {
+    let (unversioned, suffix) = identifier.rsplit_once(':')?;
+    if !is_entity_version(suffix) {
+        return None;
+    }
+    Some((unversioned, suffix.parse().ok()?))
+}

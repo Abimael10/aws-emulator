@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRuleSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRuleSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Freezes the rule's PUBLISHED version as an immutable snapshot and PERSISTS it in
+//! [`crate::state`]: the response is rendered from the stored snapshot, so a read of the
+//! version-qualified identifier it answers with (`<ruleArn>:<version>`) observes exactly
+//! what this call returned, however far the live rule moves on afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRuleSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a snapshot freezes, and what it reads from the live rule, is decided once in
+//! [`crate::state::RuleSnapshot::facts`] rather than here.
 //!
 //! ## Shape of an operation
 //!
@@ -186,20 +184,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRuleSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRuleSnapshot"))
+        // The model documents `ruleIdentifier` as the rule's ARN, so a value of another
+        // form is a FIELD of this request that failed validation rather than an identifier
+        // naming a rule that is absent: it is refused before the store is consulted at
+        // all, exactly as every other operation naming a rule refuses it.
+        if let Some(message) = crate::state::identifier_arn_violation(
+            crate::state::RULE_IDENTIFIER_MEMBER,
+            &input.rule_identifier,
+        ) {
+            return Err(CreateRuleSnapshotErrorModeled::ValidationException(
+                ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: None,
+                    message,
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        let Some(rule_id) = store.resolve_rule_id(&input.rule_identifier) else {
+            // The wording this service states for a miss: the resource type being resolved
+            // and the rule id the identifier names, from `crate::state`'s one home for the
+            // sentence, so every operation that resolves such an identifier words it alike.
+            return Err(CreateRuleSnapshotErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::RESOURCE_TYPE_RULE,
+                    &input.rule_identifier,
+                ),
+            )
+            .into());
+        };
+
+        // `clientToken` is `@idempotencyToken`: "If you retry a request with the same
+        // client token and the same parameters, the service returns the result of the
+        // original successful request." The record names the rule and the version the
+        // original call froze, so the replay is answered from that stored snapshot and
+        // freezes nothing a second time.
+        if let Some(facts) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .filter(|call| call.resource_id == rule_id)
+            .map(|call| call.version)
+            .and_then(|version| {
+                let rule = store.rules.get(&rule_id)?;
+                Some(store.rule_snapshot(&rule_id, version)?.facts(rule))
+            })
+        {
+            return Ok(output_of(facts));
+        }
+
+        let Some(rule) = store.rules.get(&rule_id) else {
+            return Err(CreateRuleSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule resolved from the identifier is no longer stored"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // This operation snapshots "the current published version of the specified rule",
+        // so a rule that has never published one has nothing to copy: the modelled
+        // `ConflictException` — "it is in a state that does not allow the requested
+        // operation".
+        let Some(published) = rule.published.clone() else {
+            return Err(CreateRuleSnapshotErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::NO_PUBLISHED_VERSION_MESSAGE.to_string(),
+                    resource_id: Some(rule.rule_id.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
+                },
+            )
+            .into());
+        };
+        let version = published.version;
+        let snapshot_arn = format!("{}:{version}", rule.rule_arn);
+
+        // A snapshot is an IMMUTABLE copy of one published version, so the snapshot of a
+        // version is taken once: a later call naming a published version this store
+        // already froze answers with the stored copy rather than freezing a second one.
+        if let Some(facts) = store
+            .rule_snapshot(&rule_id, version)
+            .map(|snapshot| snapshot.facts(rule))
+        {
+            if let Some(key) = idempotency_key {
+                store.remember_idempotent_call(key, rule_id, version);
+            }
+            return Ok(output_of(facts));
+        }
+
+        // The store is bounded per rule: past its capacity a snapshot is REFUSED with the
+        // modelled quota error rather than growing the process for as long as callers keep
+        // asking.
+        if store.rule_snapshot_count(&rule_id) >= crate::state::MAX_RULE_SNAPSHOTS {
+            return Err(
+                CreateRuleSnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this rule already holds the maximum of {} snapshots",
+                            crate::state::MAX_RULE_SNAPSHOTS
+                        ),
+                        resource_id: Some(rule_id.clone()),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
+                        ..ServiceQuotaExceededException::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let snapshot = crate::state::RuleSnapshot {
+            rule_id: rule_id.clone(),
+            rule_arn: snapshot_arn,
+            published,
+            update_token: crate::state::mint_update_token(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+        };
+
+        // Rendered from the record that is about to be stored, so the response cannot
+        // disagree with what a later read of the same version returns.
+        let facts = snapshot.facts(rule);
+        store
+            .rule_snapshots
+            .insert((rule_id.clone(), version), snapshot);
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, rule_id, version);
+        }
+        Ok(output_of(facts))
+    }
+}
+
+/// The `CreateRuleSnapshotOutput` view of a persisted snapshot.
+fn output_of(facts: crate::state::RuleFacts) -> CreateRuleSnapshotOutput {
+    CreateRuleSnapshotOutput {
+        rule_id: facts.rule_id,
+        rule_arn: facts.rule_arn,
+        rule_name: facts.rule_name,
+        rule_description: facts.rule_description,
+        firewall_type: facts.firewall_type,
+        rule_type: Some(facts.rule_type),
+        configuration: facts.configuration,
+        status: facts.status,
+        version: facts.version,
+        update_token: Some(facts.update_token),
+        is_snapshot: Some(facts.is_snapshot),
+        has_published_version: Some(facts.has_published_version),
+        updated_at: Some(facts.updated_at),
     }
 }

@@ -66,6 +66,12 @@ pub struct Rule {
     pub update_token: String,
     pub is_snapshot: bool,
     pub has_published_version: bool,
+    /// The rule's PUBLISHED version: the body as it stood when a create or update last
+    /// published one, which a draft update leaves alone, and which [`super::RuleSnapshot`]
+    /// copies. `None` until the rule publishes a version, so it is `Some` exactly when
+    /// [`Rule::has_published_version`] is true — a create or update writes the two
+    /// together.
+    pub published: Option<super::RuleVersion>,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,

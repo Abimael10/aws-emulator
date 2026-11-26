@@ -312,6 +312,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         rule.version = rule.version.saturating_add(1);
         rule.update_token = crate::state::mint_update_token();
         rule.updated_at = now;
+        // An update that publishes records the body it just wrote as the rule's published
+        // version; a draft update moves the live record on and leaves the published
+        // version — the body `CreateRuleSnapshot` copies — as it stood.
+        if input.is_published {
+            rule.published = Some(rule.version_body());
+        }
 
         // Rendered from the stored record, so the response cannot disagree with what a
         // later `GetRule` returns.

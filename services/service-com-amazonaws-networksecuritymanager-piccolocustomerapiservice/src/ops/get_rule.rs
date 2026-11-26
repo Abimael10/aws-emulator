@@ -199,7 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let Some(rule) = store.rule_by_identifier(&input.rule_identifier) else {
+        // What `ruleIdentifier` names: the live rule, or the snapshot of one published
+        // version for that ARN carrying a version suffix. Resolved through
+        // `crate::state::rule_facts`, so this read and `CreateRuleSnapshot` cannot
+        // disagree about what a snapshot holds.
+        let Some(facts) = store.rule_facts(&input.rule_identifier) else {
             // The wording this service states for a miss: the resource type the read
             // resolves and the rule id the identifier names. The sentence itself is
             // `crate::state`'s, so every entity's miss is worded alike.
@@ -213,19 +217,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetRuleOutput {
-            rule_id: rule.rule_id.clone(),
-            rule_arn: rule.rule_arn.clone(),
-            rule_name: rule.rule_name.clone(),
-            rule_description: rule.rule_description.clone(),
-            firewall_type: rule.firewall_type.clone(),
-            rule_type: Some(rule.rule_type.clone()),
-            configuration: rule.configuration.clone(),
-            status: rule.status.clone(),
-            version: rule.version_string(),
-            update_token: Some(rule.update_token.clone()),
-            is_snapshot: Some(rule.is_snapshot),
-            has_published_version: Some(rule.has_published_version),
-            updated_at: Some(rule.updated_at_timestamp()),
+            rule_id: facts.rule_id,
+            rule_arn: facts.rule_arn,
+            rule_name: facts.rule_name,
+            rule_description: facts.rule_description,
+            firewall_type: facts.firewall_type,
+            rule_type: Some(facts.rule_type),
+            configuration: facts.configuration,
+            status: facts.status,
+            version: facts.version,
+            update_token: Some(facts.update_token),
+            is_snapshot: Some(facts.is_snapshot),
+            has_published_version: Some(facts.has_published_version),
+            updated_at: Some(facts.updated_at),
         })
     }
 }

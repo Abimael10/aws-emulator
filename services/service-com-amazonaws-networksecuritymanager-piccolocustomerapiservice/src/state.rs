@@ -13,12 +13,14 @@
 //! Deployment record in [`deployments`], the Template record in [`templates`] and the
 //! Scope record in [`scopes`], re-exported here so `crate::state::<name>` keeps naming
 //! every one of them. The references those records hold between one another — the graph a
-//! delete consults before removing anything — live in [`references`], and a policy's
-//! published version and the snapshots taken of it in [`policy_snapshots`].
+//! delete consults before removing anything — live in [`references`], a policy's
+//! published version and the snapshots taken of it in [`policy_snapshots`], and a rule's
+//! in [`rule_snapshots`].
 
 mod deployments;
 mod policy_snapshots;
 mod references;
+mod rule_snapshots;
 mod rules;
 mod scopes;
 mod templates;
@@ -26,6 +28,7 @@ mod templates;
 pub use deployments::*;
 pub use policy_snapshots::*;
 pub use references::*;
+pub use rule_snapshots::*;
 pub use rules::*;
 pub use scopes::*;
 pub use templates::*;
@@ -674,6 +677,12 @@ pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     /// Rules are NOT indexed by name: unlike a policy, two rules may carry the same
     /// `ruleName` and remain distinct resources.
     pub rules: BTreeMap<String, Rule>,
+    /// Every snapshot taken of a rule's published version, keyed by that rule's `ruleId`
+    /// and the version the snapshot froze — so one published version has one snapshot, and
+    /// the snapshots of one rule are iterated in version order. At most
+    /// [`MAX_RULE_SNAPSHOTS`] entries per rule; a rule's snapshots are removed with the
+    /// rule.
+    pub rule_snapshots: BTreeMap<(String, u32), RuleSnapshot>,
     /// Monotonic counter feeding [`Self::mint_rule_id`].
     pub next_rule_seq: u64,
     /// Every persisted deployment, keyed by its `deploymentId` and so iterated in a

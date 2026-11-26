@@ -220,6 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.rules.remove(&rule_id);
+        // A snapshot is a version of the rule, so it goes with the rule: keeping one would
+        // leave a version-qualified identifier resolving against a rule no read can reach.
+        store
+            .rule_snapshots
+            .retain(|(snapshot_rule, _), _| *snapshot_rule != rule_id);
         // The idempotency records too: a token that produced this rule can no longer
         // replay it, so keeping the row would only hold memory for an id no call can read
         // again.

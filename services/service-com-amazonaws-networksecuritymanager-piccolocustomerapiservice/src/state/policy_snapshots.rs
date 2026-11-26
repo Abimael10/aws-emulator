@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use super::{
     ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState as State, Policy,
-    STATUS_ACTIVE, to_date_time,
+    STATUS_ACTIVE, to_date_time, version_qualified,
 };
 use crate::ops::types::{AssociatedTemplateOrRule, PolicyConfiguration};
 
@@ -188,17 +188,4 @@ impl State {
         let snapshot = self.policy_snapshot(&policy.policy_id, version)?;
         Some(snapshot.facts(policy))
     }
-}
-
-/// The policy identifier and the version a version-qualified identifier names — `None`
-/// when the value carries no version suffix.
-///
-/// The suffix is read exactly as a reference's is ([`super::is_entity_version`]), so one
-/// reading of "`<identifier>`:`<version>`" serves the reference graph and this lookup.
-fn version_qualified(identifier: &str) -> Option<(&str, u32)> {
-    let (unversioned, suffix) = identifier.rsplit_once(':')?;
-    if !super::references::is_entity_version(suffix) {
-        return None;
-    }
-    Some((unversioned, suffix.parse().ok()?))
 }
