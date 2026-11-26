@@ -31,11 +31,12 @@
 //! Only the rules whose violation the macro cannot expand PAST are judged: a `Policies` entry
 //! that is none of the three things the property accepts, a `Zip` function with no runtime or
 //! no handler to run, an `Events` entry naming no event source type (on the two types that
-//! take one), a `SimpleTable` whose stated primary key says nothing about its type, and an
+//! take one), a `SimpleTable` whose stated primary key says nothing about its type, an
 //! API whose `Auth` states an authorizer that could never authorize a request or a default
-//! authorizer the api does not declare. Everything else a declaration carries is expanded as
-//! written and judged where it lands — by the service that owns the resource the expansion
-//! produced, which is where the real macro leaves it too.
+//! authorizer the api does not declare, and a CONNECTOR asking for a permission the profile of
+//! the pair it runs between does not publish ([`super::connector`]). Everything else a
+//! declaration carries is expanded as written and judged where it lands — by the service that
+//! owns the resource the expansion produced, which is where the real macro leaves it too.
 //!
 //! At most ONE fault per declaration, which is how the validator reports them: the first thing
 //! it finds wrong with a resource is what that resource is invalid for, so the count is the
@@ -66,7 +67,7 @@ const SERVERLESS_TYPES: &[&str] = &[
     LAYER_VERSION,
     STATE_MACHINE,
     "AWS::Serverless::Application",
-    "AWS::Serverless::Connector",
+    CONNECTOR,
     "AWS::Serverless::GraphQLApi",
 ];
 
@@ -140,7 +141,7 @@ pub(super) fn failure(document: &Value) -> Option<String> {
     let causes: Vec<String> = resources
         .iter()
         .filter_map(|(logical_id, declaration)| {
-            fault_in(declaration, &globals)
+            fault_in(declaration, &globals, resources)
                 .map(|detail| format!("Resource with id [{logical_id}] is invalid. {detail}"))
         })
         .collect();
@@ -180,7 +181,14 @@ fn unrecognised_types(resources: &Map<String, Value>) -> Vec<String> {
 /// them ([`super::expanded_resources`]): a runtime or a handler the template states once for
 /// every function is stated for each of them, so a declaration is judged on what it really
 /// carries.
-fn fault_in(declaration: &Value, globals: &Value) -> Option<String> {
+///
+/// A declaration judged against OTHER declarations of the same document — a connector, whose
+/// ends are resources of it — is handed the whole `Resources` section for that reason.
+fn fault_in(
+    declaration: &Value,
+    globals: &Value,
+    resources: &Map<String, Value>,
+) -> Option<String> {
     match resource_type(declaration)? {
         FUNCTION => function_fault(&merged(
             globals.get("Function"),
@@ -205,6 +213,10 @@ fn fault_in(declaration: &Value, globals: &Value) -> Option<String> {
             let properties = declaration.get("Properties").cloned().unwrap_or(Value::Null);
             policies_fault(&properties).or_else(|| events_fault(&properties))
         }
+        // A connector is judged on the permissions the profile of the pair it runs between
+        // publishes, which is the one thing about it the macro cannot expand past
+        // ([`connector`]). `Globals` has no section for this type.
+        CONNECTOR => connector::fault(declaration, resources),
         _ => None,
     }
 }
@@ -597,6 +609,30 @@ mod tests {
                     1,
                     &["Resource with id [Web] is invalid. Unable to set DefaultAuthorizer \
                        because 'Missing' was not defined in 'Authorizers'"],
+                ),
+            ),
+            (
+                "a connector asking a permission its pair does not publish",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {
+                        "Fn": {"Type": FUNCTION, "Properties": {
+                            "Runtime": "python3.12",
+                            "Handler": "index.handler",
+                        }},
+                        "Table": {"Type": SIMPLE_TABLE, "Properties": {}},
+                        "Connector": {"Type": CONNECTOR, "Properties": {
+                            "Source": {"Id": "Fn"},
+                            "Destination": {"Id": "Table"},
+                            "Permissions": ["Delete"],
+                        }},
+                    },
+                }),
+                wrapped(
+                    1,
+                    &["Resource with id [Connector] is invalid. Unsupported 'Permissions' \
+                       provided for connector from AWS::Lambda::Function to \
+                       AWS::DynamoDB::Table; valid values are: Read, Write."],
                 ),
             ),
             (

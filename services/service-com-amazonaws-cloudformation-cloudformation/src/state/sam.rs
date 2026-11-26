@@ -71,13 +71,22 @@
 //! logical id has to name the expanded one, in every section of the processed template.
 //! Nothing else is renamed, so every other reference reads exactly as the template wrote it.
 //!
+//! * An `AWS::Serverless::Connector` is the GRANT between the two resources it names, not a
+//!   resource of its own: the permissions it may ask for come from the profile of its
+//!   source/destination type pair, and where that profile grants on the role the source
+//!   executes as, the connector becomes the `AWS::IAM::ManagedPolicy` attached to that role
+//!   ([`connector`]).
+//!
 //! ## What is left as declared
 //!
 //! An `AWS::Serverless::Application` resolves its template from the AWS Serverless
 //! Application Repository, which needs an outbound connection this emulator does not make,
-//! and an `AWS::Serverless::GraphQLApi` or `AWS::Serverless::Connector` expansion is not
+//! and an `AWS::Serverless::GraphQLApi` expansion is not
 //! modelled here: those declarations are left exactly as the template spells them rather
-//! than expanded into resources nothing computed. The same holds for an event type this
+//! than expanded into resources nothing computed. A connector whose grant is a policy on its
+//! DESTINATION rather than on the source's role is left as declared for the same reason, with
+//! its `Permissions` judged all the same ([`connector`]). The same
+//! holds for an event type this
 //! module does not carry — it contributes no resource, instead of a fabricated one. Every
 //! OTHER macro (`AWS::Include`, a private one) is still unexpanded: this module answers for
 //! the SAM transform alone, which is why [`super::resource_types`] keeps admitting the
@@ -119,6 +128,10 @@ mod object_events;
 /// of the api the transform expands it into.
 mod auth;
 
+/// The CONNECTOR between two resources (`AWS::Serverless::Connector`): the permissions its
+/// source/destination profile publishes, and what the macro refuses that asks for more.
+mod connector;
+
 /// `Some(reason)` for a template body whose declared Serverless transform cannot be applied
 /// to it, worded as the failure the operation that submitted it records; `None` for a body
 /// this macro processes, and for one that does not declare it at all.
@@ -142,6 +155,10 @@ const HTTP_API: &str = "AWS::Serverless::HttpApi";
 const SIMPLE_TABLE: &str = "AWS::Serverless::SimpleTable";
 const LAYER_VERSION: &str = "AWS::Serverless::LayerVersion";
 const STATE_MACHINE: &str = "AWS::Serverless::StateMachine";
+
+/// The type a CONNECTOR between two resources is declared as, which the macro validates
+/// ([`connector`]) and this emulator leaves as declared.
+const CONNECTOR: &str = "AWS::Serverless::Connector";
 
 /// The logical id of the REST API the transform synthesizes for the `Api` events that name
 /// no `RestApiId` ("AWS SAM creates … an implicit API with the logical ID
@@ -600,6 +617,18 @@ fn expanded_resources(
                     added.insert(format!("{logical_id}Role"), conditioned(role, condition));
                 }
             }
+            // A CONNECTOR is the GRANT between the two resources it names rather than a
+            // resource of its own: where its profile publishes a policy on the role the source
+            // executes as, that policy is what the declaration becomes ([`connector`]) and the
+            // declaration itself is gone, as every expanded type is.
+            Some(CONNECTOR) => match connector::expanded(logical_id, declaration, resources) {
+                Some((policy_id, policy)) => {
+                    added.insert(policy_id, conditioned(policy, condition));
+                }
+                None => {
+                    primary.insert(logical_id.clone(), declaration.clone());
+                }
+            },
             // A type the transform does not expand (an `AWS::Serverless::Application`,
             // whose template lives in the Serverless Application Repository) stays exactly
             // as declared, and so does every resource the template writes out itself.
