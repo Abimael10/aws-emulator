@@ -222,7 +222,11 @@ fn entry_of(arn: &str) -> &'static state::AwsManagedPolicy {
 
 /// `Policy$PolicyId` as AWS spells a policy's unique id: the `ANPA` prefix and 17 further
 /// characters, all of the modelled `idType` (len 16..128, pattern `^[\w]+$`).
-fn assert_published_policy_id(case: &str, policy_id: &str) {
+///
+/// `pub(crate)` because the id FORM is one statement for the whole published catalog, which
+/// every suite reading a published policy's id asserts through this one
+/// (`tests/all/published_service_access_policy_families.rs`).
+pub(crate) fn assert_published_policy_id(case: &str, policy_id: &str) {
     assert_eq!(
         policy_id.len(),
         21,

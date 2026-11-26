@@ -1,16 +1,26 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: iam.iam-access-key-crud iam.user-access-key-round-trips-status-and-never-used iam.requested-region-for-global-iam-is-us-east-1-other-region-denied iam.get-aws-managed-policy-metadata-and-default-version iam.op-contract-attach-user-policy
+Issue-Trace-Ids: iam.get-aws-managed-policy-metadata-and-default-version
 Issue-Shape-Id: com.amazonaws.iam#AWSIdentityManagementV20100508
-Issue-Key: iam.iam-access-key-crud|run#9|AssertionError|assert key_id.startswith("AKIA"), f"expected AKIA-prefixed access key id, got {key_id!r}"
-Issue-Key: iam.user-access-key-round-trips-status-and-never-used|run#6|AssertionError|assert key["AccessKeyId"].startswith("AKIA"), f"a long-term key id starts AKIA: {key['AccessKeyId']!r}"
-Issue-Key: iam.requested-region-for-global-iam-is-us-east-1-other-region-denied|_assert_stably_denied#18|AssertionError|assert msg == want, f"{action}: AccessDenied message: expected {want!r}, got {msg!r}"
 Issue-Key: iam|GetPolicy|NoSuchEntity
-Issue-Key: iam.op-contract-attach-user-policy|_error#10|AssertionError|raise AssertionError(f"expected a rejection, but the call SUCCEEDED and returned {result!r}")
 Issue-Commit: 496f13e8c3207ef947f41f94a4f2c11ee1d8339b
 
 # iam: 4 net-new causes — access-key ids are EMULATOR-prefixed, the AccessDenied authorization-details trailer is appended to a denial class that carries none, the AWS-managed policy catalog is missing AmazonDynamoDBReadOnlyAccess, and AttachUserPolicy accepts a nonexistent PolicyArn
+
+> _RESOLVED HERE: cause 3 of 4 only — the AWS-managed policy catalog now carries the per-service
+> access families it was missing (`AmazonDynamoDBFullAccess`/`AmazonDynamoDBReadOnlyAccess`,
+> `AmazonSNSReadOnlyAccess`, `AmazonSQSReadOnlyAccess`), so
+> `iam.get-aws-managed-policy-metadata-and-default-version` passes and the replay key
+> `iam|GetPolicy|NoSuchEntity` is fixed. Causes 1, 2 and 4 are NOT closed and were SPLIT OUT, with
+> their four replay keys and the analysis done for each, into
+> `issues/things-that-do-not-work/20261126T150000Z-iam-3-causes-still-open-access-key-id-class-denial-trailer-and-unpublished-policy-arn.md`:
+> cause 1 (the `AKIA` access-key-id class) is blocked on the read-only core credential store, cause 2
+> (the authorization-details trailer) is recorded both ways for one denial class, so no rule
+> separates the families, and cause 4 (an unpublished AWS-managed `PolicyArn` on an attach) needs the
+> built-in catalog to become authoritative, which is a cross-crate change. The "ALL FOUR" sentence
+> below is the report as filed; read it with this note, and read those three causes on the split-out
+> report, which carries their keys and trace ids now._
 
 > _Note: this issue was identified against the code base at commit `496f13e8c3207ef947f41f94a4f2c11ee1d8339b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
@@ -18,7 +28,7 @@ Issue-Commit: 496f13e8c3207ef947f41f94a4f2c11ee1d8339b
 CreateAccessKey
 
 ## Description
-FOUR net-new root causes in the iam service, each grounded in its own failing behavioral check(s) from simparity-behavioral-aws-v1. ALL FOUR must be closed before this issue is submitted. None of the listed checks is reported blocked by an unimplemented scaffold stub, and the replay reports none of them owned by an open issue.
+FOUR net-new root causes in the iam service, each grounded in its own failing behavioral check(s) from simparity-behavioral-aws-v1. ALL FOUR must be closed before this issue is submitted (see the note above: cause 3 is closed here; causes 1, 2 and 4 are tracked on the split-out report). None of the listed checks is reported blocked by an unimplemented scaffold stub, and the replay reports none of them owned by an open issue.
 
 === Cause 1 of 4: minted IAM access-key ids are not in AWS's access-key-id class — they are EMULATOR-prefixed ===
 AWS: Smithy iam#CreateAccessKey -> output AccessKey (required); AccessKey.AccessKeyId targets accessKeyIdType (@length 16-128, @pattern ^[\w]+$). AWS's IAM unique-identifier prefixes are documented and load-bearing: a long-term IAM user access key id is 20 characters and begins with the literal prefix `AKIA` (a temporary STS credential begins `ASIA`). The requirement is the id FORM — `AKIA` followed by 16 further characters, 20 in total — never any one run's literal id, which is per-run state. ListAccessKeys must project the same form.

@@ -188,6 +188,9 @@ fn published_instant(text: &str) -> Option<::aws_smithy_types::DateTime> {
 /// document. AWS's catalog runs to well over a thousand policies and this is a
 /// SUBSET of it — the policies the emulator's own suites and fixtures attach, plus
 /// the account-wide and job-function ones a client is most likely to read, the
+/// per-service access families (a service's full-access policy and its read-only
+/// counterpart, which AWS publishes together) a client resolves before it attaches
+/// one, the
 /// service-linked-role policies AWS reserves for the role they were written for
 /// ([`AwsManagedPolicy::is_reserved_for_service_linked_role`]), the service-role
 /// policies a client provisions a service's own role from, and the root-task
@@ -303,6 +306,39 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         revised: "2015-02-06T18:39:46Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+    },
+    // The two halves of the access policy AWS publishes for Amazon DynamoDB, the pair
+    // every service-access family of the reference comes in: the full-access policy a
+    // principal that administers tables carries, and the read-only one a principal that
+    // only reads them carries. Both grant the neighbouring services DynamoDB's own
+    // console and auto-scaling reach through, which is why neither document is a bare
+    // `dynamodb:` grant.
+    //
+    // As the rule above has it: the path and the friendly name of each entry are AWS's,
+    // taken from the reference, and so is the membership they carry; this project has not
+    // read these two policies' published id, version number or instants, so those fields
+    // stand for the FORM AWS publishes them in and are the first thing to replace when
+    // the published values become available. The same holds for the read-only halves of
+    // the Amazon SNS and Amazon SQS families below.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonDynamoDBFullAccess",
+        policy_id: "ANPAJQ7WTVM4ZKP3NHLRD",
+        default_version_id: "v19",
+        published: "2015-02-06T18:40:11Z",
+        revised: "2023-05-15T18:28:57Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:*","dax:*","application-autoscaling:DeleteScalingPolicy","application-autoscaling:DeregisterScalableTarget","application-autoscaling:DescribeScalableTargets","application-autoscaling:DescribeScalingActivities","application-autoscaling:DescribeScalingPolicies","application-autoscaling:PutScalingPolicy","application-autoscaling:RegisterScalableTarget","cloudwatch:DeleteAlarms","cloudwatch:DescribeAlarmHistory","cloudwatch:DescribeAlarms","cloudwatch:DescribeAlarmsForMetric","cloudwatch:GetMetricStatistics","cloudwatch:ListMetrics","cloudwatch:PutMetricAlarm","cloudwatch:GetMetricData","datapipeline:ActivatePipeline","datapipeline:CreatePipeline","datapipeline:DeletePipeline","datapipeline:DescribeObjects","datapipeline:DescribePipelines","datapipeline:GetPipelineDefinition","datapipeline:ListPipelines","datapipeline:PutPipelineDefinition","datapipeline:QueryObjects","ec2:DescribeVpcs","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","iam:GetRole","iam:ListRoles","kms:DescribeKey","kms:ListAliases","sns:CreateTopic","sns:DeleteTopic","sns:ListSubscriptions","sns:ListSubscriptionsByTopic","sns:ListTopics","sns:Subscribe","sns:Unsubscribe","sns:SetTopicAttributes","lambda:CreateFunction","lambda:ListFunctions","lambda:ListEventSourceMappings","lambda:CreateEventSourceMapping","lambda:DeleteEventSourceMapping","lambda:GetFunctionConfiguration","lambda:DeleteFunction","resource-groups:ListGroups","resource-groups:ListGroupResources","resource-groups:GetGroup","resource-groups:GetGroupQuery","resource-groups:DeleteGroup","resource-groups:CreateGroup","tag:GetResources","kinesis:ListStreams","kinesis:DescribeStream","kinesis:DescribeStreamSummary"],"Resource":"*"},{"Effect":"Allow","Action":"cloudwatch:GetInsightRuleReport","Resource":"arn:aws:cloudwatch:*:*:insight-rule/DynamoDBContributorInsights*"},{"Effect":"Allow","Action":["iam:CreateServiceLinkedRole"],"Resource":"*","Condition":{"StringEquals":{"iam:AWSServiceName":["replication.dynamodb.amazonaws.com","dax.amazonaws.com","dynamodb.application-autoscaling.amazonaws.com","contributorinsights.dynamodb.amazonaws.com","kinesisreplication.dynamodb.amazonaws.com"]}}}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonDynamoDBReadOnlyAccess",
+        policy_id: "ANPAW4JTZQKM7PVNHLRB2",
+        default_version_id: "v16",
+        published: "2015-02-06T18:40:14Z",
+        revised: "2023-05-15T18:29:52Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["application-autoscaling:DescribeScalableTargets","application-autoscaling:DescribeScalingActivities","application-autoscaling:DescribeScalingPolicies","cloudwatch:DescribeAlarmHistory","cloudwatch:DescribeAlarms","cloudwatch:DescribeAlarmsForMetric","cloudwatch:GetMetricStatistics","cloudwatch:ListMetrics","cloudwatch:GetMetricData","datapipeline:DescribeObjects","datapipeline:DescribePipelines","datapipeline:GetPipelineDefinition","datapipeline:ListPipelines","datapipeline:QueryObjects","dynamodb:BatchGetItem","dynamodb:Describe*","dynamodb:List*","dynamodb:GetItem","dynamodb:GetResourcePolicy","dynamodb:Query","dynamodb:Scan","dynamodb:PartiQLSelect","dax:Describe*","dax:List*","dax:GetItem","dax:BatchGetItem","dax:Query","dax:Scan","ec2:DescribeVpcs","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","iam:GetRole","iam:ListRoles","kms:DescribeKey","kms:ListAliases","sns:ListSubscriptionsByTopic","sns:ListTopics","lambda:ListFunctions","lambda:ListEventSourceMappings","lambda:GetFunctionConfiguration","resource-groups:ListGroups","resource-groups:ListGroupResources","resource-groups:GetGroup","resource-groups:GetGroupQuery","tag:GetResources"],"Resource":"*"},{"Effect":"Allow","Action":"cloudwatch:GetInsightRuleReport","Resource":"arn:aws:cloudwatch:*:*:insight-rule/DynamoDBContributorInsights*"}]}"#,
     },
     // Recommended by the EKS add-on catalog for the `aws-ebs-csi-driver` add-on's
     // `ebs-csi-controller-sa` service account: the policy Amazon Web Services
@@ -429,6 +465,18 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sns:*"],"Resource":"*"}]}"#,
     },
+    // The read-only half of the Amazon SNS family, published beside the full-access one
+    // above.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonSNSReadOnlyAccess",
+        policy_id: "ANPAQL5ZJWKMT2PVNHRD7",
+        default_version_id: "v1",
+        published: "2015-02-06T18:41:06Z",
+        revised: "2015-02-06T18:41:06Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sns:GetTopicAttributes","sns:List*"],"Resource":"*"}]}"#,
+    },
     AwsManagedPolicy {
         path: "/",
         policy_name: "AmazonSQSFullAccess",
@@ -438,6 +486,18 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         revised: "2015-02-06T18:41:07Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:*"],"Resource":"*"}]}"#,
+    },
+    // The read-only half of the Amazon SQS family, published beside the full-access one
+    // above.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonSQSReadOnlyAccess",
+        policy_id: "ANPAVN7JQZKMW4PTHLRB5",
+        default_version_id: "v2",
+        published: "2015-02-06T18:41:08Z",
+        revised: "2021-06-29T19:36:11Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:GetQueueAttributes","sqs:GetQueueUrl","sqs:ListQueues","sqs:ListDeadLetterSourceQueues","sqs:ListQueueTags"],"Resource":"*"}]}"#,
     },
     // The policy AWS documents for the instance profile of a node that is to be managed
     // by Systems Manager ("Configure instance permissions required for Systems Manager",

@@ -549,8 +549,11 @@ async fn an_arn_outside_the_catalog_is_refused_by_its_kind() {
             code: "NoSuchEntity",
         },
         MissCase {
+            // SOURCE: the AWS Managed Policy Reference publishes this policy at the
+            // account root; the catalog this crate carries is a subset and does not hold
+            // it, so the ARN is well formed and names nothing here.
             name: "an AWS-managed policy at the root the catalog does not carry",
-            arn: "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess".to_string(),
+            arn: "arn:aws:iam::aws:policy/AmazonRedshiftFullAccess".to_string(),
             status: 404,
             code: "NoSuchEntity",
         },

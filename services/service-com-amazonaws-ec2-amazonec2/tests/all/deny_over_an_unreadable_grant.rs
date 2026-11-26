@@ -50,8 +50,8 @@ use super::ec2_query::{elements, error_code, error_message};
 const UNREADABLE_GRANT: &str = "arn:aws:iam::aws:policy/AWSCloudFormationFullAccess";
 
 /// A second one, so a row can carry more than one unreadable attachment; its real document
-/// covers `dynamodb:` reads and no `ec2:` action either.
-const OTHER_UNREADABLE_GRANT: &str = "arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess";
+/// covers `ses:` actions and no `ec2:` action either.
+const OTHER_UNREADABLE_GRANT: &str = "arn:aws:iam::aws:policy/AmazonSESFullAccess";
 
 /// An AWS-managed policy whose document this emulator DOES hold, and which grants the read
 /// verbs of every service: a readable grant beside the unreadable one.
