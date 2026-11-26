@@ -543,13 +543,19 @@ fn update_cases() -> Vec<(&'static str, Value, Value)> {
 
 /// `count` distinct wait actions, for the rows that vary how many actions a template
 /// declares.
+///
+/// They form a CHAIN — each action but the first waits for the one before it — so a row
+/// declaring many actions still starts only one of them with the run, which is what keeps it
+/// inside the parallel-action quota (`tests/all/parallel_action_quota.rs`).
 fn wait_actions(count: usize) -> Value {
     let mut actions = serde_json::Map::new();
     for index in 0..count {
-        actions.insert(
-            format!("wait-{index}"),
-            json!({ "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } }),
-        );
+        let mut action =
+            json!({ "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } });
+        if index > 0 {
+            action["startAfter"] = json!([format!("wait-{}", index - 1)]);
+        }
+        actions.insert(format!("wait-{index}"), action);
     }
     Value::Object(actions)
 }

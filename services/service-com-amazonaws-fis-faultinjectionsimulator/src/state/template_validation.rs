@@ -413,6 +413,41 @@ pub fn actions_quota_refusal(
     })
 }
 
+/// `None` when no more of a template's actions START TOGETHER than the parallel-action
+/// quota allows; otherwise the `ServiceQuotaExceededException` that refuses it.
+///
+/// An action's `startAfter` is "the name of the action that must be completed before the
+/// current action starts", so an action that declares one is SEQUENCED behind another
+/// action and an action that declares none starts with the run. The actions counted here
+/// are therefore the unsequenced ones, and a template may carry more actions than this cap
+/// as long as the rest wait for one of them. An EMPTY `startAfter` list names no earlier
+/// action, so it sequences nothing and is counted with them — the same reading of "not
+/// specified" [`targets_refusal`] gives an empty collection.
+///
+/// See [`MAX_PARALLEL_ACTIONS`]. A quota, so FIS answers it with its own error class rather
+/// than as a validation failure.
+pub fn parallel_actions_quota_refusal(
+    actions: &HashMap<String, ExperimentTemplateAction>,
+) -> Option<ServiceQuotaExceededException> {
+    let parallel = actions
+        .values()
+        .filter(|action| {
+            action
+                .start_after
+                .as_ref()
+                .is_none_or(|earlier| earlier.is_empty())
+        })
+        .count();
+    if parallel <= MAX_PARALLEL_ACTIONS {
+        return None;
+    }
+    Some(ServiceQuotaExceededException {
+        message: Some(format!(
+            "The number of parallel actions cannot exceed {MAX_PARALLEL_ACTIONS}"
+        )),
+    })
+}
+
 /// Why a template record is not one this service admits, carrying the error FIS answers it
 /// with.
 ///
@@ -563,6 +598,12 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
     // bounds the work the action graph of this template costs every later
     // `StartExperiment` — a quota, so FIS answers it with its own error class.
     if let Some(refusal) = actions_quota_refusal(&template.actions) {
+        return Some(TemplateRefusal::QuotaExceeded(refusal));
+    }
+    // How many of those actions START TOGETHER is a second quota, judged beside the count
+    // above and before the actions themselves: an action sequenced behind another one is
+    // not among them, so this is the one rule that draws that distinction.
+    if let Some(refusal) = parallel_actions_quota_refusal(&template.actions) {
         return Some(TemplateRefusal::QuotaExceeded(refusal));
     }
     // An action FIS publishes no action for, one missing a parameter its published contract

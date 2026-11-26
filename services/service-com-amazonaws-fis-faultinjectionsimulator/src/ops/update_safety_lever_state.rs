@@ -84,11 +84,13 @@
 //!   running, which is what FIS documents engaging the lever as doing;
 //! * `disengaged` lands immediately: the model declares no transient status on that side.
 //!
-//! `ConflictException` is not reached from here: the lever's own lifecycle has nothing to
-//! conflict with, since a state a caller asks for is accepted whatever state it is in
-//! (engaging it twice neither restarts the span nor takes an engaged lever back to
-//! `engaging`). The conflict an engaged lever DOES cause is a `StartExperiment` refused
-//! while it holds.
+//! `ConflictException` refuses an update that asks for the status the lever is already held
+//! at: the state a request carries is a status and the reason FOR that status, so a request
+//! that changes no status is not a way to rewrite the reason
+//! ([`crate::state::safety_lever_change_refusal`]). It stores nothing and stops no
+//! experiment, while the records the settle it performed materialised are still delivered by
+//! it, as they are by every other refusal this service answers. The other conflict an
+//! engaged lever causes is a `StartExperiment` refused while it holds.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -206,25 +208,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The guard is taken, spent and RELEASED inside this block: the log records the
         // stops below produced are written after it, so nothing is delivered while the
         // store is locked.
-        let (safety_lever, deliveries) = {
+        let (outcome, deliveries) = {
             let mut store = state.lock();
 
-            // Engaging the lever stops the experiments that are running. Done before the
-            // lever's own state is written, and on the same clock a `StopExperiment` puts an
-            // experiment on, so the lever reports `engaging` exactly while the experiments it
-            // stopped are on their way to `stopped`.
-            if engaging {
-                store.stop_experiments_for_safety_lever(now);
-            }
+            // The lever's reason is not independently writable, so an update asking for the
+            // status the lever is already held at is refused rather than applied, which is
+            // what leaves the stored state — its reason included — as the last accepted
+            // status change set it. Judged against the lever as it stands at `now`, the
+            // transition the clock already owed it materialised, so the request is compared
+            // with the status a caller reading the lever would see.
             let record = store.settled_safety_lever(now);
-            if engaging {
-                record.engage(&input.state.reason, now);
-            } else {
-                record.disengage(&input.state.reason);
-            }
-            let safety_lever = record.to_safety_lever(&input.id, &region);
+            let refusal =
+                crate::state::safety_lever_change_refusal(record, input.state.status.as_str());
+            let outcome = match refusal {
+                Some(refusal) => Err(refusal),
+                None => {
+                    // Engaging the lever stops the experiments that are running. Done before
+                    // the lever's own state is written, and on the same clock a
+                    // `StopExperiment` puts an experiment on, so the lever reports `engaging`
+                    // exactly while the experiments it stopped are on their way to `stopped`.
+                    if engaging {
+                        store.stop_experiments_for_safety_lever(now);
+                    }
+                    let record = store.settled_safety_lever(now);
+                    if engaging {
+                        record.engage(&input.state.reason, now);
+                    } else {
+                        record.disengage(&input.state.reason);
+                    }
+                    Ok(record.to_safety_lever(&input.id, &region))
+                }
+            };
+            // Whatever this call answers, the records the settle above materialised belong to
+            // it: a refused call cannot leave the terminal record of a run whose end it
+            // materialised parked in the store for some later call to happen upon.
             let deliveries = store.take_pending_log_deliveries();
-            (safety_lever, deliveries)
+            (outcome, deliveries)
         };
 
         // A stop the lever performed is a move of the stopped experiment's OWN lifecycle,
@@ -232,6 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly as a `StopExperiment` of the same experiment would be. Best effort, and
         // never the caller's problem: see [`crate::state::experiment_logs`].
         crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
+
+        let safety_lever = match outcome {
+            Ok(safety_lever) => safety_lever,
+            Err(refusal) => {
+                return Err(UpdateSafetyLeverStateErrorModeled::ConflictException(refusal).into())
+            }
+        };
 
         Ok(UpdateSafetyLeverStateOutput {
             safety_lever: Some(safety_lever),

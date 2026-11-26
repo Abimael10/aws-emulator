@@ -24,7 +24,8 @@
 //!
 //! The second test is the rule from the other side: the lever writes nothing for an experiment
 //! whose run has NOT ended, and writes the report once a later call of the same operation
-//! materialises the end the lever itself set in motion.
+//! materialises the end the lever itself set in motion — which that call does whether it is
+//! accepted or refused, since the generation was owed by the clock and not by the request.
 //!
 //! The lever request, the report configuration and the post-read generation assertions come
 //! from the sibling suite rather than being copied here.
@@ -54,9 +55,13 @@ const RUN_ELAPSES_AFTER: Duration = Duration::from_secs(13);
 /// documents for that action's `duration`. See [`RUN_ELAPSES_AFTER`].
 const LONGEST_DURATION: &str = "PT10M";
 
-/// How long after the lever asked an experiment to stop that stop must have been
-/// materialised: past the emulator's own non-zero transition span.
-const PAST_STOP_TRANSITION: Duration = Duration::from_millis(900);
+/// How long the second test keeps calling the lever before giving up on the report of the
+/// stop it caused: generous, because the wait ends as soon as the object is there — the
+/// emulator's own transition span is non-zero and well under this.
+const REPORT_LANDS_WITHIN: Duration = Duration::from_secs(30);
+
+/// How long that loop pauses between two looks.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
 
 /// Where a row's report must land, and what its template configured for it.
 enum Reporting {
@@ -311,21 +316,36 @@ async fn the_lever_writes_the_report_of_the_stop_it_caused_once_that_stop_has_la
          s3://{BUCKET}/{key}"
     );
 
-    // Once the stop has fallen due, the next call of the same operation materialises that
-    // end — and with it the report that end makes due. The lever's own engage has taken
-    // effect by now, which is a span of its own and not the experiment's.
-    tokio::time::sleep(PAST_STOP_TRANSITION).await;
-    assert_engaged(
-        case,
-        &engage_lever(&router, "stop everything again").await,
-        "engaged",
-    );
-    let document = report_object(&router, case, &key).await.unwrap_or_else(|| {
-        panic!(
+    // Once the stop has fallen due, a call of the same operation materialises that end — and
+    // with it the report that end makes due. The stop falls due on the CLOCK, so the case
+    // looks again until the report is there instead of waiting a fixed time: the lever is
+    // called in a loop, and the only other call it makes is the Amazon S3 read that looks
+    // for the object, which settles nothing. Each of those lever calls asks for the status
+    // the lever is already held at, so each is REFUSED
+    // (`tests/all/safety_lever_status_change.rs`): the generation it performs is the one the
+    // clock already made due, which the call does whatever it answers the caller.
+    let deadline = std::time::Instant::now() + REPORT_LANDS_WITHIN;
+    let document = loop {
+        let refused = engage_lever(&router, "stop everything again").await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case:?}: an engage of a lever already engaged changes no status, so it is \
+             refused; got {} with {:?}",
+            refused.status, refused.body
+        );
+        if let Some(document) = report_object(&router, case, &key).await {
+            break document;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
             "case {case:?}: expected the lever to write the report of {id} once the stop it \
-             caused had landed, found no object at s3://{BUCKET}/{key}"
-        )
-    });
+             caused had landed, found no object at s3://{BUCKET}/{key} within \
+             {REPORT_LANDS_WITHIN:?}"
+        );
+        // A pause between two looks, so the loop polls rather than spins. The wait ends on
+        // the condition above and never on this interval.
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    };
     assert_eq!(
         document["experiment"]["id"].as_str().unwrap_or_default(),
         id.as_str(),

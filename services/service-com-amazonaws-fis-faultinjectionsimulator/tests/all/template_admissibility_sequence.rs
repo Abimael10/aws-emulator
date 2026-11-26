@@ -57,10 +57,18 @@ fn wait(duration: &str) -> Value {
 }
 
 /// `count` distinct `aws:fis:wait` actions, for the rows about the action quota.
+///
+/// They form a CHAIN — each action but the first waits for the one before it — so however
+/// many actions a row declares, only one of them starts with the run and the row stays
+/// inside the parallel-action quota a separate rule applies (`tests/all/parallel_action_quota.rs`).
 fn waits(count: usize) -> Value {
     let mut actions = Map::new();
     for index in 0..count {
-        actions.insert(format!("wait-{index}"), wait("PT1M"));
+        let mut action = wait("PT1M");
+        if index > 0 {
+            action["startAfter"] = json!([format!("wait-{}", index - 1)]);
+        }
+        actions.insert(format!("wait-{index}"), action);
     }
     Value::Object(actions)
 }

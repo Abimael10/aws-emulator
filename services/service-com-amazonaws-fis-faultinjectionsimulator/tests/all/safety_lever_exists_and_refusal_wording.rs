@@ -220,10 +220,16 @@ async fn the_account_has_its_lever_before_any_call_creates_one() {
 async fn the_lever_that_already_exists_takes_an_update_without_a_create() {
     // The rows differ along the state asked for of a lever NOTHING created: each
     // requestable status, with the status the update itself reports back (an engage takes
-    // effect, so it reports the transient status the service reaches).
-    let cases: [(&str, &str); 2] = [("disengaged", "disengaged"), ("engaged", "engaging")];
+    // effect, so it reports the transient status the service reaches). The disengage is
+    // asked of a lever engaged first, because a request repeating the state the lever is
+    // already held at changes no status and is refused rather than applied
+    // (`tests/all/safety_lever_status_change.rs`).
+    let cases: [(&str, &str, bool); 2] = [
+        ("engaged", "engaging", false),
+        ("disengaged", "disengaged", true),
+    ];
 
-    for (requested, immediate) in cases {
+    for (requested, immediate, engage_first) in cases {
         let case = format!("update-without-create-{requested}");
         assert!(
             REQUESTABLE_STATUSES.contains(&requested),
@@ -231,6 +237,16 @@ async fn the_lever_that_already_exists_takes_an_update_without_a_create() {
         );
         let router = emulator();
         let reason = format!("asked for {requested}");
+
+        if engage_first {
+            let engaged = update_lever(&router, LEVER_ID, "engaged", "engaged first", REGION).await;
+            assert_eq!(
+                engaged.status, 200,
+                "case {case:?}: expected the lever to take the engage this row starts from, \
+                 got {} with {:?}",
+                engaged.status, engaged.body
+            );
+        }
 
         let updated = update_lever(&router, LEVER_ID, requested, &reason, REGION).await;
         assert_eq!(

@@ -303,6 +303,15 @@ pub const MAX_TARGET_ACCOUNT_CONFIGURATIONS: usize = 1_000;
 /// linear in the size of the request instead of growing with it.
 pub const MAX_ACTIONS_PER_TEMPLATE: usize = 20;
 
+/// How many of one experiment template's actions may run IN PARALLEL.
+///
+/// A quota of the account, enforced when the template is built rather than when a run of it
+/// starts: the actions that declare no `startAfter` all start together, so a template
+/// declaring more of them than this describes a run FIS would not carry out. An action that
+/// declares one WAITS for another action to complete, so it is sequenced and does not count
+/// toward this cap ([`parallel_actions_quota_refusal`]).
+pub const MAX_PARALLEL_ACTIONS: usize = 10;
+
 /// The built-in FIS action that waits: "aws:fis:wait — Run a wait action for a specified
 /// duration". Its whole effect is elapsed time, and it is the action whose `duration`
 /// parameter FIS documents a range for.
@@ -2311,11 +2320,30 @@ impl SafetyLeverRecord {
         }
     }
 
+    /// The requestable status this lever is HELD at: the status a request would have to
+    /// change for the update to be one that moves it.
+    ///
+    /// An engage that is still taking effect holds the lever engaged — that is what
+    /// `engaging` says — so it reports the status an engage asks for, and only a disengage
+    /// moves it. The two values this reports are therefore the two
+    /// `SafetyLeverStatusInput` admits, which is what makes it comparable with a request's
+    /// own status ([`safety_lever_change_refusal`]).
+    pub fn held_at(&self) -> SafetyLeverStatusKind {
+        match self.status {
+            SafetyLeverStatusKind::Disengaged => SafetyLeverStatusKind::Disengaged,
+            SafetyLeverStatusKind::Engaging | SafetyLeverStatusKind::Engaged => {
+                SafetyLeverStatusKind::Engaged
+            }
+        }
+    }
+
     /// Engage the lever, recording `reason`.
     ///
-    /// An engage of a lever that is already engaging or engaged records the new reason and
-    /// leaves the transition where it was: the lever is engaged once, so a repeated
-    /// request neither restarts the span nor takes an engaged lever back to `engaging`.
+    /// A lever that is already engaging or engaged is left where it is apart from the
+    /// reason: the lever is engaged once, so nothing restarts the span or takes an engaged
+    /// lever back to `engaging`. `UpdateSafetyLeverState` refuses such a request before it
+    /// gets here ([`safety_lever_change_refusal`]), so the only engage this applies is one
+    /// of a disengaged lever.
     pub fn engage(&mut self, reason: &str, now: SystemTime) {
         if self.status == SafetyLeverStatusKind::Disengaged {
             self.status = SafetyLeverStatusKind::Engaging;
@@ -2394,6 +2422,34 @@ pub fn safety_lever_status_refusal(status: &str) -> Option<ValidationException> 
         return None;
     }
     Some(invalid_input(invalid_safety_lever_status_message(status)))
+}
+
+/// `None` when a request asking the lever for `requested` asks it for a status CHANGE;
+/// otherwise the `ConflictException` (409) that refuses the update.
+///
+/// `UpdateSafetyLeverStateInput` carries the target status and the reason for it TOGETHER,
+/// and the reason is not independently writable: the reason a lever reports is the reason
+/// of the status change that last moved it. So a request naming the status the lever is
+/// already held at carries no change to make, and is refused rather than applied — which is
+/// what leaves the stored reason as the last accepted status change set it.
+///
+/// A lever whose engage is still taking effect ([`SafetyLeverStatusKind::Engaging`]) is
+/// already held engaged, so it answers a further engage the same way a settled one does:
+/// which of the two the clock has reached decides nothing, since neither is a state another
+/// engage would move.
+///
+/// The sentence is FIXED: FIS states the conflict without interpolating the request or the
+/// stored state.
+pub fn safety_lever_change_refusal(
+    record: &SafetyLeverRecord,
+    requested: &str,
+) -> Option<ConflictException> {
+    if requested != record.held_at().as_wire() {
+        return None;
+    }
+    Some(ConflictException {
+        message: Some("Cannot update Safety Lever reason without a status change".to_string()),
+    })
 }
 
 /// The `state.reason` of an experiment the account's safety lever CANCELLED: the experiment

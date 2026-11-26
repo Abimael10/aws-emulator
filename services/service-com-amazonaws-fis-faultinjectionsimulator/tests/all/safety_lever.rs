@@ -268,20 +268,24 @@ fn keys(case: &str, what: &str, value: &Value) -> Vec<String> {
 async fn the_reported_lever_carries_only_the_members_the_model_declares() {
     // The rows differ along what the lever has been asked for, which is what decides
     // whether `reason` is carried and which status is reported: an untouched lever, one
-    // whose engage is still taking effect, and a disengaged one.
-    let cases: [(&str, Option<&str>); 3] = [
-        ("untouched", None),
-        ("engaged", Some("engaged")),
-        ("disengaged", Some("disengaged")),
+    // whose engage is still taking effect, and a disengaged one. The disengage is asked of
+    // a lever that was engaged first, because a request repeating the state the lever is
+    // already held at changes no status and is refused rather than applied
+    // (`tests/all/safety_lever_status_change.rs`).
+    let cases: [(&str, &[&str]); 3] = [
+        ("untouched", &[]),
+        ("engaged", &["engaged"]),
+        ("disengaged", &["engaged", "disengaged"]),
     ];
 
-    for (case, requested) in cases {
+    for (case, requests) in cases {
         let router = emulator();
-        if let Some(requested) = requested {
+        for requested in requests {
             let updated = update_lever(&router, LEVER_ID, requested, case, REGION).await;
             assert_eq!(
                 updated.status, 200,
-                "case {case:?}: expected HTTP 200 from UpdateSafetyLeverState, got {} with {:?}",
+                "case {case:?}: expected HTTP 200 from UpdateSafetyLeverState asking for \
+                 {requested:?}, got {} with {:?}",
                 updated.status, updated.body
             );
         }
@@ -320,20 +324,21 @@ async fn the_reported_lever_carries_only_the_members_the_model_declares() {
             REPORTABLE_STATUSES.contains(&status.as_str()),
             "case {case:?}: expected a modelled SafetyLeverStatus, got {state:?}"
         );
-        match requested {
-            // An update stores the reason it was given, so the lever carries it.
-            Some(_) => assert_eq!(
-                state["reason"].as_str().unwrap_or_default(),
-                case,
-                "case {case:?}: expected the stored reason, got {state:?}"
-            ),
-            // Nothing has stored one, so the lever still carries the reason it was
-            // seeded with.
-            None => assert_eq!(
+        if requests.is_empty() {
+            // Nothing has stored one, so the lever still carries the reason it was seeded
+            // with.
+            assert_eq!(
                 state["reason"].as_str().unwrap_or_default(),
                 INITIAL_REASON,
                 "case {case:?}: expected the initial reason on an untouched lever, got {state:?}"
-            ),
+            );
+        } else {
+            // An update stores the reason it was given, so the lever carries it.
+            assert_eq!(
+                state["reason"].as_str().unwrap_or_default(),
+                case,
+                "case {case:?}: expected the stored reason, got {state:?}"
+            );
         }
     }
 }
@@ -420,9 +425,11 @@ struct Step {
 #[tokio::test]
 async fn the_state_a_request_asks_for_is_persisted_and_taken_up_on_the_clock() {
     // The rows differ along the state asked for, the state the lever is already in, and
-    // how many updates it takes: every ordered pair of the two requestable states, plus
-    // each of them on its own.
-    let cases: [(&str, Vec<Step>); 5] = [
+    // how many updates it takes: each requestable state asked for from the other one, and a
+    // lever taken through both and back again. No row repeats the state the lever is already
+    // held at: that asks for no state change at all, which is refused rather than persisted
+    // (`tests/all/safety_lever_status_change.rs`).
+    let cases: [(&str, Vec<Step>); 3] = [
         (
             "engage-an-untouched-lever",
             vec![Step {
@@ -430,29 +437,6 @@ async fn the_state_a_request_asks_for_is_persisted_and_taken_up_on_the_clock() {
                 immediate: "engaging",
                 settled: "engaged",
             }],
-        ),
-        (
-            "disengage-an-untouched-lever",
-            vec![Step {
-                requested: "disengaged",
-                immediate: "disengaged",
-                settled: "disengaged",
-            }],
-        ),
-        (
-            "engage-an-engaged-lever",
-            vec![
-                Step {
-                    requested: "engaged",
-                    immediate: "engaging",
-                    settled: "engaged",
-                },
-                Step {
-                    requested: "engaged",
-                    immediate: "engaged",
-                    settled: "engaged",
-                },
-            ],
         ),
         (
             "disengage-an-engaged-lever",
@@ -472,6 +456,11 @@ async fn the_state_a_request_asks_for_is_persisted_and_taken_up_on_the_clock() {
         (
             "engage-a-disengaged-lever",
             vec![
+                Step {
+                    requested: "engaged",
+                    immediate: "engaging",
+                    settled: "engaged",
+                },
                 Step {
                     requested: "disengaged",
                     immediate: "disengaged",
@@ -520,10 +509,9 @@ async fn the_state_a_request_asks_for_is_persisted_and_taken_up_on_the_clock() {
                  stored ({reported:?}), got {read_lever:?}"
             );
 
-            // And once the clock has caught up, the state the lever settles in.
-            tokio::time::sleep(PAST_TRANSITION).await;
-            let settled = get_lever(&router, LEVER_ID, REGION).await;
-            let settled_lever = lever(case, &settled, "safetyLever", REGION);
+            // And once the clock has caught up, the state the lever settles in — looked for
+            // until it holds rather than waited for by the clock of whatever host runs this.
+            let settled_lever = poll_lever_until(&router, step.settled).await;
             assert_eq!(
                 status_of(&settled_lever),
                 step.settled,
