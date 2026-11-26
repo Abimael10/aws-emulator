@@ -20,15 +20,17 @@
 //! A child of [`super`] rather than a suite beside it, so the domain, index, stream and
 //! backup harness that suite already has is the one driven here too.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state as search_state;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::ingest;
 
 use super::{
     create_domain, create_index, destination, indexed, indexed_documents, parked_documents,
     strict_schema, FAILED_FOLDER,
 };
+use crate::delivery_stream_lifecycle::REGION;
 use crate::destination_delivery::{base64, Emulator};
 
 /// The engine error types a write of one document is refused with
@@ -370,6 +372,231 @@ fn assert_vocabulary(kind: &Kind, case: &str, document: &Value, index: &str, cod
             .is_some_and(|message| !message.is_empty()),
         "case {case:?}: expected a reason beside the code, got {document:?}"
     );
+}
+
+/// Turn implicit index creation OFF on `domain`'s cluster, through the domain's own REST data
+/// plane.
+///
+/// The setting is the one that decides whether a write to an index the cluster does not hold
+/// creates it (`search_state::AUTO_CREATE_INDEX_SETTING`, written in the scope
+/// `search_state::SETTINGS_PERSISTENT` names), so a delivery into an index nobody created is
+/// a refusal of the cluster's rather than a create.
+async fn given_no_implicit_index_creation(emulator: &Emulator, domain: &str) {
+    let mut scope = ::serde_json::Map::new();
+    scope.insert(
+        search_state::AUTO_CREATE_INDEX_SETTING.to_string(),
+        json!("false"),
+    );
+    let mut body = ::serde_json::Map::new();
+    body.insert(
+        search_state::SETTINGS_PERSISTENT.to_string(),
+        Value::Object(scope),
+    );
+    let answer = emulator
+        .signed(
+            "es",
+            "PUT",
+            &format!("/_aws/es/{domain}/_cluster/settings"),
+            Value::Object(body).to_string().as_bytes(),
+        )
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "the cluster setting must be written on {domain}, got {} with {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// The two records a row whose delivery fails for a reason that is not about the DOCUMENT
+/// delivers: documents a strict mapping would accept, so what parks them is the class under
+/// test and nothing of their own.
+fn conforming_records() -> [Vec<u8>; 2] {
+    [
+        br#"{"level":"info","count":1}"#.to_vec(),
+        br#"{"level":"warn","count":2}"#.to_vec(),
+    ]
+}
+
+/// What makes ONE row's delivery fail, and so the class its error output reports.
+#[derive(Debug, Clone, Copy)]
+enum Class {
+    /// The destination index's mappings refuse the documents: a strict index, delivered a
+    /// record carrying a field it does not map and one carrying a value its mapped type
+    /// cannot parse — two engine error types of one Firehose class.
+    MappingConflict,
+    /// The cluster holds no such index and does not let the write create one, so the write
+    /// met an index that is not there: a refusal of no class of its own.
+    NoSuchIndex,
+    /// No domain of this emulator carries the destination's address, so nothing judged the
+    /// documents at all — parked once the destination's retry window is spent.
+    NoDestination,
+}
+
+impl Class {
+    /// How this class is named in a row's failure message.
+    fn case(self) -> &'static str {
+        match self {
+            Self::MappingConflict => "a batch the index's mappings refuse",
+            Self::NoSuchIndex => "an index the cluster does not hold",
+            Self::NoDestination => "a destination nothing answers",
+        }
+    }
+
+    /// A short, name-safe spelling of this class, for the resources a row creates.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::MappingConflict => "mapping",
+            Self::NoSuchIndex => "no-index",
+            Self::NoDestination => "absent",
+        }
+    }
+
+    /// The `errorCode` `kind` reports this class under: that kind's own error namespace,
+    /// followed by the Firehose exception name for the class.
+    fn code(self, kind: &Kind) -> String {
+        match self {
+            Self::MappingConflict => kind.parse_exception.to_string(),
+            Self::NoSuchIndex => format!("{}ServiceException", kind.namespace),
+            Self::NoDestination => format!("{}ServiceUnavailable", kind.namespace),
+        }
+    }
+}
+
+/// RULE: every record Firehose parks under the failed-document folder carries an `errorCode`
+/// in the destination kind's own error namespace naming the Firehose exception class of the
+/// failure — never the engine's own error type, whose wording stays in `errorMessage` — so
+/// one batch that failed for one reason carries exactly ONE distinct code, whatever the
+/// engine called each refusal.
+///
+/// The rows are the two destination kinds crossed with the classes a delivery of theirs can
+/// fail in: documents the index's mappings refuse (delivered as two DIFFERENT engine error
+/// types, which one Firehose class covers), an index the cluster does not hold and will not
+/// create, and a destination no domain answers whose retry window is spent.
+#[tokio::test]
+async fn every_parked_record_carries_one_namespaced_code_for_its_failure_class() {
+    let emulator = Emulator::new();
+    emulator.create_bucket(super::BACKUP_BUCKET).await;
+    let index = "events";
+
+    for kind in &KINDS {
+        for class in [
+            Class::MappingConflict,
+            Class::NoSuchIndex,
+            Class::NoDestination,
+        ] {
+            let case = format!("{} / {}", kind.case, class.case());
+            let slug = format!("{}-{}", kind.slug, class.slug());
+            let domain = format!("search-class-{slug}");
+            let stream = format!("class-{slug}-stream");
+            let prefix = format!("class-{slug}/");
+            // Each record of the row, beside what the engine's own reason for not taking it
+            // must state — the variable part of that reason, taken from the request and the
+            // emulator's state rather than spelled out here.
+            let mut rows: Vec<(Vec<u8>, String)> = Vec::new();
+            let config = match class {
+                Class::MappingConflict => {
+                    let domain_arn = create_domain(&emulator, &domain, None).await;
+                    create_index(&emulator, &domain, index, strict_schema()).await;
+                    rows.push((
+                        br#"{"level":"info","surprise":"x"}"#.to_vec(),
+                        "surprise".to_string(),
+                    ));
+                    rows.push((
+                        br#"{"level":"info","count":"many"}"#.to_vec(),
+                        "count".to_string(),
+                    ));
+                    destination(&domain_arn, index, &prefix)
+                }
+                Class::NoSuchIndex => {
+                    let domain_arn = create_domain(&emulator, &domain, None).await;
+                    given_no_implicit_index_creation(&emulator, &domain).await;
+                    rows.extend(
+                        conforming_records()
+                            .into_iter()
+                            .map(|record| (record, index.to_string())),
+                    );
+                    destination(&domain_arn, index, &prefix)
+                }
+                Class::NoDestination => {
+                    // An address of the documented form that no domain of this emulator
+                    // carries, so the delivery reaches no cluster at all.
+                    let absent = format!("arn:aws:es:{REGION}:000000000000:domain/{domain}");
+                    rows.extend(
+                        conforming_records()
+                            .into_iter()
+                            .map(|record| (record, absent.clone())),
+                    );
+                    let mut config = destination(&absent, index, &prefix);
+                    // "a value of 0 (zero) results in no retries"
+                    // (`ElasticsearchRetryOptions$DurationInSeconds`, whose range admits it),
+                    // so the one attempt the buffer gets spends the window and the records
+                    // are parked instead of being owed again.
+                    config["RetryOptions"] = json!({ "DurationInSeconds": 0 });
+                    config
+                }
+            };
+            emulator
+                .create_active_stream(&stream, kind.member, config)
+                .await;
+
+            let records: Vec<Vec<u8>> = rows.iter().map(|(record, _)| record.clone()).collect();
+            let (status, answered) = emulator.put_batch(&stream, &records).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the put must be accepted, got {answered:?}"
+            );
+
+            let parked =
+                parked_documents(&emulator, &case, &format!("{prefix}{FAILED_FOLDER}"), records.len())
+                    .await;
+            assert_eq!(
+                parked.len(),
+                records.len(),
+                "case {case:?}: expected every record of the batch parked, got {parked:?}"
+            );
+            let code = class.code(kind);
+            let codes: BTreeSet<&str> = parked
+                .iter()
+                .filter_map(|document| document["errorCode"].as_str())
+                .collect();
+            assert_eq!(
+                codes,
+                BTreeSet::from([code.as_str()]),
+                "case {case:?}: expected one distinct code for the batch, got {codes:?}"
+            );
+            let parked_by_record: BTreeMap<String, Value> = parked
+                .iter()
+                .map(|document| {
+                    (
+                        document["rawData"].as_str().unwrap_or_default().to_string(),
+                        document.clone(),
+                    )
+                })
+                .collect();
+            for (record, mentioned) in &rows {
+                let document = parked_by_record.get(&base64(record)).unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected the record's own bytes parked, got \
+                         {parked_by_record:?}"
+                    )
+                });
+                assert_vocabulary(kind, &case, document, index, &code);
+                let message = document["errorMessage"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains(mentioned.as_str()),
+                    "case {case:?}: expected the reason to state {mentioned:?}, got {document:?}"
+                );
+            }
+            if !matches!(class, Class::NoDestination) {
+                assert!(
+                    indexed(&emulator, &domain, index).is_empty(),
+                    "case {case:?}: expected nothing indexed of a batch the cluster refused"
+                );
+            }
+        }
+    }
 }
 
 /// RULE: the error output of a failed document is written in the DESTINATION KIND's own
