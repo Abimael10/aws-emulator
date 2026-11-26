@@ -2,11 +2,15 @@
 
 //! @op StartApplicationRefresh
 //!
-//! Refreshes the stored application: its `DiscoveryStatus` becomes `REGISTERING` now and
-//! `SUCCESS` one [`crate::state::TRANSITION_SPAN`] later, and the `OperationId` returned
-//! names a persisted `START_APPLICATION_REFRESH` operation record that `GetOperation`
-//! reads back. A refresh re-runs the application's discovery rather than its SAP system,
-//! so the `Status` the application is in is the one it keeps.
+//! Refreshes the stored application: its `DiscoveryStatus` becomes `REGISTERING` now and,
+//! one [`crate::state::TRANSITION_SPAN`] later, the result of the DISCOVERY this call
+//! re-runs on the application's Amazon EC2 instances
+//! ([`crate::state::discovery::run_document`]) — `SUCCESS` for a re-discovery that could
+//! be carried out and `REFRESH_FAILED`, carrying the refusal it ran into, for one that
+//! could not. The `OperationId` returned names a persisted `START_APPLICATION_REFRESH`
+//! operation record that `GetOperation` reads back, which reaches the same outcome:
+//! `SUCCESS`, or `ERROR` with that refusal. A refresh re-runs the application's discovery
+//! rather than its SAP system, so the `Status` the application is in is the one it keeps.
 //!
 //! ## Shape of an operation
 //!
@@ -150,8 +154,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
-        let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
+
+        // A refresh RE-RUNS the DISCOVERY of the application it names, so it runs the one
+        // discovery this crate has ([`crate::state::discovery::run_document`]) on the
+        // instances that application's registration named — the very instances, and the
+        // very hop, the registration's own discovery ran on, so the same question is
+        // answered the same way for the same application. The instances are read off the
+        // registration FIRST, with the store guard living for exactly that read, so no lock
+        // is held across the hop; the read mints nothing and the hop reads and refuses
+        // nothing, so a refresh refused below is refused on exactly the grounds it always
+        // was, and an id this Region holds no application under is asked nothing about.
+        let instances = registered_instances(&state, &region, &input.application_id);
+        let discovery_refusal =
+            crate::state::discovery::run_document(ctx, &region, &instances).await;
+
+        let mut state = state.lock();
         state.settle(now);
 
         let Some(mut application) = state
@@ -206,28 +224,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             due_at: now + crate::state::TRANSITION_SPAN,
             change: crate::state::PendingChange::Status {
                 status: application.status.clone(),
-                // The emulator discovers nothing on the registered instances, so what a
-                // refresh re-discovers is the registration this store already holds: the
-                // discovery the clock owes this application succeeds, exactly as the one
-                // its registration started did.
-                discovery_status: crate::state::DISCOVERY_STATUS_SUCCESS.to_string(),
-                // The discovery this refresh re-runs succeeds and the application's own
-                // status is left where it is, so there is no non-success outcome for
-                // `StatusMessage` to explain.
-                status_message: None,
+                // What the re-discovery came to is what the refresh settles as, exactly as
+                // a registration settles as what ITS discovery came to: a re-discovery the
+                // owner of the instances let this service carry out reports `SUCCESS`, and
+                // one it could not reports the model's own discovery result for a failed
+                // refresh. The registration itself stands either way — a refresh neither
+                // registers nor deregisters anything — so the components that registration
+                // discovered stay the application's.
+                discovery_status: if discovery_refusal.is_some() {
+                    crate::state::DISCOVERY_STATUS_REFRESH_FAILED.to_string()
+                } else {
+                    crate::state::DISCOVERY_STATUS_SUCCESS.to_string()
+                },
+                // `StatusMessage` explains the outcome the application REACHES, so the
+                // refusal the re-discovery ran into is attached to the failed discovery
+                // result it explains — the same sentence this refresh's own operation
+                // record reaches `ERROR` with below. A re-discovery that could be carried
+                // out leaves nothing to explain, which is also what clears the sentence a
+                // previous failed refresh left behind.
+                status_message: discovery_refusal.clone(),
             },
         });
 
         // The application was just found in this Region, so reaching for the partition
         // to write mints nothing.
         let region_state = state.region_entry(&region);
-        let operation_id = region_state.record_operation(
+        let operation_id = region_state.record_operation_outcome(
             crate::state::OPERATION_TYPE_START_APPLICATION_REFRESH,
             &application,
             // `StartApplicationRefresh` carries no parameter beyond the application it
             // names, which the record already reports as `ResourceId`/`ResourceArn`.
             ::std::collections::HashMap::new(),
             now,
+            // The record of this refresh reaches the outcome of the work it tracks: the
+            // refusal the re-discovery ran into is what the refresh failed with, so the
+            // record reaches `ERROR` carrying it, and a re-discovery that could be carried
+            // out reaches `SUCCESS`.
+            discovery_refusal,
         );
         region_state
             .applications
@@ -237,4 +270,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id: Some(operation_id),
         })
     }
+}
+
+/// The Amazon EC2 instances the registration of `application_id` named, which are the ones
+/// this application's discovery runs on — and no instance at all for an id this Region
+/// holds no application under.
+///
+/// SYNCHRONOUS, and separate from `handle` for that reason: the store guard lives for
+/// exactly this read, so the handler can await the hop into the owner of those instances
+/// with no lock held. It is a pure read — nothing is settled, written or minted here, so
+/// the refusals the handler decides under the guard it takes afterwards are decided against
+/// the store every other caller sees.
+fn registered_instances(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsSsmsapSsmsapState>,
+    region: &str,
+    application_id: &str,
+) -> Vec<String> {
+    state
+        .lock()
+        .region(region)
+        .applications
+        .get(application_id)
+        .map(|application| application.instances.clone())
+        .unwrap_or_default()
 }

@@ -119,7 +119,11 @@ fn quota_refusal(count: usize) -> String {
 /// [`NOT_REGISTERED_SUCCESSFULLY`] is. `instance_id` and the Region come from the request
 /// and the signing context; the identity is the service-linked role this service discovers
 /// an application as.
-fn discovery_refusal(instance_id: &str) -> String {
+///
+/// `pub(crate)` because one discovery is what this crate runs, so the suite about what a
+/// RE-discovery settles as (`tests/all/refresh_discovery.rs`) pins the same relayed
+/// sentence rather than spelling a second copy of it.
+pub(crate) fn discovery_refusal(instance_id: &str) -> String {
     format!(
         "Error executing SSM document - AccessDeniedException User: \
          arn:aws:sts::{ACCOUNT}:assumed-role/AWSServiceRoleForAWSSSMForSAP/ssm-sap is not \
@@ -135,7 +139,9 @@ fn discovery_refusal(instance_id: &str) -> String {
 ///
 /// The request id of one run is per-run information a client must not depend on, so what
 /// the rows pin is everything around it.
-fn without_request_id(case: &str, relayed: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`discovery_refusal`] is.
+pub(crate) fn without_request_id(case: &str, relayed: &str) -> String {
     let marker = "Request ID: ";
     let Some((head, rest)) = relayed.split_once(marker) else {
         panic!("case {case:?}: expected the relayed refusal to report a request id, got {relayed:?}");

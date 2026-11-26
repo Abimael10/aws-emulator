@@ -231,6 +231,18 @@ pub const DISCOVERY_STATUS_SUCCESS: &str = "SUCCESS";
 /// not be carried out: the discovery result a failed registration converges to.
 pub const DISCOVERY_STATUS_REGISTRATION_FAILED: &str = "REGISTRATION_FAILED";
 
+/// `ApplicationDiscoveryStatus` of an application whose RE-discovery could not be carried
+/// out: the discovery result a failed refresh converges to.
+///
+/// The model spells a failed discovery two ways — one for the discovery a registration
+/// runs ([`DISCOVERY_STATUS_REGISTRATION_FAILED`]) and one for the discovery a refresh
+/// re-runs — so what `Application$DiscoveryStatus` reports as "the latest discovery
+/// result" says WHICH discovery produced it. A refresh that could not be carried out
+/// leaves the registration itself intact: the application keeps the components that
+/// registration discovered and its own `Status`, and only its latest discovery result
+/// failed, so a later refresh of the same application can report `SUCCESS` again.
+pub const DISCOVERY_STATUS_REFRESH_FAILED: &str = "REFRESH_FAILED";
+
 /// `OperationStatus` for an operation that has not reached its terminal status yet.
 /// One of the model's `OperationStatus` values (see
 /// [`crate::ops::types::OPERATION_STATUS_VALUES`]).
