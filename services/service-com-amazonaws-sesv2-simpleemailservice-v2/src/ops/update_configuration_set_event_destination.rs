@@ -191,8 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&set_name)
             .and_then(|set| set.event_destinations.get_mut(&destination_name))
         else {
-            return Err(not_found(crate::state::event_destination_not_found(
+            return Err(not_found(crate::state::event_destination_does_not_exist(
                 &set_name,
+                &destination_name,
             )));
         };
         destination.replace_definition(definition);
@@ -219,8 +220,12 @@ fn missing_resource(
             set_name,
         )));
     };
-    (!set.event_destinations.contains_key(destination_name))
-        .then(|| not_found(crate::state::event_destination_not_found(set_name)))
+    (!set.event_destinations.contains_key(destination_name)).then(|| {
+        not_found(crate::state::event_destination_does_not_exist(
+            set_name,
+            destination_name,
+        ))
+    })
 }
 
 /// Refuse the request with this service's input error.

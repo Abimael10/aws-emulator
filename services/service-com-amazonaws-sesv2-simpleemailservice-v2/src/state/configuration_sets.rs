@@ -544,27 +544,49 @@ pub fn sorted_event_types(mut event_types: Vec<String>) -> Vec<String> {
 /// How this service words `AlreadyExistsException` for an event-destination name a
 /// configuration set already holds, stated once for every operation that attaches
 /// one.
+///
+/// The sentence is SES's own: fixed text naming the kind of resource that is taken,
+/// with each of its two variable parts — the destination name the request asked for and
+/// the configuration set the request path addressed it within — wrapped in literal
+/// angle brackets, and a closing period.
 pub fn event_destination_already_exists(
     configuration_set_name: &str,
     event_destination_name: &str,
 ) -> String {
     format!(
-        "Event destination {event_destination_name} already exists in configuration set \
-         {configuration_set_name}."
+        "An event destination with name <{event_destination_name}> already exists for \
+         configuration set <{configuration_set_name}>."
     )
 }
 
-/// How this service words `NotFoundException` for an event destination a configuration
-/// set does not hold.
+/// How the DELETE of an event destination words `NotFoundException` for a destination
+/// the addressed configuration set does not hold.
 ///
-/// One wording for every operation that addresses a destination within a set, so a
-/// client sees the same sentence whichever call first tells it the destination is not
-/// there. The sentence is fixed text naming the kind of resource that was not found,
-/// and its one variable part is the CONFIGURATION SET the request addressed the
-/// destination within, taken from the request path; the destination's own name is not
-/// part of it.
+/// The sentence is fixed text naming the kind of resource that was not found, and its one
+/// variable part is the CONFIGURATION SET the request addressed the destination within,
+/// taken from the request path; the destination's own name is not part of it, and there is
+/// no closing period.
 pub fn event_destination_not_found(configuration_set_name: &str) -> String {
     format!("No EventDestination found for {configuration_set_name}")
+}
+
+/// How the UPDATE of an event destination words `NotFoundException` for a destination the
+/// addressed configuration set does not hold.
+///
+/// The counterpart of [`event_destination_already_exists`], worded the same way: fixed
+/// text naming the kind of resource, with each of its two variable parts — the destination
+/// name the request addressed and the configuration set it addressed the destination
+/// within — wrapped in literal angle brackets, and a closing period. The DELETE answers
+/// its own sentence ([`event_destination_not_found`]): each operation carries the wording
+/// the service words for it rather than one wording shared across them.
+pub fn event_destination_does_not_exist(
+    configuration_set_name: &str,
+    event_destination_name: &str,
+) -> String {
+    format!(
+        "An event destination with name <{event_destination_name}> does not exist for \
+         configuration set <{configuration_set_name}>."
+    )
 }
 
 /// The delivery configuration a write of ONE configuration set stores, from the members
