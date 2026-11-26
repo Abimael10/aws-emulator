@@ -1389,14 +1389,14 @@ async fn a_rate_based_statement_s_evaluation_window_must_be_one_of_the_published
 /// than imported, so the table pins the arithmetic and not merely its reuse.
 const BYTE_MATCH_SCANNING_WCU: i64 = 10;
 
-/// The WCUs inspecting EVERY value of a multi-valued component adds.
-const MULTI_VALUED_COMPONENT_WCU: i64 = 10;
+/// The WCUs a component WAF has to extract out of a container adds: every value of a
+/// multi-valued component, or a query argument parsed out of the raw query string.
+const EXTRACTED_COMPONENT_WCU: i64 = 10;
 
-/// The WCUs one transformation of a request component costs, and what applying
-/// pre-parse transformations at all costs on top: a statement that normalizes the raw
-/// query string makes WAF parse that component out of text it did not arrive as.
+/// The WCUs one transformation of a request component costs, whichever member of a
+/// statement asks for it: a pre-parse text transformation is transformation work like
+/// any other and is charged the same amount and nothing besides.
 const TRANSFORMATION_WCU: i64 = 10;
-const PRE_PARSE_PARSE_WCU: i64 = 10;
 
 /// Every `FieldToMatch` these rows inspect. The two pre-parse text transformations are
 /// defined for — "only supported when `FieldToMatch` is `SingleQueryArgument` or
@@ -1606,15 +1606,16 @@ async fn pre_parse_text_transformations_are_only_accepted_on_a_query_argument_fi
 
 /// A pre-parse text transformation is work WAF does on a request component, so it is
 /// charged like every other transformation — once per (component, chain) across the
-/// rule list — and the statement that applies one also pays for parsing the component
-/// out of the normalized text. So a rule set carrying them prices strictly above the
-/// same rule set without them, and `CheckCapacity` publishes that price.
+/// rule list — and nothing besides is charged for carrying the member. So a rule set
+/// carrying a chain that transforms prices strictly above the same rule set without
+/// it, and `CheckCapacity` publishes that price.
 ///
-/// The rows differ along what the arithmetic generalises over: no transformation, one,
-/// two, a chain of nothing but the no-op, the component inspected, and two statements
-/// sharing one chain. The first two are the figures the recorded corpus pins: the
-/// statement alone prices 10 and the same statement applying one pre-parse
-/// transformation prices 30.
+/// The rows differ along what the arithmetic generalises over: no member at all, an
+/// empty chain, a chain of nothing but the no-op, one transformation, two, the
+/// component inspected, and two statements sharing one chain. The first two are the
+/// figures the recorded corpus pins: the statement alone prices 20 — it inspects a
+/// query argument, which WAF has to parse the query string for — and the same
+/// statement carrying one pre-parse transformation prices 30.
 #[tokio::test]
 async fn pre_parse_text_transformations_are_charged_web_acl_capacity_units() {
     let waf = Waf::new();
@@ -1637,22 +1638,27 @@ async fn pre_parse_text_transformations_are_charged_web_acl_capacity_units() {
         (
             "a scanning byte match over one query argument, no pre-parse transformations",
             json!([blocking_rule("a", 0, byte_match(&single, None))]),
-            BYTE_MATCH_SCANNING_WCU,
+            BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU,
         ),
         (
             "the same statement applying one pre-parse transformation",
             json!([blocking_rule("a", 0, byte_match(&single, Some(&one)))]),
-            BYTE_MATCH_SCANNING_WCU + PRE_PARSE_PARSE_WCU + TRANSFORMATION_WCU,
+            BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU + TRANSFORMATION_WCU,
         ),
         (
             "the same statement applying two pre-parse transformations",
             json!([blocking_rule("a", 0, byte_match(&single, Some(&two)))]),
-            BYTE_MATCH_SCANNING_WCU + PRE_PARSE_PARSE_WCU + 2 * TRANSFORMATION_WCU,
+            BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU + 2 * TRANSFORMATION_WCU,
         ),
         (
             "a pre-parse chain of nothing but the no-op normalizes nothing",
             json!([blocking_rule("a", 0, byte_match(&single, Some(&none_only)))]),
-            BYTE_MATCH_SCANNING_WCU,
+            BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU,
+        ),
+        (
+            "an empty pre-parse chain asks for no normalization at all",
+            json!([blocking_rule("a", 0, byte_match(&single, Some(&json!([]))))]),
+            BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU,
         ),
         (
             "one pre-parse transformation over every query argument",
@@ -1661,10 +1667,7 @@ async fn pre_parse_text_transformations_are_charged_web_acl_capacity_units() {
                 0,
                 byte_match(&json!({ "AllQueryArguments": {} }), Some(&one))
             )]),
-            BYTE_MATCH_SCANNING_WCU
-                + MULTI_VALUED_COMPONENT_WCU
-                + PRE_PARSE_PARSE_WCU
-                + TRANSFORMATION_WCU,
+            BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU + TRANSFORMATION_WCU,
         ),
         (
             "two statements over different arguments sharing one pre-parse chain",
@@ -1679,9 +1682,10 @@ async fn pre_parse_text_transformations_are_charged_web_acl_capacity_units() {
                     )
                 ),
             ]),
-            // Each statement is matched and its component parsed, and the chain they
-            // both normalize the query string with is charged once.
-            2 * (BYTE_MATCH_SCANNING_WCU + PRE_PARSE_PARSE_WCU) + TRANSFORMATION_WCU,
+            // Each statement is matched over a query argument the query string has to
+            // be parsed for, and the chain they both normalize that query string with
+            // is charged once.
+            2 * (BYTE_MATCH_SCANNING_WCU + EXTRACTED_COMPONENT_WCU) + TRANSFORMATION_WCU,
         ),
     ];
 

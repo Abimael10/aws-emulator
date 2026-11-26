@@ -17,13 +17,13 @@ use crate::ops::types::PreParseTextTransformation;
 ///
 /// Each kind's base cost is a constant below. On top of a base, the modifiers a
 /// statement carries are charged: the component it inspects can add a surcharge
-/// ([`MULTI_VALUED_COMPONENT_WCU`]) or multiply the match itself
+/// ([`EXTRACTED_COMPONENT_WCU`]) or multiply the match itself
 /// ([`JSON_BODY_BASE_MULTIPLIER`]), and each text transformation it applies adds a
 /// flat [`TEXT_TRANSFORMATION_WCU`] — once per (component, transformation chain)
 /// across the WHOLE rule list, because the transformed content is computed once and
 /// every statement over that component inspects it (see [`CapacityAccount`]). A
 /// statement's `PreParseTextTransformations` are transformations too and are charged
-/// the same way, over the component THEY transform
+/// that same flat amount each, and nothing besides, over the component THEY transform
 /// ([`CapacityAccount::note_pre_parse_transformations`]).
 ///
 /// One cost is not a constant: a `RuleGroupReferenceStatement` costs the
@@ -159,33 +159,20 @@ pub const TEXT_TRANSFORMATION_WCU: i64 = 10;
 /// token answers "does this transformation transform anything?" for both.
 pub const TEXT_TRANSFORMATION_NONE: &str = "NONE";
 
-/// The WCUs a statement adds for applying pre-parse text transformations at all,
-/// beside the per-transformation charge each of them costs
-/// ([`TEXT_TRANSFORMATION_WCU`]).
+/// The WCUs a statement adds for a request component WAF has to EXTRACT out of a
+/// container before the match can run, rather than inspect as it arrived.
 ///
-/// A pre-parse text transformation "normalizes the raw query string before WAF parses
-/// it into individual query arguments", so a statement that applies one makes WAF
-/// parse that component a second time, out of text it did not arrive as — work on top
-/// of transforming it, the way splitting a multi-valued component into its entries is
-/// work on top of matching one ([`MULTI_VALUED_COMPONENT_WCU`]). Pinned by the
-/// recorded corpus: a `CONTAINS` byte match over a single query argument that applies
-/// one pre-parse transformation reports `Capacity` 30 — its base
-/// ([`BYTE_MATCH_SCANNING_WCU`]), one charged transformation, and this.
-pub const PRE_PARSE_QUERY_STRING_WCU: i64 = 10;
-
-/// The WCUs a statement adds for inspecting EVERY value of a multi-valued request
-/// component rather than one named value.
-///
-/// `FieldToMatch$AllQueryArguments` is "inspect all query arguments",
-/// `FieldToMatch$Headers` "inspect the request headers" and
-/// `FieldToMatch$Cookies` "inspect the request cookies" — each of the three makes
-/// WAF split one component into its entries and run the match over the entries the
-/// `MatchPattern` selects, instead of over one already-extracted value. The three
-/// are modelled alike for exactly that reason (the latter two carry a
-/// `MatchPattern`, a `MatchScope` and an `OversizeHandling` of their own), so they
-/// are charged alike, which is why this names the work rather than the one
-/// component the figure was first pinned on.
-pub const MULTI_VALUED_COMPONENT_WCU: i64 = 10;
+/// Two kinds of component need that work, and the recorded corpus prices both at the
+/// same figure. `FieldToMatch$Headers` is "inspect the request headers" and
+/// `FieldToMatch$Cookies` "inspect the request cookies" — each makes WAF split one
+/// component into its entries and run the match over the entries the `MatchPattern`
+/// selects, instead of over one already-extracted value. `FieldToMatch$SingleQueryArgument`
+/// ("inspect a single query argument") and `FieldToMatch$AllQueryArguments` ("inspect
+/// all query arguments") both make WAF parse the raw query string into its individual
+/// arguments first: naming ONE argument does not save that parse, which is why the two
+/// are charged alike. So this names the work rather than any one component the figure
+/// was pinned on.
+pub const EXTRACTED_COMPONENT_WCU: i64 = 10;
 
 /// What inspecting the request body AS JSON multiplies a statement's base cost by.
 ///
@@ -256,9 +243,9 @@ impl CapacityAccount {
     /// the component's own modifiers applied, and the transformations it runs over
     /// that component.
     ///
-    /// The component modifiers are the two the component itself carries:
-    /// inspecting every query argument is a surcharge on top of the match
-    /// ([`MULTI_VALUED_COMPONENT_WCU`]) and inspecting the body as JSON multiplies the
+    /// The component modifiers are the two the component itself carries: a component
+    /// WAF has to extract out of a container is a surcharge on top of the match
+    /// ([`EXTRACTED_COMPONENT_WCU`]) and inspecting the body as JSON multiplies the
     /// match itself ([`JSON_BODY_BASE_MULTIPLIER`]) — so they COMPOSE with each
     /// other and with the per-transformation charge, which is flat.
     ///
@@ -325,21 +312,17 @@ impl CapacityAccount {
     /// different query arguments with the same pre-parse chain normalize the same raw
     /// query string and share the charge.
     ///
-    /// A statement that applies one also pays [`PRE_PARSE_QUERY_STRING_WCU`] for the
-    /// parse of the normalized text, which is the statement's own work and so is not
-    /// shared. A list of nothing but the no-op transforms nothing, so it normalizes
-    /// nothing to re-parse and pays neither charge.
+    /// Nothing else is charged for them: a statement that lists a pre-parse chain
+    /// pays the transformation charge for every transformation in it that transforms,
+    /// and a chain of nothing but the no-op ([`TEXT_TRANSFORMATION_NONE`]), or no
+    /// chain at all, costs nothing. Charging a pre-parse chain exactly as a standard
+    /// one is what the recorded corpus prices: a `CONTAINS` byte match over one query
+    /// argument carrying a chain of one transformation costs ten WCUs more than the
+    /// same statement without it.
     pub(super) fn note_pre_parse_transformations(
         &mut self,
         pre_parse_text_transformations: &[PreParseTextTransformation],
     ) {
-        if pre_parse_text_transformations
-            .iter()
-            .all(|transformation| transformation.r#type == TEXT_TRANSFORMATION_NONE)
-        {
-            return;
-        }
-        self.add_base(PRE_PARSE_QUERY_STRING_WCU);
         self.note_chain(
             PRE_PARSE_COMPONENT,
             pre_parse_text_transformations
@@ -523,14 +506,16 @@ pub(super) fn component_base_multiplier(field_to_match: &FieldToMatch) -> i64 {
 }
 
 /// What the component a statement inspects adds to its base cost: the surcharge
-/// for every multi-valued component it names. See
-/// [`MULTI_VALUED_COMPONENT_WCU`].
+/// for every component WAF has to extract out of a container — every value of a
+/// multi-valued component, or a query argument parsed out of the raw query string.
+/// See [`EXTRACTED_COMPONENT_WCU`].
 pub(super) fn component_surcharge(field_to_match: &FieldToMatch) -> i64 {
-    let multi_valued = field_to_match.all_query_arguments.is_some()
+    let extracted = field_to_match.all_query_arguments.is_some()
+        || field_to_match.single_query_argument.is_some()
         || field_to_match.headers.is_some()
         || field_to_match.cookies.is_some();
-    if multi_valued {
-        MULTI_VALUED_COMPONENT_WCU
+    if extracted {
+        EXTRACTED_COMPONENT_WCU
     } else {
         0
     }

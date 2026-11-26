@@ -49,6 +49,27 @@ Model references used: CheckCapacity (input Scope+Rules required; output Capacit
 
 The open issue 20261029T192556Z-wafv2-request-validation-never-refuses-ten-operations-answer lists ten never-refused operations but not CheckCapacity, and carries neither replay key above.
 
+## Resolution
+
+Cause 1 — FIXED, with one correction to this report's attribution. The recorded fixture's first
+rule set carries no `PreParseTextTransformations` member at all: its 20-vs-10 gap is the surcharge
+for the component it inspects. A statement's price is its kind's base plus a flat surcharge for a
+component WAF has to extract out of a container — every value of a multi-valued component, or a
+query argument the raw query string has to be parsed into, where naming ONE argument does not save
+that parse — so `SingleQueryArgument` is charged exactly as `AllQueryArguments` is, which the cost
+model charged nothing for. The pre-parse arithmetic this report hypothesised is confirmed for the
+fixture's other rule sets: a `PreParseTextTransformations` chain is charged exactly what the same
+chain costs as a statement's `TextTransformations` (one flat charge per transformation that
+transforms, once per (component, chain) across the rule list) and nothing besides, where the cost
+model also added a flat per-statement charge on top.
+
+Cause 2 — FIXED: the `FieldToMatch`/`PreParseTextTransformations` compatibility refusal is in the
+shared rule validation every operation taking a rule list goes through, and all six of its replay
+keys pass.
+
+Both corrections live in the one cost function `CheckCapacity`, the stored `WebACL$Capacity` and the
+rule-group capacity precondition read.
+
 ## Steps to Reproduce
 1. Boot the emulator from this checkout and replay the wire corpus (replay_wire_corpus).
 2. Cause 1: CheckCapacity with a rule whose ByteMatchStatement has FieldToMatch = {"AllQueryArguments": {}} (or SingleQueryArgument) plus a PreParseTextTransformations entry -> AWS reports a Capacity that includes the pre-parse transformation's cost (20 in the recording); the emulator reports the base cost only (10). Repeat for the fixture's task#2 and task#3 rule sets.
