@@ -1,0 +1,55 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ecs.e2e-capacity-provider-fargate-spot-task-lifecycle ecs.service-deployment-event-timestamps-monotonic-across-updates
+Issue-Shape-Id: com.amazonaws.ecs#AmazonEC2ContainerServiceV20141113
+Issue-Key: ecs|ListTasks|ClusterNotFoundException
+Issue-Key: ecs.service-deployment-event-timestamps-monotonic-across-updates|run#31|AssertionError|assert event_times == sorted(event_times, reverse=True), (
+Issue-Commit: 34fefd7aecead9141157dc0abcdfe1d4823d27aa
+
+# ecs: 2 net-new causes — ListTasks refuses a cluster deleted by the caller, and DescribeServices.events is returned oldest-first
+
+> _Note: this issue was identified against the code base at commit `34fefd7aecead9141157dc0abcdfe1d4823d27aa`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListTasks
+
+## Description
+Two net-new root causes in the ECS emulator, both grounded in failing behavioral checks of the `ecs` suite. Neither is marked ALREADY FILED or OWNED in the replay report.
+
+Cause 1 of 2: ListTasks refuses a cluster the caller has just deleted, instead of answering 200 with that cluster's (now empty) task list. Failing check: ecs.e2e-capacity-provider-fargate-spot-task-lifecycle.
+AWS: Smithy (com.amazonaws.ecs#ListTasks) models input `cluster` as "The short name or full Amazon Resource Name (ARN) of the cluster to use when filtering the ListTasks results", output {taskArns: StringList, nextToken} at HTTP 200, and errors AccessDeniedException (403), ClientException (400), ClusterNotFoundException (400, "The specified cluster wasn't found. You can view your available clusters with ListClusters. Amazon ECS clusters are Region specific."), InvalidParameterException (400), ServerException (500), ServiceNotFoundException (400). The model does not say what a reference to a deleted (tombstoned) cluster does on this read, so for that case this is recorded behavior only: the recording drives DeleteCluster on a cluster whose only task has already been stopped, waits until DescribeClusters reports the cluster INACTIVE (or no longer returns it), and then calls ListTasks(cluster=<that cluster's ARN>) — which succeeds with HTTP 200 and an empty `taskArns`, which is what lets the recording assert "no orphaned tasks should remain after teardown". AWS treats the tombstone a delete leaves as a cluster record the account still holds for this read, exactly the rule this same service already applies on DescribeServices.
+Emulator: that ListTasks is refused with HTTP 400, Error.Code "ClusterNotFoundException", Error.Message "The referenced cluster was inactive." Message anatomy: that sentence is entirely fixed text with no variable part — the divergence is not the wording but that a refusal is served at all where AWS answers 200 with an (empty) taskArns list. The refusal is the handler's cluster gate: ListTasks gates on `has_active_cluster(&region, &cluster_name)` (ACTIVE only) and builds ClusterNotFoundException from the stored cluster record via `cluster_refusal_message`, whereas DescribeServices in the same service gates on `holds_cluster(...)` and documents the correct rule in place ("the tombstone a delete leaves is still a cluster record this account holds"). So the two reads disagree about the same cluster record.
+Why: a client cannot complete or verify teardown. The standard drain/delete/verify loop (DeleteCluster, then ListTasks to confirm nothing is orphaned) gets a 400 that a correct client reads as "this cluster never existed", so inventory and reconciliation code cannot distinguish a cleanly torn-down cluster from a bad cluster reference, and any poll that waits for tasks to disappear after a delete fails hard instead of converging.
+Fix: the cluster gate at the head of the ListTasks handler (services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/list_tasks.rs), which must resolve a cluster record the account still holds — including an INACTIVE tombstone — and answer 200 with the filtered task ARNs, reserving ClusterNotFoundException for a reference that resolves to no record at all; i.e. the same `holds_cluster` rule DescribeServices already uses in that crate's state.
+Traces: ecs.e2e-capacity-provider-fargate-spot-task-lifecycle (the check reaches its last statement, so every earlier assertion — FARGATE/FARGATE_SPOT association, RunTask on FARGATE_SPOT reaching RUNNING with capacityProviderName=FARGATE_SPOT, StopTask to STOPPED, disassociation, DeleteCluster to INACTIVE — passed).
+
+Cause 2 of 2: DescribeServices returns `services[].events` in ascending (oldest-first) createdAt order, not newest-first, and mints distinct events with an identical createdAt. Failing check: ecs.service-deployment-event-timestamps-monotonic-across-updates.
+AWS: the Smithy model describes only the shape — ServiceEvent{id: String "The ID string for the event", createdAt: Timestamp "The Unix timestamp for the time when the event was triggered", message: String} — and states no ordering, so the ordering is recorded behavior: the recording reads DescribeServices after a CreateService plus two sequential UpdateService calls and finds `events` presented newest-first, i.e. the createdAt sequence is non-increasing, with each event carrying its own id. The call itself is HTTP 200 with no error code; the sibling listing in the same recording (ListServiceDeployments, ordered newest-first by createdAt) passes against the emulator, so only the service event log diverges.
+Emulator: the same `events` list comes back oldest-first. The replayed response's createdAt sequence is ascending and contains a repeat: three events whose timestamps are [T, T, T+1s] — the first two events share one createdAt to the millisecond and the newest event is returned last rather than first. Reproduced generally: the emulator appends service events in occurrence order and serializes them in that order, and it stamps several events produced inside one state transition with one clock reading, so the list is ascending and not strictly monotonic.
+Why: every client that reads "what just happened to this service" takes events[0] — the console, the CLI's service status output, deployment waiters and operator scripts all show or branch on the most recent event. Oldest-first makes them report the service's first event (typically the initial "has started a deployment") forever, so a failed or rolled-back deployment is invisible, and the duplicate createdAt makes any client that re-sorts by timestamp order the tied events arbitrarily and non-reproducibly between calls.
+Fix: the service view the DescribeServices handler builds (services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/describe_services.rs, via the crate's state `service_view`) must present the service's event log newest-first by createdAt; and the ECS state that appends service events must give each appended event its own strictly increasing createdAt so the timeline it hands out is never tied.
+Traces: ecs.service-deployment-event-timestamps-monotonic-across-updates.
+
+## Evidence
+Cause 1 — suite report, ### ecs: "[error] ecs.e2e-capacity-provider-fargate-spot-task-lifecycle — botocore.errorfactory.ClusterNotFoundException: An error occurred (ClusterNotFoundException) when calling the ListTasks operation: The referenced cluster was inactive." The failing call is the check's final statement, `ecs.list_tasks(cluster=cluster_arn)["taskArns"]`, issued after `delete_cluster(cluster=cluster_arn)` and after DescribeClusters already reported the cluster INACTIVE/absent.
+Expected: HTTP 200 with {"taskArns": []} (the deleted cluster holds no task).
+Actual: HTTP 400, Error.Code "ClusterNotFoundException", Error.Message "The referenced cluster was inactive." — that message is wholly fixed text with no variable part; the generated cluster name/ARN in the run differ per environment and are not part of the requirement.
+Note on related filed work: the open issue 20261125T070016Z-cloudwatch-ecs-logs-listtasks-refuses-a-live-never.md reports the same error string for a cluster that was NEVER deleted (a state-lifecycle bug that retires an ACTIVE cluster). It does not cover this cause: here the caller did delete the cluster, and the defect is that the ListTasks gate refuses a legitimately tombstoned record at all, so fixing the premature-tombstone bug leaves this replay still refused.
+
+Cause 2 — suite report, ### ecs: "[mismatch] ecs.service-deployment-event-timestamps-monotonic-across-updates — AssertionError: service events are not newest-first: [datetime.datetime(2026, 11, 26, 16, 37, 24, 328000, ...), datetime.datetime(2026, 11, 26, 16, 37, 24, 328000, ...), datetime.datetime(2026, 11, 26, 16, 37, 25, 328000, ...)]". The assertion is `event_times == sorted(event_times, reverse=True)` over `describe_services(...)["services"][0]["events"][*]["createdAt"]`.
+Expected: HTTP 200 with `events` in non-increasing createdAt order (newest first), each event carrying a distinct id and its own createdAt.
+Actual: HTTP 200 with `events` in increasing createdAt order (oldest first), two distinct events sharing one createdAt value. The absolute clock values above are this run's only; the requirement is the ordering and the strict distinctness, not those instants.
+
+## Steps to Reproduce
+Cause 1 (ListTasks after DeleteCluster):
+1. Replay ecs.e2e-capacity-provider-fargate-spot-task-lifecycle.
+2. Short form: CreateCluster C; PutClusterCapacityProviders(cluster=C, capacityProviders=[FARGATE, FARGATE_SPOT], defaultCapacityProviderStrategy=[{capacityProvider: FARGATE_SPOT, weight: 1}]); RegisterTaskDefinition (awsvpc, requiresCompatibilities=[FARGATE], cpu 256, memory 512); RunTask count=1 with capacityProviderStrategy=[{capacityProvider: FARGATE_SPOT, weight: 1}]; wait for lastStatus RUNNING; StopTask and wait for STOPPED.
+3. PutClusterCapacityProviders(cluster=C, capacityProviders=[], defaultCapacityProviderStrategy=[]), then DeleteCluster(cluster=C); poll DescribeClusters until the cluster is INACTIVE or no longer returned.
+4. Call ListTasks(cluster=<C's ARN>). Observe HTTP 400 ClusterNotFoundException "The referenced cluster was inactive." instead of HTTP 200 with an empty taskArns list.
+
+Cause 2 (DescribeServices.events ordering):
+1. Replay ecs.service-deployment-event-timestamps-monotonic-across-updates.
+2. Short form: CreateCluster; RegisterTaskDefinition three revisions of one family (awsvpc, FARGATE, cpu 256, memory 512); CreateService(desiredCount=1, launchType=FARGATE, taskDefinition=rev1) and wait for a RUNNING task.
+3. UpdateService(taskDefinition=rev2), wait for the new service deployment to leave PENDING; UpdateService(taskDefinition=rev3), wait again.
+4. Call DescribeServices(cluster, services=[svc]) and read services[0].events. Observe the createdAt values ascending (oldest first) with two events sharing one createdAt, instead of descending (newest first) with distinct per-event timestamps.
