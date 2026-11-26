@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repository, so the delete that removes it RETIRES those authorizations
         // (`crate::state::key_grant`): nothing is left holding permission on the key for a
         // repository that is gone.
-        crate::state::key_grant::retire(ctx, &region, &removed.key_grants).await;
+        crate::state::key_grant::retire(&*self.engine, ctx, &region, &removed.key_grants).await;
 
         Ok(DeleteRepositoryOutput {
             // The echoed repository carries the same URI every read of it carried: its own

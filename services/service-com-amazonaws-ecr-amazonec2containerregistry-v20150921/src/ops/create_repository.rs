@@ -335,6 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut reported_key = encryption.kms_key.clone();
         if let Some(kms_key) = crate::state::key_grant::granted_key(&encryption) {
             match crate::state::key_grant::take(
+                &*self.engine,
                 ctx,
                 &region,
                 kms_key,
@@ -427,7 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let repository = match written {
             Ok(repository) => repository,
             Err(refusal) => {
-                crate::state::key_grant::retire(ctx, &region, &granted).await;
+                crate::state::key_grant::retire(&*self.engine, ctx, &region, &granted).await;
                 return Err(refusal);
             }
         };

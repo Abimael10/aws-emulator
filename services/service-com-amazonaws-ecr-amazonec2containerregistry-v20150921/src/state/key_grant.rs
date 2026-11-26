@@ -55,9 +55,26 @@
 //! fault, a refusal of the call itself. Such an answer refuses nothing and takes no grant,
 //! and it is logged, because a deployment with no KMS to ask is one where this half of the
 //! contract does not run.
+//!
+//! # What the account's event history says about these calls
+//!
+//! None of these calls is one a client made: the client called this service, and the KMS call
+//! its repository needed was made by this service FOR that client. CloudTrail records such a
+//! call as a call of the service that was CALLED — `eventSource` `kms.amazonaws.com`,
+//! `eventName` the KMS operation — with the CALLER's own `userIdentity` and `invokedBy`
+//! naming this service ([`AUDITED_AS`]), which is how a key owner auditing the key tells a
+//! call this service made for a client from one the client made itself. The one builder of
+//! such a record is shared ([`::service_common::on_behalf_of_calls`]); what this module
+//! states is the call — which key, under what terms — and nothing of what KMS answered that a
+//! record does not carry. Recording is best effort, like every recorder in this tree: an
+//! engine with no event history records nothing and the call it was made for is served
+//! exactly as it would be otherwise.
+
+use std::time::SystemTime;
 
 use ::aws_sdk_kms::error::ProvideErrorMetadata;
 use ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use ::service_common::on_behalf_of_calls::{record_on_behalf_of, OnBehalfOfCall};
 
 /// How many grants one KMS-encrypted repository takes on the key it is encrypted with.
 ///
@@ -95,7 +112,27 @@ pub const GRANT_OPERATIONS: [&str; 2] = ["Decrypt", "GenerateDataKey"];
 /// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Constraints",model_path="services/service-com-amazonaws-kms-trentservice/smithy-model/com-amazonaws-kms-trentservice.json")`).
 const REPOSITORY_ENCRYPTION_CONTEXT_KEY: &str = "aws:ecr:arn";
 
+/// The `eventSource` of the service these calls are made TO, in CloudTrail's
+/// `<endpoint-prefix>.amazonaws.com` form.
+const KMS_EVENT_SOURCE: &str = "kms.amazonaws.com";
+
+/// The service that MADE these calls, as the record's `userIdentity.invokedBy` names it: this
+/// service's own `eventSource` ([`crate::service::management_events::EVENT_SOURCE`]), which is
+/// the GLOBAL form — `invokedBy` names the service, and the regional spelling belongs to the
+/// grantee principal the grant itself carries ([`service_principal`]).
+const AUDITED_AS: &str = crate::service::management_events::EVENT_SOURCE;
+
+/// The KMS operation that resolves the key, as KMS's model names it.
+const DESCRIBE_KEY_OPERATION: &str = "DescribeKey";
+
+/// The KMS operation that takes one of the grants, as KMS's model names it.
+const CREATE_GRANT_OPERATION: &str = "CreateGrant";
+
+/// The KMS operation that retires one of them again.
+const RETIRE_GRANT_OPERATION: &str = "RetireGrant";
+
 /// The service principal this service calls KMS as, for `region`.
+///
 ///
 /// The regional form, because the grant is taken at one Region's endpoint on a key that lives
 /// in that Region: an AWS service principal is `<service>.<region>.amazonaws.com` where the
@@ -165,7 +202,8 @@ pub fn granted_key(encryption: &crate::ops::types::EncryptionConfiguration) -> O
 /// [`GRANTS_PER_REPOSITORY`] grants are then taken, one request each. An answer KMS gives
 /// about the key refuses the whole create, so any grant already taken is retired again rather
 /// than left on the key for a repository that is not created.
-pub async fn take(
+pub async fn take<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     kms_key: &str,
@@ -178,6 +216,18 @@ pub async fn take(
         Ok(described) => described,
         Err(error) => return answered_about_the_key(&error, "resolve", kms_key),
     };
+    // The read that resolved the key is a call this service made for the caller, so the
+    // account's event history carries it as one: the selector it carried is the one the
+    // request named, and a read answers no `responseElements`.
+    record(
+        engine,
+        ctx,
+        region,
+        DESCRIBE_KEY_OPERATION,
+        A_READ_OF_THE_KEY,
+        ::serde_json::json!({"keyId": kms_key}),
+        None,
+    );
     let Some(key_arn) = described
         .key_metadata
         .and_then(|metadata| metadata.arn)
@@ -194,13 +244,13 @@ pub async fn take(
 
     let mut taken: Vec<KeyGrant> = Vec::with_capacity(GRANTS_PER_REPOSITORY);
     while taken.len() < GRANTS_PER_REPOSITORY {
-        match one_grant(&client, region, &key_arn, repository_arn).await {
+        match one_grant(engine, ctx, &client, region, &key_arn, repository_arn).await {
             Ok(grant) => taken.push(grant),
             Err(unserved) => {
                 // Nothing is left holding permission on the key for a create that is not
                 // going through.
                 for grant in &taken {
-                    retire_one(&client, grant).await;
+                    retire_one(engine, ctx, &client, region, grant).await;
                 }
                 return unserved;
             }
@@ -211,7 +261,9 @@ pub async fn take(
 
 /// Take ONE of the grants, on the key already resolved to `key_arn`: the grant KMS minted, or
 /// the reason there is none.
-async fn one_grant(
+async fn one_grant<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     client: &::aws_sdk_kms::Client,
     region: &str,
     key_arn: &str,
@@ -251,10 +303,35 @@ async fn one_grant(
         }
     };
     match created.grant_id {
-        Some(grant_id) if !grant_id.is_empty() => Ok(KeyGrant {
-            key_arn: key_arn.to_string(),
-            grant_id,
-        }),
+        Some(grant_id) if !grant_id.is_empty() => {
+            // The grant this service took for the caller, in the account's event history: the
+            // terms the request stated, and the id KMS minted as what it answered with — a
+            // grant id is what a key owner revokes by, and no part of it is key material.
+            record(
+                engine,
+                ctx,
+                region,
+                CREATE_GRANT_OPERATION,
+                A_CHANGE_TO_THE_KEYS_GRANTS,
+                ::serde_json::json!({
+                    "keyId": key_arn,
+                    "granteePrincipal": service_principal(region),
+                    "retiringPrincipal": service_principal(region),
+                    "operations": GRANT_OPERATIONS,
+                    "constraints": {
+                        "sourceArn": repository_arn,
+                        "encryptionContextSubset": {
+                            REPOSITORY_ENCRYPTION_CONTEXT_KEY: repository_arn,
+                        },
+                    },
+                }),
+                Some(::serde_json::json!({"grantId": grant_id})),
+            );
+            Ok(KeyGrant {
+                key_arn: key_arn.to_string(),
+                grant_id,
+            })
+        }
         // A grant KMS reported without an id is one nothing can retire, so it is not
         // recorded as one this repository holds.
         _ => {
@@ -272,7 +349,8 @@ async fn one_grant(
 /// Best effort and reported nowhere: the repository they were taken for is gone either way,
 /// and a grant KMS no longer holds — one a key owner revoked, one on a key whose deletion is
 /// scheduled — is already retired as far as this service is concerned.
-pub async fn retire(
+pub async fn retire<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     grants: &[KeyGrant],
@@ -284,13 +362,19 @@ pub async fn retire(
         return;
     };
     for grant in grants {
-        retire_one(&client, grant).await;
+        retire_one(engine, ctx, &client, region, grant).await;
     }
 }
 
 /// Retire ONE grant: the single `kms:RetireGrant` call of this module, so its two callers —
 /// the delete, and the create backing out a refused request — make the same one.
-async fn retire_one(client: &::aws_sdk_kms::Client, grant: &KeyGrant) {
+async fn retire_one<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    client: &::aws_sdk_kms::Client,
+    region: &str,
+    grant: &KeyGrant,
+) {
     if let Err(error) = client
         .retire_grant()
         .key_id(&grant.key_arn)
@@ -303,7 +387,60 @@ async fn retire_one(client: &::aws_sdk_kms::Client, grant: &KeyGrant) {
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "the KMS grant this repository held on its key could not be retired"
         );
+        // A call KMS did not serve is no call of the account's: the record of a failed call
+        // belongs to the service that refused it.
+        return;
     }
+    record(
+        engine,
+        ctx,
+        region,
+        RETIRE_GRANT_OPERATION,
+        A_CHANGE_TO_THE_KEYS_GRANTS,
+        ::serde_json::json!({"keyId": grant.key_arn, "grantId": grant.grant_id}),
+        // Retiring a grant answers nothing.
+        None,
+    );
+}
+
+/// Whether the KMS call that RESOLVES the key only reports it: `kms:DescribeKey` "provides
+/// detailed information about a KMS key" and changes nothing the account holds, which is what
+/// CloudTrail records as the event's `readOnly`.
+const A_READ_OF_THE_KEY: bool = true;
+
+/// Whether taking or retiring a grant only reports the key: it does not — each one changes
+/// which authorizations the key carries, which is what `kms:ListGrants` then reports.
+const A_CHANGE_TO_THE_KEYS_GRANTS: bool = false;
+
+/// Record one call this service made to KMS for the caller of `ctx`, in the account's event
+/// history (see the module docs).
+///
+/// `request_parameters` states the call as the record carries it, and `response_elements` what
+/// it answered with for a call whose answer a record carries — `None` for a read, which
+/// CloudTrail records with none.
+fn record<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    read_only: bool,
+    request_parameters: ::serde_json::Value,
+    response_elements: Option<::serde_json::Value>,
+) {
+    record_on_behalf_of(
+        engine,
+        ctx.parts(),
+        OnBehalfOfCall {
+            event_name: operation.to_string(),
+            event_source: KMS_EVENT_SOURCE.to_string(),
+            invoked_by: AUDITED_AS.to_string(),
+            aws_region: region.to_string(),
+            read_only,
+            request_parameters,
+            response_elements,
+        },
+        SystemTime::now(),
+    );
 }
 
 /// How one failed KMS call is read: an answer KMS gave with a CLIENT status is its judgement

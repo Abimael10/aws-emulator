@@ -97,10 +97,17 @@ mod registry_v2;
 /// service has before dispatch.
 mod unreadable_body;
 
+/// This front door's AUDIT leg, in `service/management_events.rs`: every call this service
+/// serves is a management event of `ecr.amazonaws.com`, recorded in the account's event
+/// history where CloudTrail's `LookupEvents` reads it. It is wired in where the entry is
+/// built below, so every request that resolves a modelled operation is served through it.
+pub mod management_events;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
 
@@ -110,7 +117,11 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, behind the AUDIT wrapper: identity, protocol and every
+    /// framework-level error renderer are the generated ones untouched, and the routing
+    /// table is the audited one, whose keys are the same modelled operation names
+    /// ([`management_events`]).
+    entry: management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
     /// The SAME shared engine the generated entry threads into every operation.
     ///
     /// Held here because the layer download plane is served from
@@ -126,7 +137,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            // Every modelled operation is served through this service's own
+            // management-event recorder (see [`management_events`]), so each call it
+            // serves is recorded in the account's event history.
+            entry: management_events::AuditedDefinition::new(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                management_events::audited_table(&engine),
+            ),
             engine,
         }
     }
