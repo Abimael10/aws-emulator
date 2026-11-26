@@ -3,21 +3,23 @@
 //! End-to-end HTTP tests for ONE rendering rule: the `Tags` member that reports "the
 //! tags assigned to the retention rule".
 //!
-//! `Tags` is an OPTIONAL member of every shape that reports it (`CreateRuleResponse`,
-//! `ListTagsForResourceResponse`), read off the one stored tag set of one rule.
+//! `Tags` is a member of every shape that reports it (`CreateRuleResponse`,
+//! `ListTagsForResourceResponse`), read off the one stored tag set of one rule, and its
+//! target `TagList` is bounded `0..200`.
 //! Source: smithy_query(query="operation", operation="CreateRule,ListTagsForResource")
 //! and smithy_query(query="doc", shape="ListTagsForResourceResponse", member="Tags").
-//! So a rule carrying tags reports them, and a rule carrying NONE has no tag assignment
-//! to report: the member is absent rather than present as an empty list, because an
-//! absent optional member and a present empty collection are different on the wire.
+//! So a rule carrying tags reports them, and a rule carrying NONE reports a collection of
+//! length zero: the member is PRESENT as an empty list rather than omitted, because a
+//! reader of the collection must find it whatever the rule holds.
 //!
 //! What this suite pins, which no other suite does (`tests/all/rule_status_transitions.rs`
 //! owns the `CreateRule` side of the same member, and this suite reads the member through
 //! that suite's reader rather than a second one):
 //!
-//! * the ABSENCE of the member for a rule with no tags, on `ListTagsForResource` — the
-//!   tagging suite reads the member through a helper that collapses an absent member and
-//!   `[]` into the same empty map, so it cannot see the difference;
+//! * the PRESENCE of the member, as `[]`, for a rule with no tags, on
+//!   `ListTagsForResource` — the tagging suite reads the member through a helper that
+//!   collapses an absent member and `[]` into the same empty map, so it cannot see the
+//!   difference;
 //! * that both renderers of the member agree for the same rule, whatever tag set it
 //!   holds, so the two cannot drift apart again;
 //! * that the rendering follows the rule's CURRENT tag set however the rule reached it —
@@ -35,8 +37,9 @@ use serde_json::{json, Value};
 
 use crate::resource_tags::{keys, list_tags, pairs, tag_resource, untag_resource};
 use crate::retention_rule_lifecycle::{create_rule, retention, router, RESOURCE_TYPES};
-// The one reader in this test target that tells an ABSENT `Tags` member from a present
-// empty list, shared with the suite that pins the same distinction on `CreateRule`.
+// The one reader in this test target that tells an ABSENT `Tags` member (`None`) from a
+// present empty list (`Some` of an empty map), shared with the suite that pins the same
+// distinction on `CreateRule`.
 use crate::rule_status_transitions::tags_of;
 use service_com_amazonaws_rbin_amazonrecyclebin::state::MAX_TAGS_PER_RULE;
 
@@ -181,7 +184,7 @@ fn create_body(row: &Row) -> Value {
 }
 
 #[tokio::test]
-async fn the_tags_member_is_reported_only_for_a_rule_that_carries_tags() {
+async fn the_tags_member_is_reported_as_a_present_list_for_every_tag_set() {
     let router = router();
     for row in rows() {
         let case = row.case;
@@ -237,22 +240,21 @@ async fn the_tags_member_is_reported_only_for_a_rule_that_carries_tags() {
             status, 200,
             "case {case:?}: expected HTTP 200 from ListTagsForResource, got {status} / {listed:?}"
         );
-        let reported = tags_of(&listed);
-        if row.expected.is_empty() {
-            assert!(
-                reported.is_none(),
-                "case {case:?}: a rule holding no tags must omit the Tags member, got {:?}",
-                listed.get("Tags")
-            );
-        } else {
-            assert_eq!(
-                reported.as_ref(),
-                Some(&row.expected),
-                "case {case:?}: expected ListTagsForResource to report Tags {:?}, got {:?}",
-                row.expected,
-                listed.get("Tags")
-            );
-        }
+        // The member is a present list for every tag set, the empty one included, so a
+        // client indexing it never misses it.
+        assert!(
+            listed.get("Tags").is_some_and(Value::is_array),
+            "case {case:?}: expected ListTagsForResource to report Tags as a present list, \
+             got {:?}",
+            listed.get("Tags")
+        );
+        assert_eq!(
+            tags_of(&listed).as_ref(),
+            Some(&row.expected),
+            "case {case:?}: expected ListTagsForResource to report Tags {:?}, got {:?}",
+            row.expected,
+            listed.get("Tags")
+        );
 
         // Reporting only: reading the tags changes nothing a later caller sees, so the
         // second read is byte-for-byte the first.

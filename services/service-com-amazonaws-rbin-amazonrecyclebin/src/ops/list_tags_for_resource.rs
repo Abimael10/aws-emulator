@@ -56,7 +56,8 @@
 //! ## Output
 //!
 //! * `Tags` (TagList, len 0..200) — Information about the tags assigned to the retention
-//!   rule.
+//!   rule. Reported as a list that is always present: a rule carrying no tags is a
+//!   collection of length zero, rendered `[]`.
 //!
 //! ## Errors
 //!
@@ -172,11 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // The tags assigned to the rule are reported through the one normalisation every
-        // renderer of that member shares: the stored assignments when the rule carries
-        // any, and no `Tags` member at all when it carries none — an untagged rule has no
-        // tag assignment to report, and an absent optional member is not an empty list.
+        // renderer of that member shares: the stored assignments as a PRESENT list, which
+        // is empty for a rule carrying none. A caller that reads the collection this
+        // operation exists to report therefore always finds it.
         Ok(ListTagsForResourceOutput {
-            tags: rule.reported_tags(),
+            tags: Some(rule.reported_tags()),
         })
     }
 }

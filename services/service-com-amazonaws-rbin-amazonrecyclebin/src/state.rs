@@ -385,19 +385,23 @@ impl Rule {
     }
 
     /// The `Tags` member every response that reports this rule's own tags carries: the
-    /// stored tag assignments when the rule has any, and NOTHING at all when it has none.
+    /// stored tag assignments, as a list that is PRESENT whether or not the rule carries
+    /// any.
     ///
-    /// `Tags` is the same optional member, documented the same way — "Information about
-    /// the tags assigned to the retention rule" — on every shape that reports it, read
-    /// off the one [`Self::tags`] field. A rule carrying no tags has no tag assignment to
-    /// report, so the member is left unset rather than serialized as an empty list: an
-    /// absent optional member and a present empty collection are different on the wire.
-    /// The normalisation lives here, in one place, so no two renderers of this one field
-    /// can answer differently for the same rule. (The resource-SELECTION members —
-    /// `ResourceTags` / `ExcludeResourceTags` — are reported either way: they are always
-    /// part of a rule's record, empty or not.)
-    pub fn reported_tags(&self) -> Option<Vec<Tag>> {
-        (!self.tags.is_empty()).then(|| self.tags.clone())
+    /// `Tags` is the same member, documented the same way — "Information about the tags
+    /// assigned to the retention rule" — on every shape that reports it, read off the one
+    /// [`Self::tags`] field, and its target `TagList` is bounded `0..200`
+    /// (smithy_query(query="operation", operation="CreateRule,ListTagsForResource")), so a
+    /// rule carrying no tags is a tag collection of length zero: the member is serialized
+    /// as `[]` rather than left unset. A reader of the collection then always finds it,
+    /// exactly as the other list members of a rule's record are always found — the
+    /// resource SELECTION (`ResourceTags` / `ExcludeResourceTags`) and `ListRules`' own
+    /// `Rules` page are reported empty rather than omitted too. The normalisation lives
+    /// here, in one place, so no two renderers of this one field can answer differently
+    /// for the same rule, and the return type states that the member is never absent:
+    /// each renderer wraps the list in the `Some` its output field is declared with.
+    pub fn reported_tags(&self) -> Vec<Tag> {
+        self.tags.clone()
     }
 
     /// Whether the rule's lock still forbids modifying or deleting it.

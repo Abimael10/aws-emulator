@@ -11,11 +11,12 @@
 //!    never runs backwards.
 //!    Source: smithy_query(query="shape", shape="RuleStatus,CreateRuleResponse,
 //!    UpdateRuleResponse,GetRuleResponse").
-//! 2. TAGS. `CreateRuleResponse$Tags` is the OPTIONAL member reporting "the tags
-//!    assigned to the retention rule", so a rule carrying no tags has the member
-//!    ABSENT rather than present as an empty list — while the resource-selection
-//!    members (`ResourceTags`, `ExcludeResourceTags`) are part of a rule's record
-//!    either way and are reported empty.
+//! 2. TAGS. `CreateRuleResponse$Tags` is the member reporting "the tags
+//!    assigned to the retention rule" and targets a `TagList` bounded `0..200`, so a
+//!    rule carrying no tags reports the member PRESENT as an empty list rather than
+//!    omitting it — exactly like the resource-selection members (`ResourceTags`,
+//!    `ExcludeResourceTags`), which are part of a rule's record either way and are
+//!    reported empty.
 //!
 //! Every case drives the service through the real router, exactly as a signed SDK
 //! request would, and each row states its own case so a failure names the input.
@@ -314,7 +315,7 @@ async fn update_rule_returns_the_rule_to_pending_until_the_clock_settles_it_agai
 }
 
 /// `(case, the request's Tags member, the tags the rule must end up carrying)`. A row
-/// whose expected map is empty must come back with NO `Tags` member at all.
+/// whose expected map is empty must come back with the `Tags` member present and empty.
 fn tag_rows() -> Vec<(&'static str, Option<Value>, BTreeMap<String, String>)> {
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
     // The quota the store holds one rule to, so the top of the count range is covered.
@@ -366,7 +367,7 @@ fn tag_rows() -> Vec<(&'static str, Option<Value>, BTreeMap<String, String>)> {
 }
 
 #[tokio::test]
-async fn create_rule_reports_the_tags_member_only_for_a_rule_that_carries_tags() {
+async fn create_rule_reports_the_tags_member_as_a_present_list() {
     let router = router();
     for (case, requested, expected) in tag_rows() {
         let mut body = json!({
@@ -382,21 +383,17 @@ async fn create_rule_reports_the_tags_member_only_for_a_rule_that_carries_tags()
             "case {case:?}: expected HTTP 201 from CreateRule, got {status} / {created:?}"
         );
 
-        let reported = tags_of(&created);
-        if expected.is_empty() {
-            assert!(
-                reported.is_none(),
-                "case {case:?}: an untagged rule must omit the Tags member, got {:?}",
-                created["Tags"]
-            );
-        } else {
-            assert_eq!(
-                reported.as_ref(),
-                Some(&expected),
-                "case {case:?}: expected CreateRule to report Tags {expected:?}, got {:?}",
-                created["Tags"]
-            );
-        }
+        assert!(
+            created.get("Tags").is_some_and(Value::is_array),
+            "case {case:?}: expected CreateRule to report Tags as a present list, got {:?}",
+            created.get("Tags")
+        );
+        assert_eq!(
+            tags_of(&created).as_ref(),
+            Some(&expected),
+            "case {case:?}: expected CreateRule to report Tags {expected:?}, got {:?}",
+            created["Tags"]
+        );
 
         // The resource-selection members are part of a rule's record either way, so
         // they stay present even when the rule names none of them.
@@ -409,8 +406,8 @@ async fn create_rule_reports_the_tags_member_only_for_a_rule_that_carries_tags()
             );
         }
 
-        // ROUND TRIP: the omission is a serialization choice, not lost state —
-        // `ListTagsForResource` reads the same tags back out of the store.
+        // ROUND TRIP: the same tags are read back out of the store by
+        // `ListTagsForResource`, which reports the collection the same way.
         let rule_arn = created["RuleArn"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: CreateRule reported no RuleArn"));
@@ -419,9 +416,9 @@ async fn create_rule_reports_the_tags_member_only_for_a_rule_that_carries_tags()
             status, 200,
             "case {case:?}: expected HTTP 200 from ListTagsForResource, got {status} / {listed:?}"
         );
-        let listed_tags = tags_of(&listed).unwrap_or_default();
         assert_eq!(
-            listed_tags, expected,
+            tags_of(&listed).as_ref(),
+            Some(&expected),
             "case {case:?}: expected ListTagsForResource to report {expected:?}, got {:?}",
             listed["Tags"]
         );

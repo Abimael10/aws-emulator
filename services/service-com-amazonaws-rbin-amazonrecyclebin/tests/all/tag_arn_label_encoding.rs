@@ -8,7 +8,7 @@
 //! that to hold; `:` is legal unencoded in a path segment (RFC 3986 `pchar`), and a
 //! percent escape is case-insensitive. The rule under test: the ARN the service minted
 //! resolves to its rule whichever of those forms a client sends, and a rule carrying no
-//! tags OMITS the optional `Tags` member rather than reporting an empty array — a
+//! tags reports the `Tags` member PRESENT as an empty array rather than omitting it — a
 //! distinction a map- or list-defaulting assertion cannot see.
 //!
 //! `tests/all/resource_tags.rs` covers the tag sets, the upsert/removal rules and the
@@ -173,7 +173,7 @@ async fn the_resource_arn_label_resolves_however_the_client_escaped_it() {
 }
 
 #[tokio::test]
-async fn an_untagged_rule_omits_the_tags_member() {
+async fn an_untagged_rule_reports_an_empty_tags_member() {
     let router = router();
     // Both ways a rule can end up holding no tags: created with an empty list, and
     // created with tags that are then all unassigned.
@@ -214,12 +214,13 @@ async fn an_untagged_rule_omits_the_tags_member() {
             status, 200,
             "case {case:?}: expected HTTP 200, got {status} / {listed:?}"
         );
-        // `Tags` reports the tags ASSIGNED to the rule, and this rule has no assignment
-        // to report: the optional member is absent, not present as an empty array.
-        assert!(
-            listed.get("Tags").is_none_or(Value::is_null),
-            "case {case:?}: expected no Tags member at all, got {:?}",
-            listed["Tags"]
+        // `Tags` reports the tags ASSIGNED to the rule as a collection: this rule holds
+        // none, so the member is present and empty, not missing.
+        assert_eq!(
+            listed.get("Tags"),
+            Some(&json!([])),
+            "case {case:?}: expected an empty Tags list, got {:?}",
+            listed.get("Tags")
         );
         assert!(
             tag_pairs(&listed).is_empty(),

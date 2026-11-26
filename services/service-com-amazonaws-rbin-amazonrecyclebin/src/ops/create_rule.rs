@@ -370,11 +370,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retention_period: Some(stored.retention_period.clone()),
             description: stored.description.clone(),
             // `Tags` reports "the tags assigned to the retention rule", through the one
-            // normalisation every renderer of that member shares: a rule carrying no tags
-            // has no tag assignment to report, so the OPTIONAL member is left unset rather
-            // than serialized as an empty list. (The resource-selection members below are
-            // reported either way — they are always part of a rule's record, empty or not.)
-            tags: stored.reported_tags(),
+            // normalisation every renderer of that member shares: the stored assignments
+            // as a PRESENT list, empty for a rule carrying none — like the
+            // resource-selection members below, which are part of a rule's record empty
+            // or not.
+            tags: Some(stored.reported_tags()),
             resource_type: Some(stored.resource_type.clone()),
             resource_tags: Some(stored.resource_tags.clone()),
             status: Some(stored.status.clone()),
