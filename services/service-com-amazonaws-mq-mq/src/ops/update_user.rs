@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: changes the members `UpdateUser` carries on the user named by `Username`
+//! of the broker named by `BrokerId` and persists them on that broker's record, where
+//! `DescribeUser` and `DescribeBroker` read them back. The response has no members. A
+//! member the request leaves out is left as it was — the operation changes what it was
+//! sent and nothing else.
+//!
+//! A user change does not take effect on the broker until the broker is rebooted — which
+//! is what `UserPendingChanges` reports — so the user keeps being served with the change
+//! staged on it until the reboot applies it (`crate::state::broker_restart`).
+//!
+//! The per-user API applies to the ActiveMQ engine only
+//! (`crate::state::user_api_applies`), so the call is refused, and the broker's users left
+//! untouched, on a broker of any other engine.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +84,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +158,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUser"))
+        let _ = ctx;
+        let Some(state) = state::service_state(&*self.engine) else {
+            return Err(UpdateUserErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // Each member the request may carry is held to its own documented constraint,
+        // and a member it does not carry is not constrained at all: it is left as it is.
+        // They are evaluated here but ANSWERED after the broker is resolved, so a request
+        // naming a broker that does not exist is reported as the missing resource it is
+        // even when one of its members is also invalid — the same order `CreateUser`
+        // answers in.
+        let members = state::validate_username(state::USERNAME_ATTRIBUTE, &input.username)
+            .and_then(|()| match &input.password {
+                Some(password) => state::validate_password("password", password),
+                None => Ok(()),
+            })
+            .and_then(|()| match &input.groups {
+                Some(groups) => state::validate_groups("groups", groups),
+                None => Ok(()),
+            });
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(broker) = store.settled_broker_mut(&input.broker_id, now) else {
+            return Err(UpdateUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some("broker-id".to_string()),
+                message: Some(state::broker_not_found_message(&input.broker_id)),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+        // The per-user API applies to the ActiveMQ engine only, so a broker of another
+        // engine has no user to change: the request is refused BEFORE anything on the
+        // broker is changed.
+        if !broker.user_api_applies() {
+            return Err(UpdateUserErrorModeled::ConflictException(ConflictException {
+                error_attribute: None,
+                message: Some(state::USER_API_ACTIVEMQ_ONLY_MESSAGE.to_string()),
+                resource_share_errors: None,
+            })
+            .into());
+        }
+        members.map_err(bad_request)?;
+
+        let Some(user) = broker.users.get_mut(&input.username) else {
+            return Err(UpdateUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some(state::USERNAME_ATTRIBUTE.to_string()),
+                message: Some(state::user_not_found_message(
+                    &input.broker_id,
+                    &input.username,
+                )),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+
+        // Only what the request carried changes: every member of `UpdateUser` is
+        // optional, and an absent one is not "set to its default" but "not part of this
+        // change".
+        if let Some(password) = &input.password {
+            user.password = password.clone();
+        }
+        if let Some(console_access) = input.console_access {
+            user.console_access = console_access;
+        }
+        if let Some(groups) = &input.groups {
+            user.groups = groups.clone();
+        }
+        if let Some(replication_user) = input.replication_user {
+            user.replication_user = replication_user;
+        }
+        // What this call stages is a pending UPDATE, which the broker's next reboot
+        // applies. A user that already owes the broker a change keeps THAT change: the
+        // broker still owes its creation or its removal, and an update does not turn one
+        // into the other.
+        if user.pending_change.is_none() {
+            user.pending_change = Some(state::CHANGE_TYPE_UPDATE.to_string());
+        }
+
+        Ok(UpdateUserOutput {})
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> UpdateUserError {
+    UpdateUserErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

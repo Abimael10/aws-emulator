@@ -6,7 +6,9 @@
 //! pending deletion and persists that on the broker's record, where `DescribeUser` and
 //! `DescribeBroker` read it back as this user's pending change. The response has no
 //! members. A `BrokerId` with no broker behind it, or a `Username` the broker does not
-//! hold, is `NotFoundException` (404).
+//! hold, is `NotFoundException` (404). The per-user API applies to the ActiveMQ engine
+//! only (`crate::state::user_api_applies`), so the call is refused, and the broker's
+//! users left untouched, on a broker of any other engine.
 //!
 //! A user change does not take effect on the broker until the broker is rebooted — which
 //! is why the modelled answer carries `UserPendingChanges` at all — so the deleted user
@@ -70,6 +72,9 @@
 //! * `ForbiddenException` (HTTP 403) — Returns information about an error.
 //! * `InternalServerErrorException` (HTTP 500) — Returns information about an error.
 //! * `NotFoundException` (HTTP 404) — Returns information about an error.
+//! * `ConflictException` (HTTP 409) — widened in through `extra_errors` (see below): the
+//!   per-user API applies to the ActiveMQ engine only, and this operation's own `errors`
+//!   list omits the shape the SERVICE models for that refusal.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,10 +91,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mq-mq.json");
 // here — hence the `DeleteUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mq#DeleteUser")]
+// `ConflictException` is widened in through `extra_errors`, exactly as `DescribeUser`
+// widens it: the per-user API applies to the ActiveMQ engine only
+// (`state::user_api_applies`), so a broker of another engine holds no user to delete — a
+// conflict with the state of the addressed broker (409), which this SERVICE models while
+// this operation's own `errors` list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mq#DeleteUser",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteUserErrorModeled {
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     NotFoundException(NotFoundException),
@@ -167,6 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // The per-user API applies to the ActiveMQ engine only, so a broker of another
+        // engine has no user to delete: the request is refused BEFORE anything on the
+        // broker is changed.
+        if !broker.user_api_applies() {
+            return Err(DeleteUserErrorModeled::ConflictException(ConflictException {
+                error_attribute: None,
+                message: Some(state::USER_API_ACTIVEMQ_ONLY_MESSAGE.to_string()),
+                resource_share_errors: None,
+            })
+            .into());
+        }
 
         // A username outside its documented constraint can name no stored user, so
         // the lookup below already answers it as the missing resource it is — the

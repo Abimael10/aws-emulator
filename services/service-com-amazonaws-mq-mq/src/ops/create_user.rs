@@ -4,6 +4,9 @@
 //!
 //! Implemented: adds a user to the broker named by `BrokerId` and persists it on that
 //! broker's record, where `DescribeUser` reads it back. The response has no members.
+//! The per-user API applies to the ActiveMQ engine only
+//! (`crate::state::user_api_applies`), so the call is refused, and the broker's users
+//! left untouched, on a broker of any other engine.
 //!
 //! ## Shape of an operation
 //!
@@ -181,6 +184,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // The per-user API applies to the ActiveMQ engine only, so a broker of another
+        // engine takes no user through it: the request is refused BEFORE anything on the
+        // broker is changed, and before any member of it is answered for — what the
+        // request carries cannot matter to an operation that does not apply at all.
+        if !broker.user_api_applies() {
+            return Err(CreateUserErrorModeled::ConflictException(ConflictException {
+                error_attribute: None,
+                message: Some(state::USER_API_ACTIVEMQ_ONLY_MESSAGE.to_string()),
+                resource_share_errors: None,
+            })
+            .into());
+        }
         members.map_err(bad_request)?;
 
         // A username is unique within one broker.
@@ -200,14 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // driven purely by how many requests a caller makes. No `errorAttribute`:
         // no member of the request is at fault, the broker's user count is.
         if broker.users.len() >= state::MAX_USERS_PER_BROKER {
-            return Err(bad_request(state::Invalid {
-                attribute: None,
-                message: format!(
-                    "broker {:?} already holds its quota of {} users",
-                    input.broker_id,
-                    state::MAX_USERS_PER_BROKER
-                ),
-            }));
+            return Err(bad_request(state::Invalid::without_attribute(format!(
+                "broker {:?} already holds its quota of {} users",
+                input.broker_id,
+                state::MAX_USERS_PER_BROKER
+            ))));
         }
 
         broker.users.insert(

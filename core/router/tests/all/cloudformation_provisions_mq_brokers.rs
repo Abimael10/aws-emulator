@@ -33,6 +33,13 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The mq service's own reading of which engine reports which spelling, and which engines
+// its per-user API applies to, so this suite names neither of those rules itself.
+use service_com_amazonaws_mq_mq::ops::types::ENGINE_TYPE_VALUES;
+use service_com_amazonaws_mq_mq::state::{
+    reported_engine_type, user_api_applies, USER_API_ACTIVEMQ_ONLY_MESSAGE,
+};
+
 // The awsQuery form encoder and the XML element readers this crate writes ONCE
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
 // The same encoder escapes a value for a non-greedy URI label, which is what an SDK sends.
@@ -738,6 +745,20 @@ async fn a_stack_provisions_the_mq_broker_its_template_declares() {
         // A user's own record is read through the operation that addresses one: the broker
         // id the stack published plus the username, which is what proves the whole user
         // structure reached the create rather than only its name.
+        //
+        // That per-user API applies to the ActiveMQ engine only, so a broker of any other
+        // engine answers the SAME read with the service's refusal: the users the stack
+        // declared are still on the broker's own read above, which is where a client of
+        // such a broker finds them.
+        let engine_token = ENGINE_TYPE_VALUES
+            .iter()
+            .find(|token| reported_engine_type(token) == row.expected_engine_type)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: no modelled engine type reports as {:?}",
+                    row.expected_engine_type
+                )
+            });
         for user in row.expected_users {
             let (status, described_user) = mq(
                 &router,
@@ -750,6 +771,21 @@ async fn a_stack_provisions_the_mq_broker_its_template_declares() {
                 ),
             )
             .await;
+            if !user_api_applies(engine_token) {
+                assert_eq!(
+                    status, 409,
+                    "case {case:?}: expected HTTP 409 from DescribeUser on a {:?} broker \
+                     for {:?}, got {status} with body {described_user}",
+                    row.expected_engine_type, user.username
+                );
+                assert_eq!(
+                    described_user.get("message").and_then(Value::as_str),
+                    Some(USER_API_ACTIVEMQ_ONLY_MESSAGE),
+                    "case {case:?}: expected the service's refusal of the per-user API, \
+                     got {described_user}"
+                );
+                continue;
+            }
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected HTTP 200 from DescribeUser for {:?}, got {status} \

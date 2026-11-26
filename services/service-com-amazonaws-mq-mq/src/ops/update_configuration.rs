@@ -239,14 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused call, and no member of the request is at fault — the
         // configuration's revision count is.
         if configuration.revisions.len() >= state::MAX_CONFIGURATION_REVISIONS {
-            return Err(bad_request(state::Invalid {
-                attribute: None,
-                message: format!(
-                    "this configuration already holds its quota of {} revisions; delete the \
-                     configuration before making another",
-                    state::MAX_CONFIGURATION_REVISIONS
-                ),
-            }));
+            return Err(bad_request(state::Invalid::without_attribute(format!(
+                "this configuration already holds its quota of {} revisions; delete the \
+                 configuration before making another",
+                state::MAX_CONFIGURATION_REVISIONS
+            ))));
         }
         // Amazon MQ READS the document before it keeps it: `Data` is the engine's own
         // configuration document (the XML an ActiveMQ broker takes, the Cuttlefish a

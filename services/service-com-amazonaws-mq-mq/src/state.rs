@@ -440,6 +440,17 @@ impl Broker {
         self.engine_type != ENGINE_TYPE_RABBITMQ
     }
 
+    /// Whether Amazon MQ's PER-USER API applies to this broker at all.
+    ///
+    /// The user operations manage the users of an ActiveMQ broker — each is documented
+    /// as acting on "an ActiveMQ user" — so on a broker of any other engine there is no
+    /// user resource for them to address: such a broker's users are managed through the
+    /// broker's own management interface, and every one of those calls is refused
+    /// ([`USER_API_ACTIVEMQ_ONLY_MESSAGE`]).
+    pub fn user_api_applies(&self) -> bool {
+        user_api_applies(&self.engine_type)
+    }
+
     /// `Tags`, as the modelled map, or `None` when the broker carries none.
     pub fn optional_tags(&self) -> Option<std::collections::HashMap<String, String>> {
         optional_tag_map(&self.tags)
@@ -926,13 +937,61 @@ pub struct Invalid {
     pub attribute: Option<String>,
     /// What was wrong, naming the member and the constraint it broke.
     pub message: String,
+    /// Whether [`Self::message`] is a sentence AMAZON MQ ITSELF words for this
+    /// refusal, in which case it is answered VERBATIM: such a sentence states the
+    /// rule, so nothing — not the element of a list the faulty value sat in, not the
+    /// value — may be added to it ([`Self::in_list_member`]). A message this emulator
+    /// words itself carries no such constraint.
+    fixed_wording: bool,
 }
 
 impl Invalid {
+    /// A refusal of `attribute` worded by this emulator, which an enclosing member may
+    /// add its own element path to.
     pub fn new(attribute: &str, message: impl Into<String>) -> Self {
         Self {
             attribute: Some(attribute.to_string()),
             message: message.into(),
+            fixed_wording: false,
+        }
+    }
+
+    /// A refusal of `attribute` whose `message` is AMAZON MQ'S OWN sentence for the
+    /// rule that was broken, which is answered exactly as the service words it.
+    pub fn fixed(attribute: &str, message: impl Into<String>) -> Self {
+        Self {
+            fixed_wording: true,
+            ..Self::new(attribute, message)
+        }
+    }
+
+    /// A refusal no member of the request is at fault for — a quota, the state a
+    /// resource is in — so it carries no `errorAttribute`.
+    pub fn without_attribute(message: impl Into<String>) -> Self {
+        Self {
+            attribute: None,
+            message: message.into(),
+            fixed_wording: false,
+        }
+    }
+
+    /// This refusal as the LIST member holding the faulty element reports it: the list
+    /// is the member at fault, and the element's position is put in front of the
+    /// message so a client can tell which element earned it.
+    ///
+    /// A refusal Amazon MQ words ITSELF ([`Self::fixed`]) keeps that sentence exactly:
+    /// the service's own text is the whole message, and prefixing it would answer
+    /// wording no client of the real service ever sees.
+    pub fn in_list_member(self, attribute: &str, position: usize) -> Self {
+        let message = if self.fixed_wording {
+            self.message
+        } else {
+            format!("{attribute}[{position}]: {}", self.message)
+        };
+        Self {
+            attribute: Some(attribute.to_string()),
+            message,
+            fixed_wording: self.fixed_wording,
         }
     }
 }
@@ -1115,6 +1174,25 @@ pub fn user_not_found_message(broker_id: &str, username: &str) -> String {
     format!("Can\u{2019}t find user [{username}] for broker [{broker_id}]. Make sure user exists.")
 }
 
+/// Whether Amazon MQ's per-user API applies to a broker running `engine_type`.
+///
+/// RULE: the per-user API (`CreateUser`, `DescribeUser`, `UpdateUser`, `DeleteUser`)
+/// manages the users of an ACTIVEMQ broker — every one of those operations is
+/// documented as acting on "an ActiveMQ user", and `User$consoleAccess` and
+/// `User$groups` are documented for that engine's users alone — so a broker of any
+/// other engine holds no user the API can address and every such call is refused with
+/// [`USER_API_ACTIVEMQ_ONLY_MESSAGE`], leaving the broker's users untouched.
+pub fn user_api_applies(engine_type: &str) -> bool {
+    engine_type == ENGINE_TYPE_ACTIVEMQ
+}
+
+/// How Amazon MQ states that the per-user API does not apply to the addressed broker's
+/// engine ([`user_api_applies`]).
+///
+/// The sentence is ENTIRELY fixed: it names neither the broker, the user nor the engine
+/// of the request, so every one of the four operations answers this one text.
+pub const USER_API_ACTIVEMQ_ONLY_MESSAGE: &str = "The users API only applies to ActiveMQ brokers.";
+
 /// The input member a refusal names when the `ConfigurationId` of the request
 /// resolved to no configuration, for `NotFoundException$errorAttribute` ("The
 /// attribute which caused the error").
@@ -1252,17 +1330,22 @@ pub fn validate_username(attribute: &str, username: &str) -> Result<(), Invalid>
 /// length, its unique-character count or the character at fault — leaves this function.
 pub fn validate_password(attribute: &str, password: &str) -> Result<(), Invalid> {
     if password.chars().count() < MIN_PASSWORD_LENGTH {
-        return Err(Invalid::new(attribute, PASSWORD_LENGTH_MESSAGE));
+        return Err(Invalid::fixed(attribute, PASSWORD_LENGTH_MESSAGE));
     }
     let unique: std::collections::BTreeSet<char> = password.chars().collect();
     if unique.len() < MIN_UNIQUE_PASSWORD_CHARACTERS {
-        return Err(Invalid::new(attribute, PASSWORD_UNIQUE_CHARACTERS_MESSAGE));
+        return Err(Invalid::fixed(attribute, PASSWORD_UNIQUE_CHARACTERS_MESSAGE));
     }
-    if password.chars().any(|c| matches!(c, ',' | ':' | '=')) {
-        return Err(Invalid::new(attribute, PASSWORD_FORBIDDEN_CHARACTERS_MESSAGE));
+    if password.chars().any(|c| FORBIDDEN_PASSWORD_CHARACTERS.contains(&c)) {
+        return Err(Invalid::fixed(attribute, PASSWORD_FORBIDDEN_CHARACTERS_MESSAGE));
     }
     Ok(())
 }
+
+/// The characters a password must not carry, from `User$Password`'s own documentation
+/// ("must not contain commas, colons, or equal signs (,:=)") — the set
+/// [`PASSWORD_FORBIDDEN_CHARACTERS_MESSAGE`] states.
+pub const FORBIDDEN_PASSWORD_CHARACTERS: &[char] = &[',', ':', '='];
 
 /// How many characters long a password must be, from `User$Password`'s own
 /// documentation ("must be at least 12 characters long") — the bound
@@ -1287,10 +1370,13 @@ pub const PASSWORD_UNIQUE_CHARACTERS_MESSAGE: &str =
 pub const PASSWORD_LENGTH_MESSAGE: &str = "Password must be at least [12] characters long.";
 
 /// How Amazon MQ states the forbidden-character rule, the third rule of that set
-/// ("must not contain commas, colons, or equal signs (,:=)"). Fixed text: the character
-/// the password carried is not quoted back.
+/// ("must not contain commas, colons, or equal signs (,:=)").
+///
+/// The sentence is ENTIRELY fixed — it is the service's own text, down to the spacing
+/// of the bracketed set — so neither the password, the character at fault nor the
+/// element of `Users` the password was sent in appears in it ([`Invalid::fixed`]).
 pub const PASSWORD_FORBIDDEN_CHARACTERS_MESSAGE: &str =
-    "Password must not contain commas, colons, or equal signs (,:=).";
+    "Make sure your password doesn't contain invalid characters [, :=].";
 
 /// A user's `Groups` constraint, as the model documents it: "The list of groups
 /// (20 maximum) to which the ActiveMQ user belongs. This value can contain only
@@ -1300,10 +1386,8 @@ pub const PASSWORD_FORBIDDEN_CHARACTERS_MESSAGE: &str =
 pub fn validate_groups(attribute: &str, groups: &[String]) -> Result<(), Invalid> {
     validate_list_size(attribute, groups.len(), 0, MAX_GROUPS_PER_USER)?;
     for (position, group) in groups.iter().enumerate() {
-        validate_username(attribute, group).map_err(|invalid| Invalid {
-            attribute: invalid.attribute,
-            message: format!("{attribute}[{position}]: {}", invalid.message),
-        })?;
+        validate_username(attribute, group)
+            .map_err(|invalid| invalid.in_list_member(attribute, position))?;
     }
     Ok(())
 }

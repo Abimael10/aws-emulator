@@ -253,14 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored, and with no `errorAttribute`, because no member of the request
         // is at fault — the account's configuration count is.
         if store.configurations.len() >= state::MAX_CONFIGURATIONS {
-            return Err(bad_request(state::Invalid {
-                attribute: None,
-                message: format!(
-                    "this account already holds its quota of {} configurations in this \
-                     Region; delete a configuration before creating another",
-                    state::MAX_CONFIGURATIONS
-                ),
-            }));
+            return Err(bad_request(state::Invalid::without_attribute(format!(
+                "this account already holds its quota of {} configurations in this \
+                 Region; delete a configuration before creating another",
+                state::MAX_CONFIGURATIONS
+            ))));
         }
 
         let created = ::std::time::SystemTime::now();

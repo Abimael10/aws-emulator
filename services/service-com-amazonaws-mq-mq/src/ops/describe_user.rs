@@ -4,7 +4,9 @@
 //!
 //! Implemented: a REPORTING operation. Returns the user `CreateUser` (or
 //! `CreateBroker`'s inline `Users`) persisted on that broker. The user's password is
-//! never returned — no modelled output member carries it.
+//! never returned — no modelled output member carries it. The per-user API applies to
+//! the ActiveMQ engine only (`crate::state::user_api_applies`), so the call is refused
+//! on a broker of any other engine.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +78,9 @@
 //! * `ForbiddenException` (HTTP 403) — Returns information about an error.
 //! * `InternalServerErrorException` (HTTP 500) — Returns information about an error.
 //! * `NotFoundException` (HTTP 404) — Returns information about an error.
+//! * `ConflictException` (HTTP 409) — widened in through `extra_errors` (see below): the
+//!   per-user API applies to the ActiveMQ engine only, and this operation's own `errors`
+//!   list omits the shape the SERVICE models for that refusal.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -92,10 +97,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mq-mq.json");
 // here — hence the `DescribeUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mq#DescribeUser")]
+// `ConflictException` is widened in through `extra_errors`: the per-user API applies to
+// the ActiveMQ engine only (`state::user_api_applies`), and a broker of another engine
+// holds no user to report — a conflict with the state of the addressed broker (409),
+// which this SERVICE models while this operation's own `errors` list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mq#DescribeUser",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DescribeUserErrorModeled {
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     NotFoundException(NotFoundException),
@@ -173,6 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // The per-user API applies to the ActiveMQ engine only, so a broker of another
+        // engine has no user to report: the request is refused before the broker is read
+        // any further.
+        if !broker.user_api_applies() {
+            return Err(DescribeUserErrorModeled::ConflictException(ConflictException {
+                error_attribute: None,
+                message: Some(state::USER_API_ACTIVEMQ_ONLY_MESSAGE.to_string()),
+                resource_share_errors: None,
+            })
+            .into());
+        }
         let Some(user) = broker.users.get(&input.username) else {
             return Err(DescribeUserErrorModeled::NotFoundException(NotFoundException {
                 error_attribute: Some(state::USERNAME_ATTRIBUTE.to_string()),

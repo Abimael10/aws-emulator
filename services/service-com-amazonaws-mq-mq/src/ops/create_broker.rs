@@ -319,11 +319,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut users: std::collections::BTreeMap<String, state::BrokerUser> =
             std::collections::BTreeMap::new();
         for (position, user) in input.users.iter().flatten().enumerate() {
+            // `users` is the member at fault, and the element's position goes in front
+            // of a message this emulator words itself; a rule Amazon MQ words its own
+            // refusal for keeps that sentence exactly (`state::Invalid::in_list_member`).
             let in_users = |invalid: state::Invalid| {
-                bad_request(state::Invalid {
-                    attribute: Some("users".to_string()),
-                    message: format!("users[{position}]: {}", invalid.message),
-                })
+                bad_request(invalid.in_list_member("users", position))
             };
             state::validate_username("username", &user.username).map_err(in_users)?;
             state::validate_password("password", &user.password).map_err(in_users)?;
@@ -579,14 +579,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which mints nothing, and before anything is stored. No `errorAttribute`:
         // no member of the request is at fault, the account's broker count is.
         if store.brokers.len() >= state::MAX_BROKERS {
-            return Err(bad_request(state::Invalid {
-                attribute: None,
-                message: format!(
-                    "this account already holds its quota of {} brokers in this Region; \
-                     delete a broker before creating another",
-                    state::MAX_BROKERS
-                ),
-            }));
+            return Err(bad_request(state::Invalid::without_attribute(format!(
+                "this account already holds its quota of {} brokers in this Region; \
+                 delete a broker before creating another",
+                state::MAX_BROKERS
+            ))));
         }
 
         // The configuration the broker is to run, when the request names one: only a

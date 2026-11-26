@@ -22,8 +22,10 @@
 //! model's documented charset and length bounds allow
 //! (`smithy_query(query="doc", shape="CreateUserRequest", member="Username")` — "only
 //! alphanumeric characters, dashes, periods, underscores, and tildes (- . _ ~) … must be
-//! 2-100 characters long"), and the engine type the broker runs (`ENGINE_TYPE_VALUES`,
-//! the model's own enumeration). The recorded case — one broker, one administrative
+//! 2-100 characters long"), and the engine type the broker runs — of the engines
+//! `ENGINE_TYPE_VALUES` enumerates, those whose brokers hold a user this API addresses
+//! at all (`state::user_api_applies`); the refusal on every other engine is
+//! [`crate::user_api_engine_scope`]'s. The recorded case — one broker, one administrative
 //! user, deleted and then read back — is one row of the first table.
 //!
 //! The wire harness is shared with [`crate::broker_lifecycle`], so every call goes
@@ -33,7 +35,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mq_mq::ops::types::ENGINE_TYPE_VALUES;
 use service_com_amazonaws_mq_mq::state::{
-    user_not_found_message, CHANGE_TYPE_DELETE, MIN_USERS_PER_BROKER,
+    user_api_applies, user_not_found_message, CHANGE_TYPE_DELETE, MIN_USERS_PER_BROKER,
 };
 
 use crate::broker_lifecycle::{create_body, string_at, Mq};
@@ -252,16 +254,24 @@ async fn deleting_a_brokers_last_user_is_accepted() {
     let mq = Mq::new("eu-west-1");
     let names = user_names();
 
-    for (index, engine_type) in ENGINE_TYPE_VALUES.iter().enumerate() {
+    // The engines rows: those whose brokers hold a user the per-user API addresses at
+    // all (`user_api_applies`). On every other engine the four user operations are
+    // refused whatever the user set, which [`crate::user_api_engine_scope`] pins.
+    let engines: Vec<&str> = ENGINE_TYPE_VALUES
+        .iter()
+        .copied()
+        .filter(|engine_type| user_api_applies(engine_type))
+        .collect();
+    assert!(
+        !engines.is_empty(),
+        "expected at least one engine whose brokers hold users, got {ENGINE_TYPE_VALUES:?}"
+    );
+    for (index, engine_type) in engines.into_iter().enumerate() {
         for size in [MIN_USERS_PER_BROKER, MIN_USERS_PER_BROKER + 2] {
             let case = format!("{engine_type} broker starting with {size} users");
             let usernames: Vec<String> = names[..size].to_vec();
             let mut body = create_body(&format!("last-user-{index}-{size}"));
             body["engineType"] = json!(engine_type);
-            if *engine_type == "RABBITMQ" {
-                // The deployment mode a RabbitMQ broker runs as a cluster with.
-                body["deploymentMode"] = json!("CLUSTER_MULTI_AZ");
-            }
             body["users"] = json!([{"username": usernames[0], "password": "GoodPassword12"}]);
             let (status, created) = mq.create_broker(body).await;
             assert_eq!(
