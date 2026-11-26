@@ -46,6 +46,8 @@ mod shard_reading;
 mod stream_metrics;
 mod streaming_table;
 mod write_quota;
+mod subscriptions;
+pub use subscriptions::*;
 
 pub use channel_key_access::*;
 pub use channels::*;
@@ -939,12 +941,13 @@ pub struct ConsumerRecord {
     /// consumer it governs is where it is stored, and it is gone when the consumer is.
     pub policy: Option<String>,
     /// The subscriptions of this consumer whose event stream is STILL LIVE, keyed by the
-    /// shard each one holds and carrying the instant it was established — what a later
-    /// subscription to the same shard is judged against. An entry is written as a
-    /// subscription is established ([`Self::subscribed_at`]) and dropped as its event stream
-    /// ends ([`Self::subscription_ended`]), so a consumer whose last subscription is over
-    /// holds no shard here and the shards this map names are the ones being read right now.
-    pub subscriptions: HashMap<String, SystemTime>,
+    /// shard each one holds and carrying the instant it was established and whether a later
+    /// subscription has contested it ([`LiveSubscription`]) — what a later subscription to
+    /// the same shard is judged against. An entry is written as a subscription is established
+    /// ([`Self::subscribed_at`]) and dropped as its event stream ends
+    /// ([`Self::subscription_ended`]), so a consumer whose last subscription is over holds no
+    /// shard here and the shards this map names are the ones being read right now.
+    pub subscriptions: HashMap<String, LiveSubscription>,
 }
 
 impl ConsumerRecord {
@@ -970,61 +973,6 @@ impl ConsumerRecord {
             // A consumer a registration has just minted is subscribed to no shard: a
             // subscription is `SubscribeToShard`'s to establish.
             subscriptions: HashMap::new(),
-        }
-    }
-
-    /// Whether a subscription of this consumer to `shard_id` is still LIVE at `now`, so a
-    /// second one is refused rather than taking it over: "If you call SubscribeToShard again
-    /// with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll
-    /// get a ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a
-    /// successful call, the second call takes over the subscription" (`SubscribeToShard`).
-    /// Only a subscription that has not ended is recorded at all, and the window above
-    /// bounds even that one, so a renewal of a subscription whose event stream is over
-    /// contends with nothing. Decided from the stored instant, so two reads at the same
-    /// instant agree.
-    pub fn holds_subscription(&self, shard_id: &str, now: SystemTime) -> bool {
-        self.subscriptions.get(shard_id).is_some_and(|established| {
-            // A subscription established at an instant later than `now` — a wall clock that
-            // moved backwards — still holds the shard.
-            !now.duration_since(*established)
-                .is_ok_and(|since| since >= SUBSCRIPTION_TAKEOVER_WINDOW)
-        })
-    }
-
-    /// Record that a subscription of this consumer to `shard_id` was established at `at` and
-    /// is now live, which is what the window above is then counted from. The entries the
-    /// window has rolled past are dropped with it, so the record holds at most the
-    /// subscriptions that are live.
-    pub fn subscribed_at(&mut self, shard_id: &str, at: SystemTime) {
-        self.subscriptions.retain(|_, established| {
-            !at.duration_since(*established)
-                .is_ok_and(|since| since >= SUBSCRIPTION_TAKEOVER_WINDOW)
-        });
-        self.subscriptions.insert(shard_id.to_string(), at);
-    }
-
-    /// Release the shard a subscription of this consumer to `shard_id` held: its event
-    /// stream has ENDED, so the subscription is no longer one a later call contends with.
-    /// "Your consumer starts receiving events of type SubscribeToShardEvent over the HTTP/2
-    /// connection for up to 5 minutes, after which time you need to call SubscribeToShard
-    /// again to renew the subscription if you want to continue to receive records"
-    /// (`SubscribeToShard`) — that renewal is what this makes possible, because a stream
-    /// that is over holds nothing.
-    pub fn subscription_ended(&mut self, shard_id: &str) {
-        self.subscriptions.remove(shard_id);
-    }
-
-    /// Release the shard ONE subscription held: the one established at `established_at`, and
-    /// nothing else.
-    ///
-    /// The same end as [`Self::subscription_ended`] for the caller that established it, and a
-    /// no-op for a caller whose subscription a LATER one has already taken over ("if you call
-    /// SubscribeToShard 5 seconds or more after a successful call, the second call takes over
-    /// the subscription") — so an ending stream cannot release a shard the subscription now
-    /// reading it holds.
-    pub fn subscription_ended_at(&mut self, shard_id: &str, established_at: SystemTime) {
-        if self.subscriptions.get(shard_id) == Some(&established_at) {
-            self.subscriptions.remove(shard_id);
         }
     }
 
@@ -3254,20 +3202,6 @@ pub fn consumer_already_exists_message(consumer_name: &str, stream_name: &str) -
     format!(
         "Consumer {consumer_name} under stream {stream_name} already exists for account {}.",
         ::engine::emulator_account_id()
-    )
-}
-
-/// How a subscription refuses a shard this consumer already holds one to: "If you call
-/// SubscribeToShard again with the same ConsumerARN and ShardId within 5 seconds of a
-/// successful call, you'll get a ResourceInUseException" (`SubscribeToShard`), which is the
-/// modelled "resource is not available for this operation" refusal. Built FROM the request,
-/// so the consumer and the shard at fault are what name it.
-pub fn consumer_already_subscribed_message(consumer_arn: &str, shard_id: &str) -> String {
-    format!(
-        "Consumer {consumer_arn} is already subscribed to shard {shard_id}; you can call \
-         SubscribeToShard again for the same consumer and shard {} seconds or more after a \
-         successful call",
-        SUBSCRIPTION_TAKEOVER_WINDOW.as_secs()
     )
 }
 

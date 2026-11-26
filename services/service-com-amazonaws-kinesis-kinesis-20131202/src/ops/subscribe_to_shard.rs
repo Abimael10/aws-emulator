@@ -65,10 +65,28 @@
 //!
 //! The record is RELEASED the moment that event stream ends
 //! ([`crate::state::ConsumerRecord::subscription_ended`]), which is the instant its frames are
-//! complete. A consumer whose stream is over holds no shard, so the renewal above is SERVED
-//! rather than refused, and the refusal is left to say what it is for: a subscription that is
-//! still being read — which is what the OTHER of two overlapping subscriptions of one
-//! consumer to one shard is refused as.
+//! complete. A consumer whose stream is over holds no shard, so the renewal above is SERVED.
+//!
+//! ## Two subscriptions of one consumer to one shard
+//!
+//! A subscription established while another one of the same consumer to the same shard is
+//! still being read CONTENDS with it, and that is not a refusal of the call: the call is
+//! served with a live event stream of its own, and the conflict travels as the
+//! `ResourceInUseException` member of the output union — "If you call SubscribeToShard again
+//! with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
+//! ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a successful
+//! call, the second call takes over the subscription and the previous connection expires or
+//! fails with a ResourceInUseException."
+//!
+//! BOTH streams report it and end there: the contesting one as the only event it carries
+//! (it reads no record, [`Established::Contested`]), and the one it contested as the last
+//! event of its own stream, which its pushing loop frames as soon as it sees the mark
+//! ([`crate::state::ConsumerRecord::subscription_contested`]). That is the one signal an
+//! enhanced fan-out consumer tells "my lease is contested, stop and re-acquire" from "my
+//! window elapsed, renew from my checkpoint" by, so two readers racing onto one consumer and
+//! shard are both told rather than both quietly served the same records. The shard is released
+//! when the contested stream ends, so a later `SubscribeToShard` for the same consumer and
+//! shard is served again from the position it names.
 //!
 //! ## Input
 //!
@@ -90,19 +108,21 @@
 //! ## Output
 //!
 //! * `EventStream` (SubscribeToShardEventStream, `@streaming`) **required** — the body. Its
-//!   `SubscribeToShardEvent` member is the data event; its `KMSDisabledException` member and
-//!   the rest of the KMS family are in-band failures of reading a stream encrypted under a
-//!   CMK the data plane may no longer use, which is why no KMS error is among this
-//!   operation's own modelled errors.
+//!   `SubscribeToShardEvent` member is the data event; its `ResourceInUseException` member is
+//!   the conflict between two subscriptions of one consumer to one shard; its
+//!   `KMSDisabledException` member and the rest of the KMS family are in-band failures of
+//!   reading a stream encrypted under a CMK the data plane may no longer use, which is why no
+//!   KMS error is among this operation's own modelled errors.
 //!
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 400) — the `ConsumerARN` names a stream this account
 //!   and region do not hold, a consumer that stream does not carry, or the `ShardId` names no
 //!   shard of it.
-//! * `ResourceInUseException` (HTTP 400) — the stream is not `ACTIVE`, the consumer is not
-//!   `ACTIVE` yet ("a consumer can't read data while in the CREATING or DELETING states"), or
-//!   a subscription of this consumer to this shard is still being served.
+//! * `ResourceInUseException` (HTTP 400) — the stream is not `ACTIVE`, or the consumer is not
+//!   `ACTIVE` yet ("a consumer can't read data while in the CREATING or DELETING states"). A
+//!   subscription contended by another one of the same consumer to the same shard is NOT
+//!   refused: it is served, and the same shape travels as an in-band event of the stream.
 //! * `InvalidArgumentException` (HTTP 400) — the `StartingPosition` members name no position
 //!   in the shard.
 //! * `DryRunOperationException` (HTTP 400) — "The request was rejected because the DryRun
@@ -156,6 +176,13 @@ const SUBSCRIBE_TO_SHARD_EVENT: &str = "SubscribeToShardEvent";
 /// The `SubscribeToShardEventStream` member an in-band failure to read the stream's records
 /// under its CMK is framed as (same source).
 const KMS_DISABLED_EVENT: &str = "KMSDisabledException";
+
+/// The `SubscribeToShardEventStream` member the conflict between two subscriptions of one
+/// consumer to one shard is framed as (same source): "The resource is not available for this
+/// operation" is a member of the output union as well as one of this operation's errors, so a
+/// subscription that is CONTESTED reports it as the last event of its own stream instead of
+/// the call being refused.
+const RESOURCE_IN_USE_EVENT: &str = "ResourceInUseException";
 
 /// The members a `SubscribeToShard` request spells a starting position with, as its refusals
 /// name them: this operation carries all three inside its `StartingPosition` structure.
@@ -239,6 +266,20 @@ struct Pushed {
     measured: crate::state::Measured,
 }
 
+/// What establishing a subscription answered with: the shard it HOLDS and the first event of
+/// reading it, or the conflict it found.
+enum Established {
+    /// The subscription holds its shard: this is the first event it pushed, and it goes on
+    /// pushing while it holds it.
+    Holding(Pushed),
+    /// Another subscription of this consumer to this shard is still being read, so the two
+    /// contend: this one is SERVED — "the second call takes over the subscription and the
+    /// previous connection expires or fails with a ResourceInUseException" — and both event
+    /// streams report the conflict in band and end. It reads no record and holds no shard, so
+    /// neither of two contending readers quietly delivers the shard twice.
+    Contested(ResourceInUseException),
+}
+
 /// Which of the two forms one pushed event takes.
 enum PushedEvent {
     /// An event of a shard the subscription goes on reading: it reports the checkpoint the
@@ -301,18 +342,20 @@ const MAX_PUSHED_EVENTS: u32 = 1 + (crate::state::SUBSCRIPTION_TAKEOVER_WINDOW.a
 
 impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
     /// Resolve the subscription the request asks for, refuse whatever stands in the way, and
-    /// RECORD the subscription it established.
+    /// RECORD the subscription it established — or, where another subscription of this
+    /// consumer to this shard is still being read, the CONFLICT the two of them are reported
+    /// with ([`Established`]).
     ///
     /// The whole resolution lives here so the store's lock is held for exactly this long,
-    /// which is also what admits exactly ONE of two overlapping subscriptions of the same
-    /// consumer to the same shard: the one that gets the lock first records it, and the next
-    /// one reads that record and is refused.
+    /// which is also what decides which of two overlapping subscriptions of the same consumer
+    /// to the same shard holds the shard: the one that gets the lock first records it, and the
+    /// next one reads that record and contests it.
     fn establish(
         store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
         region: &str,
         now: std::time::SystemTime,
         input: &SubscribeToShardInput,
-    ) -> Result<Pushed, SubscribeToShardErrorModeled> {
+    ) -> Result<Established, SubscribeToShardErrorModeled> {
         // "Before you call this operation, call RegisterStreamConsumer to register the
         // consumer with Kinesis Data Streams": the consumer's ARN names the stream it was
         // registered with, so the stream is resolved first and the consumer inside it — a
@@ -323,6 +366,9 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             .stream_by_arn(now, region, stream_arn)
             .ok_or_else(|| not_found(crate::state::stream_not_found_message(stream_arn)))?;
         let stream_key = crate::state::RegionalName::new(&stream.region, &stream.name);
+        // The stream's own name, which names it in the conflict two contending subscriptions
+        // of one of its consumers are reported with below.
+        let stream_name = stream.name.clone();
         // Which `AWS/Kinesis` series this delivery is measured into: the stream's name, and
         // the shard-level metrics its enhanced monitoring names
         // (`crate::state::stream_metrics`).
@@ -361,16 +407,19 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         }
 
         // "If you call SubscribeToShard again with the same ConsumerARN and ShardId within 5
-        // seconds of a successful call, you'll get a ResourceInUseException": what is
-        // refused is a subscription being CONTENDED, so only a stream that has not ended yet
-        // is recorded here at all — a consumer renewing from its checkpoint after its stream
-        // is over contends with nothing and is served.
-        if consumer.holds_subscription(&input.shard_id, now) {
-            return Err(in_use(crate::state::consumer_already_subscribed_message(
-                &input.consumer_arn,
-                &input.shard_id,
-            )));
-        }
+        // seconds of a successful call, you'll get a ResourceInUseException": a subscription
+        // established while another one of this consumer to this shard is still being read
+        // CONTENDS with it, and that is not a refusal of the call — it is served, and the
+        // conflict is reported on both event streams by the union member below. Only a stream
+        // that has not ended yet is recorded at all, so a consumer renewing from its
+        // checkpoint after its stream is over contends with nothing.
+        //
+        // Read here, where the whole request is judged, and acted on once the request is
+        // known to be servable at all: a subscription naming a shard this stream does not
+        // hold, a starting position the shard does not admit, or a dry run is answered with
+        // the error the model declares for it whether or not another subscription is live.
+        let contends = consumer.holds_subscription(&input.shard_id, now);
+        let consumer_name = consumer.name.clone();
 
         let shard = stream
             .shards
@@ -413,6 +462,30 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             ));
         }
 
+        // A subscription that contends with one this consumer is still reading reads no
+        // record of its own and holds no shard: both it and the one it contests are about to
+        // report the conflict in band and end, so the only thing it writes is the MARK that
+        // tells the incumbent's pushing loop it has been contested. The shard stays held by
+        // the subscription that was already reading it until that stream is over, which is
+        // what frees it for the next call.
+        if contends {
+            let fault = crate::state::another_active_subscription_message(
+                &stream_name,
+                &input.shard_id,
+                &consumer_name,
+            );
+            if let Some(consumer) = store
+                .streams
+                .get_mut(&stream_key)
+                .and_then(|stream| stream.consumer_by_arn_mut(&input.consumer_arn))
+            {
+                consumer.contend_subscription(&input.shard_id, now);
+            }
+            return Ok(Established::Contested(ResourceInUseException {
+                message: Some(fault),
+            }));
+        }
+
         // The first event of the subscription, and where it reads on from.
         let pushed = Self::pushed(stream, shard, &position, now);
 
@@ -437,7 +510,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             consumer.subscribed_at(&input.shard_id, now);
         }
 
-        Ok(Pushed { measured, ..pushed })
+        Ok(Established::Holding(Pushed { measured, ..pushed }))
     }
 
     /// ONE event of a live subscription over `shard`: the records the shard retains from
@@ -587,6 +660,38 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         Some(Self::pushed(stream, shard, position, now))
     }
 
+    /// The conflict the subscription this request established at `established_at` must report
+    /// IN BAND, when another subscription of the same consumer to the same shard was
+    /// established behind it while it was being served, and `None` while nothing contests it.
+    ///
+    /// Worded from the stored records the conflict is between, so the account, the stream, the
+    /// shard and the consumer that contend are what name it. A consumer, stream or shard that
+    /// has gone away in the meantime contests nothing — that stream simply ends
+    /// ([`Self::pushed_again`]).
+    fn contested(
+        store: &crate::state::ComAmazonawsKinesisKinesis20131202State,
+        region: &str,
+        now: std::time::SystemTime,
+        input: &SubscribeToShardInput,
+        established_at: std::time::SystemTime,
+    ) -> Option<ResourceInUseException> {
+        let stream = store.stream_by_arn(
+            now,
+            region,
+            crate::state::stream_arn_of_consumer(&input.consumer_arn),
+        )?;
+        let consumer = stream.consumer_by_arn(&input.consumer_arn)?;
+        consumer
+            .subscription_contested(&input.shard_id, established_at)
+            .then(|| ResourceInUseException {
+                message: Some(crate::state::another_active_subscription_message(
+                    &stream.name,
+                    &input.shard_id,
+                    &consumer.name,
+                )),
+            })
+    }
+
     /// Release the shard the subscription this request established was holding: its event
     /// stream has ENDED.
     ///
@@ -623,6 +728,31 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             .and_then(|stream| stream.consumer_by_arn_mut(&input.consumer_arn))
         {
             consumer.subscription_ended_at(&input.shard_id, established_at);
+        }
+    }
+
+    /// The whole body of a stream that carries ONE in-band failure and no event of its own:
+    /// the frame a client reads the output shape out of, then the union member the failure
+    /// travels as, marked as the exception frame it is.
+    ///
+    /// Both failures the `SubscribeToShardEventStream` union carries before any record is
+    /// delivered are answered through here — the stream's CMK and a contested subscription —
+    /// so a client decodes them the same way.
+    fn faulted_stream(
+        protocol: &dyn ::smithy_server_runtime::ServerHttpProtocol,
+        event_type: &str,
+        event: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+        schema: &::aws_smithy_schema::Schema,
+    ) -> Response {
+        match frame_empty_initial_response(protocol).and_then(|mut frames| {
+            frames.extend(frame_event(protocol, event_type, true, event, schema)?);
+            Ok(frames)
+        }) {
+            Ok(frames) => event_stream_only_response(frames),
+            Err(error) => error_response(
+                protocol,
+                &internal(format!("the event stream could not be framed: {error}")),
+            ),
         }
     }
 
@@ -738,26 +868,15 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         // errors), so it travels as an in-band exception frame of the established stream
         // rather than as a refusal of the call.
         if let Some(key_arn) = disabled_key {
-            let protocol = svc.definition().protocol();
             let event = KMSDisabledException {
                 message: Some(crate::state::key_disabled_message(&key_arn)),
             };
-            return match frame_empty_initial_response(protocol).and_then(|mut frames| {
-                frames.extend(frame_event(
-                    protocol,
-                    KMS_DISABLED_EVENT,
-                    true,
-                    &event,
-                    &SCHEMA_KMS_DISABLED_EXCEPTION,
-                )?);
-                Ok(frames)
-            }) {
-                Ok(frames) => event_stream_only_response(frames),
-                Err(error) => error_response(
-                    protocol,
-                    &internal(format!("the event stream could not be framed: {error}")),
-                ),
-            };
+            return Self::faulted_stream(
+                svc.definition().protocol(),
+                KMS_DISABLED_EVENT,
+                &event,
+                &SCHEMA_KMS_DISABLED_EXCEPTION,
+            );
         }
 
         let established = {
@@ -766,7 +885,22 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         };
         let protocol = svc.definition().protocol();
         let mut pushed = match established {
-            Ok(pushed) => pushed,
+            Ok(Established::Holding(pushed)) => pushed,
+            // Two subscriptions of one consumer to one shard contend. The conflict is a
+            // member of the output UNION, so this call is served and states it in band —
+            // "the second call takes over the subscription and the previous connection
+            // expires or fails with a ResourceInUseException" — and the stream it contested
+            // states the same thing on its own stream below. It delivers no record, so a
+            // consumer whose lease is contested is told so instead of being served the
+            // shard twice.
+            Ok(Established::Contested(event)) => {
+                return Self::faulted_stream(
+                    protocol,
+                    RESOURCE_IN_USE_EVENT,
+                    &event,
+                    &SCHEMA_RESOURCE_IN_USE_EXCEPTION,
+                )
+            }
             Err(error) => return error_response(protocol, &error),
         };
 
@@ -812,10 +946,33 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             }
             tokio::time::sleep(PUSH_INTERVAL).await;
             let at = std::time::SystemTime::now();
-            let again = {
+            let (contested, again) = {
                 let store = state.lock();
-                Self::pushed_again(&store, region, at, input, &pushed.next)
+                (
+                    Self::contested(&store, region, at, input, now),
+                    Self::pushed_again(&store, region, at, input, &pushed.next),
+                )
             };
+            // Another subscription of this consumer to this shard was established behind this
+            // one while it was being read: the two contend, so this stream states the
+            // conflict as the LAST event it carries and ends there rather than going on
+            // delivering records a second reader is also being served. The shard it held is
+            // released below, so a consumer that re-acquires after the fault is served again.
+            if let Some(event) = contested {
+                if let Ok(frames) = framed.as_mut() {
+                    match frame_event(
+                        protocol,
+                        RESOURCE_IN_USE_EVENT,
+                        true,
+                        &event,
+                        &SCHEMA_RESOURCE_IN_USE_EXCEPTION,
+                    ) {
+                        Ok(fault) => frames.extend(fault),
+                        Err(error) => framed = Err(error),
+                    }
+                }
+                break;
+            }
             match again {
                 Some(again) => pushed = again,
                 // The stream, the consumer or the shard is gone: the event stream is over,

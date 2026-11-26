@@ -29,8 +29,10 @@
 //! A subscription holds its shard only while its event stream is LIVE: once that stream has
 //! ended, the consumer's renewal of it — `SubscribeToShard` again for the same `ConsumerARN`
 //! and `ShardId`, from the `ContinuationSequenceNumber` the last event reported — is served
-//! from the position it names, and only a subscription that is still being read is refused as
-//! a contended one.
+//! from the position it names. A subscription established while another one of the same
+//! consumer to the same shard is still being read is served too, and the conflict is reported
+//! IN BAND on both event streams, as the `ResourceInUseException` member of the output union,
+//! which is the last event either of them carries.
 //!
 //! The recorded flows this was derived from subscribe with a `ConsumerARN` naming a stream
 //! that does not exist, with one naming a consumer that was never registered, and with the
@@ -1360,66 +1362,299 @@ async fn a_record_written_during_a_subscription_is_delivered_by_a_later_event() 
     }
 }
 
-/// Two overlapping subscriptions of one consumer to one shard: exactly ONE is served and the
-/// other is refused as the contended subscription it is — "if you call SubscribeToShard again
-/// with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
-/// ResourceInUseException" — and the refusal names the consumer and the shard at fault.
+/// The `SubscribeToShardEventStream` member the conflict between two subscriptions of one
+/// consumer to one shard is framed as (source:
+/// `smithy_query(query="shape",shape="SubscribeToShardEventStream")`).
+const CONFLICT_EVENT: &str = "ResourceInUseException";
+
+/// The message a contended subscription states the conflict in, for the consumer, stream and
+/// shard that contend: its fixed text, and the account, stream, shard and consumer the request
+/// and the store supply.
+fn conflict_message(stream: &str, shard: &str, consumer: &str) -> String {
+    format!(
+        "Another active subscription exists for this consumer: {}:{stream}:{shard}:{consumer}",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
+/// Assert the whole wire shape of a subscription that was SERVED and then faulted in band, and
+/// answer how many DATA events it delivered before the fault and the message the fault states.
+fn faulted_events(case: &str, status: u16, body: &[u8]) -> (usize, String) {
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: a contended subscription is SERVED, got {status} with {:?}",
+        String::from_utf8_lossy(body)
+    );
+    let frames = decode_frames(case, body);
+    let framed: Vec<(&str, &str)> = frames
+        .iter()
+        .map(|frame| (frame.message_type.as_str(), frame.event_type.as_str()))
+        .collect();
+    let (opened, rest) = framed
+        .split_first()
+        .unwrap_or_else(|| panic!("case {case:?}: a served stream carries frames, got none"));
+    assert_eq!(
+        *opened,
+        ("event", INITIAL_RESPONSE),
+        "case {case:?}: a served stream opens with the frame the output shape arrives in, got \
+         {opened:?}"
+    );
+    let (last, events) = rest.split_last().unwrap_or_else(|| {
+        panic!("case {case:?}: a contended stream carries the conflict, got only {framed:?}")
+    });
+    assert_eq!(
+        *last,
+        ("exception", CONFLICT_EVENT),
+        "case {case:?}: a contended stream ends with the conflict as an in-band exception \
+         frame, got {framed:?}"
+    );
+    for event in events {
+        assert_eq!(
+            *event,
+            ("event", DATA_EVENT),
+            "case {case:?}: every frame before the conflict is a data event, got {framed:?}"
+        );
+    }
+    let payload = &frames[frames.len() - 1].payload;
+    let message = payload
+        .get("message")
+        .or_else(|| payload.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the conflict states a message, got {payload}")
+        })
+        .to_string();
+    (events.len(), message)
+}
+
+/// Two overlapping subscriptions of one consumer to one shard are BOTH served — "the second
+/// call takes over the subscription and the previous connection expires or fails with a
+/// ResourceInUseException" — and both event streams end with the conflict as the in-band
+/// `ResourceInUseException` member of the output union, naming the account, stream, shard and
+/// consumer that contend. Only one of the two ever delivers a record, so a contested reader is
+/// told its lease is contested instead of the shard being served twice.
+///
+/// The rows differ along what the rule generalises over: which shard of the stream the two
+/// contend for, which consumer they belong to, and which starting position they name.
 #[tokio::test]
-async fn one_of_two_overlapping_subscriptions_is_refused_as_contended() {
+async fn two_contending_subscriptions_are_both_faulted_in_band() {
     let emulator = Emulator::new();
     let stream = "efo-contended";
-    active_stream(&emulator, "setup", stream, 1).await;
-    let consumer_arn = active_consumer(&emulator, "setup", stream, "contending").await;
-    let body = json!({
-        "ConsumerARN": consumer_arn,
-        "ShardId": FIRST_SHARD,
-        "StartingPosition": { "Type": "TRIM_HORIZON" },
-    });
+    active_stream(&emulator, "setup", stream, 2).await;
+    let shards = shard_ids(&emulator, "setup", stream).await;
+    let first = shards
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("case setup: a two-shard stream carries shards"));
+    let last = shards
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("case setup: a two-shard stream carries shards"));
+    let (written_shard, sequence) = put_at(&emulator, "setup", stream, "contended-alpha").await;
+    let one = active_consumer(&emulator, "setup", stream, "contending-one").await;
+    let other = active_consumer(&emulator, "setup", stream, "contending-two").await;
 
-    let case = "two subscriptions at once";
-    let (first, second) = tokio::join!(
-        emulator.call_raw("SubscribeToShard", &body),
-        emulator.call_raw("SubscribeToShard", &body),
-    );
-    let mut served = 0usize;
-    let mut refused = 0usize;
-    for (status, _headers, payload) in [first, second] {
-        if status == 200 {
-            served += 1;
-            let frames = decode_frames(case, &payload);
-            assert!(
-                frames.len() > 1,
-                "case {case:?}: the served subscription pushes events, got {} frame(s)",
-                frames.len()
-            );
-            continue;
-        }
-        refused += 1;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a contended subscription is refused with a modelled client \
-             error, got {status} with {:?}",
-            String::from_utf8_lossy(&payload)
-        );
-        let response: Value = serde_json::from_slice(&payload).unwrap_or_else(|error| {
-            panic!("case {case:?}: the refusal must be a JSON envelope: {error}")
+    // (case, consumer name, its ARN, the shard the two contend for, the position they name)
+    let rows = [
+        (
+            "the first shard from the horizon",
+            "contending-one",
+            &one,
+            first.clone(),
+            json!({ "Type": "TRIM_HORIZON" }),
+        ),
+        (
+            "the last shard from the horizon",
+            "contending-one",
+            &one,
+            last.clone(),
+            json!({ "Type": "TRIM_HORIZON" }),
+        ),
+        (
+            "another consumer at the tip",
+            "contending-two",
+            &other,
+            first.clone(),
+            json!({ "Type": "LATEST" }),
+        ),
+        (
+            "from the sequence number a record was stored under",
+            "contending-two",
+            &other,
+            written_shard.clone(),
+            json!({ "Type": "AT_SEQUENCE_NUMBER", "SequenceNumber": sequence }),
+        ),
+    ];
+
+    for (case, consumer_name, consumer_arn, shard, position) in rows {
+        let body = json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": shard,
+            "StartingPosition": position,
         });
-        assert_eq!(
-            error_code(&response),
-            "ResourceInUseException",
-            "case {case:?}: expected the contended refusal, got {response}"
+        // Two subscriptions of one consumer to one shard at once: whichever of them records
+        // the shard first, both are served and both are faulted.
+        let (incumbent, challenger) = tokio::join!(
+            emulator.call_raw("SubscribeToShard", &body),
+            emulator.call_raw("SubscribeToShard", &body),
         );
-        let message = error_message(&response);
-        for names in [consumer_arn.as_str(), FIRST_SHARD] {
-            assert!(
-                message.contains(names),
-                "case {case:?}: expected the refusal to name {names:?}, got {message:?}"
+        let expected = conflict_message(stream, &shard, consumer_name);
+        let mut delivered_by = Vec::new();
+        for (status, headers, payload) in [incumbent, challenger] {
+            let media_type = headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            assert_eq!(
+                media_type, EVENT_STREAM,
+                "case {case:?}: a contended subscription is served a live event stream, got \
+                 {media_type:?}"
             );
+            let (events, message) = faulted_events(case, status, &payload);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the conflict to state {expected:?}, got {message:?}"
+            );
+            delivered_by.push(events);
         }
+        delivered_by.sort_unstable();
+        assert_eq!(
+            delivered_by.first().copied(),
+            Some(0),
+            "case {case:?}: the subscription that found the conflict delivers no event of its \
+             own, got {delivered_by:?}"
+        );
+        assert!(
+            delivered_by.last().copied().unwrap_or_default() >= 1,
+            "case {case:?}: the subscription that held the shard delivers its events before \
+             the conflict, got {delivered_by:?}"
+        );
     }
+
+    // "With both faulted streams closed, a fresh SubscribeToShard for the same consumer and
+    // shard is accepted again and replays from TRIM_HORIZON": the fault was about concurrency,
+    // so the shard the contested stream held is free once it has ended.
+    let case = "re-acquired after the conflict";
+    let event = subscribed_event(
+        &emulator,
+        case,
+        &json!({
+            "ConsumerARN": other,
+            "ShardId": written_shard,
+            "StartingPosition": { "Type": "TRIM_HORIZON" },
+        }),
+    )
+    .await;
     assert_eq!(
-        (served, refused),
-        (1, 1),
-        "case {case:?}: exactly one of two overlapping subscriptions is served"
+        delivered(case, &event),
+        vec!["contended-alpha".to_string()],
+        "case {case:?}: a subscription re-acquired after the conflict replays the shard, got \
+         {event}"
     );
+}
+
+/// Write one record to `stream`, answering the shard it landed in and the sequence number it
+/// was stored under: which shard a record is placed in is the partition key's hash, so the
+/// write reports it rather than the test assuming it.
+async fn put_at(emulator: &Emulator, case: &str, stream: &str, payload: &str) -> (String, String) {
+    let written = emulator
+        .ok(
+            case,
+            "PutRecord",
+            &json!({
+                "StreamName": stream,
+                "Data": aws_smithy_types::base64::encode(payload),
+                "PartitionKey": "one-key",
+            }),
+        )
+        .await;
+    let member = |name: &str| {
+        written[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: PutRecord answers {name}, got {written}"))
+            .to_string()
+    };
+    (member("ShardId"), member("SequenceNumber"))
+}
+
+/// A second subscription contests exactly the LIVE subscription of the same consumer to the
+/// same shard, and nothing else: a subscription the documented window has rolled past is taken
+/// over rather than contested, another shard's subscription is untouched, and a contested
+/// subscription that has ended leaves the shard free.
+#[test]
+fn a_second_subscription_contests_only_the_live_subscription_of_that_shard() {
+    let established = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let mut consumer = ConsumerRecord::registered_at(
+        &stream_arn(REGION, "efo-contending"),
+        "contending",
+        established,
+        HashMap::new(),
+    );
+
+    // (case, when the second subscription arrives, whether it contests the one above) — each
+    // bound of the documented window and one past it.
+    let rows = [
+        ("the same instant", established, true),
+        (
+            "a moment into the stream",
+            established + Duration::from_millis(1),
+            true,
+        ),
+        (
+            "just inside the window",
+            established + SUBSCRIPTION_TAKEOVER_WINDOW - Duration::from_millis(1),
+            true,
+        ),
+        (
+            "at the window",
+            established + SUBSCRIPTION_TAKEOVER_WINDOW,
+            false,
+        ),
+        (
+            "well past the window",
+            established + SUBSCRIPTION_TAKEOVER_WINDOW + Duration::from_secs(600),
+            false,
+        ),
+    ];
+    for (case, now, contests) in rows {
+        consumer.subscribed_at(FIRST_SHARD, established);
+        let contested = consumer.contend_subscription(FIRST_SHARD, now);
+        assert_eq!(
+            contested, contests,
+            "case {case:?}: expected a second subscription to contest {contests}, got \
+             {contested}"
+        );
+        let reported = consumer.subscription_contested(FIRST_SHARD, established);
+        assert_eq!(
+            reported, contests,
+            "case {case:?}: expected the subscription to report the conflict {contests}, got \
+             {reported}"
+        );
+        let other_shard = consumer.contend_subscription(ABSENT_SHARD, now);
+        assert!(
+            !other_shard,
+            "case {case:?}: a subscription to another shard contests nothing, got {other_shard}"
+        );
+        // The contested stream ends, which frees the shard: a later subscription of this
+        // consumer to it contends with nothing and reports no conflict.
+        consumer.subscription_ended_at(FIRST_SHARD, established);
+        let after_the_stream = consumer.subscription_contested(FIRST_SHARD, established);
+        assert!(
+            !after_the_stream,
+            "case {case:?}: a subscription whose stream has ended reports no conflict, got \
+             {after_the_stream}"
+        );
+        let holds = consumer.holds_subscription(FIRST_SHARD, now);
+        assert!(
+            !holds,
+            "case {case:?}: the shard a contested stream held is free once it ended, got \
+             {holds}"
+        );
+    }
 }
