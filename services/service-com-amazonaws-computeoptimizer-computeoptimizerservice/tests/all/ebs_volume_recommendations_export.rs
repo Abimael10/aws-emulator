@@ -40,7 +40,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     analysed_emulator, assert_figure, call, call_in_region, cell, create_bucket, emulator,
-    error_code, exported_recommendation_rows, metrics, opt_in, put_preference, ACCOUNT,
+    error_code, exported_recommendation_rows, exported_recommendation_rows_selecting, metrics,
+    opt_in, put_preference, ACCOUNT,
 };
 
 /// The operation under test.
@@ -605,7 +606,7 @@ async fn the_export_and_the_reader_admit_the_same_filters() {
             true,
         ),
         (
-            "a filter carrying no value, which selects nothing",
+            "a filter carrying no value, which constrains nothing",
             json!([{"name": "Finding", "values": []}]),
             true,
         ),
@@ -666,6 +667,76 @@ async fn the_export_and_the_reader_admit_the_same_filters() {
     }
 }
 
+/// The volume ARNs the EXPORT writes a row for, for one `EBSFilters` list: the one
+/// export-then-download workflow this target shares
+/// ([`crate::harness::exported_recommendation_rows_selecting`]), reduced to the ARN column.
+async fn exported_volume_arns(
+    router: &MultiServiceRouter,
+    case: &str,
+    filters: &Value,
+) -> BTreeSet<String> {
+    let rows = exported_recommendation_rows_selecting(
+        router,
+        case,
+        EXPORT,
+        BUCKET,
+        &[ARN_COLUMN, "Finding"],
+        filters,
+    )
+    .await;
+    let (header, data) = rows
+        .split_first()
+        .unwrap_or_else(|| panic!("case {case:?}: the export file carries a header row"));
+    data.iter()
+        .map(|row| cell(header, row, ARN_COLUMN).to_string())
+        .collect()
+}
+
+/// ONE `EBSFilters` list selects the SAME volumes whichever surface of this service answers it:
+/// a filter carrying no values constrains nothing, so the reader reports every analysed volume
+/// and the exported file holds a row for each — and a list that does constrain narrows both the
+/// same way.
+///
+/// The table spans the forms a request states "no values" in (`values` sent empty, `values` left
+/// out — the member is optional) and the company such a filter keeps (alone, and ANDed with one
+/// that constrains), beside a list carrying only constraining values as the control.
+#[tokio::test]
+async fn a_filter_list_selects_the_same_volumes_in_the_reader_and_the_export() {
+    // (case, the `filters` both calls carry)
+    let rows: Vec<(&str, Value)> = vec![
+        ("values sent empty", json!([{"name": "Finding", "values": []}])),
+        (
+            "values left out, the member being optional",
+            json!([{"name": "Finding"}]),
+        ),
+        (
+            "a valueless filter beside one that constrains",
+            json!([{"name": "Finding"}, {"name": "Finding", "values": ["NotOptimized"]}]),
+        ),
+        (
+            "both findings, which every analysed volume has one of",
+            json!([{"name": "Finding", "values": ["Optimized", "NotOptimized"]}]),
+        ),
+    ];
+
+    for (case, filters) in rows {
+        // A fresh emulator per row: one volume export job runs per Region at a time, so each
+        // row gets its own store rather than waiting on the previous row's job.
+        let router = analysed_emulator().await;
+        create_bucket(&router, BUCKET).await;
+
+        let read: BTreeSet<String> = reported_volumes(&router, case, Some(&filters))
+            .await
+            .into_keys()
+            .collect();
+        let exported = exported_volume_arns(&router, case, &filters).await;
+        assert_eq!(
+            read, exported,
+            "case {case:?} ({filters}): the reader selected {read:?}, the export {exported:?}"
+        );
+    }
+}
+
 /// How a cell holding several values separates them, so one exportable field is still one
 /// column.
 const LIST_SEPARATOR: &str = "|";
@@ -701,12 +772,17 @@ fn rounded(value: f64) -> f64 {
 }
 
 /// The volume recommendations the READER reports, keyed by volume ARN — the oracle every
-/// assertion about the exported file is made against.
+/// assertion about the exported file is made against. `filters` is the `EBSFilters` list the
+/// read carries, or `None` for a read that narrows nothing.
 async fn reported_volumes(
     router: &MultiServiceRouter,
     case: &str,
+    filters: Option<&Value>,
 ) -> BTreeMap<String, Value> {
-    let request = json!({"maxResults": 100});
+    let mut request = json!({"maxResults": 100});
+    if let Some(selecting) = filters {
+        request["filters"] = selecting.clone();
+    }
     let (status, body) = call(router, "GetEBSVolumeRecommendations", request.clone()).await;
     assert_eq!(
         status, 200,
@@ -818,7 +894,7 @@ async fn the_export_file_states_what_the_reader_reports_for_every_volume() {
             .await;
         }
 
-        let reported = reported_volumes(&router, &case).await;
+        let reported = reported_volumes(&router, &case, None).await;
         let exported = exported_recommendation_rows(
             &router,
             &case,

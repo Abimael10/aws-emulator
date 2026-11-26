@@ -452,8 +452,7 @@ async fn a_longer_look_back_preference_analyses_more_of_the_observed_period() {
 
 #[tokio::test]
 async fn filters_narrow_the_answer_by_finding() {
-    let router = emulator();
-    analysed(&router).await;
+    let router = analysed_emulator().await;
 
     // `EBSFilterName` admits one name, `Finding`, so each row is a set of `EBSFinding`
     // values with the volumes whose DERIVED finding is one of them.
@@ -479,8 +478,19 @@ async fn filters_narrow_the_answer_by_finding() {
                 GP3_ALREADY_RIGHT_SIZED,
             ],
         ),
-        // A filter carrying no value selects nothing: no finding is one of none.
-        (json!([{"name": "Finding", "values": []}]), &[]),
+        // A filter carrying no value constrains nothing, so every analysed volume is
+        // reported — the rule every filter of this service is applied by, covered over
+        // every form it takes by
+        // [`a_filter_carrying_no_values_constrains_nothing`].
+        (
+            json!([{"name": "Finding", "values": []}]),
+            &[
+                GP2_WITH_HEADROOM,
+                GP3_OUTRUNNING_ITS_IOPS,
+                IO1_OVER_PROVISIONED,
+                GP3_ALREADY_RIGHT_SIZED,
+            ],
+        ),
     ];
 
     for (filters, expected) in cases {
@@ -492,6 +502,74 @@ async fn filters_narrow_the_answer_by_finding() {
         assert_eq!(
             reported, wanted,
             "case {filters}: expected {wanted:?}, got {reported:?}"
+        );
+    }
+}
+
+/// A filter carrying NO values constrains nothing — the one rule every recommendation filter
+/// of this service is applied by, and the rule the EXPORT of these same recommendations
+/// applies to the same `EBSFilters` list.
+///
+/// The table spans the forms a request states "no values" in and the company such a filter
+/// keeps: `values` sent empty, `values` left out (the member is optional), a whole filter list
+/// of valueless filters, and a valueless filter ANDed with one that does constrain — plus the
+/// two no-constraint baselines, no `filters` member at all and an empty filter list, which a
+/// valueless filter has to answer exactly like.
+#[tokio::test]
+async fn a_filter_carrying_no_values_constrains_nothing() {
+    let router = analysed_emulator().await;
+
+    /// Every analysed volume of the account's inventory: what a filter list constraining
+    /// nothing selects.
+    const EVERY_VOLUME: &[&str] = &[
+        GP2_WITH_HEADROOM,
+        GP3_OUTRUNNING_ITS_IOPS,
+        IO1_OVER_PROVISIONED,
+        GP3_ALREADY_RIGHT_SIZED,
+    ];
+
+    // (case, the `filters` the request carries — `null` for a request that carries none —,
+    //  the volumes the list selects)
+    let cases: [(&str, Value, &[&str]); 6] = [
+        ("no filters member at all", json!(null), EVERY_VOLUME),
+        ("an empty filter list", json!([]), EVERY_VOLUME),
+        (
+            "values sent empty",
+            json!([{"name": "Finding", "values": []}]),
+            EVERY_VOLUME,
+        ),
+        (
+            "values left out, the member being optional",
+            json!([{"name": "Finding"}]),
+            EVERY_VOLUME,
+        ),
+        (
+            "two valueless filters",
+            json!([{"name": "Finding", "values": []}, {"name": "Finding"}]),
+            EVERY_VOLUME,
+        ),
+        // ANDed with a filter that does constrain, the valueless one adds no constraint of
+        // its own: the answer is the one that filter alone selects.
+        (
+            "a valueless filter beside one that constrains",
+            json!([{"name": "Finding"}, {"name": "Finding", "values": ["Optimized"]}]),
+            &[GP3_ALREADY_RIGHT_SIZED],
+        ),
+    ];
+
+    for (case, filters, expected) in cases {
+        let mut request = json!({"maxResults": 100});
+        if !filters.is_null() {
+            request["filters"] = filters.clone();
+        }
+        let body = recommendations(&router, request).await;
+        let mut reported = reported_arns(&body);
+        reported.sort();
+        let mut wanted: Vec<String> = expected.iter().map(|suffix| volume_arn(suffix)).collect();
+        wanted.sort();
+        assert_eq!(
+            reported, wanted,
+            "case {case:?} ({filters}): expected {wanted:?}, got {reported:?}"
         );
     }
 }

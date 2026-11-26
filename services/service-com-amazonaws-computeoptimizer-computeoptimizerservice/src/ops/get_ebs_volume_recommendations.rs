@@ -476,14 +476,25 @@ fn requested_volume_ids(
 /// names `EBSFilter$name`'s prose mentions — before this handler runs. The model is what
 /// the wire enforces, so this handler implements what the model declares.
 struct FindingFilter {
-    /// The `EBSFinding` values this filter admits.
+    /// The `EBSFinding` values this filter admits, or EMPTY for every finding: `values` is
+    /// an optional member, so a filter can name the member it selects on and list no value
+    /// of it.
     findings: Vec<String>,
 }
 
 impl FindingFilter {
-    /// Whether a recommendation satisfies this filter: a filter is satisfied by ANY of
-    /// its values, and a request's filters all have to be.
+    /// Whether a recommendation satisfies this filter: a filter carrying NO values
+    /// constrains nothing, one carrying values is satisfied by ANY of them, and a request's
+    /// filters all have to be satisfied.
+    ///
+    /// The rule every filter of this service is applied by ([`crate::state::resource_filter_matches`]
+    /// for the instance and group readers, and the same rule the EXPORT of these very
+    /// recommendations applies to the same `EBSFilters` list) — so one filter list selects the
+    /// same recommendations whichever surface of this service reads them.
     fn matches(&self, recommendation: &VolumeRecommendation) -> bool {
+        if self.findings.is_empty() {
+            return true;
+        }
         recommendation
             .finding
             .as_deref()

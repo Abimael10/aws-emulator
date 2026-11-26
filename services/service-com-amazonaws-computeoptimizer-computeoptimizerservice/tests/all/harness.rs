@@ -659,12 +659,43 @@ pub(crate) async fn exported_recommendation_rows_asking(
     fields: &[&str],
     preference: Option<&Value>,
 ) -> Vec<Vec<String>> {
+    exported_rows(router, case, operation, bucket, fields, preference, None).await
+}
+
+/// The same export-then-download workflow for an export whose `filters` select which
+/// recommendations the exported file holds a row of — the filter list a recommendation READER
+/// takes as well, so a suite can compare what one filter list selects on either surface.
+pub(crate) async fn exported_recommendation_rows_selecting(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    bucket: &str,
+    fields: &[&str],
+    filters: &Value,
+) -> Vec<Vec<String>> {
+    exported_rows(router, case, operation, bucket, fields, None, Some(filters)).await
+}
+
+/// The ONE export-then-download workflow the wrappers above narrow: `preference` and `filters`
+/// are the members an export carries beside its destination and its field set.
+async fn exported_rows(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    bucket: &str,
+    fields: &[&str],
+    preference: Option<&Value>,
+    filters: Option<&Value>,
+) -> Vec<Vec<String>> {
     let mut request = json!({
         "s3DestinationConfig": {"bucket": bucket, "keyPrefix": "options"},
         "fieldsToExport": fields,
     });
     if let Some(asked) = preference {
         request["recommendationPreferences"] = asked.clone();
+    }
+    if let Some(selecting) = filters {
+        request["filters"] = selecting.clone();
     }
     let (status, body) = call(router, operation, request.clone()).await;
     assert_eq!(
