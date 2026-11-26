@@ -31,7 +31,8 @@
 //! [`REMOVAL_STABILISATION_WINDOW`]): a resource the owning service has not brought up, or
 //! has not let go of, inside it fails the resource, and the stack rolls back, exactly as a
 //! call that service refused outright does. So no template can leave a stack in progress for
-//! ever.
+//! ever — and a CUSTOM RESOURCE whose declaration states its own `ServiceTimeout` is held for
+//! the span it asked for ([`StabilisationBarrier::deadline`]).
 //!
 //! This module is the model of those waits, and nothing else. [`StabilisationBarrier`] is
 //! one resource's: which answer it waits for ([`Awaited`]), what the call left, the instant
@@ -244,7 +245,30 @@ impl StabilisationBarrier {
 
     /// The instant the wait gives up, which is the window of the answer it waits for, run
     /// from the instant the call it is waiting for was made ([`Self::asked_at`]).
+    ///
+    /// A CUSTOM RESOURCE's declaration can state that window itself: `ServiceTimeout` is "the
+    /// maximum time, in seconds, that can elapse before a custom resource operation times
+    /// out", so a resource that asked for a span is held for exactly the span it asked for,
+    /// bounded by the range that property documents ([`super::provisioning::custom_resource::declared_service_timeout`]
+    /// reads no span outside it) —
+    /// the same reading a duration declared on a resource signal gets
+    /// ([`super::wait_conditions::WaitConditionBarrier::deadline`]). A declaration that states
+    /// none has asked for no particular span, and is held to this emulator's own ceiling on an
+    /// open wait like every other wait for another component of it, rather than to the one-hour
+    /// default the property documents: a provider that never answers then fails the stack
+    /// inside a client's poll loop instead of outliving it.
     pub fn deadline(&self) -> SystemTime {
+        if let Some(stated) = self.provider_request.as_ref().and_then(|request| {
+            super::provisioning::custom_resource::declared_service_timeout(&request.properties)
+        }) {
+            // The span is held to the range the property documents before it is ever read
+            // here, so the instant it gives is always representable; one that somehow is not
+            // falls through to the window below rather than being taken as an instant no clock
+            // can carry.
+            if let Some(stated_deadline) = self.asked_at.checked_add(stated) {
+                return stated_deadline;
+            }
+        }
         let window = match self.awaited {
             // A change the owning service has accepted is waited out for as long as a
             // creation is: both wait for that service to report the resource in the state it
@@ -258,7 +282,12 @@ impl StabilisationBarrier {
             Awaited::Deferred => CREATE_STABILISATION_WINDOW,
             Awaited::Gone => REMOVAL_STABILISATION_WINDOW,
         };
-        self.asked_at + window
+        // The window is one of this module's own constants, so this sum is representable from
+        // any instant a call was made at; an instant it is not representable from is one the
+        // wait has nothing left to run for, which is the instant the call was made.
+        self.asked_at
+            .checked_add(window)
+            .unwrap_or(self.asked_at)
     }
 
     /// Whether the wait has run out at `now`, which fails the resource it is holding.

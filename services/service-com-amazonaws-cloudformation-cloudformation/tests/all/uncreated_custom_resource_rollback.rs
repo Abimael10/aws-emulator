@@ -268,7 +268,11 @@ pub(crate) fn age_the_provider_wait(
 
 /// Move every wait the stack is holding for a provider's answer `by` further into the past,
 /// and answer how many there were — the same move [`age_the_provider_wait`] asserts one of.
-fn aged_provider_waits(
+///
+/// `pub(crate)` beside it because it asserts NOTHING: a suite driving a whole operation to the
+/// end while nothing answers ages the waits of every one of its passes, and a pass between two
+/// requests holds none at all.
+pub(crate) fn aged_provider_waits(
     engine: &Arc<engine::InMemoryEngine>,
     stack_name: &str,
     by: Duration,

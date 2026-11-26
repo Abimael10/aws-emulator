@@ -91,16 +91,40 @@ pub fn service_timeout_refusal(properties: &Value) -> Option<&'static str> {
     if declared.is_null() {
         return None;
     }
-    let seconds = match declared {
+    match stated_service_timeout(properties) {
+        Some(seconds) if (MIN_SERVICE_TIMEOUT..=MAX_SERVICE_TIMEOUT).contains(&seconds) => None,
+        _ => Some(SERVICE_TIMEOUT_OUT_OF_RANGE),
+    }
+}
+
+/// The whole number of seconds `properties` states for [`SERVICE_TIMEOUT`], or `None` for a
+/// declaration that states none — or states something that is no whole number at all.
+///
+/// A property value is TEXT however the template spelled it, so the integer is read out of the
+/// text the declaration carries as well as out of a JSON number.
+fn stated_service_timeout(properties: &Value) -> Option<i64> {
+    match properties.get(SERVICE_TIMEOUT)? {
         Value::String(text) => text.trim().parse::<i64>().ok(),
         Value::Number(number) => number.as_i64(),
         // A boolean, a list or an object is not an integer in the range either.
         _ => None,
-    };
-    match seconds {
-        Some(seconds) if (MIN_SERVICE_TIMEOUT..=MAX_SERVICE_TIMEOUT).contains(&seconds) => None,
-        _ => Some(SERVICE_TIMEOUT_OUT_OF_RANGE),
     }
+}
+
+/// How long the wait for this provider's answer runs, for a declaration that ASKED for a span:
+/// `ServiceTimeout` is "the maximum time, in seconds, that can elapse before a custom resource
+/// operation times out", so that span is the window — the same reading every other duration a
+/// template declares gets ([`crate::state::wait_conditions`]).
+///
+/// `None` for a declaration that states none, which has asked for no particular span, and for
+/// one outside the documented range, which is refused before any provider is sent anything
+/// ([`service_timeout_refusal`]) and so opens no wait at all. What bounds the wait in either
+/// case is this emulator's own ceiling on an open wait, which is where this is read
+/// ([`crate::state::stabilising::StabilisationBarrier::deadline`]).
+pub fn declared_service_timeout(properties: &Value) -> Option<::std::time::Duration> {
+    let seconds = stated_service_timeout(properties)
+        .filter(|seconds| (MIN_SERVICE_TIMEOUT..=MAX_SERVICE_TIMEOUT).contains(seconds))?;
+    Some(::std::time::Duration::from_secs(u64::try_from(seconds).ok()?))
 }
 
 /// The `RequestType` of a provider request: which stack operation it is for.
