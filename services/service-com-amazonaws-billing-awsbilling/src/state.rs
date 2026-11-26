@@ -176,6 +176,19 @@ pub const BILLING_VIEWS_QUOTA_CODE: &str = "BillingViewsPerAccount";
 /// resource").
 pub const MAX_SOURCE_VIEWS_PER_VIEW: usize = 10;
 
+/// The fewest source views one billing view can draw from.
+///
+/// The other side of the very bound [`MAX_SOURCE_VIEWS_PER_VIEW`] names, read
+/// off the same modelled trait: `BillingViewSourceViewsList` — the shape
+/// `CreateBillingView$sourceViews`, `AssociateSourceViews$sourceViews`,
+/// `DisassociateSourceViews$sourceViews` and the `@required`
+/// `ListSourceViewsForBillingView$sourceViews` output all target — is `@length`
+/// 1..10. A view is therefore born drawing from at least one view, and a
+/// caller's write of the set it owns may not take that set below the minimum any
+/// more than it may take it above the maximum: see [`remove_source_views`],
+/// which every narrowing writer goes through.
+pub const MIN_SOURCE_VIEWS_PER_VIEW: usize = 1;
+
 /// The `quotaCode` the modeled `ServiceQuotaExceededException` reports for the
 /// per-view source-view count.
 ///
@@ -1647,6 +1660,44 @@ pub fn add_source_views(held: &mut Vec<String>, requested: impl IntoIterator<Ite
             held.push(source);
         }
     }
+}
+
+/// The source views `held` keeps once the ones `requested` names are removed, as
+/// a SET — or the message that refuses a removal which would take the stored set
+/// below [`MIN_SOURCE_VIEWS_PER_VIEW`].
+///
+/// The inverse of [`add_source_views`], and bounded like it: the association is a
+/// set, so what the view keeps is the set difference (a source named twice, or
+/// one the view does not draw from, removes what it names once and nothing
+/// else), and the result has to stay inside the modelled `@length` of
+/// `BillingViewSourceViewsList` — a view that draws from nothing is a record no
+/// create can produce and no read can report inside that `@required` 1..10
+/// output. Every writer that NARROWS a view's source set collects through here,
+/// so no two of them can disagree about the bound.
+///
+/// A request that removes NOTHING — every ARN it names is one the view does not
+/// draw from — leaves the stored set exactly as it stands, so it is answered
+/// rather than refused however small that set is: it moves the set no closer to
+/// the bound, and these writers are `@idempotent`. That exemption is also what
+/// keeps a view whose last source was DELETED out from under it (see
+/// [`ComAmazonawsBillingAwsbillingState::forget_view`], the cascade a forced
+/// delete runs) answerable: the caller of this did not take that set down, and
+/// refusing it would not put the deleted source back.
+///
+/// The caller renders the `Err` as its own modeled `ValidationException` over
+/// the member that carried the list, and writes nothing.
+pub fn remove_source_views(held: &[String], requested: &[String]) -> Result<Vec<String>, String> {
+    let remaining: Vec<String> = held
+        .iter()
+        .filter(|source| !requested.contains(source))
+        .cloned()
+        .collect();
+    if remaining.len() < held.len() && remaining.len() < MIN_SOURCE_VIEWS_PER_VIEW {
+        return Err(format!(
+            "A billing view must draw from at least {MIN_SOURCE_VIEWS_PER_VIEW} source view"
+        ));
+    }
+    Ok(remaining)
 }
 
 /// Check the relations between the members of one request's data filter

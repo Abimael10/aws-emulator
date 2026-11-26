@@ -311,8 +311,10 @@ async fn the_propagation_clears_on_the_clock_alone() {
     // reads watches the view settle.
     let (router, engine) = emulator_with_engine();
     let case = "the clock alone";
-    let source =
-        create_view(&router, &engine, case, "clock-source", &[PRIMARY_ARN.to_string()]).await;
+    // The source view draws from two views of its own, so the definition change
+    // below (losing one of them) leaves it the modelled minimum of one.
+    let held = vec![PRIMARY_ARN.to_string(), source_arn("clock-extra")];
+    let source = create_view(&router, &engine, case, "clock-source", &held).await;
     let drawing = create_view(
         &router,
         &engine,
@@ -410,12 +412,18 @@ async fn every_gate_fires_while_a_source_view_is_still_propagating() {
             &[source_arn(&format!("gate-{index}-held"))],
         )
         .await;
+        // The drawing view holds a SECOND source of its own, so the row that
+        // disassociates `source` from it leaves the modelled minimum of one
+        // behind and the gate is the only thing that can refuse it.
         let drawing = create_view(
             &router,
             &engine,
             case,
             &format!("gate-drawing-{index}"),
-            std::slice::from_ref(&source),
+            &[
+                source.clone(),
+                source_arn(&format!("gate-{index}-second")),
+            ],
         )
         .await;
 

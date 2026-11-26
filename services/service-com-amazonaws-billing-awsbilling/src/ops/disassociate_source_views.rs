@@ -8,6 +8,11 @@
 //! billing view has a source-view association a caller owns; a managed view's
 //! definition is the service's, so one is refused with a `ValidationException`.
 //!
+//! What the view keeps is bounded BELOW by the same modelled `@length` the
+//! association is bounded above by: a removal that would leave the view drawing
+//! from nothing is refused with a `ValidationException` and writes nothing — see
+//! [`crate::state::remove_source_views`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,6 +179,31 @@ const NOT_A_CUSTOM_VIEW_MESSAGE: &str =
 /// The input member a non-`CUSTOM` view refusal reports in its `fieldList`.
 const ARN_MEMBER: &str = "arn";
 
+/// The input member that carries the source views to remove, reported in the
+/// `fieldList` of a refusal that is about the list rather than about the view.
+const SOURCE_VIEWS_MEMBER: &str = "sourceViews";
+
+/// The modeled `ValidationException` (HTTP 400) for a `sourceViews` list this
+/// request may not remove — one that would take the view's stored association
+/// outside the modelled `@length` of `BillingViewSourceViewsList`.
+///
+/// `why` is the sentence the rule itself states
+/// ([`crate::state::remove_source_views`]), reported both as the exception's
+/// `message` and as the message of the one `fieldList` entry naming the member
+/// the decision was made from, as every other field-level `ValidationException`
+/// of this service does.
+fn invalid_source_views(why: &str) -> DisassociateSourceViewsError {
+    DisassociateSourceViewsErrorModeled::ValidationException(ValidationException {
+        message: why.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: SOURCE_VIEWS_MEMBER.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
 impl<Eng> DisassociateSourceViews<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -272,17 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The association is a SET and this operation is `@idempotent`, so the
         // request's effect is the set difference: a source the view draws from is
         // removed, and one it does not draw from leaves the set as it was rather
-        // than refusing a retry of a call that already succeeded.
+        // than refusing a retry of a call that already succeeded. What is left
+        // has to stay inside the modelled `@length` of
+        // `BillingViewSourceViewsList`, the bound `AssociateSourceViews`
+        // enforces at the other end — the rule every writer that narrows this
+        // field shares (`crate::state::remove_source_views`).
         //
-        // Nothing before this line writes, so every refusal above leaves the
-        // view — and the `sourceViewCount` a later read derives from it —
-        // untouched.
-        let remaining: Vec<String> = view
-            .source_views
-            .iter()
-            .filter(|source| !input.source_views.contains(source))
-            .cloned()
-            .collect();
+        // Nothing before this line writes, so every refusal above — and this one
+        // — leaves the view, and the `sourceViewCount` a later read derives from
+        // it, untouched.
+        let remaining = crate::state::remove_source_views(&view.source_views, &input.source_views)
+            .map_err(|why| invalid_source_views(&why))?;
         if view.source_views != remaining {
             view.source_views = remaining;
             view.updated_at = Some(now);

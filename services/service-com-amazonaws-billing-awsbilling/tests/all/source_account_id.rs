@@ -329,27 +329,31 @@ async fn the_filter_selects_every_view_that_uses_the_account_as_a_source() {
 async fn the_source_account_follows_the_sources_a_later_call_changes() {
     let router = emulator();
     let case = "association round trip";
-    let arn = create_view(&router, case, "round-trip", &[PRIMARY_ARN.to_string()]).await;
+    let only_source = create_view(&router, case, "only-source", &[PRIMARY_ARN.to_string()]).await;
+    let arn = create_view(&router, case, "round-trip", std::slice::from_ref(&only_source)).await;
     let other = create_view(&router, case, "other-source", &[PRIMARY_ARN.to_string()]).await;
 
     assert_eq!(
         get_source_account(&router, case, &arn).await.as_deref(),
         Some(ACCOUNT_ID),
-        "case {case:?}: the created view draws from the caller's own PRIMARY view"
+        "case {case:?}: the created view draws from a view of the caller's own account"
     );
 
-    // Dropping every source leaves a view that draws from nothing: it is no
-    // longer derived, so no account owns its source view and no filter value
-    // selects it.
+    // Losing every source leaves a view that draws from nothing: it is no longer
+    // derived, so no account owns its source view and no filter value selects
+    // it. A disassociation may not take the set that far (`@length` 1..10, see
+    // `source_view_minimum.rs`); a FORCED delete of the only view it draws from
+    // does, which is what "forces deletion of the billing view even if it has
+    // derived resources" means for the view that was drawing from it.
     let (status, body) = call(
         &router,
-        "DisassociateSourceViews",
-        &json!({ "arn": arn, "sourceViews": [PRIMARY_ARN] }),
+        "DeleteBillingView",
+        &json!({ "arn": only_source, "force": true }),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected DisassociateSourceViews to answer 200, got {status} {body:?}"
+        "case {case:?}: expected the forced delete to answer 200, got {status} {body:?}"
     );
     assert_eq!(
         get_source_account(&router, case, &arn).await,

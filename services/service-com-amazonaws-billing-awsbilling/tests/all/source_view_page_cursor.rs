@@ -127,8 +127,10 @@ fn shrink_rows() -> Vec<ShrinkRow> {
             removed: &[0],
         },
         ShrinkRow {
-            case: "a single entry, taken whole, then dropped",
-            entries: 1,
+            // A removal may not empty the association (`source_view_minimum.rs`),
+            // so the smallest list a walk can lose an entry from holds two.
+            case: "the entry a one-entry page reported, leaving the modelled minimum",
+            entries: 2,
             page_size: 1,
             removed: &[0],
         },

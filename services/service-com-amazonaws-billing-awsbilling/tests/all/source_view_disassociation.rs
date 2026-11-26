@@ -11,6 +11,11 @@
 //! an ARN no view is stored under with `ResourceNotFoundException`, and one
 //! outside the caller's account with `AccessDeniedException`.
 //!
+//! What the view keeps is bounded below by the same modelled `@length`: a
+//! removal that would leave it drawing from nothing is refused, which is
+//! `source_view_minimum.rs`'s own rule — so every row here leaves at least the
+//! modelled minimum of one source view behind.
+//!
 //! Every removal is read back through `ListSourceViewsForBillingView` and
 //! `GetBillingView`'s derived `sourceViewCount`, so the assertion is about the
 //! persisted view and not about the answer this one call composed.
@@ -51,10 +56,10 @@ fn rows() -> Vec<Row> {
     let ten: Vec<String> = (0..10).map(|i| source_arn(&format!("src-{i}"))).collect();
     vec![
         Row {
-            case: "the only source view",
-            held: vec![PRIMARY_ARN.to_string()],
+            case: "the first of two, leaving the modelled minimum of one",
+            held: vec![PRIMARY_ARN.to_string(), source_arn("kept")],
             remove: vec![PRIMARY_ARN.to_string()],
-            remaining: vec![],
+            remaining: vec![source_arn("kept")],
         },
         Row {
             case: "the first of three",
@@ -93,10 +98,10 @@ fn rows() -> Vec<Row> {
             remaining: vec![source_arn("a")],
         },
         Row {
-            case: "all ten, the modeled maximum of one request",
+            case: "nine of ten, the largest removal the stored bounds allow",
             held: ten.clone(),
-            remove: ten.clone(),
-            remaining: vec![],
+            remove: ten[..9].to_vec(),
+            remaining: vec![ten[9].clone()],
         },
         Row {
             case: "three of ten",
