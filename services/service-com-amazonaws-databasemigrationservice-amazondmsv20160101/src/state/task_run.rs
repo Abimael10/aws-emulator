@@ -74,6 +74,22 @@ pub const TABLE_COMPLETED: &str = "Table completed";
 /// The state of a table the migration found no data for at the source.
 pub const TABLE_DOES_NOT_EXIST: &str = "Table does not exist";
 
+/// The `TableStatistics$ValidationState` of a table in a task that does not validate the
+/// rows it migrates: "Not enabled – Validation isn't enabled for the table in the migration
+/// task", the first value that member's doc publishes. Fixed text, with no variable part.
+pub const VALIDATION_NOT_ENABLED: &str = "Not enabled";
+/// The state of a table whose loaded rows a validating task has not validated yet:
+/// "Pending records – Some records in the table are waiting for validation."
+pub const VALIDATION_PENDING_RECORDS: &str = "Pending records";
+/// The state of a table a validating task holds no record of waiting validation for:
+/// "Pending validation – The table is waiting validation."
+pub const VALIDATION_PENDING: &str = "Pending validation";
+
+/// The `TableStatistics$ResyncState` of a table no resynchronisation session covers: "Not
+/// enabled – Resync is not enabled for the table in the migration task", the first value
+/// that member's doc publishes. Fixed text, with no variable part.
+pub const RESYNC_NOT_ENABLED: &str = "Not enabled";
+
 /// The `StartReplicationTaskTypeValue` that reloads the target, which makes the load a
 /// RELOAD of each table rather than a new one (`TableStatistics$FullLoadReloaded`).
 pub const START_TYPE_RELOAD_TARGET: &str = "reload-target";
@@ -244,6 +260,29 @@ pub struct TableLoad {
     /// Whether the source held the table at all. A table the mappings name and the source
     /// does not hold is reported as absent, not as loaded.
     pub present_at_source: bool,
+    /// The change rows this run APPLIED to the table at the target, which
+    /// `TableStatistics$AppliedInserts` and its siblings report.
+    pub applied: AppliedChanges,
+}
+
+/// The change rows a run applied to ONE table at the target, by the kind of change each
+/// was: `TableStatistics$AppliedInserts`, `$AppliedDeletes`, `$AppliedUpdates` and
+/// `$AppliedDdls`.
+///
+/// A full load moves a table's rows as a LOAD, which `FullLoadRows` counts. Only a
+/// change-data-capture phase APPLIES changes to a target, so a load leaves none of them
+/// behind and the accounting it records is zero of each kind — which is what the statistics
+/// report, rather than leaving a counter unsaid.
+#[derive(Debug, Clone, Default)]
+pub struct AppliedChanges {
+    /// Inserts applied at the target.
+    pub inserts: i64,
+    /// Deletes applied at the target.
+    pub deletes: i64,
+    /// Updates applied at the target.
+    pub updates: i64,
+    /// Data-definition statements applied at the target.
+    pub ddls: i64,
 }
 
 /// Whether a task of `migration_type` has a full-load phase at all.
@@ -365,6 +404,13 @@ impl ReplicationTaskRecord {
     /// This task's per-table accounting, as `DescribeTableStatistics` reports it: one
     /// entry per table the run's full load covers, in schema and table order.
     ///
+    /// Every member of the accounting is REPORTED for a table the run covers, including the
+    /// ones whose count is zero: the change rows the run applied to the target, what its
+    /// resynchronisation of validation mismatches did, and the documented state of
+    /// validation and resync for the table. A client reading the accounting can then tell
+    /// "nothing applied" and "not enabled" from "not reported", which an absent member
+    /// leaves it unable to do.
+    ///
     /// A task that has never run, and one whose load has not begun, has nothing per table
     /// to report yet.
     pub fn table_statistics(&self) -> Vec<TableStatistics> {
@@ -372,25 +418,57 @@ impl ReplicationTaskRecord {
             return Vec::new();
         };
         let reloaded = self.run.as_ref().is_some_and(|run| run.reloaded);
+        // Whether the task validates what it migrates is a setting of the document the task
+        // runs with, so the state reported per table follows the task's own settings.
+        let validating = super::validation_enabled(self.replication_task_settings.as_deref());
         let mut statistics: Vec<TableStatistics> = load
             .tables
             .iter()
-            .map(|table| TableStatistics {
-                schema_name: Some(table.schema_name.clone()),
-                table_name: Some(table.table_name.clone()),
-                full_load_rows: table.rows,
-                full_load_error_rows: table.errored_rows,
-                full_load_start_time: table.present_at_source.then(|| tstamp(load.started)),
-                full_load_end_time: (table.present_at_source && load.finished)
-                    .then(|| tstamp(load.finish_due)),
-                full_load_reloaded: table.present_at_source.then_some(reloaded),
-                last_update_time: Some(if load.finished {
-                    tstamp(load.finish_due)
-                } else {
-                    tstamp(load.started)
-                }),
-                table_state: Some(table_state(table, load).to_string()),
-                ..TableStatistics::default()
+            .map(|table| {
+                // The rows of this table that a validating task still owes validation:
+                // every row its load moved, since the run validates none of them. A task
+                // that does not validate owes none.
+                let pending_validation = if validating { table.rows } else { 0 };
+                TableStatistics {
+                    schema_name: Some(table.schema_name.clone()),
+                    table_name: Some(table.table_name.clone()),
+                    full_load_rows: table.rows,
+                    full_load_error_rows: table.errored_rows,
+                    full_load_start_time: table.present_at_source.then(|| tstamp(load.started)),
+                    full_load_end_time: (table.present_at_source && load.finished)
+                        .then(|| tstamp(load.finish_due)),
+                    full_load_reloaded: table.present_at_source.then_some(reloaded),
+                    last_update_time: Some(if load.finished {
+                        tstamp(load.finish_due)
+                    } else {
+                        tstamp(load.started)
+                    }),
+                    table_state: Some(table_state(table, load).to_string()),
+                    // What the run APPLIED to the target table as changes: a full load
+                    // moves a table's rows as a LOAD, counted by `FullLoadRows`, and no
+                    // phase of this run applies a change row, a deletion or a DDL
+                    // statement — so each applied-change counter is the zero the run
+                    // accounted for.
+                    applied_inserts: Some(table.applied.inserts),
+                    applied_deletes: Some(table.applied.deletes),
+                    applied_updates: Some(table.applied.updates),
+                    applied_ddls: Some(table.applied.ddls),
+                    // Resynchronisation fixes rows data validation found mismatched
+                    // between source and target. The run resynchronises no table, so it
+                    // attempted none, fixed none and failed none, its progress over the
+                    // mismatches it resynced is zero, and the state is the one the member
+                    // publishes for a table resync does not cover.
+                    resync_rows_attempted: Some(0),
+                    resync_rows_succeeded: Some(0),
+                    resync_rows_failed: Some(0),
+                    resync_progress: Some(0.0),
+                    resync_state: Some(RESYNC_NOT_ENABLED.to_string()),
+                    validation_pending_records: pending_validation,
+                    validation_state: Some(
+                        validation_state(validating, pending_validation).to_string(),
+                    ),
+                    ..TableStatistics::default()
+                }
             })
             .collect();
         statistics.sort_by(|left, right| {
@@ -410,6 +488,23 @@ fn table_state(table: &TableLoad, load: &FullLoad) -> &'static str {
         TABLE_COMPLETED
     } else {
         TABLE_FULL_LOAD
+    }
+}
+
+/// The `ValidationState` of a table in a task that validates (`validating`) or does not,
+/// and that owes `pending` of the table's records validation.
+///
+/// A task whose settings leave validation off validates no table, so every table reports
+/// the state the member publishes for that; one that validates reports the records of the
+/// table waiting for validation where it has any, and otherwise that the table itself is
+/// waiting.
+fn validation_state(validating: bool, pending: i64) -> &'static str {
+    if !validating {
+        VALIDATION_NOT_ENABLED
+    } else if pending > 0 {
+        VALIDATION_PENDING_RECORDS
+    } else {
+        VALIDATION_PENDING
     }
 }
 
@@ -628,6 +723,9 @@ async fn run_full_load(callback: &EmbeddedEmulator, due: &DueFullLoad) -> Vec<Ta
             // source served is a row the target took.
             errored_rows: 0,
             present_at_source: rows.is_some(),
+            // A full load applies no CHANGE to the target — it moves the table's rows as
+            // a load — so this load records no applied change of any kind.
+            applied: AppliedChanges::default(),
         });
     }
     loaded
@@ -1142,6 +1240,48 @@ mod tests {
                 actual.as_deref(),
                 *expected,
                 "case {case:?}: expected the key to name {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a table's reported validation state follows the task's own settings — a task
+    /// that does not validate reports the documented state for that, and one that does
+    /// reports the records of the table waiting for validation, or the table itself
+    /// waiting where none is.
+    #[test]
+    fn a_validation_state_follows_the_tasks_settings() {
+        let rows: &[(&str, bool, i64, &str)] = &[
+            ("a task that does not validate", false, 0, "Not enabled"),
+            (
+                "a task that does not validate, with rows loaded",
+                false,
+                12,
+                "Not enabled",
+            ),
+            (
+                "a validating task with records waiting",
+                true,
+                12,
+                "Pending records",
+            ),
+            (
+                "a validating task with one record waiting",
+                true,
+                1,
+                "Pending records",
+            ),
+            (
+                "a validating task with no record waiting",
+                true,
+                0,
+                "Pending validation",
+            ),
+        ];
+        for (case, validating, pending, expected) in rows {
+            let actual = validation_state(*validating, *pending);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

@@ -33,7 +33,8 @@ pub mod task_settings;
 pub use filters::{check_filter_names, unrecognized_filter_name_message};
 pub use task_run::{advance_task_runs, TaskRun, FULL_LOAD_ONLY_FINISHED, STOPPED_NORMALLY};
 pub use task_settings::{
-    default_task_settings, resolve_task_settings, LOG_COMPONENTS, LOG_SEVERITY_DEFAULT,
+    default_task_settings, resolve_task_settings, validation_enabled, LOG_COMPONENTS,
+    LOG_SEVERITY_DEFAULT,
 };
 
 use std::collections::BTreeMap;

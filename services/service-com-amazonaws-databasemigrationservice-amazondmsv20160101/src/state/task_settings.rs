@@ -161,6 +161,23 @@ pub fn resolve_task_settings(supplied: Option<&str>) -> Result<String, String> {
     Ok(Value::Object(resolved).to_string())
 }
 
+/// Whether the task running with `settings` validates the rows its migration moves: the
+/// `ValidationSettings.EnableValidation` setting of its RESOLVED document, which a default
+/// document carries as false.
+///
+/// Read off the stored document rather than remembered beside it, so the one answer to
+/// "does this task validate?" is the document the task reports to its caller.
+pub fn validation_enabled(settings: Option<&str>) -> bool {
+    settings
+        .and_then(|settings| ::serde_json::from_str::<Value>(settings).ok())
+        .and_then(|document| {
+            document
+                .pointer("/ValidationSettings/EnableValidation")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 /// The defaults as a JSON object.
 ///
 /// [`DEFAULT_TASK_SETTINGS_TEMPLATE`] is a constant of this module and the splice only
@@ -312,6 +329,57 @@ mod tests {
                 resolve_task_settings(Some(case)).is_err(),
                 "case {case:?}: expected a refusal, got {:?}",
                 resolve_task_settings(Some(case))
+            );
+        }
+    }
+
+    /// A task validates what it migrates only where its resolved settings say so, and a
+    /// document that does not say is a task that does not validate.
+    #[test]
+    fn validation_is_enabled_only_where_the_settings_say_so() {
+        let resolved = |supplied: Option<&str>| {
+            resolve_task_settings(supplied).expect("a readable document resolves")
+        };
+        let rows: &[(&str, Option<String>, bool)] = &[
+            ("no settings at all", None, false),
+            ("the service defaults", Some(resolved(None)), false),
+            (
+                "a document that enables validation",
+                Some(resolved(Some(
+                    r#"{"ValidationSettings":{"EnableValidation":true}}"#,
+                ))),
+                true,
+            ),
+            (
+                "a document that turns validation back off",
+                Some(resolved(Some(
+                    r#"{"ValidationSettings":{"EnableValidation":false}}"#,
+                ))),
+                false,
+            ),
+            (
+                "a document that names other validation settings only",
+                Some(resolved(Some(
+                    r#"{"ValidationSettings":{"ThreadCount":9}}"#,
+                ))),
+                false,
+            ),
+            (
+                "a document carrying no validation section",
+                Some(r#"{"Logging":{"EnableLogging":true}}"#.to_string()),
+                false,
+            ),
+            (
+                "a document that is not readable JSON",
+                Some("not json at all".to_string()),
+                false,
+            ),
+        ];
+        for (case, settings, expected) in rows {
+            let actual = validation_enabled(settings.as_deref());
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected}, got {actual} for {settings:?}"
             );
         }
     }
