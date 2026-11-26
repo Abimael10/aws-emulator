@@ -281,6 +281,85 @@ async fn a_jsonata_template_is_evaluated_over_the_input_document() {
     }
 }
 
+/// A template calling a function of the LANGUAGE's own library is evaluated with that
+/// function's value, whichever of them it calls — including the ones this interpreter
+/// does not bind itself, which are supplied from the one place this workspace states
+/// them.
+///
+/// The rows differ along the function called and along the type of the value it produces
+/// (a type name, a number, an array of pairs, an object, a decoded string), so what is
+/// asserted is the library rather than one function.
+#[tokio::test]
+async fn a_template_calling_the_languages_function_library_is_evaluated() {
+    let router = b2bi_router();
+
+    let cases: &[MappingCase] = &[
+        (
+            "the type of a member",
+            "JSON",
+            r#"{"amount":12}"#,
+            "$type(amount)",
+            r#""number""#,
+        ),
+        (
+            "the type of the document itself",
+            "JSON",
+            r#"{"amount":12}"#,
+            "$type($)",
+            r#""object""#,
+        ),
+        (
+            "the mean of an array of numbers",
+            "JSON",
+            r#"{"amounts":[2,4,9]}"#,
+            "$average(amounts)",
+            "5",
+        ),
+        (
+            "an object split into its pairs",
+            "JSON",
+            r#"{"claim":{"id":"X-7"}}"#,
+            "$spread(claim)",
+            r#"{"id":"X-7"}"#,
+        ),
+        (
+            "the pairs a predicate keeps",
+            "JSON",
+            r#"{"totals":{"low":1,"high":20}}"#,
+            "$sift(totals, function($v) { $v > 10 })",
+            r#"{"high":20}"#,
+        ),
+        (
+            "a URL component escaped",
+            "JSON",
+            r#"{"query":"?x=test"}"#,
+            "$encodeUrlComponent(query)",
+            r#""%3Fx%3Dtest""#,
+        ),
+        (
+            "a URL component resolved",
+            "JSON",
+            r#"{"query":"%3Fx%3Dtest"}"#,
+            "$decodeUrlComponent(query)",
+            r#""?x=test""#,
+        ),
+    ];
+
+    for (case, file_format, input, template, expected) in cases {
+        let (status, body) = test_mapping(&router, file_format, input, template).await;
+        assert_eq!(
+            status, MAPPED_STATUS,
+            "case {case:?}: expected {MAPPED_STATUS}, got {status} {body}"
+        );
+        let actual = mapped_document(&body);
+        let expected: Value = serde_json::from_str(expected).expect("the expectation is JSON");
+        assert!(
+            same_json(&actual, &expected),
+            "case {case:?}: expected {expected}, got {actual}"
+        );
+    }
+}
+
 /// A seeded xorshift64* generator, so a failing round-trip case can be replayed from the
 /// seed this test prints.
 struct Rng(u64);

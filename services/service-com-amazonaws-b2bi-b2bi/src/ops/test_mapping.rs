@@ -1196,6 +1196,12 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
         return Err(construct_not_implemented(construct));
     }
 
+    // The functions of the language's own library this interpreter leaves unbound,
+    // supplied from the one place this workspace states them, so a template calling one
+    // of them computes its value here exactly as it does wherever else this emulator
+    // evaluates an expression.
+    ::service_common::jsonata::bind_library(&expression);
+
     let mapped = expression
         .evaluate_timeboxed(
             document,

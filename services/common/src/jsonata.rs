@@ -28,6 +28,13 @@
 //! caller's expression has no primitive with which to reach outside this process. No
 //! host surface is opened by evaluating one, and nothing here has to close one.
 //!
+//! SUPPLIED HERE, because that binding set is INCOMPLETE: a few of the functions the
+//! language defines have no binding in this engine at all, so an expression calling one
+//! throws instead of computing ([`library`]). Each of them is added on the engine's own
+//! extension seam, computes from the arguments it is handed exactly as the language
+//! defines that function, and opens no primitive the engine does not already open — the
+//! language's `eval` is deliberately not among them.
+//!
 //! ENFORCED HERE, because the engine does not bound them:
 //!
 //! * the EXPRESSION TEXT: at most [`MAX_EXPRESSION_BYTES`], carrying at most
@@ -71,6 +78,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
+
+mod library;
+
+pub use library::bind as bind_library;
 
 /// The most bytes of expression TEXT this module evaluates.
 ///
@@ -183,7 +194,10 @@ compile_error!(
 /// EVERYTHING ELSE IS EVALUATED: the growth of every other function is charged to the
 /// arena, which refuses an over-ceiling layout before asking the system for it, and
 /// the ones that take a function call it once per member, which is a step the engine's
-/// own clock can interrupt.
+/// own clock can interrupt. The functions this module BINDS itself are outside that
+/// argument — a native function is one step, and a walk inside one that allocates
+/// nothing is charged to neither the arena nor the clock — so each of them carries a
+/// node budget of its own, ahead of the step ([`library`]).
 ///
 /// The decision is read off the ENGINE's own parse, never off the expression's text:
 /// whether a `/` opens a regular expression or divides, and whether `$pad` is the
@@ -681,6 +695,11 @@ fn contained(
             let bound = arena_value(&arena, value, MAX_EVALUATION_DEPTH)?;
             parsed.assign_var(name, bound);
         }
+        // The functions of the language's library this engine leaves unbound, supplied
+        // before anything is evaluated, so a caller's expression computes with the
+        // library the language defines rather than throwing on a function that is not
+        // there ([`library`]).
+        library::bind(&parsed);
         let answer = parsed
             .evaluate_timeboxed(
                 Some(input),
@@ -773,8 +792,9 @@ fn evaluation_failure(text: &str, why: &::jsonata_rs::Error, allowed_ms: usize) 
              it"
         )),
         ::jsonata_rs::Error::U1001StackOverflow => Refused::NotEvaluated(format!(
-            "'{text}' nested deeper than the {MAX_EVALUATION_DEPTH} evaluations this emulator \
-             allows one expression"
+            "'{text}' asked for more structure than this emulator evaluates for one \
+             expression: it nested deeper than the {MAX_EVALUATION_DEPTH} evaluations allowed \
+             one expression, or asked one function for more values than it walks"
         )),
         thrown => Refused::Threw(thrown_account(thrown)),
     }
