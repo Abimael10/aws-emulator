@@ -107,6 +107,20 @@ pub(super) const IN_SPEECH_AND_TEXT: &[&str] = &[MODALITY_SPEECH, "TEXT"];
 pub(super) const OUT_SPEECH_AND_TEXT: &[&str] = &[MODALITY_SPEECH, "TEXT"];
 /// `InferenceType` — a model offered on demand only.
 pub(super) const ON_DEMAND: &[&str] = &["ON_DEMAND"];
+/// The inference type of a model Amazon Bedrock offers ONLY through a cross-region inference
+/// profile: it is invoked by naming such a profile rather than the model itself, so neither
+/// on-demand nor reserved capacity is offered over the model id.
+///
+/// `InferenceType` declares ON_DEMAND and PROVISIONED in this model copy
+/// (`crate::ops::types::INFERENCE_TYPE_VALUES`) and no value for a model reached that way,
+/// while the catalog publishes one for the models offered through a profile alone — RECORDED
+/// behaviour, not modelled, like the capability members of a summary — so the value is
+/// stated here and reported as published. A `byInferenceType` filter still accepts the two
+/// values the enum declares and no other, because the validating walk runs on operation
+/// INPUTS.
+pub(super) const INFERENCE_PROFILE_ONLY: &[&str] = &[INFERENCE_TYPE_INFERENCE_PROFILE];
+/// `inferenceTypesSupported` — the model is reached through a cross-region inference profile.
+pub(super) const INFERENCE_TYPE_INFERENCE_PROFILE: &str = "INFERENCE_PROFILE";
 /// `InferenceType` — a model offered both on demand and with Provisioned Throughput.
 pub(super) const ON_DEMAND_AND_PROVISIONED: &[&str] = &["ON_DEMAND", "PROVISIONED"];
 /// `ModelCustomizationList` — a model no customization job accepts.
@@ -122,26 +136,59 @@ pub(super) const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTI
 /// Each one has its own "Supported models" table in the Amazon Bedrock User Guide, which is
 /// what makes support for it a published per-model fact; the order here is that of the
 /// feature names, so two rows list the features they share in the same order.
+///
+/// Batch inference is published per REGION SCOPE — a model a job may run where it is offered
+/// is not thereby a model a job in another region may run — so each scope is a value of its
+/// own ([`FEATURE_BATCH_INFERENCE`], [`FEATURE_CROSS_REGION_BATCH_INFERENCE`]), and the
+/// feature record answers one member per scope out of them.
 pub const PUBLISHED_FEATURE_VALUES: &[&str] = &[
     FEATURE_BATCH_INFERENCE,
+    FEATURE_CROSS_REGION_BATCH_INFERENCE,
     FEATURE_INTELLIGENT_PROMPT_ROUTING,
     FEATURE_LATENCY_OPTIMIZATION,
     FEATURE_PROMPT_CACHING,
+    FEATURE_PROMPT_OPTIMIZATION,
 ];
 
 /// `featuresSupported` — no feature's table lists the model, which is where a freshly
 /// offered model starts.
 pub(super) const NO_FEATURES: &[&str] = &[];
-/// `featuresSupported` — a model batch inference runs and no other feature lists.
-pub(super) const BATCH_ONLY: &[&str] = &[FEATURE_BATCH_INFERENCE];
-/// `featuresSupported` — a model batch inference runs and a prompt router routes to.
-pub(super) const BATCH_AND_ROUTING: &[&str] = &[FEATURE_BATCH_INFERENCE, FEATURE_INTELLIGENT_PROMPT_ROUTING];
-/// `featuresSupported` — a model batch inference runs and a prompt prefix may be cached for.
-pub(super) const BATCH_AND_CACHING: &[&str] = &[FEATURE_BATCH_INFERENCE, FEATURE_PROMPT_CACHING];
+/// `featuresSupported` — a model batch inference runs, in the region it is offered in and
+/// from another, and no other feature lists.
+pub(super) const BATCH_ONLY: &[&str] =
+    &[FEATURE_BATCH_INFERENCE, FEATURE_CROSS_REGION_BATCH_INFERENCE];
+/// `featuresSupported` — a model batch inference runs only in the region it is offered in:
+/// the cross-region scope's own table does not list it.
+pub(super) const IN_REGION_BATCH_ONLY: &[&str] = &[FEATURE_BATCH_INFERENCE];
+/// `featuresSupported` — a model batch inference runs in both scopes and a prompt router
+/// routes to.
+pub(super) const BATCH_AND_ROUTING: &[&str] = &[
+    FEATURE_BATCH_INFERENCE,
+    FEATURE_CROSS_REGION_BATCH_INFERENCE,
+    FEATURE_INTELLIGENT_PROMPT_ROUTING,
+];
+/// `featuresSupported` — a model batch inference runs in both scopes and a prompt prefix may
+/// be cached for.
+pub(super) const BATCH_AND_CACHING: &[&str] = &[
+    FEATURE_BATCH_INFERENCE,
+    FEATURE_CROSS_REGION_BATCH_INFERENCE,
+    FEATURE_PROMPT_CACHING,
+];
 /// `featuresSupported` — a model only prompt caching's table lists.
 pub(super) const CACHING_ONLY: &[&str] = &[FEATURE_PROMPT_CACHING];
-/// `featuresSupported` — a model every one of these four features lists.
-pub(super) const EVERY_PUBLISHED_FEATURE: &[&str] = PUBLISHED_FEATURE_VALUES;
+/// `featuresSupported` — a model batch inference runs in both scopes, a prompt router routes
+/// to, a prompt prefix may be cached for and latency-optimized inference is offered over.
+///
+/// Prompt optimization is NOT among them: it is published in its own supported-models table
+/// ([`FEATURE_PROMPT_OPTIMIZATION`]), which lists none of this catalog's models, so a row
+/// that publishes every other feature still publishes no prompt optimization.
+pub(super) const BATCH_ROUTING_CACHING_AND_LATENCY: &[&str] = &[
+    FEATURE_BATCH_INFERENCE,
+    FEATURE_CROSS_REGION_BATCH_INFERENCE,
+    FEATURE_INTELLIGENT_PROMPT_ROUTING,
+    FEATURE_LATENCY_OPTIMIZATION,
+    FEATURE_PROMPT_CACHING,
+];
 /// `FoundationModelLifecycleStatus` — the model is available.
 pub(super) const LIFECYCLE_ACTIVE: &str = "ACTIVE";
 /// `FoundationModelLifecycleStatus` — the model is deprecated: it is still offered and
@@ -277,6 +324,17 @@ pub(super) const fn also_provisioned(model: FoundationModel) -> FoundationModel 
     }
 }
 
+/// The same row, offered ONLY THROUGH A CROSS-REGION INFERENCE PROFILE: a model Amazon
+/// Bedrock serves by naming such a profile rather than the model id, so the row publishes
+/// [`INFERENCE_PROFILE_ONLY`] instead of an on-demand or reserved-capacity offering, and a
+/// client reading the row knows to route its invocation through the profile.
+pub(super) const fn inference_profile_only(model: FoundationModel) -> FoundationModel {
+    FoundationModel {
+        inference_types_supported: INFERENCE_PROFILE_ONLY,
+        ..model
+    }
+}
+
 /// The same row, publishing the CUSTOMIZATIONS the model's training variant accepts.
 ///
 /// Amazon Bedrock publishes a customizable model under its TRAINING-QUALIFIED id — the
@@ -297,6 +355,79 @@ pub(super) const fn customizable(
         ..model
     }
 }
+
+/// The same row under ANOTHER published id of the same model: the
+/// version-and-context-qualified id Amazon Bedrock publishes a model under beside its base
+/// id, which is the id a Provisioned Throughput over the model names.
+///
+/// One published model addressed by two ids, so every published fact of the model — its
+/// brand, what it takes and answers, the features published for it and the point of its
+/// lifecycle it has reached — is the same on both rows, and only the id differs. A
+/// deprecated model keeps its qualified row for as long as the catalog offers it under that
+/// id: the id is how a client reaches reserved capacity it already bought, which outlives
+/// the model's move into legacy state.
+pub(super) const fn under_qualified_id(
+    model: FoundationModel,
+    model_id: &'static str,
+) -> FoundationModel {
+    FoundationModel { model_id, ..model }
+}
+
+/// The published row of the deprecated Cohere Command model, named so the catalog can
+/// publish it under its base id and under the qualified id of the same model
+/// ([`under_qualified_id`]) without holding two copies of its facts.
+const COHERE_COMMAND: FoundationModel = FoundationModel {
+    model_id: "cohere.command-text-v14",
+    model_name: "Command",
+    provider_name: "Cohere",
+    model_family: "Command",
+    input_modalities: IN_TEXT,
+    output_modalities: OUT_TEXT,
+    response_streaming_supported: true,
+    customizations_supported: NO_CUSTOMIZATION,
+    inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+    features_supported: BATCH_ONLY,
+    lifecycle_status: LIFECYCLE_LEGACY,
+    start_of_life_time: "2023-09-28T00:00:00Z",
+    legacy_window: Some(LegacyWindow {
+        entered_at: "2025-04-30T00:00:00Z",
+        end_of_life_at: "2027-06-30T00:00:00Z",
+    }),
+};
+
+/// The published row of the deprecated Cohere Command Light model, named for the reason
+/// [`COHERE_COMMAND`] is.
+const COHERE_COMMAND_LIGHT: FoundationModel = FoundationModel {
+    model_id: "cohere.command-light-text-v14",
+    model_name: "Command Light",
+    ..COHERE_COMMAND
+};
+
+/// The published row of the Cohere Embed English model under the version-qualified id, named
+/// so the catalog can publish it under the context-qualified id of the same model too
+/// ([`under_qualified_id`]).
+const COHERE_EMBED_ENGLISH_V3_0: FoundationModel = also_provisioned(embedding_model(
+    "cohere.embed-english-v3:0",
+    "Embed English",
+    "Cohere",
+    "Embed",
+    IN_TEXT,
+    NO_FEATURES,
+    "2023-11-29T00:00:00Z",
+));
+
+/// The published row of the Cohere Embed Multilingual model, named for the reason
+/// [`COHERE_EMBED_ENGLISH_V3_0`] is: the catalog publishes it under its base id and under two
+/// qualified ids of the same model.
+const COHERE_EMBED_MULTILINGUAL_V3: FoundationModel = also_provisioned(embedding_model(
+    "cohere.embed-multilingual-v3",
+    "Embed Multilingual",
+    "Cohere",
+    "Embed",
+    IN_TEXT,
+    NO_FEATURES,
+    "2023-11-29T00:00:00Z",
+));
 
 /// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
 ///
@@ -329,14 +460,13 @@ pub(super) const fn customizable(
 /// offered row carries — so a filter on one of them narrows the catalog to the rows that do.
 ///
 /// A model a customization job accepts is published under a second, TRAINING-QUALIFIED id
-/// beside its on-demand one ([`customizable`]), and that second row is published only while
-/// a customization of the model is still offered: a DEPRECATED model ([`LIFECYCLE_LEGACY`])
-/// takes no new customization job, so AWS publishes no training-qualified row for one and
-/// the catalog carries a deprecated model under its base id alone — which is why no row here
-/// is both deprecated and customizable. The qualified id goes on naming the same published
-/// model, so it still resolves to that base row
-/// ([`FoundationModelCatalog::qualified_model`]) and the inference plane goes on serving it;
-/// it is simply not a catalog entry of its own for a listing to report.
+/// beside its on-demand one ([`customizable`]), and the CUSTOMIZATIONS belong to that second
+/// row: a DEPRECATED model ([`LIFECYCLE_LEGACY`]) takes no new customization job, which is
+/// why no row here is both deprecated and customizable. The qualified id is published for the
+/// model all the same ([`under_qualified_id`]) — it is the id a Provisioned Throughput over
+/// the model names, which outlives the model's move into legacy state — and it names the same
+/// published model, so it also resolves to the base row
+/// ([`FoundationModelCatalog::qualified_model`]) and the inference plane goes on serving it.
 ///
 /// A row whose published attributes differ from the three kinds below — a model a
 /// customization job accepts, or a deprecated one — is written out member by member; every
@@ -380,7 +510,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: EVERY_PUBLISHED_FEATURE,
+        features_supported: BATCH_ROUTING_CACHING_AND_LATENCY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -395,7 +525,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: EVERY_PUBLISHED_FEATURE,
+        features_supported: BATCH_ROUTING_CACHING_AND_LATENCY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -410,7 +540,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: EVERY_PUBLISHED_FEATURE,
+        features_supported: BATCH_ROUTING_CACHING_AND_LATENCY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -426,13 +556,17 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         NO_FEATURES,
         "2024-12-01T00:00:00Z",
     ),
+    // The Titan and Cohere embedding rows below publish batch inference per REGION SCOPE, as
+    // each scope's own supported-models table lists them: a row listed in neither publishes
+    // no batch inference at all, and one listed for the region it is offered in alone
+    // publishes IN_REGION_BATCH_ONLY.
     also_provisioned(embedding_model(
         "amazon.titan-embed-g1-text-02",
         "Titan Embed G1 Text",
         "Amazon",
         "Titan",
         IN_TEXT,
-        BATCH_ONLY,
+        NO_FEATURES,
         "2023-09-28T00:00:00Z",
     )),
     FoundationModel {
@@ -445,7 +579,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
+        features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
@@ -461,7 +595,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
             "Amazon",
             "Titan",
             IN_TEXT_AND_IMAGE,
-            BATCH_ONLY,
+            IN_REGION_BATCH_ONLY,
             "2023-11-29T00:00:00Z",
         )),
         FINE_TUNING,
@@ -472,7 +606,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         "Amazon",
         "Titan",
         IN_TEXT,
-        BATCH_ONLY,
+        NO_FEATURES,
         "2023-09-28T00:00:00Z",
     )),
     also_provisioned(embedding_model(
@@ -481,7 +615,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         "Amazon",
         "Titan",
         IN_TEXT,
-        BATCH_ONLY,
+        NO_FEATURES,
         "2023-09-28T00:00:00Z",
     )),
     FoundationModel {
@@ -494,7 +628,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
+        features_supported: IN_REGION_BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-30T00:00:00Z",
         legacy_window: None,
@@ -525,7 +659,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         "Anthropic",
         "Claude Haiku 4.5",
         IN_TEXT_AND_IMAGE,
-        EVERY_PUBLISHED_FEATURE,
+        BATCH_ROUTING_CACHING_AND_LATENCY,
         "2025-10-01T00:00:00Z",
     ),
     text_model(
@@ -636,42 +770,14 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         NO_FEATURES,
         "2026-09-29T00:00:00Z",
     ),
-    FoundationModel {
-        model_id: "cohere.command-light-text-v14",
-        model_name: "Command Light",
-        provider_name: "Cohere",
-        model_family: "Command",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_LEGACY,
-        start_of_life_time: "2023-09-28T00:00:00Z",
-        legacy_window: Some(LegacyWindow {
-            entered_at: "2025-04-30T00:00:00Z",
-            end_of_life_at: "2027-06-30T00:00:00Z",
-        }),
-    },
-    FoundationModel {
-        model_id: "cohere.command-text-v14",
-        model_name: "Command",
-        provider_name: "Cohere",
-        model_family: "Command",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
-        lifecycle_status: LIFECYCLE_LEGACY,
-        start_of_life_time: "2023-09-28T00:00:00Z",
-        legacy_window: Some(LegacyWindow {
-            entered_at: "2025-04-30T00:00:00Z",
-            end_of_life_at: "2027-06-30T00:00:00Z",
-        }),
-    },
+    COHERE_COMMAND_LIGHT,
+    // The same Command Light model under the VERSION-AND-CONTEXT-QUALIFIED id the catalog
+    // also publishes it under — the id a Provisioned Throughput over the model names. One
+    // published model, two ids a client may address it by, so the qualified row publishes the
+    // model's own facts, its deprecation among them (`under_qualified_id`).
+    under_qualified_id(COHERE_COMMAND_LIGHT, "cohere.command-light-text-v14:7:4k"),
+    COHERE_COMMAND,
+    under_qualified_id(COHERE_COMMAND, "cohere.command-text-v14:7:4k"),
     FoundationModel {
         model_id: "cohere.embed-english-v3",
         model_name: "Embed English",
@@ -682,47 +788,28 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        features_supported: BATCH_ONLY,
+        features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
     },
     // Cohere — the Embed and Rerank lines, each embedding model also under the
-    // version-qualified id the catalog publishes it under.
-    also_provisioned(embedding_model(
-        "cohere.embed-english-v3:0",
-        "Embed English",
-        "Cohere",
-        "Embed",
-        IN_TEXT,
-        BATCH_ONLY,
-        "2023-11-29T00:00:00Z",
-    )),
-    also_provisioned(embedding_model(
-        "cohere.embed-multilingual-v3",
-        "Embed Multilingual",
-        "Cohere",
-        "Embed",
-        IN_TEXT,
-        BATCH_ONLY,
-        "2023-11-29T00:00:00Z",
-    )),
-    also_provisioned(embedding_model(
-        "cohere.embed-multilingual-v3:0",
-        "Embed Multilingual",
-        "Cohere",
-        "Embed",
-        IN_TEXT,
-        BATCH_ONLY,
-        "2023-11-29T00:00:00Z",
-    )),
+    // version-qualified ids the catalog publishes it under.
+    COHERE_EMBED_ENGLISH_V3_0,
+    under_qualified_id(COHERE_EMBED_ENGLISH_V3_0, "cohere.embed-english-v3:0:512"),
+    COHERE_EMBED_MULTILINGUAL_V3,
+    under_qualified_id(COHERE_EMBED_MULTILINGUAL_V3, "cohere.embed-multilingual-v3:0"),
+    under_qualified_id(
+        COHERE_EMBED_MULTILINGUAL_V3,
+        "cohere.embed-multilingual-v3:0:512",
+    ),
     embedding_model(
         "cohere.embed-v4:0",
         "Embed 4",
         "Cohere",
         "Embed",
         IN_TEXT_AND_IMAGE,
-        BATCH_ONLY,
+        NO_FEATURES,
         "2025-04-15T00:00:00Z",
     ),
     embedding_model(
@@ -1075,15 +1162,16 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         NO_FEATURES,
         "2026-04-21T00:00:00Z",
     ),
-    // NVIDIA Nemotron.
+    // NVIDIA Nemotron. The Nano V2 VL line takes an image beside the text it is prompted
+    // with, which is what its published family says it is.
     text_model(
         "nvidia.nemotron-nano-12b-v2",
         "Nemotron Nano 12B",
         "NVIDIA",
-        "Nemotron Nano",
-        IN_TEXT,
-        NO_FEATURES,
-        "2025-09-15T00:00:00Z",
+        "Nemotron Nano V2 VL",
+        IN_TEXT_AND_IMAGE,
+        IN_REGION_BATCH_ONLY,
+        "2025-12-02T00:00:00Z",
     ),
     text_model(
         "nvidia.nemotron-nano-3-30b",
@@ -1159,7 +1247,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         NO_FEATURES,
         "2026-05-19T00:00:00Z",
     ),
-    text_model(
+    inference_profile_only(text_model(
         "openai.gpt-6-astra",
         "GPT-6 Astra",
         "OpenAI",
@@ -1167,7 +1255,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         IN_TEXT_AND_IMAGE,
         NO_FEATURES,
         "2026-09-08T17:00:00Z",
-    ),
+    )),
     text_model(
         "openai.gpt-6-luna",
         "GPT-6 Luna",
@@ -1948,13 +2036,17 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 // may stream, converse, guard, cache, route, batch or customise a model it picked out of
 // the listing, which is what makes a listing that omits them undecidable.
 //
-// Each one is read off the catalog row: the family and the four features of
-// [`PUBLISHED_FEATURE_VALUES`] are PUBLISHED per model — each feature has its own
-// "Supported models" table, so support for it is a fact about the model and not a
-// consequence of what the model does — while the rest follow from attributes the row
-// already carries, so they are computed rather than stored a second time. Nothing here is
-// invented for a model: a feature no table lists the model in is simply not supported for
-// it, which is where a freshly offered model starts.
+// Each one is read off the PUBLISHED data of that model: the family, every feature of
+// [`PUBLISHED_FEATURE_VALUES`] — each has its own "Supported models" table, so support for
+// it is a fact about the model and not a consequence of what the model does, and batch
+// inference publishes one table per region scope — and the two OpenAI-compatible endpoints
+// ([`OPENAI_CHAT_COMPLETIONS_MODELS`], [`OPENAI_RESPONSES_MODELS`]), which are Amazon
+// Bedrock surfaces in the shape of another API rather than a property of a provider. Only
+// what genuinely FOLLOWS from an attribute the row already carries is computed — whether the
+// answer arrives in one piece, whether a guardrail has written text to decide about — so a
+// published fact is never derived from a model's modalities, streaming or provider. Nothing
+// here is invented for a model: a feature no table lists the model in is simply not supported
+// for it, which is where a freshly offered model starts.
 //
 // A capability is reported as a RECORD naming what is supported
 // ([`CapabilitySupport`], [`BatchSupport`], [`FeaturesSupport`], [`ConverseSupport`])
@@ -1979,9 +2071,11 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 /// (`crate::ops::types::MODEL_MODALITY_VALUES`).
 pub(super) const MODALITY_TEXT: &str = "TEXT";
 
-/// The `providerName` whose own OpenAI-compatible endpoints Amazon Bedrock serves its
-/// models on beside its own invocation APIs, which is what puts those two APIs in their
-/// `inferenceAPIsSupported`.
+/// The `providerName` whose own API Amazon Bedrock's two OpenAI-compatible endpoints are the
+/// shape of, and which publishes one ceiling for the whole line it serves its models under
+/// ([`CONVERSE_PROVIDER_MAX_OUTPUT_TOKENS`]). WHICH models those endpoints serve is published
+/// per model instead ([`OPENAI_CHAT_COMPLETIONS_MODELS`]), so this names the provider line
+/// and nothing about an endpoint.
 pub(super) const OPENAI_MODEL_PROVIDER: &str = "OpenAI";
 
 /// The modality a turn of a SPOKEN conversation carries: the one a two-way stream is made
@@ -1996,9 +2090,17 @@ pub(super) const OPENAI_MODEL_PROVIDER: &str = "OpenAI";
 /// operation INPUTS.
 pub(super) const MODALITY_SPEECH: &str = "SPEECH";
 
-/// `featuresSupported` — a model invocation job may run the model over a dataset ("Supported
-/// models and Regions for batch inference").
+/// `featuresSupported` — a model invocation job submitted in the region the model is offered
+/// in may run it over a dataset ("Supported models and Regions for batch inference").
 pub(super) const FEATURE_BATCH_INFERENCE: &str = "BATCH_INFERENCE";
+/// `featuresSupported` — a model invocation job submitted in ANOTHER region may run the model
+/// over a dataset: batch inference publishes its supported models per region scope, and the
+/// cross-region scope has its own table, so a model listed for one scope is not thereby
+/// listed for the other.
+pub(super) const FEATURE_CROSS_REGION_BATCH_INFERENCE: &str = "CROSS_REGION_BATCH_INFERENCE";
+/// `featuresSupported` — a prompt optimization job may rewrite a prompt for the model
+/// ("Supported models and Regions for prompt optimization").
+pub(super) const FEATURE_PROMPT_OPTIMIZATION: &str = "PROMPT_OPTIMIZATION";
 /// `featuresSupported` — a prompt router may route a prompt to the model ("Supported models
 /// and Regions for intelligent prompt routing").
 pub(super) const FEATURE_INTELLIGENT_PROMPT_ROUTING: &str = "INTELLIGENT_PROMPT_ROUTING";
@@ -2096,23 +2198,38 @@ pub fn model_latency_optimization_supported(model: &FoundationModel) -> bool {
 
 /// Whether a model invocation job may run `model` over a dataset, as the record a summary
 /// reports it: a job runs the base model itself, runs it from another region, and runs a
-/// CUSTOMIZATION of it — the last of which needs the model to accept a customization at
-/// all, so it holds of a model whose `customizationsSupported` is not empty and of no
-/// other.
+/// CUSTOMIZATION of it.
+///
+/// Each of the three is read off the row's published features rather than off one batch bit,
+/// because each is published in its own right: the base model's scope and the cross-region
+/// scope have a supported-models table each ([`FEATURE_BATCH_INFERENCE`],
+/// [`FEATURE_CROSS_REGION_BATCH_INFERENCE`]), and running a customization needs the model to
+/// accept a customization at all, so it holds of a model whose `customizationsSupported` is
+/// not empty and of no other.
 #[must_use]
 pub fn model_batch_support(model: &FoundationModel) -> BatchSupport {
-    let supported = model_batch_supported(model);
+    let in_region = model_batch_supported(model);
     BatchSupport {
-        base_model_supported: Some(supported),
-        cross_region_supported: Some(supported),
-        custom_model_supported: Some(supported && !model.customizations_supported.is_empty()),
+        base_model_supported: Some(in_region),
+        cross_region_supported: Some(model_cross_region_batch_supported(model)),
+        custom_model_supported: Some(in_region && !model.customizations_supported.is_empty()),
     }
 }
 
-/// Whether a model invocation job may run `model` over a dataset.
+/// Whether a model invocation job submitted in the region `model` is offered in may run it
+/// over a dataset.
 #[must_use]
 pub fn model_batch_supported(model: &FoundationModel) -> bool {
     model_publishes_feature(model, FEATURE_BATCH_INFERENCE)
+}
+
+/// Whether a model invocation job submitted in ANOTHER region may run `model` over a
+/// dataset: the cross-region scope of batch inference, published for the model in its own
+/// right, so a model a job may run where it is offered is not thereby one a job elsewhere
+/// may run.
+#[must_use]
+pub fn model_cross_region_batch_supported(model: &FoundationModel) -> bool {
+    model_publishes_feature(model, FEATURE_CROSS_REGION_BATCH_INFERENCE)
 }
 
 /// The invocation APIs `model` is reachable through, as the RECORD a summary reports them
@@ -2131,15 +2248,15 @@ pub fn model_batch_supported(model: &FoundationModel) -> bool {
 /// speak, whatever else it produces, and streams its answer exactly where the row streams;
 /// `converse` answers a WRITTEN turn in one piece for a conversational model
 /// ([`model_is_conversational`]) and streams a turn for any model that takes part in a
-/// conversation at all, spoken or written, and streams it; the two OpenAI-compatible
-/// endpoints reach a model published by that provider ([`OPENAI_MODEL_PROVIDER`]), whose own
-/// API they are the shape of; and the two long-running modes are
+/// conversation at all, spoken or written, and streams it; each of the two OpenAI-compatible
+/// endpoints reaches the models Amazon Bedrock publishes it FOR
+/// ([`model_open_ai_chat_completions_supported`], [`model_open_ai_responses_supported`]);
+/// and the two long-running modes are
 /// [`model_async_invoke_supported`] and [`model_bidirectional_streaming_supported`].
 #[must_use]
 pub fn model_inference_apis_supported(model: &FoundationModel) -> InferenceApisSupport {
     let conversational = model_is_conversational(model);
     let speaks = model_speaks(model);
-    let openai_published = model.provider_name == OPENAI_MODEL_PROVIDER;
     InferenceApisSupport {
         async_invoke: Some(model_async_invoke_supported(model)),
         converse: Some(ConverseApiSupport {
@@ -2151,10 +2268,141 @@ pub fn model_inference_apis_supported(model: &FoundationModel) -> InferenceApisS
             response_streaming: Some(model.response_streaming_supported),
             sync: Some(!speaks),
         }),
-        open_ai_chat_completions: Some(openai_published),
-        open_ai_responses: Some(openai_published),
+        open_ai_chat_completions: Some(model_open_ai_chat_completions_supported(model)),
+        open_ai_responses: Some(model_open_ai_responses_supported(model)),
     }
 }
+
+/// Whether Amazon Bedrock serves `model` on its OpenAI-compatible CHAT COMPLETIONS endpoint.
+///
+/// PUBLISHED per model ([`OPENAI_CHAT_COMPLETIONS_MODELS`]) rather than implied by the
+/// model's provider: the endpoint is an Amazon Bedrock surface in the SHAPE of the OpenAI
+/// API, not the provider's own, so which models it serves is a fact Amazon Bedrock publishes
+/// model by model — a provider whose own API the endpoint imitates has models the endpoint
+/// does not serve, and models of every other provider are served on it.
+#[must_use]
+pub fn model_open_ai_chat_completions_supported(model: &FoundationModel) -> bool {
+    OPENAI_CHAT_COMPLETIONS_MODELS.contains(&model.model_id)
+}
+
+/// Whether Amazon Bedrock serves `model` on its OpenAI-compatible RESPONSES endpoint.
+///
+/// Published per model ([`OPENAI_RESPONSES_MODELS`]) for the reason
+/// [`model_open_ai_chat_completions_supported`] is, and published SEPARATELY from the Chat
+/// Completions endpoint: the two endpoints are two surfaces, so a model served on one is not
+/// thereby served on the other.
+#[must_use]
+pub fn model_open_ai_responses_supported(model: &FoundationModel) -> bool {
+    OPENAI_RESPONSES_MODELS.contains(&model.model_id)
+}
+
+/// The models Amazon Bedrock serves on its OpenAI-compatible Chat Completions endpoint, by
+/// `modelId`.
+///
+/// A published per-model fact, in `modelId` order. A model in no row is served on Amazon
+/// Bedrock's own invocation APIs alone, which is where a freshly offered model starts.
+pub const OPENAI_CHAT_COMPLETIONS_MODELS: &[&str] = &[
+    "deepseek.v3-v1:0",
+    "deepseek.v3.2",
+    "google.gemma-3-12b-it",
+    "google.gemma-3-27b-it",
+    "google.gemma-3-4b-it",
+    "minimax.minimax-m2",
+    "minimax.minimax-m2.1",
+    "minimax.minimax-m2.5",
+    "mistral.devstral-2-123b",
+    "mistral.magistral-small-2509",
+    "mistral.ministral-3-14b-instruct",
+    "mistral.ministral-3-3b-instruct",
+    "mistral.ministral-3-8b-instruct",
+    "mistral.mistral-large-3-675b-instruct",
+    "mistral.voxtral-mini-3b-2507",
+    "mistral.voxtral-small-24b-2507",
+    "moonshot.kimi-k2-thinking",
+    "moonshotai.kimi-k2.5",
+    "moonshotai.kimi-k3",
+    "nvidia.nemotron-nano-12b-v2",
+    "nvidia.nemotron-nano-3-30b",
+    "nvidia.nemotron-nano-9b-v2",
+    "nvidia.nemotron-super-3-120b",
+    "openai.gpt-5.4",
+    "openai.gpt-5.5",
+    "openai.gpt-5.6-luna",
+    "openai.gpt-5.6-sol",
+    "openai.gpt-5.6-terra",
+    "openai.gpt-6-astra",
+    "openai.gpt-6-luna",
+    "openai.gpt-6-sol",
+    "openai.gpt-6.1-sol",
+    "openai.gpt-oss-120b-1:0",
+    "openai.gpt-oss-20b-1:0",
+    "openai.gpt-oss-safeguard-120b",
+    "openai.gpt-oss-safeguard-20b",
+    "qwen.qwen3-235b-a22b-2507-v1:0",
+    "qwen.qwen3-32b-v1:0",
+    "qwen.qwen3-coder-30b-a3b-v1:0",
+    "qwen.qwen3-coder-480b-a35b-v1:0",
+    "qwen.qwen3-next-80b-a3b",
+    "qwen.qwen3-vl-235b-a22b",
+    "writer.palmyra-vision-7b",
+    "xai.grok-4.6",
+    "xai.grok-4.7",
+    "zai.glm-4.7",
+    "zai.glm-4.7-flash",
+    "zai.glm-5",
+    "zai.glm-5.3",
+];
+
+/// The models Amazon Bedrock serves on its OpenAI-compatible Responses endpoint, by
+/// `modelId`.
+///
+/// Published in its own right beside [`OPENAI_CHAT_COMPLETIONS_MODELS`], in `modelId` order:
+/// the Responses endpoint is a surface of its own, so this is not that table — several models
+/// Chat Completions serves are published for it and nothing else.
+pub const OPENAI_RESPONSES_MODELS: &[&str] = &[
+    "deepseek.v3.2",
+    "google.gemma-3-12b-it",
+    "google.gemma-3-27b-it",
+    "google.gemma-3-4b-it",
+    "minimax.minimax-m2",
+    "minimax.minimax-m2.1",
+    "minimax.minimax-m2.5",
+    "mistral.devstral-2-123b",
+    "mistral.magistral-small-2509",
+    "mistral.ministral-3-14b-instruct",
+    "mistral.ministral-3-3b-instruct",
+    "mistral.ministral-3-8b-instruct",
+    "mistral.mistral-large-3-675b-instruct",
+    "mistral.voxtral-mini-3b-2507",
+    "mistral.voxtral-small-24b-2507",
+    "moonshot.kimi-k2-thinking",
+    "moonshotai.kimi-k2.5",
+    "moonshotai.kimi-k3",
+    "nvidia.nemotron-nano-12b-v2",
+    "nvidia.nemotron-nano-3-30b",
+    "nvidia.nemotron-nano-9b-v2",
+    "nvidia.nemotron-super-3-120b",
+    "openai.gpt-5.4",
+    "openai.gpt-5.5",
+    "openai.gpt-5.6-luna",
+    "openai.gpt-5.6-sol",
+    "openai.gpt-5.6-terra",
+    "openai.gpt-6-astra",
+    "openai.gpt-6-luna",
+    "openai.gpt-6-sol",
+    "openai.gpt-6.1-sol",
+    "openai.gpt-oss-safeguard-120b",
+    "openai.gpt-oss-safeguard-20b",
+    "qwen.qwen3-next-80b-a3b",
+    "qwen.qwen3-vl-235b-a22b",
+    "writer.palmyra-vision-7b",
+    "xai.grok-4.6",
+    "xai.grok-4.7",
+    "zai.glm-4.7",
+    "zai.glm-4.7-flash",
+    "zai.glm-5",
+    "zai.glm-5.3",
+];
 
 /// Whether an ASYNCHRONOUS invocation may be started for `model`.
 ///
@@ -2185,27 +2433,25 @@ pub fn model_bidirectional_streaming_supported(model: &FoundationModel) -> bool 
 /// record reports it in: a job runs the model from the region the model is offered in, and
 /// from another region, and each scope is its own answer.
 ///
-/// The same published fact [`model_batch_support`] reports, read per region scope, so the
-/// feature record and `batchSupported` cannot disagree about the model: a job that may run
-/// the base model may run it from either scope, and a model no batch-inference table lists
-/// may be run from neither.
+/// The same published facts [`model_batch_support`] reports, read per region scope, so the
+/// feature record and `batchSupported` cannot disagree about the model: each scope's own
+/// supported-models table decides its member, and a model neither table lists may be run
+/// from neither.
 #[must_use]
 pub fn model_batch_inference_support(model: &FoundationModel) -> BatchInferenceSupport {
-    let supported = model_batch_supported(model);
     BatchInferenceSupport {
-        cross_region: Some(supported),
-        in_region: Some(supported),
+        cross_region: Some(model_cross_region_batch_supported(model)),
+        in_region: Some(model_batch_supported(model)),
     }
 }
 
 /// The features published for `model` ([`FoundationModel::features_supported`]), as the
 /// record a summary reports them in: one member per feature of
 /// [`PUBLISHED_FEATURE_VALUES`], naming whether the catalog publishes that feature for the
-/// model, beside the three features that follow from what the model IS rather than from a
-/// supported-models table — a token count ([`model_count_tokens_supported`]), prompt
-/// optimization ([`model_prompt_optimization_supported`]) and Provisioned Throughput
-/// ([`supports_provisioned_throughput`], the same fact that decides whether one can be
-/// bought over the model) — so a client tests one feature by name.
+/// model, beside the two features that follow from what the model IS rather than from a
+/// supported-models table — a token count ([`model_count_tokens_supported`]) and Provisioned
+/// Throughput ([`supports_provisioned_throughput`], the same fact that decides whether one
+/// can be bought over the model) — so a client tests one feature by name.
 ///
 /// The same set the capability members beside it report one by one, so the record and those
 /// members cannot disagree: a feature is named supported here exactly while the row
@@ -2229,14 +2475,15 @@ pub fn model_features_supported(model: &FoundationModel) -> FeaturesSupport {
 
 /// Whether a prompt may be OPTIMIZED for `model`.
 ///
-/// An advanced prompt optimization job rewrites a prompt TEMPLATE for the models it is told
-/// to target (`modelConfigurations` of
-/// `smithy_query(query="operation",operation="CreateAdvancedPromptOptimizationJob")`), so
-/// what it needs of a model is that a WRITTEN prompt is what the model is given and a
-/// written turn what it answers ([`model_is_conversational`]) — and nothing else.
+/// PUBLISHED per model like the other features of [`PUBLISHED_FEATURE_VALUES`] rather than
+/// implied by what the model does: an advanced prompt optimization job rewrites a prompt
+/// TEMPLATE for the models it is told to target, and Amazon Bedrock publishes the models it
+/// may be asked for in that feature's own "Supported models" table — so a model the table
+/// does not list publishes no prompt optimization however conversational it is, which is
+/// where every row of this catalog stands.
 #[must_use]
 pub fn model_prompt_optimization_supported(model: &FoundationModel) -> bool {
-    model_is_conversational(model)
+    model_publishes_feature(model, FEATURE_PROMPT_OPTIMIZATION)
 }
 
 /// Whether the tokens of a conversation may be COUNTED for `model`.
@@ -2293,7 +2540,9 @@ pub(super) const COUNT_TOKENS_MODEL_PROVIDER: &str = "Anthropic";
 ///   REQUEST carries, and no model publishes one of its own.
 /// * `userImageTypesSupported` and `userVideoTypesSupported` are the formats a turn may
 ///   carry TO the model in a modality the model TAKES
-///   ([`FoundationModel::input_modalities`]), and `userDocumentTypesSupported` the formats
+///   ([`FoundationModel::input_modalities`]) — the image formats in the order the model's
+///   provider line publishes them ([`model_user_image_formats`]) — and
+///   `userDocumentTypesSupported` the formats
 ///   its provider line parses ([`model_user_document_formats`]) — each a list that is EMPTY
 ///   for a model no attachment of that kind reaches, because a document is a FILE a turn
 ///   carries rather than a modality the model declares.
@@ -2323,7 +2572,10 @@ pub fn model_converse_support(model: &FoundationModel) -> Option<ConverseSupport
         stop_sequences_default: Some(Vec::new()),
         system_role_supported: Some(true),
         user_document_types_supported: Some(model_user_document_formats(model)),
-        user_image_types_supported: Some(formats(takes(MODALITY_IMAGE), CONVERSE_IMAGE_FORMATS)),
+        user_image_types_supported: Some(formats(
+            takes(MODALITY_IMAGE),
+            model_user_image_formats(model),
+        )),
         user_video_types_supported: Some(formats(takes(MODALITY_VIDEO), CONVERSE_VIDEO_FORMATS)),
     })
 }
@@ -2561,6 +2813,33 @@ pub(super) const DOCUMENTS_PDF: &[&str] = &["pdf"];
 /// turn — which is the order they are reported in, because a client that takes the FIRST
 /// supported format as its default reads a different default from a different order.
 pub(super) const CONVERSE_IMAGE_FORMATS: &[&str] = &["jpeg", "png", "gif", "webp"];
+
+/// The same four formats in the order the provider lines of
+/// [`CONVERSE_PROVIDER_IMAGE_FORMATS`] publish them in, PNG first.
+pub(super) const CONVERSE_IMAGE_FORMATS_PNG_FIRST: &[&str] = &["png", "jpeg", "gif", "webp"];
+
+/// The order each provider line publishes its user image formats in, by `providerName`, for
+/// the lines whose order is not [`CONVERSE_IMAGE_FORMATS`].
+///
+/// The format SET is the one the Converse API accepts for an image block, but the ORDER is
+/// published with the provider's own integration — and it is part of what a summary reports,
+/// because a client that takes the first supported format as its default picks whatever the
+/// catalog puts first. So it is read per provider line rather than stated once for every
+/// model.
+pub(super) const CONVERSE_PROVIDER_IMAGE_FORMATS: &[(&str, &[&str])] =
+    &[(NEMOTRON_MODEL_PROVIDER, CONVERSE_IMAGE_FORMATS_PNG_FIRST)];
+
+/// The image formats a turn may carry to `model`, in the order its provider line publishes
+/// them ([`CONVERSE_PROVIDER_IMAGE_FORMATS`]); the formats are reported for a model that
+/// TAKES an image and the empty list for every other, which is what
+/// [`model_converse_support`] does with them.
+#[must_use]
+pub fn model_user_image_formats(model: &FoundationModel) -> &'static [&'static str] {
+    CONVERSE_PROVIDER_IMAGE_FORMATS
+        .iter()
+        .find(|(provider, _)| *provider == model.provider_name)
+        .map_or(CONVERSE_IMAGE_FORMATS, |(_, formats)| *formats)
+}
 
 /// The video formats a turn may carry to a model that takes video (`VideoFormat`). The
 /// modality is written as the rule the other two are — the formats of a modality the model

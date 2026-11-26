@@ -8,8 +8,8 @@
 //! turn of a conversation is TEXT or SPEECH, and a model that answers a turn at all carries
 //! the members describing a conversation with it or a job built over it — `modelFamily`,
 //! `batchSupported`, `latencyOptimizationSupported` — while the surfaces that act on a
-//! WRITTEN turn (the `converse` record, `guardrailsSupported`,
-//! `featuresSupported.promptOptimization`, and Converse's own synchronous mode) reach a
+//! WRITTEN turn (the `converse` record, `guardrailsSupported`, and Converse's own
+//! synchronous mode) reach a
 //! model whose turn is TEXT and no other. A spoken answer arrives as it is spoken rather
 //! than in one piece, so a model that SPEAKS offers no synchronous calling mode on any API
 //! and is carried by a stream in both directions when it takes a spoken turn as well.
@@ -101,8 +101,8 @@ const fn row(
 struct Case {
     name: &'static str,
     model: FoundationModel,
-    /// Whether a `converse` record, `guardrailsSupported` and
-    /// `featuresSupported.promptOptimization` hold: the surfaces that act on a WRITTEN turn.
+    /// Whether a `converse` record and `guardrailsSupported` hold: the surfaces that act on a
+    /// WRITTEN turn.
     written_turn: bool,
     /// Whether the members describing a conversation with the model or a job built over it
     /// are reported: `modelFamily`, `batchSupported`, `latencyOptimizationSupported`.
@@ -208,12 +208,16 @@ async fn the_modality_a_model_answers_with_decides_which_surfaces_reach_it() {
             "case {name:?}: expected guardrailsSupported {}, got {guardrails}",
             case.written_turn
         );
+        // Prompt optimization is PUBLISHED per model rather than decided by the modality the
+        // model answers with, so it is read off the row: these rows publish none, so none of
+        // them reports it however written its turn is.
         let features = bedrock::state::model_features_supported(model);
+        let publishes_optimization = model.features_supported.contains(&"PROMPT_OPTIMIZATION");
         assert_eq!(
             features.prompt_optimization,
-            Some(case.written_turn),
-            "case {name:?}: expected featuresSupported.promptOptimization {:?}, got {features:?}",
-            case.written_turn
+            Some(publishes_optimization),
+            "case {name:?}: expected featuresSupported.promptOptimization \
+             {publishes_optimization:?}, got {features:?}"
         );
 
         let apis = bedrock::state::model_inference_apis_supported(model);

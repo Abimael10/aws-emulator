@@ -181,8 +181,8 @@ pub fn profile_model_id(profile_arn: &str) -> String {
 ///   answers by SPEAKING is reached through a stream and through nothing else. So
 ///   `invokeModel` answers in one piece for every model that does not speak and streams
 ///   where the row streams, `converse` answers in one piece for a model whose turn is TEXT
-///   and streams a turn for any model that answers a turn at all and streams it, the two
-///   OpenAI-compatible endpoints answer for a model that provider publishes,
+///   and streams a turn for any model that answers a turn at all and streams it, each of the
+///   two OpenAI-compatible endpoints answers for the models Amazon Bedrock publishes it for,
 ///   `invokeModel.bidirectionalStreaming` answers for a model whose turn is SPEECH each
 ///   way, and `asyncInvoke` answers no for every row, because no modality this model copy
 ///   declares is a clip.
@@ -190,8 +190,8 @@ pub fn profile_model_id(profile_arn: &str) -> String {
 ///   written text and about nothing else, and is applied beside the invocation rather than
 ///   built into the model's integration, so nothing else is needed of the model.
 /// * `featuresSupported` names each Amazon Bedrock feature the row publishes support for,
-///   beside the three that follow from what the model IS: `countTokens`, published for the
-///   family a token count is served for, `promptOptimization`, and `provisionedThroughput`,
+///   beside the two that follow from what the model IS: `countTokens`, published for the
+///   family a token count is served for, and `provisionedThroughput`,
 ///   which the inference types the row is offered under decide;
 ///   `explicitPromptCaching`, `intelligentPromptRouting`, `latencyOptimizationSupported`
 ///   and `batchSupported` each report that one feature — each is a published per-model
@@ -237,8 +237,8 @@ pub fn expected_foundation_model_projection(
             "responseStreaming": model.response_streaming_supported,
             "sync": !speaks,
         },
-        "openAiChatCompletions": model.provider_name == "OpenAI",
-        "openAiResponses": model.provider_name == "OpenAI",
+        "openAiChatCompletions": expected_open_ai_chat_completions(model),
+        "openAiResponses": expected_open_ai_responses(model),
     });
 
     let mut lifecycle = json!({
@@ -271,18 +271,21 @@ pub fn expected_foundation_model_projection(
     // because every offered model can be invoked.
     projection["inferenceAPIsSupported"] = apis;
     projection["featuresSupported"] = json!({
-        // Batch inference is published per region scope, so it answers with a record.
+        // Batch inference is published per region scope, so it answers with a record — and
+        // each scope has its own supported-models table, so one scope's answer is not the
+        // other's.
         "batchInference": {
-            "crossRegion": published("BATCH_INFERENCE"),
+            "crossRegion": published("CROSS_REGION_BATCH_INFERENCE"),
             "inRegion": published("BATCH_INFERENCE"),
         },
         "countTokens": expected_count_tokens_supported(model),
         "intelligentPromptRouting": published("INTELLIGENT_PROMPT_ROUTING"),
         "latencyOptimization": published("LATENCY_OPTIMIZATION"),
         "promptCaching": published("PROMPT_CACHING"),
-        // A prompt optimization job rewrites a prompt template for the models it targets,
-        // so it needs of a model only that a prompt is what the model is given.
-        "promptOptimization": conversational,
+        // Prompt optimization has a supported-models table of its own, so it is published
+        // for the model like every other feature rather than following from what the model
+        // does.
+        "promptOptimization": published("PROMPT_OPTIMIZATION"),
         // Reserved capacity may be bought for a model the catalogue offers it under, which
         // is the same fact that decides whether a purchase over the model is accepted.
         "provisionedThroughput": model.inference_types_supported.contains(&"PROVISIONED"),
@@ -301,7 +304,7 @@ pub fn expected_foundation_model_projection(
     projection["latencyOptimizationSupported"] = json!(published("LATENCY_OPTIMIZATION"));
     projection["batchSupported"] = json!({
         "baseModelSupported": published("BATCH_INFERENCE"),
-        "crossRegionSupported": published("BATCH_INFERENCE"),
+        "crossRegionSupported": published("CROSS_REGION_BATCH_INFERENCE"),
         "customModelSupported":
             published("BATCH_INFERENCE") && !model.customizations_supported.is_empty(),
     });
@@ -324,7 +327,7 @@ pub fn expected_foundation_model_projection(
         "streamingSupported": model.response_streaming_supported,
         "systemRoleSupported": true,
         "stopSequencesDefault": Vec::<&str>::new(),
-        "userImageTypesSupported": formats(takes("IMAGE"), IMAGE_FORMATS),
+        "userImageTypesSupported": formats(takes("IMAGE"), expected_user_image_formats(model)),
         // No modality the model declares is video, so no row takes one.
         "userVideoTypesSupported": Vec::<&str>::new(),
         // A document is a FILE a turn carries rather than a modality the model declares, so
@@ -395,6 +398,49 @@ pub fn expected_additional_request_fields_schema(
 /// Amazon Bedrock Runtime model), in the published order: the format a client that takes
 /// the first supported one as its default would pick comes first.
 const IMAGE_FORMATS: &[&str] = &["jpeg", "png", "gif", "webp"];
+
+/// The same four formats in the order the provider lines that publish PNG first do.
+const IMAGE_FORMATS_PNG_FIRST: &[&str] = &["png", "jpeg", "gif", "webp"];
+
+/// The order the row's provider line publishes its user image formats in — stated HERE
+/// rather than read off the service, for the same reason as the reasoning set below.
+///
+/// The format SET is what the Converse API accepts for an image block, but the ORDER is
+/// published with the provider's own integration, and a client that takes the first
+/// supported format as its default reads a different default from a different order; of the
+/// provider lines this catalogue carries it is the NVIDIA Nemotron line that publishes PNG
+/// first.
+pub fn expected_user_image_formats(
+    model: &bedrock::state::FoundationModel,
+) -> &'static [&'static str] {
+    if model.provider_name == "NVIDIA" {
+        IMAGE_FORMATS_PNG_FIRST
+    } else {
+        IMAGE_FORMATS
+    }
+}
+
+/// Whether Amazon Bedrock serves the row on its OpenAI-compatible CHAT COMPLETIONS
+/// endpoint, read off the PUBLISHED table of the models that endpoint serves.
+///
+/// Read off the published data rather than restated here because it is a per-model list
+/// rather than a rule: what the suites assert is that the projection reports what the
+/// catalogue PUBLISHES for the model, so the published table is the statement, and the
+/// per-model values of the few rows the reports name are pinned case by case by
+/// `foundation_model_capability_member_shapes.rs`. What must not be read off the service is
+/// the projection itself, and this is not it — an endpoint derived from the model's provider,
+/// as it once was, disagrees with this table.
+pub fn expected_open_ai_chat_completions(model: &bedrock::state::FoundationModel) -> bool {
+    bedrock::state::OPENAI_CHAT_COMPLETIONS_MODELS.contains(&model.model_id)
+}
+
+/// Whether Amazon Bedrock serves the row on its OpenAI-compatible RESPONSES endpoint, read
+/// off that endpoint's own published table for the reason
+/// [`expected_open_ai_chat_completions`] is: the two endpoints are two surfaces, each
+/// published for the models it serves.
+pub fn expected_open_ai_responses(model: &bedrock::state::FoundationModel) -> bool {
+    bedrock::state::OPENAI_RESPONSES_MODELS.contains(&model.model_id)
+}
 
 /// Whether the provider publishes extended reasoning for the row, stated HERE rather than
 /// read off the service: the suites assert that the summary reports what the catalogue

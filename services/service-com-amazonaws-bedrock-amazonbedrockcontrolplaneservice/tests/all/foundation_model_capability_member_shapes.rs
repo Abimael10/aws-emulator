@@ -56,7 +56,7 @@ use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{
     emulator, expected_max_output_tokens, expected_reasoning_supported,
-    expected_user_document_formats, label, Emulator, Reply, REGION,
+    expected_user_document_formats, expected_user_image_formats, label, Emulator, Reply, REGION,
 };
 
 /// The path `ListFoundationModels` is bound to, and the prefix `GetFoundationModel` reads
@@ -71,14 +71,21 @@ const PATH: &str = "/foundation-models";
 /// the format a client that takes the first supported one as its default would pick first.
 const PUBLISHED_IMAGE_FORMATS: &[&str] = &["jpeg", "png", "gif", "webp"];
 
+/// The same four formats in the order the provider lines that publish PNG first do — the
+/// ORDER is published with the provider's own integration, so it is read per line.
+const PUBLISHED_IMAGE_FORMATS_PNG_FIRST: &[&str] = &["png", "jpeg", "gif", "webp"];
+
 /// One row of the catalogue and what the rules above say its capability members are.
 struct Case {
     /// The `modelId` the listing carries the summary under.
     model_id: &'static str,
     /// What this row contributes to the table: the attribute combination it stands for.
     note: &'static str,
-    /// Whether a model invocation job may run the model, in either region scope.
+    /// Whether a model invocation job submitted where the model is offered may run it.
     batch_inference: bool,
+    /// Whether a job submitted in ANOTHER region may run it: the other region scope, which
+    /// batch inference publishes in its own right.
+    cross_region_batch_inference: bool,
     /// Whether reserved capacity may be bought for the model.
     provisioned_throughput: bool,
     /// Whether extended reasoning may be asked of the model.
@@ -90,24 +97,39 @@ struct Case {
 }
 
 /// The table: the rows differ along every attribute the rules generalise over — which
-/// features the row publishes (none, batch only, batch and routing), whether it is offered
+/// features the row publishes (none, batch in one region scope, batch in both, batch and
+/// routing), whether it is offered
 /// with Provisioned Throughput, whether its provider publishes reasoning for it, which
-/// modalities it takes, and who publishes it (a provider line published with document input
-/// and three that are not).
+/// modalities it takes, and who publishes it (a provider line published with document input,
+/// one that publishes its image formats in another order, and three that are neither).
 const CASES: &[Case] = &[
     Case {
         model_id: "openai.gpt-6-astra",
-        note: "no feature's table lists it, on demand only, takes text and images",
+        note: "no feature's table lists it, offered through an inference profile alone, takes \
+               text and images",
         batch_inference: false,
+        cross_region_batch_inference: false,
         provisioned_throughput: false,
         reasoning: false,
         documents: &[],
         images: PUBLISHED_IMAGE_FORMATS,
     },
     Case {
+        model_id: "nvidia.nemotron-nano-12b-v2",
+        note: "batch inference published for the region it is offered in alone, and a provider \
+               line that publishes its image formats PNG first",
+        batch_inference: true,
+        cross_region_batch_inference: false,
+        provisioned_throughput: false,
+        reasoning: false,
+        documents: &[],
+        images: PUBLISHED_IMAGE_FORMATS_PNG_FIRST,
+    },
+    Case {
         model_id: "anthropic.claude-opus-4-6-v1",
         note: "a reasoning model of the provider line published with document input",
         batch_inference: false,
+        cross_region_batch_inference: false,
         provisioned_throughput: false,
         reasoning: true,
         documents: &["pdf"],
@@ -118,6 +140,7 @@ const CASES: &[Case] = &[
         note: "every feature's table lists it, on demand only, document input published for \
                its provider line",
         batch_inference: true,
+        cross_region_batch_inference: true,
         provisioned_throughput: false,
         reasoning: true,
         documents: &["pdf"],
@@ -125,8 +148,9 @@ const CASES: &[Case] = &[
     },
     Case {
         model_id: "meta.llama3-1-70b-instruct-v1:0",
-        note: "batch inference published and reserved capacity sold, text only",
+        note: "batch inference published in both scopes and reserved capacity sold, text only",
         batch_inference: true,
+        cross_region_batch_inference: true,
         provisioned_throughput: true,
         reasoning: false,
         documents: &[],
@@ -136,6 +160,7 @@ const CASES: &[Case] = &[
         model_id: "meta.llama3-3-70b-instruct-v1:0",
         note: "batch inference published, on demand only, text only",
         batch_inference: true,
+        cross_region_batch_inference: true,
         provisioned_throughput: false,
         reasoning: false,
         documents: &[],
@@ -145,6 +170,7 @@ const CASES: &[Case] = &[
         model_id: "qwen.qwen3-32b-v1:0",
         note: "a reasoning model of a line published with no document input",
         batch_inference: false,
+        cross_region_batch_inference: false,
         provisioned_throughput: false,
         reasoning: true,
         documents: &[],
@@ -228,56 +254,85 @@ struct ApiCase {
     converse: bool,
     /// Whether the model streams what it answers.
     streaming: bool,
-    /// Whether its provider's own OpenAI-compatible endpoints serve it.
-    openai_published: bool,
+    /// Whether Amazon Bedrock publishes the model on its OpenAI-compatible Chat Completions
+    /// endpoint.
+    openai_chat_completions: bool,
+    /// Whether it publishes the model on its OpenAI-compatible Responses endpoint: a surface
+    /// of its own, published for its own models.
+    openai_responses: bool,
 }
 
 /// The table: the rows differ along everything the rule reads off a row — what the model
 /// answers with (text, an embedding vector, a relevance score, an image, a clip of
-/// frames), whether it streams that answer, and who publishes it. None of these is an id
-/// the issue this rule was written for cites as an example of the defect.
+/// frames), whether it streams that answer, who publishes it, and which of the two
+/// OpenAI-compatible endpoints Amazon Bedrock publishes it on (both, Chat Completions alone,
+/// neither). None of these is an id the issue this rule was written for cites as an example
+/// of the defect.
 const API_CASES: &[ApiCase] = &[
     ApiCase {
         model_id: "cohere.embed-v4:0",
         note: "an embedding model: a vector is no turn of a conversation",
         converse: false,
         streaming: false,
-        openai_published: false,
+        openai_chat_completions: false,
+        openai_responses: false,
     },
     ApiCase {
         model_id: "cohere.rerank-v3-5:0",
         note: "a reranking model: a relevance score is no turn either",
         converse: false,
         streaming: false,
-        openai_published: false,
+        openai_chat_completions: false,
+        openai_responses: false,
     },
     ApiCase {
         model_id: "stability.stable-image-ultra-v1:1",
         note: "an image model, answered in one piece",
         converse: false,
         streaming: false,
-        openai_published: false,
+        openai_chat_completions: false,
+        openai_responses: false,
     },
     ApiCase {
         model_id: "luma.ray-v2:0",
         note: "a model that generates a clip of frames",
         converse: false,
         streaming: false,
-        openai_published: false,
+        openai_chat_completions: false,
+        openai_responses: false,
+    },
+    ApiCase {
+        model_id: "writer.palmyra-x5-v1:0",
+        note: "a streaming text model neither endpoint is published for",
+        converse: true,
+        streaming: true,
+        openai_chat_completions: false,
+        openai_responses: false,
     },
     ApiCase {
         model_id: "google.gemma-3-27b-it",
-        note: "a streaming text model published by neither Amazon nor OpenAI",
+        note: "a streaming text model published on both endpoints, by a provider whose own API \
+               neither is named after",
         converse: true,
         streaming: true,
-        openai_published: false,
+        openai_chat_completions: true,
+        openai_responses: true,
+    },
+    ApiCase {
+        model_id: "openai.gpt-oss-120b-1:0",
+        note: "a text model published on Chat Completions and on no Responses endpoint",
+        converse: true,
+        streaming: true,
+        openai_chat_completions: true,
+        openai_responses: false,
     },
     ApiCase {
         model_id: "openai.gpt-oss-safeguard-20b",
-        note: "a text model its provider also serves on its own OpenAI-compatible APIs",
+        note: "a text model published on both endpoints",
         converse: true,
         streaming: true,
-        openai_published: true,
+        openai_chat_completions: true,
+        openai_responses: true,
     },
 ];
 
@@ -339,13 +394,15 @@ async fn the_invocation_apis_answer_per_api_and_per_calling_mode() {
             case.converse,
             case.converse && case.streaming
         );
-        for member in ["openAiChatCompletions", "openAiResponses"] {
+        for (member, published) in [
+            ("openAiChatCompletions", case.openai_chat_completions),
+            ("openAiResponses", case.openai_responses),
+        ] {
             assert_eq!(
                 apis.get(member).and_then(Value::as_bool),
-                Some(case.openai_published),
-                "case {name:?} ({note}): an OpenAI-compatible endpoint serves a model that \
-                 provider publishes ({:?}), got {apis:?}",
-                case.openai_published
+                Some(published),
+                "case {name:?} ({note}): an OpenAI-compatible endpoint serves the models Amazon \
+                 Bedrock publishes it for ({published:?}), got {apis:?}"
             );
         }
         // An asynchronous invocation answers with an artifact instead of a response body,
@@ -425,13 +482,15 @@ async fn a_feature_record_answers_per_region_scope_and_per_inference_type() {
             "case {name:?} ({note}): expected featuresSupported.batchInference to be the record \
              naming each region scope, got {batch:?}"
         );
-        for scope in ["crossRegion", "inRegion"] {
+        for (scope, published) in [
+            ("crossRegion", case.cross_region_batch_inference),
+            ("inRegion", case.batch_inference),
+        ] {
             assert_eq!(
                 batch.get(scope).and_then(Value::as_bool),
-                Some(case.batch_inference),
-                "case {name:?} ({note}): expected featuresSupported.batchInference.{scope} {:?}, \
-                 got {batch:?}",
-                case.batch_inference
+                Some(published),
+                "case {name:?} ({note}): expected featuresSupported.batchInference.{scope} \
+                 {published:?}, got {batch:?}"
             );
         }
 
@@ -584,13 +643,23 @@ async fn every_summary_answers_every_capability_in_the_published_shape() {
             panic!("case {name:?}: every offered model carries a feature record, got {summary:?}")
         });
         let batch = features.get("batchInference").unwrap_or(&Value::Null);
-        let runs_batch = model.features_supported.contains(&"BATCH_INFERENCE");
-        for scope in ["crossRegion", "inRegion"] {
+        for (scope, published) in [
+            (
+                "crossRegion",
+                model
+                    .features_supported
+                    .contains(&"CROSS_REGION_BATCH_INFERENCE"),
+            ),
+            (
+                "inRegion",
+                model.features_supported.contains(&"BATCH_INFERENCE"),
+            ),
+        ] {
             assert_eq!(
                 batch.get(scope).and_then(Value::as_bool),
-                Some(runs_batch),
-                "case {name:?}: featuresSupported.batchInference answers per region scope, so \
-                 expected {scope} {runs_batch:?}, got {batch:?}"
+                Some(published),
+                "case {name:?}: featuresSupported.batchInference answers per region scope out of \
+                 that scope's own table, so expected {scope} {published:?}, got {batch:?}"
             );
         }
         let provisioned = model.inference_types_supported.contains(&"PROVISIONED");
@@ -643,10 +712,11 @@ async fn every_summary_answers_every_capability_in_the_published_shape() {
             "case {name:?}: expected converse.userDocumentTypesSupported {expected:?}, got \
              {documents:?}"
         );
-        // And an image format list, where the model takes images, is the published order.
+        // And an image format list, where the model takes images, is the order its provider
+        // line publishes.
         if model.input_modalities.contains(&"IMAGE") {
             let images = string_list(converse, "userImageTypesSupported");
-            let expected: Vec<String> = PUBLISHED_IMAGE_FORMATS
+            let expected: Vec<String> = expected_user_image_formats(model)
                 .iter()
                 .map(|format| (*format).to_string())
                 .collect();

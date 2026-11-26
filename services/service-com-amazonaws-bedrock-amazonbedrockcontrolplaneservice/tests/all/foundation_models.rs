@@ -449,6 +449,18 @@ fn carries_modality(value: &str) -> bool {
     carries(MODEL_MODALITY_VALUES, value) || value == "SPEECH"
 }
 
+/// Whether `value` is an inference type a catalog row may publish: one `InferenceType`
+/// declares (`INFERENCE_TYPE_VALUES`), or the CROSS-REGION INFERENCE PROFILE a model Amazon
+/// Bedrock offers through such a profile alone is published under.
+///
+/// That value is RECORDED behaviour, not modelled, exactly as the spoken modality above is:
+/// this model copy declares ON_DEMAND and PROVISIONED
+/// (`smithy_query(query="shape",shape="InferenceType")`), while the catalog publishes a third
+/// value for a model that is invoked by naming a profile rather than the model itself.
+fn carries_inference_type(value: &str) -> bool {
+    carries(INFERENCE_TYPE_VALUES, value) || value == "INFERENCE_PROFILE"
+}
+
 #[test]
 fn every_catalog_row_carries_only_values_the_model_declares() {
     let mut seen_ids: Vec<&str> = Vec::new();
@@ -524,9 +536,9 @@ fn every_catalog_row_carries_only_values_the_model_declares() {
                 && model
                     .inference_types_supported
                     .iter()
-                    .all(|value| carries(INFERENCE_TYPE_VALUES, value)),
-            "case {case:?}: inferenceTypesSupported must be non-empty InferenceType values, got \
-             {:?}",
+                    .all(|value| carries_inference_type(value)),
+            "case {case:?}: inferenceTypesSupported must be non-empty published InferenceType \
+             values, got {:?}",
             model.inference_types_supported
         );
         assert!(
@@ -600,7 +612,7 @@ fn the_catalog_spans_every_value_a_caller_can_filter_on() {
 const CONTINUED_PRE_TRAINING: &str = "CONTINUED_PRE_TRAINING";
 
 // ---------------------------------------------------------------------------------------
-// 7. The training-qualified id of a model, and the deprecated model that has none.
+// 7. The qualified id of a model, and the customization a deprecated model takes none of.
 // ---------------------------------------------------------------------------------------
 
 /// `FoundationModelLifecycleStatus` — the status of a deprecated model.
@@ -647,7 +659,7 @@ fn qualifier_prefixes(model_id: &str) -> Vec<&str> {
 }
 
 #[tokio::test]
-async fn a_deprecated_model_is_published_under_its_base_id_alone() {
+async fn a_deprecated_model_publishes_no_customization_under_any_of_its_ids() {
     let emu = emulator();
     let case = "the whole catalog";
     let listed = summaries(case, &list(&emu, "").await);
@@ -685,46 +697,49 @@ async fn a_deprecated_model_is_published_under_its_base_id_alone() {
              no customization, got {customizations:?}"
         );
     }
-    // … and no row is the training-qualified variant of one.
-    for (id, _, _) in &rows {
+    // … and a qualified id of a model reports the SAME point of life its base id does: how
+    // far through its life a model is, is the MODEL's fact rather than one id's, so a
+    // deprecated model is deprecated under every id it is published under.
+    for (id, status, _) in &rows {
         for prefix in qualifier_prefixes(id) {
             let base = rows
                 .iter()
                 .find(|(listed_id, _, _)| listed_id == prefix)
                 .map(|(_, status, _)| status.as_str());
-            assert_ne!(
-                base,
-                Some(LEGACY),
-                "case {id:?}: {prefix:?} is deprecated, so no training-qualified row is \
-                 published for it, yet {id:?} is listed beside it"
-            );
+            if let Some(base_status) = base {
+                assert_eq!(
+                    base_status, status,
+                    "case {id:?}: {prefix:?} names the same published model, so both ids must \
+                     report its lifecycle status"
+                );
+            }
         }
     }
 }
 
 /// One `:`-qualified identifier a client may address a published model by: the catalog row
-/// it names, and whether the catalog publishes a row of its OWN under it — which the
-/// model's lifecycle decides.
+/// it names, and whether the catalog publishes a row of its OWN under it.
 struct Variant {
     identifier: &'static str,
     base: &'static str,
     own_row: bool,
 }
 
-/// The identifiers rule 7 splits: the training-qualified ids of the catalog's deprecated
-/// models, published under no row of their own, beside the qualified ids of models that are
-/// still available, which ARE rows of their own — one published with a single qualifier, one
-/// with two, and from another provider.
+/// The identifiers rule 7 splits: the version-and-context-qualified ids the catalog
+/// publishes a row of its own under — the id a Provisioned Throughput over the model names,
+/// published for a deprecated model as well as for an available one, with one qualifier and
+/// with two, and from two providers — beside a qualified id no row is published under, which
+/// still names the model its unqualified prefix is.
 const VARIANTS: &[Variant] = &[
     Variant {
         identifier: "cohere.command-text-v14:7:4k",
-        base: "cohere.command-text-v14",
-        own_row: false,
+        base: "cohere.command-text-v14:7:4k",
+        own_row: true,
     },
     Variant {
         identifier: "cohere.command-light-text-v14:7:4k",
-        base: "cohere.command-light-text-v14",
-        own_row: false,
+        base: "cohere.command-light-text-v14:7:4k",
+        own_row: true,
     },
     Variant {
         identifier: "amazon.titan-embed-image-v1:0",
@@ -735,6 +750,11 @@ const VARIANTS: &[Variant] = &[
         identifier: "amazon.titan-embed-text-v1:2:8k",
         base: "amazon.titan-embed-text-v1:2:8k",
         own_row: true,
+    },
+    Variant {
+        identifier: "amazon.nova-lite-v1:0:300k",
+        base: "amazon.nova-lite-v1:0",
+        own_row: false,
     },
 ];
 

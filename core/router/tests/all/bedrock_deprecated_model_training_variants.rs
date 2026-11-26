@@ -1,33 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! An id the Amazon Bedrock control plane publishes NO CATALOGUE ROW for is still an id the
-//! Bedrock Runtime plane resolves.
+//! An id the Amazon Bedrock control plane publishes a model under is an id the Bedrock
+//! Runtime plane resolves.
 //!
-//! The rule under test: **a model a customization job accepts is published under a second,
-//! TRAINING-QUALIFIED id beside its on-demand one — the model id followed by the
-//! `:`-separated version and context-length qualifiers a `CustomModelArn` embeds
-//! (`([:][a-z0-9-]{1,63}){0,2}`,
-//! `smithy_query(query="operation",operation="CreateCustomModelDeployment")`) — and that
-//! second row is published only while a customization of the model is still offered.** A
-//! DEPRECATED model (`FoundationModelLifecycleStatus` `LEGACY`,
-//! `smithy_query(query="shape",shape="FoundationModelLifecycle")`) takes no new
-//! customization job, so the catalogue carries it under its base id alone and reports no
-//! training-qualified row for it — while the qualified id goes on naming the same published
-//! model.
+//! The rule under test: **a published model is offered under its base model id and under the
+//! version-and-context-qualified id Amazon Bedrock publishes it with beside it — the model id
+//! followed by the `:`-separated version and context-length qualifiers a `CustomModelArn`
+//! embeds (`([:][a-z0-9-]{1,63}){0,2}`,
+//! `smithy_query(query="operation",operation="CreateCustomModelDeployment")`) — and BOTH
+//! planes resolve the model under either id.** The qualified id is the one a Provisioned
+//! Throughput over the model names, so it is published for a DEPRECATED model
+//! (`FoundationModelLifecycleStatus` `LEGACY`,
+//! `smithy_query(query="shape",shape="FoundationModelLifecycle")`) as well as for an
+//! available one; what a deprecated model takes none of is a new CUSTOMIZATION, which its
+//! own crate's suite pins.
 //!
-//! That last half is what this suite is here for: two crates have to agree about it. The
-//! control plane decides which ids are catalogue ROWS (`ListFoundationModels`,
-//! `GetFoundationModel`) and the Bedrock Runtime plane decides which ids an invocation
-//! RESOLVES, so a row the catalogue stops publishing must not make an id the runtime cannot
-//! interpret — the control plane's own suite
+//! Two crates have to agree about that: the control plane decides which ids are catalogue
+//! ROWS (`ListFoundationModels`, `GetFoundationModel`) and the Bedrock Runtime plane decides
+//! which ids an invocation RESOLVES, so a model the catalogue publishes must not be an
+//! identifier the runtime cannot interpret — the control plane's own suite
 //! (`services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/tests/all/foundation_models.rs`,
 //! rule 7) pins the catalogue half, and a crate-local suite can see only one of the two
 //! planes.
 //!
+//! A qualified id the catalogue publishes NO row of its own under is still read by the
+//! control plane as the model its unqualified prefix names, and that half is asserted for it
+//! too; the inference plane carries the ids it serves, which is what the sibling suite
+//! `bedrock_catalogue_is_invocable.rs` holds it to, so nothing is claimed here about an id no
+//! catalogue row publishes.
+//!
 //! The rows span what the rule generalises over rather than one id: both lifecycle statuses,
 //! the two qualifier depths a base model id is published with (one, `…-v1:0`, and two,
-//! `…-v1:2:8k`), two providers, and a model each plane serves an inference for beside one it
-//! recognises and serves none for.
+//! `…-v1:2:8k`), three providers, a model each plane serves an inference for beside ones it
+//! recognises and serves none for, and an id the catalogue publishes no row of its own under.
 
 use std::sync::Arc;
 
@@ -112,27 +117,32 @@ fn label(identifier: &str) -> String {
 }
 
 /// One `:`-qualified identifier a client may address a published model by: the catalogue row
-/// it names, and whether the catalogue publishes a row of its OWN under it — which the
-/// model's lifecycle decides.
+/// it names, and whether the catalogue publishes a row of its OWN under it.
 struct Variant {
     identifier: &'static str,
     base: &'static str,
     own_row: bool,
 }
 
-/// The identifiers this rule splits: the training-qualified ids of the catalogue's
-/// deprecated models, published under no row of their own, beside the qualified ids of
-/// models that are still available, which ARE rows of their own.
+/// The identifiers this rule covers: the version-and-context-qualified ids the catalogue
+/// publishes a row of its own under — for a deprecated model and for available ones, with one
+/// qualifier and with two, from three providers — beside a qualified id no row is published
+/// under, which the control plane still reads as the model its prefix names.
 const VARIANTS: &[Variant] = &[
     Variant {
         identifier: "cohere.command-text-v14:7:4k",
-        base: "cohere.command-text-v14",
-        own_row: false,
+        base: "cohere.command-text-v14:7:4k",
+        own_row: true,
     },
     Variant {
         identifier: "cohere.command-light-text-v14:7:4k",
-        base: "cohere.command-light-text-v14",
-        own_row: false,
+        base: "cohere.command-light-text-v14:7:4k",
+        own_row: true,
+    },
+    Variant {
+        identifier: "cohere.embed-english-v3:0:512",
+        base: "cohere.embed-english-v3:0:512",
+        own_row: true,
     },
     Variant {
         identifier: "amazon.titan-embed-image-v1:0",
@@ -143,6 +153,11 @@ const VARIANTS: &[Variant] = &[
         identifier: "amazon.titan-embed-text-v1:2:8k",
         base: "amazon.titan-embed-text-v1:2:8k",
         own_row: true,
+    },
+    Variant {
+        identifier: "amazon.nova-lite-v1:0:300k",
+        base: "amazon.nova-lite-v1:0",
+        own_row: false,
     },
 ];
 
@@ -182,8 +197,8 @@ async fn a_qualified_id_resolves_in_both_planes_whether_or_not_it_is_a_catalogue
     for row in VARIANTS {
         let case = row.identifier;
 
-        // The catalogue publishes a row of its own only for a model that still takes a
-        // customization; either way the model's base id is published.
+        // The catalogue publishes a row of its own under the qualified ids it offers the
+        // model under; either way the row the id names is published.
         let carried = published.iter().any(|id| id == case);
         assert_eq!(
             carried, row.own_row,
@@ -219,8 +234,11 @@ async fn a_qualified_id_resolves_in_both_planes_whether_or_not_it_is_a_catalogue
             "case {case:?}: the read must report the row the id resolves to, got {body}"
         );
 
-        // And the inference plane resolves the same id: a catalogue row it has none of is
-        // not an identifier it cannot interpret.
+        // And the inference plane resolves every id the catalogue publishes a row under: a
+        // model one plane offers must not be an identifier the other cannot interpret.
+        if !row.own_row {
+            continue;
+        }
         let (status, answered) = call(
             &router,
             "POST",

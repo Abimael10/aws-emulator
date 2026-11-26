@@ -45,7 +45,8 @@ use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{
     emulator, expected_count_tokens_supported, expected_foundation_model_projection,
-    expected_max_output_tokens, expected_reasoning_supported, label, Emulator, Reply, REGION,
+    expected_max_output_tokens, expected_open_ai_chat_completions, expected_open_ai_responses,
+    expected_reasoning_supported, label, Emulator, Reply, REGION,
 };
 
 /// The path `ListFoundationModels` is bound to, and the prefix `GetFoundationModel` reads
@@ -81,7 +82,8 @@ const FEATURE_MEMBERS: &[&str] = &[
 ];
 
 /// The members of the record `featuresSupported.batchInference` is: batch inference is
-/// published per region scope, so it answers for each scope rather than with one boolean.
+/// published per region scope, so it answers for each scope rather than with one boolean,
+/// and each scope's own supported-models table decides its answer.
 const BATCH_INFERENCE_MEMBERS: &[&str] = &["crossRegion", "inRegion"];
 
 /// The members of the record `inferenceAPIsSupported` is: one per invocation API Amazon
@@ -237,13 +239,18 @@ async fn a_capability_is_reported_as_the_record_that_names_what_is_supported() {
             "case {case:?}: InvokeModel reaches every offered model and streams where the row \
              streams, and no row is published with a two-way stream, got {apis:?}"
         );
-        let openai_published = model.provider_name == "OpenAI";
-        for member in ["openAiChatCompletions", "openAiResponses"] {
+        for (member, served) in [
+            (
+                "openAiChatCompletions",
+                expected_open_ai_chat_completions(model),
+            ),
+            ("openAiResponses", expected_open_ai_responses(model)),
+        ] {
             assert_eq!(
                 apis.get(member).and_then(Value::as_bool),
-                Some(openai_published),
-                "case {case:?}: an OpenAI-compatible endpoint serves a model that provider \
-                 publishes ({openai_published:?}), got {apis:?}"
+                Some(served),
+                "case {case:?}: an OpenAI-compatible endpoint serves the models Amazon Bedrock \
+                 publishes it for ({served:?}), got {apis:?}"
             );
         }
         assert_eq!(
@@ -295,11 +302,21 @@ async fn a_capability_is_reported_as_the_record_that_names_what_is_supported() {
              region scope, got {batch_inference:?}"
         );
         for member in BATCH_INFERENCE_MEMBERS {
+            assert!(
+                batch_inference.get(member).and_then(Value::as_bool).is_some(),
+                "case {case:?}: featuresSupported.batchInference must answer for {member}, got \
+                 {batch_inference:?}"
+            );
+        }
+        for (member, runs_scope) in [
+            ("crossRegion", published("CROSS_REGION_BATCH_INFERENCE")),
+            ("inRegion", runs_batch),
+        ] {
             assert_eq!(
                 batch_inference.get(member).and_then(Value::as_bool),
-                Some(runs_batch),
+                Some(runs_scope),
                 "case {case:?}: expected featuresSupported.batchInference.{member} \
-                 {runs_batch:?}, got {batch_inference:?}"
+                 {runs_scope:?}, got {batch_inference:?}"
             );
         }
         // Reserved capacity is offered for a model the catalogue publishes it under.

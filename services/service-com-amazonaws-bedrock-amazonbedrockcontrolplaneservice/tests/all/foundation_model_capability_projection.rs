@@ -164,7 +164,17 @@ struct Case {
     caching: bool,
     routing: bool,
     latency: bool,
+    /// `featuresSupported.promptOptimization`: a feature with a supported-models table of its
+    /// own, so it is published per model rather than implied by the model being
+    /// conversational.
+    optimization: bool,
+    /// `featuresSupported.batchInference.inRegion` and `batchSupported.baseModelSupported`:
+    /// whether a job submitted where the model is offered may run it.
     batch: bool,
+    /// `featuresSupported.batchInference.crossRegion` and
+    /// `batchSupported.crossRegionSupported`: the other region scope, published in its own
+    /// right, so it is its own column.
+    cross_region_batch: bool,
     converse: bool,
     converse_streaming: bool,
 }
@@ -196,25 +206,30 @@ const fn row(
     }
 }
 
-/// Every feature a row can publish, in the order a summary reports them.
+/// Every feature a row can publish, in the order a summary reports them. Batch inference
+/// publishes one supported-models table per REGION SCOPE, so each scope is a feature value
+/// of its own.
 const ALL_FEATURES: &[&str] = &[
     "BATCH_INFERENCE",
+    "CROSS_REGION_BATCH_INFERENCE",
     "INTELLIGENT_PROMPT_ROUTING",
     "LATENCY_OPTIMIZATION",
     "PROMPT_CACHING",
+    "PROMPT_OPTIMIZATION",
 ];
 
-/// The APIs whose own answer for a model that produces TEXT and is published by anybody but
-/// OpenAI is yes: Amazon Bedrock's own conversation API, and `invokeModel`, which reaches
-/// every offered model.
+/// The APIs whose own answer for a model that produces TEXT and that no OpenAI-compatible
+/// endpoint is published for is yes: Amazon Bedrock's own conversation API, and
+/// `invokeModel`, which reaches every offered model.
 const CONVERSE_AND_INVOKE: &[&str] = &["converse", "invokeModel"];
 
 #[tokio::test]
 async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it() {
     // The rows differ along what the rules generalise over: which features the row
-    // publishes (all four, none, one, two), the output modality (TEXT, IMAGE, EMBEDDING),
-    // whether the model streams, whether it is offered ON_DEMAND or only with reserved
-    // throughput, and who publishes it.
+    // publishes (all of them, none, one, two, one batch scope only), the output modality
+    // (TEXT, IMAGE, EMBEDDING), whether the model streams, whether it is offered ON_DEMAND or
+    // only with reserved throughput, who publishes it, and which OpenAI-compatible endpoints
+    // Amazon Bedrock publishes it on.
     let cases = [
         Case {
             name: "a streaming text model every feature's table lists",
@@ -232,7 +247,9 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             caching: true,
             routing: true,
             latency: true,
+            optimization: true,
             batch: true,
+            cross_region_batch: true,
             converse: true,
             converse_streaming: true,
         },
@@ -248,18 +265,20 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
                 &[],
             ),
             // Converse and guardrails are decided by what the model does, so they hold of
-            // this row exactly as they do of the one above; the four features do not.
+            // this row exactly as they do of the one above; the published features do not.
             inference_apis: CONVERSE_AND_INVOKE,
             guardrails: true,
             caching: false,
             routing: false,
             latency: false,
+            optimization: false,
             batch: false,
+            cross_region_batch: false,
             converse: true,
             converse_streaming: true,
         },
         Case {
-            name: "a text model only batch inference lists",
+            name: "a text model only batch inference lists, in the region it is offered in",
             model: row(
                 "table.text-batch",
                 "Table AI",
@@ -274,7 +293,11 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             caching: false,
             routing: false,
             latency: false,
+            optimization: false,
             batch: true,
+            // The cross-region scope has its own table, and this row is in neither it nor
+            // any other feature's.
+            cross_region_batch: false,
             converse: true,
             converse_streaming: true,
         },
@@ -294,7 +317,9 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             caching: true,
             routing: true,
             latency: false,
+            optimization: false,
             batch: false,
+            cross_region_batch: false,
             converse: true,
             // Nothing is streamed, so Converse streaming is not reported for it.
             converse_streaming: false,
@@ -308,14 +333,16 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
                 &["TEXT"],
                 true,
                 &["PROVISIONED"],
-                &["BATCH_INFERENCE"],
+                &["BATCH_INFERENCE", "CROSS_REGION_BATCH_INFERENCE"],
             ),
             inference_apis: CONVERSE_AND_INVOKE,
             guardrails: true,
             caching: false,
             routing: false,
             latency: false,
+            optimization: false,
             batch: true,
+            cross_region_batch: true,
             converse: true,
             converse_streaming: true,
         },
@@ -336,7 +363,9 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             caching: false,
             routing: false,
             latency: false,
+            optimization: false,
             batch: true,
+            cross_region_batch: false,
             converse: false,
             converse_streaming: false,
         },
@@ -356,12 +385,15 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             caching: false,
             routing: false,
             latency: false,
+            optimization: false,
             batch: false,
+            cross_region_batch: false,
             converse: false,
             converse_streaming: false,
         },
         Case {
-            name: "a text model its provider also serves on its own OpenAI-compatible API",
+            name: "a text model whose provider's own API the two endpoints are the shape of, \
+                   and that Amazon Bedrock publishes neither of them for",
             model: row(
                 "openai.table-model",
                 "OpenAI",
@@ -371,9 +403,33 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
                 &["ON_DEMAND"],
                 &["BATCH_INFERENCE"],
             ),
-            // Who publishes a model decides which of its provider's own APIs Amazon Bedrock
-            // serves it on, and nothing else about it: the four features and Converse hold
-            // of this row exactly as they do of a row published by anybody else.
+            // Who publishes a model decides nothing about which endpoints serve it: the two
+            // OpenAI-compatible endpoints are Amazon Bedrock surfaces, published model by
+            // model, and this id is in neither published table.
+            inference_apis: CONVERSE_AND_INVOKE,
+            guardrails: true,
+            caching: false,
+            routing: false,
+            latency: false,
+            optimization: false,
+            batch: true,
+            cross_region_batch: false,
+            converse: true,
+            converse_streaming: true,
+        },
+        Case {
+            name: "a model Amazon Bedrock publishes on both OpenAI-compatible endpoints",
+            model: row(
+                // A published id, so the endpoints answer for it however it is branded: the
+                // tables are keyed by model id, not by provider.
+                "zai.glm-5",
+                "Table AI",
+                &["TEXT"],
+                &["TEXT"],
+                true,
+                &["ON_DEMAND"],
+                &[],
+            ),
             inference_apis: &[
                 "converse",
                 "invokeModel",
@@ -384,7 +440,33 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             caching: false,
             routing: false,
             latency: false,
-            batch: true,
+            optimization: false,
+            batch: false,
+            cross_region_batch: false,
+            converse: true,
+            converse_streaming: true,
+        },
+        Case {
+            name: "a model published on Chat Completions and on no Responses endpoint",
+            model: row(
+                "qwen.qwen3-32b-v1:0",
+                "Table AI",
+                &["TEXT"],
+                &["TEXT"],
+                true,
+                &["ON_DEMAND"],
+                &[],
+            ),
+            // The two endpoints are two surfaces, each published for the models it serves,
+            // so one of them answering is no reason for the other to.
+            inference_apis: &["converse", "invokeModel", "openAiChatCompletions"],
+            guardrails: true,
+            caching: false,
+            routing: false,
+            latency: false,
+            optimization: false,
+            batch: false,
+            cross_region_batch: false,
             converse: true,
             converse_streaming: true,
         },
@@ -443,8 +525,9 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
                 Some(answers("openAiChatCompletions")),
                 Some(answers("openAiResponses")),
             ),
-            "case {name:?}: an OpenAI-compatible endpoint serves the models that provider \
-             publishes, got {apis:?}"
+            "case {name:?}: an OpenAI-compatible endpoint serves the models Amazon Bedrock \
+             publishes it for, which is a per-model fact and not the model's provider, got \
+             {apis:?}"
         );
         assert_eq!(
             apis.async_invoke,
@@ -461,13 +544,15 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
                  region scope, got {features:?}"
             )
         });
-        // Batch inference answers per region scope, so it is a record and never one bit.
+        // Batch inference answers per region scope, so it is a record and never one bit, and
+        // each scope answers out of its own table.
         assert_eq!(
             (batch_inference.in_region, batch_inference.cross_region),
-            (Some(case.batch), Some(case.batch)),
+            (Some(case.batch), Some(case.cross_region_batch)),
             "case {name:?}: expected featuresSupported.batchInference to answer {:?} in region \
-             and across regions, got {batch_inference:?}",
-            case.batch
+             and {:?} across regions, got {batch_inference:?}",
+            case.batch,
+            case.cross_region_batch
         );
         assert_eq!(
             features.intelligent_prompt_routing,
@@ -487,6 +572,12 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             Some(case.caching),
             "case {name:?}: expected featuresSupported.promptCaching {:?}, got {features:?}",
             case.caching
+        );
+        assert_eq!(
+            features.prompt_optimization,
+            Some(case.optimization),
+            "case {name:?}: expected featuresSupported.promptOptimization {:?}, got {features:?}",
+            case.optimization
         );
         let guardrails = bedrock::state::model_guardrails_supported(model);
         assert_eq!(
@@ -514,10 +605,12 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
         );
         let batch = bedrock::state::model_batch_support(model);
         assert_eq!(
-            batch.base_model_supported,
-            Some(case.batch),
-            "case {name:?}: expected batchSupported.baseModelSupported {:?}, got {batch:?}",
-            case.batch
+            (batch.base_model_supported, batch.cross_region_supported),
+            (Some(case.batch), Some(case.cross_region_batch)),
+            "case {name:?}: expected batchSupported to answer {:?} for the base model and {:?} \
+             across regions, got {batch:?}",
+            case.batch,
+            case.cross_region_batch
         );
         let converse = bedrock::state::model_converse_support(model);
         assert_eq!(
@@ -537,7 +630,7 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
         );
     }
 
-    // Every feature name a row may publish is one of the four, so a row cannot put a
+    // Every feature name a row may publish is one of these, so a row cannot put a
     // feature on the wire that no member of the summary reports.
     assert_eq!(
         bedrock::state::PUBLISHED_FEATURE_VALUES,
