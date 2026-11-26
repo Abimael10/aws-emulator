@@ -77,6 +77,17 @@ pub const RESOURCE_TYPE_POLICY: &str = "Policy";
 /// differ states its own rather than taking this.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
 
+/// The `message` this service states when a write's `updateToken` is not the one the
+/// addressed resource currently carries — the modelled `ConflictException`'s
+/// "the resource was modified concurrently" case.
+///
+/// Fixed text for the error class: it names neither the resource nor either token,
+/// because the `ConflictException` shape carries the resource in its own optional
+/// `resourceId` / `resourceType` members, and a token is a value one run produced. One
+/// home for the sentence, so every entity's update refuses a stale token alike.
+pub const UPDATE_TOKEN_CONFLICT_MESSAGE: &str =
+    "The provided updateToken is not the current updateToken for the resource";
+
 /// The largest page `ListPolicies` can answer with, and so the page size used when the
 /// caller sends no `maxResults`: `PolicySummaryList` is modelled `@length(max: 100)`, so
 /// a larger page could not be serialized at all.

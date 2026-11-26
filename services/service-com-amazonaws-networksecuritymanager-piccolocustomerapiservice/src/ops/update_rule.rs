@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request provides to the rule persisted in [`crate::state`],
+//! under optimistic concurrency control: the caller's `updateToken` must be the stored
+//! one, and a successful update bumps the version and rotates the token — so every token
+//! an earlier call handed out is stale from that moment on.
 //!
 //! ## Shape of an operation
 //!
@@ -204,20 +199,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRule"))
+        // The model documents `ruleIdentifier` as the rule's ARN, so a value of another
+        // form is a FIELD of this request that failed validation rather than an identifier
+        // naming a rule that is absent: it is refused before the store is consulted at
+        // all, exactly as the rule read and the rule delete refuse it.
+        if let Some(message) = crate::state::identifier_arn_violation(
+            crate::state::RULE_IDENTIFIER_MEMBER,
+            &input.rule_identifier,
+        ) {
+            return Err(
+                UpdateRuleErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: None,
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        let Some(rule_id) = store.resolve_rule_id(&input.rule_identifier) else {
+            // The wording this service states for a rule miss, as the rule read states
+            // it: fixed text and the rule id the identifier names.
+            let missing = crate::state::rule_id_in(&input.rule_identifier);
+            return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Rule not found: {missing}"),
+                    resource_id: Some(missing.to_string()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `clientToken` is `@idempotencyToken`: a retry of an update that already landed
+        // answers with that update's result instead of applying it (and bumping the
+        // version) a second time. Checked BEFORE the token comparison, because the first
+        // attempt rotated the `updateToken` the retry still carries — and only while the
+        // stored record IS still what that call left behind, so an intervening update is
+        // never reported as this call's result (the retry then carries a stale
+        // `updateToken` and is refused below).
+        if let Some(applied) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .filter(|call| call.resource_id == rule_id)
+            .and_then(|call| {
+                store
+                    .rules
+                    .get(&call.resource_id)
+                    .filter(|rule| rule.version == call.version)
+            })
+        {
+            return Ok(output_of(applied));
+        }
+
+        let Some(rule) = store.rules.get_mut(&rule_id) else {
+            return Err(UpdateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule resolved from the identifier is no longer stored"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Optimistic concurrency control: "Provide the most recent value on your next
+        // update to detect and prevent conflicting concurrent modifications." Only the one
+        // token the rule currently carries is accepted — every token an earlier call
+        // returned names a version the resource has since moved past, so it is a stale
+        // view of it whether the create, a read or an earlier update handed it out.
+        if input.update_token != rule.update_token {
+            return Err(UpdateRuleErrorModeled::ConflictException(ConflictException {
+                message: crate::state::UPDATE_TOKEN_CONFLICT_MESSAGE.to_string(),
+                resource_id: Some(rule.rule_id.clone()),
+                resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
+            })
+            .into());
+        }
+
+        // Only the members the request provided change; every absent optional member keeps
+        // its stored value. `firewallType` is not one of this operation's inputs, so it
+        // stays what the create fixed it at.
+        if let Some(description) = input.rule_description {
+            rule.rule_description = Some(description);
+        }
+        if let Some(rule_type) = input.rule_type {
+            rule.rule_type = rule_type;
+        }
+        if let Some(configuration) = input.configuration {
+            rule.configuration = configuration;
+        }
+        rule.status = crate::state::status_for(input.is_published).to_string();
+        // Once a version has been published the resource HAS a published version, whether
+        // or not this update publishes one.
+        rule.has_published_version = rule.has_published_version || input.is_published;
+        rule.version = rule.version.saturating_add(1);
+        rule.update_token = crate::state::mint_update_token();
+        rule.updated_at = now;
+
+        // Rendered from the stored record, so the response cannot disagree with what a
+        // later `GetRule` returns.
+        let output = output_of(rule);
+        let applied_version = rule.version;
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, rule_id, applied_version);
+        }
+        Ok(output)
+    }
+}
+
+/// The `UpdateRuleOutput` view of a persisted rule.
+fn output_of(rule: &crate::state::Rule) -> UpdateRuleOutput {
+    UpdateRuleOutput {
+        rule_id: rule.rule_id.clone(),
+        rule_arn: rule.rule_arn.clone(),
+        rule_name: rule.rule_name.clone(),
+        rule_description: rule.rule_description.clone(),
+        firewall_type: rule.firewall_type.clone(),
+        rule_type: Some(rule.rule_type.clone()),
+        configuration: rule.configuration.clone(),
+        status: rule.status.clone(),
+        version: rule.version_string(),
+        update_token: Some(rule.update_token.clone()),
+        is_snapshot: Some(rule.is_snapshot),
+        has_published_version: Some(rule.has_published_version),
+        updated_at: Some(rule.updated_at_timestamp()),
     }
 }

@@ -314,9 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // else is a stale view of the resource.
         if input.update_token != policy.update_token {
             return Err(UpdatePolicyErrorModeled::ConflictException(ConflictException {
-                message: "updateToken does not match the policy's current token; read the \
-                          policy again and retry with the token it returns"
-                    .to_string(),
+                message: crate::state::UPDATE_TOKEN_CONFLICT_MESSAGE.to_string(),
                 resource_id: Some(policy.policy_id.clone()),
                 resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
             })
