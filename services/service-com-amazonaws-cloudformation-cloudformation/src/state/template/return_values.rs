@@ -695,6 +695,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // that service's model spells it with (`Queue$Arn`, `JobTemplate$Arn`, `Preset$Arn`:
         // "an identifier for this resource that is unique within all of AWS").
         MEDIACONVERT_QUEUE | MEDIACONVERT_JOB_TEMPLATE | MEDIACONVERT_PRESET => &["Arn"],
+        // An Amazon Athena capacity reservation publishes its own ARN, which is also the
+        // type's primary identifier and what its `Ref` resolves to.
+        crate::state::provisioning::athena_resources::ATHENA_CAPACITY_RESERVATION => &["Arn"],
         _ => &[],
     }
 }

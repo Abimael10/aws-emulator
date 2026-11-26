@@ -85,6 +85,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         STEP_FUNCTIONS_ACTIVITY => "Arn",
         // The CodeArtifact types, each identified by the ARN its create answers.
         CODEARTIFACT_DOMAIN | CODEARTIFACT_REPOSITORY => "Arn",
+        // An Amazon Athena CAPACITY RESERVATION is identified by its own ARN, which is that
+        // resource type's primary identifier and what its `Ref` returns; the reservation's
+        // `Name` is what Athena's own calls take, and it is the ARN's last segment.
+        crate::state::provisioning::athena_resources::ATHENA_CAPACITY_RESERVATION => "Arn",
         // The Amazon S3 Tables table bucket, identified by its own ARN — the `tableBucketARN`
         // every operation of that service on a table bucket takes.
         S3TABLES_TABLE_BUCKET => S3TABLES_TABLE_BUCKET_ARN_ATTRIBUTE,

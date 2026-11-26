@@ -466,6 +466,23 @@ impl CapacityReservationRegistry {
             .collect()
     }
 
+    /// Every reservation this account holds at `now`, as the RECORDS this registry stores,
+    /// in name order.
+    ///
+    /// The same filter a read by name applies ([`Self::reservation`]), so a reservation
+    /// whose cancelled retention elapsed is as absent here as it is to a read of it. For a
+    /// caller that has to weigh one reservation against the others the account holds —
+    /// which workgroup each of them assigns ([`ComAmazonawsAthenaAmazonathenaState::put_capacity_assignments`]) —
+    /// rather than report them.
+    pub fn records_at(
+        &self,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &CapacityReservationRecord> + '_ {
+        self.reservations
+            .values()
+            .filter(move |record| !record.is_retired_at(now))
+    }
+
     /// How many reservations the account holds at `now`, the count
     /// [`MAX_CAPACITY_RESERVATIONS`] bounds.
     pub fn len_at(&self, now: SystemTime) -> usize {

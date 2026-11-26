@@ -3047,6 +3047,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // the resource — and a deployment the state it reports the rollout in.
     APPCONFIG_HOSTED_CONFIGURATION_VERSION,
     APPCONFIG_DEPLOYMENT,
+    // The Amazon Athena CAPACITY RESERVATION, publishing the ARN that identifies one — the
+    // type's own primary identifier, which is what its `Ref` resolves to. (The other three
+    // `AWS::Athena::*` types publish no return value beyond the name their `Ref` already
+    // gives every type.)
+    crate::state::provisioning::athena_resources::ATHENA_CAPACITY_RESERVATION,
     BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,

@@ -54,11 +54,17 @@
 //! list, so CloudFormation propagates no tag to a saved query.
 //!
 //! `AWS::Athena::CapacityReservation`'s properties are `CreateCapacityReservation`'s own
-//! members under the same names — the `Name` it is created under (this resource's physical id)
-//! `TargetDpus` and `Tags` — plus the `CapacityAssignmentConfiguration` that maps workgroups
+//! members under the same names — the `Name` it is created under, `TargetDpus` and `Tags` —
+//! plus the `CapacityAssignmentConfiguration` that maps workgroups
 //! onto the reservation, which is `PutCapacityAssignmentConfiguration`'s own mapping and is
 //! therefore applied by that call once the reservation exists
-//! ([`CAPACITY_RESERVATION_PROPERTIES`]). Its removal takes the two steps Athena requires: "a
+//! ([`CAPACITY_RESERVATION_PROPERTIES`]) — under that CALL's own member names, this type being
+//! the one here whose published property for a value is spelled differently from the member
+//! that applies it ([`capacity_assignments`]). Its identity is NOT that name: the type's primary
+//! identifier is the reservation's ARN, which is what its `Ref` resolves to and therefore
+//! this resource's physical id ([`capacity_reservation_arn`]) — every Athena call on one
+//! still takes the name, which is the ARN's last segment ([`reservation_name`]). Its removal
+//! takes the two steps Athena requires: "a
 //! reservation must be cancelled before it can be deleted", and a cancellation is not complete
 //! when the call that asked for it answers, so the delete asks for the cancellation and the
 //! removal is reported finished only once the reservation has left the account
@@ -91,7 +97,8 @@ pub(super) const ATHENA_DATA_CATALOG: &str = "AWS::Athena::DataCatalog";
 /// ([`crate::state::template::replacement_properties`]).
 pub(in crate::state) const ATHENA_NAMED_QUERY: &str = "AWS::Athena::NamedQuery";
 /// See [`ATHENA_WORK_GROUP`]. The reservation is created UNDER the name its declaration
-/// states, which is what every Athena call on one takes.
+/// states, which is what every Athena call on one takes; the resource is IDENTIFIED by that
+/// name's ARN ([`capacity_reservation_arn`]).
 pub(in crate::state) const ATHENA_CAPACITY_RESERVATION: &str =
     "AWS::Athena::CapacityReservation";
 
@@ -103,12 +110,70 @@ const ATHENA_SIGNING_NAME: &str = "athena";
 /// See [`ATHENA_SIGNING_NAME`].
 const ATHENA_TARGET_PREFIX: &str = "AmazonAthena";
 
+/// Amazon Athena's ARN namespace, which that model carries as `awsService.arnNamespace`
+/// (`athena`, `smithy_query(query="service_info")`) — the service segment of every ARN of
+/// one of its resources.
+const ATHENA_ARN_NAMESPACE: &str = "athena";
+
+/// The RESOURCE-TYPE segment a capacity reservation's ARN carries, from the "Resource types
+/// defined by Amazon Athena" table of the IAM Service Authorization Reference:
+/// `arn:${Partition}:athena:${Region}:${Account}:capacity-reservation/${CapacityReservationName}`.
+const CAPACITY_RESERVATION_SEGMENT: &str = "capacity-reservation";
+
+/// How long [`release_capacity_reservation`] waits before it looks at the reservation's
+/// status again, and how many looks it makes.
+///
+/// The walk waits for Athena's own transitions — an allocation completing, a cancellation
+/// completing — so it waits for the STATUS rather than for a span, with a bound generous
+/// enough that a loaded host cannot turn a slow transition into capacity reported released
+/// while it is still held.
+const RELEASE_CHECK_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(100);
+/// See [`RELEASE_CHECK_INTERVAL`].
+const RELEASE_CHECKS: usize = 600;
+
+/// The ARN of the capacity reservation `name` in `region`, which is what identifies one
+/// resource of `AWS::Athena::CapacityReservation`: the type's primary identifier, the value
+/// its `Ref` and its `Arn` attribute resolve to
+/// ([`crate::state::template::return_values`]), and the ARN Athena's own tagging calls
+/// resolve that reservation by.
+///
+/// Built here rather than in the return-value catalogue so the ARN a stack publishes and the
+/// name this module addresses the reservation by ([`reservation_name`]) are one form read
+/// two ways: the account id is the one this emulator mints, and the last segment is the name
+/// the reservation was created under.
+pub(in crate::state) fn capacity_reservation_arn(region: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ATHENA_ARN_NAMESPACE,
+        region,
+        &format!("{CAPACITY_RESERVATION_SEGMENT}/{name}"),
+    )
+}
+
+/// The NAME of the capacity reservation `physical_resource_id` identifies, which is what
+/// every Athena call on one takes.
+///
+/// This resource's physical id is the reservation's ARN
+/// ([`capacity_reservation_arn`]), whose last segment is that name — a
+/// `CapacityReservationName` matches `^[a-zA-Z0-9._-]+$`, so it carries no separator of its
+/// own and the split is unambiguous. An id that is a bare name — a record from before the
+/// identity was the ARN — names the reservation as it stands.
+fn reservation_name(physical_resource_id: &str) -> &str {
+    physical_resource_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(physical_resource_id)
+}
+
 /// The code a refusal of this module's own carries for a declaration it cannot act on: the same
 /// one the catalogue's arms use for a property this emulator does not apply.
 const NOT_IMPLEMENTED: &str = "NotImplemented";
 
 /// The code a refusal carries for a declaration that states none of a required property.
 const MISSING_PROPERTY: &str = "InvalidRequest";
+
+/// The code a refusal carries for a step this module could not complete at all — neither the
+/// declaration's fault nor an operation nobody has written.
+const INTERNAL_FAILURE: &str = "InternalFailure";
 
 /// The state a created workgroup is in, which is one of the two values Athena's `WorkGroupState`
 /// enum admits (`smithy_query(query="shape",shape="WorkGroupState")`): `CreateWorkGroup` takes no
@@ -252,7 +317,7 @@ const NAMED_QUERY_PROPERTIES: &[&str] =
 const NAMED_QUERY_CREATE_MEMBERS: &[&str] = NAMED_QUERY_PROPERTIES;
 
 /// Every property `AWS::Athena::CapacityReservation` publishes: the `Name` the reservation is
-/// created under (this resource's physical id and what its `Ref` resolves to), the
+/// created under (which its `Ref` resolves to the ARN of), the
 /// `TargetDpus` `CreateCapacityReservation` requires, its `Tags`, and the
 /// [`CAPACITY_ASSIGNMENT_CONFIGURATION`] the workgroups that run on the reservation are
 /// assigned through. A declared property this list does not carry is one no call here
@@ -280,6 +345,22 @@ const CAPACITY_ASSIGNMENT_CONFIGURATION: &str = "CapacityAssignmentConfiguration
 /// The one member `CAPACITY_ASSIGNMENT_CONFIGURATION` publishes, which is also the member
 /// `PutCapacityAssignmentConfiguration` takes the mapping as.
 const CAPACITY_ASSIGNMENTS_MEMBER: &str = "CapacityAssignments";
+
+/// The one property a `CapacityAssignment` of this resource TYPE publishes: "the list of
+/// workgroup names for the capacity assignment", which the type spells `WorkgroupNames`.
+const WORK_GROUP_NAMES_PROPERTY: &str = "WorkgroupNames";
+
+/// The member `PutCapacityAssignmentConfiguration` takes those same names as, which Athena's
+/// own model spells with a capital G (`CapacityAssignment$WorkGroupNames`,
+/// `smithy_query(query="shape",shape="CapacityAssignment")`).
+///
+/// The one member name these two surfaces spell differently, which is why the assignment list
+/// is rewritten rather than passed through ([`capacity_assignments`]).
+const WORK_GROUP_NAMES_MEMBER: &str = "WorkGroupNames";
+
+/// Every property one `CapacityAssignment` of this type publishes. A declared member this list
+/// does not carry is one no call here applies, and is refused rather than dropped.
+const CAPACITY_ASSIGNMENT_PROPERTIES: &[&str] = &[WORK_GROUP_NAMES_PROPERTY];
 
 /// The member `PutCapacityAssignmentConfiguration` addresses a reservation by.
 const CAPACITY_RESERVATION_NAME_MEMBER: &str = "CapacityReservationName";
@@ -399,7 +480,11 @@ pub(super) async fn create(
 ///
 /// The workgroup mapping is a call of its own: `CreateCapacityReservation` takes no
 /// assignment, so a declaration carrying one is carried out by the single call that takes such
-/// a mapping, against the reservation just created.
+/// a mapping, against the reservation just created. An assignment Athena REFUSES — a workgroup
+/// another live reservation already serves — fails the resource, and the capacity this call
+/// reserved is released before that refusal propagates
+/// ([`release_capacity_reservation`]): the stack records no physical id for a resource whose
+/// create failed, so nothing else would ever take it back out of the account.
 async fn create_capacity_reservation(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -411,7 +496,7 @@ async fn create_capacity_reservation(
         &resource.resource_type,
         CAPACITY_RESERVATION_PROPERTIES,
     )?;
-    let name = resource.physical_resource_id.clone();
+    let name = reservation_name(&resource.physical_resource_id).to_string();
     let mut request = declared_members(&resource.properties, CAPACITY_RESERVATION_CREATE_MEMBERS);
     if !request.contains_key(TARGET_DPUS) {
         return Err(Refusal {
@@ -428,19 +513,91 @@ async fn create_capacity_reservation(
         &Value::Object(request),
     )
     .await?;
-    put_capacity_assignments(ctx, region, &name, &resource.properties).await?;
+    if let Err(refusal) = put_capacity_assignments(
+        ctx,
+        region,
+        &name,
+        &resource.resource_type,
+        &resource.properties,
+    )
+    .await
+    {
+        // The resource the template declares is the reservation AND the workgroups assigned
+        // to it, so an assignment Athena refuses fails the resource. The stack records no
+        // physical id for a resource whose create failed, so nothing would ever release the
+        // capacity this call already reserved: it is released here, before the refusal
+        // propagates, and what the stack reports is Athena's own refusal.
+        if let Err(failure) = release_capacity_reservation(ctx, region, &name).await {
+            return Err(Refusal {
+                code: refusal.code,
+                message: format!(
+                    "{}; the capacity reservation it created was left behind: {failure}",
+                    refusal.message,
+                ),
+            });
+        }
+        return Err(refusal);
+    }
     // The reservation was created under the name CloudFormation decided, which is the one it
-    // answers to.
+    // answers to; the identity the stack publishes for it is that name's ARN, which the
+    // naming rules already computed ([`capacity_reservation_arn`]).
     Ok(Created::default())
+}
+
+/// Take the reservation `name` that this create reserved back out of the account, which is
+/// what a create that cannot be completed leaves behind otherwise.
+///
+/// Athena's own two steps, which is why this is a walk rather than one call: "a reservation
+/// must be cancelled before it can be deleted", only an ALLOCATED reservation can be
+/// cancelled, and a cancellation is not complete when the call that asked for it answers. So
+/// this looks at the status Athena reports and acts on it — cancelling the reservation once
+/// it is allocated, deleting it once that cancellation is complete — until the account no
+/// longer holds it. The CONDITION is what is waited on, not a span: each look asks that
+/// service, and the bound is only there so a reservation that never settles cannot hold the
+/// deployment open forever.
+///
+/// `Err` is Athena's refusal of one of those steps, which the caller reports beside its own:
+/// the capacity really is still held, and a deployment that said otherwise would be reporting
+/// a rollback it did not complete.
+async fn release_capacity_reservation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<(), Refusal> {
+    for _ in 0..RELEASE_CHECKS {
+        match capacity_reservation_status(ctx, region, name).await? {
+            // The account no longer holds it, which is where this walk ends.
+            None => return Ok(()),
+            Some(status) if status == CAPACITY_RESERVATION_ACTIVE => {
+                cancel_capacity_reservation(ctx, region, name).await?;
+            }
+            Some(status) if status == CAPACITY_RESERVATION_CANCELLED => {
+                return delete_capacity_reservation(ctx, region, name).await;
+            }
+            // Still allocating, or still cancelling: the next step is not available yet.
+            Some(_) => {}
+        }
+        ::tokio::time::sleep(RELEASE_CHECK_INTERVAL).await;
+    }
+    Err(Refusal {
+        code: INTERNAL_FAILURE.to_string(),
+        message: format!(
+            "Amazon Athena did not release the capacity reservation {name} in time"
+        ),
+    })
 }
 
 /// Assign the workgroups a declaration's [`CAPACITY_ASSIGNMENT_CONFIGURATION`] maps onto the
 /// reservation `name`, where it declares one. A declaration carrying none assigns nothing: the
 /// reservation holds the capacity and no workgroup runs on it yet.
+///
+/// `resource_type` is the type whose declaration this is, which a refusal of a member no call
+/// here applies names.
 async fn put_capacity_assignments(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     name: &str,
+    resource_type: &str,
     properties: &Value,
 ) -> Result<(), Refusal> {
     let Some(assignments) = declared(properties, CAPACITY_ASSIGNMENT_CONFIGURATION)
@@ -455,7 +612,7 @@ async fn put_capacity_assignments(
     );
     request.insert(
         CAPACITY_ASSIGNMENTS_MEMBER.to_string(),
-        modelled(CAPACITY_ASSIGNMENTS_MEMBER, assignments),
+        capacity_assignments(assignments, resource_type)?,
     );
     call_athena(
         ctx,
@@ -465,6 +622,45 @@ async fn put_capacity_assignments(
     )
     .await
     .map(|_| ())
+}
+
+/// The `CapacityAssignments` list a declared configuration reaches
+/// `PutCapacityAssignmentConfiguration` with: one assignment per declared assignment, each
+/// carrying the workgroup names it states under the member that CALL takes them as.
+///
+/// This is the one member name the resource type and the owning API spell differently: the
+/// type publishes the names of a `CapacityAssignment` as [`WORK_GROUP_NAMES_PROPERTY`] where
+/// the call takes them as [`WORK_GROUP_NAMES_MEMBER`], so they are rewritten rather than
+/// passed through under the type's own spelling — which the call would not recognise, leaving
+/// the reservation serving no workgroup at all while the stack reported the declaration
+/// applied.
+///
+/// A declared member of an assignment that the type publishes NO property for is refused
+/// rather than dropped, for the reason [`refuse_unapplied_properties`] records; so is a
+/// configuration whose assignments are not a list, which describes no mapping this call could
+/// make.
+fn capacity_assignments(assignments: &Value, resource_type: &str) -> Result<Value, Refusal> {
+    let Some(declared_assignments) = assignments.as_array() else {
+        return Err(Refusal {
+            code: MISSING_PROPERTY.to_string(),
+            message: format!(
+                "the {CAPACITY_ASSIGNMENTS_MEMBER} of {resource_type} is a list of assignments"
+            ),
+        });
+    };
+    let mut carried = Vec::with_capacity(declared_assignments.len());
+    for assignment in declared_assignments {
+        refuse_unapplied_properties(assignment, resource_type, CAPACITY_ASSIGNMENT_PROPERTIES)?;
+        let mut entry = Map::new();
+        if let Some(names) = declared(assignment, WORK_GROUP_NAMES_PROPERTY) {
+            entry.insert(
+                WORK_GROUP_NAMES_MEMBER.to_string(),
+                modelled(WORK_GROUP_NAMES_MEMBER, names),
+            );
+        }
+        carried.push(Value::Object(entry));
+    }
+    Ok(Value::Array(carried))
 }
 
 /// Create the workgroup an `AWS::Athena::WorkGroup` declares, and put it in the state its
@@ -604,10 +800,13 @@ pub(super) async fn readiness(
     // cancelled) is not going to come up, and one the account no longer holds is a creation
     // nothing can report ready.
     if kind == Kind::CapacityReservation {
+        // Addressed by the reservation's NAME, which is what every Athena call on one takes
+        // and which this resource's identity carries ([`reservation_name`]).
+        let name = reservation_name(physical_resource_id);
         return Ok(
-            match capacity_reservation_status(ctx, region, physical_resource_id).await? {
+            match capacity_reservation_status(ctx, region, name).await? {
                 None => Readiness::Failed(format!(
-                    "Amazon Athena holds no capacity reservation named {physical_resource_id}"
+                    "Amazon Athena holds no capacity reservation named {name}"
                 )),
                 Some(status) if status == CAPACITY_RESERVATION_ACTIVE => Readiness::Ready,
                 Some(status)
@@ -671,18 +870,20 @@ pub(super) async fn removal(
     if kind != Kind::CapacityReservation {
         return Ok(Removal::Gone);
     }
-    match capacity_reservation_status(ctx, region, physical_resource_id).await? {
+    // Addressed by the reservation's NAME, as every Athena call on one is.
+    let name = reservation_name(physical_resource_id);
+    match capacity_reservation_status(ctx, region, name).await? {
         // The account no longer holds it, which is what the delete below leaves behind.
         None => Ok(Removal::Gone),
         Some(status) if status == CAPACITY_RESERVATION_CANCELLED => {
-            delete_capacity_reservation(ctx, region, physical_resource_id).await?;
+            delete_capacity_reservation(ctx, region, name).await?;
             Ok(Removal::Gone)
         }
         // A reservation that reached ACTIVE after the delete was asked for — one whose
         // allocation was still in flight then — is cancelled here, which is the step its
         // removal is waiting on.
         Some(status) if status == CAPACITY_RESERVATION_ACTIVE => {
-            cancel_capacity_reservation(ctx, region, physical_resource_id).await?;
+            cancel_capacity_reservation(ctx, region, name).await?;
             Ok(Removal::Pending(status))
         }
         Some(status) => Ok(Removal::Pending(status)),
@@ -862,10 +1063,9 @@ async fn update_capacity_reservation(
             message: format!("{} declares no {TARGET_DPUS}", resource.resource_type),
         });
     }
-    request.insert(
-        NAME_MEMBER.to_string(),
-        Value::String(resource.physical_resource_id.clone()),
-    );
+    // Both calls address the reservation by its NAME, which this resource's identity carries.
+    let name = reservation_name(&resource.physical_resource_id).to_string();
+    request.insert(NAME_MEMBER.to_string(), Value::String(name.clone()));
     call_athena(
         ctx,
         region,
@@ -876,7 +1076,8 @@ async fn update_capacity_reservation(
     put_capacity_assignments(
         ctx,
         region,
-        &resource.physical_resource_id,
+        &name,
+        &resource.resource_type,
         declared_properties,
     )
     .await?;
@@ -998,17 +1199,19 @@ pub(super) async fn delete(
         // physical id ([`create_named_query`]).
         Kind::NamedQuery => ("DeleteNamedQuery", NAMED_QUERY_ID_MEMBER),
         Kind::CapacityReservation => {
+            // Addressed by the reservation's NAME, which this resource's identity — its ARN —
+            // carries ([`reservation_name`]).
+            let name = reservation_name(&resource.physical_resource_id);
             // Only an ACTIVE reservation has a cancellation to ask for: one still allocating
             // is not cancellable yet, one already cancelling or cancelled has nothing left to
             // cancel, and one the account no longer holds is gone. [`removal`] asks for the
             // cancellation of a reservation that reaches ACTIVE after this call, so the
             // removal makes progress whichever status the delete found it in.
-            let held =
-                capacity_reservation_status(ctx, region, &resource.physical_resource_id).await?;
+            let held = capacity_reservation_status(ctx, region, name).await?;
             if held.as_deref() != Some(CAPACITY_RESERVATION_ACTIVE) {
                 return Ok(());
             }
-            return cancel_capacity_reservation(ctx, region, &resource.physical_resource_id).await;
+            return cancel_capacity_reservation(ctx, region, name).await;
         }
     };
     request.insert(

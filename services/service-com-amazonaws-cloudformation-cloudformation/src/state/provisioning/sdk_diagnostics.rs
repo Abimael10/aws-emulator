@@ -144,6 +144,19 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // provisions over this signing name is that service's (a GraphQL API's own estate,
     // the two custom-domain types, and the Event API types beside them).
     ("appsync", "AppSync", SdkDiagnostic::Attempts),
+    // Amazon Athena's SDK names it by that model's own `sdkId` (`Athena`,
+    // `smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` the type names of its resources carry. The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::Athena::CapacityReservation` whose replacement cannot claim the workgroup its
+    // still-live predecessor holds carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `athena.deploy-capacity-reservation-rename-with-assigned-workgroup-rejected`, whose
+    // reason reads `Resource handler returned message: "<the service's sentence> (Service:
+    // Athena, Status Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: InvalidRequest)`). Every type this emulator provisions over this
+    // signing name is that service's ([`athena_resources`]).
+    ("athena", "Athena", SdkDiagnostic::Attempts),
     // Amazon EC2 Auto Scaling's SDK names it `AutoScaling` — that model's own
     // `awsService.cloudFormationName`, which is its `sdkId` (`Auto Scaling`,
     // `smithy_query(query="service_info")` on that service's model) with the space closed up,

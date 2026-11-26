@@ -8,7 +8,9 @@
 //! service that OWNS it, through that service's own public API and with every declared property
 //! applied — so the identifier a stack publishes for it resolves in that service's own read
 //! right after the stack completes, a changed declaration is applied to the resource that
-//! exists, and deleting the stack releases it there.** For this type the identifier is the NAME:
+//! exists, and deleting the stack releases it there.** For this type the identifier a stack
+//! publishes is the reservation's ARN — the resource type's own primary identifier, which is
+//! what its `Ref` returns — whose last segment is the NAME every Athena call on one takes:
 //! `GetCapacityReservation`, `UpdateCapacityReservation`, `CancelCapacityReservation` and
 //! `DeleteCapacityReservation` each address a reservation by it, and the workgroups that run on
 //! the reservation are assigned to that same name. Two crates have to agree for that to hold
@@ -266,6 +268,10 @@ struct Row {
     updated_to: i64,
     /// The workgroups the declaration assigns to the reservation, which Athena then reports as
     /// its capacity assignment configuration.
+    ///
+    /// The templates declare them under the property the TYPE publishes (`WorkgroupNames`),
+    /// where Athena's own answer carries them under the member its model spells
+    /// (`WorkGroupNames`) — the one name the two surfaces spell differently.
     assigned: &'static [&'static str],
 }
 
@@ -289,7 +295,7 @@ const ROWS: &[Row] = &[
                 "TargetDpus": 24,
                 "Tags": [{"Key": "Owner", "Value": "analytics"}],
                 "CapacityAssignmentConfiguration": {
-                  "CapacityAssignments": [{"WorkGroupNames": ["capacity-analytics"]}]
+                  "CapacityAssignments": [{"WorkgroupNames": ["capacity-analytics"]}]
                 }
               }
             }
@@ -314,7 +320,7 @@ const ROWS: &[Row] = &[
                 "TargetDpus": 48,
                 "Tags": [{"Key": "Owner", "Value": "analytics"}],
                 "CapacityAssignmentConfiguration": {
-                  "CapacityAssignments": [{"WorkGroupNames": ["capacity-analytics"]}]
+                  "CapacityAssignments": [{"WorkgroupNames": ["capacity-analytics"]}]
                 }
               }
             }
@@ -395,12 +401,20 @@ async fn a_stack_provisions_the_capacity_reservation_its_template_declares() {
         );
         let described = wait_for_stack_status(&router, region, &stack, "CREATE_COMPLETE").await;
         let outputs = outputs_of(&described);
-        let name = output(&outputs, "ReservationRef", case);
+        // `Ref` on this type returns the reservation's ARN, which is the type's primary
+        // identifier — so the name every Athena call takes is that ARN's last segment, and the
+        // two Outputs (the `Ref` and the published `Arn`) carry the same value.
+        let published = output(&outputs, "ReservationRef", case);
+        let name = published
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         if let Some(declared) = row.declared_name {
             assert_eq!(
                 name, declared,
                 "case {case:?}: expected the reservation to carry the declared name \
-                 {declared:?}, got {name:?}"
+                 {declared:?}, got {published:?}"
             );
         }
         // A name CloudFormation generated is still a name Athena's own rule admits.
@@ -420,11 +434,18 @@ async fn a_stack_provisions_the_capacity_reservation_its_template_declares() {
         // carry for that name (`arn:${Partition}:athena:${Region}:${Account}:<type>/<name>`, the
         // "Resource types defined by Amazon Athena" table of the IAM Service Authorization
         // Reference), so a policy or a tag read built from it addresses the reservation that
-        // service holds.
+        // service holds — and the `Ref` resolves to exactly that ARN rather than to the bare
+        // name.
+        let expected_arn = format!("arn:aws:athena:{region}:{ACCOUNT}:capacity-reservation/{name}");
         assert_eq!(
             output(&outputs, "ReservationArn", case),
-            format!("arn:aws:athena:{region}:{ACCOUNT}:capacity-reservation/{name}"),
+            expected_arn,
             "case {case:?}: expected the reservation's own ARN, got {outputs:?}"
+        );
+        assert_eq!(
+            published, expected_arn,
+            "case {case:?}: expected a Ref to this resource to resolve to its ARN, got \
+             {published:?}"
         );
 
         // Athena itself resolves the published name to the reservation the template declared,
@@ -496,11 +517,11 @@ async fn a_stack_provisions_the_capacity_reservation_its_template_declares() {
             "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {body}"
         );
         let described = wait_for_stack_status(&router, region, &stack, "UPDATE_COMPLETE").await;
-        let updated_name = output(&outputs_of(&described), "ReservationRef", case);
+        let updated_ref = output(&outputs_of(&described), "ReservationRef", case);
         assert_eq!(
-            updated_name, name,
+            updated_ref, published,
             "case {case:?}: a changed amount must not replace the reservation, got \
-             {updated_name:?}"
+             {updated_ref:?}"
         );
         let reservation = wait_for_reservation(&router, region, &name, ACTIVE, case).await;
         assert_eq!(

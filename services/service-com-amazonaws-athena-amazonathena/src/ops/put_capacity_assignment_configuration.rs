@@ -178,10 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The operation's own client error (HTTP 400), carrying `message`.
 ///
 /// Every refusal above is caused by the request itself — a configuration larger than this
-/// service stores, a `CapacityReservationName` naming no reservation this account holds, or an
-/// assignment naming a workgroup it does not hold — and `InvalidRequestException` is the
-/// client error this operation models: "Indicates that something is wrong with the input to
-/// the request." That is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+/// service stores, a `CapacityReservationName` naming no reservation this account holds, an
+/// assignment naming a workgroup it does not hold, or one naming a workgroup another live
+/// reservation already serves — and `InvalidRequestException` is the client error this
+/// operation models: "Indicates that something is wrong with the input to the request." That
+/// is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
 fn invalid_request(message: impl Into<String>) -> PutCapacityAssignmentConfigurationError {
     PutCapacityAssignmentConfigurationError::invalid_request(
         crate::state::ERROR_CODE_INVALID_INPUT,

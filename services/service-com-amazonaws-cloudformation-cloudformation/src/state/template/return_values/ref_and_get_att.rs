@@ -3839,6 +3839,26 @@ pub(crate) fn return_values(
             attributes.insert("HookArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // An Amazon Athena CAPACITY RESERVATION is identified by its ARN: that is the
+        // resource type's own primary identifier, so "Ref returns" it rather than the
+        // reservation's name, and the type publishes the same value as `Arn`. The ARN's form
+        // is the one the IAM Service Authorization Reference publishes for the resource type
+        // (`arn:<partition>:athena:<region>:<account>:capacity-reservation/<name>`, the
+        // resource path Athena's own tagging calls resolve a reservation by —
+        // `capacity_reservation_arn` in that service's own state module), so the handle the
+        // stack publishes addresses the reservation
+        // [`crate::state::provisioning::athena_resources`] created however a client reaches
+        // Athena with it. The reservation is still CREATED under the declared name, which is
+        // what every Athena call on one takes, and that name is the last segment of this ARN.
+        // (The other three `AWS::Athena::*` types are NOT here: a workgroup and a data catalog
+        // are each identified by the name they are created under, and a saved query by the
+        // `NamedQueryId` Athena minted.)
+        crate::state::provisioning::athena_resources::ATHENA_CAPACITY_RESERVATION => {
+            let arn =
+                crate::state::provisioning::athena_resources::capacity_reservation_arn(region, name);
+            attributes.insert("Arn".to_string(), arn.clone());
+            (arn, attributes)
+        }
         // The two Amazon MemoryDB groups a cluster is configured out of. "Ref returns the
         // name" for each, which is the `ParameterGroupName`/`SubnetGroupName` the declaration
         // states and the identifier every MemoryDB call on one takes, and each publishes its
