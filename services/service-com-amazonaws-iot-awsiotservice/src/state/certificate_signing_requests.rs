@@ -124,17 +124,18 @@ pub fn unreadable_certificate_signing_request_message() -> String {
     "Invalid CSR format".to_string()
 }
 
-/// The message a request refuses a public key the operation does not admit with, worded
-/// from the rule `CreateCertificateFromCsr` states: "The CSR must include a public key
-/// that is either an RSA key with a length of at least 2048 bits or an ECC key from NIST
-/// P-256, NIST P-384, or NIST P-521 curves", with the shortest admitted RSA key taken from
-/// the constant that enforces it.
+/// The message a request refuses a public key the operation does not admit with.
+///
+/// A readable certification request whose key violates the key-strength constraint the
+/// operation documents — "The CSR must include a public key that is either an RSA key with
+/// a length of at least 2048 bits or an ECC key from NIST P-256, NIST P-384, or NIST P-521
+/// curves" — is refused in ONE fixed sentence that states the class of the violation and
+/// not the rule that was violated: it names neither the member that carried the request,
+/// nor the key type or size submitted, nor the shortest admitted key or the admitted curve
+/// names, so the sentence has no variable part. The class it is stated under is the
+/// modelled `InvalidRequestException` (HTTP 400), "The request is not valid".
 pub fn unsupported_csr_key_message() -> String {
-    format!(
-        "Invalid certificate signing request: the public key must be an RSA key of at least \
-         {MIN_CSR_RSA_KEY_BITS} bits or an ECC key from the NIST P-256, NIST P-384 or NIST P-521 \
-         curves"
-    )
+    "CSR violates constraints".to_string()
 }
 
 /// The certification request `material` holds, or why it is not one this operation can

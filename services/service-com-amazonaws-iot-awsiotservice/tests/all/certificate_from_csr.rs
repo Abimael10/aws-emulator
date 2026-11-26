@@ -871,13 +871,10 @@ fn unreadable_message() -> String {
 }
 
 /// The message it refuses a readable request whose public key the operation does not admit
-/// with, worded from the rule the operation states.
+/// with: one fixed sentence naming the class of the violation, with no part taken from the
+/// request or from the rule that was violated.
 fn unsupported_key_message() -> String {
-    format!(
-        "Invalid certificate signing request: the public key must be an RSA key of at least \
-         {MIN_CSR_RSA_KEY_BITS} bits or an ECC key from the NIST P-256, NIST P-384 or NIST P-521 \
-         curves"
-    )
+    "CSR violates constraints".to_string()
 }
 
 #[tokio::test]
