@@ -2447,3 +2447,273 @@ async fn request_endpoint(
     let state = service_state(&**emulator.engine()).expect("this service's store");
     serve_request(&state, function_name, endpoint_name, &request).await
 }
+
+/// The endpoint a configuration row asks for: the members every create of an endpoint
+/// needs, plus the configuration members the row itself sends.
+fn configuration_body(endpoint_name: &str, configurations: Value) -> Value {
+    let mut body = json!({
+        "endpointName": endpoint_name,
+        "endpointType": "HomeRegion",
+        "authType": "IamAuth",
+    });
+    for (name, value) in configurations
+        .as_object()
+        .expect("the configurations a row sends are an object")
+    {
+        body[name] = value.clone();
+    }
+    body
+}
+
+/// One row of the configuration-form table: the `scalingConfig` / `throttleConfig`
+/// members a request sends, and what every reader of the endpoint has to report for
+/// them afterwards.
+struct ConfigurationCase {
+    case: &'static str,
+    /// The two members as the request sends them; a member a row leaves out is one the
+    /// request omits.
+    sent: fn() -> Value,
+    /// What each of the two members has to be afterwards: `None` means the member is
+    /// ABSENT from the response, rather than present and empty.
+    expected: fn() -> Vec<(&'static str, Option<Value>)>,
+}
+
+/// The table: the rule generalises over the FORM a configuration takes on a request —
+/// omitted, an object that sets no value, or an object that sets one — so the rows
+/// differ along that form, independently for the two configurations. The values sit on
+/// the bounds the model publishes: `ScalingConfig$maxEnvironments` is
+/// `@range(2..10000)` and `ThrottleConfig$rateLimit` is `@range(0..)` with "one of the
+/// following supported values: 0, 100, … 10000" (source: `smithy_query(query="shape",
+/// shape="ScalingConfig,ThrottleConfig")`), and 1000 is a supported value neither the
+/// bounds nor the sibling tables already use.
+fn configuration_cases() -> Vec<ConfigurationCase> {
+    vec![
+        ConfigurationCase {
+            case: "neither configuration named",
+            sent: || json!({}),
+            expected: || vec![("scalingConfig", None), ("throttleConfig", None)],
+        },
+        ConfigurationCase {
+            case: "both configurations sent as objects that set no value",
+            sent: || json!({ "scalingConfig": {}, "throttleConfig": {} }),
+            expected: || vec![("scalingConfig", None), ("throttleConfig", None)],
+        },
+        ConfigurationCase {
+            case: "an empty scaling configuration beside a throttling one that sets a value",
+            sent: || json!({ "scalingConfig": {}, "throttleConfig": { "rateLimit": 1000 } }),
+            expected: || {
+                vec![
+                    ("scalingConfig", None),
+                    ("throttleConfig", Some(json!({ "rateLimit": 1000 }))),
+                ]
+            },
+        },
+        ConfigurationCase {
+            case: "a scaling configuration that sets a value beside an empty throttling one",
+            sent: || json!({ "scalingConfig": { "maxEnvironments": 3 }, "throttleConfig": {} }),
+            expected: || {
+                vec![
+                    ("scalingConfig", Some(json!({ "maxEnvironments": 3 }))),
+                    ("throttleConfig", None),
+                ]
+            },
+        },
+        ConfigurationCase {
+            case: "both configurations at the smallest values the model publishes",
+            sent: || {
+                json!({
+                    "scalingConfig": { "maxEnvironments": 2 },
+                    "throttleConfig": { "rateLimit": 0 },
+                })
+            },
+            expected: || {
+                vec![
+                    ("scalingConfig", Some(json!({ "maxEnvironments": 2 }))),
+                    ("throttleConfig", Some(json!({ "rateLimit": 0 }))),
+                ]
+            },
+        },
+        ConfigurationCase {
+            case: "both configurations at the largest values the model publishes",
+            sent: || {
+                json!({
+                    "scalingConfig": { "maxEnvironments": 10000 },
+                    "throttleConfig": { "rateLimit": 10000 },
+                })
+            },
+            expected: || {
+                vec![
+                    ("scalingConfig", Some(json!({ "maxEnvironments": 10000 }))),
+                    ("throttleConfig", Some(json!({ "rateLimit": 10000 }))),
+                ]
+            },
+        },
+    ]
+}
+
+/// Assert that `object` reports the two configuration members exactly as `expected`
+/// has them — a member expected `None` being ABSENT from the object rather than
+/// present and empty.
+fn assert_configurations(
+    case: &str,
+    reader: &str,
+    object: &Value,
+    expected: &[(&'static str, Option<Value>)],
+) {
+    for (name, want) in expected {
+        let actual = object.get(*name);
+        assert_eq!(
+            actual,
+            want.as_ref(),
+            "case {case:?}: {reader} must report {name} as {want:?}, got {actual:?} in \
+             {object:?}"
+        );
+    }
+}
+
+/// RULE: a scaling or throttling configuration is a configuration only when it sets
+/// its own value — "There is no default value. If you don't specify a value, the
+/// scaling configuration is absent from the response", and the readers repeat it
+/// ("This field is absent if the endpoint has no scaling configuration") — so a
+/// configuration object that sets none of its members is stored as no configuration at
+/// all, whichever write path received it, and every reader of that endpoint omits the
+/// member.
+#[tokio::test]
+async fn a_configuration_that_sets_no_value_is_no_configuration_on_either_create_path() {
+    for (index, row) in configuration_cases().into_iter().enumerate() {
+        let case = row.case;
+        let expected = (row.expected)();
+        let emulator = Emulator::new();
+        let function_name = format!("configuration-forms-{index}");
+
+        // The create that carries the endpoint with the function (`endpointConfig`).
+        let created = create_with_endpoint(
+            &emulator,
+            &function_name,
+            configuration_body("initial", (row.sent)()),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: CreateWebFunction with endpointConfig expected 202, got {} with \
+             {:?}",
+            created.status, created.body
+        );
+        let initial = endpoint_of(&created);
+        assert_configurations(case, "the CreateWebFunction endpoint summary", &initial, &expected);
+
+        let fetched = get_endpoint(&emulator, &function_name, "initial").await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {case:?}: GetWebFunctionEndpoint expected 200, got {} with {:?}",
+            fetched.status, fetched.body
+        );
+        assert_configurations(case, "GetWebFunctionEndpoint", &fetched.body, &expected);
+        // Every Region of the endpoint reports the one configuration the endpoint has.
+        let regional = member(&fetched.body, "regionalEndpoints");
+        let regional = regional
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: expected regionalEndpoints, got {regional:?}"));
+        for (region, entry) in regional {
+            assert_configurations(case, &format!("the {region} regional entry"), entry, &expected);
+        }
+
+        // The create that adds an endpoint to the stored function.
+        let added = create_endpoint(
+            &emulator,
+            &function_name,
+            configuration_body("added", (row.sent)()),
+        )
+        .await;
+        assert_eq!(
+            added.status, 202,
+            "case {case:?}: CreateWebFunctionEndpoint expected 202, got {} with {:?}",
+            added.status, added.body
+        );
+        assert_configurations(case, "the CreateWebFunctionEndpoint answer", &added.body, &expected);
+
+        let fetched = get_endpoint(&emulator, &function_name, "added").await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {case:?}: GetWebFunctionEndpoint expected 200, got {} with {:?}",
+            fetched.status, fetched.body
+        );
+        assert_configurations(
+            case,
+            "GetWebFunctionEndpoint on the added endpoint",
+            &fetched.body,
+            &expected,
+        );
+    }
+}
+
+/// RULE (the same one, across the write paths): an endpoint has no scaling or
+/// throttling configuration exactly when no request set one, so the three ways to
+/// arrive there — a create sending the object that sets no value, a create naming no
+/// configuration at all, and the documented clear of a previously set value by an
+/// update — leave ONE endpoint shape, with the member absent.
+#[tokio::test]
+async fn an_empty_configuration_object_means_the_same_on_every_write_path() {
+    let emulator = Emulator::new();
+    let function_name = "configuration-write-paths";
+    let _ = function_with_a_revision(&emulator, function_name).await;
+    let empty = json!({ "scalingConfig": {}, "throttleConfig": {} });
+    let set = json!({
+        "scalingConfig": { "maxEnvironments": 5 },
+        "throttleConfig": { "rateLimit": 100 },
+    });
+
+    for (endpoint_name, configurations) in [
+        ("created-empty", empty.clone()),
+        ("created-absent", json!({})),
+        ("cleared-by-update", set.clone()),
+    ] {
+        let created = create_endpoint(
+            &emulator,
+            function_name,
+            configuration_body(endpoint_name, configurations),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {endpoint_name:?}: CreateWebFunctionEndpoint expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+    }
+
+    // The endpoint the update clears has both configurations to begin with, so the
+    // clear below has something to clear.
+    let before = get_endpoint(&emulator, function_name, "cleared-by-update").await;
+    assert_configurations(
+        "cleared-by-update",
+        "GetWebFunctionEndpoint before the clear",
+        &before.body,
+        &[
+            ("scalingConfig", Some(json!({ "maxEnvironments": 5 }))),
+            ("throttleConfig", Some(json!({ "rateLimit": 100 }))),
+        ],
+    );
+    let cleared = update_endpoint(&emulator, function_name, "cleared-by-update", empty).await;
+    assert_eq!(
+        cleared.status, 202,
+        "UpdateWebFunctionEndpoint expected 202, got {} with {:?}",
+        cleared.status, cleared.body
+    );
+    assert_configurations(
+        "cleared-by-update",
+        "the UpdateWebFunctionEndpoint answer",
+        &cleared.body,
+        &[("scalingConfig", None), ("throttleConfig", None)],
+    );
+
+    let absent = [("scalingConfig", None), ("throttleConfig", None)];
+    for endpoint_name in ["created-empty", "created-absent", "cleared-by-update"] {
+        let read = get_endpoint(&emulator, function_name, endpoint_name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {endpoint_name:?}: GetWebFunctionEndpoint expected 200, got {} with {:?}",
+            read.status, read.body
+        );
+        assert_configurations(endpoint_name, "GetWebFunctionEndpoint", &read.body, &absent);
+    }
+}

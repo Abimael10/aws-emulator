@@ -131,6 +131,46 @@ pub struct EndpointRegion {
     pub domain_name: Option<String>,
 }
 
+/// An optional endpoint configuration shape whose value is what makes it a
+/// configuration at all: it carries a single optional member, and the shape sets
+/// nothing when that member is absent.
+///
+/// Implemented for `ScalingConfig` and `ThrottleConfig`, whose member documentation
+/// states the rule [`configured`] applies (source: `smithy_query(query="shape",
+/// shape="ScalingConfig,ThrottleConfig")`).
+pub trait EndpointConfiguration {
+    /// Whether this shape names a configuration, rather than setting none of its
+    /// members.
+    fn is_configured(&self) -> bool;
+}
+
+impl EndpointConfiguration for ScalingConfig {
+    fn is_configured(&self) -> bool {
+        self.max_environments.is_some()
+    }
+}
+
+impl EndpointConfiguration for ThrottleConfig {
+    fn is_configured(&self) -> bool {
+        self.rate_limit.is_some()
+    }
+}
+
+/// `requested` as an endpoint stores it: a configuration that sets none of its own
+/// members is no configuration, so it is stored — and therefore reported — as absent.
+///
+/// "There is no default value. If you don't specify a value, the scaling configuration
+/// is absent from the response." (source: `smithy_query(query="shape",
+/// shape="ScalingConfig")`, member `maxEnvironments`, and the same sentence for
+/// `ThrottleConfig$rateLimit`), which `FunctionEndpointSummary$scalingConfig` repeats
+/// for the readers: "This field is absent if the endpoint has no scaling
+/// configuration." An empty object therefore means one thing on EVERY write path — the
+/// endpoint has no such configuration — whether it arrives on a create or as the
+/// documented clear of a previously set value on an update.
+pub fn configured<C: EndpointConfiguration>(requested: Option<C>) -> Option<C> {
+    requested.filter(EndpointConfiguration::is_configured)
+}
+
 /// One stored endpoint of a web function.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
@@ -317,13 +357,10 @@ impl Endpoint {
         // sentence for `ThrottleConfig$rateLimit`), so a configuration that sets none of
         // its members clears the stored one rather than storing an empty shape.
         if let Some(scaling_config) = update.scaling_config {
-            self.scaling_config = scaling_config
-                .max_environments
-                .is_some()
-                .then_some(scaling_config);
+            self.scaling_config = configured(Some(scaling_config));
         }
         if let Some(throttle_config) = update.throttle_config {
-            self.throttle_config = throttle_config.rate_limit.is_some().then_some(throttle_config);
+            self.throttle_config = configured(Some(throttle_config));
         }
         self.updated_at = now;
         self.update_status = Some(ENDPOINT_UPDATE_IN_PROGRESS.to_string());
@@ -616,8 +653,11 @@ impl ComAmazonawsLambdawebLambdawebState {
                 .auto_deployment_mode
                 .unwrap_or_else(|| DEFAULT_AUTO_DEPLOYMENT_MODE.to_string()),
             revision_weights: new.revision_weights,
-            scaling_config: new.scaling_config,
-            throttle_config: new.throttle_config,
+            // An empty configuration object sets none of its members, so the endpoint is
+            // stored with no such configuration at all — the one meaning this service
+            // gives it on its update path too.
+            scaling_config: configured(new.scaling_config),
+            throttle_config: configured(new.throttle_config),
             state: EndpointState::Pending,
             state_reason: ENDPOINT_PENDING_REASON.to_string(),
             update_status: None,
