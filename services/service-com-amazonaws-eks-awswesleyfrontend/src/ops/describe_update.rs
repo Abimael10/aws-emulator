@@ -152,6 +152,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // Completing a `logging` update is what puts that configuration on the cluster,
+        // and what the enabled types OWE CloudWatch Logs — the cluster's log group and
+        // the stream of each of them — is owed from that same instant whether or not
+        // anybody called. This is the read a client polls while it waits for the update,
+        // so it is where both are materialised (see
+        // [`crate::state::export_owed_control_plane_logs`]): an update that reports
+        // `Successful` here has had its export made. A cluster that enables no log type
+        // owes nothing and nothing is asked of CloudWatch Logs.
+        crate::state::export_owed_control_plane_logs(ctx, &store, &region).await;
+
         let mut guard = store.lock();
         guard.materialize_due_transitions(SystemTime::now());
 

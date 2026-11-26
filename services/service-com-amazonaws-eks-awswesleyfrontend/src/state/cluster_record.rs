@@ -246,6 +246,27 @@ pub fn reported_kube_controller_manager_config(
 }
 
 impl ClusterRecord {
+    /// Whether the export of `log_type`'s control plane logs has already been made for
+    /// this cluster ([`Self::exported_log_types`]).
+    pub fn has_exported_log_type(&self, log_type: &str) -> bool {
+        self.exported_log_types
+            .iter()
+            .any(|exported| exported == log_type)
+    }
+
+    /// Record that the export of each type in `log_types` has been made, so a later read
+    /// of this cluster owes it no second time.
+    ///
+    /// Idempotent and bounded: a type already recorded is not recorded twice, so the list
+    /// never grows past the values `LogType` declares.
+    pub fn record_exported_log_types(&mut self, log_types: &[&str]) {
+        for log_type in log_types {
+            if !self.has_exported_log_type(log_type) {
+                self.exported_log_types.push((*log_type).to_string());
+            }
+        }
+    }
+
     /// Materialise the status moves the clock already owes at `now`.
     ///
     /// This is the only write a reporting operation may make: each transition was

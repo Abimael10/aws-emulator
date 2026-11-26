@@ -177,6 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What a cluster of this Region still OWES CloudWatch Logs — the stream of a
+        // control plane log type its configuration enables and whose export has not been
+        // made yet — is exported before the record is read. The configuration a `logging`
+        // update carries lands on the cluster when the clock completes that update, so
+        // the export is owed from that same instant whether or not anybody called, and
+        // this is the read that materialises both (see
+        // [`crate::state::export_owed_control_plane_logs`]). A cluster that enables no
+        // log type owes nothing and nothing is asked of CloudWatch Logs.
+        crate::state::export_owed_control_plane_logs(ctx, &store, &region).await;
+
         let mut guard = store.lock();
         guard.materialize_due_transitions(SystemTime::now());
 

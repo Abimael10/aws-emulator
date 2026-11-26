@@ -504,8 +504,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the cluster's log group and the stream of each enabled type are provisioned
         // here rather than only recorded on the cluster. A request that enables no type
         // provisions none, which is what `ControlPlaneLogExport::of` answers `None` for.
+        //
+        // The export is not this CALL's alone, though: what owes it is the configuration
+        // the update puts on the cluster, which the clock applies when it completes the
+        // update. So a type CloudWatch Logs did not take here — and a type enabled by a
+        // call that was answered from an update already recorded, which is what a retry
+        // under the same `clientRequestToken` is answered with above — stays owed, and
+        // the reads that materialise the completion make the export
+        // ([`state::export_owed_control_plane_logs`]).
         if let Some(export) = export.as_ref() {
-            state::export_control_plane_logs(ctx, &region, export).await;
+            state::export_control_plane_logs_and_record(ctx, &store, &region, &key, export).await;
         }
 
         Ok(UpdateClusterConfigOutput {

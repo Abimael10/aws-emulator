@@ -2079,6 +2079,19 @@ pub struct ClusterRecord {
     /// ([`ClusterRecord::to_cluster`] reports the record as it stands), so the one
     /// place a delivery would be recorded is the record itself.
     pub vended_logs: bool,
+    /// The control plane log types whose export to CloudWatch Logs this service has
+    /// already made for this cluster — the group and the stream of each are there.
+    ///
+    /// It is what makes the export an effect of the cluster's stored `logging` rather
+    /// than of the one call that asked for it: a type this cluster reports as enabled
+    /// and that is not in here is still OWED a stream, and the next operation that
+    /// reads the cluster makes that export
+    /// ([`export_owed_control_plane_logs`]). Written only by the export itself, and
+    /// only for a type CloudWatch Logs took, so one it refused is tried again. Bounded
+    /// by the five values `LogType` declares, and never pruned: a type that was
+    /// exported keeps its stream when it is disabled again, because nothing deletes a
+    /// customer's logs.
+    pub exported_log_types: Vec<String>,
     /// When set, the instant of the latest COMPLETED analysis of this cluster's
     /// insights — `InsightSummary$lastRefreshTime`, read through
     /// [`ClusterRecord::insights_refreshed_at`].

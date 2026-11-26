@@ -196,6 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_LIST_PAGE_SIZE)
             .max(1) as usize;
 
+        // The same materialisation `DescribeUpdate` makes: a completed `logging` update
+        // owes CloudWatch Logs the cluster's log group and the stream of each type it
+        // enabled, from the instant the clock completed it, so a client that watches its
+        // updates through this listing has had that export made too (see
+        // [`state::export_owed_control_plane_logs`]).
+        state::export_owed_control_plane_logs(ctx, &store, &region).await;
+
         let mut guard = store.lock();
         guard.materialize_due_transitions(SystemTime::now());
 

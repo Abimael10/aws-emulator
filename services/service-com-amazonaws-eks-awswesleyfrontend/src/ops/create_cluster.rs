@@ -933,6 +933,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // cluster's own creation, which is what every insight of a cluster
             // nobody has refreshed reports: no later analysis has completed yet.
             insights_analyzed_at: None,
+            // Nothing has been exported to CloudWatch Logs yet: what the log types this
+            // create enables owe is exported below, once the record is stored.
+            exported_log_types: Vec::new(),
             // Nothing in this API configures vended log delivery for a cluster, so
             // a cluster this create stores has none (see
             // [`state::ClusterRecord::vended_logs`]).
@@ -1086,9 +1089,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the cluster's log group and the stream of each enabled type are provisioned
         // here, beside the cluster's other managed resources. A create that enables no
         // type provisions none, which is what `ControlPlaneLogExport::of` answers `None`
-        // for.
+        // for. What CloudWatch Logs took is recorded on the cluster, so a type it did not
+        // take stays owed and the next read of the cluster exports it
+        // ([`state::export_owed_control_plane_logs`]).
         if let Some(export) = log_export.as_ref() {
-            state::export_control_plane_logs(ctx, &region, export).await;
+            state::export_control_plane_logs_and_record(ctx, &store, &region, &key, export).await;
         }
 
         Ok(CreateClusterOutput {

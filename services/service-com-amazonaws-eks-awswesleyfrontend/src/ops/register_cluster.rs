@@ -442,6 +442,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // manages, and a connected cluster has none, so no analysis of one
             // ever completes.
             insights_analyzed_at: None,
+            // A connected cluster has no Amazon EKS control plane to export logs from,
+            // and no `logging` configuration either, so it owes CloudWatch Logs nothing.
+            exported_log_types: Vec::new(),
             // Nothing in this API configures vended log delivery for a cluster, so
             // a cluster this registration stores has none (see
             // [`crate::state::ClusterRecord::vended_logs`]).
