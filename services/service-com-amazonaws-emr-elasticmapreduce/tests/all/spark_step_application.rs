@@ -308,6 +308,50 @@ spark.stop()
             ends: Ends::Completed(vec![("out/version.txt".to_string(), "3.5.5".to_string())]),
         },
         Case {
+            label: "an application that reads its dataset back through the forms a frame's own \
+                    columns take",
+            source: Some(
+                r#"
+import sys
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+frame = spark.createDataFrame(
+    [(index, "n%d" % index, index * 1.5) for index in range(10)],
+    "id bigint, name string, amount double",
+)
+frame.write.mode("overwrite").parquet(sys.argv[1])
+# A read naming no format reads the session's default source format.
+read = spark.read.load(sys.argv[1])
+# A column by attribute, a column by subscript, a filter spelled as SQL text, and the
+# rows as the JSON documents `toJSON` answers.
+probed = read.filter(read.id == 7).collect()[0]
+subscript = read.filter(read["name"] == "n3").collect()[0]
+counted = read.filter("amount > 12").count()
+documents = read.filter(read.id == 0).toJSON().collect()
+text = "%s|%s|%d|%s" % (probed["name"], subscript["id"], counted, documents[0])
+path = spark._jvm.org.apache.hadoop.fs.Path(sys.argv[2])
+out = path.getFileSystem(spark._jsc.hadoopConfiguration()).create(path, True)
+out.write(bytearray(text.encode("utf-8")))
+out.close()
+spark.stop()
+"#
+                .to_string(),
+            ),
+            submits_jar: false,
+            arguments: vec![
+                format!("s3://{BUCKET}/out/columns"),
+                format!("s3://{BUCKET}/out/columns.txt"),
+            ],
+            // The row the attribute form probed, the id the subscript form probed, how many
+            // rows the SQL-text filter kept (only `9 * 1.5`), and the first row as JSON —
+            // this suite's own arithmetic over the ten rows the program names.
+            ends: Ends::Completed(vec![(
+                "out/columns.txt".to_string(),
+                "n7|3|1|{\"id\": 0, \"name\": \"n0\", \"amount\": 0.0}".to_string(),
+            )]),
+        },
+        Case {
             label: "an application that raises",
             source: Some(
                 r#"

@@ -291,9 +291,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             release_label: input.release_label,
             r#type: engine_type.to_string(),
-            // A new application is not usable the instant the create returns; the clock
-            // owes it `CREATED` once the transition span has passed.
-            state: "CREATING".to_string(),
+            // The create ALLOCATES NOTHING — it writes this record — so the application
+            // is `CREATED` as of the call that wrote it, with no span for the next read to
+            // out-wait (`crate::state::LIFECYCLE_TRANSITION` states why, and which legs
+            // keep a span).
+            state: "CREATED".to_string(),
             state_details: Some(crate::state::CREATED_STATE_DETAILS.to_string()),
             initial_capacity: input.initial_capacity,
             maximum_capacity: input.maximum_capacity,
@@ -335,11 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             application_id.clone(),
             crate::state::ApplicationRecord {
                 application,
-                pending: Some(crate::state::PendingState {
-                    due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
-                    state: "CREATED".to_string(),
-                    state_details: None,
-                }),
+                // Nothing is owed: the application this call wrote is already the one a
+                // later read reports.
+                pending: None,
                 job_runs: ::std::collections::BTreeMap::new(),
                 job_run_tokens: ::std::collections::HashMap::new(),
                 next_job_run_seq: 0,

@@ -868,35 +868,33 @@ async fn get_application_reports_exactly_what_the_create_stored() {
     }
 }
 
-/// A created application is not usable the instant the create returns: it reports the
-/// transient state to a caller acting straight away, and the clock owes it the settled
-/// one without any further call. The same holds for a start and for a stop.
+/// A created application is usable as soon as the create answers: the create allocates
+/// nothing and its response carries no state at all, so the record it wrote is already
+/// `CREATED` for the read that follows it. A START and a STOP move capacity, so each
+/// reports its transient state to a caller acting straight away and the clock owes it the
+/// settled one without any further call.
 #[tokio::test]
 async fn every_lifecycle_call_reports_its_transient_state_until_the_clock_settles_it() {
     let router = emulator();
 
-    // (case, the transient state, the settled state, how to start the transition)
-    let started_at = Instant::now();
     let created = create_application(&router, minimal_create("tok-transient")).await;
     let id = created
         .at("/applicationId")
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let immediately = get_application(&router, &id).await;
-    if started_at.elapsed() < LIFECYCLE_TRANSITION {
-        assert_eq!(
-            immediately.at("/application/state"),
-            json!("CREATING"),
-            "case create: a caller acting inside the transition span sees CREATING, got {:?}",
-            immediately.at("/application/state")
-        );
-    }
+    assert_eq!(
+        get_application(&router, &id).await.at("/application/state"),
+        json!("CREATED"),
+        "case create: the application the create wrote must be CREATED for the read that \
+         follows it, got {:?}",
+        get_application(&router, &id).await.at("/application/state")
+    );
     wait_for_transition();
     assert_eq!(
         get_application(&router, &id).await.at("/application/state"),
         json!("CREATED"),
-        "case create: the clock owes the application CREATED"
+        "case create: and it stays CREATED, with no transition owed"
     );
 
     let started_at = Instant::now();
@@ -1130,8 +1128,9 @@ async fn an_id_that_names_nothing_is_refused() {
 /// `DeleteApplication` documents its precondition — "An application has to be in a
 /// stopped or created state in order to be deleted" — judged against the state the
 /// application has SETTLED on: it admits a transition on its way to `CREATED` or
-/// `STOPPED` and refuses one on its way to `STARTED`. An accepted delete leaves the
-/// application readable in the terminal `TERMINATED` state.
+/// `STOPPED`, refuses one on its way to `STARTED`, and refuses an application STANDING on a
+/// status the documented set does not name. An accepted delete leaves the application
+/// readable in the terminal `TERMINATED` state.
 #[tokio::test]
 async fn delete_application_admits_the_states_that_settle_on_the_ones_it_documents() {
     // One row per `ApplicationState` a client can put an application into: the state it
@@ -1139,7 +1138,7 @@ async fn delete_application_admits_the_states_that_settle_on_the_ones_it_documen
     // the `ApplicationState` enum (`CREATING`, `CREATED`, `STARTING`, `STARTED`,
     // `STOPPING`, `STOPPED`, `TERMINATED`), every value of which is a row here.
     let cases = [
-        ("CREATING", "CREATED", 200),
+        ("CREATING", "CREATING", 400),
         ("CREATED", "CREATED", 200),
         ("STARTING", "STARTED", 400),
         ("STARTED", "STARTED", 400),
@@ -1149,7 +1148,7 @@ async fn delete_application_admits_the_states_that_settle_on_the_ones_it_documen
     ];
 
     for (state, settles_on, expected_status) in cases {
-        let router = emulator();
+        let (router, engine) = emulator_with_engine();
         let created = create_application(&router, minimal_create("tok-delete")).await;
         let id = created
             .at("/applicationId")
@@ -1157,7 +1156,11 @@ async fn delete_application_admits_the_states_that_settle_on_the_ones_it_documen
             .unwrap_or_default()
             .to_string();
         match state {
-            "CREATING" => {}
+            // A create settles at the call, so no sequence of calls leaves an application
+            // standing on CREATING: the row reaches that status through the store the
+            // handlers share — the same seam the status-gate suite parks a record on — and
+            // the gate has to judge it like any other value of the enum.
+            "CREATING" => super::application_status_gates::park_on(&engine, &id, "CREATING"),
             "CREATED" => wait_for_transition(),
             "STARTING" => {
                 wait_for_transition();
@@ -3408,6 +3411,155 @@ async fn every_reported_instant_carries_at_most_millisecond_resolution() {
             "a session the clock has started",
             member,
             &live.at(&format!("/session/{member}")),
+        );
+    }
+}
+
+/// RULE: the lifecycle legs this emulator PACES are the ones that move capacity. A
+/// `CreateApplication` moves none — it writes the application record, and
+/// `CreateApplicationResponse` carries no `state` member at all for a transient state to be
+/// reported in (`smithy_query(query="operation",operation="CreateApplication")`) — so the
+/// application a create wrote is already SETTLED for the read that FOLLOWS the call, whatever
+/// that create named, and a precondition judged against the application's state admits
+/// straight away what `CREATED` admits. The paced legs keep their transient state, which
+/// [`every_lifecycle_call_reports_its_transient_state_until_the_clock_settles_it`] pins;
+/// what this one pins is that a client driving this lifecycle by POLLING `GetApplication`
+/// is never made to look a second time for a state the create had already reached — a client
+/// that looks on the order of seconds would otherwise spend a whole interval of its own per
+/// leg.
+///
+/// The rows differ along what the rule generalises over: what the create NAMES — nothing
+/// beyond the required members, the auto-start and auto-stop configurations, pre-initialised
+/// capacity, a name and tags — none of which is work this service performs before it answers.
+#[tokio::test]
+async fn a_create_leaves_the_application_settled_for_the_read_that_follows_it() {
+    // (case, the body the create carries)
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a create naming nothing but the required members",
+            minimal_create("tok-settled-minimal"),
+        ),
+        (
+            "a create naming auto start and auto stop",
+            json!({
+                "clientToken": "tok-settled-auto",
+                "releaseLabel": "emr-6.15.0",
+                "type": "SPARK",
+                "autoStartConfiguration": { "enabled": true },
+                "autoStopConfiguration": { "enabled": true, "idleTimeoutMinutes": 1 },
+            }),
+        ),
+        (
+            "a create naming pre-initialised capacity",
+            json!({
+                "clientToken": "tok-settled-capacity",
+                "releaseLabel": "emr-7.1.0",
+                "type": "SPARK",
+                "initialCapacity": {
+                    "Driver": {
+                        "workerCount": 1,
+                        "workerConfiguration": { "cpu": "2 vCPU", "memory": "4 GB" },
+                    }
+                },
+                "maximumCapacity": { "cpu": "8 vCPU", "memory": "32 GB" },
+            }),
+        ),
+        (
+            "a create naming a name and tags",
+            json!({
+                "clientToken": "tok-settled-named",
+                "releaseLabel": "emr-7.1.0",
+                "type": "HIVE",
+                "name": "settled-at-the-create",
+                "tags": { "owner": "batch" },
+            }),
+        ),
+    ];
+
+    for (case, body) in rows {
+        let router = emulator();
+        let created = create_application(&router, body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateApplication expected 200, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created
+            .at("/applicationId")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        // The FIRST read after the create, with nothing waited out: the state is the one the
+        // create left, and the detail that goes with it is a `String256` sentence rather than
+        // an omission.
+        let first = get_application(&router, &id).await;
+        assert_eq!(
+            first.at("/application/state"),
+            json!("CREATED"),
+            "case {case:?}: the read that follows the create must report CREATED, got {:?}",
+            first.at("/application/state")
+        );
+        let details = first.at("/application/stateDetails");
+        assert!(
+            details
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty() && text.chars().count() <= 256),
+            "case {case:?}: a created application reports its state detail, got {details:?}"
+        );
+
+        // Nothing is owed, so a second read answers the same thing: the state does not move
+        // because it was read, nor because a span later passed.
+        wait_for_transition();
+        let again = get_application(&router, &id).await;
+        assert_eq!(
+            again.at("/application/state"),
+            json!("CREATED"),
+            "case {case:?}: the application must stay CREATED, got {:?}",
+            again.at("/application/state")
+        );
+        assert_eq!(
+            again.at("/application/stateDetails"),
+            details,
+            "case {case:?}: the detail must not move either, got {:?}",
+            again.at("/application/stateDetails")
+        );
+
+        // The INVENTORY reports the state the single read reports: one record, two readers.
+        let listed = list_applications(&router, "").await;
+        let in_listing = listed
+            .body
+            .get("applications")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(id.as_str()))
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            in_listing["state"],
+            json!("CREATED"),
+            "case {case:?}: ListApplications must report the created application CREATED, \
+             got {in_listing:?}"
+        );
+
+        // And the precondition a start is judged against admits it at once: a client does not
+        // have to look again before it may act on the application it just created.
+        let started = start_application(&router, &id).await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: StartApplication on the application just created expected 200, \
+             got {} with {:?}",
+            started.status, started.body
+        );
+        // The START is the paced leg: the clock owes it its settled state, which a poll for
+        // that CONDITION reaches.
+        let live = application_in_state(&router, &id, "STARTED").await;
+        assert_eq!(
+            live.at("/application/state"),
+            json!("STARTED"),
+            "case {case:?}: the clock must owe the start STARTED, got {:?}",
+            live.at("/application/state")
         );
     }
 }

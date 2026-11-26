@@ -496,7 +496,9 @@ class DataFrameReader(object):
         if schema is not None:
             self.schema(schema)
         self.options(**named)
-        return self._read(format or self._format or "csv", path)
+        # The format a read names NOTHING for is the session's default source format,
+        # `spark.sql.sources.default`, which is `parquet`.
+        return self._read(format or self._format or "parquet", path)
 
     def csv(self, path, schema=None, **named):
         if schema is not None:
@@ -929,6 +931,52 @@ class DataFrame(object):
         print(self.schema.simpleString())
         return None
 
+    def __getattr__(self, name):
+        """The column this dataset holds under `name`.
+
+        `DataFrame.__getattr__` "returns the Column denoted by name", which is how an
+        application writes `frame.id` for the column `id`. A name this dataset holds no
+        column under is no attribute of it, so it raises exactly as any other missing
+        attribute does — a program asking `hasattr` about one is told the truth.
+        """
+        if name.startswith("_"):
+            raise AttributeError("'DataFrame' object has no attribute %r" % (name,))
+        if name in (self.__dict__.get("_columns") or []):
+            return _field(name)
+        raise AttributeError("'DataFrame' object has no attribute %r" % (name,))
+
+    def __getitem__(self, item):
+        """What `DataFrame.__getitem__` answers for each of the forms it takes: a NAME or a
+        POSITION is the column it names, a LIST of them is the projection of those columns,
+        and a column EXPRESSION is the rows it holds for (`frame[frame.id > 3]`).
+        """
+        if isinstance(item, Column):
+            return self.filter(item)
+        if isinstance(item, (list, tuple)):
+            return self.select(*item)
+        if isinstance(item, bool):
+            raise AnalysisException("a column is named by a name, a position or an expression")
+        if isinstance(item, int):
+            if item < 0 or item >= len(self._columns):
+                raise AnalysisException(
+                    "this dataset holds no column at position %d" % (item,)
+                )
+            return _field(self._columns[item])
+        return self._resolved(str(item))
+
+    def toJSON(self, use_unicode=True):
+        """This dataset as the strings `DataFrame.toJSON` answers: "a new RDD of JSON
+        strings", one per row, each the row's own columns as a JSON document.
+        """
+        import json
+
+        return RDD(
+            slices(
+                [json.dumps(row.asDict(), default=str) for row in self._frame_rows()],
+                self._partitions,
+            )
+        )
+
     def _column_type(self, name):
         """The type the column `name` carries: the one it was built with, or the one the first
         value of it that is not null has."""
@@ -1327,9 +1375,13 @@ class DataFrame(object):
     def filter(self, condition):
         """The rows of this dataset the condition holds for.
 
-        The condition is a column expression over a row ([`pyspark.sql.column`]) or a
-        function of one, which is what a filter of this engine applies to each row.
+        `DataFrame.filter` takes "a Column of types.BooleanType or a string of SQL
+        expressions", so a condition spelled as SQL text is read by the same expression
+        grammar `selectExpr` reads ([`pyspark.sql.expression`]) and then applied to each row
+        exactly as a column expression is; a function of a row is applied the same way.
         """
+        if isinstance(condition, str):
+            condition = read_sql_expression(condition)
         if isinstance(condition, Column):
             kept = [row for row in self._frame_rows() if condition.of(row)]
         elif callable(condition):

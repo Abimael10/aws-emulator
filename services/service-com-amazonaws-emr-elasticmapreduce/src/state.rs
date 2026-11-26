@@ -353,6 +353,12 @@ pub use session_credentials::*;
 mod step_logs;
 pub use step_logs::*;
 
+/// The work a launched cluster OWES — its bootstrap actions, the applications its steps
+/// submitted and the commands they ran — carried out by a task of this process rather than
+/// only inside a caller's request, split out and re-exported the same way.
+mod cluster_work_driver;
+pub use cluster_work_driver::*;
+
 /// The gzipped LOG FILES a cluster's NODES leave under the same `LogUri` — the directory of
 /// each bootstrap action a node ran and the node's own instance-state file — split out and
 /// re-exported the same way.
@@ -2181,6 +2187,16 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// once however often its step is read. An entry goes as soon as the run answers or is
     /// given up on, so this holds no more entries than there are steps still running.
     step_application_runs: BTreeMap<String, PendingApplicationRun>,
+    /// The clusters whose owed applications a runner of this process is performing right now
+    /// ([`run_due_step_applications`]), by cluster id: one runner per cluster at a time, so a
+    /// submitted application runs ONCE however many callers and drivers find it owed. An entry
+    /// goes when that runner ends, however it ends.
+    step_application_runners: BTreeSet<String>,
+    /// The task driving the work ONE cluster owes, by cluster id ([`drive_cluster_work`]),
+    /// kept so a driver can be abandoned rather than merely forgotten and so one cluster
+    /// never has two. An entry goes when its driver ends, so this holds no more entries than
+    /// there are clusters with work in flight.
+    step_work_drivers: BTreeMap<String, ::tokio::task::JoinHandle<()>>,
 }
 
 /// The account's default configuration is in place before any caller puts one, so the
@@ -2216,6 +2232,8 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             cluster_clock_pump: None,
             notebook_runs: BTreeMap::new(),
             step_application_runs: BTreeMap::new(),
+            step_application_runners: BTreeSet::new(),
+            step_work_drivers: BTreeMap::new(),
         }
     }
 }

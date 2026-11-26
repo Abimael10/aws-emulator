@@ -356,6 +356,16 @@ pub async fn run_due_step_applications<Eng: Send + Sync + 'static>(
             _ => return,
         }
     };
+    // ONE runner performs a cluster's owed applications at a time. The plans are read under
+    // this store's guard and an application runs with that guard RELEASED — it is
+    // caller-supplied code and may not be held under a lock — so two runners that overlapped
+    // would both find the same plan owed and run one submitted application TWICE. The claim
+    // is what makes it run once, whether the second runner is another client's read or the
+    // task driving the cluster's own work ([`super::drive_cluster_work`]); the runner that
+    // holds it performs what the cluster owes inside this same window.
+    let Some(_claim) = StepApplicationRunnerClaim::take(&state, cluster_id) else {
+        return;
+    };
     // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
     // once for this call: the credential an application whose step carries no runtime role of
     // its own presents, which is nothing at all where that profile carries no role those
@@ -531,6 +541,45 @@ impl ComAmazonawsEmrElasticmapreduceState {
     /// Hold `pending` under `key` until a later call collects its answer.
     fn hold_step_application_run(&mut self, key: String, pending: PendingApplicationRun) {
         self.step_application_runs.insert(key, pending);
+    }
+}
+
+/// The claim ONE runner of a cluster's owed applications holds while it performs them.
+///
+/// Taken for the whole of [`run_due_step_applications`] and given back however that function
+/// ends — which is what a `Drop` claim is for, since it ends at several places — so a cluster
+/// never has two runners starting the same step's application.
+struct StepApplicationRunnerClaim {
+    state: ::engine::ServiceState<ComAmazonawsEmrElasticmapreduceState>,
+    cluster_id: String,
+}
+
+impl StepApplicationRunnerClaim {
+    /// The claim on `cluster_id`, or `None` when another runner already holds it.
+    fn take(
+        state: &::engine::ServiceState<ComAmazonawsEmrElasticmapreduceState>,
+        cluster_id: &str,
+    ) -> Option<Self> {
+        if !state
+            .lock()
+            .step_application_runners
+            .insert(cluster_id.to_string())
+        {
+            return None;
+        }
+        Some(Self {
+            state: ::engine::ServiceState::clone(state),
+            cluster_id: cluster_id.to_string(),
+        })
+    }
+}
+
+impl Drop for StepApplicationRunnerClaim {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .step_application_runners
+            .remove(&self.cluster_id);
     }
 }
 

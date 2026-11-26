@@ -192,13 +192,25 @@ pub const EXTENDED_SUPPORT_ENABLED: bool = false;
 pub const EXTENDED_SUPPORT_SOURCE: &str = "ACCOUNT";
 
 /// How long a resource stays in the state the call that started the work returned
-/// (`CREATING` after a create, `STARTING` after a start, `STOPPING` after a stop,
-/// `CANCELLING` after a cancel) before the clock owes it the settled state.
+/// (`STARTING` after a start, `STOPPING` after a stop, `CANCELLING` after a cancel)
+/// before the clock owes it the settled state.
 ///
 /// EMR Serverless takes seconds to minutes; the emulator CHOOSES this span, and it is
 /// deliberately not zero so a caller acting straight after the call still observes the
 /// transient state. The due instant is stored on the record and materialised by
 /// whichever later call reads it — nothing sleeps.
+///
+/// It paces the legs that MOVE CAPACITY, and only those. A `CreateApplication` paces
+/// nothing: it writes the application record and allocates no worker, its response carries
+/// no `state` member at all to report `CREATING` in
+/// (`smithy_query(query="operation",operation="CreateApplication")`), and the state an
+/// application's own members describe is what the call that wrote them has already left — so
+/// the record it stores is SETTLED on `CREATED` and the next read reports that. A span there
+/// would be a span nothing shows the caller and that the caller's next read, landing
+/// milliseconds later over a loopback endpoint, could only out-wait by polling: a client
+/// that drives this lifecycle by polling `GetApplication` on an interval of its own would
+/// pay a whole interval of it per leg, and a flow of several legs would not finish inside
+/// its budget.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
 /// How long a submitted job run spends in EACH of the non-terminal `JobRunState` values

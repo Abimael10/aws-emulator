@@ -258,6 +258,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
+        // Amazon EMR runs the queue itself, from the instant the cluster is ready: the steps
+        // this call submitted are performed by a task of this process rather than waiting for
+        // whoever reports them next ([`crate::state::drive_cluster_work`]), so a client that
+        // polls `DescribeStep` on an interval of its own learns what each step came to as soon
+        // as the work answered.
+        crate::state::drive_cluster_work(
+            &self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.job_flow_id,
+        );
+
         Ok(AddJobFlowStepsOutput {
             step_ids: Some(step_ids),
         })

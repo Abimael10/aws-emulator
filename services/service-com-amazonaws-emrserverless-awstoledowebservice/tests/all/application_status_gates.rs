@@ -342,10 +342,11 @@ fn assert_refused_start(case: &str, application_id: &str, answer: &Answer) {
 /// share — the seam the idle suite rewinds a record's own clock through.
 ///
 /// It is how a row reaches a SETTLED status that no sequence of calls leaves behind: the
-/// clock owes a `CREATING` or a `STOPPING` application a settled status, so over HTTP the
-/// gate never finds one standing on either. The status itself is an ordinary value of the
-/// model's `ApplicationState` enum, and the gate has to judge it like any other.
-fn park_on(engine: &engine::InMemoryEngine, application_id: &str, status: &str) {
+/// clock owes a `STOPPING` application a settled status, and a create leaves none standing
+/// on `CREATING` at all, so over HTTP the gate never finds one standing on either. The
+/// status itself is an ordinary value of the model's `ApplicationState` enum, and the gate
+/// has to judge it like any other.
+pub(crate) fn park_on(engine: &engine::InMemoryEngine, application_id: &str, status: &str) {
     let state = engine.state::<ComAmazonawsEmrserverlessAwstoledowebserviceState>();
     let mut store = state.lock();
     let record = store

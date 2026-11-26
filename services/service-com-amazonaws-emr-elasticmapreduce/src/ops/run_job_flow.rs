@@ -947,6 +947,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stays up — finish.
         crate::state::settle_cluster_events(&self.engine, ctx, &region);
 
+        // And the work the launch itself accepted — the bootstrap actions its nodes run and
+        // the queue of steps behind them — is carried out by a task of this process rather
+        // than waiting for whoever reports the cluster next
+        // ([`crate::state::drive_cluster_work`]): Amazon EMR runs a cluster's queue itself, so
+        // a client that polls `DescribeStep` on an interval of its own learns what each step
+        // came to as soon as the work answered rather than one step per poll.
+        crate::state::drive_cluster_work(&self.engine, ctx, &region, &id);
+
         Ok(RunJobFlowOutput {
             job_flow_id: Some(id),
             cluster_arn: Some(arn),
