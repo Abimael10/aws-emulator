@@ -21,9 +21,11 @@
 //! `Lifecycle`: a plan rule's own, the lifecycle of one of that rule's copy
 //! actions, the same rule stored by `UpdateBackupPlan`, and the lifecycle a
 //! `StartBackupJob` keeps its recovery point under. The condition is ONE, so
-//! every surface answers it the same way — one token, one `Context` and one
-//! sentence, the condition's own — whether the member sat inside one of a plan's
-//! rules or was taken by the operation itself.
+//! every surface reports the same token, the same `Context` and the same reason,
+//! whether the member sat inside one of a plan's rules or was taken by the
+//! operation itself; a reason the per-rule validation pass over a plan body's
+//! rules produced is stated after that pass's envelope, which
+//! `plan_rule_refusal_envelope.rs` owns the rule for.
 //!
 //! The request harness (`router`, `call`, `call_reported`) is the one
 //! `vault_and_backup_job.rs` exposes to this test binary, so there is ONE wire
@@ -46,6 +48,18 @@ const INTERVAL_CONTEXT: &str = "90";
 /// (`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`).
 const INTERVAL_REASON: &str = "Invalid lifecycle. DeleteAfterDays cannot be less than 90 days \
                                apart from MoveToColdStorageAfterDays";
+
+/// The envelope a reason the per-rule validation pass over a plan body's rules
+/// produced is stated after (`MESSAGE_BACKUP_PLAN_RULES_PREFIX`); which refusals
+/// carry it is `plan_rule_refusal_envelope.rs`'s rule, and this suite states
+/// only the sentence each surface it drives earns.
+const RULE_ENVELOPE: &str = "Error in some rules due to : ";
+
+/// The sentence a rule's OWN lifecycle earns, the member being one the per-rule
+/// pass judges.
+fn rule_sentence() -> String {
+    format!("{RULE_ENVELOPE}{INTERVAL_REASON}")
+}
 
 /// The vault every row's job and copy destination names.
 const VAULT: &str = "lifecycle-vault";
@@ -248,6 +262,14 @@ async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
     let body = plan_body(name, row.lifecycle(), on_rule);
     let (status, answered) = create_plan(&router, &body).await;
     if !row.served {
+        // The rule's own lifecycle is a member the per-rule pass judges, so its
+        // reason carries that pass's envelope; a copy action's lifecycle is
+        // judged with the copy action, so it is stated alone.
+        let sentence = if on_rule {
+            rule_sentence()
+        } else {
+            INTERVAL_REASON.to_string()
+        };
         assert_eq!(
             (
                 status,
@@ -258,7 +280,7 @@ async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
             (
                 400,
                 INTERVAL_CODE.to_string(),
-                INTERVAL_REASON.to_string(),
+                sentence,
                 INTERVAL_CONTEXT.to_string(),
             ),
             "case {surface}/{:?}: expected the interval refusal, got {status} \
@@ -309,7 +331,7 @@ async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
 
 /// Every surface that stores a plan body applies the interval rule: the rule's
 /// own lifecycle, a copy action's lifecycle, and the body an update stores. Each
-/// states the condition's own sentence, with nothing wrapped around it.
+/// reports the condition's own token, `Context` and reason.
 #[tokio::test]
 async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storage_interval() {
     for row in rows() {
@@ -362,7 +384,7 @@ async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storag
                 (
                     400,
                     INTERVAL_CODE.to_string(),
-                    INTERVAL_REASON.to_string(),
+                    rule_sentence(),
                     INTERVAL_CONTEXT.to_string(),
                 ),
                 "case UpdateBackupPlan/{:?}: expected the interval refusal, got \

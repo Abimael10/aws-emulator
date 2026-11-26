@@ -1084,9 +1084,11 @@ pub const MESSAGE_LATEST_BACKUP_PLAN_VERSION_UNREADABLE_SUFFIX: &str =
 /// which reason is reported in `Context` and in the sentence, not in the token.
 pub const ERROR_CODE_BACKUP_PLAN_RULE_INVALID: &str = "ERROR_3015";
 
-/// The FIXED text that opens the sentence AWS states for that class; the
-/// per-rule validation reason follows it, and is also carried whole in
-/// `Context` ([`rejected_backup_plan_rule`]).
+/// The FIXED text that opens the sentence AWS states for a plan body refused
+/// for one of its RULES; the reason that rule failed follows it
+/// ([`within_plan_rule`]), and a reason of the class whose token is
+/// [`ERROR_CODE_BACKUP_PLAN_RULE_INVALID`] is carried whole in `Context` too
+/// ([`rejected_backup_plan_rule`]).
 pub const MESSAGE_BACKUP_PLAN_RULES_PREFIX: &str = "Error in some rules due to : ";
 
 /// The FIXED text that opens the per-rule reason for a `ScheduleExpression`
@@ -1663,26 +1665,42 @@ pub fn latest_backup_plan_version_unreadable(plan_arn: &str) -> ResourceNotFound
 /// The modelled refusal for a RULE of a backup plan body AWS Backup does not
 /// accept, stated by the per-rule validation `reason`.
 ///
-/// ONE builder for the class, so no operation that stores a plan body words it
-/// differently: AWS reports the class's own `Code`
-/// ([`ERROR_CODE_BACKUP_PLAN_RULE_INVALID`]), carries the per-rule reason whole
-/// in `Context` — the member a client reads to learn what the rule got wrong —
-/// and states that same reason after the class's fixed prefix
-/// ([`MESSAGE_BACKUP_PLAN_RULES_PREFIX`]).
-///
-/// The envelope belongs to THIS class — the per-rule validations AWS Backup runs
-/// over a rule it is about to schedule jobs from, whose reasons it reports
-/// together under one token — and not to every condition a member inside a rule
-/// can meet: a condition with a token of its own is stated by its own builder,
-/// with its own sentence, wherever the member that carries it sits
-/// ([`rejected_lifecycle`], [`rejected_backup_vault_arn`]).
+/// ONE builder for the conditions a rule can fail that have NO token of their
+/// own, so no operation that stores a plan body words one differently: AWS
+/// reports the class's own `Code` ([`ERROR_CODE_BACKUP_PLAN_RULE_INVALID`]),
+/// carries the reason whole in `Context` — the member a client reads to learn
+/// what the rule got wrong — and states that reason as the per-rule failure it
+/// is ([`within_plan_rule`]).
 pub fn rejected_backup_plan_rule(reason: &str) -> InvalidParameterValueException {
-    InvalidParameterValueException {
+    within_plan_rule(InvalidParameterValueException {
         code: Some(ERROR_CODE_BACKUP_PLAN_RULE_INVALID.to_string()),
-        message: Some(format!("{MESSAGE_BACKUP_PLAN_RULES_PREFIX}{reason}")),
+        message: Some(reason.to_string()),
         context: Some(reason.to_string()),
         ..Default::default()
+    })
+}
+
+/// `refusal`, worded as the PER-RULE validation failure it is.
+///
+/// AWS Backup validates each RULE of a submitted plan body before it stores any
+/// of it, and states the reason a rule failed after this class's fixed envelope
+/// ([`MESSAGE_BACKUP_PLAN_RULES_PREFIX`]) — the envelope is how the answer marks
+/// the body as refused for one of its rules rather than for a top-level plan
+/// parameter, so nothing from the request enters it. The condition's own `Code`
+/// and `Context` are left as the condition states them: the envelope words WHERE
+/// the failure was found, while the token still says WHICH condition was met
+/// ([`rejected_lifecycle`]).
+///
+/// A condition met outside that per-rule pass keeps its sentence alone — the
+/// lifecycle or destination vault ARN of one of a rule's copy actions, which the
+/// copy action is judged by, and the lifecycle an operation takes itself.
+pub fn within_plan_rule(
+    mut refusal: InvalidParameterValueException,
+) -> InvalidParameterValueException {
+    if let Some(reason) = refusal.message.take() {
+        refusal.message = Some(format!("{MESSAGE_BACKUP_PLAN_RULES_PREFIX}{reason}"));
     }
+    refusal
 }
 
 /// The modelled refusal for a call that would act under an IAM role AWS Backup
@@ -2460,14 +2478,19 @@ pub fn lifecycle_keeps_cold_storage_interval(lifecycle: Option<&Lifecycle>) -> b
 /// The modelled refusal for a `Lifecycle` AWS Backup does not accept, or `None`
 /// when the lifecycle is one it does.
 ///
-/// ONE refusal for the condition, stated the same way wherever a lifecycle is
-/// stated — a plan rule's own, the lifecycle of one of that rule's copy actions,
-/// and the lifecycle a job or a recovery-point update carries — because the
-/// condition is one: the class's own token
-/// ([`ERROR_CODE_LIFECYCLE_COLD_STORAGE_INTERVAL`]), the condition's fixed
-/// sentence ([`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`]), and the interval the
-/// service enforces in `Context`, which is the only variable part — a client
-/// reads the required spread in days from it rather than from the sentence.
+/// ONE refusal for the condition wherever a lifecycle is stated — a plan rule's
+/// own, the lifecycle of one of that rule's copy actions, and the lifecycle a
+/// job or a recovery-point update carries — because the condition is one: the
+/// class's own token ([`ERROR_CODE_LIFECYCLE_COLD_STORAGE_INTERVAL`]), the
+/// condition's fixed sentence ([`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`]), and
+/// the interval the service enforces in `Context`, which is the only variable
+/// part — a client reads the required spread in days from it rather than from
+/// the sentence.
+///
+/// Where the member that carried it is one of a plan RULE's own, the plan-body
+/// check states this reason as the per-rule validation failure it is
+/// ([`within_plan_rule`]); the token and `Context` are the condition's either
+/// way.
 pub fn rejected_lifecycle(lifecycle: Option<&Lifecycle>) -> Option<InvalidParameterValueException> {
     if lifecycle_keeps_cold_storage_interval(lifecycle) {
         return None;
@@ -2525,10 +2548,15 @@ pub enum RejectedBackupPlanBody {
 /// * every `Lifecycle` the rule carries \u2014 its own and each copy action's \u2014
 ///   leaves the interval the model requires between the transition to cold
 ///   storage and the deletion ([`rejected_lifecycle`]), stated with that
-///   condition's own sentence;
+///   condition's own token and `Context`;
 /// * the members that name a BACKUP VAULT by ARN carry one
 ///   ([`rejected_backup_vault_arn`]), rather than a rule being stored whose
 ///   destination no vault ARN resolves to.
+///
+/// Every one of those checks that judges a member of a RULE states its reason as
+/// the per-rule validation failure it is ([`within_plan_rule`]), whichever
+/// condition the rule failed; what a nested copy action is judged by, and the
+/// body-level conditions above the per-rule walk, state their own sentences.
 pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBackupPlanBody> {
     if plan.rules.is_empty() {
         return Some(RejectedBackupPlanBody::NoRules(backup_plan_no_rules()));
@@ -2543,14 +2571,16 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
             .iter()
             .any(|earlier| earlier.rule_name == rule.rule_name)
         {
-            return Some(RejectedBackupPlanBody::Value(InvalidParameterValueException {
-                message: Some(format!(
-                    "RuleName {} is used by more than one rule; rule names must be \
-                     unique within a backup plan",
-                    rule.rule_name
-                )),
-                ..Default::default()
-            }));
+            return Some(RejectedBackupPlanBody::Value(within_plan_rule(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "RuleName {} is used by more than one rule; rule names must be \
+                         unique within a backup plan",
+                        rule.rule_name
+                    )),
+                    ..Default::default()
+                },
+            )));
         }
         for (member, minutes, minimum) in [
             (
@@ -2561,7 +2591,7 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
             ("CompletionWindowMinutes", rule.completion_window_minutes, 0),
         ] {
             if let Some(refusal) = rejected_window_minutes(member, minutes, minimum) {
-                return Some(RejectedBackupPlanBody::Value(refusal));
+                return Some(RejectedBackupPlanBody::Value(within_plan_rule(refusal)));
             }
         }
         // A rule initiates its jobs from its `ScheduleExpression`, so a rule
@@ -2576,18 +2606,18 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         // The lifecycle of the rule, and of each of its copy actions, keeps the
         // interval the model requires between a transition to cold storage and
         // the deletion that follows it; one that does not is refused as the
-        // LIFECYCLE it is, with the class's own token, `Context` and sentence
-        // ([`rejected_lifecycle`]) — the same answer wherever a lifecycle is
-        // stated, since the condition is a parameter value's own and not one of
-        // the per-rule validations the rule-error envelope marks.
-        let lifecycles = ::std::iter::once(rule.lifecycle.as_ref()).chain(
-            rule.copy_actions
-                .iter()
-                .flatten()
-                .map(|copy| copy.lifecycle.as_ref()),
-        );
-        for lifecycle in lifecycles {
-            if let Some(refusal) = rejected_lifecycle(lifecycle) {
+        // LIFECYCLE it is, with the condition's own token, `Context` and
+        // sentence ([`rejected_lifecycle`]) — the same token and reason wherever
+        // a lifecycle is stated. The rule's OWN lifecycle is one of the members
+        // the per-rule pass judges, so its reason is stated as that pass states
+        // one ([`within_plan_rule`]); the lifecycle of a copy action is judged
+        // with the copy action, so it keeps its sentence alone, as the one an
+        // operation takes itself does.
+        if let Some(refusal) = rejected_lifecycle(rule.lifecycle.as_ref()) {
+            return Some(RejectedBackupPlanBody::Value(within_plan_rule(refusal)));
+        }
+        for copy in rule.copy_actions.iter().flatten() {
+            if let Some(refusal) = rejected_lifecycle(copy.lifecycle.as_ref()) {
                 return Some(RejectedBackupPlanBody::Value(refusal));
             }
         }
@@ -2596,18 +2626,17 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         // types each as `ARN` with no pattern, so the narrower check is the one
         // that applies: a value that is the ARN of something else names no
         // vault a copy could be written to.
-        let vault_arns = rule
-            .target_logically_air_gapped_backup_vault_arn
-            .as_deref()
-            .into_iter()
-            .chain(
-                rule.copy_actions
-                    .iter()
-                    .flatten()
-                    .map(|copy| copy.destination_backup_vault_arn.as_str()),
-            );
-        for arn in vault_arns {
+        //
+        // The member on the RULE is judged by the per-rule pass, so its reason
+        // is stated as that pass states one; a copy action's destination is
+        // judged with the copy action, so it keeps its sentence alone.
+        if let Some(arn) = rule.target_logically_air_gapped_backup_vault_arn.as_deref() {
             if let Some(refusal) = rejected_backup_vault_arn(arn) {
+                return Some(RejectedBackupPlanBody::Value(within_plan_rule(refusal)));
+            }
+        }
+        for copy in rule.copy_actions.iter().flatten() {
+            if let Some(refusal) = rejected_backup_vault_arn(&copy.destination_backup_vault_arn) {
                 return Some(RejectedBackupPlanBody::Value(refusal));
             }
         }

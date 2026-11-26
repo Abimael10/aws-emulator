@@ -88,13 +88,14 @@ const SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceeded";
 const CRON_INVALID_MESSAGE: &str =
     "Error in some rules due to : Cron expression is not valid: Invalid cron expression";
 
-/// The sentence it words for a `Lifecycle` whose deletion falls less than the required
-/// interval after the transition to cold storage — fixed text naming the two members and
-/// the interval, quoting neither day count (the model's own rule for `DeleteAfterDays`:
-/// "must be at least 90 days after the number of days specified in
+/// The sentence it words for a plan RULE whose `Lifecycle` leaves less than the required
+/// interval between the transition to cold storage and the deletion that follows it: the
+/// per-rule validation envelope's fixed prefix followed by that rule's reason, which names
+/// the two members and the interval and quotes neither day count (the model's own rule for
+/// `DeleteAfterDays`: "must be at least 90 days after the number of days specified in
 /// `MoveToColdStorageAfterDays`").
-const LIFECYCLE_MESSAGE: &str = "Invalid lifecycle. DeleteAfterDays cannot be less than 90 \
-                                 days apart from MoveToColdStorageAfterDays";
+const LIFECYCLE_MESSAGE: &str = "Error in some rules due to : Invalid lifecycle. DeleteAfterDays \
+                                 cannot be less than 90 days apart from MoveToColdStorageAfterDays";
 
 /// The sentence it words for a member of the request whose value it cannot accept, whose one
 /// variable part is the member it rejected — here the vault's key reference, which that
