@@ -205,12 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.group_exists(&input.name) {
-            return Err(CreateScheduleGroupErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!("Schedule group {} already exists.", input.name),
-                },
-            )
-            .into());
+            // The two forms of this conflict: a request that carries TAGS would have
+            // written the held group's tags, so it collided with a group another
+            // writer holds — reported as that group's concurrent modification, named
+            // by its ARN. A request that carries none asks only for the name, so it
+            // is reported as the name being taken. Neither touches the held group.
+            let held = store.group_record(&region, &input.name);
+            let message = match (tags.is_empty(), held) {
+                (false, Some(held)) => crate::state::group_modified_concurrently(&held.arn),
+                _ => crate::state::group_already_exists(&input.name),
+            };
+            return Err(
+                CreateScheduleGroupErrorModeled::ConflictException(ConflictException { message })
+                    .into(),
+            );
         }
 
         if store.groups.len() >= crate::state::MAX_SCHEDULE_GROUPS {

@@ -253,6 +253,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| {
                 crate::state::schedule_window_violation(input.start_date, input.end_date, now)
             })
+            // An update is held to the same reachability rule a create is: an
+            // expression this service can read but names no occurrence of inside
+            // the window it carries would leave the schedule invoking its target
+            // never, so it is refused rather than applied.
+            .or_else(|| {
+                crate::state::schedule_occurrence_violation(
+                    &input.schedule_expression,
+                    input.start_date,
+                    input.end_date,
+                    now,
+                )
+            })
             // `Target$Arn` is the one ARN-valued member of a schedule the model leaves
             // without a `@pattern`, so the ARN FORM is this service's own check: an update
             // that would leave a target naming no ARN is refused rather than applied.
@@ -268,6 +280,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that would leave a source outside that expression is refused rather than
             // applied.
             .or_else(|| crate::state::event_bridge_target_violation(&input.target))
+            // The same cross-member requirement a create is held to: an update that
+            // would leave a task asking for a public address under a launch type
+            // that assigns none is refused rather than applied.
+            .or_else(|| crate::state::ecs_target_violation(&input.target))
             // The PAYLOAD the target is handed is bounded by the service rather than by
             // the model, so an update that would leave a schedule carrying a payload past
             // that bound is refused rather than applied.

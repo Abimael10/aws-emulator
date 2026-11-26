@@ -20,7 +20,9 @@
 //!    message is the only place the service reports the offending input back and a caller
 //!    that compares the echo against what it sent has to see its own bytes;
 //! 3. a reported `@pattern` is the expression without the `^`/`$` anchors a model writes to
-//!    demand a whole-string match (`service_common::validation::unanchored`);
+//!    demand a whole-string match (`service_common::validation::unanchored`), with the ARN
+//!    PARTITION stated the way this service's own validator prints it
+//!    ([`PRINTED_PARTITION`]);
 //! 4. an enum's value set is listed as the service's OWN enum declares it, which for one of
 //!    this service's enums is not the order the public model publishes
 //!    ([`REPORTED_VALUE_SETS`]).
@@ -116,17 +118,37 @@ fn clause(violation: &Violation) -> String {
     .message()
 }
 
+/// How the MODEL writes the partition of an ARN-valued member's `@pattern`: the optional
+/// `-<suffix>` group every ARN pattern of this model carries
+/// (`smithy_query(query="shape", shape="com.amazonaws.scheduler#DeadLetterConfig")` and the
+/// other ARN members).
+const MODELLED_PARTITION: &str = "aws(-[a-z]+)?";
+
+/// How this service's own validator PRINTS that same partition: the character class its
+/// refusals echo for every ARN member it reports a pattern for, which is not the spelling the
+/// public model declares. The expression admits the same partitions either way — what differs
+/// is the text the service states, and the echoed expression is the only machine-readable
+/// part of a constraint refusal, so it is reported as the service prints it.
+const PRINTED_PARTITION: &str = "aws[a-z-]*";
+
 /// A violated constraint as this service reports it: a `@pattern` without its whole-value
-/// anchors, an enum value set as the service's own enum declares it, and every other class
-/// exactly as the framework describes it.
+/// anchors and with the partition as the service prints it, an enum value set as the
+/// service's own enum declares it, and every other class exactly as the framework describes
+/// it.
 fn as_reported(kind: &ViolationKind) -> ViolationKind {
     match kind {
-        ViolationKind::Pattern(pattern) => {
-            ViolationKind::Pattern(::service_common::validation::unanchored(pattern))
-        }
+        ViolationKind::Pattern(pattern) => ViolationKind::Pattern(as_printed(
+            &::service_common::validation::unanchored(pattern),
+        )),
         ViolationKind::EnumValue(values) => ViolationKind::EnumValue(reported_value_set(values)),
         other => other.clone(),
     }
+}
+
+/// `pattern` as this service prints it: the partition of an ARN expression in the service's
+/// own spelling ([`PRINTED_PARTITION`]), and every other expression as the model declares it.
+fn as_printed(pattern: &str) -> String {
+    pattern.replace(MODELLED_PARTITION, PRINTED_PARTITION)
 }
 
 /// `values` as the service's own enum declares them ([`REPORTED_VALUE_SETS`]), or unchanged
@@ -259,18 +281,37 @@ mod tests {
         }
     }
 
-    /// A `@pattern` loses the whole-value anchors the model spells the total match with.
+    /// A `@pattern` loses the whole-value anchors the model spells the total match with, and
+    /// an ARN expression's partition is stated the way this service prints it.
     #[test]
     fn a_pattern_is_reported_without_its_whole_value_anchors() {
         // (case, modelled pattern, reported pattern). Source: `smithy_query(query="shape",
         // shape="com.amazonaws.scheduler#<Shape>")` for each.
-        let rows: [(&str, &str, &str); 4] = [
+        let rows: [(&str, &str, &str); 7] = [
             ("ScheduleGroupName", r"^[0-9a-zA-Z-_.]+$", r"[0-9a-zA-Z-_.]+"),
             ("ClientToken", r"^[a-zA-Z0-9-_]+$", r"[a-zA-Z0-9-_]+"),
+            // An ARN member's partition is stated the way the service prints it, whichever
+            // service the ARN names.
             (
                 "RoleArn",
                 r"^arn:aws(-[a-z]+)?:iam::\d{12}:role\/[\w+=,.@\/-]+$",
-                r"arn:aws(-[a-z]+)?:iam::\d{12}:role\/[\w+=,.@\/-]+",
+                r"arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@\/-]+",
+            ),
+            (
+                "DeadLetterConfig$Arn",
+                r"^arn:aws(-[a-z]+)?:sqs:[a-z0-9\-]+:\d{12}:[a-zA-Z0-9\-_]+$",
+                r"arn:aws[a-z-]*:sqs:[a-z0-9\-]+:\d{12}:[a-zA-Z0-9\-_]+",
+            ),
+            // A pattern already written with the partition the service prints keeps it.
+            (
+                "TagResource$ResourceArn",
+                r"^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$",
+                r"arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+",
+            ),
+            (
+                "KmsKeyArn",
+                r"^arn:aws(-[a-z]+)?:kms:[a-z0-9\-]+:\d{12}:(key|alias)\/[0-9a-zA-Z-_]*$",
+                r"arn:aws[a-z-]*:kms:[a-z0-9\-]+:\d{12}:(key|alias)\/[0-9a-zA-Z-_]*",
             ),
             // An expression with no anchors at all is reported as written.
             ("an unanchored expression", r"[a-z]+", r"[a-z]+"),

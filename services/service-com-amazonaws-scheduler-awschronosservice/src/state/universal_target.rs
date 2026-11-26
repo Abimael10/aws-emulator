@@ -35,6 +35,12 @@
 //! resolves the call, builds its request and signs it, so the facts of those services
 //! are stated once for both callers rather than copied here.
 //!
+//! WHICH operations a called service has, and which of them only READ — the facts a
+//! caller validating a WRITTEN target asks for — are likewise the called service's own,
+//! and are read from the tree's single statement of them
+//! ([`::service_common::universal_target_apis`]), the same statement the other services
+//! whose target names an API operation read.
+//!
 //! What this module owns is EventBridge Scheduler's half: the universal ARN's own
 //! grammar, the access request the call is subject to, and what one ANSWER means to a
 //! schedule's INVOCATION — which is this service's vocabulary ([`super::dead_letter`]),
@@ -80,6 +86,13 @@ const FIRST_ERROR_STATUS: u16 = 400;
 /// id — `states` for the service whose id is `sfn`), or naming the operation in any
 /// other case than lowerCamelCase, is refused.
 ///
+/// A pair that DOES name an operation is held to one more rule: the operation has to be
+/// one a schedule invokes. An operation whose only effect is its own answer
+/// ([`only_reads`], read from the tree's single statement of the APIs a universal target
+/// may name) changes nothing when it is performed and has no caller for that answer, so
+/// this service supports no schedule for one and the write is refused in those words
+/// ([`unsupported_api`]) rather than stored.
+///
 /// `None` for every `Target$Arn` that is not written as a universal target — a
 /// templated target names a RESOURCE, whose own form the modelled constraints and the
 /// target's kind decide — and for a universal target whose service this emulator cannot
@@ -108,7 +121,12 @@ pub fn universal_target_violation(target_arn: &str) -> Option<String> {
     let names_a_call = is_sdk_service_id(service)
         && !names_a_service_by_another_name(service)
         && is_lower_camel_case(api);
-    (!names_a_call).then(|| invalid_universal_target(service, api))
+    if !names_a_call {
+        return Some(invalid_universal_target(service, api));
+    }
+    // The pair names an operation; whether that operation is one a SCHEDULE may
+    // invoke is the other half of the rule ([`only_reads`]).
+    only_reads(service, api).then(|| unsupported_api(api))
 }
 
 /// How this service states a universal target whose api and service do not name one
@@ -118,6 +136,35 @@ fn invalid_universal_target(service: &str, api: &str) -> String {
         "Invalid RequestJson provided. Reason The api {api} is not valid for the service \
          {AWS_SDK_SEGMENT}:{service}."
     )
+}
+
+/// How this service states an operation it will not invoke on a schedule's behalf: the
+/// api as the value named it, and the statement that this service supports no schedule
+/// for it. One sentence per api, carrying nothing but the operation the request wrote.
+fn unsupported_api(api: &str) -> String {
+    format!("Invalid RequestJson provided. Reason {api} API is not supported.")
+}
+
+/// Whether `api` is an operation of `service` whose only effect is its own ANSWER.
+///
+/// An invocation of a universal target IS the call the ARN names, made with
+/// `Target$Input` as its request, so the operation has to be one there is a point in
+/// performing on a schedule: an operation that only reports state changes nothing when
+/// it is performed and has no caller to hand its answer to — the schedule is not one —
+/// so EventBridge Scheduler supports no schedule for one and refuses the write
+/// ([`unsupported_api`]).
+///
+/// WHICH operations of a service only read is a fact of that service's own model, not
+/// of this one, and is therefore read from the tree's single statement of the APIs a
+/// universal target may name ([`::service_common::universal_target_apis`]) — the same
+/// statement the other services whose target names an API operation read it from. The
+/// spelling of the name decides nothing: that statement holds operations that read like
+/// writes and writes that read like reads. A service it holds nothing for is NOT judged,
+/// because AWS's universal targets span far more services than this emulator hosts, so
+/// refusing one for an unlisted service would refuse a schedule the service accepts.
+fn only_reads(service: &str, api: &str) -> bool {
+    ::service_common::universal_target_apis::apis_of(service)
+        .is_some_and(|apis| apis.only_reads(api))
 }
 
 /// Whether `service` is written the way an SDK service id is when the AWS SDK family
@@ -646,12 +693,12 @@ mod tests {
             ),
             (
                 "an SDK service id carrying a digit",
-                "arn:aws:scheduler:::aws-sdk:elasticloadbalancingv2:describeTargetHealth",
+                "arn:aws:scheduler:::aws-sdk:elasticloadbalancingv2:registerTargets",
                 false,
             ),
             (
                 "an operation whose name carries a digit",
-                "arn:aws:scheduler:::aws-sdk:s3:listObjectsV2",
+                "arn:aws:scheduler:::aws-sdk:sagemaker:createAutoMLJobV2",
                 false,
             ),
             (
@@ -733,6 +780,58 @@ mod tests {
                     ),
                     "case {case:?}: expected the refusal to name the pair the value states, \
                      got {message:?}"
+                );
+            }
+        }
+    }
+
+    /// An operation whose only effect is its own ANSWER is one no schedule invokes,
+    /// whichever service it belongs to. The rows differ along the service named, along
+    /// the kind of reading (an item, an attribute, a listing, a query, an existence
+    /// check, a transactional read), and along the writes beside them — including the
+    /// two whose spelling says the opposite of what they do, which is why the facts come
+    /// from the tree's own statement of them rather than from the name. A service that
+    /// statement holds nothing for is not judged at all.
+    #[test]
+    fn a_universal_target_naming_a_reading_operation_is_refused() {
+        // (case, the service, the operation, whether the write is refused)
+        let rows: [(&str, &str, &str, bool); 17] = [
+            ("a queue's own lookup", "sqs", "getQueueUrl", true),
+            ("a queue attribute read", "sqs", "getQueueAttributes", true),
+            ("a queue listing", "sqs", "listQueues", true),
+            // Two queue operations whose names read like reads and change the queue.
+            ("a receive, which starts a visibility timeout", "sqs", "receiveMessage", false),
+            ("a purge, which deletes every message", "sqs", "purgeQueue", false),
+            ("a message sent", "sqs", "sendMessage", false),
+            ("an item read", "dynamodb", "getItem", true),
+            ("a transactional read", "dynamodb", "transactGetItems", true),
+            ("a query over a table", "dynamodb", "query", true),
+            ("an item written", "dynamodb", "putItem", false),
+            ("a batched write", "dynamodb", "batchWriteItem", false),
+            ("a statement that may write", "dynamodb", "executeStatement", false),
+            ("an object read", "s3", "getObject", true),
+            ("an existence check", "s3", "headObject", true),
+            ("an object query that changes nothing", "s3", "selectObjectContent", true),
+            ("a restore, which starts one", "s3", "restoreObject", false),
+            // A service the shared statement holds no APIs for is not judged: AWS's
+            // universal targets span far more services than this emulator hosts.
+            ("an operation of a service it holds nothing for", "sfn", "describeExecution", false),
+        ];
+
+        for (case, service, operation, refused) in rows {
+            let arn = format!("arn:aws:scheduler:::aws-sdk:{service}:{operation}");
+            let violation = universal_target_violation(&arn);
+            assert_eq!(
+                violation.is_some(),
+                refused,
+                "case {case:?}: expected refused={refused} for {arn}, got {violation:?}"
+            );
+            if let Some(message) = violation {
+                assert_eq!(
+                    message,
+                    format!("Invalid RequestJson provided. Reason {operation} API is not supported."),
+                    "case {case:?}: expected the refusal to name the operation the value \
+                     states, got {message:?}"
                 );
             }
         }

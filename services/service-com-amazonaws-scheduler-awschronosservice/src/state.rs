@@ -25,7 +25,9 @@
 //! [`dead_letter`]. A target that names an API OPERATION rather than a resource — a
 //! UNIVERSAL target — is [`universal_target`]. A target naming an EVENT BUS is a
 //! templated EventBridge target, whose own kind and the parameters it carries are
-//! [`event_bridge_target`]. The SIZE of the payload a target is handed —
+//! [`event_bridge_target`]. A target naming an ECS CLUSTER is a templated ECS
+//! target, whose parameters carry one requirement across two members:
+//! [`ecs_target`]. The SIZE of the payload a target is handed —
 //! `Target$Input`'s service maximum, which the model does not state — is
 //! [`target_input`].
 //!
@@ -44,6 +46,7 @@
 //! principal both stand on is [`caller_identity`].
 
 mod dead_letter;
+mod ecs_target;
 mod event_bridge_target;
 mod kms_key;
 mod occurrence;
@@ -61,6 +64,7 @@ pub mod schedule_metrics;
 
 pub use caller_authorization::{caller_denial, ANY_RESOURCE};
 pub use dead_letter::RETRY_INTERVAL;
+pub(crate) use ecs_target::ecs_target_violation;
 pub(crate) use event_bridge_target::event_bridge_target_violation;
 pub use invocation::{drive_invocation_clock, Invocations};
 pub use kms_key::{kms_key_refusal, kms_key_violation};
@@ -487,6 +491,25 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
 pub fn reserved_group_refusal(name: &str) -> Option<String> {
     (name == DEFAULT_SCHEDULE_GROUP)
         .then(|| format!("This operation cannot be performed on schedule group {name}."))
+}
+
+/// The `ConflictException` message for a request that would have MODIFIED the
+/// schedule group `arn` while another writer held it.
+///
+/// A create that carries tags writes the group's tags as well as minting it, so a
+/// name a group already holds is a collision with a group that is being modified
+/// rather than a name that is merely taken: the refusal is the concurrent
+/// modification of the group it collided with, and it names that group by its ARN —
+/// the identity of the resource the request met, which the name alone does not
+/// carry.
+pub fn group_modified_concurrently(arn: &str) -> String {
+    format!("Schedule group {arn} was modified concurrently.")
+}
+
+/// The `ConflictException` message for a create addressed at a name a schedule
+/// group already holds, which carries nothing to modify on it.
+pub fn group_already_exists(name: &str) -> String {
+    format!("Schedule group {name} already exists.")
 }
 
 /// The `ResourceNotFoundException` message for a group this account does not

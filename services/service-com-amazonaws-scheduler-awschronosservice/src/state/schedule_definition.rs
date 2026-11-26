@@ -23,6 +23,11 @@
 //!   schedule can invoke its target" (`CreateSchedule$StartDate` /
 //!   `$EndDate`): together they are an interval, and an interval that holds no
 //!   instant is a schedule that can never fire ([`schedule_window_violation`]).
+//! * an expression the service CAN read still has to name an occurrence inside
+//!   the window it is read with: one whose every occurrence falls outside the
+//!   span this service can name an instant in invokes its target never, which is
+//!   a condition of its own and worded apart from a malformed expression
+//!   ([`schedule_occurrence_violation`]).
 //! * both instants are stored at MILLISECOND resolution, at the NEAREST
 //!   millisecond to the instant the request stated
 //!   ([`to_millisecond_precision`]), which is the resolution a schedule's
@@ -65,6 +70,27 @@ pub(crate) const CRON_FIELDS: usize = 6;
 /// day-of-month and day-of-week — which is the same statement `*` makes in the
 /// grammar the `cron` crate reads.
 pub(crate) const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [2, 4];
+
+/// The field value that states "no specific value".
+const NO_SPECIFIC_VALUE: &str = "?";
+
+/// The index of the YEAR field among the six the format documents.
+const YEAR_FIELD: usize = 5;
+
+/// The years a `cron(...)` year field may name: "Year […] 1970-2199" (the
+/// wildcards-and-values table of the service's schedule-types reference).
+const CRON_YEARS: (i32, i32) = (1970, 2199);
+
+/// The last year this service can name an occurrence AT: the ceiling of the year
+/// the shared grammar reads ([`cron_field_parses`] refuses the year after it),
+/// which is therefore the end of the lookahead the validator and the evaluator
+/// ([`super::occurrence`]) share.
+///
+/// An expression whose years all fall past it names occurrences this service
+/// could never perform — the condition [`schedule_occurrence_violation`] refuses
+/// — while the year field itself is still one the published grammar admits
+/// ([`CRON_YEARS`]), so such an expression is well-formed rather than malformed.
+const LAST_FEASIBLE_YEAR: i32 = 2100;
 
 /// The field values the normalised seven-field expression carries for every field
 /// but the one under test, so a field is judged on its own.
@@ -157,31 +183,147 @@ fn rate_expression_states_a_period(body: &str) -> bool {
     states_a_count && RATE_UNITS.iter().any(|(name, _)| *name == unit)
 }
 
-/// Whether a `cron(...)` body states the instants it has to: six fields, each one
-/// the cron grammar reads in the place it stands.
+/// Whether a `cron(...)` body states the instants it has to.
+fn cron_expression_states_its_instants(body: &str) -> bool {
+    cron_fields(body).is_some()
+}
+
+/// The six fields of a `cron(...)` body this service can read, or `None` for a body
+/// that states no instants at all.
+///
+/// A body is read when it carries the six documented fields, each field states
+/// values that field admits ([`cron_field_states_its_values`]), the two DAY fields
+/// state between them exactly one specific day ([`one_day_field_is_specific`]), and
+/// the fields the shared grammar reads combine into an expression it accepts.
 ///
 /// The `cron` crate reads the seven-field form (seconds first), so a literal `0`
 /// seconds field is prepended, and a `?` in the day-of-month or day-of-week field
 /// is the `*` that grammar spells the same statement with. A field carrying one of
 /// the service's own wildcards ([`SERVICE_CRON_WILDCARDS`]) is a statement that
-/// grammar does not read at all, so it is accepted on the service's grammar
-/// instead of being refused on the parser's.
-fn cron_expression_states_its_instants(body: &str) -> bool {
+/// grammar does not read at all, so such a body is read on the service's grammar
+/// instead of being refused on the parser's — the CROSS-FIELD rules below still
+/// hold for it, since they are the service's own and not the parser's.
+fn cron_fields(body: &str) -> Option<Vec<&str>> {
     let fields: Vec<&str> = body.split_whitespace().collect();
     if fields.len() != CRON_FIELDS {
-        return false;
+        return None;
     }
-    let service_dialect = fields.iter().any(|field| names_service_wildcard(field));
+    if !one_day_field_is_specific(&fields) {
+        return None;
+    }
     for (index, field) in fields.iter().enumerate() {
-        if !cron_field_parses(index, field) && !names_service_wildcard(field) {
-            return false;
+        if !cron_field_states_its_values(index, field) {
+            return None;
         }
     }
-    // Every field reads on its own; the whole expression is read once more so a
-    // combination of fields the grammar refuses is refused too — except for a body
-    // in the service's own dialect, which that grammar cannot read as a whole
-    // either.
-    service_dialect || normalised_cron(&fields).parse::<::cron::Schedule>().is_ok()
+    // Every field reads on its own; the fields the shared grammar reads are read
+    // once more TOGETHER, so a combination of them that grammar refuses is refused
+    // too. A body in the service's own dialect is left out of that reading, which
+    // that grammar cannot perform; the YEAR stands at `*` for it, because the years
+    // a field names are read on their own ([`cron_years`]) past the ceiling that
+    // grammar's own year ordinal stops at.
+    if fields.iter().any(|field| names_service_wildcard(field)) {
+        return Some(fields);
+    }
+    let mut combined = fields.clone();
+    if let Some(year) = combined.get_mut(YEAR_FIELD) {
+        *year = "*";
+    }
+    normalised_cron(&combined)
+        .parse::<::cron::Schedule>()
+        .ok()
+        .map(|_| fields)
+}
+
+/// Whether `field` states values the field at `index` admits, judged on that field
+/// alone.
+///
+/// Every field but the YEAR is read by the shared grammar in the place it stands
+/// ([`cron_field_parses`]), or carries one of the service's own wildcards. The year
+/// is read here instead ([`cron_years`]): that grammar's year ordinal stops at
+/// [`LAST_FEASIBLE_YEAR`], while the field itself admits every year the service
+/// publishes ([`CRON_YEARS`]) — a year past the ceiling is a year the service reads
+/// and names no feasible occurrence at, not a value it cannot read.
+fn cron_field_states_its_values(index: usize, field: &str) -> bool {
+    if index == YEAR_FIELD {
+        return cron_years(field).is_some();
+    }
+    cron_field_parses(index, field) || names_service_wildcard(field)
+}
+
+/// Whether the two DAY fields state between them exactly one specific day.
+///
+/// The cron form carries both a day-of-month and a day-of-week field, and one of
+/// the two must state "no specific value" (`?`): an expression that states a day in
+/// BOTH names instants the form does not define, and one that states `?` in both
+/// names no day at all — so exactly one of them carries the `?`.
+fn one_day_field_is_specific(fields: &[&str]) -> bool {
+    NO_SPECIFIC_VALUE_FIELDS
+        .iter()
+        .filter(|index| fields.get(**index) == Some(&NO_SPECIFIC_VALUE))
+        .count()
+        == 1
+}
+
+/// The years one `cron(...)` YEAR field names, as the `(first, last, step)` terms it
+/// is written in, or `None` for a field that names no years the service publishes.
+///
+/// The field's grammar is the shared one — a comma-separated list of terms, each a
+/// year, a range of years or `*`, any of them over a step — read over
+/// [`CRON_YEARS`]. It is read HERE rather than by the shared parser because that
+/// parser's year ordinal stops at [`LAST_FEASIBLE_YEAR`], so it cannot represent the
+/// later years this field still admits.
+fn cron_years(field: &str) -> Option<Vec<(i32, i32, i32)>> {
+    let mut terms = Vec::new();
+    for term in field.split(',') {
+        let (values, step) = match term.split_once('/') {
+            Some((values, step)) => (values, step.parse::<i32>().ok().filter(|by| *by > 0)?),
+            None => (term, 1),
+        };
+        let (first, last) = if values == "*" {
+            CRON_YEARS
+        } else if let Some((first, last)) = values.split_once('-') {
+            (published_year(first)?, published_year(last)?)
+        } else {
+            let first = published_year(values)?;
+            // A year over a step opens a series that runs to the end of the range;
+            // a year on its own is that year.
+            match term.contains('/') {
+                true => (first, CRON_YEARS.1),
+                false => (first, first),
+            }
+        };
+        if first > last {
+            return None;
+        }
+        terms.push((first, last, step));
+    }
+    (!terms.is_empty()).then_some(terms)
+}
+
+/// `text` as one of the years the service publishes, or `None` for anything else.
+fn published_year(text: &str) -> Option<i32> {
+    let year: i32 = text.parse().ok()?;
+    (CRON_YEARS.0..=CRON_YEARS.1).contains(&year).then_some(year)
+}
+
+/// Whether `terms` name any year in `from..=to`.
+///
+/// The arithmetic is saturating: a step is a figure the REQUEST wrote, so a term may
+/// state one no span of years could hold, and a saturated step names no further year
+/// rather than running past what the count can hold.
+fn years_reach(terms: &[(i32, i32, i32)], from: i32, to: i32) -> bool {
+    terms.iter().any(|(first, last, step)| {
+        let opens = (*first).max(from);
+        // The term's own series: the first year it names at or after the floor is
+        // the one its step lands on.
+        let past = opens.saturating_sub(*first).rem_euclid(*step);
+        let named = match past {
+            0 => opens,
+            past => opens.saturating_add(step.saturating_sub(past)),
+        };
+        named <= (*last).min(to)
+    })
 }
 
 /// Whether `field` carries one of the wildcards this service's cron dialect
@@ -190,6 +332,112 @@ fn names_service_wildcard(field: &str) -> bool {
     SERVICE_CRON_WILDCARDS
         .iter()
         .any(|wildcard| field.contains(*wildcard))
+}
+
+/// How this service states an expression it CAN read that will nonetheless never
+/// invoke the schedule's target: the never-fires class of the failure, naming the
+/// expression and the window it was read with.
+///
+/// Worded apart from [`invalid_expression`] because the two are different
+/// conditions: an unreadable expression is a syntax failure a caller fixes by
+/// rewriting the expression, while this one is a statement about the expression and
+/// the window TOGETHER — they have no instant in common.
+fn never_schedules_an_invocation(
+    expression: &str,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+) -> String {
+    format!(
+        "The schedule expression {expression}, with StartDate {} and EndDate {}, is invalid \
+         because it will never schedule an invocation.",
+        echoed_instant(start_date),
+        echoed_instant(end_date)
+    )
+}
+
+/// What the never-fires refusal states for a window boundary the request left out.
+const ABSENT_INSTANT: &str = "null";
+
+/// One of the window's boundaries as this service echoes it in a sentence: the UTC
+/// date and time it names, carried only to the resolution it states something at —
+/// no zone suffix, no seconds on a whole minute and no remainder on a whole second
+/// — and [`ABSENT_INSTANT`] for a boundary the request did not state.
+///
+/// The instant echoed is the one the service HOLDS ([`to_millisecond_precision`]),
+/// so the sentence states the same boundary a later read of the schedule would.
+fn echoed_instant(at: Option<DateTime>) -> String {
+    let Some(at) = at.map(to_millisecond_precision) else {
+        return ABSENT_INSTANT.to_string();
+    };
+    let Some(utc) = utc_instant(at) else {
+        return ABSENT_INSTANT.to_string();
+    };
+    let naive = utc.naive_utc();
+    let minutes = naive.format("%Y-%m-%dT%H:%M").to_string();
+    let seconds = ::chrono::Timelike::second(&naive);
+    let milliseconds = ::chrono::Timelike::nanosecond(&naive) / NANOS_PER_MILLISECOND;
+    match (seconds, milliseconds) {
+        (0, 0) => minutes,
+        (seconds, 0) => format!("{minutes}:{seconds:02}"),
+        (seconds, milliseconds) => format!("{minutes}:{seconds:02}.{milliseconds:03}"),
+    }
+}
+
+/// One wire instant as the UTC date and time it names, or `None` for one no
+/// calendar reading of this clock covers.
+fn utc_instant(at: DateTime) -> Option<::chrono::DateTime<::chrono::Utc>> {
+    ::chrono::DateTime::from_timestamp(at.secs(), at.subsec_nanos())
+}
+
+/// The calendar year `at` falls in, read in UTC — the years a schedule's window
+/// opens in, which is the floor the feasible lookahead is measured from.
+fn year_of(at: ::chrono::DateTime<::chrono::Utc>) -> i32 {
+    ::chrono::Datelike::year(&at)
+}
+
+/// Refuse a readable `ScheduleExpression` that names no occurrence the schedule
+/// could ever be invoked at; `None` for one with an occurrence ahead of it.
+///
+/// A cron expression's YEAR field states which years its instants fall in, so an
+/// expression none of whose years falls inside the schedule's window — behind the
+/// instant it opens at, past the instant it closes at, or past the end of the
+/// lookahead this service can name an instant in ([`LAST_FEASIBLE_YEAR`]) — has no
+/// occurrence in common with that window: the schedule would invoke its target
+/// never, which is refused when it is WRITTEN rather than stored as a schedule
+/// nothing will ever be delivered for.
+///
+/// The window opens at `StartDate` when the request carries one and at the instant
+/// of the request otherwise, which is the same opening the empty-window rule reads
+/// it at ([`schedule_window_violation`]), and closes at `EndDate` when the request
+/// carries one — both boundaries, the two the sentence states. The YEAR is the
+/// resolution the test is taken at: a year the window admits any part of still
+/// holds the instants of that year the expression names, so only a year wholly
+/// outside the window is ruled out. An expression the service cannot read at all is
+/// the malformed class instead ([`schedule_expression_violation`]), and a
+/// `rate(...)` names an occurrence a period on from wherever its series is started,
+/// so neither is this rule's.
+pub fn schedule_occurrence_violation(
+    expression: &str,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    now: SystemTime,
+) -> Option<String> {
+    let Some((ExpressionForm::Cron, body)) = form_of(expression) else {
+        return None;
+    };
+    let fields = cron_fields(body)?;
+    let years = cron_years(fields.get(YEAR_FIELD)?)?;
+    let opens = year_of(::chrono::DateTime::<::chrono::Utc>::from(now));
+    let opens = match start_date.and_then(utc_instant) {
+        Some(start) => opens.max(year_of(start)),
+        None => opens,
+    };
+    let closes = match end_date.and_then(utc_instant) {
+        Some(end) => LAST_FEASIBLE_YEAR.min(year_of(end)),
+        None => LAST_FEASIBLE_YEAR,
+    };
+    (!years_reach(&years, opens, closes))
+        .then(|| never_schedules_an_invocation(expression, start_date, end_date))
 }
 
 /// The six documented fields as the seven-field expression the `cron` crate reads.
@@ -493,5 +741,265 @@ mod tests {
                 "case {case:?}: a held instant carries whole milliseconds, got {normalised:?}"
             );
         }
+    }
+
+    /// The cron form carries a day-of-month field and a day-of-week field, and
+    /// exactly one of the two states "no specific value": a day stated in both names
+    /// instants the form does not define, and `?` in both names no day at all. The
+    /// rows differ along which day field carries the `?`, along what the other
+    /// states — a number, a range, a list, a step, a named day, one of the service's
+    /// own wildcards — and along how many of them carry it.
+    #[test]
+    fn exactly_one_of_the_two_day_fields_states_no_specific_value() {
+        // (case, expression, states a schedule)
+        let rows: [(&str, &str, bool); 14] = [
+            ("a day of the month", "cron(0 12 1 * ? *)", true),
+            ("every day of the month", "cron(0 12 * * ? *)", true),
+            ("a day of the week", "cron(0 12 ? * MON *)", true),
+            ("a range of weekdays", "cron(0 12 ? * MON-FRI *)", true),
+            ("a list of days of the month", "cron(0 12 1,15 * ? *)", true),
+            ("a step over the days of the month", "cron(0 12 1/5 * ? *)", true),
+            ("the last day of the month", "cron(0 12 L * ? *)", true),
+            ("the nth weekday of the month", "cron(0 12 ? * 3#2 *)", true),
+            ("the nearest weekday", "cron(0 12 3W * ? *)", true),
+            // Both day fields stating a day, including the dialect's own wildcards,
+            // which are held to this rule exactly as the shared grammar's forms are.
+            ("a day of the month beside a day of the week", "cron(0 12 1 * MON *)", false),
+            ("every day of the month beside a weekday", "cron(0 12 * * MON *)", false),
+            ("the last day beside the nth weekday", "cron(0 12 L * 3#2 *)", false),
+            ("the nearest weekday beside a weekday", "cron(0 12 3W * 3#2 *)", false),
+            // Neither field stating a day states no day at all.
+            ("no specific value in either field", "cron(0 12 ? * ? *)", false),
+        ];
+
+        for (case, expression, states_a_schedule) in rows {
+            let violation = schedule_expression_violation(expression);
+            assert_eq!(
+                violation.is_none(),
+                states_a_schedule,
+                "case {case:?}: expected states_a_schedule={states_a_schedule}, got \
+                 {violation:?}"
+            );
+            if let Some(message) = violation {
+                assert_eq!(
+                    message,
+                    invalid_expression(expression),
+                    "case {case:?}: a cron the service cannot read is the malformed class"
+                );
+            }
+        }
+    }
+
+    /// GUARD on [`LAST_FEASIBLE_YEAR`]: it is the ceiling of the year the shared
+    /// grammar reads, so the grammar reads that year and not the one after it — which
+    /// is what makes it the end of the lookahead the evaluator can name an instant
+    /// in. The published range reaches further ([`CRON_YEARS`]), which is why a year
+    /// past the ceiling is still a year the service reads.
+    #[test]
+    fn the_lookahead_ends_where_the_shared_grammar_stops_reading_years() {
+        assert!(
+            cron_field_parses(YEAR_FIELD, &LAST_FEASIBLE_YEAR.to_string()),
+            "case the last feasible year: expected the shared grammar to read \
+             {LAST_FEASIBLE_YEAR}"
+        );
+        let past = LAST_FEASIBLE_YEAR + 1;
+        assert!(
+            !cron_field_parses(YEAR_FIELD, &past.to_string()),
+            "case the year after it: expected the shared grammar not to read {past}"
+        );
+        assert!(
+            published_year(&past.to_string()).is_some(),
+            "case the year after it: expected {past} to be a year the service publishes"
+        );
+    }
+
+    /// A YEAR field is read over the years the service publishes, and the years it
+    /// names decide whether the expression can still fire: the rows differ along the
+    /// form the field is written in (a year, a range, a list, a step, `*`), along
+    /// whether its years reach the lookahead, and along values no year answers to.
+    #[test]
+    fn a_year_field_is_read_over_the_years_the_service_publishes() {
+        // (case, the year field, the years it reaches from 2026 on)
+        let rows: [(&str, &str, Option<bool>); 14] = [
+            ("every year", "*", Some(true)),
+            ("a year inside the lookahead", "2031", Some(true)),
+            ("the first year of the lookahead", "2026", Some(true)),
+            ("the last year of the lookahead", "2100", Some(true)),
+            ("a year past the lookahead", "2176", Some(false)),
+            ("the last year the service publishes", "2199", Some(false)),
+            ("a year already behind the window", "2020", Some(false)),
+            ("a range reaching into the lookahead", "2090-2199", Some(true)),
+            ("a range wholly past the lookahead", "2150-2199", Some(false)),
+            ("a list with one reachable year", "2020,2176,2040", Some(true)),
+            ("a list of unreachable years", "2020,2176", Some(false)),
+            ("a step inside the lookahead", "2030/5", Some(true)),
+            // Values the published grammar does not read at all.
+            ("a year before the published range", "1969", None),
+            ("a year past the published range", "2200", None),
+        ];
+
+        for (case, field, reaches) in rows {
+            let years = cron_years(field);
+            assert_eq!(
+                years.is_some(),
+                reaches.is_some(),
+                "case {case:?}: expected the field read={}, got {years:?}",
+                reaches.is_some()
+            );
+            if let (Some(years), Some(reaches)) = (years, reaches) {
+                assert_eq!(
+                    years_reach(&years, 2026, LAST_FEASIBLE_YEAR),
+                    reaches,
+                    "case {case:?}: expected reaches={reaches}, got {years:?}"
+                );
+            }
+        }
+    }
+
+    /// An expression the service READS but none of whose years falls inside the
+    /// schedule's window — behind its opening, past its close, or past the end of
+    /// the lookahead — is refused as one that will never invoke the target, never as
+    /// a malformed expression. The rows differ along the year the expression names,
+    /// along the boundaries the window states and along the form the expression is
+    /// written in.
+    #[test]
+    fn a_readable_expression_with_no_reachable_occurrence_is_refused_as_never_firing() {
+        // The clock the rows are judged against: 1 January 2027, 00:00:00 UTC.
+        let now = SystemTime::UNIX_EPOCH + ::std::time::Duration::from_secs(1_798_761_600);
+        let at = |secs: i64| DateTime::from_secs(secs);
+        /// One row: the case, the expression, the window's two boundaries, and
+        /// whether the write is refused as one that will never fire.
+        type OccurrenceRow = (
+            &'static str,
+            &'static str,
+            Option<DateTime>,
+            Option<DateTime>,
+            bool,
+        );
+        let rows: [OccurrenceRow; 12] = [
+            ("a year inside the lookahead", "cron(0 12 * * ? 2030)", None, None, false),
+            ("every year", "cron(0 12 * * ? *)", None, None, false),
+            ("a year past the lookahead", "cron(0 12 * * ? 2176)", None, None, true),
+            (
+                "a year past the lookahead with a window",
+                "cron(0 12 * * ? 2176)",
+                Some(at(1_800_000_000)),
+                Some(at(1_900_000_000)),
+                true,
+            ),
+            (
+                // The window's opening moves the floor, so a year behind the start
+                // the request named is unreachable even though the field reads.
+                "a year behind the window's opening",
+                "cron(0 12 * * ? 2030)",
+                Some(at(2_240_000_000)),
+                None,
+                true,
+            ),
+            (
+                // The window's close moves the ceiling the same way: 2029-07-11 for
+                // this instant, which the 2030 the expression names is past.
+                "a year past the window's close",
+                "cron(0 12 * * ? 2030)",
+                Some(at(1_800_000_000)),
+                Some(at(1_878_000_000)),
+                true,
+            ),
+            (
+                // The same expression with a close in its own year is reachable: the
+                // test is taken at the resolution of a year.
+                "a year the window's close falls in",
+                "cron(0 12 * * ? 2030)",
+                Some(at(1_800_000_000)),
+                Some(at(1_900_000_000)),
+                false,
+            ),
+            (
+                "every year with a close ahead of the clock",
+                "cron(0 12 * * ? *)",
+                None,
+                Some(at(1_900_000_000)),
+                false,
+            ),
+            ("a year behind the clock", "cron(0 12 * * ? 2020)", None, None, true),
+            // The other two forms name no year at all, so this rule is not theirs.
+            ("a rate", "rate(5 minutes)", None, None, false),
+            ("an instant", "at(2030-01-01T00:00:00)", None, None, false),
+            // An expression the service cannot read is the malformed class instead.
+            ("an unreadable expression", "cron(0 12 1 * MON *)", None, None, false),
+        ];
+
+        for (case, expression, start_date, end_date, refused) in rows {
+            let violation = schedule_occurrence_violation(expression, start_date, end_date, now);
+            assert_eq!(
+                violation.is_some(),
+                refused,
+                "case {case:?}: expected refused={refused}, got {violation:?}"
+            );
+            if let Some(message) = violation {
+                assert_eq!(
+                    message,
+                    never_schedules_an_invocation(expression, start_date, end_date),
+                    "case {case:?}: expected the never-fires sentence, got {message:?}"
+                );
+            }
+        }
+    }
+
+    /// The never-fires sentence states the expression and both window boundaries as
+    /// the service echoes them: the UTC date and time, no zone suffix, carried only
+    /// to the resolution the instant states something at, and `null` for a boundary
+    /// the request left out.
+    #[test]
+    fn the_never_fires_sentence_echoes_the_window_as_the_service_states_it() {
+        // (case, the instant, the echo)
+        let rows: [(&str, Option<DateTime>, &str); 6] = [
+            ("no boundary at all", None, ABSENT_INSTANT),
+            (
+                "a whole minute",
+                Some(DateTime::from_secs(1_798_761_600)),
+                "2027-01-01T00:00",
+            ),
+            (
+                "a whole second inside the minute",
+                Some(DateTime::from_secs(1_798_761_630)),
+                "2027-01-01T00:00:30",
+            ),
+            (
+                "a remainder of milliseconds",
+                Some(DateTime::from_secs_and_nanos(1_798_761_630, 120_000_000)),
+                "2027-01-01T00:00:30.120",
+            ),
+            (
+                // A finer remainder is echoed at the resolution the service holds.
+                "a remainder finer than a millisecond",
+                Some(DateTime::from_secs_and_nanos(1_798_761_630, 120_499_000)),
+                "2027-01-01T00:00:30.120",
+            ),
+            (
+                "a remainder inside a whole minute",
+                Some(DateTime::from_secs_and_nanos(1_798_761_600, 5_000_000)),
+                "2027-01-01T00:00:00.005",
+            ),
+        ];
+
+        for (case, instant, echo) in rows {
+            assert_eq!(
+                echoed_instant(instant),
+                echo,
+                "case {case:?}: expected the instant echoed as {echo:?}"
+            );
+        }
+
+        let expression = "cron(0 12 * * ? 2176)";
+        let start = DateTime::from_secs(1_798_761_600);
+        assert_eq!(
+            never_schedules_an_invocation(expression, Some(start), None),
+            format!(
+                "The schedule expression {expression}, with StartDate 2027-01-01T00:00 and \
+                 EndDate null, is invalid because it will never schedule an invocation."
+            ),
+            "case the whole sentence: expected the expression and the window in it"
+        );
     }
 }

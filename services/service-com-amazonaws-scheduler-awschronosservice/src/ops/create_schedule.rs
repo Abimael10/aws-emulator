@@ -232,6 +232,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| {
                 crate::state::schedule_window_violation(input.start_date, input.end_date, now)
             })
+            // An expression the service CAN read still has to name an occurrence
+            // inside the window it is read with: one whose occurrences all fall
+            // outside the span this service names instants in would invoke the
+            // target never, which is its own condition and its own sentence.
+            .or_else(|| {
+                crate::state::schedule_occurrence_violation(
+                    &input.schedule_expression,
+                    input.start_date,
+                    input.end_date,
+                    now,
+                )
+            })
             // `Target$Arn` is the one ARN-valued member of a schedule the model leaves
             // without a `@pattern`, so the ARN FORM is this service's own check: a target
             // naming no ARN names nothing an occurrence could be delivered to, and is
@@ -247,6 +259,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the model declares is a requirement however it is applied, so a source
             // outside that expression is refused here rather than stored.
             .or_else(|| crate::state::event_bridge_target_violation(&input.target))
+            // `AwsVpcConfiguration$AssignPublicIp` states a requirement about TWO
+            // members of a target's ECS parameters, which no boundary walk can
+            // apply: a task asking for a public address under a launch type that
+            // assigns none is refused here rather than stored as a schedule whose
+            // occurrences could never run the task.
+            .or_else(|| crate::state::ecs_target_violation(&input.target))
             // The PAYLOAD the target is handed is bounded by the service rather than by
             // the model, so a payload past that bound is refused here rather than stored
             // on a schedule the service would never have taken.
