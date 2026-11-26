@@ -223,6 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A manager whose accepted deletion the clock has already made due is gone
+        // before this call looks for it, so a connector is never created on a manager
+        // that is no longer there.
+        store.expire_deleted_payment_managers(now);
+
         // The resource the PATH addresses is resolved BEFORE this operation's own judgement
         // of the body: a connector belongs TO a payment manager, this route carries that
         // manager's id, and an id this account holds no manager under names nothing to
@@ -310,6 +315,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::payment_manager_not_found(&input.payment_manager_id),
                 )
             })?;
+
+        // A manager whose own deletion has been accepted is going away, and the
+        // connectors it holds go with it, so it takes no new connector: the create is
+        // refused the modelled 409 and nothing is written. "All payment connectors
+        // associated with the payment manager must be deleted before the payment manager
+        // can be deleted" (`smithy_query doc shape=DeletePaymentManager`) is the rule a
+        // connector written onto a manager already being deleted would defeat.
+        if manager.is_deleting() {
+            return Err(CreatePaymentConnectorErrorModeled::ConflictException(
+                crate::state::payment_manager_deleting_conflict(&input.payment_manager_id),
+            )
+            .into());
+        }
 
         // The connectors one manager holds are bounded, so a caller looping on create
         // meets the modelled quota instead of this process's memory limit.

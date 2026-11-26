@@ -1679,6 +1679,11 @@ pub mod capacity_providers;
 /// it. Re-exported, so a handler names `crate::state::…` for it exactly as it does
 /// for the resources beside it.
 pub mod payment_managers;
+/// The window an accepted payment manager deletion is under way in: the manager
+/// reports `DELETING` until the removal the clock owes it comes due, and only then
+/// is the record gone. Re-exported, so a handler names `crate::state::…` for it
+/// exactly as it does for the manager the deletion is accepted for.
+pub mod payment_manager_deletion;
 /// The payment connectors one payment manager holds: the record
 /// `CreatePaymentConnector` persists, the status it reports and the address an
 /// end user completes a service-orchestrated authorization at. Re-exported, so a
@@ -1805,6 +1810,7 @@ pub use evaluators::*;
 pub use memory_strategies::*;
 pub use payment_connectors::*;
 pub use payment_credential_providers::*;
+pub use payment_manager_deletion::*;
 pub use payment_managers::*;
 pub use policies::*;
 pub use registry_entitlement::*;

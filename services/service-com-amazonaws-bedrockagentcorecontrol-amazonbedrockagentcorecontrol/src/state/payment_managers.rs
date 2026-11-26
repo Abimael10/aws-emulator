@@ -56,6 +56,7 @@ pub fn payment_manager_arn(region: &str, payment_manager_id: &str) -> String {
 /// failed, which nothing here makes happen.
 pub const PAYMENT_MANAGER_STATUS_CREATING: &str = "CREATING";
 pub const PAYMENT_MANAGER_STATUS_UPDATING: &str = "UPDATING";
+pub const PAYMENT_MANAGER_STATUS_DELETING: &str = "DELETING";
 pub const PAYMENT_MANAGER_STATUS_READY: &str = "READY";
 
 /// The modelled conflict for a write asked of a payment manager that is not
@@ -148,14 +149,27 @@ pub struct PaymentManagerRecord {
     /// When the clock owes the move from one to the other. Stored, never slept on: a
     /// read materialises the transition the clock already made due.
     pub settles_at: SystemTime,
+    /// When an accepted deletion removes this record, once `DeletePaymentManager`
+    /// has accepted one; `None` for a manager nobody has deleted. Stored, never
+    /// slept on: the removal is the clock's, materialised by
+    /// [`super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_payment_managers`]
+    /// on the next call that reads the payments plane
+    /// ([`super::payment_manager_deletion`]).
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl PaymentManagerRecord {
     /// The status at `now`: the transient one until the clock owes the transition,
     /// the settled one from then on. No read performs it — it is due at that instant
     /// whether or not anybody looks.
+    ///
+    /// A manager whose own deletion has been accepted reports `DELETING` whatever
+    /// its create or update was doing: the resource is going away, which is the one
+    /// thing a client polling it needs to see.
     pub fn status_at(&self, now: SystemTime) -> &str {
-        if now < self.settles_at {
+        if self.is_deleting() {
+            PAYMENT_MANAGER_STATUS_DELETING
+        } else if now < self.settles_at {
             &self.transient_status
         } else {
             &self.settled_status

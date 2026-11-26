@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // The removal of a manager whose deletion the clock has already made due was
+        // owed at this instant whether or not anybody called, so this read materialises
+        // it before it looks: a connector of a manager that is gone is gone with it.
+        store.expire_deleted_payment_managers(now);
 
         // A READ: the record is reported as it stands, and the status it reports is the
         // one the clock already made due, which no read performs.

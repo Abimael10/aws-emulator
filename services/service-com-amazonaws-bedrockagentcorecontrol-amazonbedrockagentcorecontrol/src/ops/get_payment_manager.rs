@@ -181,7 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        let mut store = state.lock();
+        // The removal of a manager whose deletion the clock has already made due was
+        // owed at this instant whether or not anybody called, so this read materialises
+        // it before it looks: the manager reports `DELETING` while the removal is still
+        // owed, and the modelled 404 once it is due.
+        store.expire_deleted_payment_managers(now);
 
         // The store is keyed by the `paymentManagerId` the create minted; an id
         // naming no stored manager is the modelled 404 rather than an empty

@@ -225,6 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A manager whose accepted deletion the clock has already made due is gone
+        // before this call reads the store, so it neither replays a token nor counts
+        // against the ceiling below.
+        store.expire_deleted_payment_managers(now);
+
         // A replayed request carrying the same `clientToken` answers with the payment
         // manager that token first produced, rather than minting a second one: "If
         // this token matches a previous request, the service ignores the request, but
@@ -291,6 +296,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transient_version: 1,
             settled_version: 1,
             settles_at: now + crate::state::PAYMENT_MANAGER_SETTLE_DELAY,
+            // Nobody has deleted this manager, so the clock owes no removal of it.
+            removal_due_at: None,
         };
         let output = record.create_output(now);
 

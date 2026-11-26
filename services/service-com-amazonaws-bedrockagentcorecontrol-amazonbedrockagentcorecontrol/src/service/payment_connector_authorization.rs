@@ -51,7 +51,12 @@ pub fn answer<Eng: Send + Sync + 'static>(
     let state = crate::state::service_state(engine)?;
     let now = ::std::time::SystemTime::now();
     let page = {
-        let store = state.lock();
+        let mut store = state.lock();
+        // The removal of a manager whose deletion the clock has already made due was
+        // owed at this instant whether or not anybody opened this address, so this read
+        // materialises it before it looks: the connectors of a manager that is gone are
+        // gone with it.
+        store.expire_deleted_payment_managers(now);
         store
             .payment_managers
             .get(payment_manager_id)

@@ -208,6 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A manager whose accepted deletion the clock has already made due is gone
+        // before this call looks for it, and so are the connectors it held.
+        store.expire_deleted_payment_managers(now);
+
         // A replayed request carrying the same `clientToken` answers with the connector
         // as that token's update left it, rather than applying the change a second
         // time: "If this token matches a previous request, the service ignores the
