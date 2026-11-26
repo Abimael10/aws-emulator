@@ -62,13 +62,16 @@ const MAX_PAGES: usize = 64;
 /// `serde_json::Value`, which is exactly what this suite must not do: parsing re-renders
 /// the number and loses the characters the serializer wrote. So the router is driven
 /// directly here, the same way `core/router` assembles the production emulator.
-struct WireEmulator {
+///
+/// `pub(crate)` because the suites that read an instant as BYTES drive the service through
+/// this one harness rather than each growing a copy of it.
+pub(crate) struct WireEmulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl WireEmulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -83,12 +86,12 @@ impl WireEmulator {
     /// The one shared engine this emulator's service reads and writes, for a case that
     /// places an instant in the store the handlers read. Every assertion still goes
     /// through the router.
-    fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
         &self.engine
     }
 
     /// Call `operation` and hand back the response body EXACTLY as the bytes arrived.
-    async fn raw(&self, operation: &str, body: &Value) -> String {
+    pub(crate) async fn raw(&self, operation: &str, body: &Value) -> String {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -122,7 +125,7 @@ impl WireEmulator {
 /// value delimiter. The callers below check the COUNT of what it found against the number
 /// of structures the answer carries, so a member this scan missed, or one it found
 /// somewhere unexpected, fails rather than passing vacuously.
-fn literal_members(body: &str, name: &str) -> Vec<String> {
+pub(crate) fn literal_members(body: &str, name: &str) -> Vec<String> {
     let key = format!("\"{name}\":");
     let mut found = Vec::new();
     let mut rest = body;
@@ -138,7 +141,7 @@ fn literal_members(body: &str, name: &str) -> Vec<String> {
 /// The epoch-MILLISECONDS a literal names, read from its DIGITS rather than through a
 /// float, asserting on the way that it is one of the forms AWS writes: an epoch-seconds
 /// number with at most [`SUBSECOND_DIGITS`] fractional digits and no exponent.
-fn epoch_millis_of_literal(case: &str, path: &str, literal: &str) -> i64 {
+pub(crate) fn epoch_millis_of_literal(case: &str, path: &str, literal: &str) -> i64 {
     let (seconds, fraction) = literal.split_once('.').unwrap_or((literal, ""));
     assert!(
         !seconds.is_empty() && seconds.bytes().all(|byte| byte.is_ascii_digit()),
