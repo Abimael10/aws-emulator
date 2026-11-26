@@ -99,7 +99,161 @@ const CATALOG_ROWS: &[(&str, &str)] = &[
     // And two the recorded response did list, one Region and one Local Zone.
     ("ap-south-1", "gamelift-ping.ap-south-1.api.aws"),
     ("us-east-1-mia-2", "gamelift-ping-mia.us-east-1.api.aws"),
+    // Two more of the published set: a Region that is the second of its geography and a
+    // Local Zone of a city that holds one zone, each with the beacon its own name implies.
+    ("ap-south-2", "gamelift-ping.ap-south-2.api.aws"),
+    ("us-east-1-nyc-2", "gamelift-ping-nyc.us-east-1.api.aws"),
 ];
+
+/// A Region the service publishes no hosting location for, so being signed for it may not
+/// add one to the catalog or a beacon to it.
+const UNPUBLISHED_REGION: &str = "ca-west-1";
+
+/// Signing Regions the calls below are made in: the Region most of this suite uses, a
+/// published Region on another continent, a published Region whose catalog entry carries no
+/// Local Zone, and [`UNPUBLISHED_REGION`].
+///
+/// The catalog is the service's published location set, so none of these may change which
+/// locations are reported or which beacon any of them carries.
+const SIGNING_REGIONS: &[&str] = &["us-west-2", "eu-west-3", "ap-south-2", UNPUBLISHED_REGION];
+
+/// The beacon host name the published rule implies for `location`, derived from the
+/// location's OWN name alone: a Region name ends in its own index (`eu-west-3`) and takes
+/// `gamelift-ping.<region>.api.aws`; a Local Zone name is its parent Region — index and all
+/// — plus a city code and the index that distinguishes the zones of that city
+/// (`us-east-1-nyc-2`), and takes `gamelift-ping-<city>.<parent region>.api.aws`. `None` for
+/// a name of neither shape.
+///
+/// Derived here from the name rather than read from the service, so the expectation never
+/// borrows the emulator's own derivation.
+fn beacon_domain_from_name(location: &str) -> Option<String> {
+    let indexed = |segment: &str| {
+        !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    // Every published name ends in a numeric index, a Region's own or a Local Zone's.
+    let (head, index) = location.rsplit_once('-')?;
+    if !indexed(index) {
+        return None;
+    }
+    match head.rsplit_once('-') {
+        // What precedes the city code is the parent Region, so it ends in the Region's own
+        // index — which is what tells a Local Zone's name from a Region's.
+        Some((region, city))
+            if !indexed(city)
+                && region
+                    .rsplit_once('-')
+                    .is_some_and(|(_, region_index)| indexed(region_index)) =>
+        {
+            Some(format!("gamelift-ping-{city}.{region}.api.aws"))
+        }
+        _ => Some(format!("gamelift-ping.{location}.api.aws")),
+    }
+}
+
+/// The published catalog, and the beacon each of its locations carries, is the service's own
+/// location set: it is the same whichever Region a request is served in, and every beacon
+/// host name is derived from the location it belongs to — never from the caller's Region.
+#[tokio::test]
+async fn the_published_catalog_is_the_same_in_every_region_a_request_is_served_in() {
+    let gamelift = GameLift::new();
+    let mut baseline: Option<Vec<(String, Value)>> = None;
+
+    for region in SIGNING_REGIONS {
+        let listed = gamelift
+            .ok_in(region, "ListLocations", json!({"Filters": ["AWS"], "Limit": 200}))
+            .await;
+        let locations = listed["Locations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {region:?}: ListLocations must report a list"));
+
+        // Every location the service publishes carries the beacon its own name implies, on
+        // the documented port — whichever Region the request was served in.
+        let mut published: Vec<(String, Value)> = Vec::new();
+        for reported in &locations {
+            let name = reported["LocationName"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if reported["PingBeacon"].is_null() {
+                continue;
+            }
+            let Some(domain) = beacon_domain_from_name(&name) else {
+                panic!(
+                    "case {region:?}/{name:?}: a published location is a Region or a Local Zone \
+                     of one, got {reported}"
+                );
+            };
+            assert_eq!(
+                reported["PingBeacon"],
+                json!({"UDPEndpoint": {"Domain": domain, "Port": PING_BEACON_PORT}}),
+                "case {region:?}/{name:?}: expected the beacon this location's own name \
+                 implies, got {reported}"
+            );
+            published.push((name, reported["PingBeacon"].clone()));
+        }
+
+        // The rows of the published set are all there, including the ones that have nothing
+        // to do with the Region this request was served in.
+        let names: Vec<&str> = locations
+            .iter()
+            .map(|location| location["LocationName"].as_str().unwrap_or_default())
+            .collect();
+        for (location, domain) in CATALOG_ROWS {
+            let Some(reported) = entry(&locations, location) else {
+                panic!(
+                    "case {region:?}/{location:?}: the published catalog must carry this \
+                     location, got {names:?}"
+                );
+            };
+            assert_eq!(
+                reported["PingBeacon"],
+                json!({"UDPEndpoint": {"Domain": domain, "Port": PING_BEACON_PORT}}),
+                "case {region:?}/{location:?}: expected the location's own ping beacon, got \
+                 {reported}"
+            );
+        }
+
+        match &baseline {
+            None => baseline = Some(published),
+            Some(first) => assert_eq!(
+                &published, first,
+                "case {region:?}: the published catalog and its beacons must not depend on the \
+                 Region a request is served in, got {published:?}"
+            ),
+        }
+    }
+
+    // A Region the service publishes no hosting location for is not promoted to one by
+    // being signed for: it is reported, because the account can be served there, but with
+    // no beacon — the service operates none for it.
+    let unpublished = UNPUBLISHED_REGION;
+    let listed = list_locations(&gamelift, json!({"Filters": ["AWS"], "Limit": 200})).await;
+    assert!(
+        entry(&listed, unpublished).is_none(),
+        "case {unpublished:?}: a Region outside the published set must not appear for a \
+         caller elsewhere, got {listed:?}"
+    );
+    let served_there = gamelift
+        .ok_in(
+            unpublished,
+            "ListLocations",
+            json!({"Filters": ["AWS"], "Limit": 200}),
+        )
+        .await;
+    let there = served_there["Locations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let Some(reported) = entry(&there, unpublished) else {
+        panic!("case {unpublished:?}: the Region a request is served in must be reported");
+    };
+    assert!(
+        reported["PingBeacon"].is_null(),
+        "case {unpublished:?}: the service publishes no beacon for a location it does not \
+         operate, got {reported}"
+    );
+}
 
 /// The Local Zones of one city, which share that city's one published beacon: the parent
 /// Region, the city code the beacon host name carries, and the zones of that city the
@@ -113,6 +267,7 @@ const CITY_ZONE_GROUPS: &[(&str, &str, &[&str])] = &[
     ("us-east-1", "iah", &["us-east-1-iah-1", "us-east-1-iah-2"]),
     ("us-west-2", "phx", &["us-west-2-phx-1", "us-west-2-phx-2"]),
     ("us-east-1", "mia", &["us-east-1-mia-2"]),
+    ("us-east-1", "nyc", &["us-east-1-nyc-2"]),
     ("us-east-1", "lim", &["us-east-1-lim-1"]),
     ("af-south-1", "los", &["af-south-1-los-1"]),
 ];
