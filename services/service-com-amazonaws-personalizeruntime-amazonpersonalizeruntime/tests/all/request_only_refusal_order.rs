@@ -31,6 +31,12 @@
 //! of the Items dataset asks for no metadata, so such a request is measured against the
 //! "Otherwise" maximum and earns the clause naming the member that IS wrong — the map
 //! key — instead of one carrying a bound taken from the map the service refuses.
+//!
+//! And a `metadataColumns` rule whose violation would LOWER that bound is answered in
+//! front of the member it bounds: a column list past the documented cap is what makes a
+//! request one that includes metadata, so the caller earns the clause naming the column
+//! list rather than one measuring another member against a maximum read off the very
+//! list the service refuses.
 
 use serde_json::{json, Value};
 
@@ -722,6 +728,161 @@ async fn a_request_at_its_bound_against_a_served_resource_is_answered() {
         assert_eq!(
             entries, expected,
             "case {case}: expected {expected} entries in {member}, got {entries}"
+        );
+    }
+}
+
+/// Column counts past "The maximum number of columns you can provide is 10."
+/// (`smithy_query(query="doc",shape="GetRecommendationsRequest",member="metadataColumns")`):
+/// one past the documented cap, and well past it.
+const PAST_THE_COLUMN_CAP: [usize; 3] = [
+    MAX_METADATA_COLUMNS + 1,
+    MAX_METADATA_COLUMNS + 5,
+    MAX_METADATA_COLUMNS * 4,
+];
+
+/// Sizes of the bounded member that are past the lower maximum a request including
+/// metadata gets — at it plus one, between the two maxima, at the "Otherwise" maximum and
+/// past it — so a row's outcome cannot come from one particular size.
+const PAST_THE_LOWER_MAXIMUM: [usize; 4] = [
+    MAX_NUM_RESULTS_WITH_METADATA + 1,
+    MAX_NUM_RESULTS_WITH_METADATA * 2,
+    MAX_NUM_RESULTS,
+    MAX_NUM_RESULTS + 1,
+];
+
+#[tokio::test]
+async fn a_column_list_past_the_cap_is_refused_before_the_member_whose_bound_it_lowers() {
+    // A `metadataColumns` rule whose violation would LOWER the maximum another member is
+    // measured against is answered BEFORE that member: a column list past the documented
+    // cap is exactly what makes a request one that includes metadata, so measuring
+    // `numResults` / `inputList` against the lower maximum first would refuse the caller
+    // for a member it did not get wrong, with a bound taken from the very list the
+    // service refuses.
+    //
+    // The rows span the two metadata-bounded operations, column counts past the cap, and
+    // bounded-member sizes past the lower maximum — including sizes past the "Otherwise"
+    // maximum, where the member is too large under either reading and the column clause
+    // still names what the caller actually got wrong.
+    let emulator = seeded();
+
+    for route in METADATA_BOUNDED_ROUTES {
+        for columns in PAST_THE_COLUMN_CAP {
+            for size in PAST_THE_LOWER_MAXIMUM {
+                let body = merged(
+                    &merged(&served_base(route), &metadata_bounded_member(route, size)),
+                    &json!({
+                        "metadataColumns": { METADATA_DATASET_ITEMS: column_names(columns) },
+                    }),
+                );
+                let case = format!(
+                    "{route}: {columns} metadataColumns columns with a bounded member of {size}"
+                );
+                let refusal = emulator.refusal(route, body).await;
+                assert_eq!(
+                    (
+                        refusal.status,
+                        refusal.code.as_str(),
+                        refusal.errortype.as_str()
+                    ),
+                    (400, "InvalidInputException", "InvalidInputException"),
+                    "case {case}: expected 400 InvalidInputException, got {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.message,
+                    metadata_columns_past(columns),
+                    "case {case}: expected the column-count refusal {:?}, got {:?}",
+                    metadata_columns_past(columns),
+                    refusal.message
+                );
+                assert_ne!(
+                    refusal.message,
+                    past_the_bound(route, size, MAX_NUM_RESULTS_WITH_METADATA),
+                    "case {case}: a bound must not be taken from a column list the service \
+                     refuses, got {:?}",
+                    refusal.message
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_column_list_at_the_cap_lowers_the_bound_the_member_is_measured_against() {
+    // The complement, at the published bound itself: a column list the cap ADMITS is a
+    // request that includes metadata, so the lower maximum is the one its bounded member
+    // is measured against and the refusal names that member and that maximum. Nothing
+    // about the fix above raises the bound for an admitted list.
+    let emulator = seeded();
+
+    for route in METADATA_BOUNDED_ROUTES {
+        for size in PAST_THE_LOWER_MAXIMUM {
+            let body = merged(
+                &merged(&served_base(route), &metadata_bounded_member(route, size)),
+                &json!({
+                    "metadataColumns": { METADATA_DATASET_ITEMS: column_names(MAX_METADATA_COLUMNS) },
+                }),
+            );
+            let case = format!(
+                "{route}: {MAX_METADATA_COLUMNS} metadataColumns columns with a bounded member \
+                 of {size}"
+            );
+            let refusal = emulator.refusal(route, body).await;
+            assert_eq!(
+                (refusal.status, refusal.code.as_str()),
+                (400, "InvalidInputException"),
+                "case {case}: expected 400 InvalidInputException, got {refusal:?}"
+            );
+            assert_eq!(
+                refusal.message,
+                past_the_bound(route, size, MAX_NUM_RESULTS_WITH_METADATA),
+                "case {case}: expected the lower maximum an admitted column list fixes, {:?}, \
+                 got {:?}",
+                past_the_bound(route, size, MAX_NUM_RESULTS_WITH_METADATA),
+                refusal.message
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_request_at_the_cap_and_at_its_lowered_bound_passes_every_request_only_rule() {
+    // At the cap AND at the maximum that cap fixes, nothing about the request itself is
+    // wrong any more: the only refusal left is one that needs the RESOLVED resource — the
+    // columns are measured against the Items dataset the seeded catalog carries — so
+    // neither request-only clause can be what comes back.
+    let emulator = seeded();
+    let columns = column_names(MAX_METADATA_COLUMNS);
+
+    for route in METADATA_BOUNDED_ROUTES {
+        let size = MAX_NUM_RESULTS_WITH_METADATA;
+        let body = merged(
+            &merged(&served_base(route), &metadata_bounded_member(route, size)),
+            &json!({ "metadataColumns": { METADATA_DATASET_ITEMS: columns.clone() } }),
+        );
+        let case = format!(
+            "{route}: {MAX_METADATA_COLUMNS} metadataColumns columns with a bounded member of \
+             {size}"
+        );
+        let refusal = emulator.refusal(route, body).await;
+        assert_ne!(
+            refusal.message,
+            metadata_columns_past(MAX_METADATA_COLUMNS),
+            "case {case}: a column list AT the documented cap must not be refused for the cap, \
+             got {:?}",
+            refusal.message
+        );
+        assert_ne!(
+            refusal.message,
+            past_the_bound(route, size, MAX_NUM_RESULTS_WITH_METADATA),
+            "case {case}: a bounded member AT its maximum must not be refused for the bound, \
+             got {:?}",
+            refusal.message
+        );
+        assert!(
+            refusal.message.contains("not in the Items dataset"),
+            "case {case}: expected the refusal that needs the resolved catalog, got {:?}",
+            refusal.message
         );
     }
 }

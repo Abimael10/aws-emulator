@@ -15,7 +15,9 @@
 //!    is 500." — a longer list is 400 `Length of 'inputList' cannot be greater than
 //!    <max>`), the `@required` `userId`, and the `metadataColumns` rules that read
 //!    nothing else ("The map key is `ITEMS`", "The maximum number of columns you can
-//!    provide is 10" — see [`crate::state::requested_metadata_columns`]).
+//!    provide is 10" — see [`crate::state::requested_metadata_columns`]). The column cap
+//!    is settled in front of `inputList`'s bound, because that bound is read off the same
+//!    map: a column list the cap refuses never lowers it.
 //! 2. `campaignArn` is resolved against the registry in [`crate::state`] (400 "does
 //!    not exist or is not active yet" when it resolves to nothing — see
 //!    [`crate::state::Denied::unresolvable`]), and the campaign must deploy a
@@ -212,12 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    500." — so it is checked BEFORE the campaign is resolved: a list past the
         //    bound is refused whatever the campaign turns out to be. Which of the two
         //    maxima applies is the `metadataColumns` map read as the model states it
-        //    ("The map key is `ITEMS`"), so a map that names no column of the Items
-        //    dataset includes no metadata and gets the "Otherwise" maximum — the lower
-        //    bound is never taken from a map this handler is about to refuse.
-        let max_input_list = registry::metadata_bounded_max(registry::asks_for_metadata(
-            input.metadata_columns.as_ref(),
-        ));
+        //    ("The map key is `ITEMS`"), and the column cap is applied in front of the
+        //    bound it would otherwise lower ([`crate::state::metadata_bounded_max`]) — so
+        //    a map naming no column of the Items dataset gets the "Otherwise" maximum, and
+        //    the lower bound is never taken from a column list this handler is about to
+        //    refuse.
+        let max_input_list =
+            registry::metadata_bounded_max(input.metadata_columns.as_ref()).map_err(deny)?;
         if input.input_list.len() > max_input_list {
             return Err(deny(registry::too_long("inputList", max_input_list)));
         }
@@ -230,8 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  for.",
             ));
         }
-        //    So are the `metadataColumns` rules that need nothing but the request: the
-        //    map key, and how many columns it may name.
+        //    The remaining request-only `metadataColumns` rule is the map key, which a
+        //    map breaking asks for no metadata at all: it leaves the bound above at the
+        //    "Otherwise" maximum, so nothing it decides is measured before it.
         let requested_metadata =
             registry::requested_metadata_columns(input.metadata_columns.as_ref()).map_err(deny)?;
 

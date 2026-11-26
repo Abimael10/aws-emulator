@@ -13,8 +13,9 @@
 //!    fixes ("The default is 25. If you are including metadata in recommendations, the
 //!    maximum is 50. Otherwise, the maximum is 500."), the `metadataColumns` rules that
 //!    read nothing else ("The map key is `ITEMS`", "The maximum number of columns you
-//!    can provide is 10" — see [`crate::state::requested_metadata_columns`]), and the
-//!    `promotions` members a promoted subset cannot be defined without.
+//!    can provide is 10" — see [`crate::state::requested_metadata_columns`]), with the
+//!    column cap settled in front of `numResults` because its bound is read off the same
+//!    map, and the `promotions` members a promoted subset cannot be defined without.
 //! 2. **Resolve the resource.** Exactly one of `campaignArn` / `recommenderArn`
 //!    identifies what to recommend from; an ARN whose own resource part names another
 //!    resource type references no such resource at all, which is
@@ -243,22 +244,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    How many results to compute. Both `numResults` and the maximum it has to
         //    satisfy — "If you are including metadata in recommendations, the maximum
         //    is 50. Otherwise, the maximum is 500." — are facts about the REQUEST: the
-        //    bound is keyed off the same predicate `GetPersonalizedRanking` bounds
-        //    `inputList` with, so one request means one bound in both operations, and a
-        //    `metadataColumns` map that names no column of the Items dataset includes no
-        //    metadata, so it gets the "Otherwise" maximum rather than lowering the bound
-        //    with a map the handler is about to refuse.
-        let max_num_results = registry::metadata_bounded_max(registry::asks_for_metadata(
-            input.metadata_columns.as_ref(),
-        ));
+        //    bound comes from the same reading of `metadataColumns`
+        //    `GetPersonalizedRanking` bounds `inputList` with, so one request means one
+        //    bound in both operations. The column cap is applied in front of that bound
+        //    ([`crate::state::metadata_bounded_max`]), so a `metadataColumns` map naming
+        //    no column of the Items dataset gets the "Otherwise" maximum and the lower one
+        //    is never taken from a column list the handler is about to refuse.
+        let max_num_results =
+            registry::metadata_bounded_max(input.metadata_columns.as_ref()).map_err(deny)?;
         let num_results = registry::effective_num_results(
             input.num_results,
             registry::DEFAULT_NUM_RESULTS,
             max_num_results,
         )
         .map_err(deny)?;
-        //    The `metadataColumns` rules that need nothing but the request: the map key
-        //    and how many columns it may name.
+        //    The remaining request-only `metadataColumns` rule is the map key, which a map
+        //    breaking asks for no metadata at all: it leaves the bound above at the
+        //    "Otherwise" maximum, so nothing it decides is measured before it.
         let requested_metadata =
             registry::requested_metadata_columns(input.metadata_columns.as_ref()).map_err(deny)?;
         //    The `promotions` members themselves: a promotion missing one of them
