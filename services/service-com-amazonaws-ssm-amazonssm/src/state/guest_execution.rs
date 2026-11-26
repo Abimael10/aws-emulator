@@ -39,6 +39,8 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2_store;
+use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::aws_api::CallerIdentity;
+use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::AwsAccess;
 
 use crate::ops::types::DocumentParameter;
 
@@ -351,7 +353,9 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// and the service that owns the guest cannot read. So does the guest's PYTHON INTERPRETER
 /// ([`super::guest_python`]), which runs the inline program a script that reports a computed
 /// line ends in: the one contained engine this workspace embeds for caller-supplied Python is
-/// reachable from this crate and not from the one that owns the guest. `programs` is what the
+/// reachable from this crate and not from the one that owns the guest — and so does the AWS CLI
+/// the machine's image ships ([`super::guest_aws_cli`]), whose object calls are made on the
+/// machine's own terms. `programs` is what the
 /// programs of ONE REQUEST may spend between them
 /// ([`super::guest_python::ProgramAllowance`]) — made once per request and handed to every
 /// delivery of it, which is what bounds the product of the commands a script carries and the
@@ -362,20 +366,21 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// ([`ec2_store::instance_profile_role_name`], read before the guest's store is taken), and
 /// the guest's metadata service publishes it to a program that asks — the read an agent makes
 /// to learn the role it is running as. The CREDENTIALS of that role travel with it, minted by
-/// the token service for the instance ([`ec2_store::instance_role_credentials`]) out of
-/// `credentials`, the emulator's own credential store, which only a request's own context
-/// carries: a script inside the guest signs its AWS calls with them, so a call it makes is a
-/// call made by the role the instance runs as.
+/// the token service for the instance ([`ec2_store::instance_role_credentials`]) out of the
+/// emulator's own credential store, which only a request's own context carries: a script inside
+/// the guest signs its AWS calls with them, so a call it makes is a call made by the role the
+/// instance runs as. The terms those calls are made on travel beside them
+/// ([`MachineAccess`]).
 pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    credentials: &::emulator_server::CredentialStore,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     instance_id: &str,
     commands: &[String],
     now: SystemTime,
     programs: &::std::sync::Arc<super::guest_python::ProgramAllowance>,
 ) -> Option<ec2_store::GuestRun> {
-    let delivery = delivery_in_guest(engine, credentials, region, instance_id, now, programs);
+    let delivery = delivery_in_guest(engine, ctx, region, instance_id, now, programs);
     perform_delivery(engine, instance_id, commands, delivery)
 }
 
@@ -413,12 +418,13 @@ impl ::std::fmt::Debug for GuestDelivery {
 #[must_use]
 pub fn delivery_in_guest<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    credentials: &::emulator_server::CredentialStore,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     instance_id: &str,
     now: SystemTime,
     programs: &::std::sync::Arc<super::guest_python::ProgramAllowance>,
 ) -> GuestDelivery {
+    let credentials = ctx.credential_store();
     let resolver = ::service_com_amazonaws_route53resolver_route53resolver::state::vpc_dns::view_from_instance(
         engine, instance_id,
     )
@@ -441,9 +447,29 @@ pub fn delivery_in_guest<Eng: Send + Sync + 'static>(
     // caller-supplied Python, which the service that owns the guest cannot reach. It spends
     // from `programs`, the allowance the REQUEST's own programs share, so what one request can
     // make this process run is bounded across every command of every script it delivers.
-    let interpreter = Some(super::guest_python::interpreter_programs(programs));
+    //
+    // ... and the AWS CLI the machine's image ships ([`super::guest_aws_cli`]), which a script
+    // that moves data invokes. BOTH reach the rest of this emulator on the MACHINE's own terms
+    // ([`machine_access`]): signed as the role the instance profile carries, and held to what
+    // the machine's network carries — read here, off two other services' stores and this
+    // request's own context, for the reason everything else here is.
+    let machine = machine_access(engine, ctx, instance_id, now);
+    let interpreter = Some(super::guest_python::interpreter_programs(
+        programs,
+        machine
+            .as_ref()
+            .and_then(|machine| machine.sdk_access(ctx, region)),
+    ));
+    let command_line = machine.as_ref().and_then(|machine| {
+        super::guest_aws_cli::aws_cli_programs(
+            ctx.callback().clone(),
+            region,
+            Some(machine.signing_as()),
+            machine.egress.clone(),
+        )
+    });
     GuestDelivery {
-        supplied: [resolver, packages, nfs, interpreter]
+        supplied: [resolver, packages, nfs, interpreter, command_line]
             .into_iter()
             .flatten()
             .reduce(::service_common::posix_shell_session::layered),
@@ -459,14 +485,129 @@ pub fn delivery_in_guest<Eng: Send + Sync + 'static>(
     }
 }
 
+/// What the MACHINE brings to the programs a caller installs in its guest: WHO their calls are
+/// made by, and WHAT its own network carries.
+///
+/// Two facts of the machine, each read through the store that owns it:
+///
+/// * WHO the call is made by. "Applications on the instance retrieve the security credentials
+///   provided by the role from the instance metadata" (Amazon EC2 User Guide, "Use an IAM role
+///   to grant permissions to applications running on Amazon EC2 instances"), so a call made from
+///   inside the guest is a call made by the role the instance profile carries: it is signed as
+///   the SESSION the service that owns instances mints for the machine
+///   ([`ec2_store::instance_role_credentials`]), under the identity that mint names — the
+///   session of that role, named for the instance
+///   ([`::service_common::iam_role::assumed_role_session_arn`]) — so the service serving the
+///   call judges it against the policies in force on the role, and a refusal says which
+///   instance was refused. An instance that runs as no profile has no credentials in its guest
+///   at all, and nothing here signs for it.
+/// * WHAT its own NETWORK carries. A call out of the machine travels through the VPC endpoints
+///   of its VPC, whose policies are that service's records
+///   ([`ec2_store::instance_endpoint_policies`]), and a call such a policy does not allow is
+///   refused by the called service however the role's own policies read — which is what an
+///   endpoint policy is for ([`::service_common::vpc_endpoint_calls`], where that decision
+///   lives). A machine whose VPC holds no endpoint has no such control in force on it.
+///
+/// Read ONCE per delivery, before the store that owns the guest is taken, and shared by every
+/// program installed in that guest — so the interpreter's own SDK call and the command line's
+/// are made by the same identity on the same terms.
+struct MachineAccess {
+    /// The session the machine's calls are signed as. Its debug form carries no field.
+    credentials: ec2_store::GuestRoleCredentials,
+    /// What its network carries, and `None` where no such control is in force.
+    egress: Option<::std::sync::Arc<dyn ::service_common::vpc_endpoint_calls::CallEgress>>,
+}
+
+impl ::std::fmt::Debug for MachineAccess {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("MachineAccess")
+            .field("egress", &self.egress)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MachineAccess {
+    /// The three values a call of this machine is signed with, as the programs installed in its
+    /// guest present them. Held by host code: they reach the request's own signature and
+    /// nothing else.
+    fn signing_as(&self) -> (String, String, String) {
+        (
+            self.credentials.access_key_id.clone(),
+            self.credentials.secret_access_key.clone(),
+            self.credentials.session_token.clone(),
+        )
+    }
+
+    /// The SEAM an AWS SDK call made inside this guest is dispatched on: the in-process
+    /// callback, signed as the machine's own session and held to what its network carries.
+    ///
+    /// `None` where there is no seam at all — no async runtime to dispatch a call on — in which
+    /// case a program simply has no SDK and says so.
+    fn sdk_access(
+        &self,
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+    ) -> Option<AwsAccess> {
+        let (access_key_id, secret_access_key, session_token) = self.signing_as();
+        Some(
+            AwsAccess::new(ctx.callback().clone(), region)?
+                .signing_as(Some(CallerIdentity {
+                    access_key_id,
+                    secret_access_key,
+                    session_token,
+                }))
+                .addressed_at(ctx.endpoint())
+                .leaving_through(self.egress.clone()),
+        )
+    }
+}
+
+/// What the machine `instance_id` names brings to its guest's programs ([`MachineAccess`]) —
+/// `None` for an instance that runs as no instance profile, or one this emulator could mint no
+/// session for, whose guest then holds no credential at all.
+fn machine_access<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    instance_id: &str,
+    now: SystemTime,
+) -> Option<MachineAccess> {
+    let role = ec2_store::instance_profile_role(engine, instance_id)?;
+    let credentials =
+        ec2_store::instance_role_credentials(engine, ctx.credential_store(), instance_id, now)?;
+    // The identity the mint names the session by: the role's own session, named for the
+    // instance, which is what a refusal of one of its calls is about.
+    let principal = ::service_common::iam_role::assumed_role_session_arn(&role.arn, instance_id);
+    let egress = ::service_common::vpc_endpoint_calls::VpcEndpointEgress::of(
+        ec2_store::instance_endpoint_policies(engine, instance_id),
+        &principal,
+        ::engine::emulator_account_id(),
+    );
+    Some(MachineAccess {
+        credentials,
+        egress: egress.map(|egress| {
+            ::std::sync::Arc::new(egress)
+                as ::std::sync::Arc<dyn ::service_common::vpc_endpoint_calls::CallEgress>
+        }),
+    })
+}
+
 /// Perform `commands` in the guest of the instance `instance_id` names, with `delivery` as
 /// what the caller installs in it — the run itself, which borrows nothing of the request.
 ///
 /// SYNCHRONOUS and CPU-bound: the script is performed by the shell session of the service that
-/// owns the guest, with that store's guard held, and a program of the guest may wait a bounded
-/// span for an interpreter of this process. A caller serving a request therefore performs it on
-/// a BLOCKING thread rather than on a worker of the asynchronous runtime
-/// (`crate::ops::send_command`).
+/// owns the guest, and a program of the guest may wait a bounded span for an interpreter of
+/// this process. A caller serving a request therefore performs it on a BLOCKING thread rather
+/// than on a worker of the asynchronous runtime (`crate::ops::send_command`).
+///
+/// NO guard of the store that owns the guest is held while the script runs: the programs
+/// installed in that guest CALL this emulator — the interpreter's own SDK and the machine's
+/// command line both reach it over the in-process callback, on this very thread — and such a
+/// call is served by a handler that may need that store. So the run is performed in the three
+/// steps that service states for exactly this reason
+/// ([`ec2_store::ComAmazonawsEc2Amazonec2State::prepare_instance_guest_run`]): the session is
+/// built under the guard, the script runs with the guard given up, and what it left is kept
+/// under the guard again.
 #[must_use]
 pub fn perform_delivery<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -474,21 +615,20 @@ pub fn perform_delivery<Eng: Send + Sync + 'static>(
     commands: &[String],
     delivery: GuestDelivery,
 ) -> Option<ec2_store::GuestRun> {
-    let run = {
-        let ec2 = ec2_store::service_state(engine)?;
+    let ec2 = ec2_store::service_state(engine)?;
+    let prepared = {
         let mut store = ec2.lock();
         // The moves that service already owed the instance — its launch reaching `running` and
         // its guest's first boot — were due at their own instants whether or not anybody called,
         // and a script runs in the guest that boot brought up. Materialising them is EC2's own
         // write, through its own one-stop materialiser.
         store.materialize_due_transitions();
-        store.run_in_instance_guest_with(
-            instance_id,
-            commands,
-            delivery.supplied,
-            &delivery.identity,
-        )
-    };
+        store.prepare_instance_guest_run(instance_id, delivery.supplied, &delivery.identity)
+    }?;
+    // The run itself, with no guard of that store held — so a call a program of the guest makes
+    // is served rather than waiting for a guard its own script holds.
+    let performed = prepared.performed(commands);
+    let run = performed.map(|performed| ec2.lock().commit_instance_guest_run(performed));
     // What the script left the guest's own PUBLISHERS owing is published with no store guard
     // held: a CloudWatch agent the script configured and started has its first collections and
     // the StatsD values its listener received to publish, and those datapoints are the store

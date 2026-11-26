@@ -2784,6 +2784,12 @@ pub use guest_metadata::*;
 pub mod instance_role_credentials;
 pub use instance_role_credentials::*;
 
+/// The VPC ENDPOINT POLICIES in force on one instance's own traffic: the endpoints of its VPC
+/// that serve the subnet it is in, for the component that runs code inside its guest. A
+/// SUBMODULE for the same reason [`image_usage_reports`] is one.
+pub mod vpc_endpoint_policies;
+pub use vpc_endpoint_policies::*;
+
 /// What one instance's GUEST sees of its own CPUs: the processors, cores and threads the
 /// launch's `CpuOptions` gave it, published to that guest as the files the kernel publishes
 /// them in and the programs that print them. A SUBMODULE for the same reason

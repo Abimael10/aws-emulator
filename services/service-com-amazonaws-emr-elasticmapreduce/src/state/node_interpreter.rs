@@ -44,7 +44,12 @@ use ::service_com_amazonaws_ssm_amazonssm::state::guest_python::{
 use ::service_common::posix_shell_session::EnvironmentPrograms;
 
 /// The interpreter one command line of a cluster node is given, with an allowance of its own.
+///
+/// It is given NO AWS SDK seam: a program of such a command is handed no credential of the
+/// cluster's own here, so one that calls AWS reports the call as one that was not made — the
+/// position every program of this session was in before that seam existed, and what the change
+/// that gives a cluster's nodes their instance profile can give them.
 #[must_use]
 pub fn node_python_interpreter() -> Box<dyn EnvironmentPrograms> {
-    interpreter_programs(&ProgramAllowance::for_one_request())
+    interpreter_programs(&ProgramAllowance::for_one_request(), None)
 }

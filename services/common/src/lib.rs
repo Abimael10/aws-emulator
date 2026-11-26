@@ -514,6 +514,11 @@ pub mod vpc_dns_firewall;
 /// — recorded by the service that owns Resolver endpoints and read by whatever CARRIES such a
 /// query, so the answer comes off those services' own live records rather than a copy of them.
 pub mod vpc_private_dns;
+/// What a VPC ENDPOINT POLICY decides about an AWS API call made from inside a VPC — the one
+/// reading of that document, for every component that runs caller-supplied code in a machine of
+/// the account's own network, so a control the account wrote is enforced on the traffic rather
+/// than only stored.
+pub mod vpc_endpoint_calls;
 /// The ONE rendering of a `restJson1` timestamp whose model declares the `date-time` form,
 /// for every service of that class — which the generated member schemas drop, so without it
 /// such a member goes on the wire as the protocol's default epoch-seconds NUMBER.

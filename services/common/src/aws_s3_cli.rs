@@ -370,11 +370,20 @@ pub fn reads_standard_input(arguments: &[String]) -> bool {
 /// What a call the object store refused reports, as the CLI words a service's refusal: "An
 /// error occurred (<code>) when calling the <operation> operation: <message>".
 pub fn store_answered<E: ProvideErrorMetadata>(operation: &str, error: &E) -> String {
-    format!(
-        "An error occurred ({}) when calling the {operation} operation: {}",
+    service_answered(
+        operation,
         error.code().unwrap_or("Unknown"),
-        error.message().unwrap_or_default()
+        error.message().unwrap_or_default(),
     )
+}
+
+/// The SAME sentence for a refusal a caller holds as its code and its message rather than as a
+/// client's error — a call a CONTROL on the caller's own network refused before it was made
+/// ([`crate::vpc_endpoint_calls`]), which the CLI reports exactly as it reports one the service
+/// answered: the command made a request of the service, and what it tells its caller is the code
+/// and the sentence that request came back with.
+pub fn service_answered(operation: &str, code: &str, message: &str) -> String {
+    format!("An error occurred ({code}) when calling the {operation} operation: {message}")
 }
 
 /// The CLI's LOW-LEVEL command group for the object store: `aws s3api`, which "gives access to

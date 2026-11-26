@@ -114,8 +114,19 @@ const MAX_PRODUCED_OUTPUTS: usize = 20;
 ///
 /// A CHOSEN ceiling, the write-side counterpart of [`MAX_INPUT_BYTES`]: what a produced file
 /// holds is driven by the input's own sample table, which a caller writes, so the output is
-/// abandoned once it passes this rather than growing with whatever that table indexes.
+/// abandoned once it passes this rather than growing with whatever that table indexes. It is
+/// counted over the WHOLE file — every track of it — because each track re-indexes bytes into
+/// the same produced file ([`remux`]).
 const MAX_OUTPUT_BYTES: usize = MAX_INPUT_BYTES;
+
+/// How many tracks of an input one produced file carries.
+///
+/// CHOSEN: how many tracks a container declares is the caller's own, and each one carries
+/// samples into the produced file, so the number of them is bounded beside the bytes they
+/// come to ([`MAX_OUTPUT_BYTES`]). It is far above the tracks a MediaConvert output is made of
+/// — its video, its audio renditions and their captions — so a file this engine can produce at
+/// all is unaffected.
+const MAX_CARRIED_TRACKS: usize = 32;
 
 /// How many samples one remuxed track carries.
 ///
@@ -1189,6 +1200,10 @@ fn remux(media: &[u8], frame: Option<(i32, i32)>) -> Option<Vec<u8>> {
     ids.sort_unstable();
     let tracks: Vec<(u32, ::mp4::TrackConfig)> = ids
         .iter()
+        // What one output carries is bounded by the number of tracks this engine writes
+        // ([`MAX_CARRIED_TRACKS`]): how many a file declares is the input's own, and every one
+        // of them re-indexes bytes into the produced file.
+        .take(MAX_CARRIED_TRACKS)
         .filter_map(|id| {
             let track = reader.tracks().get(id)?;
             Some((*id, track_config(track, frame)?))
@@ -1201,6 +1216,11 @@ fn remux(media: &[u8], frame: Option<(i32, i32)>) -> Option<Vec<u8>> {
     for (_, config) in &tracks {
         writer.add_track(config).ok()?;
     }
+    // How much the written FILE holds is driven by the input's own sample TABLES, which may
+    // index the same bytes over and over and do so once per track, so the bytes carried are
+    // counted across every track of the file and the file is abandoned at the ceiling rather
+    // than grown to whatever those tables ask for.
+    let mut carried = 0usize;
     for (position, (id, _)) in tracks.iter().enumerate() {
         // The writer numbers the tracks it was given in the order it was given them, which
         // is not the input's numbering once a track has been left out: the samples of the
@@ -1213,14 +1233,9 @@ fn remux(media: &[u8], frame: Option<(i32, i32)>) -> Option<Vec<u8>> {
         if samples > MAX_CARRIED_SAMPLES {
             return None;
         }
-        let mut carried = 0usize;
         for index in 1..=samples {
             match reader.read_sample(*id, index) {
                 Ok(Some(sample)) => {
-                    // How much the written file holds is driven by the input's own sample
-                    // TABLE, which may index the same bytes over and over, so the bytes
-                    // carried are counted and the file is abandoned at the ceiling rather
-                    // than grown to whatever that table asks for.
                     carried = carried.saturating_add(sample.bytes.len());
                     if carried > MAX_OUTPUT_BYTES {
                         return None;

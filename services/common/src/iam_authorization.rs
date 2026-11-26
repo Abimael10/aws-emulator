@@ -1028,6 +1028,25 @@ pub const PERMISSIONS_BOUNDARY_EXPLICIT_DENY: &str =
 /// sentence names it rather than the action.
 pub const SESSION_POLICY_EXPLICIT_DENY: &str = "with an explicit deny in a session policy";
 
+/// The reason clause for a request an explicit `Deny` in the policy of the VPC ENDPOINT it
+/// travelled through refuses — a fact about that document, so the sentence names it rather than
+/// the caller's own.
+///
+/// A request that reaches a service through a VPC endpoint is subject to the endpoint's own
+/// policy beside the caller's ("you can … attach an endpoint policy to it that controls access
+/// to the service", `CreateVpcEndpointRequest$PolicyDocument`), so the refusal of such a request
+/// is worded like the refusals around it: which of the documents in force withheld the call.
+pub const VPC_ENDPOINT_POLICY_EXPLICIT_DENY: &str =
+    "with an explicit deny in a VPC endpoint policy";
+
+/// The reason clause for a request no policy of the VPC ENDPOINT it travelled through allows,
+/// which names the action nothing granted — the endpoint counterpart of
+/// [`no_identity_policy_allows`].
+#[must_use]
+pub fn no_vpc_endpoint_policy_allows(action: &str) -> String {
+    format!("because no VPC endpoint policy allows the {action} action")
+}
+
 /// The reason clause for a request no readable identity-based document allows — IAM's default
 /// deny, which names the action nothing granted.
 #[must_use]

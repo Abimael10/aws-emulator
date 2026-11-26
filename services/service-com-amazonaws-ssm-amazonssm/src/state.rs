@@ -510,6 +510,10 @@ pub mod guest_packages;
 /// hands it in the one contained engine this workspace embeds.
 pub mod guest_python;
 
+/// The AWS CLI in a node's guest, which performs the object calls a command's script makes as
+/// the role the instance runs as — and on the terms the machine's own network carries.
+pub mod guest_aws_cli;
+
 /// Where this service's EC2-facing work lives: the registration half and the delivery half,
 /// and why they are separate.
 pub mod ec2_managed_nodes;

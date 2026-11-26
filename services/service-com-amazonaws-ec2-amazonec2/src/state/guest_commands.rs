@@ -158,6 +158,69 @@ struct Performed {
     volume: ::service_common::posix_shell_volume::ShellVolume,
 }
 
+/// One guest SESSION with its script still to come: everything the run needs, taken out from
+/// under the store's guard so the run itself holds none
+/// ([`ComAmazonawsEc2Amazonec2State::prepare_instance_guest_run`] states why it has to).
+#[derive(Debug)]
+pub struct PreparedGuestRun {
+    /// The instance whose guest this is, which is where what the run leaves goes back.
+    instance_id: String,
+    /// The session the script is performed by, holding the machine's tree and its programs.
+    session: ShellSession,
+    /// The services the machine is running, which a command of the run may change.
+    services: super::guest_services::GuestServices,
+    /// The devices the run may read and write through.
+    services_disks: super::guest_disk_io::GuestDisks,
+}
+
+/// What one run LEFT, as the store takes it back
+/// ([`ComAmazonawsEc2Amazonec2State::commit_instance_guest_run`]).
+#[derive(Debug)]
+pub struct PerformedGuestRun {
+    /// The instance whose guest ran it.
+    instance_id: String,
+    /// What the run answered, as the caller reads it.
+    run: GuestRun,
+    /// The files it left on the machine's storage.
+    files: ::std::collections::BTreeMap<String, String>,
+    /// What it left RUNNING there.
+    services: super::GuestRuntime,
+    /// What it wrote through a device, for the volume behind that device.
+    disks: super::guest_disk_io::GuestDiskWrites,
+}
+
+impl PreparedGuestRun {
+    /// Perform `commands` in this session as ONE script, with NO guard of the store held, and
+    /// answer what the run left — `None` for a run this process could not perform at all,
+    /// which leaves the machine exactly as it was.
+    ///
+    /// The lines are one script, read by the grammar in one piece: that is what makes a
+    /// here-document opened on one line carry the lines under it, and what makes the script's
+    /// own exit status the status of its LAST command rather than of whichever line happened to
+    /// be last in the list.
+    #[must_use]
+    pub fn performed(self, commands: &[String]) -> Option<PerformedGuestRun> {
+        let Self {
+            instance_id,
+            session,
+            services,
+            services_disks,
+        } = self;
+        let script = commands.join("\n");
+        let Performed { run, volume } = performed(session, &script)?;
+        Some(PerformedGuestRun {
+            instance_id,
+            run,
+            files: volume
+                .stored_files()
+                .map(|(path, contents)| (path.to_string(), contents.to_string()))
+                .collect(),
+            services: services.taken(),
+            disks: services_disks.taken(),
+        })
+    }
+}
+
 /// Perform `script` in `session` and answer what it wrote on each stream, the status it ended
 /// on, how long it stated it took, and the tree it left behind — `None` for a run this process
 /// could not perform at all.
@@ -251,6 +314,33 @@ impl ComAmazonawsEc2Amazonec2State {
         supplied: Option<Box<dyn EnvironmentPrograms>>,
         identity: &GuestIdentity,
     ) -> Option<GuestRun> {
+        let prepared = self.prepare_instance_guest_run(instance_id, supplied, identity)?;
+        let performed = prepared.performed(commands)?;
+        Some(self.commit_instance_guest_run(performed))
+    }
+
+    /// The SESSION one script is to be performed in, built out of this store and handed back
+    /// so the run itself happens with NO guard of this store held
+    /// ([`PreparedGuestRun::performed`]) — and `None` when there is no running, booted guest to
+    /// perform anything in ([`Self::run_in_instance_guest_with`] states what a guest has to be).
+    ///
+    /// Why the three steps exist: a program installed in that session by the caller that
+    /// reached into the guest may CALL this emulator — an agent's command that moves a file
+    /// into an object store, a script's own SDK call — and such a call is served by this
+    /// process, on the very thread the script is being performed on. A guard of this store held
+    /// across the run would therefore be a guard the call cannot take: the script would wait
+    /// for an answer that waits for the guard. So the guard is taken to BUILD the session, given
+    /// up for the run, and taken again to keep what the run left
+    /// ([`Self::commit_instance_guest_run`]). What the machine holds afterwards is what the run
+    /// left, as it is for a run performed in one step: a write another caller makes to the same
+    /// machine while a script of it is running is overwritten by the script's own tree, which is
+    /// the same outcome the one-step form gives it.
+    pub fn prepare_instance_guest_run(
+        &self,
+        instance_id: &str,
+        supplied: Option<Box<dyn EnvironmentPrograms>>,
+        identity: &GuestIdentity,
+    ) -> Option<PreparedGuestRun> {
         let instance = self.instances.get(instance_id)?;
         if instance.state != InstanceStateName::Running {
             return None;
@@ -324,30 +414,42 @@ impl ComAmazonawsEc2Amazonec2State {
         // The lines are ONE script, read by the grammar in one piece: that is what makes a
         // here-document opened on one line carry the lines under it, and what makes the
         // script's own exit status the status of its LAST command rather than of whichever
-        // line happened to be last in the list.
-        let script = commands.join("\n");
-        // A run nothing performed at all leaves the machine exactly as it was: there is no
-        // outcome to report and nothing to write back.
-        let Performed { run, volume } = performed(session, &script)?;
-        let written: ::std::collections::BTreeMap<String, String> = volume
-            .stored_files()
-            .map(|(path, contents)| (path.to_string(), contents.to_string()))
-            .collect();
-        // What the program left on the machine's storage is what the machine holds now — the
-        // same write the boot's own program makes, and so is what it left RUNNING.
-        if let Some(instance) = self.instances.get_mut(instance_id) {
-            let mut runtime = services.taken();
+        // line happened to be last in the list. The session is handed back with the script
+        // still to come, so the run happens with this store's guard given up.
+        Some(PreparedGuestRun {
+            instance_id: instance_id.to_string(),
+            session,
+            services,
+            services_disks: disks,
+        })
+    }
+
+    /// Keep what one run left on the machine it ran in, and answer what that run came to.
+    ///
+    /// The write half of [`Self::prepare_instance_guest_run`], taken with this store's guard
+    /// held again: the files the script left are the machine's storage, what it left RUNNING is
+    /// the machine's services, and what it wrote THROUGH a device goes onto the volume behind
+    /// that device — the same three writes a run performed in one step makes. An instance this
+    /// store no longer holds takes none of them; the run itself is still reported, because it
+    /// happened.
+    pub fn commit_instance_guest_run(&mut self, performed: PerformedGuestRun) -> GuestRun {
+        let PerformedGuestRun {
+            instance_id,
+            run,
+            files,
+            services,
+            disks,
+        } = performed;
+        if let Some(instance) = self.instances.get_mut(&instance_id) {
+            let mut runtime = services;
             // The space a file held on the filesystem is the filesystem's again once the file
             // is gone ([`super::guest_filesystem::release_removed_files`]).
-            super::guest_filesystem::release_removed_files(&mut runtime, &written);
-            instance.guest_files = written;
+            super::guest_filesystem::release_removed_files(&mut runtime, &files);
+            instance.guest_files = files;
             instance.guest_runtime = runtime;
         }
-        // ... and what it wrote THROUGH a device goes onto the volume behind that device, which is
-        // where the data of a volume lives and what makes it follow the volume across a move
-        // ([`super::guest_disk_io`]).
-        self.apply_guest_disk_writes(disks.taken(), ::std::time::SystemTime::now());
-        Some(run)
+        self.apply_guest_disk_writes(disks, ::std::time::SystemTime::now());
+        run
     }
 
     /// What the guest of the instance `instance_id` names holds at `path`, or `None` when it

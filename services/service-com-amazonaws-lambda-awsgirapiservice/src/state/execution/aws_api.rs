@@ -2093,6 +2093,11 @@ pub struct AwsAccess {
     /// extensions registered in it. `None` for a seam built for no invocation of a function,
     /// where that interface has no environment to answer from.
     sandbox: Option<super::runtime_api::Sandbox>,
+    /// What decides whether a call of this seam LEAVES the network the run happens in — the
+    /// policies of the VPC endpoints a machine's traffic travels through, say
+    /// ([`::service_common::vpc_endpoint_calls`]). `None` for a run with no such control in
+    /// force on it, whose calls are decided by the called service alone.
+    egress: Option<::std::sync::Arc<dyn ::service_common::vpc_endpoint_calls::CallEgress>>,
 }
 
 impl AwsAccess {
@@ -2113,7 +2118,23 @@ impl AwsAccess {
             endpoint: None,
             client_endpoint: None,
             sandbox: None,
+            egress: None,
         })
+    }
+
+    /// The same access, with `egress` deciding whether a call of it leaves the network the run
+    /// happens in: a call that network does not carry is answered the refusal the called
+    /// service answers it with, and nothing is dispatched for it.
+    ///
+    /// `None` leaves every call to the called service's own decision, which is the position a
+    /// run outside any such network is in.
+    #[must_use]
+    pub fn leaving_through(
+        mut self,
+        egress: Option<::std::sync::Arc<dyn ::service_common::vpc_endpoint_calls::CallEgress>>,
+    ) -> Self {
+        self.egress = egress;
+        self
     }
 
     /// The same access, inside the execution environment `sandbox` holds the state of — the
@@ -2318,6 +2339,16 @@ impl AwsAccess {
         } else {
             &self.region
         };
+        // Whether the NETWORK the run happens in carries this call at all: a control the
+        // account wrote on that network — the policy of a VPC endpoint the traffic travels
+        // through — is decided before anything is dispatched, and a call it does not carry is
+        // answered the refusal the called service answers it with. The decision is the one
+        // reading of such a document this workspace holds, handed what the request itself says.
+        if let Some(refused) = self.egress.as_ref().and_then(|egress| {
+            egress.refusal(api.signing_name, operation, region, body)
+        }) {
+            return Ok(refusal_answered(&refused));
+        }
         // Every AWS SDK client generates a value for an input member the service's model marks
         // as an idempotency token when the caller left it out, and sends it with the request
         // (`super::idempotency_token`) — so this seam, which is the lower half of every SDK
@@ -2710,6 +2741,33 @@ pub struct Answer {
     /// output whose payload shape is a blob in a streaming body ([`super::aws_sdk_guest`]).
     /// Empty for an answer binding none — which is every answer of an AWS JSON service.
     pub payload_blobs: Vec<String>,
+}
+
+/// The answer a call the NETWORK did not carry is reported with: the called service's own
+/// status, code and sentence, in the two members the SDK the guest calls reads a refusal's code
+/// and message from.
+///
+/// It is an ANSWER rather than a [`Refusal`]: the call was refused by a policy in force on it,
+/// which is the service's own HTTP answer to the request — so the guest's SDK raises the class
+/// that code names, exactly as it does for a refusal the service itself worded. Nothing was
+/// dispatched, so no request id is reported and no member of any output shape is.
+fn refusal_answered(refused: &::service_common::vpc_endpoint_calls::RefusedCall) -> Answer {
+    let document = ::serde_json::json!({
+        "__type": refused.code,
+        "message": refused.message,
+    });
+    Answer {
+        status: refused.status,
+        body: document.to_string(),
+        error_type: Some(refused.code.clone()),
+        query_error_code: None,
+        request_id: None,
+        error_members: ::std::collections::BTreeMap::new(),
+        streams: Vec::new(),
+        blobs: Vec::new(),
+        instants: Vec::new(),
+        payload_blobs: Vec::new(),
+    }
 }
 
 /// What the CALLER of one dispatch brings to it, beside the operation and the input document:

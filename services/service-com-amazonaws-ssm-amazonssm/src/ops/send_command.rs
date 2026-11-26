@@ -728,7 +728,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing of the request.
             let delivery = crate::state::guest_execution::delivery_in_guest(
                 &*self.engine,
-                ctx.credential_store(),
+                ctx,
                 &region,
                 &id,
                 now,

@@ -68,7 +68,7 @@ struct OwedDelivery {
 /// performed by the next read.
 pub async fn settle_due_deliveries<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
-    credentials: &::emulator_server::CredentialStore,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) {
     let Some(state) = super::service_state(&**engine) else {
@@ -90,7 +90,7 @@ pub async fn settle_due_deliveries<Eng: Send + Sync + 'static>(
         ::tokio::task::yield_now().await;
         let delivery = super::guest_execution::delivery_in_guest(
             &**engine,
-            credentials,
+            ctx,
             region,
             &owed.instance_id,
             SystemTime::now(),

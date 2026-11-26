@@ -58,7 +58,14 @@
 //!   clock, one of this process's run places ([`RUN_PLACES`]), the allowance every program of
 //!   one request spends from ([`ProgramAllowance`]), and the bounded wait the command gives the
 //!   thread the run happens on ([`HOST_WAIT`]) — so what a request can make this process run is
-//!   bounded whatever its script, its node selection and its arrival rate come to.
+//!   bounded whatever its script, its node selection and its arrival rate come to;
+//! * the SEAM the program's own AWS SDK calls are made through, which is the MACHINE's — signed
+//!   as the role the instance profile carries and held to what the machine's network carries
+//!   ([`super::guest_execution::guest_sdk_access`]). "Applications on the instance retrieve the
+//!   security credentials provided by the role" (Amazon EC2 User Guide), so a program inside the
+//!   guest calls AWS as that role and its effects are real effects; a machine this emulator can
+//!   sign no call for is given no seam, and its programs report every call as one that was not
+//!   made.
 //!
 //! Nothing here starts a process, opens a host file or reaches a socket, and nothing is
 //! reported for a program that did not run.
@@ -71,7 +78,7 @@ use std::time::Duration;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::PackageModule;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
-    Budget, Clock, Completion, Stop, RUN_STACK_BYTES,
+    AwsAccess, Budget, Clock, Completion, Stop, RUN_STACK_BYTES,
 };
 use ::service_common::posix_shell_session::{
     EnvironmentPrograms, ProgramFiles, ProgramInvocation, ProgramOutcome, ProgramStreams,
@@ -337,23 +344,34 @@ fn run_budget() -> Budget {
 
 /// The interpreter a command's script runs its inline programs with.
 ///
-/// Holds the allowance the programs of THIS REQUEST spend from and nothing else: the engine is
-/// the process's, and everything one run is given — the program, its arguments and its
-/// environment — comes from the invocation itself. No store guard, no engine handle and no
-/// host handle is reachable from a program.
+/// Holds the allowance the programs of THIS REQUEST spend from and the SEAM a program's own AWS
+/// SDK calls are made through, and nothing else: the engine is the process's, and everything one
+/// run is given — the program, its arguments and its environment — comes from the invocation
+/// itself. No store guard, no engine handle and no host handle is reachable from a program.
 #[derive(Debug)]
 pub struct GuestInterpreter {
     /// What every program of this request may spend between them ([`ProgramAllowance`]).
     allowance: Arc<ProgramAllowance>,
+    /// How a program of this guest reaches the rest of this emulator through the AWS SDK the
+    /// interpreter supplies it: signed as the role the machine runs as, and held to what the
+    /// machine's own network carries ([`super::guest_execution::guest_sdk_access`]). `None`
+    /// for a machine this emulator can sign no call for, whose programs then report every
+    /// call as one that was not made.
+    aws: Option<AwsAccess>,
 }
 
 /// The Python interpreter for the guest of a managed node, as the programs its environment
 /// provides — spending from `allowance`, which is the REQUEST's and is shared by every guest
-/// session that request performs.
+/// session that request performs, and making the AWS calls of the programs it runs through
+/// `aws`, which is the MACHINE's own seam.
 #[must_use]
-pub fn interpreter_programs(allowance: &Arc<ProgramAllowance>) -> Box<dyn EnvironmentPrograms> {
+pub fn interpreter_programs(
+    allowance: &Arc<ProgramAllowance>,
+    aws: Option<AwsAccess>,
+) -> Box<dyn EnvironmentPrograms> {
     Box::new(GuestInterpreter {
         allowance: Arc::clone(allowance),
+        aws,
     })
 }
 
@@ -408,9 +426,13 @@ impl EnvironmentPrograms for GuestInterpreter {
                 status: SUCCESS,
                 ..ProgramStreams::default()
             },
-            Invocation::Program { event } => {
-                performed(name, &event, invocation.environment, &self.allowance)
-            }
+            Invocation::Program { event } => performed(
+                name,
+                &event,
+                invocation.environment,
+                &self.allowance,
+                self.aws.clone(),
+            ),
         })
     }
 }
@@ -668,6 +690,7 @@ fn performed(
     event: &::serde_json::Value,
     environment: &BTreeMap<String, String>,
     allowance: &Arc<ProgramAllowance>,
+    aws: Option<AwsAccess>,
 ) -> ProgramStreams {
     // ONE of this process's places first, so a request that waits for one is charged the wait
     // whether or not it goes on to run a program.
@@ -732,9 +755,13 @@ fn performed(
                         client_context: None,
                         tenant_id: None,
                         budget: run_budget(),
-                        // The program reaches no other service of this emulator: this run is
-                        // given no seam to dispatch an AWS call on.
-                        aws: None,
+                        // How the program reaches the rest of this emulator through the AWS
+                        // SDK the interpreter supplies: the MACHINE's own seam, signed as the
+                        // role its instance profile carries and held to what its network
+                        // carries ([`super::guest_execution::guest_sdk_access`]). A machine
+                        // this emulator can sign no call for is given none, and its programs
+                        // report every call as one that was not made.
+                        aws: aws.as_ref(),
                         // It is no Lambda durable execution's run either, so it takes no step
                         // of one and checkpoints nothing onto one.
                         durable: None,

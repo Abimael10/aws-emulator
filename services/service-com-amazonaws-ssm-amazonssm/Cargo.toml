@@ -118,6 +118,11 @@ service-com-amazonaws-efs-magnolioapiservice-v20150201 = { workspace = true }
 # generated client is needed — the emulator supplies the transport, so the SDK's own HTTPS
 # stack and runtime are left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for Amazon S3, over the same callback: the AWS CLI a command's script invokes in a
+# node's guest performs its object calls with it (`state::guest_aws_cli`), through this
+# workspace's one construction of that client and its one reading of that command line
+# (`service_common::s3_client`, `service_common::aws_s3_cli`).
+aws-sdk-s3 = { version = "1", default-features = false }
 # An ORDER-PRESERVING map: a custom inventory item's content keeps the attribute order the
 # write that registered the type stated, which is the order that type's schema is reported in
 # and the order the refusal of a write that does not match it names its attributes in
