@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchUsersByImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchUsersByImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchUsersByImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! The faces of the submitted image are MEASURED by this service's geometric detector; the
+//! `QualityFilter`'s bar removes the ones too blurry to search with, and the largest of the
+//! rest is the face the search uses, every other one being reported as a face the search
+//! did not use. That face is then resolved against the USERS the named collection holds: a
+//! user IS the faces `AssociateFaces` put on it, so how well the submitted face matches a
+//! user is the resemblance measured between it and those faces, and every user reaching
+//! `UserMatchThreshold` is reported, highest similarity first, capped by `MaxUsers`. The
+//! split, the threshold, the ordering and the cap live in [`crate::state::user_search`], so
+//! the other user search of this service decides a match the same way. Nothing is written:
+//! a search reports what the store already holds.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +198,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchUsersByImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchUsersByImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchUsersByImage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchUsersByImageErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+
+        // The resource is resolved before the image is read, so a call naming a collection
+        // that does not exist is answered as not found whatever else is wrong with it. The
+        // guard is dropped before the detection below: no other request may be kept waiting
+        // while this one reads pixels.
+        if !state.lock().collections.contains_key(&input.collection_id) {
+            return Err(SearchUsersByImageErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        }
+
+        let bar = crate::state::face_detection::quality_bar(input.quality_filter.as_deref());
+        let detected =
+            crate::state::face_detection::measured_faces_in_submitted_image(ctx, &input.image)
+                .await
+                .map_err(unreadable_error)?;
+        let split = crate::state::user_search::searchable_faces(detected, bar);
+
+        let threshold = input
+            .user_match_threshold
+            .unwrap_or(crate::state::user_search::DEFAULT_USER_MATCH_THRESHOLD);
+        // `MaxUsers` caps how many matched users are reported. The model documents no
+        // default, so an omitted cap reports every match the answer can carry; a value that
+        // is not a cap at all (a negative one, which the modelled range 1..500 refuses at
+        // the boundary) asks for none, as this service's other caps do.
+        let max_users = input
+            .max_users
+            .map_or(crate::state::user_search::DEFAULT_MAX_USERS, |max| {
+                usize::try_from(max).unwrap_or(0)
+            });
+
+        let now = ::std::time::SystemTime::now();
+        let state = state.lock();
+        // The collection is resolved again: the detection above ran without the lock, so a
+        // `DeleteCollection` may have landed in between.
+        let collection = state.collections.get(&input.collection_id).ok_or_else(|| {
+            SearchUsersByImageErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+        })?;
+        let face_model_version = Some(collection.face_model_version.clone());
+
+        // "If no valid face is detected in the image, the response will contain an empty
+        // UserMatches list and no SearchedFace object": such an image is SERVED rather than
+        // refused, and any face the detector did find in it is still reported as one the
+        // search did not use.
+        let Some(searched) = split.searched else {
+            return Ok(SearchUsersByImageOutput {
+                user_matches: Some(Vec::new()),
+                face_model_version,
+                searched_face: None,
+                unsearched_faces: Some(split.unsearched),
+            });
+        };
+
+        Ok(SearchUsersByImageOutput {
+            user_matches: Some(crate::state::user_search::matching_users(
+                collection,
+                &searched.appearance,
+                threshold,
+                max_users,
+                now,
+            )),
+            face_model_version,
+            // "It also returns a bounding box for the face found in the input image": the
+            // face the search used, as the detector measured it off the submitted image.
+            searched_face: Some(SearchedFaceDetails {
+                face_detail: Some(searched.detail),
+            }),
+            unsearched_faces: Some(split.unsearched),
+        })
     }
+}
+
+/// The modelled answer for an image whose faces could not be detected: one modelled error
+/// per reason, each carrying the reason's own message. The reason type and its wording are
+/// shared (`crate::state::image_source`); the mapping is written per operation because each
+/// operation's error enum is its own type, generated from the errors the model declares for
+/// it, so there is no one enum for a shared function to return.
+fn unreadable_error(
+    reason: crate::state::image_source::UnreadableImage,
+) -> SearchUsersByImageError {
+    use crate::state::image_source::UnreadableImage;
+    use crate::state::modeled_error::ModeledError;
+
+    let message = reason.message().to_string();
+    match reason {
+        UnreadableImage::InvalidFormat(_) => {
+            SearchUsersByImageErrorModeled::InvalidImageFormatException(
+                InvalidImageFormatException::with_message(message),
+            )
+        }
+        UnreadableImage::TooLarge(_) => SearchUsersByImageErrorModeled::ImageTooLargeException(
+            ImageTooLargeException::with_message(message),
+        ),
+        UnreadableImage::S3Unreadable(_) => {
+            SearchUsersByImageErrorModeled::InvalidS3ObjectException(
+                InvalidS3ObjectException::with_message(message),
+            )
+        }
+        UnreadableImage::InvalidParameter(_) => {
+            SearchUsersByImageErrorModeled::InvalidParameterException(
+                InvalidParameterException::with_message(message),
+            )
+        }
+        // Nothing was established about the image itself, so this is the server fault it
+        // is rather than anything about the request.
+        UnreadableImage::NotAnalysed(_) => SearchUsersByImageErrorModeled::InternalServerError(
+            InternalServerError::with_message(message),
+        ),
+    }
+    .into()
 }

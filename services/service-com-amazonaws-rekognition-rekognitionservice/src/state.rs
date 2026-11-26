@@ -37,8 +37,7 @@
 //! collection already holds: `SearchFacesByImage` reports that measured resemblance, the
 //! same measurement `CompareFaces` makes between two submitted images, and it is a
 //! resemblance of two face patches and still not an identity. The operations that would
-//! need a trained model of WHO a face belongs to (`SearchUsersByImage`, …) stay
-//! unimplemented 501s.
+//! need a trained model of WHO a face belongs to stay unimplemented 501s.
 //!
 //! The same rule governs the LABELS of a submitted image in [`label_detection`]: no
 //! classifier over a label taxonomy runs here, so the entities it reports are the ones the
@@ -55,7 +54,10 @@
 //! resembles most, by the same measured correlation `CompareFaces` reports — and reports it as
 //! that catalogue entry's celebrity, with the resemblance measured for it as the match
 //! confidence, or on the unrecognized side when it resembles no entry of the catalogue at all.
-//! `GetCelebrityInfo` resolves an `Id` the catalogue holds back to the same entry.
+//! `GetCelebrityInfo` resolves an `Id` the catalogue holds back to the same entry. A USER of
+//! a collection is such an identity too — it IS the faces `AssociateFaces` put on it — so
+//! `SearchUsersByImage` resolves the face it searched against the users the named collection
+//! holds, by the same measured resemblance, through [`user_search`].
 //! `DetectProtectiveEquipment` answers the same way about the PERSONS
 //! a frame carries: each face the detector measured locates a person, reported with the
 //! confidence and the one body part measured for it, while an item of equipment and whether
@@ -88,6 +90,7 @@ pub mod label_detection;
 pub mod label_taxonomy;
 pub mod modeled_error;
 pub mod project_policies;
+pub mod user_search;
 pub mod video_analysis;
 pub mod video_jobs;
 pub mod video_source;

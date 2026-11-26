@@ -115,12 +115,14 @@ pub fn user_is_full(face_id: &str) -> UnsuccessfulFaceAssociation {
 ///
 /// A user is identified by every face associated with it, so a candidate matches the user
 /// as closely as it matches the nearest of them; `None` when the user holds no face yet,
-/// which is the case the threshold does not apply to.
-pub fn user_match_confidence(
-    candidate: &FaceAppearance,
-    held: &[FaceAppearance],
-) -> Option<f32> {
-    held.iter()
+/// which is the case the threshold does not apply to. `held` is anything that yields the
+/// appearances of those faces, so a caller that already holds them need not copy them to
+/// ask.
+pub fn user_match_confidence<'a, Held>(candidate: &FaceAppearance, held: Held) -> Option<f32>
+where
+    Held: IntoIterator<Item = &'a FaceAppearance>,
+{
+    held.into_iter()
         .map(|face| face.similarity_to(candidate))
         .fold(None, |best: Option<f32>, measured| {
             Some(best.map_or(measured, |best| best.max(measured)))
