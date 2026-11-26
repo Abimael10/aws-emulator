@@ -237,10 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, caller_region, first_unassumable_role, now_ms, required_member_message,
-            root_domain_unit, unable_to_assume_role_message, Domain, StoredSingleSignOn,
-            DEFAULT_DOMAIN_VERSION, DOMAIN_EXECUTION_ROLE_MEMBER, DOMAIN_STATUS_CREATING,
-            LIFECYCLE_SETTLE_MS,
+            caller_region, caller_user_id, caller_user_profile, first_unassumable_role, now_ms,
+            required_member_message, root_domain_unit, unable_to_assume_role_message, Domain,
+            StoredSingleSignOn, DEFAULT_DOMAIN_VERSION, DOMAIN_EXECUTION_ROLE_MEMBER,
+            DOMAIN_STATUS_CREATING, LIFECYCLE_SETTLE_MS,
         };
 
         // The member this SERVICE requires though the model leaves it optional: a domain is
@@ -355,7 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted_domain_unit_ids: std::collections::VecDeque::new(),
             listings: std::collections::BTreeMap::new(),
             account_pools: std::collections::BTreeMap::new(),
-            user_profiles: std::collections::BTreeMap::new(),
+            user_profiles: std::collections::BTreeMap::from([caller_user_profile(&id)]),
             subscription_requests: std::collections::BTreeMap::new(),
             subscriptions: std::collections::BTreeMap::new(),
             subscription_targets: std::collections::BTreeMap::new(),
@@ -365,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the moment the domain does: the real service creates the domain's root
         // domain unit as part of creating the domain, owned by the caller that
         // created it, and every other unit in the domain hangs under it.
-        let root_unit = root_domain_unit(&domain, &caller_principal(ctx), now);
+        let root_unit = root_domain_unit(&domain, &caller_user_id(), now);
         domain.domain_units.insert(root_unit.id.clone(), root_unit);
 
         let output = domain_output(&domain);

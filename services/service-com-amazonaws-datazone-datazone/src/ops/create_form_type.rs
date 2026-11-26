@@ -205,10 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, is_form_type_name, now_ms, FormType, FormTypeRevision,
+            caller_user_id, is_form_type_name, now_ms, FormType, FormTypeRevision,
             DOMAIN_STATUS_AVAILABLE, FORM_TYPE_NAME_PATTERN, FORM_TYPE_STATUS_ENABLED,
             PROJECT_STATUS_ACTIVE,
         };
@@ -253,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        let created_by = caller_principal(ctx);
+        let created_by = caller_user_id();
 
         // Authorization comes FIRST: a DataZone permission is held on a domain, so a
         // caller holds none on an identifier this store serves no domain for, and the

@@ -239,9 +239,18 @@ pub fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// Render an epoch-millisecond instant as the modelled timestamp type.
+/// Render an epoch-millisecond instant as the modelled timestamp type, at the
+/// WHOLE-SECOND resolution this service's responses report an instant in.
+///
+/// Every timestamp this service reports targets a plain `timestamp` with no
+/// `@timestampFormat` override (`CreatedAt`, `UpdatedAt`, `CreationTimestamp`, …), so
+/// restJson1 puts it on the wire as epoch seconds — and DataZone reports a whole number
+/// of seconds there, never a sub-second tail. The stored instant keeps its millisecond
+/// precision (so orderings inside one second survive in state); only the RENDERED value
+/// is truncated, towards the epoch-second the instant falls in, so a reported instant is
+/// never later than the instant itself.
 pub fn date_time(ms: i64) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_f64(ms as f64 / 1000.0)
+    ::aws_smithy_types::DateTime::from_secs(ms.div_euclid(1000))
 }
 
 /// One stored DataZone domain, with the projects nested under it.
@@ -3656,14 +3665,72 @@ pub fn caller_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Strin
 /// `us-east-1`, so an unsigned call is reported there.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The principal that made this call, as the `createdBy` of what it creates.
+/// The IAM identity this emulator authenticates every caller as: the ARN of the one IAM
+/// user it publishes — the very principal its `sts:GetCallerIdentity` answers.
 ///
-/// Derived from the CALLER's identity — the access key id its SigV4 scope names —
-/// never from the request body, so two different callers creating the same-named
-/// project get different `createdBy` values.
-pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    let akid = ::engine::extract_akid(&ctx.parts().headers);
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+/// Read from the tree's single definition of that principal
+/// ([`::service_common::caller_principal`]) rather than composed here, so the IAM service
+/// that HOLDS the user, the STS that reports it as the caller and this service all name one
+/// record. It is the `userIdentifier` the caller's own user profile is held under
+/// ([`caller_user_profile`]), so the IAM principal behind the DataZone user a response
+/// names is one the identity service knows. Deliberately NOT derived from the request's
+/// access key id: an access key id pasted in where an IAM user NAME belongs names no
+/// principal that exists.
+pub fn caller_identity_arn() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
+}
+
+/// The `UserProfileId` of the DataZone USER this emulator authenticates every caller as.
+///
+/// Fixed, like the account id and the user name of the IAM identity it belongs to
+/// ([`caller_identity_arn`]): this emulator serves exactly one caller identity, so that
+/// user's id is the same in every domain and over every call, and every domain is created
+/// holding a profile under it ([`caller_user_profile`]) so the id a response reports
+/// resolves through `GetUserProfile`.
+///
+/// Hex digits in the groups `8-4-4-4-12` that `UserProfileId`'s `@pattern`
+/// `^([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$`
+/// admits (smithy_query shape="UserProfileId"); the optional leading group belongs to an
+/// id an identity store minted, so an id this emulator owns omits it.
+pub const CALLER_USER_PROFILE_ID: &str = "e398d0a2-f1b6-4c5d-8e7a-0b9c1d2e3f40";
+
+/// The DataZone user every call is attributed to, and so the value of every "who did
+/// this" member this service reports (`createdBy`, `updatedBy`, `firstRevisionCreatedBy`,
+/// an owner, a reviewer: "The Amazon DataZone user that created this asset in the
+/// catalog").
+///
+/// A DataZone user is identified by the id of its USER PROFILE rather than by the IAM
+/// principal behind it, so that id is what an audit member carries: the handle a reader
+/// looks the user up by (`GetUserProfile`) and the one a project membership names. Never
+/// anything the request body carried, and never the caller's access key id.
+pub fn caller_user_id() -> String {
+    CALLER_USER_PROFILE_ID.to_string()
+}
+
+/// The user profile a new domain is created holding: the DataZone user this emulator
+/// authenticates every caller as, which is the user that created the domain and owns its
+/// root domain unit.
+///
+/// Answers the `user_profiles` entry — its [`user_profile_key`] and the profile — so a
+/// domain holds one from the instant it exists and the id every audit member in it reports
+/// ([`caller_user_id`]) is one `GetUserProfile` resolves, addressed either by that id or
+/// by the IAM ARN behind it. The profile is of an IAM principal, so it is `ACTIVATED`
+/// ([`created_user_profile_status`]) and reports its ARN under the union's `iam` member,
+/// exactly as a profile `CreateUserProfile` stores for the same identity would.
+pub fn caller_user_profile(domain_id: &str) -> (String, UserProfile) {
+    let arn = caller_identity_arn();
+    (
+        user_profile_key(&arn, None),
+        UserProfile {
+            id: CALLER_USER_PROFILE_ID.to_string(),
+            domain_id: domain_id.to_string(),
+            user_identifier: arn.clone(),
+            session_name: None,
+            profile_type: USER_PROFILE_TYPE_IAM.to_string(),
+            status: created_user_profile_status(USER_PROFILE_TYPE_IAM).to_string(),
+            details: user_profile_details(USER_PROFILE_TYPE_IAM, None, &arn, None),
+        },
+    )
 }
 
 /// Encode the key a page ended on as the opaque `nextToken` a caller passes back.

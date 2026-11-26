@@ -227,8 +227,8 @@ async fn created_domain_units_are_persisted_and_reported_by_get() {
         // The creator owns what it created, as one `user` owner.
         assert_eq!(
             owner_user_ids(&created),
-            vec!["arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY".to_string()],
-            "case {:?}: expected the calling principal as the only owner, got {:?}",
+            vec![service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID.to_string()],
+            "case {:?}: expected the calling user as the only owner, got {:?}",
             case.label,
             created.body.get("owners")
         );
@@ -240,8 +240,8 @@ async fn created_domain_units_are_persisted_and_reported_by_get() {
         );
         assert_eq!(
             created.s("createdBy"),
-            "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY",
-            "case {:?}: expected the calling principal as createdBy, got {:?}",
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
+            "case {:?}: expected the calling user as createdBy, got {:?}",
             case.label,
             created.s("createdBy")
         );

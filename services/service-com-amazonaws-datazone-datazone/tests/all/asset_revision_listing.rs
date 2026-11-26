@@ -24,9 +24,10 @@
 use crate::harness::{Answer, Emulator};
 use serde_json::{json, Value};
 
-/// The principal the harness's SigV4 scope names, which is what every `createdBy` this
-/// service writes must be.
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
+/// The DataZone user every call here is attributed to: the user this emulator
+/// authenticates every caller as, read from the service's own constant so a drift between
+/// it and the value on the wire fails here.
+const CALLER: &str = service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID;
 
 /// A stored asset of a service-defined type with `extra` revisions recorded on top of
 /// the one `CreateAsset` records, so it has `extra + 1` revisions in all. Answers its id.

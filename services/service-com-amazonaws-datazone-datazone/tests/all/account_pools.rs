@@ -215,12 +215,12 @@ async fn created_account_pools_are_persisted_scoped_and_reported_by_get() {
             case.label,
             answer.s("domainUnitId")
         );
-        // `createdBy` is the CALLER's principal, derived from the request's SigV4
-        // credential scope — never an echo of the request body.
+        // `createdBy` is the CALLER's DataZone user, the one this emulator authenticates
+        // every request as — never an echo of the request body.
         assert_eq!(
             answer.s("createdBy"),
-            "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY",
-            "case {:?}: expected the signing principal as createdBy, got {:?}",
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
+            "case {:?}: expected the calling user as createdBy, got {:?}",
             case.label,
             answer.s("createdBy")
         );
@@ -280,7 +280,7 @@ async fn created_account_pools_are_persisted_scoped_and_reported_by_get() {
         );
         assert_eq!(
             got.s("createdBy"),
-            "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY",
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
             "case {label:?}: GetAccountPool must report the stored creator, got {:?}",
             got.s("createdBy")
         );

@@ -149,10 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, owner_from_properties, owner_key, ResourceKind,
+            caller_user_id, now_ms, owner_from_properties, owner_key, ResourceKind,
             DOMAIN_STATUS_AVAILABLE, MAX_OWNERS_PER_ENTITY,
         };
 
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let wanted = owner_from_properties(&input.owner);
         let wanted_key = owner_key(&wanted);
-        let added_by = caller_principal(ctx);
+        let added_by = caller_user_id();
         let entity = store
             .owned_entity_mut(
                 &input.domain_identifier,

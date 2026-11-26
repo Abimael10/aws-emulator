@@ -224,10 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            asset_type_revision, caller_principal, now_ms, stored_forms, Asset, AssetRevision,
+            asset_type_revision, caller_user_id, now_ms, stored_forms, Asset, AssetRevision,
             IdempotencyKey, StoredBusinessNameGeneration, StoredPredictionConfiguration,
             DOMAIN_STATUS_AVAILABLE, FIRST_REVISION_NUMBER,
         };
@@ -360,7 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let created_by = caller_principal(ctx);
+        let created_by = caller_user_id();
         let id = store.mint_id(now);
         // A created asset IS its own first revision, made by the caller at this instant.
         let first_revision = AssetRevision {

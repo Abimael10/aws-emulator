@@ -173,10 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, date_time, now_ms, validate_account_source, AccountPool,
+            caller_user_id, date_time, now_ms, validate_account_source, AccountPool,
             DOMAIN_STATUS_AVAILABLE, MAX_ACCOUNT_POOLS_PER_DOMAIN,
         };
 
@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ROOT unit — the unit a resource created without an explicit one hangs
             // under.
             domain_unit_id: root_domain_unit_id,
-            created_by: caller_principal(ctx),
+            created_by: caller_user_id(),
             created_at_ms: now,
             // Nothing has updated the pool yet, so its last update IS its creation and
             // no principal has updated it.

@@ -552,12 +552,12 @@ async fn created_projects_are_persisted_scoped_and_deletable() {
             case.label,
             answer.s("projectStatus")
         );
-        // `createdBy` is the caller's principal, derived from the request's SigV4
-        // credential scope — never a constant echo of the request body.
+        // `createdBy` is the DataZone user this emulator authenticates every caller as —
+        // never a constant echo of the request body.
         assert_eq!(
             answer.s("createdBy"),
-            "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY",
-            "case {:?}: expected the signing principal as createdBy, got {:?}",
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
+            "case {:?}: expected the calling user as createdBy, got {:?}",
             case.label,
             answer.s("createdBy")
         );

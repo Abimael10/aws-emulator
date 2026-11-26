@@ -238,9 +238,10 @@ async fn created_form_types_are_persisted_and_reported_by_get() {
             got.body.get("description")
         );
         // `createdBy` comes from the CALLER's identity, not from the request body.
-        assert!(
-            got.s("createdBy").contains("AKIAEXAMPLETESTKEY"),
-            "case {:?}: expected createdBy to name the calling principal, got {:?}",
+        assert_eq!(
+            got.s("createdBy"),
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
+            "case {:?}: expected createdBy to name the calling user, got {:?}",
             case.label,
             got.s("createdBy")
         );

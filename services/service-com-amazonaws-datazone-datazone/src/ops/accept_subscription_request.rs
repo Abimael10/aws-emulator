@@ -180,10 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            approved_subscription, caller_principal, check_asset_references, now_ms,
+            approved_subscription, caller_user_id, check_asset_references, now_ms,
             subscribed_asset_ids, AssetReferenceRefusal, ResourceKind,
             SUBSCRIPTION_ALREADY_DECIDED_MESSAGE, SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
         };
@@ -274,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Derived from the caller's own credential scope, never from the request body:
         // the reviewer of a decision is whoever took it.
-        let reviewer = caller_principal(ctx);
+        let reviewer = caller_user_id();
         // The id of the subscription this decision materialises, minted before the
         // request is taken mutably below so the one store lock covers the whole decision.
         let subscription_id = store.mint_id(now);

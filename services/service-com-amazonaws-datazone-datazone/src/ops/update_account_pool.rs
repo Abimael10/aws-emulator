@@ -169,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{caller_principal, date_time, now_ms, validate_account_source};
+        use crate::state::{caller_user_id, date_time, now_ms, validate_account_source};
 
         // The constraints the model declares INSIDE the `AccountSource` union: the
         // boundary validator does not walk a union's active member, so an
@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Derived from the caller's own credential scope, never from the request body.
-        let principal = caller_principal(ctx);
+        let principal = caller_user_id();
         // The pool was found under this same lock just above, so it is still there; an
         // impossible disappearance is reported as a server fault rather than answered as
         // though the update had been applied.

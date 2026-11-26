@@ -44,7 +44,11 @@ fn account() -> String {
 /// (smithy_query shape="UserProfileId"), checked here independently of the service's own
 /// helper: five groups of hex digits of 8-4-4-4-12, after an optional lowercase-hex
 /// group of 10.
-fn is_user_profile_id(id: &str) -> bool {
+///
+/// `pub(crate)` because every suite that reads a user identifier asserts the SAME shape
+/// over it ([`crate::audit_members_wire_form`] checks it on every audit member), so there
+/// is one definition of the pattern in this test target rather than one copy per suite.
+pub(crate) fn is_user_profile_id(id: &str) -> bool {
     let mut groups: Vec<&str> = id.split('-').collect();
     if groups.len() == 6 {
         let prefix = groups.remove(0);

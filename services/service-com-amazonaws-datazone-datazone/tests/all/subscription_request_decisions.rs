@@ -63,9 +63,10 @@ use service_com_amazonaws_datazone_datazone::state::{
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// The principal the harness's SigV4 scope names, which is what the reviewer of every
-/// decision taken here must be.
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
+/// The DataZone user every call here is attributed to, and so the reviewer of every
+/// decision taken here: the user this emulator authenticates every caller as, read from
+/// the service's own constant so a drift between it and the value on the wire fails here.
+const CALLER: &str = service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID;
 
 /// An IAM principal a subscription request can be made for: a role ARN of this account,
 /// which is what `IamPrincipalArn`'s modelled pattern admits. DataZone resolves nothing

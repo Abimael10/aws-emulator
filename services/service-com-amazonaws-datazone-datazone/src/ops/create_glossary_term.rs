@@ -192,10 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, stored_term_relations, term_usage_restrictions,
+            caller_user_id, now_ms, stored_term_relations, term_usage_restrictions,
             GlossaryTerm, IdempotencyKey, ResourceKind, DOMAIN_STATUS_AVAILABLE,
             GLOSSARY_TERM_STATUS_ENABLED,
         };
@@ -333,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .status
                 .unwrap_or_else(|| GLOSSARY_TERM_STATUS_ENABLED.to_string()),
             term_relations,
-            created_by: caller_principal(ctx),
+            created_by: caller_user_id(),
             created_at_ms: now,
             // Nothing has updated the term yet.
             updated_by: None,

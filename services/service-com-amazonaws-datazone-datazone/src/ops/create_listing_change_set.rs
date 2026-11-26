@@ -181,10 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, listing_glossary_terms, listing_name, now_ms, Listing, ListingRevision,
+            caller_user_id, listing_glossary_terms, listing_name, now_ms, Listing, ListingRevision,
             ResourceKind, CHANGE_ACTION_PUBLISH, CHANGE_ACTION_UNPUBLISH, DOMAIN_STATUS_AVAILABLE,
             ENTITY_TYPE_ASSET, ENTITY_TYPE_DATA_PRODUCT, LIFECYCLE_SETTLE_MS,
             LISTING_STATUS_CREATING, LISTING_STATUS_INACTIVE, MAX_LISTINGS_PER_DOMAIN,
@@ -320,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // snapshotted here rather than resolved on every later read.
             forms: entity_revision.forms.clone(),
             glossary_terms: listing_glossary_terms(domain, &entity_revision.glossary_terms),
-            created_by: caller_principal(ctx),
+            created_by: caller_user_id(),
             created_at_ms: now,
             client_token: input.client_token.clone(),
         };

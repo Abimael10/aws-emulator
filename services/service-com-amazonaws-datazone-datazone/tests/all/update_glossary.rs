@@ -30,9 +30,10 @@ use service_com_amazonaws_datazone_datazone::state::{
     GLOSSARY_STATUS_DISABLED, GLOSSARY_STATUS_ENABLED,
 };
 
-/// The principal the harness signs with: `createdBy`/`updatedBy` come from the caller's
-/// SigV4 credential scope, never from the request body.
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
+/// The DataZone user every call here is attributed to: the user this emulator
+/// authenticates every caller as, read from the service's own constant so a drift between
+/// it and the value on the wire fails here.
+const CALLER: &str = service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID;
 
 /// One `UpdateGlossary` case: the glossary the patch is applied to, the patch, and the
 /// record the glossary must carry afterwards.

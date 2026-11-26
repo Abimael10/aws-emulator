@@ -168,10 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, GLOSSARY_STATUS_DISABLED, GLOSSARY_STATUS_ENABLED,
+            caller_user_id, now_ms, GLOSSARY_STATUS_DISABLED, GLOSSARY_STATUS_ENABLED,
         };
 
         // `GlossaryStatus` is DISABLED | ENABLED (smithy_query shape="GlossaryStatus").
@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Derived from the caller's own credential scope, never from the request body.
-        let principal = caller_principal(ctx);
+        let principal = caller_user_id();
         // The glossary was found under this same lock a few lines up, so it is still
         // there; an impossible disappearance is reported as a server fault rather than
         // answered as though the update had been applied.

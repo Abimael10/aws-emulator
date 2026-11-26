@@ -169,10 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, cannot_reject_message, now_ms, ResourceKind,
+            caller_user_id, cannot_reject_message, now_ms, ResourceKind,
             SUBSCRIPTION_REQUEST_STATUS_REJECTED,
         };
 
@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Derived from the caller's own credential scope, never from the request body:
         // the reviewer of a decision is whoever took it.
-        let reviewer = caller_principal(ctx);
+        let reviewer = caller_user_id();
         // The request was found under this same lock just above, so it is still there; an
         // impossible disappearance is reported as a server fault rather than answered as
         // though the decision had been recorded.

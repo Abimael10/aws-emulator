@@ -182,10 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, check_asset_references, now_ms, stored_forms,
+            caller_user_id, check_asset_references, now_ms, stored_forms,
             AssetReferenceRefusal, IdempotencyKey, ResourceKind, SubscribedListingRef,
             SubscriptionRequest, DOMAIN_STATUS_AVAILABLE, ENTITY_TYPE_ASSET,
             MAX_SUBSCRIPTION_REQUESTS_PER_DOMAIN, SUBSCRIPTION_REQUEST_STATUS_PENDING,
@@ -373,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             metadata_forms,
             asset_scopes,
             asset_permissions,
-            created_by: caller_principal(ctx),
+            created_by: caller_user_id(),
             created_at_ms: now,
             // Nothing has updated the request yet, so `updatedAt` — a REQUIRED output
             // member — is the instant it was made, and `updatedBy` is absent.

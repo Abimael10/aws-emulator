@@ -145,10 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, owner_from_properties, owner_key, ResourceKind,
+            caller_user_id, now_ms, owner_from_properties, owner_key, ResourceKind,
         };
 
         // `entityType` targets an enum SHAPE, whose member set the request walk does
@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let unwanted_key = owner_key(&owner_from_properties(&input.owner));
-        let removed_by = caller_principal(ctx);
+        let removed_by = caller_user_id();
         let entity = store
             .owned_entity_mut(
                 &input.domain_identifier,

@@ -186,10 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, stored_term_relations, term_usage_restrictions, ResourceKind,
+            caller_user_id, now_ms, stored_term_relations, term_usage_restrictions, ResourceKind,
             GLOSSARY_TERM_STATUS_DISABLED, GLOSSARY_TERM_STATUS_ENABLED,
         };
 
@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Derived from the caller's own credential scope, never from the request body.
-        let principal = caller_principal(ctx);
+        let principal = caller_user_id();
         // The domain and the term were both found under this same lock a few lines up,
         // so they are still there; an impossible disappearance is reported as a server
         // fault rather than answered as though the patch had been applied.

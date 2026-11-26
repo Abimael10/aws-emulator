@@ -230,12 +230,12 @@ async fn created_glossaries_are_persisted_scoped_and_reported_by_get() {
             "case {label:?}: GetGlossary must report the stored usageRestrictions, got {:?}",
             got.body.get("usageRestrictions")
         );
-        // `createdBy` is the CALLER's principal, derived from the request's SigV4
-        // credential scope — never an echo of the request body.
+        // `createdBy` is the CALLER's DataZone user, the one this emulator authenticates
+        // every request as — never an echo of the request body.
         assert_eq!(
             got.s("createdBy"),
-            "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY",
-            "case {label:?}: expected the signing principal as createdBy, got {:?}",
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
+            "case {label:?}: expected the calling user as createdBy, got {:?}",
             got.s("createdBy")
         );
         assert!(

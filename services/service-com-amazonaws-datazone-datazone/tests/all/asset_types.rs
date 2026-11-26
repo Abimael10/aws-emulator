@@ -23,9 +23,10 @@
 use crate::harness::{Answer, Emulator, SETTLED};
 use serde_json::{json, Map, Value};
 
-/// The principal every request here signs as: `crate::state::caller_principal` derives
-/// it from the SigV4 credential scope's access key id.
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
+/// The DataZone user every call here is attributed to: the user this emulator
+/// authenticates every caller as, read from the service's own constant so a drift between
+/// it and the value on the wire fails here.
+const CALLER: &str = service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID;
 
 /// The two asset-type calls this suite drives, on the shared [`Emulator`] harness.
 impl Emulator {

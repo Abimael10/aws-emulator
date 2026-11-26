@@ -166,10 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            cannot_revoke_message, caller_principal, now_ms, subscription_view, ResourceKind,
+            cannot_revoke_message, caller_user_id, now_ms, subscription_view, ResourceKind,
             SUBSCRIPTION_STATUS_REVOKED,
         };
 
@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Derived from the caller's own credential scope, never from the request body:
         // whoever took the access away is who updated the subscription.
-        let revoked_by = caller_principal(ctx);
+        let revoked_by = caller_user_id();
         // The subscription was found under this same lock just above, so it is still
         // there; an impossible disappearance is reported as a server fault rather than
         // answered as though the revocation had been recorded.

@@ -183,10 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, DomainUnit, DomainUnitOwner, IdempotencyKey,
+            caller_user_id, now_ms, DomainUnit, DomainUnitOwner, IdempotencyKey,
             DOMAIN_STATUS_AVAILABLE,
         };
 
@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(replay);
         }
 
-        let created_by = caller_principal(ctx);
+        let created_by = caller_user_id();
         // `CreateDomainUnit` models no `ResourceNotFoundException`, so a request whose
         // `parentDomainUnitIdentifier` names nothing stored is refused as invalid input,
         // naming the member the caller has to fix. A domain that IS stored but is not

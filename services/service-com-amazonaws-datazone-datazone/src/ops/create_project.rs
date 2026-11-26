@@ -204,10 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, date_time, domain_not_found_message, membership_from_request, now_ms,
+            caller_user_id, date_time, domain_not_found_message, membership_from_request, now_ms,
             Membership, MembershipRefusal, Project, DOMAIN_STATUS_AVAILABLE,
             MAX_MEMBERSHIPS_PER_PROJECT, PROJECT_STATUS_ACTIVE,
         };
@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = now_ms();
         store.settle_clock(now);
 
-        let created_by = caller_principal(ctx);
+        let created_by = caller_user_id();
         // The domain a project is created IN is a resource this call RESOLVES: an
         // identifier that satisfies the modelled pattern but names no domain this store
         // holds is that resource's own miss, reported as the modelled not-found naming

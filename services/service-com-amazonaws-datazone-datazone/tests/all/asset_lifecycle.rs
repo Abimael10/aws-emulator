@@ -25,7 +25,7 @@
 //! 6. Every metadata form an asset operation reports carries how the form renders, and
 //!    the read-only forms are reported as a list — empty for an asset that has none.
 
-use crate::harness::{Emulator, SETTLED};
+use crate::harness::Emulator;
 use serde_json::{json, Value};
 
 /// `AssetId`'s modelled pattern, `^[a-zA-Z0-9_-]{1,36}$` (smithy_query shape="AssetId").
@@ -229,12 +229,12 @@ async fn created_assets_are_persisted_and_reported_by_get_asset() {
             "case {:?}: unexpected typeRevision",
             case.label
         );
-        // `createdBy` is the CALLER's principal, not anything the body carried, and the
-        // first revision was made by the same caller at the same instant.
+        // `createdBy` is the CALLER's DataZone user, not anything the body carried, and
+        // the first revision was made by the same caller at the same instant.
         assert_eq!(
             answer.s("createdBy"),
-            "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY",
-            "case {:?}: createdBy must name the calling principal",
+            service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID,
+            "case {:?}: createdBy must name the calling user",
             case.label
         );
         assert_eq!(
@@ -370,7 +370,9 @@ async fn created_assets_are_persisted_and_reported_by_get_asset() {
         "deleting the domain: expected 202, got {} {:?}",
         deleted.status, deleted.body
     );
-    tokio::time::sleep(SETTLED).await;
+    // Wait for the CONDITION the delete owes — the domain no longer being served — rather
+    // than for a fixed time, so the read below is made once the domain really is gone.
+    dz.await_domain_gone(&domain).await;
     let (_, orphan, _) = &created[0];
     // The domain is gone, so no permission is held on it any more and the read is
     // decided by authorization before any asset lookup: the asset is no longer served

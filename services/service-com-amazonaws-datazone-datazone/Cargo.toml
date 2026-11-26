@@ -33,6 +33,9 @@ html-escape = "0.2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Compiles every `tests/all/<name>.rs` as a suite of the single integration-test target,
+# so a new suite is a new file and nothing has to be declared.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The account's own IAM records, mounted beside DataZone on one engine in

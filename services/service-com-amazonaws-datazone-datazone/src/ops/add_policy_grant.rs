@@ -169,10 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, now_ms, policy_type_of_detail, principal_key, PolicyGrant,
+            caller_user_id, now_ms, policy_type_of_detail, principal_key, PolicyGrant,
             DOMAIN_STATUS_AVAILABLE, MAX_POLICY_GRANTS_PER_DOMAIN,
         };
 
@@ -307,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             principal: input.principal,
             detail: input.detail,
             created_at_ms: now,
-            created_by: caller_principal(ctx),
+            created_by: caller_user_id(),
             client_token: input.client_token,
         };
         // `domain_status` proved the domain is there; store the grant under it.

@@ -34,9 +34,10 @@ use service_com_amazonaws_datazone_datazone::state::{
     FILTER_STATUS_INVALID, FILTER_STATUS_VALID, SUBSCRIPTION_REQUEST_STATUS_PENDING,
 };
 
-/// The principal the harness's SigV4 scope names, which is what every `createdBy` this
-/// service writes must be.
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
+/// The DataZone user every call here is attributed to: the user this emulator
+/// authenticates every caller as, read from the service's own constant so a drift between
+/// it and the value on the wire fails here.
+const CALLER: &str = service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID;
 
 /// How long a case waits for a step the clock owes (a domain finishing `CREATING`).
 ///

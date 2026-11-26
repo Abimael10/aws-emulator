@@ -213,10 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            asset_type_revision, caller_principal, now_ms, stored_forms, AssetRevision,
+            asset_type_revision, caller_user_id, now_ms, stored_forms, AssetRevision,
             StoredBusinessNameGeneration, StoredPredictionConfiguration, DOMAIN_STATUS_AVAILABLE,
             MAX_ASSET_REVISIONS, PROJECT_STATUS_ACTIVE,
         };
@@ -360,7 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }),
                 }
             }),
-            created_by: caller_principal(ctx),
+            created_by: caller_user_id(),
             created_at_ms: now,
             client_token: input.client_token,
         };

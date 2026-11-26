@@ -175,9 +175,10 @@ const ENTITY_TYPES: [&str; 4] = [
     "ASSET_TYPE",
 ];
 
-/// The principal `createdBy` must name: the caller's access key id, as the harness signs
-/// every request (`crate::state::caller_principal`).
-const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
+/// The DataZone user `createdBy` must name: the user this emulator authenticates every
+/// caller as, read from the service's own constant so a drift between it and the value on
+/// the wire fails here.
+const CALLER: &str = service_com_amazonaws_datazone_datazone::state::CALLER_USER_PROFILE_ID;
 
 fn add_uri(domain: &str, entity_type: &str, entity_id: &str) -> String {
     format!("/v2/domains/{domain}/policies/managed/{entity_type}/{entity_id}/addGrant")

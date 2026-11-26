@@ -190,10 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, date_time, now_ms, AssetType, AssetTypeForm,
+            caller_user_id, date_time, now_ms, AssetType, AssetTypeForm,
             DOMAIN_STATUS_AVAILABLE, FIRST_REVISION, PROJECT_STATUS_ACTIVE,
         };
 
@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let principal = caller_principal(ctx);
+        let principal = caller_user_id();
         let asset_type = AssetType {
             name: input.name,
             domain_id: input.domain_identifier.clone(),
