@@ -34,6 +34,17 @@ use serde_json::{Map, Value};
 /// enough.
 const OR: &str = "$or";
 
+/// The matcher that compares text against literal segments separated by `*`.
+///
+/// `pub` because it is a matcher a SERVICE may decide its own filters do not
+/// carry ([`uses_matcher`]): the grammar stays here, and which of it a service
+/// admits is the service's own rule.
+pub const WILDCARD_MATCHER: &str = "wildcard";
+
+/// The matcher that NEGATES another, which is the second place any matcher can
+/// be written (`{"anything-but": {"wildcard": …}}`).
+pub const ANYTHING_BUT_MATCHER: &str = "anything-but";
+
 /// The nested operator `prefix` and `suffix` accept to compare without regard
 /// to case, e.g. `{"prefix": {"equals-ignore-case": "abc"}}`.
 const IGNORE_CASE: &str = "equals-ignore-case";
@@ -142,21 +153,161 @@ impl MatchBudget {
     }
 }
 
+/// Why a text submitted as an event pattern is not one, as the FAULT CLASSES a
+/// service words its own refusal from.
+///
+/// [`parse`] renders these as one sentence, which is what a service refusing
+/// every fault the same way needs. A service whose API words the classes
+/// DIFFERENTLY — one sentence for a text that is not JSON, another for one that
+/// is JSON but names no field — reads them apart through [`read`] instead, so
+/// the grammar and its bounds stay here and only the wording is the service's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fault {
+    /// The text is not JSON at all: `cause` is the parser's own rendering of
+    /// what it found (position included, as it writes it), and `line`/`column`
+    /// are that position on its own, both counted from one, with a column
+    /// counting bytes from the start of its line.
+    NotJson {
+        cause: String,
+        line: usize,
+        column: usize,
+    },
+    /// The text is JSON, but not an OBJECT — a pattern names fields, so a list,
+    /// a number or a bare string names none.
+    NotAnObject,
+    /// The text is an object, but no pattern of this language: `reason` is why,
+    /// in the one wording this module states it.
+    Unreadable(String),
+}
+
+impl Fault {
+    /// This fault as the ONE sentence [`parse`] reports it in.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NotJson { cause, .. } => format!("Event pattern is not valid JSON: {cause}"),
+            Self::NotAnObject => NOT_AN_OBJECT_REASON.to_string(),
+            Self::Unreadable(reason) => reason.clone(),
+        }
+    }
+}
+
+/// The reason a text that is JSON but not an object is refused with, in
+/// [`parse`]'s wording.
+const NOT_AN_OBJECT_REASON: &str = "event pattern must be a JSON object";
+
 /// Parse `source` as an event pattern, refusing one this matcher cannot honour.
 ///
 /// The `Err` is the reason, for the caller to word into its own modelled
 /// refusal (`InvalidEventPatternException` for a rule).
 pub fn parse(source: &str) -> Result<Value, String> {
+    read(source).map_err(|fault| fault.reason())
+}
+
+/// [`parse`], with the fault classes kept apart ([`Fault`]) for a service that
+/// words each of them its own way.
+///
+/// The ONE parse either way: the byte bound, the JSON reading and the structural
+/// validation below are the same, so a pattern this admits is exactly one
+/// [`parse`] admits and nothing re-parses the text to ask a second question
+/// about it.
+pub fn read(source: &str) -> Result<Value, Fault> {
     if source.len() > MAX_PATTERN_BYTES {
-        return Err(format!(
+        return Err(Fault::Unreadable(format!(
             "event pattern is {} bytes, over the {MAX_PATTERN_BYTES}-byte limit",
             source.len()
-        ));
+        )));
     }
-    let pattern: Value = serde_json::from_str(source)
-        .map_err(|error| format!("Event pattern is not valid JSON: {error}"))?;
-    validate(&pattern, 1)?;
+    let pattern: Value = serde_json::from_str(source).map_err(|error| Fault::NotJson {
+        // The parser's own rendering, which is what [`Fault::reason`] states,
+        // beside the position it reports on its own.
+        cause: error.to_string(),
+        line: error.line(),
+        column: error.column(),
+    })?;
+    if !pattern.is_object() {
+        return Err(Fault::NotAnObject);
+    }
+    validate(&pattern, 1).map_err(Fault::Unreadable)?;
     Ok(pattern)
+}
+
+/// Whether any clause of the pattern `pattern` compares by the matcher
+/// `matcher`, in either of the two places one can be written: the matcher
+/// itself, or one [`ANYTHING_BUT_MATCHER`] negates.
+///
+/// For a service that admits the language but not every matcher of it: which
+/// matchers its filters carry is the service's own rule, and the grammar a
+/// matcher is written in is this module's. The walk is over the pattern alone —
+/// a value [`read`] has already admitted, so it is bounded by
+/// [`MAX_PATTERN_DEPTH`] and costs no match budget.
+pub fn uses_matcher(pattern: &Value, matcher: &str) -> bool {
+    let Some(fields) = pattern.as_object() else {
+        return false;
+    };
+    fields.iter().any(|(field, spec)| {
+        if field == OR {
+            return spec
+                .as_array()
+                .is_some_and(|branches| branches.iter().any(|branch| uses_matcher(branch, matcher)));
+        }
+        match spec {
+            // A nested clause is itself a pattern.
+            Value::Object(_) => uses_matcher(spec, matcher),
+            Value::Array(candidates) => candidates
+                .iter()
+                .any(|candidate| candidate_uses(candidate, matcher)),
+            _ => false,
+        }
+    })
+}
+
+/// Whether the candidate `candidate` compares by `matcher`, directly or negated.
+fn candidate_uses(candidate: &Value, matcher: &str) -> bool {
+    let Some(filter) = candidate.as_object() else {
+        return false;
+    };
+    filter.iter().any(|(operator, argument)| {
+        operator == matcher
+            || (operator == ANYTHING_BUT_MATCHER
+                && argument
+                    .as_object()
+                    .is_some_and(|negated| negated.contains_key(matcher)))
+    })
+}
+
+/// The first field `pattern` compares by something other than a list of EXACT
+/// values, or `None` when every field it names is compared by one.
+///
+/// A clause in [`ClauseForm::Values`] holding only scalars compares the value
+/// itself and nothing more; every other clause — an object candidate, which is
+/// a matcher, or a nested pattern, which descends into a document — asks more of
+/// the event's value than equality. For a service whose event carries a part
+/// that holds plain values only, where such a clause can select nothing: which
+/// part that is, is the service's own rule.
+///
+/// The walk is over the pattern alone, as [`uses_matcher`]'s is, and reads a
+/// disjunction's branches the same way.
+pub fn field_compared_beyond_values(pattern: &Value) -> Option<&str> {
+    let fields = pattern.as_object()?;
+    for (field, spec) in fields {
+        if field == OR {
+            let beyond = spec
+                .as_array()
+                .and_then(|branches| branches.iter().find_map(field_compared_beyond_values));
+            if let Some(field) = beyond {
+                return Some(field);
+            }
+            continue;
+        }
+        let exact = spec
+            .as_array()
+            .is_some_and(|candidates| candidates.iter().all(|candidate| !candidate.is_object()));
+        if !exact {
+            return Some(field);
+        }
+    }
+    None
 }
 
 /// Why a member of `pattern` is in neither CLAUSE FORM, or `None` when every
@@ -320,7 +471,7 @@ fn validate(pattern: &Value, depth: usize) -> Result<(), String> {
         ));
     }
     let Value::Object(fields) = pattern else {
-        return Err("event pattern must be a JSON object".to_string());
+        return Err(NOT_AN_OBJECT_REASON.to_string());
     };
     if fields.is_empty() {
         return Err("event pattern must name at least one field".to_string());
@@ -380,7 +531,7 @@ fn validate_filter(field: &str, filter: &Map<String, Value>) -> Result<(), Strin
             }
         }
         IGNORE_CASE => require_string(operator, argument),
-        "wildcard" => {
+        WILDCARD_MATCHER => {
             let wildcard = argument
                 .as_str()
                 .ok_or_else(|| format!("\"{operator}\" takes a string"))?;
@@ -410,7 +561,7 @@ fn validate_filter(field: &str, filter: &Map<String, Value>) -> Result<(), Strin
             }
         }
         "numeric" => validate_numeric(argument),
-        "anything-but" => validate_anything_but(argument),
+        ANYTHING_BUT_MATCHER => validate_anything_but(argument),
         other => Err(format!(
             "\"{other}\" is not an event pattern matching operator"
         )),
@@ -450,27 +601,31 @@ fn validate_anything_but(argument: &Value) -> Result<(), String> {
     match argument {
         Value::Array(excluded) => {
             if excluded.is_empty() {
-                return Err("\"anything-but\" must list at least one value".to_string());
+                return Err(format!(
+                    "\"{ANYTHING_BUT_MATCHER}\" must list at least one value"
+                ));
             }
             for value in excluded {
                 if value.is_array() || value.is_object() {
-                    return Err(
-                        "\"anything-but\" lists plain values, not nested documents".to_string()
-                    );
+                    return Err(format!(
+                        "\"{ANYTHING_BUT_MATCHER}\" lists plain values, not nested documents"
+                    ));
                 }
             }
             Ok(())
         }
         Value::Object(filter) => match single_entry(filter) {
             Some((operator, _)) if NEGATABLE_FILTERS.contains(&operator.as_str()) => {
-                validate_filter("anything-but", filter)
+                validate_filter(ANYTHING_BUT_MATCHER, filter)
             }
             _ => Err(format!(
-                "\"anything-but\" negates one of {}",
+                "\"{ANYTHING_BUT_MATCHER}\" negates one of {}",
                 NEGATABLE_FILTERS.join(", ")
             )),
         },
-        Value::Null => Err("\"anything-but\" takes a value to exclude".to_string()),
+        Value::Null => Err(format!(
+            "\"{ANYTHING_BUT_MATCHER}\" takes a value to exclude"
+        )),
         _ => Ok(()),
     }
 }

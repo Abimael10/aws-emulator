@@ -250,6 +250,18 @@ fn as_text(value: ::serde_json::Value) -> String {
     }
 }
 
+/// Whether the language ADMITS the configured value `text` as an expression, for
+/// a caller that has to answer for one BEFORE any event is evaluated over it.
+///
+/// `Some` is the engine's own diagnostic for a text it will not parse
+/// ([`::service_common::jsonata::parse_failure`]); `None` is a text it parses —
+/// and a text this emulator's own ceilings stopped before the parse, which shows
+/// nothing about the language and so refuses nothing. A value that is not one
+/// whole expression is a literal and is admitted as itself.
+pub fn expression_parse_failure(text: &str) -> Option<String> {
+    ::service_common::jsonata::parse_failure(inner(text))
+}
+
 /// `value` with the members of every object in it in key order.
 ///
 /// `depth` bounds the walk at the depth the seam evaluates over, which is the

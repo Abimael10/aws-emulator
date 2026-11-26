@@ -413,8 +413,11 @@ pub fn starting_sequence_number(
         .first()
         .map_or(tip, |oldest| oldest.sequence_number);
     match point.map(|point| point.point_type.as_str()) {
-        // A `POINT_IN_TIME` subscriber carrying no point at all is at the
-        // horizon: the whole retained log is the backlog it asked for.
+        // A `POINT_IN_TIME` subscriber at the `HORIZON` point is where its
+        // bus's retained log begins: the whole of that log is the backlog it
+        // asked for. A subscriber carrying no point at all is read the same
+        // way, though a create naming none is refused before it is stored
+        // ([`point_in_time_fault`]).
         None | Some(POINT_TYPE_HORIZON) => horizon,
         Some(POINT_TYPE_TIMESTAMP) => {
             let Some(from) = point
@@ -457,10 +460,41 @@ pub const STARTING_POINT_IN_FUTURE_MESSAGE: &str =
     "PointInTimeConfiguration.StartingPoint must not be in the future";
 
 /// The whole `Message` of the `InvalidInputException` a create carrying
-/// `PointType` `TIMESTAMP` with no `StartingPoint` is refused with —
-/// "Required when PointType is TIMESTAMP", per the member's own documentation.
-pub const STARTING_POINT_REQUIRED_MESSAGE: &str =
-    "PointInTimeConfiguration.StartingPoint is required when PointType is TIMESTAMP";
+/// `PointType` `TIMESTAMP` with no usable `StartingPoint` is refused with.
+///
+/// The member is "Required when PointType is TIMESTAMP", and the instant it
+/// carries is an epoch second count, so the sentence states both halves of what
+/// a usable value is and the reading answers both: the member has to be there,
+/// and the instant it names has to be after the epoch — a value at or before it
+/// names no instant a bus could be replayed from, whatever its window. Fixed
+/// text that interpolates nothing of the request. A point that IS such an
+/// instant but falls outside the bus's replayable window is refused as that
+/// instead ([`starting_point_outside_window_message`]).
+pub const STARTING_POINT_REQUIRED_MESSAGE: &str = "PointInTimeConfiguration.StartingPoint is \
+     required and must be > 0 when PointType is TIMESTAMP";
+
+/// The whole `Message` of the `InvalidInputException` a create naming the
+/// `POINT_IN_TIME` starting position but no `PointInTimeConfiguration` is
+/// refused with.
+///
+/// `PointInTimeConfiguration` is "Point-in-time configuration for a subscriber.
+/// Only applicable when StartingPosition is POINT_IN_TIME", and that position
+/// is a POINT: naming it without the configuration that says which point names
+/// no position at all, so the member is required exactly where it applies.
+/// Fixed text around the two names it is about, which are the model's.
+pub const POINT_IN_TIME_CONFIGURATION_REQUIRED_MESSAGE: &str =
+    "PointInTimeConfiguration is required when StartingPosition is POINT_IN_TIME";
+
+/// The opening of the whole `Message` of the `InvalidInputException` a create
+/// carrying a `PointInTimeConfiguration` beside any OTHER starting position is
+/// refused with, which that position closes.
+///
+/// `PointInTimeConfiguration` is "Only applicable when StartingPosition is
+/// POINT_IN_TIME": beside another position it names a point nothing places, so
+/// it is a request parameter that is not valid rather than a member the service
+/// ignores. The one variable part is the starting position the request named.
+pub const POINT_IN_TIME_CONFIGURATION_UNAPPLICABLE_PREFIX: &str =
+    "PointInTimeConfiguration must not be provided when StartingPosition is ";
 
 /// The whole `Message` of the `InvalidInputException` a create naming a
 /// `TIMESTAMP` starting point newer than [`MIN_STARTING_POINT_AGE`] is refused
@@ -508,10 +542,13 @@ pub fn starting_point_stamp(value: &::aws_smithy_types::DateTime) -> String {
 /// position, so the create is refused rather than pinned to one.
 ///
 /// ONE reading of that range, so the gate a create is held to and the window a
-/// read of the bus reports cannot disagree. `HORIZON` carries no instant of the
-/// request — the bus itself decides where its log begins — and a configuration
-/// beside any other starting position is "not applicable", so neither is placed
-/// here.
+/// read of the bus reports cannot disagree. The position is a POINT, so naming
+/// it with no configuration at all names no position either
+/// ([`POINT_IN_TIME_CONFIGURATION_REQUIRED_MESSAGE`]), and a configuration
+/// beside any other position is "not applicable"
+/// ([`POINT_IN_TIME_CONFIGURATION_UNAPPLICABLE_PREFIX`]). `HORIZON` carries no
+/// instant of the request — the bus itself decides where its log begins — so
+/// nothing of the window is asked of it.
 pub fn point_in_time_fault(
     bus: &super::EventBus,
     starting_position: &str,
@@ -519,13 +556,23 @@ pub fn point_in_time_fault(
     now: SystemTime,
 ) -> Option<String> {
     if starting_position != STARTING_POSITION_POINT_IN_TIME {
-        return None;
+        // "Only applicable when StartingPosition is POINT_IN_TIME": a
+        // configuration beside another position names a point nothing places.
+        return point.map(|_| {
+            format!("{POINT_IN_TIME_CONFIGURATION_UNAPPLICABLE_PREFIX}{starting_position}")
+        });
     }
-    let point = point?;
+    let Some(point) = point else {
+        return Some(POINT_IN_TIME_CONFIGURATION_REQUIRED_MESSAGE.to_string());
+    };
     if point.point_type != POINT_TYPE_TIMESTAMP {
         return None;
     }
-    let Some(requested) = point.starting_point.as_ref() else {
+    let Some(requested) = point
+        .starting_point
+        .as_ref()
+        .filter(|instant| instant.secs() > 0)
+    else {
         return Some(STARTING_POINT_REQUIRED_MESSAGE.to_string());
     };
     let stamp = starting_point_stamp(requested);
@@ -949,6 +996,67 @@ pub fn parse_filter_pattern(pattern: &str) -> Result<::serde_json::Value, String
 /// refusal names it.
 pub const FILTERS_MEMBER: &str = "Filters";
 
+/// The opening of the whole `Message` of the refusal a filter configuration
+/// carrying two filters of ONE scope is answered with, which the repeated scope
+/// closes.
+///
+/// `FilterScope` is the "Scope of a filter pattern within a
+/// FilterConfiguration" and `FilterConfiguration` states that "All Filters are
+/// implicitly ANDed — an event must match every Filter to be delivered", so the
+/// scope is what each filter of a configuration selects a different part of the
+/// event by: two filters of the same scope are two patterns for one part, which
+/// is a request parameter that is not valid rather than a configuration the
+/// service picks one of.
+pub const DUPLICATE_FILTER_SCOPE_PREFIX: &str = "Duplicate filter scope: ";
+
+/// The whole `Message` of the refusal a filter carrying an EMPTY pattern is
+/// answered with.
+///
+/// `FilterConfiguration` requires "at least one Filter with a non-empty
+/// Pattern", so a blank pattern names no pattern at all and the refusal says
+/// that: fixed text throughout, naming neither the filter's scope nor its
+/// position in the list. It is reported as itself rather than as whatever a
+/// reader of the pattern language makes of an empty text, which is the
+/// requirement the member states.
+pub const EMPTY_FILTER_PATTERN_MESSAGE: &str = "Filter pattern must not be empty";
+
+/// The opening of the whole `Message` of the refusal a filter whose pattern the
+/// service cannot read is answered with, which the reason closes.
+///
+/// `FilterConfiguration$Language` declares one language, `EVENT_BRIDGE_PATTERN`,
+/// whose patterns are JSON documents, so a pattern that is not even JSON is a
+/// request parameter that is not valid — and the refusal says WHICH filter of
+/// the configuration and WHERE its text stopped parsing, because a
+/// configuration carries one filter per scope and the caller has to find the
+/// character to fix.
+pub const INVALID_FILTER_PATTERN_PREFIX: &str = "Invalid filter pattern: ";
+
+/// The filter scopes whose clauses may compare only EXACT values.
+///
+/// RECORDED behaviour of `CreateSubscriber`: a `METADATA` filter comparing a
+/// field by a matcher is refused, and the refusal states the rule —
+/// "<scope> filter field '<field>' supports exact-match values only; operators
+/// are not allowed". `METADATA` is matched against the "unstructured metadata
+/// map for customer-defined key-value pairs" (`EventMetadataMap`), which is
+/// where that holds and `DATA` — the event's own structured payload — is not one
+/// of these. Which part of an event compares only exact values is this service's
+/// rule; the reading of WHICH clause does more than compare a value is the
+/// language's ([`::service_common::event_pattern::field_compared_beyond_values`]).
+const EXACT_MATCH_ONLY_SCOPES: [&str; 1] = [FILTER_SCOPE_METADATA];
+
+/// The whole `Message` of the refusal a subscriber filter using a WILDCARD
+/// matcher is answered with.
+///
+/// RECORDED behaviour of `CreateSubscriber`: a filter pattern comparing by that
+/// matcher is refused with this sentence, which names the two places one can be
+/// written. So a subscriber's filters are the language's patterns WITHOUT its
+/// wildcard matcher — the matcher stays part of the language
+/// ([`::service_common::event_pattern::WILDCARD_MATCHER`]), and this is the one
+/// service that does not carry it. Fixed text throughout, naming the two forms
+/// rather than which of them the request used.
+pub const WILDCARD_MATCHER_MESSAGE: &str =
+    "Filter pattern must not contain wildcard matchers (wildcard, anything-but wildcard)";
+
 /// Why `configuration` is not a filter configuration a subscriber can carry, or
 /// `None` when it is one.
 ///
@@ -959,7 +1067,15 @@ pub const FILTERS_MEMBER: &str = "Filters";
 /// that names no `Filters` at all selects nothing for the lifetime of the
 /// subscriber and is a request parameter that is not valid, rather than a
 /// subscriber that silently takes every event. A pattern that is not one this
-/// service can evaluate is the same fault for the same reason.
+/// service can evaluate is the same fault for the same reason, and so is a
+/// SCOPE two of its filters share ([`DUPLICATE_FILTER_SCOPE_PREFIX`]) and a
+/// filter whose pattern is blank ([`EMPTY_FILTER_PATTERN_MESSAGE`]).
+///
+/// Each pattern is read ONCE, by the tree's one reader of this language
+/// ([`::service_common::event_pattern::read`]), which is also what bounds its
+/// size and its depth; what this adds is the WORDING of each fault class and the
+/// two rules that are this service's own ([`WILDCARD_MATCHER_MESSAGE`],
+/// [`EXACT_MATCH_ONLY_SCOPES`]).
 ///
 /// The `Some` is the whole `Message` of the refusal, which is why it names the
 /// member the request got wrong.
@@ -968,11 +1084,70 @@ pub fn filter_configuration_fault(configuration: &FilterConfiguration) -> Option
     if filters.is_empty() {
         return Some(format!("{FILTERS_MEMBER} is required"));
     }
-    filters.iter().find_map(|filter| {
-        parse_filter_pattern(&filter.pattern)
-            .err()
-            .map(|reason| format!("FilterConfiguration.{FILTERS_MEMBER}: {reason}"))
-    })
+    if let Some(repeated) = repeated_filter_scope(filters) {
+        return Some(format!("{DUPLICATE_FILTER_SCOPE_PREFIX}{repeated}"));
+    }
+    if filters.iter().any(|filter| filter.pattern.trim().is_empty()) {
+        return Some(EMPTY_FILTER_PATTERN_MESSAGE.to_string());
+    }
+    filters.iter().find_map(filter_fault)
+}
+
+/// Why `filter` is not one a subscriber can carry, or `None` when it is.
+///
+/// One reading of the pattern, whose faults this words: a text that is not JSON
+/// names the scope and the position the parse stopped at, one that is JSON but
+/// names no field says so, and anything else the language refuses carries the
+/// reason it states. A pattern the language ADMITS is then held to this
+/// service's own two rules.
+fn filter_fault(filter: &Filter) -> Option<String> {
+    use ::service_common::event_pattern::Fault;
+
+    let pattern = match ::service_common::event_pattern::read(&filter.pattern) {
+        Ok(pattern) => pattern,
+        Err(Fault::NotJson { line, column, .. }) => {
+            return Some(format!(
+                "{INVALID_FILTER_PATTERN_PREFIX}Filter pattern for scope {} is not valid JSON at \
+                 line {line}, column {column}",
+                filter.scope
+            ))
+        }
+        Err(Fault::NotAnObject) => {
+            return Some(format!(
+                "{} filter pattern must be a JSON object",
+                filter.scope
+            ))
+        }
+        Err(Fault::Unreadable(reason)) => {
+            return Some(format!("FilterConfiguration.{FILTERS_MEMBER}: {reason}"))
+        }
+    };
+    if ::service_common::event_pattern::uses_matcher(
+        &pattern,
+        ::service_common::event_pattern::WILDCARD_MATCHER,
+    ) {
+        return Some(WILDCARD_MATCHER_MESSAGE.to_string());
+    }
+    if !EXACT_MATCH_ONLY_SCOPES.contains(&filter.scope.as_str()) {
+        return None;
+    }
+    let field = ::service_common::event_pattern::field_compared_beyond_values(&pattern)?;
+    Some(format!(
+        "{} filter field '{field}' supports exact-match values only; operators are not allowed",
+        filter.scope
+    ))
+}
+
+/// The first scope two of `filters` share, or `None` when each names its own.
+fn repeated_filter_scope(filters: &[Filter]) -> Option<&str> {
+    let mut seen: Vec<&str> = Vec::with_capacity(filters.len());
+    for filter in filters {
+        if seen.contains(&filter.scope.as_str()) {
+            return Some(&filter.scope);
+        }
+        seen.push(&filter.scope);
+    }
+    None
 }
 
 /// Whether `configuration` is the EMPTY shape, which an update carries to CLEAR
@@ -1011,6 +1186,44 @@ pub fn transformer_fault(
          UniversalTargetParameters.Input and accepts no Transformer"
             .to_string(),
     )
+}
+
+/// The whole `Message` of the `InvalidInputException` a transformer whose
+/// expression the language does not admit is refused with.
+///
+/// `JsonataConfiguration$Expression` is the "JSONata expression to transform the
+/// event", so a text the engine will not parse names no transformation at all
+/// and the subscriber it was asked for could never deliver anything. Fixed text
+/// naming the member at fault and nothing of the value, which is `@sensitive`.
+pub const JSONATA_EXPRESSION_INVALID_MESSAGE: &str =
+    "JsonataConfiguration.Expression is not a valid JSONata expression.";
+
+/// The whole `Message` of the `InvalidInputException` a `JSONATA` transformer
+/// carrying no `JsonataConfiguration` is refused with.
+///
+/// The member is "JSONata expression configuration. Required when Type is
+/// JSONATA", and the type names a transformation BY an expression, so a
+/// transformer of that type without one names no transformation at all. Fixed
+/// text around the names it is about, which are the model's.
+pub const JSONATA_CONFIGURATION_REQUIRED_MESSAGE: &str =
+    "JsonataConfiguration is required when Transformer.Type is JSONATA";
+
+/// Why the transformation `transformer` asks for cannot be performed at all, or
+/// `None` when it can.
+///
+/// The expression is read by the one bounded seam onto the language this service
+/// evaluates expressions through
+/// ([`super::event_expressions::expression_parse_failure`]), so the expressions
+/// a create admits are exactly the ones a delivery can evaluate. Only the PARSE
+/// runs: nothing is evaluated, because there is no event yet.
+pub fn transformer_configuration_fault(transformer: Option<&Transformer>) -> Option<String> {
+    let transformer = transformer?;
+    let Some(configuration) = transformer.jsonata_configuration.as_ref() else {
+        return (transformer.r#type.as_deref() == Some(TRANSFORMER_TYPE_JSONATA))
+            .then(|| JSONATA_CONFIGURATION_REQUIRED_MESSAGE.to_string());
+    };
+    super::event_expressions::expression_parse_failure(&configuration.expression)
+        .map(|_| JSONATA_EXPRESSION_INVALID_MESSAGE.to_string())
 }
 
 /// What this subscriber's target is handed for `event`, or why it is handed

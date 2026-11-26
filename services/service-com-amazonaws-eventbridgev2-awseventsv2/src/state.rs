@@ -18,7 +18,10 @@
 //! List operation shares, and the `tags` module resolves one taggable ARN
 //! against all three registries, because tagging spans them.
 //! [`subscriber_configuration`] settles the delivery members the service itself
-//! fills in for a subscriber whose request named none.
+//! fills in for a subscriber whose request named none, and
+//! [`subscriber_targets`] reads the target and the role a subscriber request
+//! names before one is minted from it, against the APIs a universal target may
+//! name ([`universal_target_apis`]).
 
 mod event_expressions;
 mod event_sources;
@@ -28,8 +31,10 @@ mod publishing;
 mod resource_policies;
 mod subscriber_configuration;
 pub mod subscriber_delivery;
+mod subscriber_targets;
 mod subscribers;
 mod tags;
+mod universal_target_apis;
 
 pub use event_expressions::*;
 pub use event_sources::*;
@@ -38,8 +43,10 @@ pub use pagination::*;
 pub use publishing::*;
 pub use resource_policies::*;
 pub use subscriber_configuration::*;
+pub use subscriber_targets::*;
 pub use subscribers::*;
 pub use tags::*;
+pub use universal_target_apis::*;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};

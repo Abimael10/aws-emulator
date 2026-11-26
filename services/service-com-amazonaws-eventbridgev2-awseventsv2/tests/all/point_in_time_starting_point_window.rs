@@ -79,10 +79,11 @@ const TOO_RECENT_MESSAGE: &str =
     "PointInTimeConfiguration.StartingPoint must be at least 5 minutes in the past";
 
 /// The whole `Message` of the refusal of a `TIMESTAMP` point carrying no
-/// instant at all — "Required when PointType is TIMESTAMP", per the member's own
-/// documentation.
-const REQUIRED_MESSAGE: &str =
-    "PointInTimeConfiguration.StartingPoint is required when PointType is TIMESTAMP";
+/// instant at all, or one at or before the epoch — the member is "Required when
+/// PointType is TIMESTAMP", and the sentence states both halves of what a usable
+/// value is.
+const REQUIRED_MESSAGE: &str = "PointInTimeConfiguration.StartingPoint is required and must be > 0 \
+     when PointType is TIMESTAMP";
 
 /// `StartingPosition::POINT_IN_TIME`, from the modelled enum.
 const POINT_IN_TIME: &str = "POINT_IN_TIME";
@@ -102,6 +103,14 @@ const POLL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long one pass of a poll waits before looking again.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The whole `Message` of the refusal of a point-in-time configuration carried
+/// beside `starting_position`, which the member is not applicable to.
+fn unapplicable_message(starting_position: &str) -> String {
+    format!(
+        "PointInTimeConfiguration must not be provided when StartingPosition is {starting_position}"
+    )
+}
 
 /// The whole `Message` of the refusal of a point earlier than the bus's
 /// retention window: fixed text around ONE variable part, `stamp` — the
@@ -485,7 +494,16 @@ async fn a_point_in_time_starting_point_outside_the_window_is_refused() {
             name: "pit-epoch",
             starting_position: Some(POINT_IN_TIME),
             point: point(TIMESTAMP, Some(DateTime::from_secs(0))),
-            expect: Expect::Refused(outside_window_message(&stamp_of(0))),
+            expect: Expect::Refused(REQUIRED_MESSAGE.to_string()),
+        },
+        Row {
+            // An instant BEFORE the epoch names no instant either, and is
+            // refused the same way.
+            case: "an instant before the epoch",
+            name: "pit-before-epoch",
+            starting_position: Some(POINT_IN_TIME),
+            point: point(TIMESTAMP, Some(DateTime::from_secs(-1))),
+            expect: Expect::Refused(REQUIRED_MESSAGE.to_string()),
         },
         Row {
             case: "a TIMESTAMP point carrying no instant",
@@ -504,19 +522,22 @@ async fn a_point_in_time_starting_point_outside_the_window_is_refused() {
         },
         Row {
             // "Only applicable when StartingPosition is POINT_IN_TIME": beside
-            // LATEST the configuration names no point to place.
+            // LATEST the configuration names a point nothing places, so it is
+            // refused rather than ignored.
             case: "a future point beside a LATEST position",
             name: "pit-latest",
             starting_position: Some(LATEST),
             point: point(TIMESTAMP, Some(DateTime::from_secs(now + 3_600))),
-            expect: Expect::Accepted,
+            expect: Expect::Refused(unapplicable_message(LATEST)),
         },
         Row {
+            // The position a request that names none takes is LATEST, so the
+            // same refusal holds: the configuration is not applicable to it.
             case: "a future point beside no stated position at all",
             name: "pit-default",
             starting_position: None,
             point: point(TIMESTAMP, Some(DateTime::from_secs(now + 3_600))),
-            expect: Expect::Accepted,
+            expect: Expect::Refused(unapplicable_message(LATEST)),
         },
     ];
 
@@ -594,11 +615,7 @@ async fn a_point_in_time_starting_point_outside_the_window_is_refused() {
     let listed = harness.subscriber_names("the enumeration", &bus).await;
     assert_eq!(
         listed,
-        vec![
-            "pit-default".to_string(),
-            "pit-horizon".to_string(),
-            "pit-latest".to_string()
-        ],
+        vec!["pit-horizon".to_string()],
         "case \"the enumeration\": expected only the accepted subscribers, got {listed:?}"
     );
 }

@@ -145,10 +145,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.eventbridgev2#CreateSubscriber",
-    extra_errors = ["InternalException", "InvalidInputException"]
+    extra_errors = ["AccessDeniedException", "InternalException", "InvalidInputException"]
 )]
 #[derive(Debug)]
 pub enum CreateSubscriberErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InternalException(InternalException),
@@ -352,6 +353,36 @@ fn create(
         .into());
     }
 
+    // And the configuration it names has to be one a subscriber could deliver
+    // under at all — the transformation, the target, the parameters member that
+    // goes with it, the values it carries and the batching it is invoked under
+    // ([`invalid_input`]). Every one of those readings happens HERE, before
+    // anything is minted, so a create this service refuses leaves no subscriber
+    // behind and holds no bus.
+    if let Some(reason) = invalid_input(input) {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
+    // The role is the one thing a request does not merely NAME but acts under:
+    // "IAM role the service assumes to invoke the target. Must belong to the
+    // calling account", so a value naming a role of another account is one no
+    // delivery could ever be made under, and the caller may not configure it.
+    // That is a permission refusal rather than a bad parameter, which is the
+    // error class it answers in.
+    if crate::state::role_is_not_the_callers(&input.invoke_configuration.role_arn) {
+        return Err(CreateSubscriberErrorModeled::AccessDeniedException(
+            AccessDeniedException {
+                message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+
     // A retry carrying the same ClientToken replays the subscriber that
     // token minted — identical parameters only; different ones are the
     // mismatch the model names. The token is read off the stored subscriber, so
@@ -494,6 +525,51 @@ fn create(
         // subscriber once however many calls follow.
         due: state.take_due_delivery(&arn).into_iter().collect(),
     })
+}
+
+/// Why this request names a subscriber this service could not deliver with, or
+/// `None` when it names one it can.
+///
+/// Every reading that answers `InvalidInputException` — "A request parameter is
+/// missing or not valid" — in one place, so a create has ONE refusal whichever
+/// of them finds the fault first (the chain stops there), and so every one of
+/// them is taken before the store is touched. Each reading is itself in
+/// `crate::state`, beside the record it is about, which is what lets the update
+/// of a subscriber be held to the same rules.
+///
+/// The readings, in the order a refusal takes them: the transformation the
+/// request asks for ([`crate::state::transformer_configuration_fault`]), the
+/// parameters member the target takes
+/// ([`crate::state::target_parameters_fault`]), the values that member carries
+/// ([`crate::state::configured_expression_fault`],
+/// [`crate::state::invocation_timeout_fault`]), the account the target belongs
+/// to ([`crate::state::target_account_fault`]), the call a universal target
+/// names and the request it is made with
+/// ([`crate::state::universal_target_api_fault`],
+/// [`crate::state::universal_target_input_fault`],
+/// [`crate::state::universal_target_batch_fault`]) and what a
+/// previous-generation target can be handed
+/// ([`crate::state::classic_target_transformer_fault`]).
+fn invalid_input(input: &CreateSubscriberInput) -> Option<String> {
+    crate::state::transformer_configuration_fault(input.transformer.as_ref())
+        .or_else(|| crate::state::target_parameters_fault(&input.invoke_configuration))
+        .or_else(|| crate::state::configured_expression_fault(&input.invoke_configuration))
+        .or_else(|| crate::state::invocation_timeout_fault(&input.invoke_configuration))
+        .or_else(|| crate::state::target_account_fault(&input.invoke_configuration))
+        .or_else(|| crate::state::universal_target_api_fault(&input.invoke_configuration))
+        .or_else(|| crate::state::universal_target_input_fault(&input.invoke_configuration))
+        .or_else(|| {
+            crate::state::universal_target_batch_fault(
+                &input.invoke_configuration,
+                input.batch_configuration.as_ref(),
+            )
+        })
+        .or_else(|| {
+            crate::state::classic_target_transformer_fault(
+                &input.invoke_configuration,
+                input.transformer.as_ref(),
+            )
+        })
 }
 
 /// Project a stored subscriber into `CreateSubscriberResponse`. Every member is

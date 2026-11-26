@@ -950,6 +950,12 @@ pub mod unstated_members;
 /// apply — the ones carrying look-around, which its engine treats as satisfied — applied,
 /// for every service whose model declares one.
 pub mod unapplied_patterns;
+/// The APIs a UNIVERSAL target may name, per AWS SDK service — the operations a service
+/// has, which of them only READ, and the members an operation's input requires — for
+/// every service whose API takes a target naming an API OPERATION rather than a resource,
+/// so two of them validating the same `aws-sdk:<service>:<apiAction>` pair cannot
+/// disagree about whether it names a call.
+pub mod universal_target_apis;
 pub mod validation;
 pub mod validation_message;
 /// The web identity tokens this emulator itself issued: the registry a redeemer of one

@@ -55,6 +55,10 @@ use crate::modelled_input_refusal::{
 /// `@range 1..500`.
 const DEFAULT_MAX_BATCH_SIZE: i32 = 10;
 
+/// The target ARN of a UNIVERSAL (aws-sdk) target, the form
+/// `UniversalTargetParameters` documents: `arn:aws:events:::aws-sdk:{service}:{apiAction}`.
+const UNIVERSAL_TARGET_ARN: &str = "arn:aws:events:::aws-sdk:s3:putObject";
+
 /// The `MaxBatchWindowInSeconds` a subscriber that named none batches within:
 /// the bottom of `BatchConfiguration$MaxBatchWindowInSeconds`'s
 /// `@range 0..300`, so nothing is held back waiting for a batch to fill.
@@ -406,9 +410,22 @@ async fn a_subscriber_on_a_universal_target_reads_back_no_transformer() {
 
     let case = "a create naming a universal target";
     let mut input = create_subscriber("effective-universal", &bus, None);
+    // A universal target is the one whose ARN names an SDK call rather than a
+    // resource — `UniversalTargetParameters` is "Used when TargetArn is in the
+    // format arn:aws:events:::aws-sdk:{service}:{apiAction}" — so the target and
+    // the parameters member that goes with it are named together.
+    input.invoke_configuration.target_arn = UNIVERSAL_TARGET_ARN.to_string();
     input.invoke_configuration.universal_target_parameters = Some(UniversalTargetParameters {
         input: "{}".to_string(),
         invocation_timeout_seconds: None,
+    });
+    // A universal target is invoked for a batch of events, so its batching is
+    // the caller's to state; these are the values the service would have
+    // applied anyway, so the effective configuration below is the defaulted
+    // one.
+    input.batch_configuration = Some(BatchConfiguration {
+        max_batch_size: Some(DEFAULT_MAX_BATCH_SIZE),
+        max_batch_window_in_seconds: Some(DEFAULT_MAX_BATCH_WINDOW),
     });
     let (arn, described) = created_and_read(&wire, case, input).await;
     let reported = effective_of(&described);

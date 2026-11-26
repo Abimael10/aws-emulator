@@ -830,8 +830,6 @@ enum Record {
     Created,
     /// A role of THIS account IAM was never given.
     Absent,
-    /// A role of ANOTHER account, which this service may not act under at all.
-    AnotherAccount,
 }
 
 /// One row of the authorization table: the role the subscriber delivers under,
@@ -863,7 +861,7 @@ async fn a_delivery_the_subscribers_role_does_not_allow_reaches_nothing_and_is_r
     // whether it states one at all), along whether IAM holds the role, and along
     // the KIND of target, since the action the delivery performs follows from
     // that kind.
-    let rows: [RoleRow; 14] = [
+    let rows: [RoleRow; 13] = [
         RoleRow {
             case: "a topic target and a grant of the publish on it",
             kind: Kind::Topic,
@@ -973,17 +971,6 @@ async fn a_delivery_the_subscribers_role_does_not_allow_reaches_nothing_and_is_r
             delivered: false,
         },
         RoleRow {
-            // "Must belong to the calling account" (`InvokeConfiguration$RoleArn`):
-            // another account's role is one this service may not act under, and
-            // another account's IAM is not this emulator's to ask.
-            case: "a topic target and a role of another account",
-            kind: Kind::Topic,
-            trusted: SERVICE_PRINCIPAL,
-            policy: None,
-            record: Record::AnotherAccount,
-            delivered: false,
-        },
-        RoleRow {
             case: "a queue target and a grant of the send on it",
             kind: Kind::Queue,
             trusted: SERVICE_PRINCIPAL,
@@ -1050,10 +1037,11 @@ async fn a_delivery_the_subscribers_role_does_not_allow_reaches_nothing_and_is_r
                 .await
             }
             // The ARN of a role of this account IAM was never given, which is
-            // the form the member's own pattern pins.
+            // the form the member's own pattern pins. A role of ANOTHER account
+            // is not a row here: "Must belong to the calling account"
+            // (`InvokeConfiguration$RoleArn`), so such a subscriber is refused
+            // at the create and never delivers at all.
             Record::Absent => format!("arn:aws:iam::{ACCOUNT}:role/{role_name}"),
-            // The same form, naming an account that is not the calling one.
-            Record::AnotherAccount => format!("arn:aws:iam::210987654321:role/{role_name}"),
         };
         let bus_arn = given_active_bus(&router, case, &format!("role-bus-{index}")).await;
         let subscriber_arn = given_subscriber(
