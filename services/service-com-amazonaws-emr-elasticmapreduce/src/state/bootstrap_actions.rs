@@ -68,10 +68,24 @@ pub fn decode_bootstrap_action_marker(marker: &str, cluster_id: &str) -> Option<
 /// bootstrap action" with "the location of the script to run" and "a list of command line
 /// arguments to pass to the bootstrap action script" — is reported member for member, as
 /// the launch submitted it.
+///
+/// `Args` is "arguments for Amazon EMR to pass to the command for execution"
+/// (`Command$Args` doc) and is ALWAYS reported: an action the launch submitted no argument
+/// for carries the EMPTY list rather than leaving the member out, so every element of one
+/// response has the same members and a caller reading `Args` positionally never meets an
+/// absent collection where another element carries one. A launch that named no `Args` and
+/// one that named an empty list are therefore indistinguishable in the report, which is
+/// what "no arguments" means for an executable.
 pub fn bootstrap_action_command(config: &BootstrapActionConfig) -> Command {
     Command {
         name: Some(config.name.clone()),
         script_path: Some(config.script_bootstrap_action.path.clone()),
-        args: config.script_bootstrap_action.args.clone(),
+        args: Some(
+            config
+                .script_bootstrap_action
+                .args
+                .clone()
+                .unwrap_or_default(),
+        ),
     }
 }

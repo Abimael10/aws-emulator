@@ -114,22 +114,18 @@ fn assert_reported_as(case: &str, submitted: &Value, reported: &Value) {
         at(submitted, &["ScriptBootstrapAction", "Path"]).as_str(),
         "case {case:?}: the script path is the submitted one, got {reported}"
     );
+    // `Args` is reported on EVERY element, so an action submitted with no arguments reads
+    // back as the empty list rather than as a missing member.
     let submitted_args = at(submitted, &["ScriptBootstrapAction", "Args"]);
-    if submitted_args.is_null() {
-        assert!(
-            at(reported, &["Args"]).is_null(),
-            "case {case:?}: an action submitted with no arguments reports none, got {reported}"
-        );
-    } else {
-        assert_eq!(
-            args_of(at(reported, &["Args"])),
-            args_of(submitted_args),
-            "case {case:?}: the arguments are the submitted ones, got {reported}"
-        );
-    }
+    assert_eq!(
+        at(reported, &["Args"]).as_array(),
+        Some(&args_of(submitted_args)),
+        "case {case:?}: the arguments are the submitted ones, got {reported}"
+    );
 }
 
-/// An argument list as a list, for a member a codec may render as an absent empty list.
+/// An argument list as a list, for a submitted member a launch may have left out
+/// altogether — "no arguments" and an empty list are the same request.
 fn args_of(value: &Value) -> Vec<Value> {
     value.as_array().cloned().unwrap_or_default()
 }
