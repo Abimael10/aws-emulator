@@ -3267,12 +3267,17 @@ pub fn check_db_subnet_group_common_vpc(
     ))
 }
 
-/// What a `SubnetIds` list whose subnets lie in more than one VPC is refused with: Amazon RDS
-/// states that a subnet is in a different VPC than another, naming the two VPCs the list
-/// straddles in the order its subnets introduce them ([`SubnetZones::straddled_vpcs`]).
+/// What a `SubnetIds` list that does not lie in ONE VPC is refused with: Amazon RDS states
+/// that a subnet is in a different VPC than another, naming the two VPCs — the one a subnet
+/// of the list lies in, and the one it has to be in.
 ///
-/// Both values come from the subnets the request named, as the service that owns them reports
-/// their VPC; the text around them is fixed.
+/// Which two those are follows from what the call knows: a list asked to make up a group of
+/// its own names the VPCs it straddles, in the order its subnets introduce them
+/// ([`SubnetZones::straddled_vpcs`]); a list asked to make up a group that already HAS a VPC
+/// names the VPC of the subnet outside it and the group's own
+/// ([`check_db_subnet_group_subnets_in_vpc`]). Either way both values come from the subnets
+/// the request named, as the service that owns them reports their VPC; the text around them
+/// is fixed.
 #[must_use]
 pub fn subnets_in_different_vpcs_message(first_vpc_id: &str, second_vpc_id: &str) -> String {
     format!("Subnet has different VPC Id: {first_vpc_id} than {second_vpc_id}")
@@ -3283,19 +3288,28 @@ pub fn subnets_in_different_vpcs_message(first_vpc_id: &str, second_vpc_id: &str
 ///
 /// A DB subnet group belongs to the VPC its subnets are in, and a modification changes which
 /// subnets OF THAT VPC it holds: an identifier naming a subnet of another VPC is not one this
-/// group can be made of, so it is reported the way an identifier the account holds no
-/// subnet for is — one sentence naming the whole list the request asked about
-/// ([`invalid_subnets_message`]).
+/// group can be made of. The list then names subnets of two VPCs, which is what the refusal
+/// states — the sentence naming the VPC the offending subnet lies in and the one the group is
+/// in ([`subnets_in_different_vpcs_message`]), the same sentence a list that straddles VPCs
+/// without a group to compare against is refused with.
 pub fn check_db_subnet_group_subnets_in_vpc(
     subnet_ids: &[String],
     zones: &SubnetZones,
     vpc_id: &str,
 ) -> Result<(), SubnetListRejection> {
-    if zones.outside_vpc(subnet_ids, vpc_id).is_empty() {
+    // A subnet is outside the group's VPC only where EC2 NAMED a VPC for it — one it named
+    // none for is no evidence of a subnet in the wrong place ([`SubnetZones::outside_vpc`])
+    // — so the VPC the sentence names beside the group's own is read off the first such
+    // subnet, and a list with none of them is not refused here at all.
+    let Some(elsewhere) = zones
+        .outside_vpc(subnet_ids, vpc_id)
+        .iter()
+        .find_map(|subnet_id| zones.vpc_of_subnet(subnet_id))
+    else {
         return Ok(());
-    }
+    };
     Err(SubnetListRejection::UnusableSubnets(
-        invalid_subnets_message(subnet_ids),
+        subnets_in_different_vpcs_message(elsewhere, vpc_id),
     ))
 }
 

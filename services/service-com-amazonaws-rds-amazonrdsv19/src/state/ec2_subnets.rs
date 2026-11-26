@@ -182,6 +182,13 @@ impl SubnetZones {
             .collect()
     }
 
+    /// The VPC EC2 reports the subnet `subnet_id` belongs to, or `None` where it answered for
+    /// no such subnet or named no VPC for it.
+    #[must_use]
+    pub fn vpc_of_subnet(&self, subnet_id: &str) -> Option<&str> {
+        self.vpc_by_id.get(subnet_id).map(String::as_str)
+    }
+
     /// The identifiers among `subnet_ids` EC2 reports in a VPC OTHER than `vpc_id`, in the
     /// order the request named them and without repetition.
     ///

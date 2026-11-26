@@ -9,10 +9,12 @@
 //! and the sentence naming the identifiers the REQUEST asked about, the ones that did resolve
 //! included — whichever operation carries the list,
 //! and BEFORE the zones the list covers are counted, since an identifier that names no subnet
-//! contributes no zone to count. A subnet of a VPC other than the one the group a
-//! modification addresses is in is not a subnet that group can be made of, so it is refused
-//! the same way; and a list whose subnets lie in several VPCs makes up no group at all, which
-//! is `InvalidSubnet`'s own documented condition.
+//! contributes no zone to count. A list whose subnets do not all lie in the ONE VPC the group
+//! is made of is refused for the VPCs instead: the sentence names the VPC a subnet of the list
+//! lies in and the VPC it has to be in — the VPC the group a modification addresses is
+//! already in (`InvalidParameterValue`, the value the request carried), or, where there is no
+//! such group to compare against, the VPC the list itself introduced first (`InvalidSubnet`,
+//! whose own documented condition that is).
 //!
 //! The rows span what the rule generalises over: where in the list the unusable identifier
 //! sits, how many there are, which published identifier form each takes (`subnet-` with 8 and
@@ -207,10 +209,11 @@ async fn a_subnet_the_account_does_not_hold_is_refused_on_create_and_on_modify()
     );
 }
 
-/// The sentence a `SubnetIds` list whose subnets lie in more than one VPC is refused with:
-/// Amazon RDS names the two VPCs the list straddles, in the order its subnets introduce them
-/// — the VPC of the first subnet named, then the VPC of the first subnet named in a different
-/// one — with fixed text around the two.
+/// The sentence a `SubnetIds` list that does not lie in ONE VPC is refused with: Amazon RDS
+/// names the VPC a subnet of the list lies in and the VPC it has to be in — for a list asked
+/// to make up a group of its own, the VPC of the first subnet named and the VPC of the first
+/// subnet named in a different one; for a modification, the VPC of the subnet outside the
+/// group's VPC and the group's own — with fixed text around the two.
 ///
 /// Spelled out here rather than read from the code under test, so the assertion is made
 /// against the wording and not against the emulator's own helper.
@@ -222,8 +225,8 @@ fn subnets_in_different_vpcs(first_vpc_id: &str, second_vpc_id: &str) -> String 
 /// whose subnets lie in several makes up no group (`InvalidSubnet`, whose message names the
 /// two VPCs the list straddles), and a modification can
 /// only name subnets of the VPC the group it addresses is in; one naming a subnet of another
-/// VPC names a subnet this group cannot be made of, which is refused the way an identifier
-/// the account holds no subnet for is.
+/// VPC carries a value of a VPC that is not the group's (`InvalidParameterValue`), and the
+/// sentence names that VPC and the group's own.
 #[tokio::test]
 async fn the_subnets_of_a_group_are_subnets_of_one_vpc() {
     let network = Network::build().await;
@@ -291,34 +294,53 @@ async fn the_subnets_of_a_group_are_subnets_of_one_vpc() {
     }
 
     // The group a modification addresses is in ONE VPC, and the rows differ along how many
-    // of the named subnets are outside it and where they sit in the list. The refusal names
-    // the list the request asked about, as it does for an identifier the account holds no
-    // subnet for.
+    // of the named subnets are outside it, where they sit in the list, and WHICH other VPC
+    // they are in — which is the VPC the sentence names, beside the group's own.
     const BASE: &str = "emu-subnet-vpc-base";
     expect_ok(
         "a group over subnets of one VPC",
         network.account.create_group(BASE, &held).await,
     );
-    let rows: [(&str, Vec<String>); 3] = [
+    // A THIRD VPC of the same account, so the VPC the refusal names is read off the subnet
+    // the request carried rather than being the only other VPC around.
+    let third_vpc = network.account.create_vpc("10.70.0.0/16").await;
+    let third = network
+        .account
+        .create_subnet(&third_vpc, "10.70.1.0/24", &network.zones[0])
+        .await;
+    let rows: [(&str, Vec<String>, String); 4] = [
         (
             "a modification to the subnets of the other VPC",
             vec![other[0].clone(), other[1].clone()],
+            subnets_in_different_vpcs(&other_vpc, &network.vpc),
         ),
         (
             "a modification keeping one subnet and taking one from the other VPC",
             vec![held[0].clone(), other[1].clone()],
+            subnets_in_different_vpcs(&other_vpc, &network.vpc),
         ),
         (
             "the same list in the other order",
             vec![other[0].clone(), held[1].clone()],
+            subnets_in_different_vpcs(&other_vpc, &network.vpc),
+        ),
+        (
+            "a modification taking a subnet of a third VPC",
+            vec![held[0].clone(), third.clone()],
+            subnets_in_different_vpcs(&third_vpc, &network.vpc),
         ),
     ];
-    for (case, subnets) in rows {
-        assert_refused(
+    for (case, subnets, expected) in rows {
+        let body = expect_error(
             case,
-            "ModifyDBSubnetGroup",
             network.account.modify_group(BASE, &subnets).await,
-            &subnets,
+            400,
+            "InvalidParameterValue",
+        );
+        let message = text(&body, "Message");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
         let read_back = expect_ok(case, network.account.describe_group(BASE).await);
         assert_eq!(

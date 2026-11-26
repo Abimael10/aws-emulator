@@ -43,6 +43,26 @@ pub fn global_cluster_not_available_message(arn: &str, status: &str) -> String {
     format!("Global Cluster {arn} isn't available for the requested operation with status {status}")
 }
 
+/// The message a request naming a DB cluster the global database does not hold as a member is
+/// refused with.
+///
+/// Membership is the global database's OWN list of member clusters, so a value that is not
+/// among them is a value the call cannot be made with, whatever else is true of it: a cluster
+/// of the account that was never attached and a reference that resolves to no cluster at all
+/// are both reported as "not found in" the global database rather than as a resource that is
+/// not there. The fixed text is "Cluster " and " is not found in global cluster ".
+///
+/// `named` is the DB cluster the REQUEST carried, in the spelling it wrote — the member that
+/// names a cluster here takes "the Amazon Resource Name (ARN) identifying the cluster", so a
+/// caller matching the message against what it sent finds it there — and
+/// `global_cluster_identifier` is likewise the identifier the request carried.
+pub fn cluster_not_in_global_cluster_message(
+    named: &str,
+    global_cluster_identifier: &str,
+) -> String {
+    format!("Cluster {named} is not found in global cluster {global_cluster_identifier}")
+}
+
 /// A stored Aurora global database cluster: the record `DescribeGlobalClusters` reports.
 ///
 /// Account-scoped rather than regional — see

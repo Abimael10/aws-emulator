@@ -14,6 +14,13 @@
 //! cluster keeps running — so the global database stays ready and a `DeleteGlobalCluster`
 //! of a global database this call emptied is accepted straight after it.
 //!
+//! WHICH cluster can be detached is decided against that member list and nothing else: a
+//! `DbClusterIdentifier` that is not among the members is a value this call cannot be made
+//! with — the query API's common `InvalidParameterValue`, naming the cluster and the global
+//! database ([`crate::state::cluster_not_in_global_cluster_message`]) — and that is the one
+//! answer whether the value names a cluster of the account that was never attached or
+//! resolves to no cluster at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -224,10 +231,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let members = record.member_cluster_arns.clone();
 
-        // The member the request names has to be a DB cluster this service holds: a value
-        // that resolves to none is the modelled `DBClusterNotFoundFault`
-        // ("DBClusterIdentifier doesn't refer to an existing DB cluster"), and nothing is
-        // detached for it.
+        // What this detach can be performed on is settled by the global database's OWN
+        // member list: "detaches an Aurora secondary cluster FROM an Aurora global database
+        // cluster", so the value the request names is held against the members the record
+        // carries ([`crate::state::GlobalClusterRecord::member_cluster_arns`]), folded to the
+        // ARN a member is held by the same way the store folds it above.
+        //
+        // A value that is not among them is a value this call cannot be made with — the
+        // query API's common `InvalidParameterValue` — and that is the one answer for every
+        // such value: a cluster of the account that was never attached to this global
+        // database and a reference that resolves to no cluster at all are both reported as
+        // not found IN the global database
+        // ([`crate::state::cluster_not_in_global_cluster_message`]), naming the cluster and
+        // the global database the request asked about rather than reporting a missing
+        // resource. Nothing is detached for either.
+        let named_member_arn = crate::state::db_cluster_arn(&member_key.0, &member_key.1);
+        if !members.contains(&named_member_arn) {
+            return Err(RemoveFromGlobalClusterError::invalid_parameter_value(
+                crate::state::cluster_not_in_global_cluster_message(
+                    named,
+                    &input.global_cluster_identifier,
+                ),
+            ));
+        }
+        // The member resolved above IS attached to this global database, so this service
+        // holds the cluster it names; a member list carrying an ARN no stored cluster answers
+        // to is the modelled `DBClusterNotFoundFault` ("DBClusterIdentifier doesn't refer to
+        // an existing DB cluster") rather than a detach performed on nothing.
         let Some(cluster) = store.db_clusters.get(&member_key) else {
             return Err(RemoveFromGlobalClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
@@ -237,24 +267,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let cluster_arn = cluster.arn();
-        // A cluster that is not a member of the global database the request named cannot be
-        // detached FROM it. Membership is the cluster's own state — `CreateGlobalCluster`
-        // refuses adopting a cluster that is already a member with the same fault — so the
-        // mirror refusal is the modelled `InvalidDBClusterStateFault`, naming the global
-        // database the request asked about.
-        if !members.contains(&cluster_arn) {
-            return Err(
-                RemoveFromGlobalClusterErrorModeled::InvalidDBClusterStateFault(
-                    InvalidDBClusterStateFault {
-                        message: Some(format!(
-                            "DB cluster {} is not a member of global cluster {identifier}",
-                            cluster.identifier
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
         // This operation "detaches an Aurora SECONDARY cluster": a global database's
         // primary feeds every secondary, so it cannot be detached while secondaries are
         // still attached — they would be left replicating from a cluster the global

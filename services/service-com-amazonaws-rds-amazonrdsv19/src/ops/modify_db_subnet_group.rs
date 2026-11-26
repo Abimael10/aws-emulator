@@ -222,15 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(subnet_list_refusal)?;
         // A DB subnet group belongs to the VPC its subnets are in, and this call changes
         // which subnets OF THAT VPC it holds: an identifier naming a subnet of another VPC
-        // is not one this group can be made of. A group whose VPC this service never learnt
+        // is not one this group can be made of, and the list it is in therefore names
+        // subnets of two VPCs — which is what the refusal states, naming the VPC that
+        // subnet lies in and the group's own. A group whose VPC this service never learnt
         // (one stored where the owner of subnets could not be asked) constrains nothing, so
         // the list is then only held to lying in one VPC of its own.
         //
         // This gate comes BEFORE the common-VPC one on purpose: where the group's VPC is
         // known it is the narrower statement — a list straddling VPCs then necessarily names
-        // a subnet outside the group's — and naming the identifiers the group cannot be made
-        // of is what RDS answers a modification with. `CreateDBSubnetGroup` has no group VPC
-        // to compare against, so there only the common-VPC rule applies.
+        // a subnet outside the group's — and it is the group's VPC the modification's
+        // refusal is about. `CreateDBSubnetGroup` has no group VPC to compare against, so
+        // there only the common-VPC rule applies.
         if let Some(vpc_id) = held.vpc_id.clone() {
             crate::state::check_db_subnet_group_subnets_in_vpc(&input.subnet_ids, &zones, &vpc_id)
                 .map_err(subnet_list_refusal)?;
@@ -302,10 +304,13 @@ fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> ModifyDB
                 },
             )
         }
-        // An identifier the account holds no subnet for is a VALUE the request carried that
-        // cannot be used, which is the query protocol's common client error rather than any
-        // of this operation's modelled faults: `InvalidSubnet` is what RDS answers for a
-        // subnet that exists and cannot be used, not for one that is not there.
+        // A subnet list the group cannot be made of — one naming an identifier the account
+        // holds no subnet for, and one naming a subnet of a VPC other than the group's — is
+        // a VALUE the request carried that cannot be used, which is the query protocol's
+        // common client error rather than any of this operation's modelled faults: a
+        // modification RDS answers for the VPC the group is in reports the value, where
+        // `InvalidSubnet` is what a list asked to make up a group of its own is refused
+        // with.
         crate::state::SubnetListRejection::UnusableSubnets(message) => {
             return ModifyDBSubnetGroupError::invalid_parameter_value(message)
         }

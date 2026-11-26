@@ -20,11 +20,12 @@
 //! * a detach is in force when it answers: nothing is provisioned for it, so the global
 //!   database stays ready and the next call against it is accepted;
 //! * a detach this service refuses persists nothing: a global database nothing created is
-//!   the modelled 404, a DB cluster nothing created is the modelled
-//!   `DBClusterNotFoundFault`, a cluster that is not a member of the global database named
-//!   is the modelled `InvalidDBClusterStateFault`, and a global database whose own change
-//!   is still being applied — or whose primary is asked for while secondaries are still
-//!   attached — is the modelled `InvalidGlobalClusterStateFault`.
+//!   the modelled 404, a `DbClusterIdentifier` that is not among the global database's
+//!   members is the common `InvalidParameterValue` naming the cluster and the global
+//!   database — whether the value names a cluster of the account that was never attached,
+//!   one attached to another global database, or no cluster at all — and a global database
+//!   whose own change is still being applied, or whose primary is asked for while
+//!   secondaries are still attached, is the modelled `InvalidGlobalClusterStateFault`.
 //!
 //! The tables below span what those rules generalise over: both engines
 //! `CreateGlobalClusterMessage$Engine` publishes, a global database created EMPTY and
@@ -383,8 +384,10 @@ async fn a_detach_writes_both_sides_of_the_membership_and_every_later_call_sees_
                  {joined:?}",
                 row.case
             );
-            // A member that is no longer one cannot be detached twice.
-            expect_error(
+            // A member that is no longer one cannot be detached twice: the second detach
+            // names a cluster the global database no longer holds, which is the same
+            // refusal every other non-member gets.
+            let refused = expect_error(
                 row.case,
                 detach(
                     &router,
@@ -393,7 +396,17 @@ async fn a_detach_writes_both_sides_of_the_membership_and_every_later_call_sees_
                 )
                 .await,
                 400,
-                "InvalidDBClusterStateFault",
+                "InvalidParameterValue",
+            );
+            let actual_message = text(&refused, "Message");
+            let expected = not_a_member(
+                &row.named_as.spell(secondary_region, secondary),
+                row.global_named_as,
+            );
+            assert_eq!(
+                actual_message, expected,
+                "case {:?}: expected the refusal {expected:?}, got {actual_message:?}",
+                row.case
             );
         }
 
@@ -473,14 +486,14 @@ async fn a_detach_writes_both_sides_of_the_membership_and_every_later_call_sees_
 /// One row of the refusal table: the case, the global database the detach names, the member
 /// it names, the HTTP status and wire error code it is refused with, and the fault's whole
 /// sentence — whose variable parts are the value the request carried and the stored records.
-type RefusalRow = (
-    &'static str,
-    &'static str,
-    &'static str,
-    u16,
-    &'static str,
-    &'static str,
-);
+type RefusalRow = (&'static str, &'static str, &'static str, u16, &'static str, String);
+
+/// The sentence a detach of a cluster the global database does not hold as a member is
+/// refused with: the fixed text around the cluster the request named, in the spelling it
+/// wrote, and the global cluster identifier it carried.
+fn not_a_member(named: &str, global: &str) -> String {
+    format!("Cluster {named} is not found in global cluster {global}")
+}
 
 #[tokio::test]
 async fn a_detach_this_service_refuses_persists_nothing() {
@@ -537,6 +550,10 @@ async fn a_detach_this_service_refuses_persists_nothing() {
     .await;
 
     // (case, the global database named, the member named, status, code, the fault's sentence)
+    //
+    // Every row that names a cluster the global database does not hold as a member is the
+    // one refusal, however the value is spelled and whether or not a cluster answers to it:
+    // the member list is what the detach is decided against.
     let refusals: &[RefusalRow] = &[
         (
             "a global database nothing created",
@@ -544,50 +561,77 @@ async fn a_detach_this_service_refuses_persists_nothing() {
             "emu-rfgc-refused-member",
             404,
             "GlobalClusterNotFoundFault",
-            "Global cluster 'emu-rfgc-absent' not found",
+            "Global cluster 'emu-rfgc-absent' not found".to_string(),
         ),
         (
             "a DB cluster nothing created",
             "emu-rfgc-refused",
             "emu-rfgc-absent-cluster",
-            404,
-            "DBClusterNotFoundFault",
-            "DBCluster emu-rfgc-absent-cluster not found.",
+            400,
+            "InvalidParameterValue",
+            not_a_member("emu-rfgc-absent-cluster", "emu-rfgc-refused"),
         ),
         (
             "a DB cluster ARN of a region this service holds no cluster in",
             "emu-rfgc-refused",
             "arn:aws:rds:ap-south-1:000000000000:cluster:emu-rfgc-refused-member",
-            404,
-            "DBClusterNotFoundFault",
-            "DBCluster arn:aws:rds:ap-south-1:000000000000:cluster:emu-rfgc-refused-member \
-             not found.",
+            400,
+            "InvalidParameterValue",
+            not_a_member(
+                "arn:aws:rds:ap-south-1:000000000000:cluster:emu-rfgc-refused-member",
+                "emu-rfgc-refused",
+            ),
         ),
         (
             "a cluster that belongs to no global database",
             "emu-rfgc-refused",
             "emu-rfgc-standalone",
             400,
-            "InvalidDBClusterStateFault",
-            "DB cluster emu-rfgc-standalone is not a member of global cluster \
-             emu-rfgc-refused",
+            "InvalidParameterValue",
+            not_a_member("emu-rfgc-standalone", "emu-rfgc-refused"),
+        ),
+        (
+            "a cluster that belongs to no global database, named by its ARN",
+            "emu-rfgc-refused",
+            "arn:aws:rds:us-west-2:000000000000:cluster:emu-rfgc-standalone",
+            400,
+            "InvalidParameterValue",
+            not_a_member(
+                "arn:aws:rds:us-west-2:000000000000:cluster:emu-rfgc-standalone",
+                "emu-rfgc-refused",
+            ),
+        ),
+        (
+            "a cluster that belongs to no global database, named in another case",
+            "emu-rfgc-refused",
+            "EMU-RFGC-STANDALONE",
+            400,
+            "InvalidParameterValue",
+            not_a_member("EMU-RFGC-STANDALONE", "emu-rfgc-refused"),
         ),
         (
             "a cluster that is a member of another global database",
             "emu-rfgc-refused",
             "emu-rfgc-other-member",
             400,
-            "InvalidDBClusterStateFault",
-            "DB cluster emu-rfgc-other-member is not a member of global cluster \
-             emu-rfgc-refused",
+            "InvalidParameterValue",
+            not_a_member("emu-rfgc-other-member", "emu-rfgc-refused"),
+        ),
+        (
+            "the global database named in another case",
+            "EMU-RFGC-REFUSED",
+            "emu-rfgc-standalone",
+            400,
+            "InvalidParameterValue",
+            not_a_member("emu-rfgc-standalone", "EMU-RFGC-REFUSED"),
         ),
     ];
 
-    for &(case, global, db_cluster, status, code, message) in refusals {
-        let refused = expect_error(case, detach(&router, global, db_cluster).await, status, code);
+    for (case, global, db_cluster, status, code, message) in refusals {
+        let refused = expect_error(case, detach(&router, global, db_cluster).await, *status, code);
         let actual_message = text(&refused, "Message");
         assert_eq!(
-            actual_message, message,
+            &actual_message, message,
             "case {case:?}: expected the refusal {message:?}, got {actual_message:?}"
         );
         // Every membership this service holds is exactly as it was.
