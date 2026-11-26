@@ -24,7 +24,8 @@
 //!   it asked for, and stores nothing.
 
 use crate::harness::{
-    call, element, emulator, emulator_and_engine, field, settle_verifications, xml_text, Field,
+    call, element, emulator, emulator_and_engine, field, grant_production_access,
+    settle_verifications, xml_text, Field,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::time::SystemTime;
@@ -226,6 +227,9 @@ async fn the_sets_sending_flag_is_whatever_the_last_write_left() {
 #[tokio::test]
 async fn a_paused_set_refuses_a_send_naming_it() {
     let (router, engine) = emulator_and_engine();
+    // About the set's own sending flag, not about the sandbox's destination gate: the
+    // account is given production access so its sends are weighed on the sender alone.
+    grant_production_access(&engine);
     ok(
         &router,
         "VerifyEmailIdentity",

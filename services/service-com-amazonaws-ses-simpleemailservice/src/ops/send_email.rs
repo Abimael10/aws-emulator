@@ -342,11 +342,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The message must be sent from a verified email address or domain. If
         // you attempt to send email using a non-verified address or domain, the
-        // operation results in an 'Email address not verified' error."
-        if !state.is_verified_sender(&source) {
+        // operation results in an 'Email address not verified' error." While the
+        // account is in the SANDBOX the same check weighs the recipients too: such
+        // an account may only send to identities it has verified, or to the mailbox
+        // simulator. The refusal names every address that failed it.
+        if let Some(failed) = state.identities_refusing_send(
+            &source,
+            &destinations,
+            input.return_path.as_deref(),
+        ) {
+            let named: Vec<&str> = failed.iter().map(String::as_str).collect();
             return Err(rejected(crate::state::unverified_identities_message(
-                &region,
-                &[source.as_str()],
+                &region, &named,
             )));
         }
 

@@ -723,6 +723,10 @@ async fn one_message_addresses_at_most_fifty_recipients() {
 
     for (case, to, cc, bcc) in rows {
         let ses = verified().await;
+        // About the recipient CEILING, so the account is given production access and no row
+        // is also weighed on which mailboxes it addresses
+        // (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&ses.engine);
         let mut index = 0;
         let mut line = |count: usize| {
             let values: Vec<String> = (0..count)
@@ -1216,6 +1220,10 @@ async fn what_a_bulk_entry_states_for_its_own_message_is_read_before_the_identit
 #[tokio::test]
 async fn a_bad_entry_beside_a_good_one_stops_only_its_own_message() {
     let ses = verified().await;
+    // About an entry's OWN defect, so the account is given production access and no entry
+    // is also weighed on which mailboxes it addresses
+    // (`send_sandbox_destination_gate.rs`).
+    crate::send_sandbox_destination_gate::given_production_access(&ses.engine);
     let created = ses.create_template().await;
     assert_eq!(
         created.status, 200,
@@ -1272,6 +1280,9 @@ async fn a_bulk_send_addresses_between_one_and_fifty_destinations() {
     let ceiling = "You must specify at least 1 destination, and no more than 50 destinations";
     for (case, count) in [("no destination at all", 0usize), ("fifty-one", 51)] {
         let ses = verified().await;
+        // About how many destinations one call may carry, so the account is given
+        // production access (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&ses.engine);
         let created = ses.create_template().await;
         assert_eq!(
             created.status, 200,

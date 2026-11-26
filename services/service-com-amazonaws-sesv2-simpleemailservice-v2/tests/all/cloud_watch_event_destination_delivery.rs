@@ -522,6 +522,11 @@ impl Emulator {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about the events a send publishes, not about the sandbox's
+        // destination gate: the account is given production access, so a send of theirs is
+        // weighed on its sending identity alone and may be addressed to a mailbox no
+        // account verified (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         router.register_service(
             service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
                 Arc::clone(&engine),

@@ -101,6 +101,11 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about what list management does with a message's recipients, not
+        // about the sandbox's destination gate: the account is given production access, so
+        // a send may address the mailboxes the rows turn into contacts
+        // (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { engine, router }
     }
 
@@ -339,7 +344,9 @@ async fn a_topic_the_list_does_not_publish_is_refused() {
 async fn a_well_formed_pair_goes_on_to_the_sender_check() {
     // The list and the topic resolve, so the send proceeds to the gate on the sending
     // identity — and an unverified sender is refused there, in the Region whose
-    // identity list the check failed in.
+    // identity list the check failed in. This account has production access
+    // (`Ses::new`), so the sending identity is the only address that gate weighs; what a
+    // sandbox account's gate weighs instead is `send_sandbox_destination_gate.rs`.
     for region in ["us-east-1", "us-west-2", "eu-central-1"] {
         for options in [
             json!({"ContactListName": LIST}),
@@ -365,11 +372,11 @@ async fn a_well_formed_pair_goes_on_to_the_sender_check() {
                 reply.message(),
                 format!(
                     "Email address is not verified. The following identities failed the check in \
-                     region {}: stranger@nowhere.example, reader@example.net",
+                     region {}: stranger@nowhere.example",
                     region.to_uppercase()
                 ),
-                "case ({region}, {options}): expected the refusal to name the Region and every \
-                 identity that failed the check, got {:?}",
+                "case ({region}, {options}): expected the refusal to name the Region and the \
+                 sending identity that failed the check, got {:?}",
                 reply.message()
             );
         }

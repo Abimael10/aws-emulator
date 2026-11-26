@@ -244,6 +244,9 @@ async fn each_bulk_entrys_event_reports_the_templates_headers_with_its_own_appli
         }
         store.settle(std::time::SystemTime::now());
     }
+    // This row is about the HEADERS each entry's message carries, not about the sandbox's
+    // destination gate, so the account may address the mailboxes the entries name.
+    crate::ses_sandbox_production_access::given_production_access(&engine);
 
     // The template the send composes every message from, and the configuration set that
     // publishes the acceptance of each of them to the topic the queue is subscribed to.

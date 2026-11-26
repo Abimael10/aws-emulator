@@ -93,6 +93,9 @@ memchr = "2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`, which declares every
+# `tests/all/<name>.rs` as a suite of it.
+automod = { workspace = true }
 # The destination pre-flight suites mount Amazon S3, KMS, Lambda and Amazon SNS beside this
 # service on one engine, exactly as the assembled router mounts them, and make every bucket,
 # bucket policy, key, function, permission and topic through those services' OWN operations

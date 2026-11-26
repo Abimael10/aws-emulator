@@ -129,7 +129,10 @@ fn raw_message(sender: &str, recipient: &str) -> String {
 
 /// The same message sent from `sender`, in each form a send of this service takes.
 fn sends_from(sender: &str) -> Vec<(&'static str, &'static str, Vec<Field>)> {
-    const RECIPIENT: &str = "recipient@example.org";
+    // A mailbox of the SES mailbox simulator, which belongs to no account and needs no
+    // identity: this account is in the sandbox, where only verified identities and the
+    // simulator may be sent TO, so each row stays about the sender's own identity.
+    const RECIPIENT: &str = "success@simulator.amazonses.com";
     let raw = ::aws_smithy_types::base64::encode(raw_message(sender, RECIPIENT));
     vec![
         (

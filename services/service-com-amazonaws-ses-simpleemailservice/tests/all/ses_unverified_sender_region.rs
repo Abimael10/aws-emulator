@@ -109,10 +109,18 @@ async fn call_in_region(
 }
 
 /// A `SendEmail` request from `source` to one recipient.
+///
+/// The recipient is a mailbox of the SES mailbox simulator, which belongs to no account
+/// and needs no identity: this account is in the sandbox, where only verified identities
+/// and the simulator may be sent TO, so the identity each refusal below names is the
+/// `Source` and nothing else.
 fn send_from(source: &str) -> Vec<Field> {
     vec![
         field("Source", source),
-        field("Destination.ToAddresses.member.1", "recipient@example.net"),
+        field(
+            "Destination.ToAddresses.member.1",
+            "success@simulator.amazonses.com",
+        ),
         field("Message.Subject.Data", "Quarterly report"),
         field("Message.Body.Text.Data", "See attached."),
     ]

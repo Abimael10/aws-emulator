@@ -76,7 +76,10 @@ struct Send {
 /// `configuration_set`, when named, is carried by every form, since every send
 /// takes the same `ConfigurationSetName`.
 fn sends_from(source: &str, configuration_set: Option<&str>) -> Vec<Send> {
-    const RECIPIENT: &str = "recipient@example.net";
+    // A mailbox of the SES mailbox simulator, which belongs to no account and needs no
+    // identity: this account is in the sandbox, where only verified identities and the
+    // simulator may be sent TO, so the identity every row below is about is its sender.
+    const RECIPIENT: &str = "success@simulator.amazonses.com";
     let raw = ::aws_smithy_types::base64::encode(raw_message(source, RECIPIENT));
     let mut rows = vec![
         Send {

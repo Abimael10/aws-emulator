@@ -32,7 +32,9 @@
 //! passes, and a row that expects NO object asserts the listing only once the object proving
 //! that message's steps are finished has appeared.
 
-use crate::harness::{call, element, field, settle_verifications, Field, REGION};
+use crate::harness::{
+    call, element, field, grant_production_access, settle_verifications, Field, REGION,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -158,6 +160,11 @@ async fn given_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
 /// `VerifyDomainIdentity` for the domain this account receives mail for, and then the store
 /// settled past the span that request leaves the record pending for — what these rows are
 /// about is the receive path rather than the verification span.
+///
+/// The account is given production access at the same time: a row hands Amazon SES a
+/// message addressed to a mailbox the account holds no identity for, which a SANDBOX
+/// account may not send to at all, and what the row is about is what the receive path then
+/// does with that message.
 async fn given_verified_domain(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
@@ -169,6 +176,7 @@ async fn given_verified_domain(
         "case {case:?}: verifying {DOMAIN}: expected 200, got {status} with {body}"
     );
     settle_verifications(engine);
+    grant_production_access(engine);
 }
 
 /// One action of a receipt rule, as the rows name it.

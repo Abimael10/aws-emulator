@@ -136,6 +136,12 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about the messages a bulk send composes from one template, not
+        // about the sandbox's destination gate: the account is given production access, so
+        // every entry is weighed on the call's sending identity alone and may address a
+        // mailbox no account verified (`send_sandbox_destination_gate.rs`, which pins what
+        // an entry a sandbox account may not send to is reported as).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         // Every case below reads an accepted message back through Message Insights, which
         // is served under the account's Virtual Deliverability Manager configuration. The
         // switch is the one `PutAccountVdmAttributes` writes and `GetAccount` reports; it
@@ -550,9 +556,13 @@ async fn a_failure_of_the_request_refuses_the_whole_send() {
             Gate::UnverifiedSender,
             400,
             "MessageRejected",
+            // This account has production access (`Ses::new`), so the one address the
+            // check weighs for the CALL is the identity every message of it is sent from;
+            // what a sandbox account weighs per entry is
+            // `send_sandbox_destination_gate.rs`.
             format!(
                 "Email address is not verified. The following identities failed the check in \
-                 region {}: stranger@nowhere.example, reader@example.net",
+                 region {}: stranger@nowhere.example",
                 HOME.to_uppercase()
             ),
         ),

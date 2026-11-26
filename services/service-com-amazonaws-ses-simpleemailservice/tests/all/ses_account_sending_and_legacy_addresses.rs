@@ -24,7 +24,7 @@
 
 use crate::harness::{
     call, element, elements, emulator, emulator_and_engine, emulator_over, field,
-    settle_verifications, Field,
+    grant_production_access, settle_verifications, Field,
 };
 use service_com_amazonaws_ses_simpleemailservice::state::{
     self, SentMessage, SEND_STATISTICS_PERIOD, SEND_STATISTICS_WINDOW,
@@ -195,6 +195,9 @@ async fn the_account_sending_flag_is_whatever_the_last_write_left() {
 #[tokio::test]
 async fn a_disabled_account_refuses_a_send_and_serving_it_again_restores_sending() {
     let (router, engine) = emulator_and_engine();
+    // About the account-wide sending switch, not about the sandbox's destination gate:
+    // with production access the account may address a message to any mailbox.
+    grant_production_access(&engine);
     ok(
         &router,
         "VerifyEmailIdentity",
@@ -349,6 +352,9 @@ async fn the_deprecated_address_apis_share_the_one_identity_list() {
 async fn send_statistics_bucket_the_send_log_into_fifteen_minute_periods() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_over(Arc::clone(&engine));
+    // About the periods the statistics bucket the log into: the account is given
+    // production access so the one send below is not weighed on its recipients.
+    grant_production_access(&engine);
 
     assert!(
         send_statistics(&router).await.is_empty(),

@@ -157,7 +157,11 @@ impl Ses {
             "/v2/email/outbound-emails",
             Some(json!({
                 "FromEmailAddress": from,
-                "Destination": { "ToAddresses": ["recipient@example.net"] },
+                // The mailbox simulator's success address: a recipient that belongs to no
+                // account, so the only identity these rows are weighed on is the sender.
+                // What a SANDBOX account's gate weighs about its recipients is
+                // `send_sandbox_destination_gate.rs`.
+                "Destination": { "ToAddresses": ["success@simulator.amazonses.com"] },
                 "Content": {"Simple": {"Subject": {"Data": "hi"}, "Body": {"Text": {"Data": "hello"}}}}
             })),
         )
@@ -367,9 +371,9 @@ async fn the_refusal_names_the_region_of_the_call_and_the_identity_that_failed()
             refused.status,
             refused.body
         );
-        // The recipient every row addresses is an address this account holds no identity
-        // for either, so the check fails for it as well and the refusal names both.
-        let expected = refusal(row.served_in, &[row.sender, "recipient@example.net"]);
+        // Every row addresses the mailbox simulator, which belongs to no account and fails
+        // no check, so the identity the refusal names is the row's sender and nothing else.
+        let expected = refusal(row.served_in, &[row.sender]);
         assert_eq!(
             refused.message(),
             expected,

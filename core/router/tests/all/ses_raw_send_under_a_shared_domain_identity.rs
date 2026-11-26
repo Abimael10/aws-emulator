@@ -475,7 +475,10 @@ fn raw_message(sender: &str, recipient: &str, subject: &str) -> Vec<u8> {
 /// for this parameter, you must specify a 'From' address in the raw text of the message"
 /// (`SendRawEmailRequest$Source`).
 fn raw_sends(sender: &str, subject: &str) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
-    const RECIPIENT: &str = "recipient@example.org";
+    // A mailbox of the SES mailbox simulator, which belongs to no account and needs no
+    // identity: these rows are about the SENDER's identity, so the recipient is one every
+    // account may send to, sandbox or not.
+    const RECIPIENT: &str = "success@simulator.amazonses.com";
     let data = ::aws_smithy_types::base64::encode(raw_message(sender, RECIPIENT, subject));
     vec![
         (

@@ -97,6 +97,11 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about what Message Insights reports for an accepted message, not
+        // about the sandbox's destination gate: the account is given production access, so
+        // the sends below are weighed on their sending identity alone
+        // (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { engine, router }
     }
 

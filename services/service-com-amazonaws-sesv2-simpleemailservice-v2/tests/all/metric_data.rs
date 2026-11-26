@@ -173,6 +173,11 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about the metrics a send is counted by, not about the sandbox's
+        // destination gate: the account is given production access, so each send below is
+        // weighed on its sending identity alone and the recipients stay the ones the metric
+        // rows are about (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { engine, router }
     }
 

@@ -84,6 +84,12 @@ impl Emulator {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        // These rows are about what the account's RECEIVE path does with a message, and
+        // one of them sends to a mailbox the account holds no identity for, which a
+        // sandbox account may not send to at all: the account is given production access,
+        // so its sends are weighed on their sending identity alone
+        // (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { router, engine }
     }
 

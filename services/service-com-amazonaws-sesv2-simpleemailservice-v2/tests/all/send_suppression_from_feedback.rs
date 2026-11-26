@@ -99,6 +99,11 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about what a RECIPIENT does with a message and what the
+        // suppression list learns from it, not about the sandbox's destination gate: the
+        // account is given production access, so a send may address the mailboxes whose
+        // reactions the rows are about (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { engine, router }
     }
 

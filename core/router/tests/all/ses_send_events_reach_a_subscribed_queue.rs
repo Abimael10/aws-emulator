@@ -196,6 +196,9 @@ pub(crate) async fn given_verified_sender(
         Some(json!({"EmailIdentity": SENDER_DOMAIN})),
     )
     .await;
+    // The rows are about the EVENTS a send publishes, not about the sandbox's destination
+    // gate, so the account may address the mailboxes they name.
+    crate::ses_sandbox_production_access::given_production_access(engine);
     let state = engine.state::<service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State>();
     let mut store = state.lock();
     let past = std::time::SystemTime::now()

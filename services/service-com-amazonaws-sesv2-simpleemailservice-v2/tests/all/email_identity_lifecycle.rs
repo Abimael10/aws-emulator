@@ -87,6 +87,12 @@ impl Ses {
         // These tests exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about the identities an account holds and the sends they
+        // authorise, not about the sandbox's destination gate: the account is given
+        // production access, so a send is weighed on its SENDING identity alone and may be
+        // addressed to a mailbox no account verified
+        // (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { engine, router }
     }
 

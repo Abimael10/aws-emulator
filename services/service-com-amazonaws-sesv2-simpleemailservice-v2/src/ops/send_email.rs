@@ -5,7 +5,10 @@
 //! sending switch is on — and, where the message names a configuration set, while
 //! that set's own sending switch is on too — appends it to this service's
 //! outbound-message log with a fresh unique `MessageId`, and bumps the account's
-//! send counters. A message that carries list-management options is resolved
+//! send counters. While the account is in the SANDBOX it may only send to verified
+//! identities, so every address such a message would be mailed to has to be one of
+//! them, or a mailbox of the mailbox simulator.
+//! A message that carries list-management options is resolved
 //! against the contact lists first, and its recipients become contacts of the list
 //! it belongs to. Each recipient then does with the message what the account's
 //! suppression list and that recipient's own mailbox decide, which is what the
@@ -455,19 +458,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The address that you specify has to be verified." An address identity
         // authorises itself; a domain identity authorises every address in that
-        // domain and its subdomains. The check covers every identity this message
-        // involves — the sending identity, the recipients it addresses and the address
-        // bounce and complaint notifications are forwarded to — and the refusal names
-        // every one of them that failed it, in the order the request states them.
-        let failed = store.unverified_send_identities(
+        // domain and its subdomains. WHICH of this message's identities the check
+        // weighs is the account's production access: the sending identity always, and
+        // — while the account is in the sandbox, where it "can only send email to
+        // verified identities" — the addresses the message would be mailed to as well,
+        // the recipients it addresses and the address bounce and complaint
+        // notifications are forwarded to. The refusal names every identity the check
+        // rejected, in the order the request states them.
+        if let Some(failed) = store.identities_refusing_send(
             &region,
             &from,
             &addressed,
             input.feedback_forwarding_email_address.as_deref(),
-        );
-        // What the failed check REFUSES is the sending identity: a send whose own sender
-        // this account has not verified has no identity to send as.
-        if failed.iter().any(|identity| identity == crate::state::addr_spec(&from)) {
+        ) {
             let named: Vec<&str> = failed.iter().map(String::as_str).collect();
             return Err(SendEmailErrorModeled::MessageRejected(MessageRejected {
                 message: Some(crate::state::unverified_identities_message(&region, &named)),

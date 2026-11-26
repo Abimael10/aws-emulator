@@ -351,6 +351,34 @@ async fn given_verified_identity(router: &MultiServiceRouter, case: &str, identi
     panic!("case {case:?}: {identity:?} never reached {VERIFIED}, last read {last}");
 }
 
+/// The same for a DOMAIN, which authorises every mailbox in it: what a SANDBOX account
+/// needs before it may send TO one of those mailboxes, since such an account "can only send
+/// email to verified identities".
+async fn given_verified_domain(router: &MultiServiceRouter, case: &str, domain: &str) {
+    ses(
+        router,
+        case,
+        "VerifyDomainIdentity",
+        &[("Domain", domain.to_string())],
+    )
+    .await;
+    let mut last = String::new();
+    for _ in 0..LOOKS {
+        last = ses(
+            router,
+            case,
+            "GetIdentityVerificationAttributes",
+            &[("Identities.member.1", domain.to_string())],
+        )
+        .await;
+        if opt_element(&last, "VerificationStatus").as_deref() == Some(VERIFIED) {
+            return;
+        }
+        tokio::time::sleep(LOOK).await;
+    }
+    panic!("case {case:?}: {domain:?} never reached {VERIFIED}, last read {last}");
+}
+
 /// How many messages the account has sent in the last day, as its own figures report it
 /// (`GetSendQuota$SentLast24Hours`).
 async fn sent_last_24_hours(router: &MultiServiceRouter, case: &str) -> f64 {
@@ -374,6 +402,10 @@ async fn a_handlers_own_send_through_the_classic_ses_api_is_served_end_to_end() 
         String::from_utf8_lossy(&created)
     );
     given_verified_identity(&router, setup, SENDER).await;
+    // The account is in the sandbox, where it may only send to identities it has verified,
+    // so the domain every row addresses is verified as well: what these rows are about is
+    // the handler's own send and what it reports of it.
+    given_verified_domain(&router, setup, "example.org").await;
 
     let before = sent_last_24_hours(&router, setup).await;
     let function = given_stack_function(&router, setup, STACK, &template()).await;

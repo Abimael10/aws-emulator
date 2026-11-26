@@ -356,15 +356,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The message must be sent from a verified email address or domain" —
-        // the same gate, read the same way, as every other send of this service.
-        // It is reached BEFORE the template the request names is resolved: the
-        // sending identity is what SES authorises the call on, and the template is
-        // part of the message that call would compose, so an account that may not
-        // send at all is told so whichever template it named.
-        if !state.is_verified_sender(&source) {
+        // the same gate, read the same way, as every other send of this service,
+        // the recipients of a SANDBOX account's message included. It is reached
+        // BEFORE the template the request names is resolved: the sending identity
+        // is what SES authorises the call on, and the template is part of the
+        // message that call would compose, so an account that may not send at all
+        // is told so whichever template it named.
+        if let Some(failed) = state.identities_refusing_send(
+            &source,
+            &destinations,
+            input.return_path.as_deref(),
+        ) {
+            let named: Vec<&str> = failed.iter().map(String::as_str).collect();
             return Err(rejected(crate::state::unverified_identities_message(
-                &region,
-                &[source.as_str()],
+                &region, &named,
             )));
         }
 

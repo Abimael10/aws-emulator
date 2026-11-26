@@ -652,6 +652,10 @@ async fn an_unconfigured_account_reports_the_attributes_a_new_account_has() {
 #[tokio::test]
 async fn the_reported_send_quota_counts_the_recipients_charged_in_the_trailing_window() {
     let ses = Ses::new();
+    // About the QUOTA each recipient is charged against, not about the sandbox's
+    // destination gate: the account is given production access, so these sends may address
+    // mailboxes no account verified (`send_sandbox_destination_gate.rs`).
+    crate::send_sandbox_destination_gate::given_production_access(&ses.engine);
     assert_eq!(
         ses.create_identity("quota.example.com").await.status,
         200,

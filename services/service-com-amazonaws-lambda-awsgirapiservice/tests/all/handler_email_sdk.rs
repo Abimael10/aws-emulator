@@ -291,10 +291,15 @@ fn rows() -> Vec<Row> {
 
 /// One message, as `SendEmail` takes one: a destination, and a simple content with a subject
 /// and a body, each its own nested structure.
+///
+/// The destination is a mailbox of the SES mailbox simulator, which belongs to no account
+/// and needs no identity: this account is in the sandbox, where only verified identities and
+/// the simulator may be sent TO, and what these rows are about is the SDK call the handler
+/// makes.
 fn message_from(sender: &str) -> Value {
     json!({
         "FromEmailAddress": sender,
-        "Destination": { "ToAddresses": ["recipient@example.org"] },
+        "Destination": { "ToAddresses": ["success@simulator.amazonses.com"] },
         "Content": {
             "Simple": {
                 "Subject": { "Data": "sent by a handler" },

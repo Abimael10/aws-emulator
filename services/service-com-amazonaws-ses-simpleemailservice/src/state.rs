@@ -105,7 +105,7 @@ pub mod lambda_action_event;
 pub mod mime_bounds;
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The trailing window the sending quota is measured over.
@@ -1594,6 +1594,93 @@ impl ComAmazonawsSesSimpleemailserviceState {
         false
     }
 
+    /// The identities a send's verification check REFUSES the send for, or `None`
+    /// when the check lets it through.
+    ///
+    /// WHICH of a message's addresses the check weighs is what the account's
+    /// production access decides. The identity the message is SENT FROM is weighed
+    /// always — "the message must be sent from a verified email address or domain"
+    /// — and so is the address bounces and complaints are forwarded to, whose own
+    /// documentation states the same requirement (`SendEmailRequest$ReturnPath`:
+    /// "This email address must be either individually verified with Amazon SES, or
+    /// from a domain that has been verified with Amazon SES"). While the account is
+    /// in the SANDBOX ([`AccountSettings::production_access_granted`] false) the
+    /// recipients are weighed too: such an account may only send TO identities it
+    /// has verified. Once it has production access they are not, since it may then
+    /// address a message to anybody.
+    ///
+    /// Each address is weighed by the reading every sender gate of this service
+    /// uses ([`Self::is_verified_sender`]) — the addr-spec's own identity, or a
+    /// verified domain above it — against the identity list the caller has already
+    /// settled ([`Self::settle_identities`]). The mailbox SIMULATOR's mailboxes
+    /// belong to no account and need no identity ([`is_mailbox_simulator`]), so they
+    /// fail no check.
+    ///
+    /// What this returns is what the refusal REPORTS
+    /// ([`unverified_identities_message`]): every address the check weighed and
+    /// rejected, named as the request spelled its mailbox ([`addr_spec`]), in the
+    /// order the request states them, and one mailbox named twice named once.
+    pub fn identities_refusing_send(
+        &self,
+        sender: &str,
+        recipients: &[String],
+        return_path: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let weighed = ::std::iter::once(sender)
+            .chain(self.weighed_recipients(recipients).iter().map(String::as_str))
+            .chain(return_path);
+        self.unverified_among(weighed)
+    }
+
+    /// The same check for ONE destination of a bulk call, which carries its own
+    /// recipient set.
+    ///
+    /// A bulk call sends one message per destination — "all of the recipients in a
+    /// Destination receive the same version of the email" — so the recipients the
+    /// sandbox weighs are weighed per destination and reported as THAT destination's
+    /// status, the way every other condition of one destination is; what the call as
+    /// a whole is weighed on (its sending identity, its return path) is
+    /// [`Self::identities_refusing_send`] with no recipients at all.
+    pub fn identities_refusing_destination(&self, recipients: &[String]) -> Option<Vec<String>> {
+        self.unverified_among(
+            self.weighed_recipients(recipients)
+                .iter()
+                .map(String::as_str),
+        )
+    }
+
+    /// The recipients the verification check weighs: all of them while the account
+    /// is in the sandbox, none once it has production access.
+    fn weighed_recipients<'a>(&self, recipients: &'a [String]) -> &'a [String] {
+        if self.account.production_access_granted {
+            &[]
+        } else {
+            recipients
+        }
+    }
+
+    /// Those of `addresses` this account holds no verified identity for, in the
+    /// order they arrive and each named once, or `None` when every one of them
+    /// passes.
+    fn unverified_among<'a>(
+        &self,
+        addresses: impl Iterator<Item = &'a str>,
+    ) -> Option<Vec<String>> {
+        let mut failed: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for address in addresses {
+            let mailbox = addr_spec(address);
+            if is_mailbox_simulator(mailbox) || !seen.insert(mailbox) {
+                continue;
+            }
+            if self.is_verified_sender(mailbox) {
+                continue;
+            }
+            failed.push(mailbox.to_string());
+        }
+        (!failed.is_empty()).then_some(failed)
+    }
+
     /// Whether `domain` is itself a verified domain identity, or sits under one.
     ///
     /// A verified domain covers its subdomains, which is the same reading
@@ -2121,6 +2208,18 @@ pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
 /// which mailbox a value names.
 pub fn addr_spec(value: &str) -> &str {
     ::service_common::ses_identities::addr_spec(value)
+}
+
+/// Whether `address` names a mailbox of the Amazon SES mailbox simulator.
+///
+/// Its mailboxes belong to no account, so no account holds an identity for one and the
+/// verification check every send runs lets them through
+/// ([`ComAmazonawsSesSimpleemailserviceState::identities_refusing_send`]). The reading is
+/// `service_common::ses_identities`', the one statement of that domain for the SES
+/// family, so this surface and the v2 surface agree about which mailboxes are the
+/// simulator's.
+pub fn is_mailbox_simulator(address: &str) -> bool {
+    ::service_common::ses_identities::is_mailbox_simulator(address)
 }
 
 /// Every addr-spec on one address header's value, in the order it lists them.

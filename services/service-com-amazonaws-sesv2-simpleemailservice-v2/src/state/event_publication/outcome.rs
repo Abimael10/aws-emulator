@@ -47,7 +47,12 @@ use std::time::SystemTime;
 
 /// The domain the SES mailbox simulator answers for. A message to one of its mailboxes is
 /// answered by SES itself, which is what makes the answer deterministic.
-pub const MAILBOX_SIMULATOR_DOMAIN: &str = "simulator.amazonses.com";
+///
+/// The domain itself is stated ONCE for the whole SES family
+/// ([`::service_common::ses_identities::MAILBOX_SIMULATOR_DOMAIN`]), so the mailboxes this
+/// module answers for are exactly the ones every send path lets through its identity check.
+pub const MAILBOX_SIMULATOR_DOMAIN: &str =
+    ::service_common::ses_identities::MAILBOX_SIMULATOR_DOMAIN;
 
 /// `SuppressionListReason`'s value for an address on the list because "a message sent to
 /// that address results in a hard bounce" (see `crate::ops::types::SUPPRESSION_LIST_REASON_VALUES`).

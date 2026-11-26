@@ -19,8 +19,8 @@
 //!   log alone.
 
 use crate::harness::{
-    call, element, elements, emulator, emulator_and_engine, field, map_entries,
-    settle_verifications, Field,
+    call, element, elements, emulator, emulator_and_engine, field, grant_production_access,
+    map_entries, settle_verifications, Field,
 };
 use service_com_amazonaws_ses_simpleemailservice::ops::IDENTITY_TYPE_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
@@ -184,6 +184,9 @@ const EMAIL_IDENTITIES: &[&str] = &[
 #[tokio::test]
 async fn the_identity_and_send_loop_is_stateful_end_to_end() {
     let (router, engine) = emulator_and_engine();
+    // This loop is about the identities and the send log, not about the sandbox's
+    // destination gate, so the account may address a message to any mailbox.
+    grant_production_access(&engine);
 
     // Nothing is verified yet, so the list is empty and nothing has been sent:
     // the reads report state, never a canned answer.
@@ -463,6 +466,9 @@ async fn list_identities_filters_by_type_and_pages_over_every_page_size() {
 #[tokio::test]
 async fn a_domain_identity_carries_a_stable_token_and_covers_its_mailboxes() {
     let (router, engine) = emulator_and_engine();
+    // The rule here is which SENDERS a domain identity covers, so the account is given
+    // production access and the recipients of these sends are weighed by nothing.
+    grant_production_access(&engine);
     let (status, body) = verify_domain(&router, "example.org").await;
     assert_eq!(
         status, 200,
@@ -533,6 +539,9 @@ async fn a_domain_identity_carries_a_stable_token_and_covers_its_mailboxes() {
 #[tokio::test]
 async fn the_quota_counts_every_recipient_of_every_send() {
     let (router, engine) = emulator_and_engine();
+    // About the quota each recipient is charged against, not about the sandbox's
+    // destination gate: the account has production access, so it may address anybody.
+    grant_production_access(&engine);
     verify_email(&router, "sender@example.com").await;
     settle_verifications(&engine);
 
@@ -592,6 +601,9 @@ async fn the_quota_counts_every_recipient_of_every_send() {
 #[tokio::test]
 async fn a_send_is_refused_with_the_modeled_error_and_leaves_the_log_alone() {
     let (router, engine) = emulator_and_engine();
+    // Each row below is about ONE refusal of its own, so the account is given production
+    // access and no row is refused for the sandbox's destination gate as well.
+    grant_production_access(&engine);
     verify_email(&router, "sender@example.com").await;
     settle_verifications(&engine);
 
@@ -728,6 +740,8 @@ async fn a_listing_with_no_max_items_is_still_one_bounded_page() {
 #[tokio::test]
 async fn a_send_past_the_accounts_24_hour_quota_is_refused() {
     let (router, engine) = emulator_and_engine();
+    // About the 24-hour quota, not about the sandbox's destination gate.
+    grant_production_access(&engine);
     verify_email(&router, "sender@example.com").await;
     settle_verifications(&engine);
     let (quota, _, _) = send_quota(&router).await;

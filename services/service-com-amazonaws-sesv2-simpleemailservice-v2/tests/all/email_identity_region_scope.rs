@@ -96,6 +96,10 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases are about the REGION an identity belongs to, not about the sandbox's
+        // destination gate: the account is given production access, so a send is weighed on
+        // its sending identity alone (`send_sandbox_destination_gate.rs`).
+        crate::send_sandbox_destination_gate::given_production_access(&engine);
         Self { engine, router }
     }
 
@@ -422,11 +426,11 @@ async fn an_identity_is_reachable_only_from_the_region_it_was_created_in() {
         );
         assert_eq!(
             sent_away.message(),
-            // The recipient the send addresses is no identity of this account either, so
-            // the check fails for it as well and the refusal names both.
-            unverified_identities_message(row.elsewhere, &[row.sender, "rcpt@example.net"]),
-            "case {case:?}: the refusal names the Region the send executes in and every \
-             identity that failed the check"
+            // This account has production access (`Ses::new`), so the only address the
+            // check weighs is the sending identity — which is what this row is about.
+            unverified_identities_message(row.elsewhere, &[row.sender]),
+            "case {case:?}: the refusal names the Region the send executes in and the \
+             sending identity that failed the check"
         );
 
         // The delete is region-scoped too, and a refused one leaves the identity exactly

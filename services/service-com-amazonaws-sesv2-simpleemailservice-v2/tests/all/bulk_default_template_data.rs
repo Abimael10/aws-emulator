@@ -118,6 +118,10 @@ impl TemplateDataCalls for Ses {
 /// A service holding the stored template, and the sending domain when `verified`.
 async fn seeded(verified: bool) -> Ses {
     let ses = Ses::new();
+    // These cases are about the default template data a bulk send states, not about the
+    // sandbox's destination gate: the account is given production access, so an entry may
+    // address a mailbox no account verified (`send_sandbox_destination_gate.rs`).
+    ses.grant_production_access();
     let stored = ses
         .store_template(
             TEMPLATE,

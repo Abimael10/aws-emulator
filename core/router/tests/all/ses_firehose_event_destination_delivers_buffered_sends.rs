@@ -482,6 +482,9 @@ async fn given_verified_identity(router: &MultiServiceRouter, engine: &engine::I
     )
     .await;
     given_dkim_publication_stood_in_for(engine);
+    // The rows are about the events a send publishes, not about the sandbox's destination
+    // gate, so the account may address the mailboxes they name.
+    crate::ses_sandbox_production_access::given_production_access(engine);
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let read = sesv2_ok(

@@ -71,6 +71,24 @@ pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
     (emulator_over(Arc::clone(&engine)), engine)
 }
 
+/// Give the account PRODUCTION access on `engine`: the state that takes it out of the
+/// Amazon SES sandbox.
+///
+/// A SANDBOX account may only send to identities it has verified, or to the mailbox
+/// simulator — the rule `ses_sandbox_destination_gate.rs` is about. A suite about
+/// anything ELSE a send does gives the account production access first, so its sends are
+/// weighed on their sending identity alone and may be addressed to any mailbox at all.
+/// Written on the store rather than asked for over the wire because no operation of this
+/// model moves an account out of the sandbox
+/// ([`PRODUCTION_ACCESS_AT_ACCOUNT_START`]).
+///
+/// [`PRODUCTION_ACCESS_AT_ACCOUNT_START`]: service_com_amazonaws_ses_simpleemailservice::state::PRODUCTION_ACCESS_AT_ACCOUNT_START
+pub fn grant_production_access(engine: &Arc<engine::InMemoryEngine>) {
+    let state = service_com_amazonaws_ses_simpleemailservice::state::service_state(&**engine)
+        .expect("this service has a store on the engine it is mounted on");
+    state.lock().account.production_access_granted = true;
+}
+
 /// A router holding this service beside Amazon SNS — the service that OWNS every topic a
 /// destination of this service names — over ONE shared engine, plus that engine, for a suite
 /// that mounts a further peer service on it.

@@ -599,6 +599,32 @@ pub fn addr_spec(value: &str) -> &str {
     }
 }
 
+/// The domain of the Amazon SES MAILBOX SIMULATOR, whose mailboxes Amazon SES answers
+/// for itself.
+///
+/// They belong to no account, so no account holds an identity for one and none can:
+/// the simulator is what a client addresses to exercise a delivery outcome without
+/// mailing anybody. Stated here, beside the identity reading, because every surface
+/// that weighs an address against the account's identities has to let the simulator's
+/// own mailboxes through.
+pub const MAILBOX_SIMULATOR_DOMAIN: &str = "simulator.amazonses.com";
+
+/// Whether `address` names a mailbox of the mailbox simulator
+/// ([`MAILBOX_SIMULATOR_DOMAIN`]).
+///
+/// The value is read down to its addr-spec first ([`addr_spec`]) and the domain
+/// compared the way DNS compares a name, so the simulator is the same mailbox in any
+/// spelling. A value naming no mailbox in that domain — the bare domain included — is
+/// not one of its mailboxes.
+#[must_use]
+pub fn is_mailbox_simulator(address: &str) -> bool {
+    addr_spec(address)
+        .rsplit_once('@')
+        .is_some_and(|(local, domain)| {
+            !local.is_empty() && domain.eq_ignore_ascii_case(MAILBOX_SIMULATOR_DOMAIN)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

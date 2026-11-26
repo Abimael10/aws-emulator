@@ -402,7 +402,12 @@ async fn a_send_naming_no_tenant_of_the_account_is_refused_before_the_sender_is_
         );
         assert_eq!(
             bulk_through_live.message(),
-            unverified(&[UNVERIFIED_SENDER, RECIPIENT]),
+            // A bulk send states ONE sending identity for the whole call and composes one
+            // message per entry, so the call is weighed on that identity (and refused for
+            // it here) while what a sandbox account may be sent to is weighed per entry
+            // and reported as that entry's own result
+            // (`send_sandbox_destination_gate.rs`).
+            unverified(&[UNVERIFIED_SENDER]),
             "case {case:?} on SendBulkEmail through the tenant the account holds: expected \
              the unverified-sender sentence, got {:?}",
             bulk_through_live.message()
@@ -471,6 +476,10 @@ async fn a_tenant_name_outside_the_documented_form_is_the_callers_mistake() {
 #[tokio::test]
 async fn an_accepted_send_is_recorded_as_having_gone_through_the_tenant_it_named() {
     let ses = Ses::new();
+    // About the tenant a send is recorded as having gone through, not about the sandbox's
+    // destination gate: the account is given production access, so the send may address
+    // the mailbox this row names (`send_sandbox_destination_gate.rs`).
+    ses.grant_production_access();
     let vdm = ses.enable_vdm().await;
     assert_eq!(
         vdm.status,

@@ -27,7 +27,8 @@
 //! bound and one past it.
 
 use crate::harness::{
-    call, element, emulator_and_engine, field, settle_verifications, xml_text, Field,
+    call, element, emulator_and_engine, field, grant_production_access, settle_verifications,
+    xml_text, Field,
 };
 use service_com_amazonaws_ses_simpleemailservice::state::{
     MAX_MESSAGE_BYTES, MAX_MULTIPART_CONTAINERS, MAX_RECIPIENTS,
@@ -83,6 +84,11 @@ async fn send_raw(
 /// the store settled past the span that request leaves the record pending for,
 /// because what these rows are about is the send path rather than the span
 /// (`settle_verifications`).
+///
+/// The account is given production access at the same time: the rows below are about the
+/// MESSAGE a raw send carries and the recipients it addresses, and a SANDBOX account may
+/// only send to identities it has verified — the rule
+/// `ses_sandbox_destination_gate.rs` is about.
 async fn verify_email(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
@@ -99,6 +105,7 @@ async fn verify_email(
         "case verify {address:?}: expected 200, got {status} with {body}"
     );
     settle_verifications(engine);
+    grant_production_access(engine);
 }
 
 /// `GetSendQuota`'s `SentLast24Hours`, which is DERIVED from the send log: it is
@@ -1009,6 +1016,10 @@ async fn a_verified_domain_covers_the_mailboxes_that_send_from_it() {
     // which mailboxes a verified domain covers, so the store is settled past the
     // span rather than slept through.
     settle_verifications(&engine);
+    // And they are about the SENDER, so the account is given production access and the
+    // recipient each row addresses is weighed by nothing
+    // (`ses_sandbox_destination_gate.rs`).
+    grant_production_access(&engine);
 
     let cases: &[(&str, u16)] = &[
         ("anyone@example.org", 200),

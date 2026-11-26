@@ -208,6 +208,16 @@ const SUCCESS: &str = "Success";
 /// service cannot send to is reported.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
+/// `BulkEmailStatus$MessageRejected` — how a destination this account's identity list
+/// does not admit is reported.
+///
+/// `MessageRejected` is the modelled error every single send of this service refuses an
+/// unverified identity with, and the bulk status set carries a value of that same name
+/// for a message of the call; a destination a SANDBOX account may not send to is
+/// therefore reported under it, carrying the refusal's own sentence as that
+/// destination's `Error`.
+const MESSAGE_REJECTED: &str = "MessageRejected";
+
 /// `BulkEmailStatus$AccountDailyQuotaExceeded`: "You have reached or exceeded
 /// the maximum number of emails you can send from your account in a 24-hour
 /// period."
@@ -390,11 +400,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The message must be sent from a verified email address or domain" —
         // the same gate, read the same way, as every other send of this service,
         // and ahead of the template the request names: the sending identity is
-        // what SES authorises the call on.
-        if !state.is_verified_sender(&source) {
+        // what SES authorises the call on. The RECIPIENTS a sandbox account may be
+        // sent to are weighed per destination below, since a bulk call sends one
+        // message per destination and a condition of ONE destination is reported as
+        // that destination's status.
+        if let Some(failed) =
+            state.identities_refusing_send(&source, &[], input.return_path.as_deref())
+        {
+            let named: Vec<&str> = failed.iter().map(String::as_str).collect();
             return Err(rejected(crate::state::unverified_identities_message(
-                &region,
-                &[source.as_str()],
+                &region, &named,
             )));
         }
 
@@ -475,6 +490,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 statuses.push(destination_status(
                     INVALID_PARAMETER_VALUE,
                     Some(crate::state::illegal_address_message(invalid)),
+                    None,
+                ));
+                continue;
+            }
+
+            // While the account is in the SANDBOX it "can only send email to
+            // verified identities", so the recipients of THIS destination's
+            // message are weighed against the account's identity list, and a
+            // destination it may not send to is reported as that destination's
+            // own `MessageRejected` rather than failing the destinations beside
+            // it. The refusal names every address of it that failed the check.
+            if let Some(failed) = state.identities_refusing_destination(&recipients) {
+                let named: Vec<&str> = failed.iter().map(String::as_str).collect();
+                statuses.push(destination_status(
+                    MESSAGE_REJECTED,
+                    Some(crate::state::unverified_identities_message(&region, &named)),
                     None,
                 ));
                 continue;

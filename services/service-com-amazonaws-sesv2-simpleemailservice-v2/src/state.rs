@@ -1889,12 +1889,36 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         recipients: &[String],
         feedback_forwarding: Option<&str>,
     ) -> Vec<String> {
-        let mut failed: Vec<String> = Vec::new();
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
         let asked = ::std::iter::once(sender)
             .chain(recipients.iter().map(String::as_str))
             .chain(feedback_forwarding);
-        for address in asked {
+        self.unverified_among(region, asked)
+    }
+
+    /// The same check over RECIPIENTS alone, for the caller that weighs a message's
+    /// destinations on their own ([`identities_refusing_entry`](Self::identities_refusing_entry)).
+    pub fn unverified_recipient_identities(
+        &self,
+        region: &str,
+        recipients: &[String],
+    ) -> Vec<String> {
+        self.unverified_among(region, recipients.iter().map(String::as_str))
+    }
+
+    /// Those of `addresses` this account holds no identity verified for sending in
+    /// `region` for, in the order they arrive and each mailbox named once.
+    ///
+    /// The one pass behind both readings above: one store lookup per address and nothing
+    /// more, with the mailbox simulator's own mailboxes passing it
+    /// ([`is_mailbox_simulator`]).
+    fn unverified_among<'a>(
+        &self,
+        region: &str,
+        addresses: impl Iterator<Item = &'a str>,
+    ) -> Vec<String> {
+        let mut failed: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for address in addresses {
             let mailbox = addr_spec(address);
             if is_mailbox_simulator(mailbox) || !seen.insert(mailbox) {
                 continue;
@@ -1908,6 +1932,63 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             failed.push(mailbox.to_string());
         }
         failed
+    }
+
+    /// The identities a send's verification check REFUSES the send for, or `None` when
+    /// the check lets it through.
+    ///
+    /// WHICH of a message's identities the check weighs is what the account's production
+    /// access decides. The identity the message is SENT FROM is weighed always —
+    /// `SendEmailRequest$FromEmailAddress` is "the email address to use as the 'From'
+    /// address for the email. The address that you specify has to be verified." While the
+    /// account is in the sandbox — `GetAccount$ProductionAccessEnabled` false, "When your
+    /// account is in the sandbox, you can only send email to verified identities" — the
+    /// addresses the message would be MAILED to are weighed too: every recipient it
+    /// addresses and the address its bounce and complaint notifications are forwarded to.
+    /// Once the account has production access they are not, since such an account may
+    /// address a message to anybody.
+    ///
+    /// The mailbox simulator's mailboxes are nobody's identity and fail no check
+    /// ([`unverified_send_identities`](Self::unverified_send_identities)), so a send
+    /// addressed to one is served in the sandbox as well.
+    ///
+    /// What this returns is what the refusal REPORTS
+    /// ([`unverified_identities_message`]): every identity the check weighed and rejected,
+    /// in the order the request states them.
+    pub fn identities_refusing_send(
+        &self,
+        region: &str,
+        sender: &str,
+        recipients: &[String],
+        feedback_forwarding: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let failed = if self.account.production_access_enabled {
+            self.unverified_send_identities(region, sender, &[], None)
+        } else {
+            self.unverified_send_identities(region, sender, recipients, feedback_forwarding)
+        };
+        (!failed.is_empty()).then_some(failed)
+    }
+
+    /// The same check for ONE entry of a bulk send, which carries its own recipients.
+    ///
+    /// A bulk send composes one message per entry, so the recipients a sandbox account
+    /// may be sent to are weighed per ENTRY and reported as that entry's own result, the
+    /// way every other condition of one entry is; what the CALL is weighed on — the one
+    /// identity every message of it is sent from, and the address its feedback is
+    /// forwarded to — is [`identities_refusing_send`](Self::identities_refusing_send)
+    /// with no recipients at all. An account with production access weighs no recipient,
+    /// so nothing here refuses one.
+    pub fn identities_refusing_entry(
+        &self,
+        region: &str,
+        recipients: &[String],
+    ) -> Option<Vec<String>> {
+        if self.account.production_access_enabled {
+            return None;
+        }
+        let failed = self.unverified_recipient_identities(region, recipients);
+        (!failed.is_empty()).then_some(failed)
     }
 
     /// The most specific domain identity that covers the address `key` names, if any,

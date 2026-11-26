@@ -80,8 +80,11 @@ const SENDER: &str = "reports@example.com";
 /// An identity no row ever verifies, which is what the refused send is made from.
 const STRANGER: &str = "stranger@example.net";
 
-/// The one recipient every send below addresses.
-const RECIPIENT: &str = "owner@example.org";
+/// The one recipient every send below addresses: a mailbox of the SES mailbox simulator,
+/// which belongs to no account and needs no identity — this account is in the sandbox,
+/// where only verified identities and the simulator may be sent TO, and what these rows are
+/// about is the SDK call the handler makes.
+const RECIPIENT: &str = "success@simulator.amazonses.com";
 
 /// The template the rows create, read back and render a send from.
 const TEMPLATE: &str = "scheduled-report";

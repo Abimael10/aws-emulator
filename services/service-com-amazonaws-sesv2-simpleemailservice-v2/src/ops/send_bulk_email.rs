@@ -361,30 +361,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing is read for one.
         validate_entry_members(&input)?;
 
-        // The recipients the messages of this call address, read BEFORE the store is locked
-        // and BOUNDED by what the request may send: only an entry that has a message to
-        // compose contributes its recipients — an entry whose destination was already
-        // reported INVALID_PARAMETER addresses nobody this call sends to — so the set holds
+        // The recipients each entry of this call addresses, read BEFORE the store is
+        // locked and BOUNDED by what the request may send: only an entry that has a
+        // message to compose addresses anybody — an entry whose destination was already
+        // reported INVALID_PARAMETER addresses nobody this call sends to — so the sets hold
         // at most `MAX_DESTINATIONS_PER_REQUEST` entries times
-        // `MAX_RECIPIENTS_PER_MESSAGE` recipients, and each mailbox once.
-        let recipients: Vec<String> = {
-            let mut addressed: ::std::collections::BTreeSet<String> =
-                ::std::collections::BTreeSet::new();
-            let mut ordered: Vec<String> = Vec::new();
-            for (entry, defect) in input.bulk_email_entries.iter().zip(&entry_defects) {
-                if defect.is_some() {
-                    continue;
-                }
-                for recipient in
-                    crate::state::send_validation::destination_recipients(&entry.destination)
-                {
-                    if addressed.insert(recipient.to_string()) {
-                        ordered.push(recipient.to_string());
-                    }
-                }
-            }
-            ordered
-        };
+        // `MAX_RECIPIENTS_PER_MESSAGE` recipients. They are kept PER ENTRY because a bulk
+        // send composes one message per entry, and what a sandbox account may be sent to is
+        // weighed on each message's own recipients.
+        let entry_recipients: Vec<Vec<String>> = input
+            .bulk_email_entries
+            .iter()
+            .zip(&entry_defects)
+            .map(|(entry, defect)| match defect {
+                Some(_) => Vec::new(),
+                None => crate::state::send_validation::destination_recipients(&entry.destination)
+                    .into_iter()
+                    .map(|recipient| recipient.to_string())
+                    .collect(),
+            })
+            .collect();
 
         let now = ::std::time::SystemTime::now();
 
@@ -400,7 +396,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to send, has no identity to send as, or names a resource it does not hold, is
         // refused whole rather than reported entry by entry. A call with no message at all was
         // already settled on its entries above, so nothing here is read for one.
-        let content = {
+        let (content, entry_refusals) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -466,23 +462,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // "The address that you specify has to be verified." An address identity
             // authorises itself; a domain identity authorises every address in that
-            // domain and its subdomains. The check covers every identity the messages
-            // of this call involve, exactly as a single send weighs them
-            // (`crate::ops::send_email`): the one sending identity, the recipients the
-            // entries address, and the address bounce and complaint notifications are
-            // forwarded to. The set it reads is the bounded one built above.
-            let failed = store.unverified_send_identities(
+            // domain and its subdomains. What the CALL is weighed on is what a single
+            // send weighs for one message (`crate::ops::send_email`) minus its
+            // recipients: the one sending identity every message of this call is sent
+            // from, always, and — while the account is in the sandbox — the address its
+            // bounce and complaint notifications are forwarded to. The RECIPIENTS a
+            // sandbox account may be sent to belong to one message each, so they are
+            // weighed per entry just below and reported as that entry's own result.
+            if let Some(failed) = store.identities_refusing_send(
                 &region,
                 &from,
-                &recipients,
+                &[],
                 input.feedback_forwarding_email_address.as_deref(),
-            );
-            // What the failed check REFUSES is the sending identity every message of
-            // this call is sent from.
-            if failed
-                .iter()
-                .any(|identity| identity == crate::state::addr_spec(&from))
-            {
+            ) {
                 let named: Vec<&str> = failed.iter().map(String::as_str).collect();
                 return Err(SendBulkEmailErrorModeled::MessageRejected(MessageRejected {
                     message: Some(crate::state::unverified_identities_message(
@@ -491,26 +483,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+            // Which entries address a mailbox this account may not send to: while it is
+            // in the sandbox it "can only send email to verified identities", and the
+            // entry that addresses another one is the entry that is refused.
+            let entry_refusals: Vec<Option<String>> = entry_recipients
+                .iter()
+                .map(|recipients| {
+                    store
+                        .identities_refusing_entry(&region, recipients)
+                        .map(|failed| {
+                            let named: Vec<&str> = failed.iter().map(String::as_str).collect();
+                            crate::state::unverified_identities_message(&region, &named)
+                        })
+                })
+                .collect();
 
             // The template every message of this call is rendered from, read back out of
             // the account's template store: a resource of the account, resolved for the
             // messages this call has to render — and this call has at least one, or it
             // would have been settled on its entries above.
-            template_content(&store, template)?
+            (template_content(&store, template)?, entry_refusals)
         };
 
         // One message composed per entry, with no lock held: each entry's own values are
         // substituted into the one template, and an entry that composes no message carries
-        // what stopped it — its own defect, reported as that destination's result.
+        // what stopped it — its own defect or the mailbox it may not be sent to, reported as
+        // that destination's result.
         let default_tags = input.default_email_tags.clone().unwrap_or_default();
         let mut composed = Vec::new();
-        for (entry, defect) in input.bulk_email_entries.iter().zip(&entry_defects) {
-            composed.push(match defect.as_deref() {
-                Some(error) => Composed::Refused {
+        for ((entry, defect), refused) in input
+            .bulk_email_entries
+            .iter()
+            .zip(&entry_defects)
+            .zip(&entry_refusals)
+        {
+            composed.push(match (defect.as_deref(), refused.as_deref()) {
+                (Some(error), _) => Composed::Refused {
                     status: STATUS_INVALID_PARAMETER,
                     error: error.to_string(),
                 },
-                None => compose(entry, &content, &default_variables, template, &default_tags)?,
+                (None, Some(error)) => Composed::Refused {
+                    status: STATUS_MESSAGE_REJECTED,
+                    error: error.to_string(),
+                },
+                (None, None) => {
+                    compose(entry, &content, &default_variables, template, &default_tags)?
+                }
             });
         }
 
@@ -722,6 +740,15 @@ const STATUS_ACCOUNT_DAILY_QUOTA_EXCEEDED: &str = "ACCOUNT_DAILY_QUOTA_EXCEEDED"
 
 /// `BulkEmailStatus`'s value for an entry nothing was composed for: "FAILED".
 const STATUS_FAILED: &str = "FAILED";
+
+/// `BulkEmailStatus`'s value for an entry this account may not send the message to:
+/// "MESSAGE_REJECTED".
+///
+/// `MessageRejected` is the modelled error a SINGLE send refuses an identity that failed
+/// the verification check with, and the bulk status set carries a value of that same name
+/// for one message of a call; an entry a sandbox account may not send to is therefore
+/// reported under it, carrying that refusal's own sentence as the entry's `Error`.
+const STATUS_MESSAGE_REJECTED: &str = "MESSAGE_REJECTED";
 
 /// How this operation refuses a request whose default content carries no template content —
 /// one carrying no `Template` member at all, and one whose template states neither the name
