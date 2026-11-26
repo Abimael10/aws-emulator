@@ -566,10 +566,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 // Only a FIFO topic is sequenced: "This parameter applies only to FIFO
                 // (first-in-first-out) topics" (`PublishBatchResultEntry$SequenceNumber`
-                // doc), and the number advances the MESSAGE GROUP this entry named.
-                let sequence_number = topic
-                    .is_fifo
-                    .then(|| store.next_sequence_number(&topic.arn, entry.message_group_id.as_deref()));
+                // doc), and the number is the next of this service's run, which the
+                // numbers of the MESSAGE GROUP this entry named increase along.
+                let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
                 let message_id = store.next_unique_id();
                 if let Some(key) = deduplication_key {
                     store.remember_deduplication(key, &message_id, sequence_number.as_deref());

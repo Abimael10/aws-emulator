@@ -4146,8 +4146,8 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// cancellations and written through [`deactivated_subscription::Deactivated::keep`],
     /// never by hand.
     pub deactivated_subscriptions: deactivated_subscription::Deactivated,
-    /// Backs the `SequenceNumber` a FIFO topic's `Publish` returns: one run of numbers per
-    /// message group ([`fifo_sequence`]).
+    /// Backs the `SequenceNumber` a FIFO topic's `Publish` returns: this service's run of
+    /// numbers, which every message group's numbers increase along ([`fifo_sequence`]).
     pub fifo_sequences: fifo_sequence::Sequences,
     /// Backs [`Self::next_unique_id`]: the monotone part of every minted id.
     id_counter: u64,
@@ -4329,18 +4329,14 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         (confirmed, pending)
     }
 
-    /// The next `SequenceNumber` for the message group `message_group_id` of the FIFO
-    /// topic `topic_arn`: a large, non-consecutive decimal that increases within that
+    /// The next `SequenceNumber` for a message published to a FIFO topic: the next number
+    /// of this service's run, a large, non-consecutive decimal that increases within every
     /// message group ([`fifo_sequence`] states the whole form and where it comes from).
     ///
     /// The one place a publishing operation asks for one, so `Publish` and `PublishBatch`
     /// sequence a topic the same way.
-    pub fn next_sequence_number(
-        &mut self,
-        topic_arn: &str,
-        message_group_id: Option<&str>,
-    ) -> String {
-        self.fifo_sequences.next(topic_arn, message_group_id)
+    pub fn next_sequence_number(&mut self) -> String {
+        self.fifo_sequences.next_number()
     }
 
     /// A fresh id in the 8-4-4-4-12 hexadecimal form SNS message ids and the last
@@ -4703,8 +4699,10 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
 /// process's randomly seeded hasher, hashed together — unique because the counter is
 /// monotone, unpredictable because the hasher's seed is random.
 ///
-/// ONE definition of that material, shared by [`uuid_v4_shaped`] and by the step a FIFO
-/// sequence number advances by ([`fifo_sequence`]), so the two cannot drift apart.
+/// ONE definition of that material, shared by every id this service shapes from it
+/// ([`uuid_v4_shaped`]), so two mints cannot drift apart. A FIFO sequence number is NOT
+/// one of them: it is the next number of this service's own run ([`fifo_sequence`]), so
+/// neither the clock nor the hasher may enter it.
 pub(crate) fn minted_digest(counter: u64) -> [u8; 32] {
     use std::hash::{BuildHasher, Hasher};
 

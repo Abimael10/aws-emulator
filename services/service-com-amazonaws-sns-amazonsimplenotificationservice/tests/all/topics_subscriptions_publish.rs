@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::fifo_sequence::{
-    MAX_SEQUENCE_NUMBER_STEP, MIN_SEQUENCE_NUMBER_STEP, SEQUENCE_NUMBER_FLOOR,
+    SEQUENCE_NUMBER_FLOOR, SEQUENCE_NUMBER_STEP,
 };
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
     INVALID_NEXT_TOKEN_REFUSAL, MAX_ATTRIBUTE_BYTES_PER_RECORD, MAX_DATA_PROTECTION_POLICY_LEN,
@@ -2264,7 +2264,7 @@ async fn the_maximum_message_size_attribute_can_only_lower_the_ceiling() {
 /// number is written at, so it is nowhere near the first value a counter hands out.
 ///
 /// Answers the value it read, for the per-group assertions the callers make.
-fn sequence_number_value(case: &str, text: &str) -> u128 {
+pub(crate) fn sequence_number_value(case: &str, text: &str) -> u128 {
     let value: u128 = text.parse().unwrap_or_else(|_| {
         panic!("case {case:?}: expected a decimal SequenceNumber, got {text:?}")
     });
@@ -2281,29 +2281,26 @@ fn sequence_number_value(case: &str, text: &str) -> u128 {
     value
 }
 
-/// Judge one advance of ONE message group: the next number of a group is greater than
-/// its last by a single unpredictable step, however many publishes other groups took in
-/// between.
-fn assert_one_step(case: &str, group: &str, previous: u128, value: u128) {
+/// Judge one advance of ONE message group: its next number is greater than its last, by a
+/// whole number of the units the service's run moves in — the units in between are the
+/// messages sequenced for other message groups.
+pub(crate) fn assert_one_step(case: &str, group: &str, previous: u128, value: u128) {
     let advance = value.checked_sub(previous).unwrap_or_else(|| {
-        panic!(
-            "case {case:?}: group {group:?} must advance, got {value} after {previous}"
-        )
+        panic!("case {case:?}: group {group:?} must advance, got {value} after {previous}")
     });
     assert!(
-        (MIN_SEQUENCE_NUMBER_STEP..=MAX_SEQUENCE_NUMBER_STEP).contains(&advance),
-        "case {case:?}: group {group:?} must advance by one step inside \
-         {MIN_SEQUENCE_NUMBER_STEP}..={MAX_SEQUENCE_NUMBER_STEP}, got {advance} \
-         ({value} after {previous})"
+        advance >= SEQUENCE_NUMBER_STEP && advance.is_multiple_of(SEQUENCE_NUMBER_STEP),
+        "case {case:?}: group {group:?} must advance by whole units of \
+         {SEQUENCE_NUMBER_STEP}, got {advance} ({value} after {previous})"
     );
 }
 
 /// RULE: a FIFO topic's publish is answered a `SequenceNumber` that is "a large,
 /// non-consecutive number", 128 bits long, which "continues to increase for each
 /// MessageGroupId" (`PublishResponse$SequenceNumber` doc) — so the value is a plain
-/// decimal at that scale, it is not the number a caller could work out from the previous
-/// one, and each message group of the topic advances on its own run of numbers rather
-/// than on one the whole topic shares.
+/// decimal at that scale, it is not the next number after the previous one but whole
+/// service units beyond it, and the numbers of each message group of the topic increase
+/// publish by publish.
 ///
 /// The rows differ along what the rule generalises over: how many message groups the
 /// publishes name, how the groups interleave, how many publishes each takes, and the
@@ -2541,4 +2538,203 @@ async fn a_batched_fifo_publish_advances_the_message_group_of_each_entry() {
         numbers[2],
         sequence_number_value("after the batch", &text),
     );
+}
+
+/// One FIFO publish that is not a duplicate of any earlier one, answered 200, read as the
+/// number it carries.
+async fn publish_sequenced(sns: &Sns, case: &str, topic: &str, group: &str, token: &str) -> u128 {
+    let answer = sns
+        .call(
+            "Publish",
+            &[
+                ("TopicArn", topic),
+                ("Message", "ordered"),
+                ("MessageGroupId", group),
+                ("MessageDeduplicationId", token),
+            ],
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: Publish expected 200, got {} / {}",
+        answer.status, answer.body
+    );
+    let text = answer
+        .element("SequenceNumber")
+        .unwrap_or_else(|| panic!("case {case:?}: no SequenceNumber in {}", answer.body));
+    sequence_number_value(case, &text)
+}
+
+/// The message groups a publish sequence names, in order: the rows differ along what the
+/// rule generalises over — how many groups the sequence names, how they interleave, how
+/// many publishes each group takes, and the form of the group id
+/// (`PublishInput$MessageGroupId`, whose documented bound is 128 characters).
+fn sequenced_group_runs(longest_group: &str) -> Vec<(&'static str, Vec<&str>)> {
+    vec![
+        ("one group once", vec!["g1"]),
+        ("one group three times", vec!["g1", "g1", "g1"]),
+        ("one group twelve times", vec!["g1"; 12]),
+        (
+            "two groups interleaved",
+            vec!["g1", "g2", "g1", "g2", "g1"],
+        ),
+        ("a group that only starts later", vec!["g1", "g1", "g2", "g2"]),
+        (
+            "four groups round robin",
+            vec!["a", "b", "c", "d", "a", "b", "c", "d"],
+        ),
+        (
+            "a group id of letters digits and punctuation",
+            vec!["orders-2024.v2", "orders-2024.v2"],
+        ),
+        (
+            "a group id at the documented 128 character bound",
+            vec![longest_group, longest_group],
+        ),
+    ]
+}
+
+/// RULE: a FIFO publish is answered the next number of the service's own run — the floor
+/// its numbers start above, advanced by one fixed unit for each message sequenced before
+/// it — so the number is decided by the messages published ahead of it and by nothing
+/// else, and the numbers of every message group increase along that run.
+#[tokio::test]
+async fn a_fifo_publish_takes_the_next_number_of_the_services_run() {
+    let longest_group = "g".repeat(128);
+    for (index, (case, groups)) in sequenced_group_runs(&longest_group)
+        .into_iter()
+        .enumerate()
+    {
+        let sns = Sns::new();
+        let topic = sns.topic(&format!("counted-{index:02}.fifo")).await;
+        let mut last: HashMap<&str, u128> = HashMap::new();
+        for (publish, group) in groups.iter().enumerate() {
+            let number =
+                publish_sequenced(&sns, case, &topic, group, &format!("token-{publish}")).await;
+            let sequenced = u128::try_from(publish).expect("the row has few publishes") + 1;
+            let expected = SEQUENCE_NUMBER_FLOOR + sequenced * SEQUENCE_NUMBER_STEP;
+            assert_eq!(
+                number, expected,
+                "case {case:?}: publish {publish} is the {sequenced}. message sequenced, \
+                 so it expects {expected}, got {number}"
+            );
+            // And what the model promises of a MESSAGE GROUP: its own numbers only go up.
+            if let Some(previous) = last.insert(group, number) {
+                assert_one_step(case, group, previous, number);
+            }
+        }
+    }
+}
+
+/// RULE, the consequence a client reads: because the run advances by a fixed unit per
+/// message and by nothing else, replaying ONE request sequence against a second, freshly
+/// created emulator answers exactly the same numbers — no part of the value is drawn from
+/// the clock, the process or anything else that differs between two runs.
+#[tokio::test]
+async fn one_publish_sequence_is_answered_the_same_numbers_by_a_second_emulator() {
+    let longest_group = "g".repeat(128);
+    for (index, (case, groups)) in sequenced_group_runs(&longest_group)
+        .into_iter()
+        .enumerate()
+    {
+        let mut runs: Vec<Vec<u128>> = Vec::new();
+        for run in 0..2 {
+            let sns = Sns::new();
+            let topic = sns.topic(&format!("replayed-{index:02}.fifo")).await;
+            let mut numbers = Vec::new();
+            for (publish, group) in groups.iter().enumerate() {
+                numbers.push(
+                    publish_sequenced(
+                        &sns,
+                        case,
+                        &topic,
+                        group,
+                        &format!("token-{run}-{publish}"),
+                    )
+                    .await,
+                );
+            }
+            runs.push(numbers);
+        }
+        assert_eq!(
+            runs[0], runs[1],
+            "case {case:?}: two emulators answering the same publish sequence must answer \
+             the same numbers, got {:?} and {:?}",
+            runs[0], runs[1]
+        );
+    }
+}
+
+/// RULE, the deduplicated path: a publish whose `MessageDeduplicationId` was already
+/// accepted inside the deduplication interval "aren't delivered"
+/// (`PublishInput$MessageDeduplicationId` doc), so it is answered the message id AND the
+/// sequence number of the copy that WAS delivered — no number is taken off the run for it,
+/// and the next message that IS delivered takes the number right after the last delivered
+/// one.
+#[tokio::test]
+async fn a_deduplicated_publish_repeats_a_stored_number_without_taking_one_off_the_run() {
+    // (case, the deduplication token of each publish, in order)
+    let cases: &[(&str, &[&str])] = &[
+        ("the second publish repeats the first", &["t1", "t1"]),
+        ("a repeat between two new tokens", &["t1", "t2", "t1", "t3"]),
+        ("every publish repeats the first", &["t1", "t1", "t1"]),
+        (
+            "a repeat of each of two tokens",
+            &["t1", "t2", "t2", "t1", "t3"],
+        ),
+    ];
+
+    for (case, tokens) in cases {
+        // A fresh emulator per row, so the run starts where a service's run starts and the
+        // numbers the row expects are the numbers of the messages the ROW delivered.
+        let sns = Sns::new();
+        let topic = sns.topic("deduplicated-run.fifo").await;
+        let group = "g1";
+        let mut answered: HashMap<&str, (String, String)> = HashMap::new();
+        let mut delivered: u128 = 0;
+        for (publish, token) in tokens.iter().enumerate() {
+            let answer = sns
+                .call(
+                    "Publish",
+                    &[
+                        ("TopicArn", &topic),
+                        ("Message", "ordered"),
+                        ("MessageGroupId", group),
+                        ("MessageDeduplicationId", token),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: Publish expected 200, got {} / {}",
+                answer.status, answer.body
+            );
+            let message_id = answer
+                .element("MessageId")
+                .unwrap_or_else(|| panic!("case {case:?}: no MessageId in {}", answer.body));
+            let text = answer.element("SequenceNumber").unwrap_or_else(|| {
+                panic!("case {case:?}: no SequenceNumber in {}", answer.body)
+            });
+            match answered.get(*token) {
+                Some((kept_id, kept_number)) => assert_eq!(
+                    (message_id.as_str(), text.as_str()),
+                    (kept_id.as_str(), kept_number.as_str()),
+                    "case {case:?}: publish {publish} repeats token {token:?}, so it expects \
+                     the delivered copy's ({kept_id}, {kept_number}), got \
+                     ({message_id}, {text})"
+                ),
+                None => {
+                    delivered += 1;
+                    let expected = SEQUENCE_NUMBER_FLOOR + delivered * SEQUENCE_NUMBER_STEP;
+                    let number = sequence_number_value(case, &text);
+                    assert_eq!(
+                        number, expected,
+                        "case {case:?}: publish {publish} is the {delivered}. message \
+                         delivered, so it expects {expected}, got {number}"
+                    );
+                    answered.insert(token, (message_id, text));
+                }
+            }
+        }
+    }
 }
