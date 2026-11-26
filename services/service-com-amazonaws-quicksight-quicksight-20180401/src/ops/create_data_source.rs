@@ -225,6 +225,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `DataSourceParameters` is a variant type whose member IS the kind of source it
+        // configures, so a parameter set belonging to a kind other than the requested
+        // `Type` describes a source this data source is not: refused before anything is
+        // stored, naming the member supplied and the kind it belongs to.
+        if let Some(message) =
+            crate::state::mismatched_parameters(input.data_source_parameters.as_ref(), &input.r#type)
+        {
+            return Err(CreateDataSourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::data_source_arn(&region, &input.aws_account_id, &input.data_source_id);
         let now = std::time::SystemTime::now();

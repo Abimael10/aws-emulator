@@ -237,6 +237,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `Type` is not an input here — the kind of a data source is fixed when it is
+        // created — so the variant type the update submits is cross-checked against the
+        // kind this data source IS, exactly as the create checks it against the
+        // requested one: a parameter set belonging to another kind is refused before the
+        // stored record is touched.
+        if let Some(message) = crate::state::mismatched_parameters(
+            input.data_source_parameters.as_ref(),
+            &record.r#type,
+        ) {
+            return Err(UpdateDataSourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
         // The whole mutable configuration comes from this request, so a member it omits
         // is cleared rather than carried over: `Name` is required, and each optional
         // member states how this data source connects from now on. `Type` is not an

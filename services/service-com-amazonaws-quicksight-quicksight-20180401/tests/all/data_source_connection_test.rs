@@ -22,6 +22,13 @@
 //! data source in a failed status cannot back a data set, so a physical table naming
 //! one is refused with `InvalidParameterValueException`.
 //!
+//! The third rule under test: `DataSourceParameters` is a variant type whose member IS
+//! the kind of source it configures, so a write whose parameter set belongs to a kind
+//! other than the data source's `DataSourceType` is refused synchronously with
+//! `InvalidParameterValueException` naming the member supplied and the kind it
+//! configures, and writes nothing — on the create against the requested kind and on the
+//! update against the kind the stored data source is of.
+//!
 //! The rows therefore vary what the rule generalises over: which parameter set the
 //! union carries, whether the named workgroup exists (the account's default, one
 //! Athena's own `CreateWorkGroup` registered, and names nothing holds), whether the
@@ -31,6 +38,7 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_quicksight_quicksight_20180401::ops::types as qs_types;
 use service_com_amazonaws_quicksight_quicksight_20180401::state as qs_state;
 
 use super::data_source_data_set_lifecycle::Harness;
@@ -122,6 +130,9 @@ async fn create_data_set(
 struct Case {
     /// What this row varies, named in every assertion it makes.
     label: &'static str,
+    /// The `DataSourceType` the data source is of — the kind the row's parameter set
+    /// belongs to, since a parameter set of another kind is refused outright.
+    kind: &'static str,
     /// The `DataSourceParameters` the create submits, or `None` for a create that
     /// submits none at all.
     parameters: Option<Value>,
@@ -139,16 +150,19 @@ fn cases() -> Vec<Case> {
     vec![
         Case {
             label: "the account's default Athena workgroup",
+            kind: "ATHENA",
             parameters: Some(json!({ "AthenaParameters": { "WorkGroup": DEFAULT_WORK_GROUP } })),
             missing_work_group: None,
         },
         Case {
             label: "an Athena workgroup the account created",
+            kind: "ATHENA",
             parameters: Some(json!({ "AthenaParameters": { "WorkGroup": "reporting" } })),
             missing_work_group: None,
         },
         Case {
             label: "no WorkGroup at all, so the default one",
+            kind: "ATHENA",
             parameters: Some(json!({
                 "AthenaParameters": {
                     "RoleArn": format!("arn:aws:iam::{ACCOUNT}:role/service-role/quicksight-athena")
@@ -158,11 +172,13 @@ fn cases() -> Vec<Case> {
         },
         Case {
             label: "no DataSourceParameters at all",
+            kind: "ATHENA",
             parameters: None,
             missing_work_group: None,
         },
         Case {
             label: "a parameter set naming a source outside this emulator",
+            kind: "POSTGRESQL",
             parameters: Some(json!({
                 "PostgreSqlParameters": { "Host": "db.internal", "Port": 5432, "Database": "sales" }
             })),
@@ -170,11 +186,13 @@ fn cases() -> Vec<Case> {
         },
         Case {
             label: "an Athena workgroup nothing created",
+            kind: "ATHENA",
             parameters: Some(json!({ "AthenaParameters": { "WorkGroup": "no-such-workgroup" } })),
             missing_work_group: Some("no-such-workgroup"),
         },
         Case {
             label: "another Athena workgroup nothing created, so another message",
+            kind: "ATHENA",
             parameters: Some(json!({
                 "AthenaParameters": {
                     "WorkGroup": "finance-eu",
@@ -185,6 +203,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             label: "a workgroup whose name differs from a held one only in case",
+            kind: "ATHENA",
             parameters: Some(json!({ "AthenaParameters": { "WorkGroup": "PRIMARY" } })),
             missing_work_group: Some("PRIMARY"),
         },
@@ -228,11 +247,12 @@ async fn a_create_settles_on_the_outcome_of_the_connection_test() {
     for (index, case) in cases().into_iter().enumerate() {
         let Case {
             label,
+            kind,
             parameters,
             missing_work_group,
         } = case;
         let id = format!("ds-create-{index}");
-        let mut body = json!({ "DataSourceId": id, "Name": id, "Type": "ATHENA" });
+        let mut body = json!({ "DataSourceId": id, "Name": id, "Type": kind });
         if let Some(parameters) = parameters.clone() {
             body["DataSourceParameters"] = parameters;
         }
@@ -297,20 +317,31 @@ async fn an_update_settles_on_the_outcome_of_its_own_connection_test() {
     for (index, case) in cases().into_iter().enumerate() {
         let Case {
             label,
+            kind,
             parameters,
             missing_work_group,
         } = case;
         let id = format!("ds-update-{index}");
-        // Every row starts from a data source whose create PASSED its test, so what
-        // the row observes is the outcome of the update's own test.
+        // Every row starts from a data source of the row's own kind whose create PASSED
+        // its test, so what the row observes is the outcome of the update's own test:
+        // the account's default Athena workgroup for an ATHENA row, and for a row of
+        // another kind its own parameters, which name a source outside this emulator and
+        // so have nothing to resolve.
+        let fixture_parameters = if kind == "ATHENA" {
+            json!({ "AthenaParameters": { "WorkGroup": DEFAULT_WORK_GROUP } })
+        } else {
+            parameters
+                .clone()
+                .unwrap_or_else(|| panic!("case {label:?}: a row of another kind submits its own parameters"))
+        };
         let (status, response) = create_data_source(
             &harness,
             ACCOUNT,
             json!({
                 "DataSourceId": id,
                 "Name": id,
-                "Type": "ATHENA",
-                "DataSourceParameters": { "AthenaParameters": { "WorkGroup": DEFAULT_WORK_GROUP } },
+                "Type": kind,
+                "DataSourceParameters": fixture_parameters,
             }),
         )
         .await;
@@ -1121,6 +1152,335 @@ async fn an_update_naming_an_unroutable_address_is_refused_and_changes_nothing()
             body["DataSource"]["Status"],
             json!(CREATION_SUCCESSFUL),
             "case {case:?}: the refused update must not move the status: {body}"
+        );
+    }
+}
+
+/// One row of the parameters-against-kind table: the kind the data source is of, the
+/// parameter set the write submits, and — for a set belonging to another kind — the union
+/// member it is submitted under together with the kind that member configures.
+struct KindRow {
+    /// What this row varies, named in every assertion it makes.
+    label: &'static str,
+    /// The `DataSourceType` of the data source the write addresses.
+    kind: &'static str,
+    /// The `DataSourceParameters` the write submits, or `None` for a write that submits
+    /// none.
+    parameters: Option<Value>,
+    /// The union member and the kind it configures, for a row the service must refuse;
+    /// `None` for a row it must accept.
+    refused_as: Option<(&'static str, &'static str)>,
+}
+
+/// The rows: each pairs a `DataSourceType` with a `DataSourceParameters` member, varying
+/// which member carries the parameters, which kind the write states, whether the two
+/// agree, whether the kind's enum member is one word or several, and whether the member
+/// belongs to a kind the enum names at all.
+///
+/// Source: smithy_query(query="shape", shape="DataSourceParameters") for the member names
+/// and smithy_query(query="shape", shape="DataSourceType") for the kinds — `RdsParameters`
+/// and `ImpalaParameters` are members of the union that the enum names no kind for.
+fn kind_rows() -> Vec<KindRow> {
+    vec![
+        KindRow {
+            label: "Athena parameters on a Presto source",
+            kind: "PRESTO",
+            parameters: Some(json!({ "AthenaParameters": { "WorkGroup": DEFAULT_WORK_GROUP } })),
+            refused_as: Some(("AthenaParameters", "ATHENA")),
+        },
+        KindRow {
+            label: "PostgreSQL parameters on a MySQL source",
+            kind: "MYSQL",
+            parameters: Some(json!({
+                "PostgreSqlParameters": { "Host": "db.example.com", "Port": 5432, "Database": "sales" }
+            })),
+            refused_as: Some(("PostgreSqlParameters", "POSTGRESQL")),
+        },
+        KindRow {
+            label: "S3 parameters on an Athena source",
+            kind: "ATHENA",
+            parameters: Some(json!({
+                "S3Parameters": {
+                    "ManifestFileLocation": { "Bucket": "bucket-1", "Key": "manifest.json" }
+                }
+            })),
+            refused_as: Some(("S3Parameters", "S3")),
+        },
+        KindRow {
+            label: "Snowflake parameters on a Redshift source",
+            kind: "REDSHIFT",
+            parameters: Some(json!({
+                "SnowflakeParameters": {
+                    "Host": "snowflake.example.com",
+                    "Database": "app",
+                    "Warehouse": "wh"
+                }
+            })),
+            refused_as: Some(("SnowflakeParameters", "SNOWFLAKE")),
+        },
+        KindRow {
+            // A near miss: the two kinds differ only in the engine, and the kind the
+            // member configures is spelled with an underscore.
+            label: "Aurora PostgreSQL parameters on an Aurora source",
+            kind: "AURORA",
+            parameters: Some(json!({
+                "AuroraPostgreSqlParameters": {
+                    "Host": "aurora.example.com",
+                    "Port": 5432,
+                    "Database": "app"
+                }
+            })),
+            refused_as: Some(("AuroraPostgreSqlParameters", "AURORA_POSTGRESQL")),
+        },
+        KindRow {
+            label: "S3 Tables parameters on an S3 source",
+            kind: "S3",
+            parameters: Some(json!({
+                "S3TablesParameters": {
+                    "TableBucketArn":
+                        format!("arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/analytics")
+                }
+            })),
+            refused_as: Some(("S3TablesParameters", "S3_TABLES")),
+        },
+        KindRow {
+            label: "the parameters of the kind the source is of",
+            kind: "ATHENA",
+            parameters: Some(json!({ "AthenaParameters": { "WorkGroup": DEFAULT_WORK_GROUP } })),
+            refused_as: None,
+        },
+        KindRow {
+            label: "another agreeing pair, whose kind is spelled with an underscore",
+            kind: "S3_TABLES",
+            parameters: Some(json!({
+                "S3TablesParameters": {
+                    "TableBucketArn":
+                        format!("arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/analytics")
+                }
+            })),
+            refused_as: None,
+        },
+        KindRow {
+            // An RDS instance is reached as the engine it runs, so the enum names no
+            // kind this parameter set configures and there is nothing to disagree with.
+            label: "a parameter set the kind enum names no member for",
+            kind: "MYSQL",
+            parameters: Some(json!({
+                "RdsParameters": { "InstanceId": "rds-1", "Database": "app" }
+            })),
+            refused_as: None,
+        },
+        KindRow {
+            label: "another parameter set the kind enum names no member for",
+            kind: "PRESTO",
+            parameters: Some(json!({
+                "ImpalaParameters": {
+                    "Host": "impala.example.com",
+                    "Port": 21050,
+                    "SqlEndpointPath": "/cliservice"
+                }
+            })),
+            refused_as: None,
+        },
+        KindRow {
+            label: "no parameters at all, so no kind to disagree with",
+            kind: "SNOWFLAKE",
+            parameters: None,
+            refused_as: None,
+        },
+    ]
+}
+
+/// The refusal a write whose parameter set belongs to another kind carries: fixed text
+/// around the union member the request supplied and the kind that member configures.
+fn mismatched_message(member: &str, owning_kind: &str) -> String {
+    format!("{member} should only be set for {owning_kind} source")
+}
+
+/// Every kind a row names is a member of the model's own `DataSourceType` enum, so no
+/// row asserts a kind the service does not have.
+fn assert_modelled_kind(label: &str, kind: &str) {
+    assert!(
+        qs_types::DATA_SOURCE_TYPE_VALUES.contains(&kind),
+        "case {label:?}: {kind:?} is not a member of the model's DataSourceType enum"
+    );
+}
+
+/// A create registers no data source whose parameter set belongs to another kind.
+///
+/// The rule: `DataSourceParameters` is a variant type whose member IS the kind of source
+/// it configures, so a write submitting a parameter set of a kind other than the data
+/// source's `DataSourceType` is refused with `InvalidParameterValueException` naming that
+/// member and the kind it belongs to, and writes nothing; a set that agrees with the
+/// kind, or that belongs to no kind the enum names, is accepted.
+#[tokio::test]
+async fn a_create_whose_parameters_belong_to_another_kind_is_refused_and_registers_nothing() {
+    let harness = Harness::new();
+
+    for (index, row) in kind_rows().into_iter().enumerate() {
+        let KindRow {
+            label,
+            kind,
+            parameters,
+            refused_as,
+        } = row;
+        assert_modelled_kind(label, kind);
+        if let Some((_, owning_kind)) = refused_as {
+            assert_modelled_kind(label, owning_kind);
+        }
+
+        let id = format!("ds-kind-create-{index}");
+        let mut request = json!({ "DataSourceId": id, "Name": id, "Type": kind });
+        if let Some(parameters) = parameters.clone() {
+            request["DataSourceParameters"] = parameters;
+        }
+        let before = held_data_sources(&harness);
+        let (status, body) = create_data_source(&harness, ACCOUNT, request).await;
+
+        let Some((member, owning_kind)) = refused_as else {
+            assert_eq!(
+                status, 202,
+                "case {label:?}: a create whose parameters are of its own kind expected \
+                 202, got {status} with {body}"
+            );
+            let (status, read) = describe_data_source(&harness, ACCOUNT, &id).await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: the accepted create must read back, got {status} with {read}"
+            );
+            assert_eq!(
+                read["DataSource"]["DataSourceParameters"],
+                parameters.unwrap_or(Value::Null),
+                "case {label:?}: the submitted parameters are stored verbatim: {read}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            status, 400,
+            "case {label:?}: a create whose parameters belong to {owning_kind} expected \
+             400, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidParameterValueException"),
+            "case {label:?}: the refused parameter value is what is reported: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(mismatched_message(member, owning_kind)),
+            "case {label:?}: the refusal must name the member supplied and the kind it \
+             configures: {body}"
+        );
+        assert!(
+            body.get("RequestId").is_none(),
+            "case {label:?}: a refusal document reports no RequestId — the id of the call \
+             travels in the x-amzn-RequestId header: {body}"
+        );
+
+        // The refused create registered nothing, so the id resolves to no data source.
+        assert_eq!(
+            held_data_sources(&harness),
+            before,
+            "case {label:?}: the refused create must write no record"
+        );
+        let (status, read) = describe_data_source(&harness, ACCOUNT, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: a data source the refused create did not register expected \
+             404, got {status} with {read}"
+        );
+        assert_eq!(
+            read["Message"],
+            json!(format!(
+                "DataSource {} is not found",
+                data_source_arn(ACCOUNT, &id)
+            )),
+            "case {label:?}: the miss must name the data source by its ARN: {read}"
+        );
+    }
+}
+
+/// The same rule on the update, where the kind is the one the data source WAS created
+/// with: `Type` is not an input there, so the parameter set is checked against the kind
+/// the stored data source is of, and a refused update changes nothing.
+#[tokio::test]
+async fn an_update_whose_parameters_belong_to_another_kind_is_refused_and_changes_nothing() {
+    let harness = Harness::new();
+
+    for (index, row) in kind_rows().into_iter().enumerate() {
+        let KindRow {
+            label,
+            kind,
+            parameters,
+            refused_as,
+        } = row;
+        let id = format!("ds-kind-update-{index}");
+        // The fixture states the kind and no parameters at all, so what the update
+        // observes is its parameter set against the kind the data source IS.
+        let (status, body) = create_data_source(
+            &harness,
+            ACCOUNT,
+            json!({ "DataSourceId": id, "Name": id, "Type": kind }),
+        )
+        .await;
+        assert_eq!(status, 202, "case {label:?}: fixture create: {body}");
+        harness.settle_data_source(ACCOUNT, &id);
+
+        let mut request = json!({ "Name": id });
+        if let Some(parameters) = parameters.clone() {
+            request["DataSourceParameters"] = parameters;
+        }
+        let (status, body) = update_data_source(&harness, ACCOUNT, &id, request).await;
+
+        let Some((member, owning_kind)) = refused_as else {
+            assert_eq!(
+                status, 202,
+                "case {label:?}: an update whose parameters are of the data source's kind \
+                 expected 202, got {status} with {body}"
+            );
+            harness.settle_data_source(ACCOUNT, &id);
+            let (_, read) = describe_data_source(&harness, ACCOUNT, &id).await;
+            assert_eq!(
+                read["DataSource"]["DataSourceParameters"],
+                parameters.unwrap_or(Value::Null),
+                "case {label:?}: the accepted update stores what it carried: {read}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            status, 400,
+            "case {label:?}: an update whose parameters belong to {owning_kind} expected \
+             400, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidParameterValueException"),
+            "case {label:?}: the refused parameter value is what is reported: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(mismatched_message(member, owning_kind)),
+            "case {label:?}: the refusal must name the member supplied and the kind it \
+             configures: {body}"
+        );
+
+        // The refused update left the data source as the create made it.
+        let (status, read) = describe_data_source(&harness, ACCOUNT, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: the data source must still read back, got {status} with {read}"
+        );
+        assert_eq!(
+            read["DataSource"]["DataSourceParameters"],
+            Value::Null,
+            "case {label:?}: the refused update must not store its parameters: {read}"
+        );
+        assert_eq!(
+            read["DataSource"]["Status"],
+            json!(CREATION_SUCCESSFUL),
+            "case {label:?}: the refused update must not move the status: {read}"
         );
     }
 }

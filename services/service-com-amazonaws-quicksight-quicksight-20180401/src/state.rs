@@ -13,6 +13,7 @@
 mod authorization;
 mod connection_target;
 mod connection_test;
+mod data_source_kind;
 mod external_login;
 mod folder_members;
 mod group_members;
@@ -27,6 +28,7 @@ mod users;
 pub use authorization::*;
 pub use connection_target::*;
 pub use connection_test::*;
+pub use data_source_kind::*;
 pub use external_login::*;
 pub use folder_members::*;
 pub use group_members::*;
