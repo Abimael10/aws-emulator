@@ -50,3 +50,29 @@ Smithy consulted (services/service-com-amazonaws-mq-mq/smithy-model/com-amazonaw
 3. Observe the list ends at index 12 and contains no entry whose engineType is RABBITMQ with a mq.m7g.* hostInstanceType; index 12 is an ACTIVEMQ mq.t3.micro entry and indices 13..19 are absent.
 4. AWS returns the full published catalog, whose entries at those positions are the RABBITMQ host-instance-type options (mq.m7g.12xlarge, .16xlarge, .2xlarge, .4xlarge, .8xlarge, ...), each with storageType 'ebs', supportedEngineVersions ['4.3', '4.2', '3.13'] and supportedDeploymentModes ['SINGLE_INSTANCE', 'CLUSTER_MULTI_AZ'].
 5. Re-replay that fixture step after the fix to confirm; the same step is part of the simparity-wire-aws-v1 corpus.
+
+## Resolution
+The instance-option catalog now enumerates the published combinations per engine instead of a
+per-size table that named only the `mq.m5` sizes and the burstable one: the handler holds one row
+per broker engine listing the host instance types that engine is offered on — ActiveMQ on the
+burstable size and the `mq.m5` sizes, RabbitMQ on the `mq.m5` sizes and the whole Graviton `mq.m7g`
+family — and reports them by host instance type, then engine type, then storage type, so every
+offered (engine type, host instance type, storage type) combination carries an entry.
+
+An entry's `supportedEngineVersions` remains the engine's published version list
+(`state::published_engine_versions`, the one `DescribeBrokerEngineTypes` serves) narrowed to the
+lines that run on the size the entry names: RabbitMQ's current major release line runs on the
+Graviton family only, so the `mq.m5` entries of that engine report the earlier line alone. The
+recording is what says so, from two directions: the resolved report
+`20261030T033328Z-mq-describebrokerinstanceoptions-serves-a-hand-built-instance-option.md` quotes
+recorded element 2 as `mq.m5.2xlarge` / RABBITMQ with `supportedEngineVersions ['3.13']`, while this
+report quotes recorded element 12 as `mq.m7g.12xlarge` / RABBITMQ with `['4.3', '4.2', '3.13']`; the
+engine catalog publishes their union. Replaying with the whole list on every size diverged at
+`$.brokerInstanceOptions[2]`, `[5]`, `[8]` and `[11]` — exactly that engine's four `mq.m5` entries —
+and the same replay passes with the narrowing.
+
+Replaying fixture `mq-catalog-describe-broker-instance-options`, step `task#1`, now passes: every
+`$.brokerInstanceOptions` index matches, including the eight RabbitMQ Graviton entries this report
+was filed for. The recorded answer carries 21 entries (the resolved report above records the count),
+the last being the burstable ActiveMQ entry, so the catalog publishes no RabbitMQ burstable entry:
+serving one diverged at `$.brokerInstanceOptions[21]` and dropping it is what made the step pass.

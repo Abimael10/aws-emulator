@@ -214,9 +214,11 @@ pub const ACTIVEMQ_ENGINE_VERSIONS: &[&str] = &["5.18", "5.19"];
 /// The engine versions Amazon MQ offers for RabbitMQ, oldest first — see
 /// [`ACTIVEMQ_ENGINE_VERSIONS`] for the granularity and where it comes from (the
 /// recorded `DescribeBrokerEngineTypes` catalog carries `["4.3", "4.2", "3.13"]`
-/// for RabbitMQ, newest first, which is also the list the recorded
-/// `DescribeBrokerInstanceOptions` entries of that engine report and the one a
-/// create's refusal quotes back).
+/// for RabbitMQ, newest first, and that is also the list a create's refusal quotes
+/// back). `DescribeBrokerInstanceOptions` publishes, per entry, the lines of this
+/// list that run on the host instance type the entry names: the recorded catalog
+/// reports the whole list on the Graviton sizes and `["3.13"]` on the `mq.m5`
+/// ones.
 pub const RABBITMQ_ENGINE_VERSIONS: &[&str] = &["3.13", "4.2", "4.3"];
 
 /// The engine versions published for `engine_type`, or none for a value outside

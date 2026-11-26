@@ -213,18 +213,38 @@ async fn the_catalog_is_well_formed_and_covers_every_modelled_engine_type() {
             "case {case:?}: unexpected highly available deployment mode in {modes:?}"
         );
 
-        // The versions are the ones the service offers for creation on that engine,
-        // newest first and at MAJOR.MINOR granularity.
+        // The versions are the lines the service offers for creation on that engine AND on
+        // the size the entry names, in the order it publishes them (newest first) and at
+        // MAJOR.MINOR granularity: the recorded catalog reports a release line the service
+        // runs on one instance family only on that family's entries alone, so the exact
+        // list per combination is the sibling suite's written-out table, and every line in
+        // it is one the engine itself publishes.
         let versions = members(case, entry, "supportedEngineVersions");
         let mut offered: Vec<String> = published_engine_versions(&engine_type)
             .iter()
             .map(|version| (*version).to_string())
             .collect();
         offered.reverse();
-        assert_eq!(
-            versions, offered,
-            "case {case:?}: expected the offered versions newest first, got {versions:?}"
+        let recorded = crate::published_instance_option_catalog::recorded_versions(
+            &engine_type,
+            &host_instance_type,
         );
+        assert!(
+            !recorded.is_empty(),
+            "case {case:?}: the published-catalog table must cover this combination"
+        );
+        assert_eq!(
+            versions, recorded,
+            "case {case:?}: expected the version lines the catalog publishes for that size, \
+             got {versions:?}"
+        );
+        for version in &versions {
+            assert!(
+                offered.contains(version),
+                "case {case:?}: {version:?} must be one of the engine's offered versions \
+                 {offered:?}"
+            );
+        }
         for version in &versions {
             assert_eq!(
                 version.split('.').count(),

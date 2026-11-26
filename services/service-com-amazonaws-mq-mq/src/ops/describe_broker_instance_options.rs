@@ -263,59 +263,87 @@ fn validate_catalog_storage_type(storage_type: &str) -> Result<(), state::Invali
 /// uses ([`state::DEFAULT_MAX_RESULTS`]).
 const DEFAULT_PAGE_SIZE: i32 = state::DEFAULT_MAX_RESULTS as i32;
 
-/// One host instance type Amazon MQ offers, and the engines offered on it.
+/// The host instance types Amazon MQ offers ONE broker engine on.
 ///
-/// The engine types are the model's own `EngineType` value set (`ENGINE_TYPE_VALUES`,
-/// from `smithy_query(query="shape", shape="EngineType")`); the instance types, and
-/// which engine runs on each, are the ones Amazon MQ publishes (the Developer Guide's
-/// "Broker instance types" tables, one per engine).
-struct PublishedHostInstanceType {
-    host_instance_type: &'static str,
-    engine_types: &'static [&'static str],
+/// Amazon MQ publishes its sizes per engine — the Developer Guide's "Broker instance
+/// types" tables, one table per engine — so this is laid out the same way: the engine
+/// type, from the model's own `EngineType` value set (`ENGINE_TYPE_VALUES`, from
+/// `smithy_query(query="shape", shape="EngineType")`), and every host instance type that
+/// engine is offered on. The storage types, deployment modes and engine versions of one
+/// entry are not columns here: they follow from the engine and the instance type
+/// ([`offers_storage_type`], [`highly_available_deployment_mode`],
+/// [`offered_engine_versions`]).
+struct PublishedEngineHostInstanceTypes {
+    engine_type: &'static str,
+    host_instance_types: &'static [&'static str],
 }
 
-/// Amazon MQ's published host instance types, in the order the catalog reports them.
+/// Amazon MQ's published host instance types, per broker engine.
 ///
-/// The catalog is grouped by host instance type and only then by engine type, so this
-/// table IS the reported order: the rows are the published instance types in ascending
-/// name order, and each row's engines in the order the model enumerates them. The
-/// storage types, deployment modes and engine versions of one entry are not columns
-/// here: they follow from the engine and the instance type ([`offers_storage_type`],
-/// [`highly_available_deployment_mode`], [`state::published_engine_versions`]).
-///
-/// WHICH combinations the service offers is recorded behaviour — the model constrains
-/// only the enums — so these rows are the combinations the recorded catalog serves: the
-/// four `mq.m5` sizes on both engines, and the burstable `micro` size on ActiveMQ only,
-/// which is why that row names one engine. The recorded catalog serves further
-/// combinations whose host instance types are not identifiable from it (the recording
-/// reports which elements differ, never a value); they are tracked as their own issue,
-/// and adding them is a row each here rather than a code change.
-const PUBLISHED_HOST_INSTANCE_TYPES: &[PublishedHostInstanceType] = &[
-    PublishedHostInstanceType {
-        host_instance_type: "mq.m5.2xlarge",
-        engine_types: ENGINE_TYPE_VALUES,
+/// WHICH sizes the service offers is published rather than modelled — the model
+/// constrains only the enums — so each row is an engine's published instance-type table:
+/// ActiveMQ on the burstable `micro` size and the general-purpose `mq.m5` sizes, and
+/// RabbitMQ on the same general-purpose sizes and on the whole Graviton `mq.m7g` family,
+/// from its smallest (`medium`) size up. The burstable size is ActiveMQ's alone: the
+/// recorded catalog's last entry is that engine's burstable one, with no RabbitMQ entry
+/// beside it. Within a row the order does not matter: the catalog is reported by host
+/// instance type ([`published_host_instance_types`]), so adding a size the service starts
+/// offering is one entry here.
+const PUBLISHED_HOST_INSTANCE_TYPES: &[PublishedEngineHostInstanceTypes] = &[
+    PublishedEngineHostInstanceTypes {
+        engine_type: state::ENGINE_TYPE_ACTIVEMQ,
+        host_instance_types: &[
+            "mq.t3.micro",
+            "mq.m5.large",
+            "mq.m5.xlarge",
+            "mq.m5.2xlarge",
+            "mq.m5.4xlarge",
+        ],
     },
-    PublishedHostInstanceType {
-        host_instance_type: "mq.m5.4xlarge",
-        engine_types: ENGINE_TYPE_VALUES,
-    },
-    PublishedHostInstanceType {
-        host_instance_type: "mq.m5.large",
-        engine_types: ENGINE_TYPE_VALUES,
-    },
-    PublishedHostInstanceType {
-        host_instance_type: "mq.m5.xlarge",
-        engine_types: ENGINE_TYPE_VALUES,
-    },
-    PublishedHostInstanceType {
-        host_instance_type: "mq.t3.micro",
-        engine_types: &[state::ENGINE_TYPE_ACTIVEMQ],
+    PublishedEngineHostInstanceTypes {
+        engine_type: state::ENGINE_TYPE_RABBITMQ,
+        host_instance_types: &[
+            "mq.m5.large",
+            "mq.m5.xlarge",
+            "mq.m5.2xlarge",
+            "mq.m5.4xlarge",
+            "mq.m7g.medium",
+            "mq.m7g.large",
+            "mq.m7g.xlarge",
+            "mq.m7g.2xlarge",
+            "mq.m7g.4xlarge",
+            "mq.m7g.8xlarge",
+            "mq.m7g.12xlarge",
+            "mq.m7g.16xlarge",
+        ],
     },
 ];
 
+/// Every host instance type the service offers, whatever the engine, in the order the
+/// catalog reports them: ascending by name, the order the published catalog is in and
+/// what makes a `NextToken` offset name the same entry on a later call.
+fn published_host_instance_types() -> Vec<&'static str> {
+    let mut host_instance_types: Vec<&'static str> = PUBLISHED_HOST_INSTANCE_TYPES
+        .iter()
+        .flat_map(|engine| engine.host_instance_types.iter().copied())
+        .collect();
+    host_instance_types.sort_unstable();
+    host_instance_types.dedup();
+    host_instance_types
+}
+
+/// Whether `engine_type` is offered on `host_instance_type` at all — a size one engine
+/// has and the other does not carries an entry for that engine only.
+fn offers_host_instance_type(engine_type: &str, host_instance_type: &str) -> bool {
+    PUBLISHED_HOST_INSTANCE_TYPES.iter().any(|engine| {
+        engine.engine_type == engine_type
+            && engine.host_instance_types.contains(&host_instance_type)
+    })
+}
+
 /// The burstable host instance types the catalog holds — the `micro` sizes Amazon MQ
 /// offers for evaluation rather than for production throughput. They are the sizes the
-/// service offers no block storage and no RabbitMQ cluster on.
+/// service offers no ActiveMQ block storage and no RabbitMQ cluster on.
 fn is_burstable(host_instance_type: &str) -> bool {
     host_instance_type.ends_with(".micro")
 }
@@ -324,8 +352,8 @@ fn is_burstable(host_instance_type: &str) -> bool {
 ///
 /// RabbitMQ is EBS-only — `BrokerStorageType`'s own documentation
 /// (`smithy_query(query="shape", shape="BrokerStorageType")`): "EFS is not supported for
-/// RabbitMQ engine type". ActiveMQ is offered on its shared EFS storage at every size
-/// and on block storage from the smallest non-burstable size up.
+/// RabbitMQ engine type". ActiveMQ is offered on its shared EFS storage at every size and
+/// on block storage from the smallest non-burstable size up.
 fn offers_storage_type(engine_type: &str, host_instance_type: &str, storage_type: &str) -> bool {
     match (engine_type, storage_type) {
         (state::ENGINE_TYPE_RABBITMQ, storage) => storage == state::STORAGE_TYPE_EBS,
@@ -370,14 +398,61 @@ fn supported_deployment_modes(
     modes
 }
 
+/// The instance family a host instance type names: Amazon MQ spells a size
+/// `mq.<family>.<size>`, so the family is the second segment.
+fn instance_family(host_instance_type: &str) -> &str {
+    host_instance_type.split('.').nth(1).unwrap_or_default()
+}
+
+/// The Graviton instance family, the one Amazon MQ runs RabbitMQ's current major release
+/// line on.
+const GRAVITON_INSTANCE_FAMILY: &str = "m7g";
+
+/// The first RabbitMQ major release Amazon MQ offers on the Graviton family alone: a
+/// broker running it has to be on a Graviton size, so the entries of the older families
+/// offer that engine's earlier release line only.
+const FIRST_GRAVITON_ONLY_RABBITMQ_MAJOR: u32 = 4;
+
+/// A version's major release number, or none when the version is not the `MAJOR.MINOR`
+/// line the catalog publishes.
+fn major_release(engine_version: &str) -> Option<u32> {
+    engine_version.split('.').next()?.parse().ok()
+}
+
+/// Whether `engine_version` of `engine_type` can run on `host_instance_type`.
+///
+/// Every version an engine publishes runs on every size that engine has, except that
+/// RabbitMQ's current major release line ([`FIRST_GRAVITON_ONLY_RABBITMQ_MAJOR`] and up)
+/// needs a Graviton size, so the entries of the other families offer the earlier line
+/// only — which is why one engine's entries do not all report the same versions. The
+/// recorded catalog is what says so: its Graviton entries of that engine report the whole
+/// published list, its `mq.m5` entries only the earlier line, while the engine catalog
+/// ([`state::published_engine_versions`], what `DescribeBrokerEngineTypes` serves)
+/// publishes their union.
+fn offers_engine_version(
+    engine_type: &str,
+    host_instance_type: &str,
+    engine_version: &str,
+) -> bool {
+    if engine_type != state::ENGINE_TYPE_RABBITMQ
+        || instance_family(host_instance_type) == GRAVITON_INSTANCE_FAMILY
+    {
+        return true;
+    }
+    major_release(engine_version)
+        .is_none_or(|major| major < FIRST_GRAVITON_ONLY_RABBITMQ_MAJOR)
+}
+
 /// The engine versions a catalog entry reports: the versions Amazon MQ currently offers
 /// for creation on that engine ([`state::published_engine_versions`], which holds them
-/// oldest first so a create defaults to the last), reported NEWEST first, the way the
-/// catalog publishes them.
-fn offered_engine_versions(engine_type: &str) -> Vec<String> {
+/// oldest first so a create defaults to the last) that run on the entry's host instance
+/// type ([`offers_engine_version`]), reported NEWEST first, the way the catalog publishes
+/// them.
+fn offered_engine_versions(engine_type: &str, host_instance_type: &str) -> Vec<String> {
     state::published_engine_versions(engine_type)
         .iter()
         .rev()
+        .filter(|version| offers_engine_version(engine_type, host_instance_type, version))
         .map(|version| (*version).to_string())
         .collect()
 }
@@ -391,7 +466,7 @@ fn catalog_storage_type(storage_type: &str) -> String {
 }
 
 /// Amazon MQ's whole instance-option catalog for `region`, in the order the service
-/// reports it: by host instance type as [`PUBLISHED_HOST_INSTANCE_TYPES`] lists them,
+/// reports it: by host instance type as [`published_host_instance_types`] orders them,
 /// then by engine type, then by storage type. The order is what makes a `NextToken`
 /// offset name the same entry on a later call.
 fn published_instance_options(region: &str) -> Vec<BrokerInstanceOption> {
@@ -401,23 +476,29 @@ fn published_instance_options(region: &str) -> Vec<BrokerInstanceOption> {
         .collect();
 
     let mut options = Vec::new();
-    for host in PUBLISHED_HOST_INSTANCE_TYPES {
-        for engine_type in host.engine_types {
+    for host_instance_type in published_host_instance_types() {
+        for engine_type in ENGINE_TYPE_VALUES {
+            if !offers_host_instance_type(engine_type, host_instance_type) {
+                continue;
+            }
             for storage_type in BROKER_STORAGE_TYPE_VALUES {
-                if !offers_storage_type(engine_type, host.host_instance_type, storage_type) {
+                if !offers_storage_type(engine_type, host_instance_type, storage_type) {
                     continue;
                 }
                 options.push(BrokerInstanceOption {
                     availability_zones: Some(zones.clone()),
                     engine_type: Some((*engine_type).to_string()),
-                    host_instance_type: Some(host.host_instance_type.to_string()),
+                    host_instance_type: Some(host_instance_type.to_string()),
                     storage_type: Some(catalog_storage_type(storage_type)),
                     supported_deployment_modes: Some(supported_deployment_modes(
                         engine_type,
-                        host.host_instance_type,
+                        host_instance_type,
                         storage_type,
                     )),
-                    supported_engine_versions: Some(offered_engine_versions(engine_type)),
+                    supported_engine_versions: Some(offered_engine_versions(
+                        engine_type,
+                        host_instance_type,
+                    )),
                 });
             }
         }

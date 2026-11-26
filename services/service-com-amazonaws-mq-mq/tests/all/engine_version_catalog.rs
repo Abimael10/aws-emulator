@@ -5,8 +5,9 @@
 //!
 //! RULE A: the versions an engine offers for creation are ONE list per engine type, the
 //! lines the service currently offers, reported newest first; every operation that
-//! publishes that list publishes the same one, and a create may name any entry of it (and
-//! defaults to its newest entry when it names none).
+//! publishes that list publishes the same one (an instance option publishes the lines of
+//! it that run on the host instance type the entry names), and a create may name any entry
+//! of it (and defaults to its newest entry when it names none).
 //!
 //! RULE B: a request whose `engineType` is not a member of the modelled `EngineType` set
 //! is refused by every operation that takes the member with HTTP 400
@@ -144,10 +145,13 @@ async fn the_engine_catalog_publishes_every_offered_version_newest_first() {
     );
 }
 
-/// RULE A, the instance-option catalog: every entry of an engine reports the SAME offered
-/// version list, so a client choosing a version from either catalog chooses the same set.
+/// RULE A, the instance-option catalog: every entry of an engine reports the offered
+/// version lines of that engine that run on the SIZE it names, in the order the engine
+/// catalog publishes them — exactly the lines the recorded catalog reports for that
+/// combination (`published_instance_option_catalog.rs` holds that written-out table), and
+/// never a line the engine catalog does not publish.
 #[tokio::test]
-async fn the_instance_option_catalog_reports_the_same_offered_versions() {
+async fn the_instance_option_catalog_reports_the_offered_versions_of_an_entrys_size() {
     let mq = Mq::new("eu-west-1");
     let mut rows = 0usize;
 
@@ -173,22 +177,44 @@ async fn the_instance_option_catalog_reports_the_same_offered_versions() {
             !entries.is_empty(),
             "case {case:?}: expected at least one instance option for the engine, got {body:?}"
         );
+        let mut whole = 0usize;
         for entry in entries {
-            let case = format!(
-                "{case}: {}",
-                entry
-                    .get("hostInstanceType")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-            );
+            let host_instance_type = entry
+                .get("hostInstanceType")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let case = format!("{case}: {host_instance_type}");
             let reported = strings_at(&case, entry, "/supportedEngineVersions");
-            assert_eq!(
-                reported, *offered,
-                "case {case:?}: expected the same offered versions {offered:?} as the engine \
-                 catalog, got {reported:?}"
+            let recorded = crate::published_instance_option_catalog::recorded_versions(
+                engine_type,
+                &host_instance_type,
             );
+            assert!(
+                !recorded.is_empty(),
+                "case {case:?}: the published-catalog table must cover this combination"
+            );
+            assert_eq!(
+                reported, recorded,
+                "case {case:?}: expected the version lines the catalog publishes for that \
+                 size, got {reported:?}"
+            );
+            for version in &reported {
+                assert!(
+                    offered.contains(&version.as_str()),
+                    "case {case:?}: {version:?} must be one of the engine catalog's \
+                     {offered:?}"
+                );
+            }
+            if reported.len() == offered.len() {
+                whole += 1;
+            }
             rows += 1;
         }
+        assert!(
+            whole > 0,
+            "case {case:?}: the engine must offer every version line {offered:?} on some size"
+        );
     }
 
     assert!(
