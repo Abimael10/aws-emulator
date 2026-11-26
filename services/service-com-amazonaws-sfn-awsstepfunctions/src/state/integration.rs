@@ -4174,10 +4174,8 @@ fn sdk_exception_cause(
 ///   COMMA-separated fields — the service as that SDK's own client names it
 ///   ([`Api::sdk_error_prefix`]), the status, and the refused request — and then a second
 ///   group naming how many attempts the call took ([`sdk_attempt_metadata`]). It names no
-///   error code and no proxy. It serves the whole AWS SDK family, and the optimized
-///   integrations whose own client is of that generation
-///   ([`CURRENT_SDK_OPTIMIZED_NAMESPACES`]);
-/// * every other optimized integration is served by the earlier generation of clients,
+///   error code and no proxy. It serves the AWS SDK family ([`current_sdk_serves`]);
+/// * an OPTIMIZED integration is served by the earlier generation of clients,
 ///   whose message is the sentence followed by SEMICOLON-separated fields: the name that
 ///   client carries ([`Api::sdk_client`]), the status, the code the answer named the
 ///   class by, the refused request, and the proxy the call went through — there is none,
@@ -4196,7 +4194,7 @@ pub fn sdk_exception_message(
     status: u16,
     request_id: Option<&str>,
 ) -> String {
-    match current_sdk_serves(api, family) {
+    match current_sdk_serves(family) {
         true => sdk_attempt_metadata(api.sdk_error_prefix, message, status, request_id),
         false => {
             let request = request_id.map_or_else(String::new, |id| format!("Request ID: {id}; "));
@@ -4209,32 +4207,25 @@ pub fn sdk_exception_message(
     }
 }
 
-/// Whether the client Step Functions reaches `api` through for a `Task` of `family` is the
-/// CURRENT AWS SDK, whose rendering of an exception [`sdk_attempt_metadata`] writes.
+/// Whether the client Step Functions makes a `Task` of `family`'s call with is the CURRENT
+/// AWS SDK, whose rendering of an exception [`sdk_attempt_metadata`] writes.
 ///
 /// The AWS SDK family IS that SDK, whichever service it calls. An OPTIMIZED integration is
-/// served by the client Step Functions' own integration with that service carries, and
-/// those are not all of one generation ([`CURRENT_SDK_OPTIMIZED_NAMESPACES`]).
-fn current_sdk_serves(api: &Api, family: Family) -> bool {
-    match family {
-        Family::AwsSdk => true,
-        Family::Optimized => CURRENT_SDK_OPTIMIZED_NAMESPACES.contains(&api.namespace),
-    }
-}
-
-/// The services whose OPTIMIZED integration — and, for Lambda, the direct invocation of a
-/// function's ARN, which is the same call ([`Family::Optimized`]) — Step Functions serves
-/// through the CURRENT AWS SDK, each named by its ARN namespace ([`Api::namespace`]).
+/// served by the client Step Functions' own integration with that service carries, and every
+/// one of those is of the EARLIER generation, so which rendering a cause carries follows from
+/// the family alone.
 ///
-/// Which generation of client an integration carries is a fact of that integration, so it
-/// is stated per service rather than derived from the family: no Smithy model carries it,
-/// and what shows it is the form a refusal of such a call closes with. A Lambda `Task`
-/// denied `lambda:InvokeFunction` reports a cause closing with that SDK's own metadata —
-/// the service named `Lambda`, the fields comma-separated and the attempt count beside
-/// them — whether the `Resource` names the function's ARN or the optimized `lambda:invoke`
-/// integration. Every other optimized integration here reports the earlier client's form,
-/// which is why this names the ones that do not rather than the ones that do.
-const CURRENT_SDK_OPTIMIZED_NAMESPACES: &[&str] = &[LAMBDA_NAMESPACE];
+/// What shows that is the form a refusal of such a call closes with. A `Task` denied
+/// `lambda:InvokeFunction` reports a cause closing with the earlier client's metadata: the
+/// service as that client names it ([`Api::sdk_client`]), the fields semicolon-separated, the
+/// code the answer named the class by, the refused request and `Proxy: null`, with no attempt
+/// count beside them. That holds whether the `Resource` names the function's ARN or the
+/// optimized `lambda:invoke` integration, which are the same call; the same invocation named
+/// through the AWS SDK family (`arn:aws:states:::aws-sdk:lambda:invoke`) is made with the
+/// current SDK and carries its form instead.
+fn current_sdk_serves(family: Family) -> bool {
+    matches!(family, Family::AwsSdk)
+}
 
 /// The field an SDK exception's own metadata names the status the answer carried by.
 const SDK_STATUS_FIELD: &str = "Status Code: ";

@@ -159,10 +159,11 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
             parameters: json!({ "FunctionName": absent_function.clone(), "Payload": {} }),
             error: "Lambda.ResourceNotFoundException",
             carries: vec![
-                // The Lambda integration is served by that same current SDK, so its
-                // rendering names the service as the SDK does and carries no error code:
-                // the CLASS is what the error name reports.
-                "(Service: Lambda, Status Code: 404, Request ID: ".to_string(),
+                // The Lambda integration is served by the earlier generation of client, so
+                // its rendering names the service as that client is named and states the
+                // code the answer named the class by.
+                "(Service: AWSLambda; Status Code: 404; Error Code: ResourceNotFoundException;"
+                    .to_string(),
             ],
         },
     ];
@@ -199,10 +200,9 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
         }
         // Every one of them is the rendering of an SDK exception, which ends in the
         // metadata the answer carried — closed as the client that made this row's call
-        // closes it: the current AWS SDK for the AWS SDK family and for the Lambda
-        // integration, the earlier generation of client for every other one.
-        let closing = match row.resource.contains(":aws-sdk:") || row.resource.contains(":lambda:")
-        {
+        // closes it: the current AWS SDK for the AWS SDK family, the earlier generation of
+        // client for every optimized `Resource`.
+        let closing = match row.resource.contains(":aws-sdk:") {
             true => ") (SDK Attempt Count: 1)",
             false => "; Proxy: null)",
         };

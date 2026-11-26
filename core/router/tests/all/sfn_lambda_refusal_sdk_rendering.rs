@@ -41,14 +41,16 @@
 //! nothing here is a second copy of either. (That suite's own reader of a history's causes
 //! signs for the Region ITS harness runs in, so the reading below is this harness's.)
 //!
-//! The metadata a refusal of a Lambda call closes with is the CURRENT AWS SDK's — the
-//! service as that SDK's own client names it, the status and the refused request in ONE
-//! group of comma-separated fields, then a group naming how many attempts the call took —
-//! because that is the client Step Functions' Lambda integration is served through,
-//! whichever form the `Resource` named the invocation in. It names no error code and no
-//! proxy, and the class the task reports is still the invoked service's base exception for
-//! a code no shape of the invoked operation's model declares: the recorded cause of such a
-//! refusal names that base exception beside this rendering, so the two stand together.
+//! The metadata a refusal of a Lambda call closes with is the EARLIER generation of
+//! client's: that client's own name for the service, the status, the code the answer named
+//! the class by, the refused request and `Proxy: null`, semicolon-separated and with no
+//! attempt count, because that is the client Step Functions' Lambda integration is served
+//! through, whichever form the optimized `Resource` named the invocation in. The same call
+//! named through the AWS SDK family is made with the current SDK, whose group of
+//! comma-separated fields names no error code and counts the attempts instead. The class the
+//! task reports is the invoked service's base exception for a code no shape of the invoked
+//! operation's model declares: the recorded cause of such a refusal names that base
+//! exception beside this rendering, so the two stand together.
 
 use serde_json::{json, Value};
 
@@ -78,9 +80,15 @@ const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The error a `Task` reports for a class no shape of `Invoke`'s model declares: Lambda's
 /// base SDK exception, under the name the client that made the call writes for the
-/// service — which is the same name whichever form named it, that SDK serving the Lambda
-/// integration and the AWS SDK family alike.
+/// service — which is the same name whichever form named it, the optimized integration and
+/// the AWS SDK family alike.
 const LAMBDA_BASE_EXCEPTION: &str = "Lambda.AWSLambdaException";
+
+/// The name the client the OPTIMIZED Lambda integration is served through gives the service,
+/// and the name the current AWS SDK's own client gives it for the AWS SDK family.
+const LAMBDA_CLIENT: &str = "AWSLambda";
+/// See [`LAMBDA_CLIENT`].
+const LAMBDA_SDK_CLIENT: &str = "Lambda";
 
 /// The text an SDK exception names the status of the answer it came back from after.
 const NAMES_THE_STATUS: &str = "Status Code: ";
@@ -179,7 +187,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": denied_function.clone(), "Payload": {} }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "Lambda",
+            client: LAMBDA_CLIENT,
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -191,7 +199,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": "answered-denied" }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "Lambda",
+            client: LAMBDA_CLIENT,
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -202,7 +210,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": format!("{ACCOUNT}:function:answered-denied") }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "Lambda",
+            client: LAMBDA_CLIENT,
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -214,20 +222,20 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: denied_function.clone(),
             parameters: json!({}),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "Lambda",
+            client: LAMBDA_CLIENT,
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
         },
         Row {
             // The AWS SDK family makes the same call on the same resource, so the answer
-            // it stands in for carries the same status and the same code — and the same
-            // client renders it, that SDK serving the Lambda integration too.
+            // it stands in for carries the same status and the same code — rendered by the
+            // current SDK, which is the client THAT family is served through.
             case: "the same invocation through the AWS SDK integration",
             resource: "arn:aws:states:::aws-sdk:lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": denied_function.clone(), "Payload": {} }),
             error: LAMBDA_BASE_EXCEPTION,
-            client: "Lambda",
+            client: LAMBDA_SDK_CLIENT,
             code: REFUSAL_CODE,
             status: FORBIDDEN,
             refused: Some((INVOKE_ACTION, denied_function.clone())),
@@ -265,7 +273,7 @@ async fn a_refused_task_reports_the_invoked_services_own_answer() {
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": granted_function.clone(), "Payload": {} }),
             error: "Lambda.ResourceNotFoundException",
-            client: "Lambda",
+            client: LAMBDA_CLIENT,
             code: NOT_FOUND_CODE,
             status: NOT_FOUND,
             refused: None,

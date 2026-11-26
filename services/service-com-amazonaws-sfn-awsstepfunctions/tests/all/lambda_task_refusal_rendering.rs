@@ -2,25 +2,25 @@
 
 //! End-to-end tests for the METADATA a refused `Task` state's cause closes with, driven
 //! over both services' own wire protocols through the production `MultiServiceRouter` with
-//! Step Functions and IAM mounted on ONE engine — the shape `core/router/src/lib.rs`
-//! mounts them in — so the policies the call is judged against are the documents IAM's own
+//! Step Functions and IAM mounted on ONE engine, the shape `core/router/src/lib.rs` mounts
+//! them in, so the policies the call is judged against are the documents IAM's own
 //! handlers wrote.
 //!
 //! RULE: a failed `Task`'s cause carries the invoked service's exception as the client that
-//! made the call RENDERS it, and which client that is belongs to the integration rather
-//! than to the family. The Lambda integration is served by the current AWS SDK, whose
-//! message closes with ONE group of comma-separated fields — the service as that SDK names
-//! it, the status and the refused request — followed by a group naming how many attempts
-//! the call took, and names neither an error code nor a proxy. An integration served by the
-//! earlier generation of client closes with semicolon-separated fields instead: that
-//! client's own name for the service, the status, the code the answer named the class by,
-//! the refused request and `Proxy: null`.
+//! made the call RENDERS it, and which client that is follows from the integration FAMILY.
+//! An OPTIMIZED integration is served by the earlier generation of client, whose message
+//! closes with SEMICOLON-separated fields: that client's own name for the service, the
+//! status, the code the answer named the class by, the refused request and `Proxy: null`,
+//! with no attempt count. The AWS SDK family is served by the current AWS SDK, whose
+//! message closes with ONE group of comma-separated fields (the service as that SDK names
+//! it, the status and the refused request) followed by a group naming how many attempts the
+//! call took, and names neither an error code nor a proxy.
 //!
 //! The rows differ along what the rule generalises over: the FORM the `Resource` names the
 //! call by (a Lambda function's ARN invoked directly, the optimized `lambda:invoke`
-//! integration, and the same call through the AWS SDK family), and — as the control that
-//! keeps the rule from being "every cause is rendered that way" — one integration of
-//! another service, which still reports the earlier client's form.
+//! integration, and the same call through the AWS SDK family, which is the control that
+//! keeps the rule from being "every cause is rendered one way"), and the SERVICE the call is
+//! made to, one optimized integration of another service beside Lambda's.
 //!
 //! Only the DENIED side is here: the call is refused before it is made, so no target
 //! service has to be mounted for the rendering to be observed.
@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 use crate::state_machine_lifecycle::REGION;
-use crate::task_execution_role::{masked, Chain, REQUEST_ID};
+use crate::task_execution_role::{masked, Chain, ACCESS_DENIED_CODE, REQUEST_ID};
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
@@ -86,9 +86,10 @@ fn definition(resource: &str, parameters: &Value) -> String {
     .to_string()
 }
 
-/// A refused Lambda `Task` reports its cause as the current AWS SDK renders an exception,
-/// whichever form its `Resource` named the invocation by; an integration served by the
-/// earlier client still reports that client's form.
+/// A refused `Task` reports its cause as the client its integration is served through
+/// renders an exception: the earlier client's form for an optimized `Resource`, whichever
+/// form that `Resource` named a Lambda invocation by, and the current SDK's form for the
+/// AWS SDK family.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_is_rendered_by_the_client_its_integration_is_served_through() {
     let chain = Chain::new();
@@ -118,16 +119,18 @@ async fn a_refusal_is_rendered_by_the_client_its_integration_is_served_through()
             resource: function_arn.clone(),
             parameters: json!({ "event": "ignored" }),
             error: "Lambda.AWSLambdaException",
-            metadata: current_sdk_metadata("Lambda", FORBIDDEN),
+            metadata: earlier_client_metadata("AWSLambda", ACCESS_DENIED_CODE, FORBIDDEN),
         },
         Row {
             case: "the optimized lambda:invoke integration",
             resource: "arn:aws:states:::lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
             error: "Lambda.AWSLambdaException",
-            metadata: current_sdk_metadata("Lambda", FORBIDDEN),
+            metadata: earlier_client_metadata("AWSLambda", ACCESS_DENIED_CODE, FORBIDDEN),
         },
         Row {
+            // The control: the same invocation named through the OTHER family is made with
+            // the current SDK, whose rendering names no error code and counts the attempts.
             case: "the same invocation through the AWS SDK integration family",
             resource: "arn:aws:states:::aws-sdk:lambda:invoke".to_string(),
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
@@ -135,8 +138,8 @@ async fn a_refusal_is_rendered_by_the_client_its_integration_is_served_through()
             metadata: current_sdk_metadata("Lambda", FORBIDDEN),
         },
         Row {
-            // The control: an optimized integration of a service whose client is of the
-            // earlier generation reports that client's own rendering.
+            // Another service's optimized integration, whose own front door names an
+            // authorization refusal by a code of its own.
             case: "an optimized send to a queue, served by the earlier client",
             resource: "arn:aws:states:::sqs:sendMessage".to_string(),
             parameters: json!({ "QueueUrl": queue_url, "MessageBody": "hello" }),
@@ -189,11 +192,12 @@ async fn a_refusal_is_rendered_by_the_client_its_integration_is_served_through()
     }
 }
 
-/// The group the current SDK's rendering names the attempt count in is not optional: a
-/// client that made the call once still reports it, and the earlier client's fields —
-/// an error code and a proxy — appear in neither Lambda cause.
+/// The fields the earlier client's rendering names are not optional: a denied Lambda
+/// invocation carries the answered error code and the proxy, so the denial is identifiable
+/// by its code from the cause alone, and the attempt count the other rendering writes
+/// appears in neither Lambda cause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_lambda_refusal_names_the_attempts_and_no_error_code_or_proxy() {
+async fn a_lambda_refusal_names_its_error_code_and_proxy_and_no_attempt_count() {
     let chain = Chain::new();
     let function_arn = format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:handler");
     let role_arn = chain
@@ -238,22 +242,25 @@ async fn a_lambda_refusal_names_the_attempts_and_no_error_code_or_proxy() {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        assert!(
-            cause.contains("(SDK Attempt Count: 1)"),
-            "case {case:?}: expected the cause to name how many attempts the call took, got \
-             {cause:?}"
-        );
-        for absent in ["Error Code:", "Proxy: null", "AWSLambda"] {
+        for named in [
+            // The denial's own code is what a client classifying the failure reads.
+            format!("Error Code: {ACCESS_DENIED_CODE}"),
+            "Proxy: null".to_string(),
+        ] {
             assert!(
-                !cause.contains(absent),
-                "case {case:?}: expected the cause not to carry {absent:?}, got {cause:?}"
+                cause.contains(&named),
+                "case {case:?}: expected the cause to carry {named:?}, got {cause:?}"
             );
         }
         assert!(
+            !cause.contains("SDK Attempt Count"),
+            "case {case:?}: expected no attempt count, got {cause:?}"
+        );
+        assert!(
             cause.contains(&format!(
-                " (Service: Lambda, Status Code: {FORBIDDEN}, Request ID: "
+                " (Service: AWSLambda; Status Code: {FORBIDDEN}; Error Code: "
             )),
-            "case {case:?}: expected the current SDK's own metadata, got {cause:?}"
+            "case {case:?}: expected the earlier client's own metadata, got {cause:?}"
         );
         assert_eq!(
             described.get("error").and_then(Value::as_str),

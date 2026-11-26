@@ -186,9 +186,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
             refusal_code: ACCESS_DENIED_CODE,
-            // The Lambda integration is served by the current AWS SDK, which names the
-            // service as its own client does.
-            service: "Lambda",
+            // The Lambda integration is served by the earlier generation of client, which
+            // names the service as that client is named.
+            service: "AWSLambda",
             status: FORBIDDEN,
         },
         Row {
@@ -213,7 +213,7 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
             refusal_code: ACCESS_DENIED_CODE,
-            service: "Lambda",
+            service: "AWSLambda",
             status: FORBIDDEN,
         },
         Row {
@@ -225,7 +225,7 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: function_arn,
             refusal_error: "Lambda.AWSLambdaException",
             refusal_code: ACCESS_DENIED_CODE,
-            service: "Lambda",
+            service: "AWSLambda",
             status: FORBIDDEN,
         },
         Row {

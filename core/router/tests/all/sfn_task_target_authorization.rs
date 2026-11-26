@@ -121,13 +121,13 @@ pub(crate) fn masked(cause: &str) -> String {
 /// through the current AWS SDK, whose exception message closes with ONE group of
 /// COMMA-separated fields — the service as that SDK's own client names it, the status and
 /// the refused request — and then a second group naming how many attempts the call took.
-/// An OPTIMIZED `Resource` is served by the client that integration carries, and those are
-/// not all of one generation: the Lambda integration — the optimized `lambda:invoke` and a
-/// function's own ARN, which is the same call — is served by that same current SDK, while
-/// every other one here is served by the earlier generation of client, whose message closes
-/// with SEMICOLON-separated fields: that client's own name, the status, the code the answer
-/// named the class by, the refused request, and the proxy the call went through — there is
-/// none, so `Proxy: null`.
+/// An OPTIMIZED `Resource` is served by the client that integration carries, and every one
+/// of those is the EARLIER generation of client, whose message closes with
+/// SEMICOLON-separated fields: that client's own name, the status, the code the answer named
+/// the class by, the refused request, and the proxy the call went through (there is none, so
+/// `Proxy: null`), and no attempt count. The Lambda integration is one of them, whether the
+/// `Resource` names the optimized `lambda:invoke` or the function's own ARN, which is the
+/// same call.
 ///
 /// `service` is the name the client of `resource`'s own integration gives the invoked
 /// service, which is not the same name for both generations.
@@ -137,10 +137,9 @@ pub(crate) fn refusal_metadata(
     code: &str,
     status: u16,
 ) -> String {
-    // The AWS SDK family is that SDK whichever service it calls, and so is the Lambda
-    // integration — whether the `Resource` names `lambda:invoke` or the function's own ARN,
-    // both of which carry that service's `lambda` namespace.
-    match resource.contains(":aws-sdk:") || resource.contains(":lambda:") {
+    // The AWS SDK family is that SDK whichever service it calls; every optimized
+    // `Resource`, Lambda's included, is served by the earlier generation of client instead.
+    match resource.contains(":aws-sdk:") {
         true => format!(
             " (Service: {service}, Status Code: {status}, Request ID: {REQUEST_ID}) \
              (SDK Attempt Count: 1)"
@@ -593,9 +592,9 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
             action: "lambda:InvokeFunction",
             code: REFUSAL_CODE,
-            // The Lambda integration is served by the current AWS SDK, which names the
-            // service as its own client does.
-            service: "Lambda",
+            // The Lambda integration is served by the earlier generation of client, which
+            // names the service as that client is named.
+            service: "AWSLambda",
             refusal_error: "Lambda.AWSLambdaException",
         },
         Row {
@@ -615,7 +614,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             parameters: json!({ "FunctionName": "absent-handler" }),
             action: "lambda:InvokeFunction",
             code: REFUSAL_CODE,
-            service: "Lambda",
+            service: "AWSLambda",
             refusal_error: "Lambda.AWSLambdaException",
         },
     ];

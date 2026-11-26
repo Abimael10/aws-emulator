@@ -84,9 +84,9 @@ const UNRELATED_ACTION: &str = "logs:PutLogEvents";
 const REFUSED_ERROR: &str = "Lambda.AWSLambdaException";
 
 /// The name the metadata of that refusal gives the invoked service, as the client Step
-/// Functions' Lambda integration is served through — the current AWS SDK — writes it, with
-/// the fields of that rendering separated by commas.
-const REFUSED_SERVICE: &str = "Service: Lambda,";
+/// Functions' Lambda integration is served through writes it: the earlier generation of
+/// client, whose own name the service carries and whose fields are separated by semicolons.
+const REFUSED_SERVICE: &str = "Service: AWSLambda;";
 
 /// The status that answer came back with: an authorization refusal of `Invoke` is the
 /// service-common `AccessDeniedException`, served as a Forbidden.

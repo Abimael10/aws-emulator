@@ -59,8 +59,14 @@ const UNRELATED_ACTION: &str = "logs:PutLogEvents";
 /// com-amazonaws-lambda-awsgirapiservice.json")`). Both families name the service `Lambda`.
 const REFUSED_ERROR: &str = "Lambda.AWSLambdaException";
 
-/// The name the client each family is served by gives Lambda in the metadata of a refusal.
-const REFUSAL_SERVICE: &str = "Lambda";
+/// The name the client each form is served by gives Lambda in the metadata of a refusal:
+/// the earlier generation of client serves every optimized form (the integration token and
+/// the function's own ARN, which are the same call) and names the service as that client is
+/// named, while the AWS SDK family is served by the current SDK, which names it as that
+/// SDK's own client does.
+const REFUSAL_SERVICE: &str = "AWSLambda";
+/// See [`REFUSAL_SERVICE`].
+const SDK_REFUSAL_SERVICE: &str = "Lambda";
 
 /// The status Lambda answers an unauthorized call with.
 const FORBIDDEN: u16 = 403;
@@ -253,7 +259,10 @@ fn expected_cause(session: &str, named: Named, function: &str, because: &str) ->
          {function} {because}{}",
         refusal_metadata(
             &named.resource(function),
-            REFUSAL_SERVICE,
+            match named {
+                Named::AwsSdk => SDK_REFUSAL_SERVICE,
+                Named::FunctionArn | Named::Optimized => REFUSAL_SERVICE,
+            },
             ACCESS_DENIED_CODE,
             FORBIDDEN,
         )

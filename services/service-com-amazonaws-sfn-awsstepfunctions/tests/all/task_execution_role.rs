@@ -111,13 +111,13 @@ pub(crate) fn masked(cause: &str) -> String {
 /// through the current AWS SDK, whose exception message closes with ONE group of
 /// COMMA-separated fields — the service as that SDK's own client names it, the status and
 /// the refused request — and then a second group naming how many attempts the call took.
-/// An OPTIMIZED `Resource` is served by the client that integration carries, and those are
-/// not all of one generation: the Lambda integration — the optimized `lambda:invoke` and a
-/// function's own ARN, which is the same call — is served by that same current SDK, while
-/// every other one here is served by the earlier generation of client, whose message closes
-/// with SEMICOLON-separated fields: that client's own name, the status, the code the answer
-/// named the class by, the refused request, and the proxy the call went through — there is
-/// none, so `Proxy: null`.
+/// An OPTIMIZED `Resource` is served by the client that integration carries, and every one
+/// of those is the EARLIER generation of client, whose message closes with
+/// SEMICOLON-separated fields: that client's own name, the status, the code the answer named
+/// the class by, the refused request, and the proxy the call went through (there is none, so
+/// `Proxy: null`), and no attempt count. The Lambda integration is one of them, whether the
+/// `Resource` names the optimized `lambda:invoke` or the function's own ARN, which is the
+/// same call.
 ///
 /// `service` is the name the client of `resource`'s own integration gives the invoked
 /// service, which is not the same name for both generations.
@@ -140,11 +140,10 @@ pub(crate) fn refusal_metadata(
 }
 
 /// Whether the client the call `resource` names is made with is the CURRENT AWS SDK: the
-/// AWS SDK family is that SDK whichever service it calls, and so is the Lambda
-/// integration — whether the `Resource` names the optimized `lambda:invoke` or the
-/// function's own ARN, both of which carry that service's `lambda` namespace.
+/// AWS SDK family is that SDK whichever service it calls, and every optimized `Resource`,
+/// Lambda's included, is served by the earlier generation of client instead.
 fn current_sdk_renders(resource: &str) -> bool {
-    resource.contains(":aws-sdk:") || resource.contains(":lambda:")
+    resource.contains(":aws-sdk:")
 }
 
 /// A child definition that finishes at once.
