@@ -19,7 +19,8 @@
 //!
 //! * a type whose resources carry a policy plane ([`POLICY_CARRYING_TARGETS`]),
 //!   resolving to a resource this service holds — the policy is stored, read or
-//!   removed;
+//!   removed (a read of a resource carrying none is answered, not refused: see
+//!   [`resource_policy_not_found`]);
 //! * such a type naming no resource this service holds — the modelled 404: create
 //!   the resource, or address one that exists;
 //! * another resource type OF THIS SERVICE ([`AGENTCORE_RESOURCE_TYPES`]) — the
@@ -120,17 +121,24 @@ pub enum ResourcePolicyTarget {
     Unrecognized,
 }
 
-/// The modelled not-found error for a resource policy this service does not
-/// hold, in the words AWS answers a policy lookup that resolves no document
-/// with ("Resource Policy doesn't exist for requested arn").
+/// The modelled not-found error for the REMOVAL of a resource policy this
+/// service does not hold, in the words AWS answers it with ("Resource Policy
+/// doesn't exist for requested arn").
 ///
 /// The sentence has no variable part: it names the ARN the request asked under
 /// rather than quoting the caller's own value, so one answer covers every
 /// resource of this service that carries no policy.
 ///
-/// It is NOT the answer for an ARN that names no resource at all — that one is
-/// [`resource_arn_not_found`]: the two conditions have different remedies (write
-/// a policy, versus address a resource that exists), so they are worded apart.
+/// It belongs to `DeleteResourcePolicy` alone — the operation whose whole effect
+/// is to remove the document, so an absent one leaves it nothing to do. The READ
+/// of an absent document is no refusal at all: `GetResourcePolicy` reports it by
+/// omitting its optional `policy` member, so a client can tell "no policy yet"
+/// from "no such resource".
+///
+/// It is also NOT the answer for an ARN that names no resource at all — that one
+/// is [`resource_arn_not_found`]: the two conditions have different remedies
+/// (write a policy, versus address a resource that exists), so they are worded
+/// apart.
 pub fn resource_policy_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some("Resource Policy doesn't exist for requested arn".to_string()),

@@ -188,15 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
+        // The document is what this read REPORTS, and the output member that
+        // carries it is optional (`policy`, `ResourcePolicyBody`, no `@required`
+        // — `smithy_query(query="operation",operation="GetResourcePolicy")`), so
+        // a resource that exists and carries no document is reported rather than
+        // refused: the member is simply absent. "No policy yet" is the answer a
+        // client probes for, a different condition from "no such resource" (the
+        // modelled 404 above) and from the removal of a document that was never
+        // there, which only `DeleteResourcePolicy` refuses.
         let policy = store.resource_policy(&target).map(str::to_string);
-        let policy = policy.ok_or_else(|| {
-            GetResourcePolicyErrorModeled::ResourceNotFoundException(
-                crate::state::resource_policy_not_found(),
-            )
-        })?;
 
-        Ok(GetResourcePolicyOutput {
-            policy: Some(policy),
-        })
+        Ok(GetResourcePolicyOutput { policy })
     }
 }

@@ -11,14 +11,15 @@
 //! The rule under test: a resource-based policy is the ONE document attached to the
 //! resource its ARN names, so `PutResourcePolicy` stores (and replaces) that document on a
 //! resource this service holds and reports it back, `GetResourcePolicy` reports exactly the
-//! stored document, `DeleteResourcePolicy` removes it, and an ARN that names no resource of
-//! a type the feature covers — or a resource carrying no policy — is the modelled 404.
+//! stored document — or answers with its optional member absent when the resource carries
+//! none — `DeleteResourcePolicy` removes it, and an ARN that names no resource of a type the
+//! feature covers is the modelled 404.
 //!
 //! A refusal is worded by the plane that owns the condition: an unresolvable `resourceArn`
 //! is answered in the resource-policy plane's OWN fixed sentence, echoing no part of the
 //! request and never carrying another resource family's lookup sentence or its retry
 //! guidance, whichever of the three operations was asked; a resource this service HOLDS that
-//! carries no document is the separate, differently-worded condition.
+//! carries no document is the separate condition, refused only by the removal.
 
 use std::sync::Arc;
 
@@ -39,8 +40,9 @@ const ACCOUNT: &str = "000000000000";
 /// `smithy_query(query="shape", shape="ResourcePolicyBody")`).
 const MAX_POLICY_LEN: usize = 20_480;
 
-/// How a policy lookup that resolves no document is worded, for a resource this service
-/// HOLDS that carries none.
+/// How a policy REMOVAL that resolves no document is worded, for a resource this service
+/// HOLDS that carries none. The read of the same resource is no refusal at all: it answers
+/// 200 with its optional `policy` member absent.
 const POLICY_MISSING: &str = "Resource Policy doesn't exist for requested arn";
 
 /// How every resource-policy operation words a `resourceArn` that names no resource a
@@ -417,14 +419,14 @@ async fn a_resource_policy_round_trips_on_every_covered_resource() {
             "case {case:?}: expected HTTP 204 from DeleteResourcePolicy, got {status} ({removed})"
         );
 
-        // The document is gone, so the resource carries no policy any more.
+        // The document is gone, so the resource carries no policy any more: the read
+        // still answers for the resource that exists, with the optional member absent.
         let (status, answer) = get_policy(&router, &arn, REGION).await;
         assert_eq!(
-            (status, error_code(&answer).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: a read after the delete is the modelled 404, got {status} {} \
-             ({answer})",
-            error_code(&answer)
+            (status, answer.get("policy").cloned()),
+            (200, None),
+            "case {case:?}: a read after the delete answers with no policy member, got \
+             {status} ({answer})"
         );
 
         // The resource itself is untouched by the policy's removal, so it takes a new
@@ -737,30 +739,24 @@ async fn the_resource_policy_operations_refuse_what_the_model_states_they_must()
         }
     }
 
-    // A resource this service holds that carries no policy: there is no document to report
-    // or to remove, in the one sentence a policy lookup that resolves nothing answers.
-    for (case, (status, answer)) in [
-        (
-            "GetResourcePolicy on a resource carrying no policy",
-            get_policy(&router, &gateway, REGION).await,
-        ),
-        (
-            "DeleteResourcePolicy on a resource carrying no policy",
-            delete_policy(&router, &gateway, REGION).await,
-        ),
-    ] {
-        assert_eq!(
-            (status, error_code(&answer).as_str(), text(&answer, "message")),
-            (
-                404,
-                "ResourceNotFoundException",
-                POLICY_MISSING.to_string()
-            ),
-            "case {case:?}: expected HTTP 404 ResourceNotFoundException {POLICY_MISSING:?}, got \
-             {status} {} ({answer})",
-            error_code(&answer)
-        );
-    }
+    // A resource this service holds that carries no policy: the READ answers for it with
+    // its optional member absent, and only the REMOVAL — which has nothing to remove — is
+    // refused, in the one sentence that condition is worded in.
+    let (status, answer) = get_policy(&router, &gateway, REGION).await;
+    assert_eq!(
+        (status, answer.get("policy").cloned()),
+        (200, None),
+        "case \"GetResourcePolicy on a resource carrying no policy\": expected HTTP 200 with no \
+         policy member, got {status} ({answer})"
+    );
+    let (status, answer) = delete_policy(&router, &gateway, REGION).await;
+    assert_eq!(
+        (status, error_code(&answer).as_str(), text(&answer, "message")),
+        (404, "ResourceNotFoundException", POLICY_MISSING.to_string()),
+        "case \"DeleteResourcePolicy on a resource carrying no policy\": expected HTTP 404 \
+         ResourceNotFoundException {POLICY_MISSING:?}, got {status} {} ({answer})",
+        error_code(&answer)
+    );
 
     // The published length range of the document, at each bound and one past it:
     // `ResourcePolicyBody` is `len 1..20480`.

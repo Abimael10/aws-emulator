@@ -38,8 +38,9 @@ const REGION: &str = "us-east-1";
 /// the principal a denial names is the account's own published credential.
 const KEY_ID: &str = "AKIDEXAMPLE";
 
-/// How a policy lookup that resolves no document is worded, for a resource this service
-/// HOLDS that carries none.
+/// How a policy REMOVAL that resolves no document is worded, for a resource this service
+/// HOLDS that carries none. The read of the same resource is no refusal: it answers 200 with
+/// its optional `policy` member absent.
 const POLICY_MISSING: &str = "Resource Policy doesn't exist for requested arn";
 
 /// How every resource-policy operation words a `resourceArn` of a policy-carrying type that
@@ -308,9 +309,15 @@ async fn a_policy_round_trips_on_every_policy_carrying_resource_type() {
         );
         let (status, gone) = get_policy(&router, &arn).await;
         assert_eq!(
-            (status, error_code(&gone).as_str(), text(&gone, "message")),
-            (404, "ResourceNotFoundException", POLICY_MISSING.to_string()),
+            (status, gone.get("policy").cloned()),
+            (200, None),
             "case {case:?}: expected the removed document to be gone, got {status} ({gone})"
+        );
+        let (status, again) = delete_policy(&router, &arn).await;
+        assert_eq!(
+            (status, error_code(&again).as_str(), text(&again, "message")),
+            (404, "ResourceNotFoundException", POLICY_MISSING.to_string()),
+            "case {case:?}: expected a second delete to be refused, got {status} ({again})"
         );
     }
 }
@@ -574,11 +581,12 @@ async fn an_arn_naming_no_resource_type_of_this_service_is_denied() {
         }
     }
 
-    // A denied call stored nothing either: the gateway still carries no policy.
+    // A denied call stored nothing either: the gateway still carries no policy, which the
+    // read reports by answering with its optional member absent.
     let (status, answer) = get_policy(&router, &gateway).await;
     assert_eq!(
-        (status, error_code(&answer).as_str(), text(&answer, "message")),
-        (404, "ResourceNotFoundException", POLICY_MISSING.to_string()),
+        (status, answer.get("policy").cloned()),
+        (200, None),
         "case \"the gateway after every denial\": expected it to carry no policy, got {status} \
          ({answer})"
     );
