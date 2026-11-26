@@ -28,8 +28,10 @@
 //!   for `sts:AssumeRoleWithSAML` with the `saml:` condition keys the response answers for;
 //!   otherwise `AccessDenied`.
 //!
-//! The inline session policy is parsed AFTER the trust policy decides, so a caller who
-//! cannot assume the role learns nothing about it from a deliberately malformed policy.
+//! The inline session policy is parsed BEFORE any of that: it is a member of the request,
+//! so a document that is not a JSON policy document is refused with
+//! `MalformedPolicyDocument` and the parser's own diagnostic rather than as a defect of the
+//! response the request presents.
 //!
 //! ## Shape of an operation
 //!
@@ -303,9 +305,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::saml::{self, AssertionDefect};
         use crate::state::{
             packed_policy_bytes, packed_policy_size, packed_policy_too_large_message,
-            parse_role_arn, policy_document_error, sts_arn, Identity, NewSession, SessionKind,
-            SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS, MAX_MANAGED_SESSION_POLICIES,
-            SESSION_TOKEN_SIZE_LIMIT,
+            parse_role_arn, relayed_policy_document_error, sts_arn, Identity, NewSession,
+            SessionKind, SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
+            MAX_MANAGED_SESSION_POLICIES, SESSION_TOKEN_SIZE_LIMIT,
         };
 
         let now = ::std::time::SystemTime::now();
@@ -329,6 +331,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  arn:<partition>:iam::<account>:role/<name>",
                 input.role_arn
             )));
+        }
+
+        // The inline session policy is part of the REQUEST, and it is read before anything
+        // about the identity the request presents: a document that is not a JSON policy
+        // document is refused with the parser's own diagnostic
+        // (`crate::state::relayed_policy_document_error`) whether or not the account holds
+        // the provider named and whether or not the response verifies, because a caller is
+        // told to fix the document it built rather than to fetch another assertion.
+        if let Some(why) = input
+            .policy
+            .as_deref()
+            .and_then(relayed_policy_document_error)
+        {
+            return Err(AssumeRoleWithSAMLErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException { message: Some(why) },
+            )
+            .into());
         }
 
         // The RESPONSE is what this caller is, and it is decided next: it is verified against
@@ -375,16 +394,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 SAML_NOT_AUTHORIZED_MESSAGE,
             ));
         };
-
-        // The session policies are read only now: authorization is decided before the
-        // request's own policy document is parsed, so a caller who cannot assume the role is
-        // told that rather than told its policy is malformed.
-        if let Some(why) = input.policy.as_deref().and_then(policy_document_error) {
-            return Err(AssumeRoleWithSAMLErrorModeled::MalformedPolicyDocumentException(
-                MalformedPolicyDocumentException { message: Some(why) },
-            )
-            .into());
-        }
 
         // The managed session policies a mint may name are capped by the operation's
         // documentation, not by the model's list shape, so the refusal is STS's own sentence

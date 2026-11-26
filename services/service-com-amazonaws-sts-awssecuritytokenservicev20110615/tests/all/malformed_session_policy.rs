@@ -7,7 +7,7 @@
 //!
 //! The rules under test, over every operation that takes an inline session policy
 //! (`AssumeRole` and `GetFederationToken`) — the wording follows the document's defect,
-//! not the operation it was passed to:
+//! and only the class that ran out of input follows the operation it was passed to:
 //!
 //! * a document whose parse stopped ON a character is reported with that character and
 //!   its character code, what the parser expected in its place, and the line and column
@@ -16,9 +16,11 @@
 //! * the reported position names the reported character: the column is that
 //!   character's position on the reported line of the submitted document;
 //! * a document that merely RAN OUT of input — it ends while a value, object, array or
-//!   string is still open, so there is no offending character and nothing specific to
-//!   describe — is refused with one fixed sentence, every part of it fixed text, with
-//!   no character, no position and nothing else of the request in it;
+//!   string is still open, so there is no offending character — is the ONE class
+//!   `GetFederationToken` words as a sentence of its own: one fixed sentence, every part of
+//!   it fixed text, with no character, no position and nothing else of the request in it
+//!   (the role-assumption mints relay their parser's diagnostic for that class too, which
+//!   `relayed_session_policy_diagnostic.rs` owns);
 //! * the refusal never echoes the submitted document back;
 //! * a document that parses but is not a JSON object is refused naming the JSON type
 //!   it carries instead;
@@ -32,8 +34,8 @@ use crate::sts_sessions::{call, element, emulator, member, LONG_TERM_KEY};
 /// The role every `AssumeRole` row here assumes.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/demo";
 
-/// The sentence a document that ran out of input is refused with, spelled out here
-/// rather than read off the service.
+/// The sentence `GetFederationToken` refuses a document that ran out of input with,
+/// spelled out here rather than read off the service.
 const RAN_OUT_SENTENCE: &str = "Syntax errors in policy.";
 
 /// The two operations that take an inline session policy, with the other parameters
@@ -294,15 +296,20 @@ async fn an_unparseable_session_policy_is_refused_describing_the_parse_failure()
     }
 }
 
-/// A document that ran out of input is refused with exactly one fixed sentence,
-/// whatever ran out and wherever it did: no offending character, no position, and
-/// nothing else of the request in the message.
+/// A document that ran out of input is refused by `GetFederationToken` with exactly one
+/// fixed sentence, whatever ran out and wherever it did: no offending character, no
+/// position, and nothing else of the request in the message.
 #[tokio::test]
 async fn a_session_policy_that_ran_out_of_input_is_refused_with_one_fixed_sentence() {
     let (router, engine) = emulator();
     let (_role_arn, _role_id) = super::sts_sessions::seed_demo_role(&engine);
+    // This operation only: a role assumption relays its parser's diagnostic for this class
+    // as it does for every other (`relayed_session_policy_diagnostic.rs`).
+    let operations = policy_operations()
+        .into_iter()
+        .filter(|(action, _)| *action == "GetFederationToken");
 
-    for (action, base_params) in policy_operations() {
+    for (action, base_params) in operations {
         for (row, policy) in documents_that_ran_out() {
             let case = format!("{action}: {row}");
             let mut params = base_params.clone();

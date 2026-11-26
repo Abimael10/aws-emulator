@@ -1,25 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Authorization is decided BEFORE the request's own session policy is parsed.
+//! Authorization is decided BEFORE the request's own session policy is parsed, for the
+//! mints whose caller is the credential the request is SIGNED with.
 //!
-//! RULE: an operation that mints a session evaluates a request in one order — the request's
-//! SHAPE first, then WHO the caller is and whether it may make this call, and only then the
-//! session policy the request carries. So a caller that may not make the call is refused as
-//! unauthorized (`AccessDenied` / HTTP 403, and for an operation whose caller is an identity
-//! token, that token's own refusal) whatever its `Policy` says, and
-//! `MalformedPolicyDocument` / HTTP 400 is answered only to a caller that genuinely could
-//! have minted the session. Otherwise the error code itself leaks across the authorization
-//! boundary: a caller learns whether a role exists and is assumable by attaching a
-//! deliberately malformed policy, and a client that retries on `MalformedPolicyDocument`
-//! loops forever against a role it may never assume.
+//! RULE: `AssumeRole` and `GetFederationToken` evaluate a request in one order — the
+//! request's SHAPE first, then WHO the signing caller is and whether it may make this
+//! call, and only then the session policy the request carries. So a caller that may not
+//! make the call is refused as unauthorized (`AccessDenied` / HTTP 403) whatever its
+//! `Policy` says, and `MalformedPolicyDocument` / HTTP 400 is answered only to a caller
+//! that genuinely could have minted the session. Otherwise the error code itself leaks
+//! across the authorization boundary: a caller learns whether a role exists and is
+//! assumable by attaching a deliberately malformed policy, and a client that retries on
+//! `MalformedPolicyDocument` loops forever against a role it may never assume.
+//!
+//! The two ANONYMOUS federation mints (`AssumeRoleWithSAML`,
+//! `AssumeRoleWithWebIdentity`) present their caller IN the request, and they are recorded
+//! answering the other way round: the inline session policy is a member of the request and
+//! is parsed ahead of that identity material, so a malformed document earns
+//! `MalformedPolicyDocument` whatever the presented identity. That ordering, and the
+//! diagnostic the refusal carries, are `relayed_session_policy_diagnostic.rs`; the rows
+//! here pin what is left of this rule on them — a verified, admitted identity is still the
+//! one that reaches the mint.
 //!
 //! The rows differ along what the rule generalises over: which mint operation is called,
-//! what makes the caller unauthorized for it (a role the account does not hold, a role whose
-//! trust policy withholds the grant, a provider that cannot verify the presented identity, a
-//! credential class the operation does not serve), and whether the same malformed document is
-//! presented by a caller that IS authorized — the positive control that proves the target
-//! does not simply answer `AccessDenied` to everything. The recorded case — an `AssumeRole`
-//! against a role the account does not hold, with `Policy="{not valid json"` — is one row.
+//! what makes the signing caller unauthorized for it (a role the account does not hold, a
+//! role whose trust policy withholds the grant, a credential class the operation does not
+//! serve), and whether the same malformed document is presented by a caller that IS
+//! authorized — the positive control that proves the target does not simply answer
+//! `AccessDenied` to everything. The recorded case — an `AssumeRole` against a role the
+//! account does not hold, with `Policy="{not valid json"` — is one row.
 
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
@@ -235,11 +244,11 @@ async fn assume_role_and_get_federation_token_authorize_before_parsing_the_polic
     );
 }
 
-/// The federation operations, whose caller is an identity the request presents rather than a
-/// credential it signs with: the identity is decided first, then the role's trust policy, and
-/// the session policy only after both.
+/// The federation operations, whose caller is an identity the request presents rather than
+/// a credential it signs with: the session policy is parsed FIRST, and the identity and
+/// then the role's trust policy decide a request whose document parses.
 #[tokio::test]
-async fn the_federation_mints_authorize_before_parsing_the_policy() {
+async fn the_federation_mints_parse_the_policy_before_deciding_the_presented_identity() {
     let (router, _engine) = emulator_with_iam();
     let provider = IdentityProvider::mint("https://idp.example.test/saml");
     let provider_arn = create_saml_provider(&router, "ordering-idp", &provider).await;
@@ -260,7 +269,9 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
     );
 
     // One row: the case, the role the request names, the provider it names, and the status
-    // and `<Code>` the rule answers for the SAME malformed session policy.
+    // and `<Code>` the rule answers for a session policy that PARSES — a malformed document
+    // is refused before any of this is reached, whichever row it is presented on, which is
+    // the first assertion of each row below.
     let rows: Vec<(&str, String, String, u16, &str)> = vec![
         (
             "a response the named provider cannot be resolved for",
@@ -276,14 +287,6 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
             403,
             "AccessDenied",
         ),
-        (
-            // The positive control: the same document, verified and admitted.
-            "a verified response against a role that admits this provider",
-            admitted.clone(),
-            provider_arn.clone(),
-            400,
-            "MalformedPolicyDocument",
-        ),
     ];
 
     for (case, role_arn, principal_arn, expected_status, expected_code) in rows {
@@ -294,6 +297,30 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
                 ..Response::valid(&provider, &role_arn, &principal_arn)
             },
         );
+        // The SAME request with the malformed document: the document is read first, so this
+        // is the policy's refusal and not the identity's or the role's.
+        let (status, body) = unsigned_call(
+            &router,
+            "AssumeRoleWithSAML",
+            &[
+                ("RoleArn", role_arn.clone()),
+                ("PrincipalArn", principal_arn.clone()),
+                ("SAMLAssertion", assertion.clone()),
+                ("Policy", MALFORMED_POLICY.to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} with a malformed policy: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            element(&body, "Code").as_deref(),
+            Some("MalformedPolicyDocument"),
+            "case {case:?} with a malformed policy: expected the document's own refusal, got \
+             {body}"
+        );
+
         let (status, body) = unsigned_call(
             &router,
             "AssumeRoleWithSAML",
@@ -301,7 +328,7 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
                 ("RoleArn", role_arn.clone()),
                 ("PrincipalArn", principal_arn.clone()),
                 ("SAMLAssertion", assertion),
-                ("Policy", MALFORMED_POLICY.to_string()),
+                ("Policy", WELL_FORMED_POLICY.to_string()),
             ],
         )
         .await;
@@ -320,8 +347,9 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
         );
     }
 
-    // The same rule on `AssumeRoleWithWebIdentity`: the presented token is what the caller
-    // IS, so a token nothing can verify is refused as that token whatever the policy says.
+    // The same rule on `AssumeRoleWithWebIdentity`: with a document that parses, the
+    // presented token is what the caller IS, so a token nothing can verify is refused as
+    // that token.
     let (status, body) = unsigned_call(
         &router,
         "AssumeRoleWithWebIdentity",
@@ -329,7 +357,7 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
             ("RoleArn", admitted.clone()),
             ("RoleSessionName", "probe".to_string()),
             ("WebIdentityToken", "not-a-jwt".to_string()),
-            ("Policy", MALFORMED_POLICY.to_string()),
+            ("Policy", WELL_FORMED_POLICY.to_string()),
         ],
     )
     .await;
@@ -345,8 +373,8 @@ async fn the_federation_mints_authorize_before_parsing_the_policy() {
          got {body}"
     );
 
-    // ... and the SAML exchange still serves a verified, admitted response whose policy
-    // parses, so the rows above refuse the policy rather than the response.
+    // ... and the SAML exchange still serves a verified, admitted response, so the rows
+    // above refuse the request rather than everything.
     let assertion = saml_assertion(
         &provider,
         &Response::valid(&provider, &admitted, &provider_arn),

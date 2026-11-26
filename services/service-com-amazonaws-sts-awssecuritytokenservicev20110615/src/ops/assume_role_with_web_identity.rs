@@ -34,6 +34,11 @@
 //!   for `sts:AssumeRoleWithWebIdentity` with the audience and subject the token carries;
 //!   otherwise `AccessDenied`.
 //!
+//! The inline session policy is parsed BEFORE any of that: it is a member of the request,
+//! so a document that is not a JSON policy document is refused with
+//! `MalformedPolicyDocument` and the parser's own diagnostic rather than as a defect of the
+//! token the request presents.
+//!
 //! ## The session tags the exchange attaches
 //!
 //! A web identity can arrive TAGGED: an issuer that tags the identity its token names
@@ -370,8 +375,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             packed_policy_bytes, packed_policy_size, packed_policy_too_large_message,
-            parse_role_arn, policy_document_error, sts_arn, Identity, NewSession, SessionKind,
-            SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
+            parse_role_arn, relayed_policy_document_error, sts_arn, Identity, NewSession,
+            SessionKind, SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
             ATTACHED_TAG_PUBLISHED_CONDITION_KEYS, MAX_MANAGED_SESSION_POLICIES,
             SESSION_TOKEN_SIZE_LIMIT, TAG_SESSION_ACTION,
         };
@@ -387,7 +392,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = ctx.credential_store();
 
-        // The TOKEN is what this caller is, and it is decided first: the recorded behaviour
+        // The inline session policy is part of the REQUEST, and it is read before anything
+        // about the identity the request presents: a document that is not a JSON policy
+        // document is refused with the parser's own diagnostic
+        // (`crate::state::relayed_policy_document_error`) whatever the presented token is,
+        // because a caller is told to fix the document it built rather than to fetch
+        // another token.
+        if let Some(why) = input
+            .policy
+            .as_deref()
+            .and_then(relayed_policy_document_error)
+        {
+            return Err(
+                AssumeRoleWithWebIdentityErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        // The TOKEN is what this caller is, and it is decided next: the recorded behaviour
         // of a well-formed but nonexistent `RoleArn` presented with an unreadable token is
         // the token's refusal, not the role's.
         let web_identity = crate::state::web_identity::resolve(
@@ -407,10 +431,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.role_arn
             )));
         }
-
-        // An inline session policy is read only AFTER the token has been verified and the
-        // role's trust policy has decided this exchange; see the `policy_document_error`
-        // call below the authorization step.
 
         // The managed session policies a mint may name are capped by the operation's
         // documentation, not by the model's list shape, so the refusal is STS's own
@@ -497,19 +517,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(
                 not_authorized_message(TAG_SESSION_ACTION),
             ));
-        }
-
-        // The authorization boundary is behind us, so the request's OWN session policy is
-        // read now: an inline session policy must be a JSON policy document, and the refusal
-        // "describes the specific error" the submitted document has. Parsing it earlier would
-        // answer `MalformedPolicyDocument` to a caller the role does not admit at all.
-        if let Some(why) = input.policy.as_deref().and_then(policy_document_error) {
-            return Err(
-                AssumeRoleWithWebIdentityErrorModeled::MalformedPolicyDocumentException(
-                    MalformedPolicyDocumentException { message: Some(why) },
-                )
-                .into(),
-            );
         }
 
         // "By default, the temporary security credentials created by

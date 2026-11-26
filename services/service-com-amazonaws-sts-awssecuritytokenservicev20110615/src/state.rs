@@ -2659,17 +2659,22 @@ pub fn inherited_transitive_tags(
         .collect()
 }
 
-/// The whole message `GetFederationToken` answers a malformed session policy with.
+/// The whole message `GetFederationToken` answers a session policy that RAN OUT of input
+/// with.
 ///
 /// Fixed text: every part of it, so nothing of the submitted document reaches it. A
 /// document that stops while a value, object, array or string is still open has no
 /// offending character to point at — the parse ran out of input rather than meeting
-/// something it could not accept — so there is no specific error to describe and this
-/// one sentence is the whole refusal.
+/// something it could not accept — and this operation is recorded answering this one
+/// sentence for it. The ROLE-ASSUMPTION operations are recorded relaying their parser's
+/// own diagnostic for that very class instead
+/// ([`relayed_policy_document_error`]), so the sentence belongs to the operation
+/// answering it and not to the class.
 pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 
 /// Why a session policy is not a JSON policy document, as the message
-/// `MalformedPolicyDocumentException` carries — `None` when it is one.
+/// `MalformedPolicyDocumentException` carries — `None` when it is one — for
+/// `GetFederationToken`.
 ///
 /// The refusal's message "describes the specific error"
 /// (`MalformedPolicyDocumentException`, this service's model) WHERE the document gives
@@ -2678,12 +2683,42 @@ pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 /// character and its character code, what the parser expected in its place, and the line
 /// and column the failure sits at; a document that parses but is not an object is
 /// reported with the JSON type it carries instead. A document that merely RAN OUT of
-/// input names nothing to describe, and is refused with the fixed sentence
-/// [`SYNTAX_ERRORS_IN_POLICY`].
-///
-/// One reading for every operation that takes an inline session policy: the wording
-/// follows the document's defect, not the operation it was passed to.
+/// input is the ONE class this operation words differently from the role-assumption ones:
+/// it is refused with the fixed sentence [`SYNTAX_ERRORS_IN_POLICY`].
 pub fn policy_document_error(policy: &str) -> Option<String> {
+    session_policy_error(policy, RanOutOfInput::OneSentence)
+}
+
+/// Why a session policy is not a JSON policy document, as the message
+/// `MalformedPolicyDocumentException` carries for a ROLE-ASSUMPTION operation
+/// (`AssumeRole`, `AssumeRoleWithSAML`, `AssumeRoleWithWebIdentity`) — `None` when it is
+/// one.
+///
+/// Every reading [`policy_document_error`] states, and the parser's own diagnostic for the
+/// one class that operation words as a fixed sentence as well: a document that RAN OUT of
+/// input is reported with what was left unterminated, where that construct OPENED and
+/// where the input ended, because these operations are recorded relaying the diagnostic of
+/// the parse that actually ran for every class of parse failure. A caller that assembled
+/// the document programmatically is told which mark it did not close and where, which one
+/// sentence cannot say.
+pub fn relayed_policy_document_error(policy: &str) -> Option<String> {
+    session_policy_error(policy, RanOutOfInput::Relayed)
+}
+
+/// How a session policy that ran out of input is reported: the one class the operations
+/// that take an inline session policy word differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RanOutOfInput {
+    /// The fixed sentence [`SYNTAX_ERRORS_IN_POLICY`] alone.
+    OneSentence,
+    /// The parser's diagnostic, as every other class of parse failure is reported.
+    Relayed,
+}
+
+/// The one reading of a submitted session policy both refusals are built from: the wording
+/// follows the document's defect, and only the class that ran out of input follows the
+/// operation it was passed to.
+fn session_policy_error(policy: &str, ran_out: RanOutOfInput) -> Option<String> {
     match serde_json::from_str::<serde_json::Value>(policy) {
         Ok(value) if value.is_object() => None,
         Ok(value) => Some(format!(
@@ -2691,9 +2726,12 @@ pub fn policy_document_error(policy: &str) -> Option<String> {
             json_type_name(&value)
         )),
         // `Category::Eof` is the parser's own classification of "ran out of input"
-        // (`serde_json::error::Category`), so the two cases are told apart by the parse
+        // (`serde_json::error::Category`), so the classes are told apart by the parse
         // that actually ran rather than by re-reading the document.
-        Err(parse) if parse.classify() == serde_json::error::Category::Eof => {
+        Err(parse)
+            if ran_out == RanOutOfInput::OneSentence
+                && parse.classify() == serde_json::error::Category::Eof =>
+        {
             Some(SYNTAX_ERRORS_IN_POLICY.to_string())
         }
         Err(parse) => Some(policy_parse_message(policy, &parse)),
@@ -2712,20 +2750,32 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// The parse failure of a policy document the parse STOPPED ON, as the refusal reports
-/// it: the offending character and its code, what was expected there, and the
-/// position of the failure in the submitted document.
+/// The parse failure of a policy document, as the refusal relays the parser's own
+/// diagnostic: what the parse stopped on — the offending character and its code, or the
+/// end of the input — what was expected there, where the construct left unterminated
+/// OPENED, and the position the parse stopped at in the submitted document.
 ///
-/// Both readings are the tree's shared one
+/// Every reading is the tree's shared one
 /// ([`::service_common::json_parse_fault`]), so a document this service and another
-/// refuse cannot be reported as failing in two different places. A document that ran out
-/// of input does not reach this: it has nothing to point at, and
-/// [`SYNTAX_ERRORS_IN_POLICY`] is its whole refusal.
+/// refuse cannot be reported as failing in two different places. The start marker is
+/// stated only for the fault it belongs to — a collection the document left open — and the
+/// position the parse stopped at is the one the parse itself reports, which for a document
+/// that ran out of input is where its next character would have gone.
 fn policy_parse_message(document: &str, parse: &serde_json::Error) -> String {
+    use ::service_common::json_parse_fault as fault;
+
+    let reading = fault::unexpected_input(document, parse);
+    let framed = match fault::unclosed_container_start(document, parse) {
+        Some((line, column)) => format!(
+            "{reading} (start marker at {})",
+            fault::location_clause(fault::REDACTED_SOURCE, line, column)
+        ),
+        None => reading,
+    };
+    let (line, column) = fault::stopped_at(document, parse);
     format!(
-        "Unexpected IOException: {}{}",
-        ::service_common::json_parse_fault::unexpected_input(document, parse),
-        ::service_common::json_parse_fault::source_location(parse.line(), parse.column())
+        "Unexpected IOException: {framed}{}",
+        fault::source_location(line, column)
     )
 }
 

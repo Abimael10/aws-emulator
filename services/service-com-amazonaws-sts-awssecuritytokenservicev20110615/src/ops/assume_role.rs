@@ -317,11 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             caller_may_call, duplicate_tag_key, inherited_transitive_tags, long_term_identity,
-            not_authorized_message, packed_policy_size, parse_role_arn, policy_document_error,
-            resolve_request_caller, sts_arn, Identity, NewSession, SessionKind, SessionPolicies,
-            ASSUME_ROLE_ACTION, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
-            MAX_MANAGED_SESSION_POLICIES, MAX_SESSION_TAGS, ROLE_CHAINING_MAX_DURATION_SECONDS,
-            SESSION_TOKEN_SIZE_LIMIT, SET_SOURCE_IDENTITY_ACTION, TAG_SESSION_ACTION,
+            not_authorized_message, packed_policy_size, parse_role_arn,
+            relayed_policy_document_error, resolve_request_caller, sts_arn, Identity, NewSession,
+            SessionKind, SessionPolicies, ASSUME_ROLE_ACTION,
+            ASSUME_ROLE_DEFAULT_DURATION_SECONDS, MAX_MANAGED_SESSION_POLICIES, MAX_SESSION_TAGS,
+            ROLE_CHAINING_MAX_DURATION_SECONDS, SESSION_TOKEN_SIZE_LIMIT,
+            SET_SOURCE_IDENTITY_ACTION, TAG_SESSION_ACTION,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -362,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An inline session policy is read only AFTER the role's trust policy has decided
         // this assume: the session policy belongs to the session this mint would create, so
         // it is parsed once the caller is known to be allowed to create one. See the
-        // `policy_document_error` call below the authorization step.
+        // `relayed_policy_document_error` call below the authorization step.
 
         if duplicate_tag_key(input.tags.as_deref()).is_some() {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
@@ -732,10 +733,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The authorization boundary is behind us, so the request's OWN session policy is
         // read now: "an inline session policy" must be a JSON policy document, and the
-        // refusal "describes the specific error" the submitted document has. Parsing it
-        // earlier would answer `MalformedPolicyDocument` to a caller who may not assume the
-        // role at all, which tells that caller whether the role exists and is assumable.
-        if let Some(why) = input.policy.as_deref().and_then(policy_document_error) {
+        // refusal "describes the specific error" the submitted document has — the parser's
+        // own diagnostic, which this operation relays
+        // (`crate::state::relayed_policy_document_error`). Parsing it earlier would answer
+        // `MalformedPolicyDocument` to a caller who may not assume the role at all, which
+        // tells that caller whether the role exists and is assumable.
+        if let Some(why) = input
+            .policy
+            .as_deref()
+            .and_then(relayed_policy_document_error)
+        {
             return Err(AssumeRoleErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {
                     message: Some(why),
