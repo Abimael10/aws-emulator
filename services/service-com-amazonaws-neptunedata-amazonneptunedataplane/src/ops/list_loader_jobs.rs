@@ -2,11 +2,16 @@
 
 //! @op ListLoaderJobs
 //!
-//! Reports the load ids of the active bulk-load jobs, from the loader registry in
-//! [`crate::state`]: the jobs the loader still owes an outcome, with the queued load
-//! requests among them unless the request excludes them, newest admission first and at
-//! most `limit` of them. The answer is computed from that registry alone, so a job the
-//! registry does not hold is never listed.
+//! Reports the load ids of the bulk-load jobs the loader keeps, from the registry in
+//! [`crate::state`]: the jobs it holds, with the queued load requests among them unless
+//! the request excludes them, newest admission first and at most `limit` of them. The
+//! answer is computed from that registry alone, so a job the registry does not hold is
+//! never listed.
+//!
+//! RECORDED BEHAVIOUR: the operation's own documentation reads "a list of the `loadIds`
+//! for all active loader jobs", and the load id of a load that has FINISHED is one the
+//! endpoint answers with — see
+//! [`crate::state::ComAmazonawsNeptunedataAmazonneptunedataplaneState::loader_job_ids`].
 //!
 //! ## Shape of an operation
 //!
@@ -210,8 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // turned into "report nothing".
         let limit = requested.clamp(min_limit, max_limit) as usize;
 
-        // A @readonly operation: the registry is read, never written.
-        let load_ids = state.lock().active_loader_job_ids(include_queued, limit);
+        // A @readonly operation: the registry is read, never written — bar the terminal
+        // status the CLOCK has already made due for a load still in progress, which was
+        // owed at this instant whether or not anybody listed the jobs, and which is what a
+        // later status read of a listed job reports.
+        let load_ids = {
+            let mut store = state.lock();
+            store.settle_loader_jobs(::std::time::SystemTime::now());
+            store.loader_job_ids(include_queued, limit)
+        };
 
         Ok(ListLoaderJobsOutput {
             status: crate::state::LOADER_JOB_LIST_SERVED.to_string(),

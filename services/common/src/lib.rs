@@ -469,6 +469,12 @@ pub mod published_metric_data;
 /// provisions a cluster and read by the graph DATA plane, which answers for a cluster it
 /// configures nothing about.
 pub mod graph_db_clusters;
+/// The Neptune BULK-LOAD DATA FORMATS — the two delimited load formats and the RDF
+/// syntaxes — read once for both services that load a graph from them: the Neptune data
+/// plane's loader endpoint and Neptune Analytics' import task. Each service keeps its own
+/// element model, ceilings and wording and takes what a reading yields through
+/// `graph_bulk_load::LoadSink`.
+pub mod graph_bulk_load;
 /// The ONE rendering of a DynamoDB STREAM RECORD as the envelope a consumer of that stream
 /// is handed one in, for every service that reads a table's stream and passes its records on
 /// — so two consumers of the same record are handed the same document.

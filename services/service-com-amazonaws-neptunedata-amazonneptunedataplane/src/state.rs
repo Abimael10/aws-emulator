@@ -19,7 +19,8 @@
 //!   query id. `ListGremlinQueries` and `GetGremlinQueryStatus` report on these and
 //!   `CancelGremlinQuery` mutates them.
 //! * [`LoaderJobRecord`] — one per bulk-load job the engine has admitted, keyed by load
-//!   id. `ListLoaderJobs` reports the load ids of the active ones.
+//!   id, carrying what that load READ ([`LoadRun`]). `ListLoaderJobs` reports the load ids
+//!   of the active ones and `GetLoaderJobStatus` reports one job's own run.
 //! * [`PropertyGraph`] — the graph's own data: the nodes and relationships the
 //!   openCypher endpoints read and write (see [`open_cypher`]). `ExecuteFastReset`
 //!   empties it, because that is what a database reset leaves behind.
@@ -40,13 +41,13 @@
 //! than with a result nothing computed, and `ExecuteGremlinProfileQuery` — which reports
 //! what an evaluation MEASURED — still answers 501 for the same reason.
 //!
-//! The loader registry is in a different position: `StartLoaderJob` reads the request and
-//! refuses one the loader could not act on (an `iamRoleArn` whose credentials it cannot
-//! resolve), and still answers HTTP 501 for a request it would have to LOAD from, because a
-//! bulk load reads the data files its source names and this emulator has no reader for
-//! those formats yet — so a load id for a load nothing performed would be a fabrication.
-//! `ListLoaderJobs` therefore reports exactly the jobs the registry holds, which is nothing
-//! until a loader that really loads is wired in.
+//! The loader registry is written by the loader endpoints themselves: `StartLoaderJob`
+//! reads the request, refuses one the loader could not act on (an `iamRoleArn` whose
+//! credentials it cannot resolve), and otherwise READS the objects its source names out of
+//! this emulator's own Amazon S3, writes what they held into [`PropertyGraph`] and records
+//! the job the load ran under (see [`loader`]). `GetLoaderJobStatus` reports the
+//! measurements of that run, `CancelLoaderJob` stops a load the engine still owes an
+//! outcome, and `ListLoaderJobs` reports exactly the jobs the registry holds as active.
 //!
 //! `ExecuteOpenCypherQuery` is the one operation that both reads and writes the graph: it
 //! parses the submitted query with a real openCypher parser and evaluates it against
@@ -399,65 +400,6 @@ impl QueryRegistry {
     }
 }
 
-/// How far a bulk-load job this engine has admitted has got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoaderJobState {
-    /// Admitted as a queued load request, waiting behind the jobs ahead of it.
-    Queued,
-    /// Loading its source data now.
-    Loading,
-    /// Finished loading everything the source held.
-    Completed,
-    /// Stopped on an error it could not skip.
-    Failed,
-    /// Stopped by `CancelLoaderJob`.
-    Cancelled,
-}
-
-impl LoaderJobState {
-    /// Whether the job is still a queued load request, which is what
-    /// `ListLoaderJobsInput$includeQueuedLoads` chooses to see or to exclude.
-    pub fn is_queued(self) -> bool {
-        matches!(self, Self::Queued)
-    }
-
-    /// Whether this is one of the "active loader jobs" `ListLoaderJobs` reports the load
-    /// ids of: a job the loader still owes an outcome, queued or loading. A job that has
-    /// finished — completed, failed or cancelled — is not active, so its load id is not
-    /// one the job list reports.
-    pub fn is_active(self) -> bool {
-        matches!(self, Self::Queued | Self::Loading)
-    }
-}
-
-/// One bulk-load job this engine has admitted, as this emulator persists it.
-#[derive(Debug, Clone)]
-pub struct LoaderJobRecord {
-    /// The id the job is reached by — `GetLoaderJobStatus`'s and `CancelLoaderJob`'s
-    /// `loadId` label, the value `ListLoaderJobs` lists, and the key this record is
-    /// stored under.
-    pub load_id: String,
-    /// When the loader admitted the job. The job list orders by this instant, so a job
-    /// the loader took on later is reported ahead of an older one.
-    pub admitted_at: SystemTime,
-    pub state: LoaderJobState,
-}
-
-impl LoaderJobRecord {
-    /// A record for the job `load_id`, admitted at `admitted_at` in `state`.
-    pub fn admitted(
-        load_id: impl Into<String>,
-        admitted_at: SystemTime,
-        state: LoaderJobState,
-    ) -> Self {
-        Self {
-            load_id: load_id.into(),
-            admitted_at,
-            state,
-        }
-    }
-}
-
 /// The fast-reset state of the database this engine serves.
 ///
 /// Fast reset is a two-step command: `initiateDatabaseReset` mints the token, and only a
@@ -541,26 +483,33 @@ pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
 }
 
 impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
-    /// The load ids of the active loader jobs — the jobs the loader still owes an
-    /// outcome — newest admission first, at most `limit` of them.
+    /// The load ids the loader job list reports — the jobs the registry holds, newest
+    /// admission first, at most `limit` of them.
+    ///
+    /// RECORDED BEHAVIOUR: the endpoint's own documentation reads "a list of the `loadIds`
+    /// for all active loader jobs", but the load id of a job that has FINISHED is one the
+    /// endpoint answers with — the loader keeps the most recent loads
+    /// ([`LOADER_JOB_HISTORY`]) and lists the ones it keeps, which is what lets a client
+    /// find the id of a load it started and then read that load's status. So every job the
+    /// registry holds is listed.
     ///
     /// `include_queued` keeps the queued load requests among them, which is what
-    /// `includeQueuedLoads` chooses; a job that has finished is not active, so its id is
-    /// never listed. Jobs admitted in the same instant are ordered by load id, so the
-    /// order is total and `limit` takes the same prefix on every read.
-    pub fn active_loader_job_ids(&self, include_queued: bool, limit: usize) -> Vec<String> {
-        let mut active: Vec<&LoaderJobRecord> = self
+    /// `includeQueuedLoads` chooses — the member "can be used to exclude the load IDs of
+    /// queued load requests". Jobs admitted in the same instant are ordered by load id, so
+    /// the order is total and `limit` takes the same prefix on every read.
+    pub fn loader_job_ids(&self, include_queued: bool, limit: usize) -> Vec<String> {
+        let mut listed: Vec<&LoaderJobRecord> = self
             .loader_jobs
             .values()
-            .filter(|job| job.state.is_active() && (include_queued || !job.state.is_queued()))
+            .filter(|job| include_queued || !job.state.is_queued())
             .collect();
-        active.sort_by(|left, right| {
+        listed.sort_by(|left, right| {
             right
                 .admitted_at
                 .cmp(&left.admitted_at)
                 .then_with(|| left.load_id.cmp(&right.load_id))
         });
-        active
+        listed
             .into_iter()
             .take(limit)
             .map(|job| job.load_id.clone())

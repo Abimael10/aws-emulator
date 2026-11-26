@@ -57,6 +57,10 @@ regex = "1"
 # step is the `time-macros` proc macro the format description is written with, which runs
 # on the builder's machine like every other derive in this crate.
 time = { version = "0.3", default-features = false, features = ["std", "macros", "formatting"] }
+# A bulk load reads the objects its `source` names out of this emulator's own Amazon S3
+# (`src/state/loader/source.rs`), over the in-process callback into this same emulator: no
+# network client feature is enabled, because the transport is the emulator's own.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -64,6 +68,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The loader suite mounts Amazon S3 beside this service on ONE engine, exactly as the
+# assembled router mounts them, and stages the objects a load reads through that service's
+# OWN `PutObject` — so what a bulk load reads is what Amazon S3 really holds. DEV-ONLY
+# outside those tests.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

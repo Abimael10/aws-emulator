@@ -21,10 +21,6 @@
 
 use super::*;
 
-/// The character that separates the several values one cell may carry — a node's
-/// labels in both delimited formats.
-const MULTI_VALUE_SEPARATOR: char = ';';
-
 /// The most characters one value a load STORES keeps: an element id, a label, a
 /// property key or a property value.
 ///
@@ -86,9 +82,10 @@ fn clamped_detail(detail: &str) -> String {
 
 /// `text` as a load stores it: no longer than [`MAX_IMPORT_VALUE_CHARS`], cut on a
 /// character boundary. Applied where text ENTERS the builder, so nothing a load retains
-/// is as long as the object it came from.
+/// is as long as the object it came from. The clamping itself is the shared reader's, so
+/// one value is cut the same way whichever format it came out of.
 fn clamped_value(text: &str) -> String {
-    text.chars().take(MAX_IMPORT_VALUE_CHARS).collect()
+    ::service_common::graph_bulk_load::clamped(text, MAX_IMPORT_VALUE_CHARS)
 }
 
 /// How many decoded bytes one stored property value is charged: its text, or the few a
@@ -157,61 +154,12 @@ fn decoded_too_large_reason() -> String {
     )
 }
 
-/// The column names one delimited bulk-load format spells its elements with.
-///
-/// Neptune's Gremlin load format names the element columns `~id`, `~label`, `~from`
-/// and `~to`, and its openCypher load format names them `:ID`, `:LABEL`, `:START_ID`,
-/// `:END_ID` and `:TYPE`; every other column is a property, spelled `key:Type` in
-/// both. The two sets are the only difference between the formats, so they are stated
-/// here once and the row rules below are shared.
-#[derive(Debug, Clone, Copy)]
-pub struct LoadColumns {
-    /// The column holding the element's own id.
-    id: &'static str,
-    /// The column holding a node's labels.
-    label: &'static str,
-    /// The column holding the id of the node an edge leaves.
-    from: &'static str,
-    /// The column holding the id of the node an edge enters.
-    to: &'static str,
-    /// The column holding an edge's label.
-    edge_label: &'static str,
-}
-
-impl LoadColumns {
-    /// The Gremlin load format's columns, which Neptune's columnar (Parquet) load
-    /// format spells identically.
-    pub const GREMLIN: Self = Self {
-        id: "~id",
-        label: "~label",
-        from: "~from",
-        to: "~to",
-        // The Gremlin format labels a node and an edge with the SAME column.
-        edge_label: "~label",
-    };
-
-    /// The openCypher load format's columns.
-    pub const OPEN_CYPHER: Self = Self {
-        id: ":ID",
-        label: ":LABEL",
-        from: ":START_ID",
-        to: ":END_ID",
-        edge_label: ":TYPE",
-    };
-}
-
-/// One file's header, resolved to the positions the loader reads each column at.
-#[derive(Debug, Default)]
-struct Header {
-    id: Option<usize>,
-    label: Option<usize>,
-    from: Option<usize>,
-    to: Option<usize>,
-    edge_label: Option<usize>,
-    /// Every other column: where it sits, the property key it sets, and the type the
-    /// header declared for it, if any.
-    properties: Vec<(usize, String, Option<String>)>,
-}
+/// The column names one delimited bulk-load format spells its elements with — the
+/// Gremlin load format's `~id`/`~label`/`~from`/`~to` and the openCypher load format's
+/// `:ID`/`:LABEL`/`:START_ID`/`:END_ID`/`:TYPE` — are the tree's one statement of them
+/// (`::service_common::graph_bulk_load`), which this service and the Neptune data plane's
+/// loader both read their delimited objects with.
+pub use ::service_common::graph_bulk_load::LoadColumns;
 
 /// The elements read so far, and what could not be read.
 ///
@@ -239,6 +187,9 @@ pub struct LoadBuilder {
     /// Why the load could not be carried out at all, when it could not: the
     /// `statusReason` the task stops `FAILED` with.
     failure: Option<String>,
+    /// Whether the object being read holds STATEMENTS rather than rows, which is what the
+    /// sentence an unreadable record is reported with names.
+    reading_statements: bool,
 }
 
 impl LoadBuilder {
@@ -541,49 +492,17 @@ fn load_counts(data: &ImportedData) -> (i64, i64) {
 }
 
 /// Read one delimited bulk-load object (`CSV` or `OPEN_CYPHER`) into `builder`.
+///
+/// The FORMAT is read by the tree's one reader for it
+/// (`::service_common::graph_bulk_load::read_delimited`), which hands every element and
+/// every fault to this builder ([`LoadBuilder`] is that reader's sink).
 pub fn load_delimited(builder: &mut LoadBuilder, columns: LoadColumns, text: &str) {
-    let mut reader = ::csv::ReaderBuilder::new()
-        // A load file may leave the trailing property columns of a row out.
-        .flexible(true)
-        .trim(::csv::Trim::All)
-        .from_reader(text.as_bytes());
-    let header = match reader.headers() {
-        Ok(header) => {
-            // A row carries at most the columns one element can be stored with, and
-            // every row is walked over the header's whole column list, so an object
-            // declaring more columns than that is refused before a row is read: the
-            // work one import performs is bounded by the ROWS it admits, not by the
-            // product of its rows and a width the object chose.
-            if header.len() > MAX_IMPORT_COLUMNS {
-                builder.fail(too_many_columns_reason());
-                return;
-            }
-            resolve_header(columns, header)
-        }
-        Err(_) => {
-            builder.note_error("A load object could not be read as delimited data.".to_string());
-            return;
-        }
-    };
-    if header.id.is_none() {
-        builder.note_error(format!(
-            "A load object's header declares no {} column, so none of its rows names an \
-             element.",
-            columns.id
-        ));
-        return;
-    }
-    for (index, record) in reader.records().enumerate() {
-        if !builder.admit_row() {
-            return;
-        }
-        // The row number a caller counts from is the one in the file, after its header.
-        let row = index + 2;
-        match record {
-            Ok(record) => take_record(builder, &header, &record, row),
-            Err(_) => builder.note_error(format!("Row {row} could not be read as a data row.")),
-        }
-    }
+    builder.reading_statements = false;
+    ::service_common::graph_bulk_load::read_delimited(
+        builder,
+        &read_options(columns),
+        text.as_bytes(),
+    );
 }
 
 /// Read one columnar (`PARQUET`) bulk-load object into `builder`.
@@ -594,6 +513,8 @@ pub fn load_delimited(builder: &mut LoadBuilder, columns: LoadColumns, text: &st
 pub fn load_parquet(builder: &mut LoadBuilder, columns: LoadColumns, object: &[u8]) {
     use ::parquet::file::reader::FileReader;
 
+    builder.reading_statements = false;
+    let options = read_options(columns);
     let reader = match ::parquet::file::reader::SerializedFileReader::new(
         ::bytes::Bytes::copy_from_slice(object),
     ) {
@@ -655,8 +576,8 @@ pub fn load_parquet(builder: &mut LoadBuilder, columns: LoadColumns, object: &[u
         builder.fail(too_many_columns_reason());
         return;
     }
-    let header = resolve_header(
-        columns,
+    let header = ::service_common::graph_bulk_load::resolve_header(
+        &options,
         &::csv::StringRecord::from(names.iter().map(String::as_str).collect::<Vec<_>>()),
     );
     if header.id.is_none() {
@@ -703,7 +624,13 @@ pub fn load_parquet(builder: &mut LoadBuilder, columns: LoadColumns, object: &[u
         }
         let record =
             ::csv::StringRecord::from(cells.iter().map(String::as_str).collect::<Vec<_>>());
-        take_record(builder, &header, &record, row_number);
+        ::service_common::graph_bulk_load::read_record(
+            builder,
+            &options,
+            &header,
+            &record,
+            row_number as u64,
+        );
     }
 }
 
@@ -759,255 +686,123 @@ fn field_text(field: &::parquet::record::Field) -> (usize, String) {
 /// — and the IRI a blank node converts to is built from its label, which the syntax
 /// makes unique within the document.
 pub fn load_ntriples(builder: &mut LoadBuilder, text: &str) {
-    use ::oxrdf::{NamedOrBlankNode, Term};
+    builder.reading_statements = true;
+    // N-Triples writes every IRI absolutely, so the syntax resolves nothing against a base.
+    ::service_common::graph_bulk_load::read_rdf(
+        builder,
+        ::service_common::graph_bulk_load::RdfSyntax::NTriples,
+        "",
+        text.as_bytes(),
+        MAX_IMPORT_VALUE_CHARS,
+    );
+}
 
-    // A blank node's label is local to the DOCUMENT it is written in, so the IRI it
-    // converts to is scoped to the object being read: two objects of one load that each
-    // name `_:b0` name two different nodes.
-    let document = builder.document();
-    for (index, triple) in ::oxttl::NTriplesParser::new()
-        .for_reader(text.as_bytes())
-        .enumerate()
-    {
-        if !builder.admit_row() {
+/// The readings of an RDF statement as a graph element — the IRI a blank node converts to
+/// under `convertToIri`, the id the triple itself gives the edge it loads, and the value a
+/// literal sets — are the tree's ONE reading of them
+/// (`::service_common::graph_bulk_load`), so the two emulated services that load a graph
+/// out of these formats read a statement the same way.
+pub use ::service_common::graph_bulk_load::{blank_node_iri, literal_value, statement_edge_id};
+
+/// Every element and every fault the shared bulk-load reader yields is taken here, where
+/// THIS service's own ceilings, counters and sentences are: the reader owns the formats and
+/// this owns the import.
+impl ::service_common::graph_bulk_load::LoadSink for LoadBuilder {
+    fn document(&self) -> usize {
+        LoadBuilder::document(self)
+    }
+
+    fn admit_record(&mut self) -> bool {
+        self.admit_row()
+    }
+
+    fn take_node(
+        &mut self,
+        id: String,
+        labels: Vec<String>,
+        properties: Vec<(String, serde_json::Value)>,
+        _record_num: u64,
+    ) {
+        LoadBuilder::take_node(self, &id, labels, properties);
+    }
+
+    fn take_edge(
+        &mut self,
+        id: Option<String>,
+        label: String,
+        from: String,
+        to: String,
+        properties: Vec<(String, serde_json::Value)>,
+        record_num: u64,
+    ) {
+        let Some(id) = id else {
+            // Every element of an import's load files names its own id, which is what this
+            // service's reading asks for, so a row reaching here without one named none.
+            self.note_error(format!("Row {record_num} names no element id."));
             return;
-        }
-        let line = index + 1;
-        let Ok(triple) = triple else {
-            builder.note_error(format!("Triple {line} could not be read as N-Triples."));
-            continue;
         };
-        // Every term a triple carries is clamped where it enters the builder, so a
-        // document's own IRIs and literals cannot make the load retain more per element
-        // than any other format's cells do.
-        let subject = match &triple.subject {
-            NamedOrBlankNode::NamedNode(node) => clamped_value(node.as_str()),
-            NamedOrBlankNode::BlankNode(node) => {
-                clamped_value(&blank_node_iri(document, node.as_str()))
+        LoadBuilder::take_edge(self, &id, &label, &from, &to, properties);
+    }
+
+    /// What this task's `errorDetails` SAYS about a fault the reader reported. A ceiling
+    /// the object broke stops the run (`fail`); everything else is one error of the row or
+    /// the file it was in.
+    fn note_fault(
+        &mut self,
+        fault: &::service_common::graph_bulk_load::LoadFault,
+        record_num: u64,
+    ) {
+        use ::service_common::graph_bulk_load::LoadFault;
+
+        let row = record_num;
+        match fault {
+            LoadFault::TooManyColumns { .. } => self.fail(too_many_columns_reason()),
+            LoadFault::FileUnreadable => {
+                self.note_error("A load object could not be read as delimited data.".to_string());
             }
-        };
-        let predicate = clamped_value(triple.predicate.as_str());
-        match &triple.object {
-            Term::Literal(literal) => {
-                builder.take_node(
-                    &subject,
-                    Vec::new(),
-                    vec![(predicate, literal_value(literal))],
-                );
+            LoadFault::HeaderWithoutId { column } => self.note_error(format!(
+                "A load object's header declares no {column} column, so none of its rows \
+                 names an element."
+            )),
+            // The sentence names what the file holds: a delimited object holds rows and an
+            // RDF object holds triples.
+            LoadFault::RecordUnreadable if self.reading_statements => {
+                self.note_error(format!("Triple {row} could not be read as N-Triples."));
             }
-            Term::NamedNode(node) if triple.predicate == ::oxrdf::vocab::rdf::TYPE => {
-                builder.take_node(&subject, vec![clamped_value(node.as_str())], Vec::new());
+            LoadFault::RecordUnreadable => {
+                self.note_error(format!("Row {row} could not be read as a data row."));
             }
-            Term::NamedNode(node) => {
-                let object = clamped_value(node.as_str());
-                builder.take_edge(
-                    &clamped_value(&edge_id(&subject, &predicate, &object)),
-                    &predicate,
-                    &subject,
-                    &object,
-                    Vec::new(),
-                );
+            LoadFault::NoElementId | LoadFault::EdgeWithoutId => {
+                self.note_error(format!("Row {row} names no element id."));
             }
-            Term::BlankNode(node) => {
-                let object = clamped_value(&blank_node_iri(document, node.as_str()));
-                builder.take_edge(
-                    &clamped_value(&edge_id(&subject, &predicate, &object)),
-                    &predicate,
-                    &subject,
-                    &object,
-                    Vec::new(),
-                );
+            LoadFault::EdgeWithoutLabel => {
+                self.note_error(format!("Row {row} is an edge carrying no label."));
             }
+            LoadFault::OneEndpointOnly => {
+                self.note_error(format!("Row {row} names one endpoint of an edge, not both."));
+            }
+            LoadFault::UndeclaredType { key, declared } => self.note_error(format!(
+                "Row {row}, column {key:?}: the value does not read as the declared \
+                 {declared}."
+            )),
         }
     }
 }
 
-/// The IRI a blank node labelled `label` in the `document`-th object of the source
-/// converts to under `convertToIri`.
+/// How this service reads a delimited or columnar load object: the columns `columns` names,
+/// and the rules its own API settles.
 ///
-/// "blank nodes are converted to unique IRIs at load time": the label is unique within
-/// the document the syntax wrote it in, so the IRI is that label scoped to the document,
-/// which makes it unique across the whole load.
-fn blank_node_iri(document: usize, label: &str) -> String {
-    format!("urn:bnode:{document}:{label}")
-}
-
-/// The id of the edge a resource triple loads: the triple itself, so the same triple
-/// read twice is one edge.
-fn edge_id(subject: &str, predicate: &str, object: &str) -> String {
-    format!("<{subject}> <{predicate}> <{object}>")
-}
-
-/// One RDF literal as the JSON value the property it sets keeps.
-///
-/// The XSD datatype the literal carries is what decides the type — a number stays a
-/// number and a boolean stays a boolean — and everything else keeps its lexical form,
-/// which is the only reading of it the datatype allows.
-fn literal_value(literal: &::oxrdf::Literal) -> serde_json::Value {
-    use ::oxrdf::vocab::xsd;
-
-    let text = literal.value();
-    let datatype = literal.datatype();
-    if datatype == xsd::BOOLEAN {
-        if let Ok(parsed) = text.parse::<bool>() {
-            return serde_json::Value::Bool(parsed);
-        }
-    }
-    if datatype == xsd::INTEGER
-        || datatype == xsd::INT
-        || datatype == xsd::LONG
-        || datatype == xsd::SHORT
-        || datatype == xsd::BYTE
-    {
-        if let Ok(parsed) = text.parse::<i64>() {
-            return serde_json::Value::from(parsed);
-        }
-    }
-    if datatype == xsd::DOUBLE || datatype == xsd::FLOAT || datatype == xsd::DECIMAL {
-        if let Some(parsed) = text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
-            return serde_json::Value::Number(parsed);
-        }
-    }
-    serde_json::Value::String(clamped_value(text))
-}
-
-/// Resolve one file's header to the positions each column sits at.
-fn resolve_header(columns: LoadColumns, header: &::csv::StringRecord) -> Header {
-    let mut resolved = Header::default();
-    for (index, raw) in header.iter().enumerate() {
-        let name = raw.trim();
-        if name.eq_ignore_ascii_case(columns.id) {
-            resolved.id = Some(index);
-        } else if name.eq_ignore_ascii_case(columns.label) {
-            resolved.label = Some(index);
-        } else if name.eq_ignore_ascii_case(columns.from) {
-            resolved.from = Some(index);
-        } else if name.eq_ignore_ascii_case(columns.to) {
-            resolved.to = Some(index);
-        } else if name.eq_ignore_ascii_case(columns.edge_label) {
-            resolved.edge_label = Some(index);
-        } else {
-            // Every other column is a property, spelled `key` or `key:Type`. Both
-            // halves are a header cell the caller sized, so both are clamped where they
-            // enter ([`clamped_value`]).
-            let (key, declared) = match name.split_once(':') {
-                Some((key, declared)) => (key.trim(), Some(clamped_value(declared.trim()))),
-                None => (name, None),
-            };
-            if !key.is_empty() {
-                resolved
-                    .properties
-                    .push((index, clamped_value(key), declared));
-            }
-        }
-    }
-    resolved
-}
-
-/// Take one row of a delimited or columnar load object.
-///
-/// A row that names BOTH endpoints is an edge and any other row is a node, so one
-/// prefix can hold a load's node files and its edge files together; a row that names
-/// only one endpoint names neither an edge nor a node, and a row with no id names no
-/// element at all.
-fn take_record(
-    builder: &mut LoadBuilder,
-    header: &Header,
-    record: &::csv::StringRecord,
-    row: usize,
-) {
-    // Every cell a row names is clamped where it enters the builder
-    // ([`clamped_value`]), so what one element retains is bounded however long the
-    // object's own cells are.
-    let cell = |at: Option<usize>| {
-        at.and_then(|index| record.get(index))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    };
-    let Some(id) = cell(header.id).map(clamped_value) else {
-        builder.note_error(format!("Row {row} names no element id."));
-        return;
-    };
-    let mut properties = Vec::new();
-    for (index, key, declared) in &header.properties {
-        let Some(raw) = cell(Some(*index)) else {
-            continue;
-        };
-        match typed_value(declared.as_deref(), raw) {
-            Ok(value) => properties.push((key.clone(), value)),
-            Err(detail) => builder.note_error(format!("Row {row}, column {key:?}: {detail}")),
-        }
-    }
-    let from = cell(header.from).map(clamped_value);
-    let to = cell(header.to).map(clamped_value);
-    match (from, to) {
-        (Some(from), Some(to)) => {
-            let label = cell(header.edge_label).or_else(|| cell(header.label));
-            match label {
-                Some(label) => {
-                    builder.take_edge(&id, &clamped_value(label), &from, &to, properties);
-                }
-                None => builder.note_error(format!("Row {row} is an edge carrying no label.")),
-            }
-        }
-        (None, None) => {
-            // A label cell carries as many labels as the caller separates, so the cell
-            // is read up to the most one node may carry and the rest is COUNTED rather
-            // than held: a label past that ceiling is an error of the row, exactly as a
-            // property past its own ceiling is.
-            let mut labels: Vec<String> = Vec::new();
-            let mut beyond = 0usize;
-            if let Some(named) = cell(header.label) {
-                for label in named
-                    .split(MULTI_VALUE_SEPARATOR)
-                    .map(str::trim)
-                    .filter(|label| !label.is_empty())
-                {
-                    if labels.len() >= MAX_LABELS_PER_NODE {
-                        beyond += 1;
-                        continue;
-                    }
-                    labels.push(clamped_value(label));
-                }
-            }
-            builder.take_node(&id, labels, properties);
-            if beyond > 0 {
-                builder.note_error(refused_labels_detail(beyond));
-            }
-        }
-        _ => builder.note_error(format!("Row {row} names one endpoint of an edge, not both.")),
-    }
-}
-
-/// One cell as the JSON value the property it sets keeps, from the type its column
-/// declared.
-///
-/// Both delimited load formats declare a property column as `key:Type`, and the type
-/// names are the ones those formats list (`Bool`/`Boolean`, `Byte`, `Short`, `Int`,
-/// `Integer`, `Long`, `Float`, `Double`, `String`, `Date`/`DateTime`). A value that
-/// does not read as the type its column declared is a data error, which is what
-/// `failOnError` decides the fate of; a column that declares a type this loader does
-/// not narrow keeps the cell's text, which every one of those types admits.
-fn typed_value(declared: Option<&str>, raw: &str) -> Result<serde_json::Value, String> {
-    let Some(declared) = declared.map(str::trim).filter(|name| !name.is_empty()) else {
-        return Ok(serde_json::Value::String(clamped_value(raw)));
-    };
-    let lowered = declared.to_ascii_lowercase();
-    match lowered.as_str() {
-        "bool" | "boolean" => raw
-            .parse::<bool>()
-            .map(serde_json::Value::Bool)
-            .map_err(|_| format!("the value does not read as the declared {declared}.")),
-        "byte" | "short" | "int" | "integer" | "long" => raw
-            .parse::<i64>()
-            .map(serde_json::Value::from)
-            .map_err(|_| format!("the value does not read as the declared {declared}.")),
-        "float" | "double" => raw
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| format!("the value does not read as the declared {declared}.")),
-        _ => Ok(serde_json::Value::String(clamped_value(raw))),
+/// Every element of an import's load files names its own id, and a value that does not read
+/// as the type its column declared loses that VALUE rather than its row — "the task skips
+/// the data that caused the error and continues if possible".
+fn read_options(columns: LoadColumns) -> ::service_common::graph_bulk_load::ReadOptions {
+    ::service_common::graph_bulk_load::ReadOptions {
+        columns,
+        header_requires_id: true,
+        edge_ids_from_data: true,
+        allow_empty_strings: false,
+        skip_record_on_fault: false,
+        max_columns: MAX_IMPORT_COLUMNS,
+        value_chars: MAX_IMPORT_VALUE_CHARS,
     }
 }

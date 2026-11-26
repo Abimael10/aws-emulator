@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartLoaderJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` for a
-//! load it could ACT on — a bulk load reads the data files its source names, and this
-//! emulator has no reader for those formats yet, so a load id for a load nothing performed
-//! would be a fabrication. What it does NOT answer 501 for is a request the loader could
-//! never have started: the role the load would run under is read first (see
-//! [`crate::state::resolves_credentials`]), and a value no credential can be resolved for
-//! is refused through the modelled error that states so. Implement the load itself here —
-//! this is the ONLY file to touch for this operation.
+//! The Neptune bulk LOADER: this operation reads the objects its `source` names out of
+//! this emulator's own Amazon S3, decodes each one in the `format` the request named and
+//! writes what they held into this engine's graph, then hands back the `loadId` of the job
+//! it recorded for that run — so a load id names a load that was really performed, and
+//! every number `GetLoaderJobStatus` reports for it is a measurement of this run.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartLoaderJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What the loader could never have started is refused instead: the role the load would
+//! run under is read first (see [`crate::state::resolves_credentials`]), and a value no
+//! credential can be resolved for is refused through the modelled error that states so.
+//! What the loader could not READ is the LOAD's own outcome — Amazon S3 is where its work
+//! happens, so a source it cannot read is a job that failed rather than a request that was
+//! wrong. The reading itself, the formats and the job registry live in
+//! [`crate::state::loader`]; this file is the request walk over them.
 //!
 //! ## Shape of an operation
 //!
@@ -291,16 +290,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input, "store-unavailable");
+            return Err(StartLoaderJobErrorModeled::InternalFailureException(
+                crate::state::store_unavailable_internal(),
+            )
+            .into());
+        };
 
-        // The request names a load this emulator cannot PERFORM: a bulk load reads the
-        // data files the source names, and there is no reader for those formats here, so
-        // the call is answered 501 rather than with a load id for a load nothing ran.
-        // Nothing is recorded in the loader registry either — `ListLoaderJobs` reports
-        // exactly the jobs the registry holds — so a refused or unperformed load adds no
-        // load id.
-        record_access(ctx, &input, "not-implemented");
-        let _ = &self.engine;
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartLoaderJob"))
+        // The one modelled format this loader cannot READ (see
+        // [`crate::state::reads_format`]): nothing here can decode such a file, so the
+        // call is answered "not written yet" rather than with a load id for a load nothing
+        // performed, and the registry is left as it was.
+        if !crate::state::reads_format(&input.format) {
+            record_access(ctx, &input, "format-not-read");
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartLoaderJob for the rdfxml format",
+            ));
+        }
+
+        let request = crate::state::LoadRequest::of(&input);
+        // What the mode makes of this load is decided from the loads this engine has
+        // already run, so the registry is read first — and the jobs whose terminal status
+        // the clock has made due are settled while it is, because a previous load that has
+        // completed is what `AUTO` and `RESUME` look for.
+        let plan = {
+            let mut store = state.lock();
+            store.settle_loader_jobs(::std::time::SystemTime::now());
+            store.resolve_load_mode(&request)
+        };
+        // The source is read with NO state guard held: it is a call into another service.
+        let reading = match plan {
+            Ok(crate::state::LoadPlan::ReadSource) => {
+                crate::state::read_load_source(ctx, &request).await
+            }
+            // "If a previous load job loaded all files from the same source successfully,
+            // nothing is reloaded, and the loader returns success."
+            Ok(crate::state::LoadPlan::NothingToReload) => {
+                crate::state::LoadReading::nothing_to_reload()
+            }
+            // A `RESUME` that finds no previous load of this source is a load the loader
+            // stops: "If no previous load job is found, the loader stops."
+            Err(code) => crate::state::LoadReading::halted(
+                crate::state::LOAD_FAILED,
+                crate::state::LoadErrorLog::new(
+                    code,
+                    "The load names no previous load of this source to resume.",
+                    crate::state::echoed(&request.source),
+                    0,
+                ),
+            ),
+        };
+
+        let load_id = crate::state::new_load_id();
+        let job = {
+            let mut store = state.lock();
+            store.admit_load(
+                load_id.clone(),
+                ::std::time::SystemTime::now(),
+                &request,
+                reading,
+            )
+        };
+        record_access(ctx, &input, "load-admitted");
+        ::tracing::debug!(
+            operation = "StartLoaderJob",
+            records = job.run.as_ref().map_or(0, |run| run.total_records),
+            errors = job
+                .run
+                .as_ref()
+                .map_or(0, crate::state::LoadRun::error_count),
+            "neptunedata bulk load performed"
+        );
+        Ok(StartLoaderJobOutput {
+            status: crate::state::LOADER_JOB_ACCEPTED.to_string(),
+            // "Contains a loadId name-value pair that provides an identifier for the load
+            // operation."
+            payload: ::std::collections::HashMap::from([(
+                crate::state::LOAD_ID_MEMBER.to_string(),
+                load_id,
+            )]),
+        })
     }
 }
 

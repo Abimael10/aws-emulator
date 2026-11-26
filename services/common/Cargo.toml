@@ -122,6 +122,12 @@ serde_json = { workspace = true }
 # reader for that format rather than by a splitter written here — the separator, the
 # quoting and the line terminators come from the table's own SerDe.
 csv = "1.4"
+# `graph_bulk_load`: the RDF bulk-load syntaxes a Neptune load's statements are written in
+# (N-Triples, N-Quads and Turtle) are parsed by the maintained crate for them, and the
+# terms a statement carries (IRIs, blank nodes and typed literals) are read through its
+# term model, so the two services that load a graph read a statement the same way.
+oxttl = "0.2.5"
+oxrdf = "0.3.5"
 # `submitted_collections`: reads the ORDER a request's JSON object wrote a map member's
 # entries in, which the built input (a `HashMap`) does not keep. Only the deserializer
 # seam is used; no shape here derives `Serialize`.

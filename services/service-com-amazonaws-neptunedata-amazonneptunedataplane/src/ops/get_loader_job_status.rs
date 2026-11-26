@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLoaderJobStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLoaderJobStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports on ONE bulk-load job this engine holds: the job the `loadId` names, as the
+//! loader recorded it when it ran the load (see [`crate::state::loader`]). Every number in
+//! the payload is a measurement of that run, and an id the registry does not hold is
+//! refused with the modelled not-found error rather than answered.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLoaderJobStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: the one thing it writes is the terminal status the CLOCK has
+//! already made due for a load still in progress, which was owed at that instant whether
+//! or not anybody read the job.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +184,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLoaderJobStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLoaderJobStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLoaderJobStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLoaderJobStatusErrorModeled::InternalFailureException(
+                crate::state::store_unavailable_internal(),
+            )
+            .into());
+        };
+
+        // "The error page number (a positive integer; the default is 1)" and "The number of
+        // errors returned in each page (a positive integer; the default is 10)" — both are
+        // held to the range the model publishes before this handler runs, so an absent
+        // member is the only value left to fill in.
+        let page = input.page.unwrap_or(crate::state::DEFAULT_ERROR_PAGE);
+        let errors_per_page = input
+            .errors_per_page
+            .unwrap_or(crate::state::DEFAULT_ERRORS_PER_PAGE);
+        let now = ::std::time::SystemTime::now();
+
+        let payload = {
+            let mut store = state.lock();
+            // The terminal status the clock owes this job lands here: it was due at `now`
+            // whether or not this read happened, so reporting the job does not change what
+            // a later caller sees.
+            store.settle_loader_jobs(now);
+            let Some(job) = store.loader_jobs.get(&input.load_id) else {
+                // There is no load to report on, so what was wrong with the request is the
+                // value it carried.
+                return Err(GetLoaderJobStatusErrorModeled::InvalidParameterException(
+                    crate::state::invalid_load_id(&input.load_id),
+                )
+                .into());
+            };
+            job.status_payload(
+                now,
+                // "Flag indicating whether or not to include details beyond the overall
+                // status (TRUE or FALSE; the default is FALSE)."
+                input.details.unwrap_or(false),
+                // "Flag indicating whether or not to include a list of errors encountered
+                // (TRUE or FALSE; the default is FALSE)."
+                input.errors.unwrap_or(false),
+                page,
+                errors_per_page,
+            )
+        };
+
+        Ok(GetLoaderJobStatusOutput {
+            status: crate::state::LOADER_JOB_STATUS_SERVED.to_string(),
+            payload: crate::state::json_to_document(&payload),
+        })
     }
 }
