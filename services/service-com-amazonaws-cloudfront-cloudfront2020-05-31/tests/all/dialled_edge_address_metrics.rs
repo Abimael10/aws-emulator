@@ -147,7 +147,10 @@ fn driven() -> [Driven; 4] {
 ///
 /// The edge reports a cache outcome on every answer it serves, so an answer carrying none of
 /// the three fails the case rather than being read as one of them.
-fn outcome_of(case: &str, raw: &str) -> Outcome {
+///
+/// `pub(crate)` so a sibling suite whose viewer dials a published address reads the answer it
+/// wrote back the same way rather than carrying its own copy.
+pub(crate) fn outcome_of(case: &str, raw: &str) -> Outcome {
     let status_line = raw
         .lines()
         .next()
@@ -177,7 +180,10 @@ fn outcome_of(case: &str, raw: &str) -> Outcome {
 }
 
 /// How many of `served` satisfy `predicate`, as the count a rate is computed from.
-fn count_of(served: &[Outcome], predicate: impl Fn(&Outcome) -> bool) -> f64 {
+///
+/// `pub(crate)` so every suite that computes a rate from the answers the edge served counts
+/// them the same way.
+pub(crate) fn count_of(served: &[Outcome], predicate: impl Fn(&Outcome) -> bool) -> f64 {
     // A row drives a handful of requests, so every count here is exact in `f64`.
     #[allow(clippy::cast_precision_loss)]
     let counted = served.iter().filter(|answer| predicate(answer)).count() as f64;
@@ -203,7 +209,10 @@ async fn dialled(case: &str, address: &str, domain: &str) -> Vec<Outcome> {
 
 /// Assert that a series holds nothing: a series a distribution is not subscribed to, or one of
 /// a distribution nothing viewed, has no datapoint in any minute.
-fn assert_no_datapoint(case: &str, metric: &str, holding: &Held) {
+///
+/// `pub(crate)` so every suite that reads a series a distribution does not publish holds it to
+/// this one assertion.
+pub(crate) fn assert_no_datapoint(case: &str, metric: &str, holding: &Held) {
     assert_eq!(
         holding.samples, 0.0,
         "case {case:?} ({metric}): expected no datapoint at all, got {holding:?}"

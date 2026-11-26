@@ -45,7 +45,11 @@ const SERVED_ORIGIN: &str = HOST;
 /// The `DistributionConfig` every row serves through: one origin under a caching policy, and a
 /// default behaviour allowing only the reading methods — so a `DELETE` is refused by CloudFront
 /// itself.
-fn config(caller_reference: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that drives this same traffic through a distribution of this
+/// shape — one minted by another operation, which takes the document rather than the create
+/// [`created`] makes — serves it through the same configuration rather than copying it.
+pub(crate) fn config(caller_reference: &str) -> String {
     format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{caller_reference}</CallerReference>\
