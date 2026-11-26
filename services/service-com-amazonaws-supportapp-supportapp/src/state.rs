@@ -5,8 +5,9 @@
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
-//! a caller-supplied `channelRoleArn` must name together with which refusal that member
-//! draws and in which order its rules are judged, the parts of a modelled `@pattern` the
+//! a caller-supplied `channelRoleArn` must name together with which refusal the members of
+//! a channel write draw, in which order those rules are judged and the one counted envelope
+//! every clause of a single request travels in, the parts of a modelled `@pattern` the
 //! request boundary's walk cannot apply (`channelName`'s `.`, `accountAlias`'s `\w` and the
 //! `\S` the Slack ids and the pagination token share among them),
 //! which stored Slack channel configuration a `(teamId, channelId)` pair names and how a
@@ -592,8 +593,8 @@ pub fn workspace_quota_exceeded_message(operation: &str) -> String {
 /// Why the `channelRoleArn` a write carried names no role this account can pass, as the
 /// message the refusal carries, or `None` when it does.
 ///
-/// Private, and reached only through [`channel_role_arn_refusal`]: WHICH of this member's
-/// refusals applies, and in which order they are judged, is that function's rule, not a
+/// Private, and reached only through [`channel_write_refusal`]: WHICH refusal a request's
+/// members draw, and in which order the rules are judged, is that function's rule, not a
 /// handler's.
 ///
 /// The member documents the role as one "that you want to use to perform operations on
@@ -668,7 +669,7 @@ pub const CHANNEL_NAME_PATTERN: &str = "^.+$";
 const CHANNEL_NAME_PATH: &str = "channelName";
 
 /// Why the `channelName` a write carried is outside that member's declared `@pattern`
-/// ([`CHANNEL_NAME_PATTERN`]), as the message the refusal carries, or `None` when the
+/// ([`CHANNEL_NAME_PATTERN`]), as the clause the refusal names it in, or `None` when the
 /// value is one the expression admits.
 ///
 /// The member's expression is `.`-based, and the framework's centralized constraint walk
@@ -685,14 +686,22 @@ const CHANNEL_NAME_PATH: &str = "channelName";
 /// is the walk's, which applies it to every request that carries the member.
 ///
 /// The refusal is the one a declared constraint draws, because this IS the member's
-/// declared `@pattern`, and it is stated through [`declared_pattern_refusal`] — the one
-/// rendering every `@pattern` this module applies by hand goes through, so one request is
-/// refused one way whichever reading of the expression caught it.
-pub fn channel_name_refusal(channel_name: &str) -> Option<String> {
+/// declared `@pattern`, and the clause is built by [`declared_pattern_violation`] — the one
+/// every `@pattern` this module applies by hand goes through, so one request is refused one
+/// way whichever reading of the expression caught it. What this rule yields is the CLAUSE
+/// and not a whole refusal, because the other clauses the same request draws travel in the
+/// envelope with it: [`channel_write_refusal`] is what renders them.
+fn channel_name_violation(
+    channel_name: &str,
+) -> Option<::aws_smithy_schema_server::constraints::Violation> {
     if !carries_pattern_dot_excluded_char(channel_name) {
         return None;
     }
-    declared_pattern_refusal(CHANNEL_NAME_PATH, CHANNEL_NAME_PATTERN, channel_name)
+    Some(declared_pattern_violation(
+        CHANNEL_NAME_PATH,
+        CHANNEL_NAME_PATTERN,
+        channel_name,
+    ))
 }
 
 /// The message a value outside its member's own declared `@pattern` is refused with.
@@ -797,12 +806,21 @@ fn carries_pattern_space_char(value: &str) -> bool {
 /// refused in ONE counted envelope naming every clause, as the walk refuses a request whose
 /// members it caught itself.
 fn slack_id_refusal(members: &[(&str, &str)]) -> Option<String> {
-    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = members
+    ::aws_smithy_schema_server::constraints::envelope(&slack_id_violations(members))
+}
+
+/// The clauses those members draw, as the framework's own violations and in the order
+/// `members` were handed over — what [`slack_id_refusal`] renders, kept apart from the
+/// rendering so the clauses a request's OTHER members draw from a rule this module applies
+/// by hand travel in the same envelope ([`channel_write_refusal`]).
+fn slack_id_violations(
+    members: &[(&str, &str)],
+) -> Vec<::aws_smithy_schema_server::constraints::Violation> {
+    members
         .iter()
         .filter(|(_, value)| carries_pattern_space_char(value))
         .map(|(path, value)| declared_pattern_violation(path, SLACK_ID_PATTERN, value))
-        .collect();
-    ::aws_smithy_schema_server::constraints::envelope(&violations)
+        .collect()
 }
 
 /// Why the `teamId` a request carried is outside that member's declared `@pattern`, or
@@ -898,10 +916,11 @@ pub const MAX_CHANNEL_ROLE_ARN_LEN: usize = 2048;
 /// validation envelope states a member with.
 const CHANNEL_ROLE_ARN_PATH: &str = "channelRoleArn";
 
-/// Why the `channelRoleArn` a write carried is too long to hold, or `None` when it fits.
+/// Why the `channelRoleArn` a write carried is too long to hold, as the clause the refusal
+/// names it in, or `None` when it fits.
 ///
 /// Private for the same reason as [`channel_role_account_refusal`]: a handler asks
-/// [`channel_role_arn_refusal`] what this member's answer is.
+/// [`channel_write_refusal`] what this request's answer is.
 ///
 /// The member's declared `@length` maximum is a bound on what the API can carry — the
 /// same member reports the stored value back on `UpdateSlackChannelConfiguration` and
@@ -923,19 +942,23 @@ const CHANNEL_ROLE_ARN_PATH: &str = "channelRoleArn";
 /// cannot express. The value is echoed through the tree's shared
 /// [`::service_common::validation::quoted_echo`], so a handler-worded clause quotes a value
 /// under the same ceiling as one the walk restored and no message is sized by the request.
-fn channel_role_arn_length_refusal(role_arn: &str) -> Option<String> {
+/// Like every other constraint this module applies by hand it yields the CLAUSE and not a
+/// whole refusal, so the clauses one request draws travel in one envelope
+/// ([`channel_write_refusal`]).
+fn channel_role_arn_length_violation(
+    role_arn: &str,
+) -> Option<::aws_smithy_schema_server::constraints::Violation> {
     if role_arn.chars().count() <= MAX_CHANNEL_ROLE_ARN_LEN {
         return None;
     }
-    let violation = ::aws_smithy_schema_server::constraints::Violation {
+    Some(::aws_smithy_schema_server::constraints::Violation {
         path: CHANNEL_ROLE_ARN_PATH.to_string(),
         kind: ::aws_smithy_schema_server::constraints::ViolationKind::MaxLength(
             i64::try_from(MAX_CHANNEL_ROLE_ARN_LEN).unwrap_or(i64::MAX),
         ),
         value: Some(::service_common::validation::quoted_echo(role_arn).into_owned()),
         sensitive: false,
-    };
-    ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
+    })
 }
 
 /// Which refusal a `channelRoleArn` draws, as the modelled error class it is answered in
@@ -956,28 +979,130 @@ pub enum ChannelRoleArnRefusal {
     AccessDenied(String),
 }
 
+/// Which refusal the members of a Slack channel write draw, as the modelled error class the
+/// request is answered in plus the message that class carries — the request-wide answer
+/// [`ChannelRoleArnRefusal`] is the one-member view of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelWriteRefusal {
+    /// At least one member the request carries is outside its own declared constraint: the
+    /// modelled `ValidationException` (HTTP 400), as the standard validation envelope over
+    /// EVERY clause the request drew.
+    Validation(String),
+    /// Every value this API can carry, and the `channelRoleArn` names no role this service
+    /// may pass for the account: the modelled `AccessDeniedException` (HTTP 403), worded as
+    /// [`CROSS_ACCOUNT_PASS_ROLE_MESSAGE`].
+    AccessDenied(String),
+}
+
+impl From<ChannelWriteRefusal> for ChannelRoleArnRefusal {
+    fn from(refusal: ChannelWriteRefusal) -> Self {
+        match refusal {
+            ChannelWriteRefusal::Validation(message) => Self::Validation(message),
+            ChannelWriteRefusal::AccessDenied(message) => Self::AccessDenied(message),
+        }
+    }
+}
+
+/// The members of a Slack channel write whose declared constraints this service applies by
+/// hand, each as the value the request CARRIES and `None` for a member it does not carry —
+/// a rule judges the request in front of it, so an absent optional member has no value to
+/// be outside anything.
+///
+/// The fields are in the order the model declares the members
+/// (`smithy_query(query="operation",operation="CreateSlackChannelConfiguration")`), which is
+/// the order [`channel_write_refusal`] states their clauses in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelWriteMembers<'a> {
+    /// The `teamId` the request carries, whose `@pattern` is [`SLACK_ID_PATTERN`].
+    pub team_id: Option<&'a str>,
+    /// The `channelId` the request carries, whose `@pattern` is [`SLACK_ID_PATTERN`].
+    pub channel_id: Option<&'a str>,
+    /// The `channelName` the request carries, whose `@pattern` is [`CHANNEL_NAME_PATTERN`].
+    pub channel_name: Option<&'a str>,
+    /// The `channelRoleArn` the request carries, whose declared `@length` maximum is
+    /// [`MAX_CHANNEL_ROLE_ARN_LEN`] and which names the role the service is asked to pass.
+    pub channel_role_arn: Option<&'a str>,
+}
+
+/// Every clause the members a write carries draw from a declared constraint this service
+/// applies by hand, in the order the model declares those members: `teamId` and `channelId`
+/// ([`slack_id_violations`]), `channelName` ([`channel_name_violation`]) and
+/// `channelRoleArn`'s declared `@length` maximum ([`channel_role_arn_length_violation`]).
+///
+/// Collected rather than returned one at a time because the clauses of ONE request belong in
+/// ONE envelope: see [`channel_write_refusal`].
+fn channel_write_violations(
+    members: &ChannelWriteMembers<'_>,
+) -> Vec<::aws_smithy_schema_server::constraints::Violation> {
+    let patterned_ids: Vec<(&str, &str)> = [
+        members.team_id.map(|value| (TEAM_ID_PATH, value)),
+        members.channel_id.map(|value| (CHANNEL_ID_PATH, value)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut violations = slack_id_violations(&patterned_ids);
+    violations.extend(members.channel_name.and_then(channel_name_violation));
+    violations.extend(
+        members
+            .channel_role_arn
+            .and_then(channel_role_arn_length_violation),
+    );
+    violations
+}
+
+/// Why the members a Slack channel write carried cannot be used — which modelled error class
+/// answers the request and with which message — or `None` when every value is one this
+/// service can take.
+///
+/// This is the single entry point every operation that writes a channel configuration goes
+/// through, so the ORDER of the rules, and the class each refusal travels in, is stated once
+/// here instead of once per writing handler:
+///
+/// * every member that is outside its OWN declared constraint is reported together, in the
+///   standard validation envelope over every clause the request drew
+///   ([`channel_write_violations`]) — a request breaking two of these rules is refused the
+///   same way the request boundary's own walk refuses a request whose members IT caught, in
+///   one counted envelope naming every clause in model order, rather than with whichever
+///   clause a handler happened to test first;
+/// * and only a request this API can carry WHOLE reaches the pass-role attempt that judges
+///   which role the `channelRoleArn` names ([`channel_role_account_refusal`]), because that
+///   attempt is about a value the API could have carried.
+///
+/// A handler's whole part is lifting the answer into its own operation error enum, which is
+/// the one thing it cannot share; no operation can reorder, drop or split a step, so two
+/// operations cannot answer different classes, or different clauses, for the same request.
+///
+/// Nothing is read or written for a request this refuses: every rule is a fact about the
+/// REQUEST, so each is answered before the account's store is reached.
+pub fn channel_write_refusal(members: &ChannelWriteMembers<'_>) -> Option<ChannelWriteRefusal> {
+    if let Some(message) =
+        ::aws_smithy_schema_server::constraints::envelope(&channel_write_violations(members))
+    {
+        return Some(ChannelWriteRefusal::Validation(message));
+    }
+    members
+        .channel_role_arn
+        .and_then(channel_role_account_refusal)
+        .map(ChannelWriteRefusal::AccessDenied)
+}
+
 /// Why the `channelRoleArn` a write carried cannot be used — which modelled error class
 /// answers it and with which message — or `None` when the value names a role this account
 /// can pass.
 ///
-/// This is the single entry point every operation that takes the member goes through, so
-/// the ORDER of the member's two rules, and the class each refusal travels in, is stated
-/// once here instead of once per writing handler: the declared `@length` maximum
-/// ([`MAX_CHANNEL_ROLE_ARN_LEN`]) is a caller-input mistake and is settled FIRST, and only
-/// a value this API can carry reaches the pass-role attempt that judges which role it
-/// names. A handler's whole part is lifting the answer into
-/// its own operation error enum, which is the one thing it cannot share; neither
-/// operation can reorder or drop a step, so the two cannot answer different classes for
-/// the same value.
-///
-/// Nothing is read or written for a value this refuses: both rules are facts about the
-/// REQUEST, so every operation that takes the member answers them before reaching the
-/// account's store.
+/// The member's own view of [`channel_write_refusal`], over a request carrying this member
+/// and no other member that rule reads: the same two rules in the same order — the declared
+/// `@length` maximum ([`MAX_CHANNEL_ROLE_ARN_LEN`]) is a caller-input mistake and is settled
+/// FIRST, and only a value this API can carry reaches the pass-role attempt that judges
+/// which role it names — so the member cannot be answered one way on its own and another way
+/// inside a request.
 pub fn channel_role_arn_refusal(role_arn: &str) -> Option<ChannelRoleArnRefusal> {
-    if let Some(message) = channel_role_arn_length_refusal(role_arn) {
-        return Some(ChannelRoleArnRefusal::Validation(message));
-    }
-    channel_role_account_refusal(role_arn).map(ChannelRoleArnRefusal::AccessDenied)
+    channel_write_refusal(&ChannelWriteMembers {
+        channel_role_arn: Some(role_arn),
+        ..ChannelWriteMembers::default()
+    })
+    .map(ChannelRoleArnRefusal::from)
 }
 
 /// The three notification flags as ONE clause of the documented

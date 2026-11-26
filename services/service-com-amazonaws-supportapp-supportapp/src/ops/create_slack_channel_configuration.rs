@@ -11,19 +11,16 @@
 //! value is taken into the pass-role step rather than refused for its form at the request
 //! boundary (`skip_validation` on the input in `src/ops/types/`): a value that does not name
 //! a role of the calling account is the modelled `AccessDeniedException` (403), whatever
-//! form it has — see [`crate::state::channel_role_arn_refusal`], which owns both of the
-//! member's rules and the order between them.
+//! form it has.
 //!
-//! The `teamId` and `channelId` this request carries declare a `\S`-based `@pattern`, which
-//! the request boundary's constraint walk cannot apply in full either — see
-//! [`crate::state::channel_pair_refusal`], which owns that part of both members' rule for
-//! every operation that names a channel configuration by its pair.
-//!
-//! The `channelName` this request carries declares a `.`-based `@pattern`, which the
-//! request boundary's constraint walk cannot apply in full — see
-//! [`crate::state::channel_name_refusal`], which owns that part of the member's rule for
-//! both operations that write it: a value the modelled expression does not admit is the
-//! modelled `ValidationException` (400) rather than something stored.
+//! The `teamId` and `channelId` this request carries declare a `\S`-based `@pattern`, and
+//! the `channelName` a `.`-based one, which the request boundary's constraint walk cannot
+//! apply in full either. All of those rules, the `channelRoleArn`'s declared `@length`
+//! maximum among them, reach [`crate::state::channel_write_refusal`], which owns which
+//! clauses a request draws, the one counted validation envelope (400) they travel in and the
+//! order the pass-role attempt is judged in: a value a modelled expression does not admit is
+//! the modelled `ValidationException` (400) rather than something stored, and a request
+//! breaking two of those rules names both clauses.
 //!
 //! A channel configuration lives inside a Slack workspace that is registered to the
 //! account, so the request's `teamId` must be in the account's workspace registry
@@ -214,58 +211,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `teamId` and `channelId` declare a `\S`-based `@pattern`, and the request
-        // boundary's walk reads a `\S` more widely than the modelled expression does, so the
-        // part of that expression the walk admits is applied here — first, because these are
-        // the members the model declares first, and before the store is reached, because a
-        // pair the expression does not admit could not be reported back through the shape it
-        // would be stored under. See [`crate::state::channel_pair_refusal`].
-        if let Some(message) =
-            crate::state::channel_pair_refusal(&input.team_id, &input.channel_id)
+        // Every rule of this request's own members the request boundary's constraint walk
+        // cannot apply in full is applied HERE, in one pass: `teamId` and `channelId` declare
+        // a `\S`-based `@pattern` and `channelName` a `.`-based one, both of which that walk
+        // reads more widely than the modelled expressions do, and `channelRoleArn` came off
+        // the boundary with the whole member, declared `@length` maximum included. WHICH
+        // clauses a request draws, the ONE counted envelope they travel in, and the
+        // pass-role attempt only a request this API can carry whole reaches, are
+        // [`crate::state::channel_write_refusal`]'s rule — this handler only lifts the
+        // answer it gives into this operation's own error enum. Settled before the store is
+        // reached, because no configuration is recorded for a value this API cannot carry or
+        // a role this account cannot pass, and because a value the modelled expressions do
+        // not admit could not be reported back through the shape it would be stored under.
+        if let Some(refusal) =
+            crate::state::channel_write_refusal(&crate::state::ChannelWriteMembers {
+                team_id: Some(&input.team_id),
+                channel_id: Some(&input.channel_id),
+                channel_name: input.channel_name.as_deref(),
+                channel_role_arn: Some(&input.channel_role_arn),
+            })
         {
-            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
-        // `channelName`'s declared `@pattern` is `.`-based, and the request boundary's walk
-        // reads a `.` more widely than the modelled expression does, so the part of that
-        // expression the walk admits is applied here — before the pass-role step below and
-        // before the store is reached, because it is a modelled constraint on the REQUEST
-        // and so is request validation, settled for the same reason the member's declared
-        // `@length` maximum is. See [`crate::state::channel_name_refusal`].
-        if let Some(message) = input
-            .channel_name
-            .as_deref()
-            .and_then(crate::state::channel_name_refusal)
-        {
-            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
-        // `channelRoleArn` came off the request boundary with the whole member (see
-        // [`crate::state::channel_role_arn_refusal`]), so the member's rules are applied
-        // here, before the store is reached: no configuration is recorded for a value this
-        // API cannot carry or a role this account cannot pass. WHICH refusal a value draws,
-        // and in which order the two rules are judged, is that shared rule's — this handler
-        // only lifts the answer it gives into this operation's own error enum.
-        if let Some(refusal) = crate::state::channel_role_arn_refusal(&input.channel_role_arn) {
             return Err(match refusal {
-                crate::state::ChannelRoleArnRefusal::Validation(message) => {
+                crate::state::ChannelWriteRefusal::Validation(message) => {
                     CreateSlackChannelConfigurationErrorModeled::ValidationException(
                         ValidationException {
                             message: Some(message),
                         },
                     )
                 }
-                crate::state::ChannelRoleArnRefusal::AccessDenied(message) => {
+                crate::state::ChannelWriteRefusal::AccessDenied(message) => {
                     CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(
                         AccessDeniedException {
                             message: Some(message),
