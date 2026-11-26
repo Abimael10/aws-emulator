@@ -500,6 +500,29 @@ pub(crate) fn list(body: &Value, member: &str, case: &str) -> Vec<Value> {
     }
 }
 
+/// Assert that `document` carries NO value for `member` — absent, or present as `null`.
+///
+/// Read as "absence", not as "no value of the type I expected": a member present with a value
+/// of another JSON type would satisfy a typed read of `None`, so a wrongly typed `stopCode` or
+/// `startedAt` would slip through such a check. The ONE reader of absence for this binary's
+/// suites, so a suite asserting that a member was not reported shares this check rather than
+/// keeping a copy of it.
+pub(crate) fn assert_absent(document: &Value, member: &str, case: &str) {
+    assert!(
+        document.get(member).is_none_or(Value::is_null),
+        "case {case:?}: expected no {member} at all, got {document}"
+    );
+}
+
+/// One container of a described task, by name — the read every suite that asserts on a named
+/// container of a task does, shared for the same reason.
+pub(crate) fn container_of(task: &Value, name: &str, case: &str) -> Value {
+    list(task, "containers", case)
+        .into_iter()
+        .find(|container| container["name"] == json!(name))
+        .unwrap_or_else(|| panic!("case {case:?}: expected the container {name}, got {task}"))
+}
+
 /// Assert `reported` is an epoch-seconds instant encoded no finer than the MILLISECOND: the
 /// milliseconds it names are whole, so nothing below a millisecond reaches the wire.
 ///

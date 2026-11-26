@@ -46,7 +46,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    ec2_element, ec2_form, ecr, emulator_with_ec2, ok, poll_until, string, ACCOUNT, SIGNED_REGION,
+    assert_absent, ec2_element, ec2_form, ecr, emulator_with_ec2, ok, poll_until, string, ACCOUNT,
+    SIGNED_REGION,
 };
 // The ONE repeated-element reader of this binary (`all/load_balancer_target_groups.rs`: the suites
 // of this binary share ONE reader instead of each keeping its own).
@@ -437,18 +438,6 @@ fn attachment_subnets(task: &Value, case: &str) -> Vec<String> {
         .filter(|detail| detail["name"].as_str() == Some(SUBNET_ID_DETAIL))
         .filter_map(|detail| detail["value"].as_str().map(str::to_string))
         .collect()
-}
-
-/// Assert that `document` carries NO value for `member` — absent, or present as `null`.
-///
-/// Read as "absence", not as "no value of the type I expected": a member present with a value of
-/// another JSON type would satisfy a typed read of `None`, so a wrongly typed `stopCode` or
-/// `startedAt` would slip through such a check.
-fn assert_absent(document: &Value, member: &str, case: &str) {
-    assert!(
-        document.get(member).is_none_or(Value::is_null),
-        "case {case:?}: expected no {member} at all, got {document}"
-    );
 }
 
 #[tokio::test]
