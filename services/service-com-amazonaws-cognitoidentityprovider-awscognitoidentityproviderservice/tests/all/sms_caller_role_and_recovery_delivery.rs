@@ -21,11 +21,13 @@
 //! * RULE B — an SMS MFA factor needs a caller to send through: a
 //!   `SmsMfaConfiguration` that names none, while the pool's MFA is on or
 //!   optional, is `InvalidParameterException` (HTTP 400).
-//! * RULE C — a reset code goes only over a medium the pool can SEND on: the
-//!   `verified_phone_number` recovery mechanism qualifies only while the pool
-//!   stores the SMS configuration a text message leaves through, so a pool that
-//!   stores none falls through to the mechanism behind it and refuses where
-//!   nothing else qualifies.
+//! * RULE C — where a reset code goes is decided by the values the USER holds
+//!   verified and the order the pool's `AccountRecoverySetting` ranks its
+//!   mechanisms in: what the pool configured for SENDING over a medium is no part
+//!   of that decision, so the `verified_phone_number` mechanism qualifies on a
+//!   pool that stores no SMS configuration exactly as it does on one that stores
+//!   one, and only a user holding no verified value a ranked mechanism recovers
+//!   over is refused.
 //!
 //! The roles and their trust documents are IAM's OWN records, written through
 //! IAM's own `CreateRole` over the same engine, so the documents this service
@@ -679,11 +681,13 @@ async fn an_sms_mfa_factor_needs_a_caller_to_send_through() {
     }
 }
 
-/// RULE C: `ForgotPassword` delivers over a medium the pool can send on, so the
-/// `verified_phone_number` mechanism qualifies only while the pool stores the SMS
-/// configuration a text message leaves through.
+/// RULE C: which recovery mechanism `ForgotPassword` delivers over is decided by the
+/// values the USER holds verified and the order the pool's `AccountRecoverySetting`
+/// ranks its mechanisms in — what the pool configured for SENDING over a medium is no
+/// part of that decision, so the `verified_phone_number` mechanism qualifies on a pool
+/// that stores no `SmsConfiguration` exactly as it does on one that stores one.
 #[tokio::test]
-async fn a_reset_code_goes_only_over_a_medium_the_pool_can_send_on() {
+async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
     let router = router_without_iam();
     let sends_sms =
         json!({ "SnsCallerArn": account_arn("iam", "", "role/sms-caller"), "ExternalId": "tenant" });
@@ -726,7 +730,7 @@ async fn a_reset_code_goes_only_over_a_medium_the_pool_can_send_on() {
                 ("phone_number", "+15550100002"),
                 ("phone_number_verified", "true"),
             ],
-            "email",
+            "phone_number",
         ),
         (
             "a verified number as the only contact, on a pool that sends SMS",
@@ -746,13 +750,12 @@ async fn a_reset_code_goes_only_over_a_medium_the_pool_can_send_on() {
                 ("phone_number", "+15550100004"),
                 ("phone_number_verified", "true"),
             ],
-            "",
+            "phone_number",
         ),
         (
             // A stored configuration that names NOBODY to send through is a pool
             // with no SMS delivery path, exactly as a pool with no configuration
-            // at all: the two readings are one
-            // (`crate::state::names_an_sms_caller`).
+            // at all — and neither reading decides where a reset code goes.
             "a verified number alone, on a pool whose SMS configuration names no caller",
             phone_only.clone(),
             json!({ "SnsCallerArn": "" }),
@@ -760,9 +763,11 @@ async fn a_reset_code_goes_only_over_a_medium_the_pool_can_send_on() {
                 ("phone_number", "+15550100007"),
                 ("phone_number_verified", "true"),
             ],
-            "",
+            "phone_number",
         ),
         (
+            // The pool ranks the phone mechanism ALONE, so the user's verified
+            // email is not a mechanism this pool recovers through at all.
             "the phone mechanism alone and a verified email the pool may not use",
             phone_only.clone(),
             Value::Null,
@@ -772,7 +777,7 @@ async fn a_reset_code_goes_only_over_a_medium_the_pool_can_send_on() {
                 ("phone_number", "+15550100005"),
                 ("phone_number_verified", "true"),
             ],
-            "",
+            "phone_number",
         ),
         (
             "an unverified number on a pool that sends SMS",
@@ -847,8 +852,8 @@ async fn a_reset_code_goes_only_over_a_medium_the_pool_can_send_on() {
         if expected.is_empty() {
             assert_eq!(
                 status, 400,
-                "case {case:?}: a pool with nothing to deliver over refuses, got {status} \
-                 with {payload}"
+                "case {case:?}: a user holding no verified value a ranked mechanism \
+                 recovers over is refused, got {status} with {payload}"
             );
             assert_eq!(
                 error_code(&payload),

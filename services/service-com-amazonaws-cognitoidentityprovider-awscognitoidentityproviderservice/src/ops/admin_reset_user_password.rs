@@ -206,10 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
-        // The code is issued under this service's lock, and that lock is RELEASED before
-        // the pool's custom email sender is invoked: nothing else of this service can be
-        // served while a function is being waited for.
-        let issued = self.begin_reset(&input)?;
+        // The reset is decided and its code minted under this service's lock, and that
+        // lock is RELEASED before the pool's custom email sender is invoked: nothing else
+        // of this service can be served while a function is being waited for. Nothing is
+        // written yet — the message is composed first ([`Self::commit_reset`]).
+        let prepared = self.prepare_reset(&input)?;
 
         // Whatever this pool's `LambdaConfig` puts over the reset message is fired here: a
         // custom sender for the medium it travels over is handed the code and delivers it, and
@@ -222,15 +223,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ctx,
             &state,
             &input.user_pool_id,
-            &issued.username,
-            &issued.medium,
+            &prepared.username,
+            &prepared.medium,
             crate::state::lambda_triggers::message_delivery::Stage::ForgotPassword,
             crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
             input.client_metadata.as_ref(),
-            &issued.code,
+            &prepared.code.code,
         )
         .await
         .map_err(trigger_failed)?;
+
+        // The message is composed BEFORE the reset it announces is recorded, so the
+        // account is written only here, with the trigger's answer already in hand: a
+        // reset the trigger refused leaves the account in the status it held and holding
+        // the codes it held.
+        self.commit_reset(&input.user_pool_id, prepared)?;
 
         // This operation's response models no member: what it did is in the state a
         // later read renders, and the code itself is delivered out of band.
@@ -238,26 +245,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One issued code, the stored user it was issued to and the medium its message travelled
-/// over, which is what decides the custom sender it is handed to.
-struct IssuedCode {
+/// One reset this operation decided and has not recorded yet: the stored user it is for,
+/// the medium its message travels over — which is what decides the custom sender the code
+/// is handed to — and the code that message carries.
+struct PreparedReset {
     username: String,
-    code: String,
-    /// The `DeliveryMediumType` the message travelled over, read off the attribute it was
+    code: crate::state::VerificationCode,
+    /// The `DeliveryMediumType` the message travels over, read off the attribute it is
     /// addressed to ([`crate::state::delivery_medium`]).
     medium: String,
+    /// The instant the reset began, which is what the user's last-modified date reports
+    /// once the reset is recorded.
+    now: ::std::time::SystemTime,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminResetUserPassword<Eng> {
-    /// Begin the reset `input` asks for, and report the code it issued.
+    /// Decide the reset `input` asks for, and report the code its message carries.
     ///
-    /// Everything here happens under this service's lock, which this call OWNS: the lock
-    /// is taken and released inside it, so its caller holds none of it while it invokes a
-    /// trigger function.
-    fn begin_reset(
+    /// Writes NOTHING: a reset is the status it puts the account in and the code it sends,
+    /// and that message is composed by the pool's own trigger before either is recorded
+    /// ([`Self::commit_reset`]), so what this call produces is a decision rather than a
+    /// change. Everything here happens under this service's lock, which this call OWNS:
+    /// the lock is taken and released inside it, so its caller holds none of it while it
+    /// invokes a trigger function.
+    fn prepare_reset(
         &self,
         input: &AdminResetUserPasswordInput,
-    ) -> Result<IssuedCode, AdminResetUserPasswordError> {
+    ) -> Result<PreparedReset, AdminResetUserPasswordError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -265,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminResetUserPas
         // what the issued code's validity window is counted from.
         let now = ::std::time::SystemTime::now();
 
-        let mut guard = state.lock();
+        let guard = state.lock();
         let pool = guard
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
@@ -311,41 +325,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminResetUserPas
             }
         };
 
-        // Sending the code is part of what this operation DOES: it is recorded as the
-        // ONE code outstanding for a password reset of this user, so a later send
-        // supersedes it and only the latest is accepted.
+        // The code this reset's message carries, minted for the destination the pool
+        // chose: it is the message's own content, so it is minted here and recorded only
+        // once that message has been composed.
         let code = crate::state::VerificationCode::issued(&attribute, &destination, now);
-        let user = guard
-            .pool_mut(&input.user_pool_id)
-            .and_then(|pool| pool.user_mut(&username))
-            .ok_or_else(internal_error)?;
-        // "Sets the requested user's account into a RESET_REQUIRED status, and sends
-        // them a password-reset code" (this operation in this service's model), so the
-        // user owes a new password before it signs in again and holds the code that
-        // authorises setting one. The user's registration is complete (checked above),
-        // so the status it sets is set whatever else the user held before.
-        user.status = crate::state::UserStatus::ResetRequired;
-        let stored = user.issue_code(crate::state::CodePurpose::PasswordReset, code);
-        user.user_last_modified_date = now;
-
-        Ok(IssuedCode {
+        Ok(PreparedReset {
             username,
-            medium: crate::state::delivery_medium(&stored.attribute)
+            medium: crate::state::delivery_medium(&code.attribute)
                 .unwrap_or_default()
                 .to_string(),
-            code: stored.code,
+            code,
+            now,
         })
+    }
+
+    /// Record `prepared`, the reset whose message the pool has now composed.
+    ///
+    /// "Sets the requested user's account into a RESET_REQUIRED status, and sends them a
+    /// password-reset code" (this operation in this service's model): the status and the
+    /// code are the one effect, so they are written together, here, after the message that
+    /// carries the code has been composed and not before — a reset whose message the pool's
+    /// trigger refused writes neither. The code is recorded as the ONE code outstanding for
+    /// a password reset of this user, so a later send supersedes it and only the latest is
+    /// accepted.
+    ///
+    /// The account is judged AGAIN, on the state this call finds: the lock was released
+    /// while the message was composed, so a user another request disabled, or left owning no
+    /// password of its own, is refused here exactly as [`Self::prepare_reset`] would have
+    /// refused it rather than being moved by a decision taken over the account as it then
+    /// stood.
+    ///
+    /// Takes the lock itself, and releases it before returning.
+    fn commit_reset(
+        &self,
+        user_pool_id: &str,
+        prepared: PreparedReset,
+    ) -> Result<(), AdminResetUserPasswordError> {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let mut guard = state.lock();
+        let user = guard
+            .pool_mut(user_pool_id)
+            .and_then(|pool| pool.user_mut(&prepared.username))
+            .ok_or_else(user_not_found)?;
+        if !user.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        if !user.status.holds_own_password() {
+            return Err(not_authorized(
+                crate::state::PASSWORD_NOT_RESETTABLE_MESSAGE,
+            ));
+        }
+        user.status = crate::state::UserStatus::ResetRequired;
+        user.issue_code(crate::state::CodePurpose::PasswordReset, prepared.code);
+        user.user_last_modified_date = prepared.now;
+        Ok(())
     }
 }
 
 /// What the pool's custom email sender's failure is for THIS operation: the modelled
 /// error each outcome amounts to, carrying the message the dispatch built.
 ///
-/// The reset has begun and the code is recorded — it is what `ConfirmForgotPassword`
-/// checks a presented one against — so what the failure changes is what this call
-/// ANSWERS: a function Lambda cannot invoke at all is "an unexpected exception with
-/// Lambda", and one that ran and reported an error is "a user validation exception with
-/// the Lambda service" (this service's model).
+/// The message carrying the reset code is composed before the reset is recorded, so a
+/// failure here is a reset that never happened: the account keeps the status it had and
+/// the codes it had, and this call answers the class the failure amounts to — a function
+/// Lambda cannot invoke at all is "an unexpected exception with Lambda", and one that ran
+/// and reported an error is "a user validation exception with the Lambda service" (this
+/// service's model).
 fn trigger_failed(
     failure: crate::state::lambda_triggers::Failure,
 ) -> AdminResetUserPasswordError {

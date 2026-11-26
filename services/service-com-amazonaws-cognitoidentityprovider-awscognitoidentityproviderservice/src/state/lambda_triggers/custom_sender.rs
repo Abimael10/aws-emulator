@@ -287,10 +287,11 @@ pub fn pending(
 
 /// Encrypt the pending code under the pool's key and invoke the function it is destined for.
 ///
-/// Call it with the state lock RELEASED: the issuing operation's own writes are already
-/// persisted — the code is recorded, which is what the operation that consumes it checks a
-/// presented code against — and holding the lock across the key-service call and the
-/// invocation would make every other request of this service wait on them.
+/// Call it with the state lock RELEASED: holding it across the key-service call and the
+/// invocation would make every other request of this service wait on them. Whether the
+/// issuing operation has already recorded what the message announces is that operation's
+/// own decision — a password reset composes its message before recording either the status
+/// it moves or the code it sends — and this call writes nothing either way.
 pub async fn invoke(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     owed: Pending,

@@ -1446,28 +1446,20 @@ impl UserPool {
             .mfa_setting_list
             .iter()
             .any(|setting| setting == SMS_MFA_SETTING);
-        // A mechanism qualifies only while this pool can SEND the message it
-        // delivers over. An SMS message is sent through the Amazon SNS caller the
-        // pool's `SmsConfiguration` names — "user pool configuration for delivery
-        // of SMS messages with Amazon Simple Notification Service"
-        // (`SmsConfigurationType` in this service's model) — so a pool that
-        // stores none has no SMS delivery path at all, and the mechanism that
-        // texts a reset code does not qualify however verified the user's number
-        // is. The pool then falls through to the next mechanism by priority,
-        // exactly as it does for a number that is this user's second sign-in
-        // factor, and a user with no other qualifying mechanism has no
-        // destination at all. It is the same coupling a pool that verifies
-        // `phone_number` itself is held to
-        // ([`crate::state::sms_configuration_missing_for_auto_verification`]),
-        // asked here because no configuration forbids naming the mechanism
-        // without the delivery path.
-        let delivers_sms = self.delivers_sms();
+        // That activated second factor is the ONE thing documented to
+        // disqualify a mechanism the pool ranks: everything else about this
+        // decision is the values the USER holds verified, taken in the pool's
+        // own order. What the pool has configured for SENDING over a medium is
+        // no part of it — `SmsConfiguration` is "user pool configuration for
+        // delivery of SMS messages with Amazon Simple Notification Service"
+        // (`SmsConfigurationType` in this service's model), which is how a
+        // message leaves the pool and not whether the user has a verified
+        // number to send one to — so a pool that stores none still recovers
+        // through the mechanism its `AccountRecoverySetting` ranks.
         mechanisms
             .iter()
             .filter_map(|(_, name)| recovered_attribute(name))
-            .filter(|attribute| {
-                *attribute != SMS_RECOVERED_ATTRIBUTE || (delivers_sms && !sms_mfa_activated)
-            })
+            .filter(|attribute| *attribute != SMS_RECOVERED_ATTRIBUTE || !sms_mfa_activated)
             .find_map(|attribute| {
                 user.verified_destination_of(attribute)
                     .map(|destination| RecoveryDestination::Delivered {

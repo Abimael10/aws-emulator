@@ -349,20 +349,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
         // decided by the recovery destination this pool chose. A request that issued no code at
         // all — one naming a user the pool does not hold, answered with a simulated delivery —
         // fires nothing either.
-        if let Some(issued) = asked.issued {
+        //
+        // The message is composed BEFORE the code it carries is recorded, so a request the
+        // trigger refused leaves the user holding the code it held ([`Self::record_code`]).
+        if let Some(prepared) = asked.issued {
             crate::state::lambda_triggers::message_delivery::fire_over_medium(
                 ctx,
                 &state,
-                &issued.user_pool_id,
-                &issued.username,
-                &issued.medium,
+                &prepared.user_pool_id,
+                &prepared.username,
+                &prepared.medium,
                 crate::state::lambda_triggers::message_delivery::Stage::ForgotPassword,
                 crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
                 input.client_metadata.as_ref(),
-                &issued.code,
+                &prepared.code.code,
             )
             .await
             .map_err(trigger_failed)?;
+            self.record_code(prepared)?;
         }
 
         Ok(asked.answer)
@@ -371,35 +375,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
 
 /// What the stored state decided a reset request is, read under the state lock.
 enum Asked {
-    /// The reset itself: the answer it owes and the code it issued.
-    Reset(AskedForReset),
+    /// The reset itself: the answer it owes and the code it sends. Boxed, because it is
+    /// much the larger of the two outcomes.
+    Reset(Box<AskedForReset>),
     /// The pool holds no such user and names a migrate-user function, so the function
     /// decides whether this username names a user at all.
     MigrateUser { user_pool_id: String },
 }
 
-/// What a reset request left behind: the answer it owes its caller, and the code it issued
-/// for the pool's custom email sender to deliver.
+/// What a reset request left behind: the answer it owes its caller, and the code its
+/// message carries, which is recorded once that message has been composed.
 struct AskedForReset {
-    /// The answer this request owes, rendered from the record it stored.
+    /// The answer this request owes, rendered from the code its message carries.
     answer: ForgotPasswordOutput,
-    /// The code it issued, or `None` where it issued none at all.
-    issued: Option<IssuedCode>,
+    /// The code it sends, or `None` where it sends none at all.
+    issued: Option<PreparedCode>,
 }
 
-/// One issued code, the stored user it was issued to and the medium its message travelled
-/// over, which is what decides the custom sender it is handed to.
-struct IssuedCode {
+/// One reset message this request sends and has not recorded yet: the pool and the stored
+/// user it is for, the code it carries and the medium it travels over, which is what
+/// decides the custom sender the code is handed to.
+struct PreparedCode {
     user_pool_id: String,
     username: String,
-    code: String,
-    /// The `DeliveryMediumType` the message travelled over, read off the attribute it was
+    code: crate::state::VerificationCode,
+    /// The `DeliveryMediumType` the message travels over, read off the attribute it is
     /// addressed to ([`crate::state::delivery_medium`]).
     medium: String,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<Eng> {
-    /// Issue the reset code `input` asks for, and report what that left behind.
+    /// Decide the reset code `input` asks for, and report what that decided.
+    ///
+    /// Writes NOTHING: the code is the content of a message the pool's own trigger
+    /// composes, so it is recorded only once that message has been composed
+    /// ([`Self::record_code`]).
     ///
     /// `may_migrate` is whether a username the pool does not hold may still be migrated:
     /// the first pass of a pool that configures a migrate-user function asks for that
@@ -418,7 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
         };
         let now = ::std::time::SystemTime::now();
 
-        let mut guard = state.lock();
+        let guard = state.lock();
         // This operation models no `UserPoolId`: the app client the request names is
         // what resolves the pool whose user is reset.
         let pool = guard
@@ -456,14 +466,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
             // submitted, so the answer carries no literal of its own.
             // `LEGACY` answers `UserNotFoundException`.
             if hides_user_existence {
-                return Ok(Asked::Reset(AskedForReset {
+                return Ok(Asked::Reset(Box::new(AskedForReset {
                     answer: ForgotPasswordOutput {
                         code_delivery_details: crate::state::simulated_code_delivery_details(
                             &input.username,
                         ),
                     },
                     issued: None,
-                }));
+                })));
             }
             return Err(user_not_found());
         };
@@ -508,42 +518,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
             }
         };
 
-        // Sending the code is what this operation DOES: it is recorded as the ONE code
-        // outstanding for a password reset of this user, so a second request supersedes
-        // the code the first one sent and only the latest is accepted.
+        // The code this reset's message carries, minted for the destination the pool
+        // chose. It is recorded as the ONE code outstanding for a password reset of this
+        // user once the message has been composed, so a second request supersedes the code
+        // the first one sent and only the latest is accepted.
         let code = crate::state::VerificationCode::issued(&attribute, &destination, now);
-        let user = guard
-            .pool_mut(&user_pool_id)
-            .and_then(|pool| pool.user_mut(&username))
-            .ok_or_else(internal_error)?;
-        let stored = user.issue_code(crate::state::CodePurpose::PasswordReset, code);
 
-        // Rendered from the record just stored: the destination is the stored attribute
-        // value, reported masked, and the medium is the one that value is reached over.
-        Ok(Asked::Reset(AskedForReset {
+        // Rendered from the code the message carries: the destination is the stored
+        // attribute value, reported masked, and the medium is the one that value is
+        // reached over.
+        Ok(Asked::Reset(Box::new(AskedForReset {
             answer: ForgotPasswordOutput {
-                code_delivery_details: stored.delivery_details(),
+                code_delivery_details: code.delivery_details(),
             },
-            issued: Some(IssuedCode {
+            issued: Some(PreparedCode {
                 user_pool_id,
                 username,
-                medium: crate::state::delivery_medium(&stored.attribute)
+                medium: crate::state::delivery_medium(&code.attribute)
                     .unwrap_or_default()
                     .to_string(),
-                code: stored.code,
+                code,
             }),
-        }))
+        })))
+    }
+
+    /// Record the code of the reset message the pool has now composed.
+    ///
+    /// The account is judged AGAIN, on the state this call finds: the lock was released while
+    /// the message was composed, so a user another request disabled, or left owning no
+    /// password of its own, holds no code from this request rather than one issued over the
+    /// account as it then stood ([`Self::ask_for_reset`] applies the same two tests).
+    ///
+    /// Takes the lock itself, and releases it before returning.
+    fn record_code(&self, prepared: PreparedCode) -> Result<(), ForgotPasswordError> {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let mut guard = state.lock();
+        let user = guard
+            .pool_mut(&prepared.user_pool_id)
+            .and_then(|pool| pool.user_mut(&prepared.username))
+            .ok_or_else(internal_error)?;
+        if !user.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        if !user.status.holds_own_password() {
+            return Err(not_authorized(
+                crate::state::PASSWORD_NOT_RESETTABLE_MESSAGE,
+            ));
+        }
+        user.issue_code(crate::state::CodePurpose::PasswordReset, prepared.code);
+        Ok(())
     }
 }
 
 /// What the pool's custom email sender's failure is for THIS operation: the modelled
 /// error each outcome amounts to, carrying the message the dispatch built.
 ///
-/// The code is already recorded — it is what `ConfirmForgotPassword` checks a presented
-/// one against, and it already superseded the code before it — so what the failure
-/// changes is what this call ANSWERS: a function Lambda cannot invoke at all is "an
-/// unexpected exception with Lambda", and one that ran and reported an error is "a user
-/// validation exception with the Lambda service" (this service's model).
+/// The message carrying the reset code is composed before that code is recorded, so a
+/// failure here is a reset that never happened: the user keeps the code it held, and this
+/// call answers the class the failure amounts to — a function Lambda cannot invoke at all
+/// is "an unexpected exception with Lambda", and one that ran and reported an error is "a
+/// user validation exception with the Lambda service" (this service's model).
 fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> ForgotPasswordError {
     match failure {
         crate::state::lambda_triggers::Failure::Reported(message) => {

@@ -442,8 +442,9 @@ async fn an_admin_reset_follows_the_pools_account_recovery_setting() {
         ),
         (
             // The same ranking and the same verified number, on a pool with no
-            // SMS delivery path: the phone mechanism cannot deliver, so the
-            // verified email behind it is the destination.
+            // SMS delivery path: what the pool configured for SENDING is no part
+            // of the decision, so the ranked mechanism the user holds verified is
+            // still the destination.
             "verified_phone_number first and verified, on a pool that sends no SMS",
             verified_phone_first.clone(),
             vec![
@@ -453,7 +454,7 @@ async fn an_admin_reset_follows_the_pools_account_recovery_setting() {
                 ("phone_number_verified", "true"),
             ],
             200,
-            "email",
+            "phone_number",
         ),
         (
             "verified_phone_number first, but only the email is verified",
@@ -477,15 +478,16 @@ async fn an_admin_reset_follows_the_pools_account_recovery_setting() {
             "phone_number",
         ),
         (
-            // The same user on a pool that cannot text: nothing qualifies at all.
+            // The same user on a pool that stores no SMS configuration: the
+            // ranked mechanism it holds verified still qualifies.
             "a verified number alone, on a pool that sends no SMS",
             json!({}),
             vec![
                 ("phone_number", "+15550100010"),
                 ("phone_number_verified", "true"),
             ],
-            400,
-            "InvalidParameterException",
+            200,
+            "phone_number",
         ),
         (
             "a pool that reserves account recovery to administrators",

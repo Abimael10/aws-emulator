@@ -1438,10 +1438,10 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
             ]
         }
     });
-    // The same ranking on a pool that can actually SEND a text message: an SMS
-    // reset code leaves through the Amazon SNS caller the pool's
-    // `SmsConfiguration` names, so the phone mechanism qualifies only where the
-    // pool stores one.
+    // The same ranking on a pool that stores the Amazon SNS caller a text
+    // message leaves through. Whether the pool stores one is no part of the
+    // recovery decision, so the rows below pair the same ranking with and
+    // without it and expect the same destination.
     let verified_phone_first_over_sms = merged(
         verified_phone_first.clone(),
         &json!({
@@ -1496,8 +1496,9 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
         ),
         (
             // The same ranking and the same verified number, on a pool with no
-            // SMS delivery path at all: the phone mechanism cannot deliver, so
-            // the pool falls through to the verified email behind it.
+            // SMS delivery path at all: what the pool configured for SENDING is
+            // no part of the decision, so the ranked mechanism the user holds
+            // verified is still the destination.
             "verified_phone_number first and verified, on a pool that sends no SMS",
             verified_phone_first.clone(),
             vec![
@@ -1507,19 +1508,19 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
                 ("phone_number_verified", "true"),
             ],
             200,
-            "email",
+            "phone_number",
         ),
         (
-            // And with the verified number as the user's ONLY address, nothing
-            // qualifies at all.
+            // And with the verified number as the user's ONLY address, that is
+            // still what the ranked mechanism recovers over.
             "a verified number alone, on a pool that sends no SMS",
             verified_phone_first.clone(),
             vec![
                 ("phone_number", "+15550100009"),
                 ("phone_number_verified", "true"),
             ],
-            400,
-            "InvalidParameterException",
+            200,
+            "phone_number",
         ),
         (
             "verified_phone_number first, but only the email is verified",
