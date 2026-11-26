@@ -14,9 +14,11 @@
 //! 1. A submit mints and persists an operation id; a poll answers that operation's
 //!    status and result from stored state, and the populated `OperationResult` member is
 //!    the one whose `OperationConfig` member was submitted.
-//! 2. An operation whose execution needs a model, tokenizer or training engine — none of
-//!    which runs in this emulator — ends in the modelled `Failed` status with
-//!    `errorDetails` that say so, and never in `Completed`.
+//! 2. An operation whose whole result is a number only a model's forward pass has — no
+//!    language model runs in this emulator — ends in the modelled `Failed` status with
+//!    `errorDetails` that say so, and never in `Completed`; an operation this emulator
+//!    does serve completes and reports its own result member (see
+//!    `sampling_completion.rs` for what a served `sample` carries).
 //! 3. A checkpoint operation (`saveWeights`, `saveState`, `loadState`,
 //!    `loadWeightsForSampling`) is executed for real: a save publishes a model package
 //!    ARN built from the request's region and an incrementing version, and a load
@@ -554,9 +556,26 @@ async fn every_sampling_operation_member_answers_from_stored_state() {
     let checkpoint = write_checkpoint(&router, session, 1, false).await;
 
     let cases: Vec<(&str, Value, &str, Option<&str>)> = vec![
-        ("sample of 1", sample_config(1), "Failed", None),
-        ("sample of 3", sample_config(3), "Failed", None),
-        ("sample of 1000", sample_config(1000), "Failed", None),
+        ("sample of 1", sample_config(1), "Completed", Some("sample")),
+        ("sample of 3", sample_config(3), "Completed", Some("sample")),
+        (
+            "sample of 1000",
+            sample_config(1000),
+            "Completed",
+            Some("sample"),
+        ),
+        (
+            "sample against a checkpoint this session never wrote",
+            json!({"sample": {
+                "prompt": model_input(&[7, 8]),
+                "numSamples": 1,
+                "samplingParams": {"maxTokens": 512},
+                "modelPackageArn":
+                    format!("arn:aws:sagemaker:{REGION}:{ACCOUNT}:model-package/elsewhere/3"),
+            }}),
+            "Failed",
+            None,
+        ),
         (
             "computeLogprobs",
             json!({"computeLogprobs": {"prompt": model_input(&[4, 5, 6])}}),

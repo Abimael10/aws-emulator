@@ -21,15 +21,26 @@
 //! * the **validation rules the model states in prose** rather than in a trait, which
 //!   the boundary validator therefore does not refuse for us.
 //!
-//! No language model, tokenizer or training engine runs inside this emulator, so
-//! nothing here invents model output and presents it as a forward pass, an optimizer
-//! step or a generated sample: an operation whose execution needs one ends in the
-//! service's own `Failed` status with `errorDetails` that say so (see
-//! [`no_model_runtime`]), and the synchronous `SampleTrainingSession` answers a body
-//! that says the same in plain terms, as does the one chunk the streaming variant frames
-//! ([`sample_response_stream_body`]). Everything around that — session and operation
-//! records, sequence ordering, idempotency, checkpoints and their ARNs, status
-//! progression, validation and the 404s — is real and computed from persisted state.
+//! No language model or training engine runs inside this emulator, so nothing here
+//! invents model output and presents it as a forward pass, an optimizer step or a
+//! generated sample. What follows from that is a line between the operations this
+//! emulator can SERVE and the ones it cannot:
+//!
+//! * an operation whose result this service computes settles in the status that outcome
+//!   is — a `sample` operation completes and reports a `SampleOperationResult$sample`
+//!   whose tokens say, in the vocabulary a real byte-pair encoder ships, that no model
+//!   ran (see [`sampled_tokens`]), exactly as the synchronous `SampleTrainingSession`
+//!   says it in its own body ([`sample_response_body`]) and the streaming variant in the
+//!   one chunk it frames ([`sample_response_stream_body`]);
+//! * an operation whose whole result is a number only a model's forward pass has — a
+//!   loss, a gradient, a log-probability — ends in the service's own `Failed` status with
+//!   `errorDetails` that say so ([`no_model_runtime`]), which is the modelled failure
+//!   channel reporting what is unsupported rather than a healthy request reported as
+//!   broken.
+//!
+//! Everything around that — session and operation records, sequence ordering,
+//! idempotency, checkpoints and their ARNs, token accounting, status progression,
+//! validation and the 404s — is real and computed from persisted state.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -40,6 +51,12 @@ use crate::ops::types::{
     LoadStateResult, LoadWeightsForSamplingResult, ModelInput, OperationConfig, OperationResult,
     SampleOperationConfig, SampleOperationResult, SaveStateResult, SaveWeightsResult,
 };
+
+/// The token sequence a completed `sample` operation serves, and the tokenizer that
+/// encodes it. Its own module because it is the one concern here that is about CONTENT
+/// rather than about the records around it.
+mod sampled_tokens;
+pub use sampled_tokens::*;
 
 /// The region a checkpoint ARN names when the request carries no SigV4 credential
 /// scope to read one from.
@@ -110,16 +127,18 @@ pub const MAX_DOCUMENT_DEPTH: usize = 32;
 pub const LOSS_FN_CONFIG_KEYS: &[(&str, f64, f64)] =
     &[("clip_low_threshold", 0.0, 1.0), ("clip_high_threshold", 1.0, 10.0)];
 
-/// Why an operation whose execution needs a model runtime ends in `Failed`.
+/// Why an operation whose whole result is a number only a model's forward pass has ends
+/// in `Failed`.
 ///
-/// `kind` is the union member that was submitted. No language model, tokenizer or
-/// training engine runs inside this emulator, so there is nothing honest to report as
-/// `Completed` for a forward pass, an optimizer step, a generated sample or a
-/// log-probability: the operation ends in the service's own modelled failure status with
-/// a reason that says why.
+/// `kind` is the union member that was submitted. No language model or training engine
+/// runs inside this emulator, so there is nothing honest to report as `Completed` for a
+/// loss, a gradient or a log-probability: the operation ends in the service's own modelled
+/// failure status with a reason that says why. An operation this emulator CAN serve never
+/// reaches this — see [`sampled_tokens`] for the sampled sequence a `sample` operation
+/// completes with.
 pub fn no_model_runtime(kind: &str) -> String {
     format!(
-        "This SageMaker training-session runtime emulator runs no model, tokenizer or \
+        "This SageMaker training-session runtime emulator runs no language model or \
          training engine, so the {kind} operation was not executed and produced no result."
     )
 }
@@ -283,10 +302,10 @@ impl Session {
     ///
     /// COUNTED from this session's own records rather than estimated: the token totals are
     /// the sums of the usage the operations themselves report, so an operation that
-    /// consumed no token adds none. No model, tokenizer or training engine runs in this
-    /// emulator, so the operations that would put data through one report no usage and the
-    /// totals stay at the zero the session has really consumed; the sums follow whatever
-    /// the operations do report.
+    /// consumed no token adds none. A sampling operation this emulator serves reports the
+    /// tokens it really prefilled and decoded; an operation that ended in the modelled
+    /// failure status executed nothing and so reports no usage at all, and the sums follow
+    /// whatever the operations do report.
     ///
     /// This is the value the data plane publishes into the account the SageMaker control
     /// plane reads ([`publish_session_usage`]), which reports both as members of its own
@@ -624,6 +643,35 @@ impl Session {
                     op.error_details = Some(checkpoint_not_in_session(&self.name, &arn));
                 }
             }
+            // "The ARN of the model package whose checkpoint this sample should run
+            // against. ... When absent, the sample runs against the session's latest
+            // checkpoint." A session that has written none still has the base model its
+            // control-plane record was created with, so only a NAMED model package that
+            // is not one of this session's checkpoints fails the operation.
+            SampleOperationConfig::Sample(config) => {
+                match config
+                    .model_package_arn
+                    .as_deref()
+                    .filter(|arn| !self.checkpoints.contains_key(*arn))
+                {
+                    Some(arn) => {
+                        op.status = STATUS_FAILED;
+                        op.error_details = Some(checkpoint_not_in_session(&self.name, arn));
+                    }
+                    None => match sample_response(config) {
+                        Some(response) => {
+                            op.status = STATUS_COMPLETED;
+                            op.result = Some(SampleOperationResult::Sample(response));
+                        }
+                        None => {
+                            op.status = STATUS_FAILED;
+                            op.error_details = Some(no_sampling_vocabulary());
+                        }
+                    },
+                }
+            }
+            // Whatever is left needs a model runtime, and was refused before it reached
+            // `InProgress`.
             other => {
                 op.status = STATUS_FAILED;
                 op.error_details = Some(no_model_runtime(sampling_config_kind(other)));
@@ -884,14 +932,17 @@ pub fn training_needs_model_runtime(config: &OperationConfig) -> Option<&'static
     }
 }
 
-/// The sampling counterpart of [`training_needs_model_runtime`]: `sample` and
-/// `computeLogprobs` put data through the model, `loadWeightsForSampling` does not.
+/// The sampling counterpart of [`training_needs_model_runtime`]: the member this emulator
+/// cannot serve, and `None` for one it can.
+///
+/// `loadWeightsForSampling` moves a checkpoint around, and a `sample` operation is served
+/// with the sequence [`sampled_tokens`] encodes — so only `computeLogprobs` is left, whose
+/// `ComputeLogprobsResult$logprobs` is `@required` and is a number only a model's forward
+/// pass has.
 pub fn sampling_needs_model_runtime(config: &SampleOperationConfig) -> Option<&'static str> {
     match config {
-        SampleOperationConfig::Sample(_) | SampleOperationConfig::computeLogprobs(_) => {
-            Some(sampling_config_kind(config))
-        }
-        SampleOperationConfig::loadWeightsForSampling(_) => None,
+        SampleOperationConfig::computeLogprobs(_) => Some(sampling_config_kind(config)),
+        SampleOperationConfig::Sample(_) | SampleOperationConfig::loadWeightsForSampling(_) => None,
     }
 }
 

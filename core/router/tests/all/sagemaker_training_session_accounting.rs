@@ -416,9 +416,12 @@ async fn the_reported_token_usage_is_what_the_data_plane_measured() {
             {
                 measured.2 += tokens;
             }
+            // `SampleOperationResult`'s members are keyed by their WIRE names, so the
+            // sampled sequences hang off `sample` — `smithy_query(query="shape",
+            // shape="SampleOperationResult")`.
             let sequences = polled
                 .get("operationResult")
-                .and_then(|result| result.get("Sample"))
+                .and_then(|result| result.get("sample"))
                 .and_then(|sample| sample.get("sequences"))
                 .and_then(Value::as_array)
                 .cloned()

@@ -21103,6 +21103,7 @@ dependencies = [
  "serde_json",
  "service-common",
  "sha2 0.10.9",
+ "tiktoken-rs",
  "tokio",
  "tracing",
 ]

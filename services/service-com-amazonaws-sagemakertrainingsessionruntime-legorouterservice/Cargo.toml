@@ -26,6 +26,9 @@ tracing = { workspace = true }
 # Mints operation ids from this service's own counter plus the submitting instant.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The byte-pair encoder a sampled sequence's token ids are encoded with: this surface
+# speaks token IDs, so serving one needs a real tokenizer over a published vocabulary.
+tiktoken-rs = "0.12"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -34,6 +37,9 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<suite>.rs`, so the crate's integration tests are
 # one target rooted at `tests/all/main.rs` with nothing to declare per suite.
 automod = { workspace = true }
+# A suite decodes the token ids a sampling operation served, the way a client of this
+# emulator reads them.
+tiktoken-rs = "0.12"
 
 [lints.rust]
 # As the workspace sets for every crate.
