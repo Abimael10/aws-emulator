@@ -20,10 +20,11 @@
 //!
 //! The rule generalises over the operation, over the error shape, over the resource class an
 //! ARN names and over WHAT answered the failure — a handler's modelled refusal, a
-//! service-rule refusal, a refusal the framework raised before any handler ran, and a request
-//! naming no modelled operation at all — so the table below spans all of those rather than
-//! the one recorded refusal. The recorded cases, a `TagResource` and an `UntagResource`
-//! against an ARN no resource carries, are two of its rows.
+//! service-rule refusal, the refusal of a surface this model declares no shape for, a refusal
+//! the framework raised before any handler ran, and a request naming no modelled operation at
+//! all — so the table below spans all of those rather than the one recorded refusal. The
+//! recorded cases, a `TagResource` and an `UntagResource` against an ARN no resource carries,
+//! are two of its rows.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -43,6 +44,11 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// (`smithy_query(query="service_info")`:
 /// `com.amazonaws.docdbelastic#ChimeraDbLionfishServiceLambda`).
 const NAMESPACE: &str = "com.amazonaws.docdbelastic";
+
+/// The error shape the ARN-ADDRESSED tagging surface is refused with for an ARN that names
+/// no resource: not one this model declares, but the shared tagging frontend's own, which
+/// serves `/tags/{resourceArn}` in front of this service.
+const TAGGING_NOT_FOUND_SHAPE: &str = "NotFoundException";
 
 /// The locator a qualified value carries after the shape name: the separator, the service
 /// stack's locator root, then the namespace that declares the shape.
@@ -231,7 +237,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             path: format!("/tags/{}", label(&absent_cluster)),
             body: Some(json!({"tags": {"Project": "lionfish"}})),
             status: 404,
-            shape: Some("ResourceNotFoundException"),
+            shape: Some(TAGGING_NOT_FOUND_SHAPE),
         },
         Failure {
             case: "UntagResource on an ARN no resource carries (404)",
@@ -239,7 +245,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             path: format!("/tags/{}?tagKeys=Project", label(&absent_cluster)),
             body: None,
             status: 404,
-            shape: Some("ResourceNotFoundException"),
+            shape: Some(TAGGING_NOT_FOUND_SHAPE),
         },
         Failure {
             case: "UntagResource naming several keys on an unheld snapshot ARN (404)",
@@ -250,7 +256,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             ),
             body: None,
             status: 404,
-            shape: Some("ResourceNotFoundException"),
+            shape: Some(TAGGING_NOT_FOUND_SHAPE),
         },
         Failure {
             case: "ListTagsForResource on an ARN no resource carries (404)",
@@ -258,7 +264,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             path: format!("/tags/{}", label(&absent_cluster)),
             body: None,
             status: 404,
-            shape: Some("ResourceNotFoundException"),
+            shape: Some(TAGGING_NOT_FOUND_SHAPE),
         },
         Failure {
             case: "ListTagsForResource on an unheld snapshot ARN (404)",
@@ -266,7 +272,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             path: format!("/tags/{}", label(&absent_foreign_snapshot)),
             body: None,
             status: 404,
-            shape: Some("ResourceNotFoundException"),
+            shape: Some(TAGGING_NOT_FOUND_SHAPE),
         },
         Failure {
             case: "GetCluster of an absent cluster (404)",
@@ -371,7 +377,8 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
     // Every shape the table exercised came back as its own name, so the form is not keyed
     // to one error class.
     assert!(
-        named_shapes.contains("ResourceNotFoundException")
+        named_shapes.contains(TAGGING_NOT_FOUND_SHAPE)
+            && named_shapes.contains("ResourceNotFoundException")
             && named_shapes.contains("ConflictException")
             && named_shapes.contains("ValidationException"),
         "the table must span several error shapes, got {named_shapes:?}"

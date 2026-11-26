@@ -5,10 +5,12 @@
 //!
 //! The rule these suites assert: **an operation that addresses its resource generically,
 //! by the ARN of any resource class this service owns, refuses an ARN it holds nothing
-//! under with 404 `ResourceNotFoundException` carrying the GENERIC fixed sentence
-//! `Resource was not found`** — the whole message is fixed text — while the ARN the
-//! request named travels in `resourceId` and the class its resource segment names travels
-//! in `resourceType`. The three tag operations are exactly that surface: `TagResource`,
+//! under with the shared tagging frontend's 404 `NotFoundException` carrying the GENERIC
+//! fixed sentence `Resource was not found`** — the whole message is fixed text, and the
+//! refusal names neither the class it looked for nor the identifier it was handed, because
+//! the frontend that serves `/tags/{resourceArn}` in front of this service is asked for no
+//! resource class of its own. The three tag operations are exactly that surface:
+//! `TagResource`,
 //! `UntagResource` and `ListTagsForResource` are all bound to `/tags/{resourceArn}` whose
 //! only identifier is an `Arn` (`smithy_query(query="operation",
 //! operation="TagResource,UntagResource,ListTagsForResource")`), so none of them is asked
@@ -69,21 +71,18 @@ const TAGGED_RESOURCE_SENTENCE: &str = "Resource was not found";
 const CLUSTER_SENTENCE: &str = "Unable to find the cluster";
 const SNAPSHOT_SENTENCE: &str = "Unable to find the snapshot";
 
-/// The AWS resource type NAMES this service reports in `resourceType`.
-///
-/// Source: the resource class each operation reads and writes one of, as its own
-/// members name it — `GetCluster` answers `cluster` and is addressed by `clusterArn`,
-/// `GetClusterSnapshot` answers `snapshot` and is addressed by `snapshotArn`
-/// (`smithy_query(query="operation", operation="GetCluster,GetClusterSnapshot")`).
-const CLUSTER_TYPE: &str = "Cluster";
-const SNAPSHOT_TYPE: &str = "Snapshot";
-
 /// The header a restJson1 client resolves an error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
-/// The error shape every refusal below is refused with, as the model names it
-/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
+/// The error shape a lookup of ONE named resource class is refused with, as the model names
+/// it (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
 const NOT_FOUND_SHAPE: &str = "ResourceNotFoundException";
+
+/// The error shape the ARN-ADDRESSED tagging surface is refused with instead: not one this
+/// model declares, but the shared tagging frontend's own, which serves
+/// `/tags/{resourceArn}` in front of this service and refuses an ARN that resolves to
+/// nothing with [`TAGGED_RESOURCE_SENTENCE`] and nothing else.
+const TAGGING_NOT_FOUND_SHAPE: &str = "NotFoundException";
 
 /// The namespace this service's shapes are declared in, as its service shape id carries it
 /// (`smithy_query(query="service_info")`:
@@ -343,19 +342,17 @@ struct TypedReader {
     sentence: &'static str,
 }
 
-/// One identifier no resource carries, labelled by what makes it differ from the others,
-/// with the resource type name its ARN segment names.
+/// One identifier no resource carries, labelled by what makes it differ from the others.
 struct Identifier {
     case: &'static str,
     value: String,
-    resource_type: &'static str,
 }
 
 /// Identifiers differing in resource segment, region, account, resource-id form and
 /// width, and whether they are an ARN at all.
 ///
-/// An identifier spelling no segment this service owns addresses its primary taggable
-/// resource, the elastic cluster, so its reported type is [`CLUSTER_TYPE`].
+/// An identifier spelling no segment this service owns is addressed by the same generic
+/// surface as one that does: a tag call names no resource class of its own.
 fn identifiers() -> Vec<Identifier> {
     vec![
         Identifier {
@@ -363,28 +360,24 @@ fn identifiers() -> Vec<Identifier> {
             value: format!(
                 "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:{CLUSTER_SEGMENT}/11111111-2222-3333-4444-555555555555"
             ),
-            resource_type: CLUSTER_TYPE,
         },
         Identifier {
             case: "a cluster ARN in another region",
             value: format!(
                 "arn:aws:docdb-elastic:us-west-2:{ACCOUNT}:{CLUSTER_SEGMENT}/00000000-0000-0000-0000-000000000000"
             ),
-            resource_type: CLUSTER_TYPE,
         },
         Identifier {
             case: "a cluster ARN in another account",
             value: format!(
                 "arn:aws:docdb-elastic:{REGION}:210987654321:{CLUSTER_SEGMENT}/ABCDEF01-2345-6789-abcd-ef0123456789"
             ),
-            resource_type: CLUSTER_TYPE,
         },
         Identifier {
             case: "a snapshot ARN in the signing region",
             value: format!(
                 "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:{SNAPSHOT_SEGMENT}/99999999-8888-7777-6666-555555555555"
             ),
-            resource_type: SNAPSHOT_TYPE,
         },
         Identifier {
             case: "a snapshot ARN whose resource id is a long word",
@@ -392,12 +385,10 @@ fn identifiers() -> Vec<Identifier> {
                 "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:{SNAPSHOT_SEGMENT}/{}",
                 "z".repeat(120)
             ),
-            resource_type: SNAPSHOT_TYPE,
         },
         Identifier {
             case: "an identifier that is not an ARN at all",
             value: "not-an-arn-at-all".to_string(),
-            resource_type: CLUSTER_TYPE,
         },
     ]
 }
@@ -437,8 +428,8 @@ async fn a_tagging_call_on_an_unheld_arn_states_the_generic_resource_sentence() 
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?}: expected a ResourceNotFoundException, got {body}"
+                TAGGING_NOT_FOUND_SHAPE,
+                "case {case:?}: expected a {TAGGING_NOT_FOUND_SHAPE}, got {body}"
             );
             assert_eq!(
                 message(&body),
@@ -464,16 +455,12 @@ async fn a_tagging_call_on_an_unheld_arn_states_the_generic_resource_sentence() 
                     message(&body)
                 );
             }
-            assert_eq!(
-                body["resourceId"].as_str(),
-                Some(identifier.value.as_str()),
-                "case {case:?}: the ARN belongs in resourceId, got {body}"
-            );
-            assert_eq!(
-                body["resourceType"].as_str(),
-                Some(identifier.resource_type),
-                "case {case:?}: resourceType must be {:?}, got {body}",
-                identifier.resource_type
+            // The frontend that answers a tag call addresses any resource class through
+            // one ARN member, so its refusal reports neither the class it looked for nor
+            // the identifier it was handed.
+            assert!(
+                body["resourceId"].is_null() && body["resourceType"].is_null(),
+                "case {case:?}: the generic refusal names no resource, got {body}"
             );
         }
     }
@@ -598,7 +585,7 @@ async fn every_failure_names_its_error_shape_in_the_qualified_form() {
             status, 404,
             "case {case:?}: expected HTTP 404, got {status} with {body}"
         );
-        let expected = format!("{NOT_FOUND_SHAPE}{}", locator());
+        let expected = format!("{TAGGING_NOT_FOUND_SHAPE}{}", locator());
         assert_eq!(
             error_type.as_deref(),
             Some(expected.as_str()),
@@ -781,22 +768,22 @@ async fn a_tagging_refusal_announces_the_generic_media_type_and_leads_with_its_e
                 });
                 assert_eq!(
                     leading_token(&named_shape),
-                    NOT_FOUND_SHAPE,
-                    "case {case:?}: expected {NOT_FOUND_SHAPE:?} to lead \
+                    TAGGING_NOT_FOUND_SHAPE,
+                    "case {case:?}: expected {TAGGING_NOT_FOUND_SHAPE:?} to lead \
                      {ERROR_TYPE_HEADER}, got {named_shape:?}"
                 );
                 // One locator rides along, whichever layer answered: a value that passed a
                 // response layer twice would carry two.
                 assert_eq!(
                     named_shape,
-                    format!("{NOT_FOUND_SHAPE}{}", locator()),
+                    format!("{TAGGING_NOT_FOUND_SHAPE}{}", locator()),
                     "case {case:?}: expected one locator after the shape name, got \
                      {named_shape:?}"
                 );
                 // The envelope the two headers announce is the one the body carries.
                 assert_eq!(
                     error_code(&body),
-                    NOT_FOUND_SHAPE,
+                    TAGGING_NOT_FOUND_SHAPE,
                     "case {case:?}: the body must name the same shape, got {body}"
                 );
                 assert_eq!(

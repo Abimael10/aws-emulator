@@ -3,12 +3,16 @@
 //! How this service WORDS a refusal of a resource identifier it holds nothing under.
 //!
 //! The rule these suites assert: a request naming an identifier this store holds no
-//! resource under is refused 404 `ResourceNotFoundException` whose `message` is the
+//! resource under is refused 404 whose `message` is the
 //! FIXED sentence of the resource the operation ADDRESSED — the class's own sentence
 //! where the operation was asked for a resource of one named class, and the generic
 //! resource sentence where it addresses any class by bare ARN — the whole message being
-//! fixed text, with no part taken from the request, and the identifier the request named
-//! being reported in `resourceId` alone.
+//! fixed text, with no part taken from the request. A lookup of one named class answers
+//! this service's own modelled `ResourceNotFoundException` and reports the identifier the
+//! request named in `resourceId` alone; the ARN-addressed tagging surface, served by the
+//! shared tagging frontend in front of this service, answers that frontend's own
+//! `NotFoundException` with the generic sentence and no member naming what was looked
+//! for.
 //!
 //! The rule generalises over the operation, over the resource class and over the form
 //! of the identifier, so the table below spans every not-found path of the implemented
@@ -43,6 +47,15 @@ const SNAPSHOT_SENTENCE: &str = "Unable to find the snapshot";
 ///
 /// Recorded AWS behavior for the tag operations, whose only identifier is an `Arn`.
 const TAGGED_RESOURCE_SENTENCE: &str = "Resource was not found";
+
+/// The wire error CODE a lookup of ONE named resource class is refused with: this
+/// service's own modelled shape (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`).
+const MODELLED_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+
+/// The wire error CODE the ARN-addressed tagging surface is refused with instead: the
+/// shared tagging frontend's own, which no operation of this model declares.
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// A SigV4 `Authorization` header for this service in [`REGION`].
 fn authorization() -> String {
@@ -195,6 +208,13 @@ struct Lookup {
     body: fn(&str) -> Option<Value>,
     /// The fixed sentence this path must answer, whatever identifier it was handed.
     sentence: &'static str,
+    /// The wire error CODE this path is refused with, and whether its refusal reports the
+    /// identifier back in `resourceId`: a lookup of one named class answers this service's
+    /// own modelled shape and names the identifier, while the ARN-addressed tagging
+    /// surface is answered by the shared tagging frontend's own code, which carries the
+    /// generic sentence alone.
+    code: &'static str,
+    reports_identifier: bool,
     /// The ARN resource segment of the class looked up, and of the other class.
     segments: (&'static str, &'static str),
 }
@@ -208,6 +228,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/cluster/{}", label(arn)),
             body: |_| None,
             sentence: CLUSTER_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -216,6 +238,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/cluster/{}", label(arn)),
             body: |_| Some(json!({"shardCount": 2})),
             sentence: CLUSTER_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -224,6 +248,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/cluster/{}", label(arn)),
             body: |_| None,
             sentence: CLUSTER_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -235,6 +261,8 @@ fn lookups() -> Vec<Lookup> {
             path: |_| "/cluster-snapshot".to_string(),
             body: |arn| Some(json!({"clusterArn": arn, "snapshotName": "probe-snapshot"})),
             sentence: CLUSTER_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -243,6 +271,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/pending-action/{}", label(arn)),
             body: |_| None,
             sentence: CLUSTER_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -257,6 +287,8 @@ fn lookups() -> Vec<Lookup> {
                 }))
             },
             sentence: CLUSTER_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster", "cluster-snapshot"),
         },
         Lookup {
@@ -265,6 +297,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/cluster-snapshot/{}", label(arn)),
             body: |_| None,
             sentence: SNAPSHOT_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster-snapshot", "cluster"),
         },
         Lookup {
@@ -273,6 +307,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/cluster-snapshot/{}", label(arn)),
             body: |_| None,
             sentence: SNAPSHOT_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster-snapshot", "cluster"),
         },
         Lookup {
@@ -281,6 +317,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/cluster-snapshot/{}/restore", label(arn)),
             body: |_| Some(json!({"clusterName": "restored"})),
             sentence: SNAPSHOT_SENTENCE,
+            code: MODELLED_NOT_FOUND_CODE,
+            reports_identifier: true,
             segments: ("cluster-snapshot", "cluster"),
         },
         Lookup {
@@ -292,6 +330,8 @@ fn lookups() -> Vec<Lookup> {
             path: |arn| format!("/tags/{}", label(arn)),
             body: |_| None,
             sentence: TAGGED_RESOURCE_SENTENCE,
+            code: TAGGING_NOT_FOUND_CODE,
+            reports_identifier: false,
             segments: ("cluster", "cluster-snapshot"),
         },
     ]
@@ -337,8 +377,9 @@ async fn a_not_found_refusal_states_the_fixed_sentence_of_its_resource_class() {
             );
             assert_eq!(
                 error_code(&response),
-                "ResourceNotFoundException",
-                "case {case:?}: expected a ResourceNotFoundException, got {response}"
+                lookup.code,
+                "case {case:?}: expected a {}, got {response}",
+                lookup.code
             );
 
             let message = response["message"]
@@ -365,11 +406,18 @@ async fn a_not_found_refusal_states_the_fixed_sentence_of_its_resource_class() {
                      {fragment:?} in {message:?}"
                 );
             }
-            assert_eq!(
-                response["resourceId"].as_str(),
-                Some(identifier.value.as_str()),
-                "case {case:?}: the identifier belongs in resourceId, got {response}"
-            );
+            if lookup.reports_identifier {
+                assert_eq!(
+                    response["resourceId"].as_str(),
+                    Some(identifier.value.as_str()),
+                    "case {case:?}: the identifier belongs in resourceId, got {response}"
+                );
+            } else {
+                assert!(
+                    response["resourceId"].is_null() && response["resourceType"].is_null(),
+                    "case {case:?}: the generic refusal names no resource, got {response}"
+                );
+            }
         }
     }
 }

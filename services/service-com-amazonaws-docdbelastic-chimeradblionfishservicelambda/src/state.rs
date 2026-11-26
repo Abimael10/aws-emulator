@@ -1001,38 +1001,6 @@ impl ResourceKind {
     }
 }
 
-/// The resource field of an ARN — what follows the account field — with any resource
-/// id stripped, or `None` when `value` is not shaped like an ARN at all.
-///
-/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and this
-/// service spells `<resource>` as `<segment>/<id>`.
-fn arn_resource_segment(value: &str) -> Option<&str> {
-    let mut fields = value.splitn(6, ':');
-    if fields.next()? != "arn" {
-        return None;
-    }
-    // partition, service, region, account: a tagging call addresses a resource by the
-    // whole ARN, which is this store's key, so none of them is read here.
-    let resource = fields.nth(4)?;
-    Some(resource.split('/').next().unwrap_or(resource))
-}
-
-/// Which kind of resource an ARN handed to a tagging call addresses.
-///
-/// A tagging operation names no resource kind of its own, so the kind comes from the
-/// ARN's own resource segment ([`ResourceKind::arn_segment`]). An identifier spelling
-/// no segment this service owns addresses this service's primary taggable resource,
-/// the elastic cluster its tagging operations are documented over ("Lists all tags on
-/// a elastic cluster resource").
-pub fn tagged_resource_kind(arn: &str) -> ResourceKind {
-    match arn_resource_segment(arn) {
-        Some(segment) if segment == ResourceKind::ClusterSnapshot.arn_segment() => {
-            ResourceKind::ClusterSnapshot
-        }
-        _ => ResourceKind::Cluster,
-    }
-}
-
 /// The `ResourceNotFoundException` (HTTP 404) for an ARN this store does not hold.
 ///
 /// The two structured members are what a client branches on: `resourceType` is the
@@ -1055,24 +1023,37 @@ pub fn not_found(kind: ResourceKind, arn: &str) -> ResourceNotFoundException {
 /// rather than by a typed identifier of one named class — so it words a miss
 /// generically, where each resource's own reader
 /// ([`ResourceKind::not_found_message`]) was asked for a resource of one named kind and
-/// says which. Like every sentence here the WHOLE message is fixed: the ARN the request
-/// named travels in `ResourceNotFoundException$resourceId`.
+/// says which. The WHOLE message is fixed: nothing the request sent appears in it.
 pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
-/// The `ResourceNotFoundException` (HTTP 404) an ARN-addressed tagging call answers for
-/// an ARN this store holds no resource under.
+/// The wire error CODE the ARN-ADDRESSED tag operations of this service answer for a
+/// `resourceArn` that names no resource.
 ///
-/// The two structured members are built exactly as [`not_found`] builds them — the ARN
-/// in `resourceId`, and in `resourceType` the class the ARN's own resource segment
-/// names ([`tagged_resource_kind`]), which is the one thing a generic sentence does not
-/// state — while the message is the generic [`TAGGED_RESOURCE_NOT_FOUND`]. One
-/// constructor for the whole tagging surface, so a tag write, a tag removal and a tag
+/// It is NOT the `ResourceNotFoundException` the rest of this service answers and the model
+/// declares for those three operations: a tag call addresses ANY taggable resource through
+/// one ARN member and is served by the shared tagging frontend in front of this service, so
+/// the refusal a tag call gets for an ARN that resolves to nothing is that frontend's own
+/// `NotFoundException`, stating its own generic [`TAGGED_RESOURCE_NOT_FOUND`] and none of the
+/// members a modelled refusal of this service carries. That shape is in no operation's
+/// modelled error set, so the refusal travels through
+/// [`crate::scaffolded::Scaffolded::unmodeled`].
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The HTTP status that refusal carries, the same status the modelled not-found of every
+/// other surface of this service carries.
+pub const TAGGING_NOT_FOUND_STATUS: u16 = 404;
+
+/// The refusal an ARN-addressed tagging call answers for an ARN this store holds no
+/// resource under.
+///
+/// One constructor for the whole tagging surface, so a tag write, a tag removal and a tag
 /// read of the same ARN cannot word one miss three ways.
-pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: TAGGED_RESOURCE_NOT_FOUND.to_string(),
-        ..not_found(tagged_resource_kind(arn), arn)
-    }
+pub fn tagged_resource_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        TAGGING_NOT_FOUND_CODE,
+        TAGGING_NOT_FOUND_STATUS,
+        TAGGED_RESOURCE_NOT_FOUND,
+    )
 }
 
 /// The `ConflictException` (HTTP 409) for a request that collides with the already

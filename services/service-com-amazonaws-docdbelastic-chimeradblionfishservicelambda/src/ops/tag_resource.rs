@@ -155,14 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = store.lock();
         let Some(tags) = guard.tags_of_mut(&input.resource_arn) else {
-            // A tagging call addresses its resource generically, by the ARN of any
-            // resource class this service owns, so its miss is worded generically; the
-            // class the 404 reports in `resourceType` still follows the ARN's own
-            // resource segment.
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                state::tagged_resource_not_found(&input.resource_arn),
-            )
-            .into());
+            // An ARN-addressed tag call is served by the shared tagging frontend in front
+            // of this service, so an ARN that resolves to no resource is refused with that
+            // frontend's own code and generic sentence rather than with this service's
+            // modelled not-found.
+            return Err(state::tagged_resource_not_found());
         };
         // How many keys the resource would carry once this request is applied: a key it
         // already holds is overwritten rather than added, so only the keys that are new

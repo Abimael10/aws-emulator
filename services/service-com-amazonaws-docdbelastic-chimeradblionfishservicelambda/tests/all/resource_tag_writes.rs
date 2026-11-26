@@ -39,6 +39,13 @@ const ACCOUNT: &str = "000000000000";
 const CLUSTER_TYPE: &str = "Cluster";
 const SNAPSHOT_TYPE: &str = "Snapshot";
 
+/// The wire error CODE, and the whole message, an ARN-addressed tag call answers for an
+/// ARN that names no resource: the shared tagging frontend in front of this service
+/// refuses it, not the service's own modelled not-found, so the code is that frontend's
+/// and the sentence names neither the resource looked for nor the ARN asked about.
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+const TAGGING_NOT_FOUND_SENTENCE: &str = "Resource was not found";
+
 /// The greatest number of tags one resource carries.
 ///
 /// Source: `UntagResourceInput$tagKeys` is modelled `length(min: 0, max: 50)`
@@ -666,9 +673,8 @@ async fn a_tag_write_changes_only_the_tags() {
 #[tokio::test]
 async fn writing_tags_on_an_absent_resource_is_a_not_found() {
     // Rows differ along which kind's resource segment the ARN spells, its region, its
-    // account and whether it is an ARN at all: the reported type name follows the ARN's
-    // own resource segment, and an identifier that spells no segment this service owns
-    // addresses its primary taggable resource, the elastic cluster.
+    // account and whether it is an ARN at all: the ARN-addressed tagging surface is
+    // served generically, so one refusal answers every one of them.
     let router = emulator();
 
     // A tagged cluster DOES exist, so each refusal is about the ARN the request named
@@ -676,35 +682,30 @@ async fn writing_tags_on_an_absent_resource_is_a_not_found() {
     let present = map(&[("Project", "lionfish")]);
     let present_arn = create_cluster(&router, "the present cluster", "present-writes", &present).await;
 
-    let rows: Vec<(&str, String, &str)> = vec![
+    let rows: Vec<(&str, String)> = vec![
         (
             "a cluster ARN in the signing region",
             format!("arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:cluster/11111111-2222-3333-4444-555555555555"),
-            CLUSTER_TYPE,
         ),
         (
             "a cluster ARN in another region",
             format!("arn:aws:docdb-elastic:us-west-2:{ACCOUNT}:cluster/00000000-0000-0000-0000-000000000000"),
-            CLUSTER_TYPE,
         ),
         (
             "a snapshot ARN in the signing region",
             format!("arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:cluster-snapshot/99999999-8888-7777-6666-555555555555"),
-            SNAPSHOT_TYPE,
         ),
         (
             "a snapshot ARN in another account",
             format!("arn:aws:docdb-elastic:{REGION}:210987654321:cluster-snapshot/ABCDEF01-2345-6789-abcd-ef0123456789"),
-            SNAPSHOT_TYPE,
         ),
         (
             "an identifier that is not an ARN at all",
             "not-an-arn-at-all".to_string(),
-            CLUSTER_TYPE,
         ),
     ];
 
-    for (row, arn, expected_type) in rows {
+    for (row, arn) in rows {
         let written = map(&[("Project", "lionfish")]);
         let attempts = [
             ("TagResource", tag_resource(&router, &arn, &written).await),
@@ -722,18 +723,19 @@ async fn writing_tags_on_an_absent_resource_is_a_not_found() {
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?}: expected a ResourceNotFoundException, got {body}"
+                TAGGING_NOT_FOUND_CODE,
+                "case {case:?}: expected a {TAGGING_NOT_FOUND_CODE}, got {body}"
             );
             assert_eq!(
-                body["resourceType"].as_str(),
-                Some(expected_type),
-                "case {case:?}: resourceType must be {expected_type:?}, got {body}"
+                body["message"].as_str(),
+                Some(TAGGING_NOT_FOUND_SENTENCE),
+                "case {case:?}: expected {TAGGING_NOT_FOUND_SENTENCE:?}, got {body}"
             );
-            assert_eq!(
-                body["resourceId"].as_str(),
-                Some(arn.as_str()),
-                "case {case:?}: resourceId must be the ARN the request named, got {body}"
+            // The generic refusal names no resource back: a tag call addresses any
+            // resource class through one ARN member.
+            assert!(
+                body["resourceType"].is_null() && body["resourceId"].is_null(),
+                "case {case:?}: the generic refusal names no resource, got {body}"
             );
         }
 
