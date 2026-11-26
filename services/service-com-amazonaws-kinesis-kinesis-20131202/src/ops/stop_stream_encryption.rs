@@ -7,6 +7,12 @@
 //! asynchronous update falls due. A stream nothing has encrypted has no encryption to
 //! disable, so such a request is REFUSED and the stream is left exactly as it was.
 //!
+//! The `KeyId` this call carries is RESOLVED against KMS before anything is cleared
+//! ([`crate::state::key_state`]), exactly as `StartStreamEncryption` resolves the key it
+//! applies: an identifier KMS holds no key for names no key of this account and region, so
+//! it is refused as the parameter that "can't be used" (`InvalidArgumentException`) and the
+//! stream keeps the key and the status it had.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -236,6 +242,37 @@ fn stop_stream_encryption(
     now: ::std::time::SystemTime,
     input: &StopStreamEncryptionInput,
 ) -> Result<(), StopStreamEncryptionError> {
+    // Made again here, under the write lock: the store can have moved while this request
+    // was asking KMS about the key.
+    refusal_from_state(store, region, now, input)?;
+
+    let identifier = stream_identifier(input).to_string();
+    let stream = store
+        .resolve_stream_mut(
+            now,
+            region,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        )
+        .map_err(|failure| lookup_refusal(failure, &identifier))?;
+
+    // The stream keeps its shard map and the records in it; what changes is that the
+    // service no longer encrypts what is written to it from here on.
+    stream.stop_encryption(now);
+    Ok(())
+}
+
+/// Every refusal this request can be answered from the STORE alone, so that nothing is
+/// written — and no key is resolved — for a request the stored streams already refuse.
+///
+/// Read-only, and made TWICE: once before the awaited KMS lookup (a store guard is not held
+/// across an await) and once under the lock that performs the write.
+fn refusal_from_state(
+    store: &crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &StopStreamEncryptionInput,
+) -> Result<(), StopStreamEncryptionError> {
     // "The encryption type. The only valid value is KMS"
     // (`StopStreamEncryptionInput$EncryptionType`): `NONE` is a value the enum admits on
     // the wire but not one this operation serves, so it is refused BEFORE any stream is
@@ -249,7 +286,7 @@ fn stop_stream_encryption(
 
     let identifier = stream_identifier(input).to_string();
     let stream = store
-        .resolve_stream_mut(
+        .resolve_stream(
             now,
             region,
             input.stream_name.as_deref(),
@@ -276,7 +313,7 @@ fn stop_stream_encryption(
     ) {
         return Err(StopStreamEncryptionErrorModeled::ResourceInUseException(
             ResourceInUseException {
-                message: Some(crate::state::stream_not_active_message(&stream.name, status)),
+                message: Some(crate::state::stream_not_active_message(&named, status)),
             },
         )
         .into());
@@ -306,9 +343,6 @@ fn stop_stream_encryption(
         .into());
     }
 
-    // The stream keeps its shard map and the records in it; what changes is that the
-    // service no longer encrypts what is written to it from here on.
-    stream.stop_encryption(now);
     Ok(())
 }
 
@@ -356,7 +390,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
+        // The refusals that only READ the store are answered first, and the lock is
+        // released before the KMS lookup below is awaited: a request the stored streams
+        // already refuse never asks KMS about a key.
+        if let Err(refusal) = {
+            let store = state.lock();
+            refusal_from_state(&store, &region, now, &input)
+        } {
+            audit(&akid, &region, "refused");
+            return Err(refusal);
+        }
+
+        // `KeyId` is @required on this operation too, and it names "the customer-managed
+        // Amazon Web Services KMS key to use for encryption" of the stream this call is
+        // disabling encryption on — so it is RESOLVED against KMS before anything is
+        // cleared, through the one lookup this crate puts every such question through
+        // ([`crate::state::key_state`]). An identifier KMS holds no key for names no key of
+        // this account and region at all, which is the parameter that "can't be used": the
+        // modelled `InvalidArgumentException` this operation carries, and the stream keeps
+        // the key and the status it had. A key KMS reports as DISABLED still exists, so it
+        // resolves and refuses nothing — what is weighed here is resolution, not key state.
+        if crate::state::key_state(ctx, &region, &input.key_id).await
+            == crate::state::KeyState::NoSuchKey
+        {
+            audit(&akid, &region, "refused");
+            return Err(invalid_argument(
+                crate::state::INVALID_KEY_ID_MESSAGE.to_string(),
+            ));
+        }
+
         let outcome = {
+            let now = ::std::time::SystemTime::now();
             let mut store = state.lock();
             stop_stream_encryption(&mut store, &region, now, &input)
         };

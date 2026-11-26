@@ -164,3 +164,9 @@ pub fn key_disabled_message(key_arn: &str) -> String {
 /// How the control plane refuses a key that is not enabled: FIXED text, the sentence AWS
 /// answers `StartStreamEncryption` with for a key it will not encrypt a stream under.
 pub const KEY_NOT_ENABLED_MESSAGE: &str = "Key is not enabled.";
+
+/// How the control plane refuses a `KeyId` that resolves to no key at all on a call whose
+/// modelled refusal for it is `InvalidArgumentException` — the parameter that "exceeds its
+/// restrictions, is not supported, or can't be used": FIXED text, interpolating nothing from
+/// the request.
+pub const INVALID_KEY_ID_MESSAGE: &str = "Invalid keyId.";
