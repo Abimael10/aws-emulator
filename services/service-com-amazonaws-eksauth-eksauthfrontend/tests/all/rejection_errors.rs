@@ -921,3 +921,83 @@ async fn an_issued_token_is_a_jwt_signed_by_the_cluster_key() {
         "each issued token must be its own value"
     );
 }
+
+/// Every expression the `@pattern` clauses of one message quote, in the order the
+/// envelope states them.
+///
+/// The requirement half of a pattern clause is the framework's own wording, and the
+/// expression runs to the end of the clause, so the clause separator the envelope joins
+/// with is what bounds it.
+fn pattern_requirements(message: &str) -> Vec<String> {
+    const QUOTED_AFTER: &str = "Member must satisfy regular expression pattern: ";
+    message
+        .split("; ")
+        .filter_map(|clause| clause.split(QUOTED_AFTER).nth(1))
+        .map(str::to_string)
+        .collect()
+}
+
+/// RULE: a `@pattern` requirement this service states quotes the expression the tree's
+/// ONE renderer of the model's whole-value anchor pair produces for that member's
+/// declared pattern (`service_common::validation::unanchored`) — there is no second,
+/// per-service reading of the rule that could drift from it.
+///
+/// The rows are every `@pattern`-constrained member of the input
+/// (`smithy_query(query="shape", shape="AssumeRoleForPodIdentityRequest")`: `clusterName`
+/// targets `ClusterName`, modelled `^[0-9A-Za-z][A-Za-z0-9\-_]*$`, and `token` targets
+/// `JwtToken`, modelled `^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+$`; no other
+/// member or target carries one), so the shared renderer is driven end to end through
+/// this operation from both of the request halves — the URI label and the body — that
+/// reach it. They differ in which half of the request carries the bad value, in whether
+/// the member is `@sensitive` (so the clause states a value or withholds it), and in
+/// which character class the declared expression is written with.
+///
+/// The expected text is COMPUTED by the shared function rather than written out: an
+/// assertion against a literal would pass just as well against a local copy of the rule,
+/// while this one can only hold if the rendering the response carries and the rendering
+/// that function performs are the same code.
+#[tokio::test]
+async fn a_pattern_clause_quotes_what_the_shared_anchor_renderer_produces() {
+    let harness = Harness::seeded();
+
+    // (member, its declared `@pattern`, the cluster label to send, the body to send)
+    let members: &[(&str, &str, &str, serde_json::Value)] = &[
+        (
+            "token",
+            r"^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+$",
+            CLUSTER,
+            serde_json::json!({ "token": "not-a-jwt" }),
+        ),
+        (
+            "clusterName",
+            r"^[0-9A-Za-z][A-Za-z0-9\-_]*$",
+            "-cluster",
+            serde_json::json!({ "token": harness.token(&SEEDS[0]) }),
+        ),
+    ];
+
+    for (member, declared, cluster, body) in members {
+        let quoted = ::service_common::validation::unanchored(declared);
+        assert_ne!(
+            &quoted, declared,
+            "case {member:?}: the declared pattern must carry the pair the renderer drops, \
+             or the row asserts nothing, got {quoted:?}"
+        );
+
+        let reply = post(&harness, cluster, body.clone()).await;
+        assert_eq!(
+            reply.verdict(),
+            "400 InvalidParameterException",
+            "case {member:?}: expected the modeled parameter failure, got {reply:?}"
+        );
+
+        let stated = pattern_requirements(&reply.message);
+        assert_eq!(
+            stated.as_slice(),
+            std::slice::from_ref(&quoted),
+            "case {member:?}: the clause must quote the expression the shared renderer \
+             produces ({quoted:?}), got {stated:?} from {:?}",
+            reply.message
+        );
+    }
+}

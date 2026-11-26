@@ -85,10 +85,13 @@ const SENSITIVE_INPUT_PATHS: &[&str] = &["token"];
 /// are chosen here, and both are what `services/common/src/validation.rs` names as the
 /// per-service halves of this rendering:
 ///
-/// * a `@pattern` requirement states the expression UNANCHORED ([`unanchored`]). A
-///   constraint pattern applies to the whole value by definition, so the `^`/`$` the
-///   model wraps it in state nothing the clause does not already say, and this service's
-///   recorded answer for a member modelled
+/// * a `@pattern` requirement states the expression UNANCHORED
+///   ([`::service_common::validation::unanchored`], the tree's one implementation of that
+///   rendering — the pair is dropped positionally and only when both ends carry one, an
+///   escaped trailing `$` is a literal dollar rather than an anchor, and the CHECK always
+///   runs the model's pattern as written). A constraint pattern applies to the whole
+///   value by definition, so the `^`/`$` the model wraps it in state nothing the clause
+///   does not already say, and this service's recorded answer for a member modelled
 ///   `^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+$` is the expression between
 ///   them;
 /// * a `@sensitive` member's value is WITHHELD: the clause is rendered from a violation
@@ -106,7 +109,9 @@ fn stated(violation: &Violation) -> String {
     let restated = Violation {
         path: violation.path.clone(),
         kind: match &violation.kind {
-            ViolationKind::Pattern(pattern) => ViolationKind::Pattern(unanchored(pattern)),
+            ViolationKind::Pattern(pattern) => {
+                ViolationKind::Pattern(::service_common::validation::unanchored(pattern))
+            }
             other => other.clone(),
         },
         value: if withheld {
@@ -132,32 +137,6 @@ fn stated(violation: &Violation) -> String {
 /// service opens one whose value it withheld.
 const VALUE_NULL_AT: &str = "Value null at '";
 const VALUE_AT: &str = "Value at '";
-
-/// `regex` with the pair of whole-value anchors the model wraps a `@pattern` in removed.
-///
-/// The pair is dropped POSITIONALLY and only when BOTH ends carry one: a `^` alone, or a
-/// `$` alone, is an expression anchored at one end — a different expression, not an
-/// anchored spelling of this one — and a `$` preceded by an odd run of backslashes is an
-/// escaped dollar rather than an anchor. The CHECK always runs the model's pattern as
-/// written; only this rendering drops the pair.
-///
-/// TODO: duplicate of `services/common/src/validation.rs::unanchored`; delete when that
-/// module's migration lands.
-fn unanchored(regex: &str) -> String {
-    let Some(body) = regex.strip_prefix('^') else {
-        return regex.to_string();
-    };
-    match body.strip_suffix('$') {
-        Some(inner) if !ends_with_escape(inner) => inner.to_string(),
-        _ => regex.to_string(),
-    }
-}
-
-/// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
-/// character that followed them was escaped.
-fn ends_with_escape(text: &str) -> bool {
-    text.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
-}
 
 /// Whether `path` names a `@sensitive` member, or anything inside one.
 fn is_sensitive(path: &str) -> bool {
