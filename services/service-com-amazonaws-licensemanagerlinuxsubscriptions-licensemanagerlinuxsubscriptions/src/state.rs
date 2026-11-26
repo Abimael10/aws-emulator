@@ -1287,17 +1287,48 @@ pub fn filter_operator(filter: &Filter) -> &str {
     filter.operator.as_deref().unwrap_or(OPERATOR_EQUAL)
 }
 
+/// One `Filter$Name` a `Filters`-driven list addresses, paired with what the member that
+/// name addresses holds on one of the records that list reports: one value for a scalar
+/// member, every value for a list member, and none for a member the record leaves unset.
+///
+/// A list's TABLE of these is the single statement of which names it addresses and which
+/// member each of them addresses. Both halves of a list read that one table:
+/// [`validate_filters`] refuses a name the table does not carry, and [`filters_select`]
+/// applies the very projection the table pairs with the name it admitted. So a name cannot
+/// be admitted by validation without a member to apply it to — which would be the silently
+/// empty page validation exists to prevent — and a projection cannot be stated for a name
+/// validation refuses, which would make it unreachable.
+pub type FilteredMember<T> = (&'static str, fn(&T) -> Vec<String>);
+
+/// The member `name` addresses in `members`, or `None` when that table addresses no such
+/// name. The ONE lookup in that table, so the question "does this list address this name?"
+/// and the question "what does the member it addresses hold?" cannot be answered from two
+/// different sets of names.
+fn addressed_member<T>(
+    members: &[FilteredMember<T>],
+    name: &str,
+) -> Option<fn(&T) -> Vec<String>> {
+    members
+        .iter()
+        .find(|(addressed, _)| *addressed == name)
+        .map(|(_, member)| *member)
+}
+
 /// Refuse a filter the list it was given to cannot apply.
 ///
-/// `valid_names` is the set of `Filter$Name` values that list documents: a filter naming
-/// anything else addresses no member, so it can select nothing and is a
-/// `ValidationException` rather than a silently empty page. A filter carrying no value
-/// has nothing to compare against (the modelled `Values` list is `len 1..100`), and an
-/// operator outside the modelled `Operator` set names no comparison.
-pub fn validate_filters(filters: &[Filter], valid_names: &[&str]) -> Result<(), StateError> {
+/// `members` is that list's table of addressed members ([`FilteredMember`]): a filter
+/// naming anything the table does not carry addresses no member, so it can select nothing
+/// and is a `ValidationException` rather than a silently empty page. A filter carrying no
+/// value has nothing to compare against (the modelled `Values` list is `len 1..100`), and
+/// an operator outside the modelled `Operator` set names no comparison.
+pub fn validate_filters<T>(
+    filters: &[Filter],
+    members: &[FilteredMember<T>],
+) -> Result<(), StateError> {
+    let valid_names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
     for filter in filters {
         let name = filter.name.as_deref().unwrap_or_default();
-        if !valid_names.contains(&name) {
+        if addressed_member(members, name).is_none() {
             return Err(StateError::Validation(format!(
                 "Filters.Name must be one of {valid_names:?}, got {name:?}"
             )));
@@ -1356,16 +1387,16 @@ pub fn filter_selects(filter: &Filter, member_values: &[String]) -> bool {
 /// is the whole of how filters COMBINE, held here once, so no list can grow its own answer
 /// to it.
 ///
-/// `member_values` is the only part a list states for itself: what the member a
-/// `Filter$Name` addresses holds on the resource being considered — one value for a scalar
-/// member, every value for a list member, and none for a member the resource leaves unset
-/// (which [`filter_selects`] then selects nothing on, whatever the operator). Only a name
-/// the list documents reaches it, because [`validate_filters`] has already refused the
-/// others.
-pub fn filters_select(filters: &[Filter], member_values: impl Fn(&str) -> Vec<String>) -> bool {
+/// `members` is the only part a list states for itself: its table of addressed members
+/// ([`FilteredMember`]), the same table [`validate_filters`] admitted the filter's `Name`
+/// from — so a filter that reaches here addresses a member, whose values
+/// [`filter_selects`] then applies the comparison against. A name that table does not
+/// carry selects nothing, which cannot arise on a validated request.
+pub fn filters_select<T>(filters: &[Filter], members: &[FilteredMember<T>], record: &T) -> bool {
     filters.iter().all(|filter| {
         let name = filter.name.as_deref().unwrap_or_default();
-        filter_selects(filter, &member_values(name))
+        addressed_member(members, name)
+            .is_some_and(|member| filter_selects(filter, &member(record)))
     })
 }
 

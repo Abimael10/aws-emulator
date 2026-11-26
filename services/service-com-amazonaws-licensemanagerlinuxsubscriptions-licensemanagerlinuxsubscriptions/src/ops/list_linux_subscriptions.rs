@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An absent `Filters` selects every discovered subscription.
         let filters = input.filters.clone().unwrap_or_default();
-        crate::state::validate_filters(&filters, FILTER_NAMES).map_err(into_error)?;
+        crate::state::validate_filters(&filters, FILTERED_MEMBERS).map_err(into_error)?;
 
         // Discovery is what fills the store this list aggregates, and it runs whether or
         // not anybody calls: the pass this report materializes asks the owner of instances
@@ -184,10 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .discovered_subscriptions()
             .into_iter()
             .filter(|subscription| {
-                // What is this list's OWN is the member a filter addresses: `Subscription`
-                // is the only name it accepts, and it addresses the subscription's own
-                // name. How several filters combine is the shared rule.
-                crate::state::filters_select(&filters, |_name| vec![subscription.name.clone()])
+                // What is this list's OWN is the member each filter name addresses, stated
+                // once in `FILTERED_MEMBERS`. How several filters combine is the shared
+                // rule.
+                crate::state::filters_select(&filters, FILTERED_MEMBERS, subscription)
             })
             .collect();
 
@@ -230,11 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `Filter$Name` values this list accepts.
+/// Which `Filter$Name` values this list addresses, and what the member each of them
+/// addresses holds on a discovered subscription — stated ONCE, as the table both halves of
+/// the list read ([`crate::state::FilteredMember`]): the request is validated against the
+/// names this table carries and the selection applies the projection it pairs with the
+/// admitted name.
 ///
 /// From the model's documentation for `ListLinuxSubscriptionsRequest$Filters`: "The valid
 /// names for this filter are: Subscription" — it addresses the subscription's name.
-const FILTER_NAMES: &[&str] = &["Subscription"];
+const FILTERED_MEMBERS: &[crate::state::FilteredMember<crate::state::DiscoveredSubscription>] =
+    &[("Subscription", |subscription| {
+        vec![subscription.name.clone()]
+    })];
 
 /// Map a state-layer refusal onto this operation's own modelled error enum. This
 /// operation models no `ResourceNotFoundException`, so a lookup failure cannot arise

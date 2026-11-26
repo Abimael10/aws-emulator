@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An absent `Filters` selects every discovered instance.
         let filters = input.filters.clone().unwrap_or_default();
-        crate::state::validate_filters(&filters, FILTER_NAMES).map_err(into_error)?;
+        crate::state::validate_filters(&filters, FILTERED_MEMBERS).map_err(into_error)?;
 
         // The same discovery pass the sibling list materializes: both report from the ONE
         // store of discovered instances, so neither can be shown an inventory the other was
@@ -185,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .running_discovered_instances_in_order()
             .into_iter()
             .filter(|record| {
-                // What is this list's OWN is the member each filter name addresses; how
-                // several filters combine is the shared rule.
-                crate::state::filters_select(&filters, |name| filtered_member(record, name))
+                // What is this list's OWN is the member each filter name addresses, stated
+                // once in `FILTERED_MEMBERS`; how several filters combine is the shared
+                // rule.
+                crate::state::filters_select(&filters, FILTERED_MEMBERS, record)
             })
             .collect();
 
@@ -217,42 +218,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `Filter$Name` values this list accepts, from the model's documentation for
+/// Which `Filter$Name` values this list addresses, and what the member each of them
+/// addresses holds on a discovered record — stated ONCE, as the table both halves of the
+/// list read ([`crate::state::FilteredMember`]): the request is validated against the
+/// names this table carries and the selection applies the projection it pairs with the
+/// admitted name, so no name can be accepted without a member to apply it to and no
+/// projection can be written for a name that is refused.
+///
+/// The names are the model's documentation for
 /// `ListLinuxSubscriptionInstancesRequest$Filters` ("you can specify one of the following
 /// values for the `Name` key": AccountID, AmiID, DualSubscription, InstanceID,
-/// InstanceType, ProductCode, Region, Status, UsageOperation).
-const FILTER_NAMES: &[&str] = &[
-    "AccountID",
-    "AmiID",
-    "DualSubscription",
-    "InstanceID",
-    "InstanceType",
-    "ProductCode",
-    "Region",
-    "Status",
-    "UsageOperation",
-];
-
-/// What the member a filter `Name` addresses holds on `record`: one value for a scalar
-/// member, every value for the list member `ProductCode`, and none for a member the
-/// record leaves unset (which no filter can then select on, whatever its `Operator`:
-/// [`crate::state::filter_selects`] compares against the values a record HOLDS).
+/// InstanceType, ProductCode, Region, Status, UsageOperation); each addresses the
+/// `Instance` member of that name.
 ///
-/// Only a name in [`FILTER_NAMES`] reaches here, so an unknown one holds nothing.
-fn filtered_member(record: &crate::state::DiscoveredInstanceRecord, name: &str) -> Vec<String> {
-    match name {
-        "AccountID" => vec![record.account_id.clone()],
-        "AmiID" => vec![record.ami_id.clone()],
-        "DualSubscription" => record.dual_subscription.clone().into_iter().collect(),
-        "InstanceID" => vec![record.instance_id.clone()],
-        "InstanceType" => vec![record.instance_type.clone()],
-        "ProductCode" => record.product_codes.clone(),
-        "Region" => vec![record.region.clone()],
-        "Status" => vec![record.status.clone()],
-        "UsageOperation" => vec![record.usage_operation.clone()],
-        _ => Vec::new(),
-    }
-}
+/// A projection answers one value for a scalar member, every value for the list member
+/// `ProductCode`, and none for a member the record leaves unset (which no filter can then
+/// select on, whatever its `Operator`: [`crate::state::filter_selects`] compares against
+/// the values a record HOLDS).
+const FILTERED_MEMBERS: &[crate::state::FilteredMember<crate::state::DiscoveredInstanceRecord>] = &[
+    ("AccountID", |record| vec![record.account_id.clone()]),
+    ("AmiID", |record| vec![record.ami_id.clone()]),
+    ("DualSubscription", |record| {
+        record.dual_subscription.clone().into_iter().collect()
+    }),
+    ("InstanceID", |record| vec![record.instance_id.clone()]),
+    ("InstanceType", |record| vec![record.instance_type.clone()]),
+    ("ProductCode", |record| record.product_codes.clone()),
+    ("Region", |record| vec![record.region.clone()]),
+    ("Status", |record| vec![record.status.clone()]),
+    ("UsageOperation", |record| {
+        vec![record.usage_operation.clone()]
+    }),
+];
 
 /// The `Instance` the model describes, built entirely from the stored record — every
 /// member is what discovery found.
