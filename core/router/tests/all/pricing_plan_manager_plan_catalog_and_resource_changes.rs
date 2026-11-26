@@ -63,6 +63,21 @@ const SIGNING_NAME: &str = "pricingplanmanager";
 /// The error code every refusal in rules 1 to 3 carries.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The plan tier the resource-mutation table below creates its subscriptions on: one of the
+/// published tiers "`FREE`, `PRO`, `BUSINESS`, or `PREMIUM`" (`smithy_query(query="doc",
+/// shape="Subscription", member="planTier")`), and the one a refusal about the resulting
+/// resource set quotes — read from the stored subscription rather than from the request.
+const TIER: &str = "PRO";
+
+/// AWS's sentence for a resource set a plan tier does not admit; its only variable part is
+/// the tier the subscription is on, quoted.
+fn incompatible_with_plan_tier(tier: &str) -> String {
+    format!(
+        "Resources are incompatible with plan tier '{tier}': modify resources or select a \
+         different tier."
+    )
+}
+
 /// One HTTP exchange, read as the restJson1 answer this service renders: the status, the
 /// parsed body, the `ETag` response header and the error class `x-amzn-errortype` names.
 struct Answer {
@@ -625,6 +640,9 @@ async fn a_well_formed_absent_subscription_arn_is_not_found_by_every_operation()
 enum Outcome {
     /// The set the subscription includes afterwards, in order.
     Covers(Vec<String>),
+    /// The request took nothing off the stored set and nothing was written: the same cover,
+    /// the same status and the same concurrency token the caller already held.
+    Unchanged,
     /// The refusal's status, error code, and message as a function of the subscription's
     /// own ARN — which the refusals that name the subscription they are about interpolate,
     /// and which is minted per run.
@@ -773,18 +791,20 @@ async fn resources_are_associated_and_disassociated_in_the_store() {
             outcome: Outcome::Covers(vec![hosted_zone("Z2")]),
         },
         Case {
-            label: "a resource the subscription does not cover cannot be removed",
+            label: "a resource the subscription does not cover takes nothing off it",
             family: "Route53",
             initial: vec![hosted_zone("Z1")],
             operation: "DisassociateResourcesFromSubscription",
             resources: vec![hosted_zone("Z9")],
-            outcome: Outcome::Refused(400, VALIDATION_EXCEPTION, |arn| {
-                format!(
-                    "Cannot remove {} from subscription {arn}: the resource is not \
-                     associated with this subscription.",
-                    hosted_zone("Z9")
-                )
-            }),
+            outcome: Outcome::Unchanged,
+        },
+        Case {
+            label: "a resource of another vendor the subscription does not cover",
+            family: "Route53",
+            initial: vec![hosted_zone("Z1"), hosted_zone("Z2")],
+            operation: "DisassociateResourcesFromSubscription",
+            resources: vec![distribution("E9"), web_acl("absent")],
+            outcome: Outcome::Unchanged,
         },
         Case {
             label: "the last resource cannot be removed",
@@ -806,13 +826,7 @@ async fn resources_are_associated_and_disassociated_in_the_store() {
             operation: "DisassociateResourcesFromSubscription",
             resources: vec![distribution("E1")],
             outcome: Outcome::Refused(400, VALIDATION_EXCEPTION, |_| {
-                format!(
-                    "For subscriptions in the CloudFront plan family, the associated \
-                     resources must always include exactly one Amazon CloudFront \
-                     distribution and exactly one WAF web ACL. You cannot remove these \
-                     required resources: {}.",
-                    distribution("E1")
-                )
+                incompatible_with_plan_tier(TIER)
             }),
         },
         Case {
@@ -822,13 +836,7 @@ async fn resources_are_associated_and_disassociated_in_the_store() {
             operation: "DisassociateResourcesFromSubscription",
             resources: vec![web_acl("acl")],
             outcome: Outcome::Refused(400, VALIDATION_EXCEPTION, |_| {
-                format!(
-                    "For subscriptions in the CloudFront plan family, the associated \
-                     resources must always include exactly one Amazon CloudFront \
-                     distribution and exactly one WAF web ACL. You cannot remove these \
-                     required resources: {}.",
-                    web_acl("acl")
-                )
+                incompatible_with_plan_tier(TIER)
             }),
         },
         Case {
@@ -846,7 +854,7 @@ async fn resources_are_associated_and_disassociated_in_the_store() {
         // so rows naming the same resources are independent accounts.
         let router = router();
         let label = case.label;
-        let created = create(&router, label, case.family, "PRO", &case.initial).await;
+        let created = create(&router, label, case.family, TIER, &case.initial).await;
         let arn = created.string("arn");
         let etag = created.etag(label);
 
@@ -887,6 +895,36 @@ async fn resources_are_associated_and_disassociated_in_the_store() {
                     answered.etag(label),
                     etag,
                     "case {label:?}: a mutation must mint a new ETag"
+                );
+            }
+            Outcome::Unchanged => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {label:?}: {} must succeed, got {} {:?}",
+                    case.operation, answered.status, answered.body
+                );
+                assert_eq!(
+                    answered.resources(label),
+                    case.initial,
+                    "case {label:?}: the answer must report the cover the subscription had"
+                );
+                assert_eq!(
+                    answered.etag(label),
+                    etag,
+                    "case {label:?}: a call that wrote nothing must not mint a new ETag"
+                );
+                // Nothing was written, so the reader agrees with the answer down to the
+                // status and the modification time.
+                let fetched =
+                    call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+                assert_eq!(
+                    fetched.body, created.body,
+                    "case {label:?}: a call that removed nothing must leave the record alone"
+                );
+                assert_eq!(
+                    fetched.etag(label),
+                    etag,
+                    "case {label:?}: the reader must still report the token the caller held"
                 );
             }
             Outcome::Refused(status, code, message) => {

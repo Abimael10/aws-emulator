@@ -48,8 +48,8 @@ pub use plan_catalog::{
 
 pub use subscription_resources::{
     is_required_resource, plan_resource_addition, plan_resource_removal,
-    required_resources_message, resource_already_subscribed, resource_in_another_subscription,
-    CoveredResource, ResourceChangeError, ResourceChangeRefusal, RESOURCE_CHANGE_STATUS,
+    resource_already_subscribed, resource_in_another_subscription, CoveredResource,
+    ResourceChangeError, ResourceChangeRefusal, RESOURCE_CHANGE_STATUS,
 };
 
 pub use subscription_identity::{client_token_parameters_differ, SubscriptionIdentity};

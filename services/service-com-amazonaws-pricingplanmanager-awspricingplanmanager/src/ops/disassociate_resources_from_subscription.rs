@@ -4,7 +4,9 @@
 //!
 //! Removes resources from a stored subscription: the request is weighed against the
 //! resource set it would LEAVE BEHIND ([`crate::state::plan_resource_removal`]), and only
-//! a set the subscription's plan family still admits is written back.
+//! a set the subscription's plan family still admits is written back — and only when it
+//! differs from the one already stored, so a request that takes nothing off the set writes
+//! nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -216,8 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What the subscription is LEFT covering decides the request: the plan family's
         // required resources stay, the set never empties, a resource the subscription does
-        // not cover is nothing this call can remove, and a state that does not admit a
-        // change refuses one. The stored set is untouched on every one of those paths.
+        // not cover is nothing this call takes off it, and a state that does not admit a
+        // change refuses one. The stored set is untouched on every refusing path.
         let retained = match crate::state::plan_resource_removal(record, &resource_arns) {
             Ok(retained) => retained,
             Err(refusal) => {
@@ -242,8 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports the status of a change that is being applied until the clock says the
         // change has taken effect — the model's own example for this operation answers
         // `SYNC_IN_PROGRESS` with the resources already gone.
-        record.resource_arns = retained;
-        record.begin_sync(now);
+        //
+        // A request that takes nothing off the stored set has no change to apply, and an
+        // unchanged record is not written: it keeps its status, its modification time and
+        // the concurrency token the caller already holds, and the answer is a report of the
+        // record as it stands.
+        if retained != record.resource_arns {
+            record.resource_arns = retained;
+            record.begin_sync(now);
+        }
 
         Ok(DisassociateResourcesFromSubscriptionOutput {
             subscription: record.to_subscription(),

@@ -29,11 +29,24 @@
 //! subscription might not be in the required state for this operation"). Either way the
 //! stored set is left alone.
 //!
+//! Because the answer is about that resulting set, a removal that names a resource the
+//! subscription does not cover takes nothing off it: such a name makes no difference to the
+//! set, so it is IGNORED rather than refused, and a request naming nothing the subscription
+//! covers leaves the stored set itself as the set it leaves behind — which is why
+//! [`plan_resource_removal`] hands back a set equal to the stored one and the caller writes
+//! only when the two differ. And a removal the resulting set does not admit is a statement
+//! about the PLAN the subscription is on rather than about any one resource, so it is
+//! refused in the same words as a resource set the plan tier does not cover
+//! ([`super::resource_eligibility::resources_incompatible_with_plan_tier_message`]).
+//!
 //! Which ARN names a CloudFront distribution and which names a WAF web ACL is read
 //! through [`super::resource_eligibility`]'s own classification, so this crate places a
 //! resource ARN in exactly one place.
 
-use super::resource_eligibility::{distribution_id, names_a_web_acl, CLOUDFRONT_PLAN_FAMILY};
+use super::resource_eligibility::{
+    distribution_id, names_a_web_acl, resources_incompatible_with_plan_tier_message,
+    CLOUDFRONT_PLAN_FAMILY,
+};
 use super::{scheduled_change_pending, Status, SubscriptionRecord, MAX_SUBSCRIPTION_RESOURCES};
 use crate::ops::types::{ConflictException, ValidationException};
 
@@ -105,26 +118,6 @@ fn unsatisfied_kinds(plan_family: &str, resource_arns: &[String]) -> Vec<Require
         .collect()
 }
 
-/// How this service states a removal its plan family's composition forbids: the rule the
-/// plan family imposes, as the operation documents it, and then the resources the request
-/// named that it keeps on.
-///
-/// The two sentences are the operation's own documented note — "For subscriptions in the
-/// CloudFront plan family, the associated resources must always include exactly one Amazon
-/// CloudFront distribution and exactly one WAF web ACL. You cannot remove these required
-/// resources." (`smithy_query(query="doc",
-/// shape="DisassociateResourcesFromSubscription")`) — and the only variable part is the
-/// required ARNs THE REQUEST named, in the order it named them, so a caller can match each
-/// one against the list it sent.
-pub fn required_resources_message(required: &[String]) -> String {
-    format!(
-        "For subscriptions in the {CLOUDFRONT_PLAN_FAMILY} plan family, the associated \
-         resources must always include exactly one Amazon CloudFront distribution and \
-         exactly one WAF web ACL. You cannot remove these required resources: {}.",
-        required.join(", ")
-    )
-}
-
 /// Why a subscription's resource set could not be changed as a request asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceChangeRefusal {
@@ -133,17 +126,17 @@ pub enum ResourceChangeRefusal {
     ChangePending,
     /// The subscription's status does not admit a change to its resources.
     Status(Status),
-    /// The request named a resource the subscription does not cover, so there is nothing
-    /// of that name to remove.
-    NotAssociated(String),
     /// The request named a resource the subscription already covers, so there is nothing
     /// of that name to add.
     AlreadyAssociated(String),
     /// The request named a resource ANOTHER subscription already covers, so this one cannot
     /// take it on.
     UsedByAnotherSubscription(String),
-    /// The request named resources the subscription's plan family requires it keep.
-    Required(Vec<String>),
+    /// The change would leave the subscription covering a resource set its PLAN does not
+    /// admit — for the CloudFront family, one no longer holding the distribution or the web
+    /// ACL its composition requires. Carries the plan tier the subscription is on, which is
+    /// what such a refusal states.
+    IncompatibleWithPlanTier(String),
     /// The change would leave the subscription covering no resource at all.
     LeavesNoResources,
     /// The change would leave the subscription covering more resources than one
@@ -182,15 +175,6 @@ impl ResourceChangeRefusal {
                 ),
                 resource_id: Some(arn.to_string()),
             }),
-            Self::NotAssociated(resource) => {
-                ResourceChangeError::Validation(ValidationException {
-                    message: format!(
-                        "Cannot remove {resource} from subscription {arn}: the resource is \
-                         not associated with this subscription."
-                    ),
-                    resource_id: Some(resource),
-                })
-            }
             Self::AlreadyAssociated(resource) => {
                 ResourceChangeError::Validation(ValidationException {
                     message: format!(
@@ -213,13 +197,17 @@ impl ResourceChangeRefusal {
                     resource_id: Some(resource),
                 })
             }
-            Self::Required(required) => ResourceChangeError::Validation(ValidationException {
-                message: required_resources_message(&required),
-                resource_id: match required.as_slice() {
-                    [only] => Some(only.clone()),
-                    _ => None,
-                },
-            }),
+            // The same sentence a resource set the plan tier does not cover is refused
+            // with ([`super::resource_eligibility`]): what failed is the resulting SET
+            // against the plan rather than any one resource, so the message names the tier
+            // and no ARN, and `resourceId` — "the identifier of the resource that failed
+            // validation" — is unset for that same reason.
+            Self::IncompatibleWithPlanTier(plan_tier) => {
+                ResourceChangeError::Validation(ValidationException {
+                    message: resources_incompatible_with_plan_tier_message(&plan_tier),
+                    resource_id: None,
+                })
+            }
             Self::LeavesNoResources => ResourceChangeError::Validation(ValidationException {
                 message: format!(
                     "Cannot remove every resource from subscription {arn}: a subscription \
@@ -248,6 +236,11 @@ impl ResourceChangeRefusal {
 /// leave behind, so the same rule holds for one resource or for ten, named in any order,
 /// and the caller writes the returned set back only on the success arm — a refused call
 /// changes nothing.
+///
+/// A name the subscription does not cover takes nothing off the set, so it is no refusal of
+/// its own: the set such a request leaves behind simply still holds everything it held. The
+/// returned set is therefore EQUAL to the stored one for a request that removes nothing at
+/// all, and a caller that writes only when the two differ writes nothing for it.
 pub fn plan_resource_removal(
     record: &SubscriptionRecord,
     requested: &[String],
@@ -260,13 +253,9 @@ pub fn plan_resource_removal(
     if record.scheduled_change.is_some() {
         return Err(ResourceChangeRefusal::ChangePending);
     }
-    // In the order the request named them, so a caller reading the refusal sees its own
-    // list's entries in its own order.
-    for resource in requested {
-        if !record.resource_arns.iter().any(|held| held == resource) {
-            return Err(ResourceChangeRefusal::NotAssociated(resource.clone()));
-        }
-    }
+    // Keeping the stored order, and keeping every resource the request did not name —
+    // including the ones it named that the subscription never covered, which are nothing
+    // this set has to lose.
     let retained: Vec<String> = record
         .resource_arns
         .iter()
@@ -275,18 +264,12 @@ pub fn plan_resource_removal(
         .collect();
     // The composition is a rule about the SET the change leaves behind, so what decides
     // the request is which required kinds that set no longer provides — not which kind
-    // each named resource happens to be. The resources named in the refusal are the ones
-    // the request would have taken the last of.
-    let unsatisfied = unsatisfied_kinds(&record.plan_family, &retained);
-    if !unsatisfied.is_empty() {
-        let required: Vec<String> = requested
-            .iter()
-            .filter(|resource| {
-                required_kind(resource).is_some_and(|kind| unsatisfied.contains(&kind))
-            })
-            .cloned()
-            .collect();
-        return Err(ResourceChangeRefusal::Required(required));
+    // each named resource happens to be. A set the plan does not admit is refused as a
+    // statement about the plan, so the tier the subscription is on is what it carries.
+    if !unsatisfied_kinds(&record.plan_family, &retained).is_empty() {
+        return Err(ResourceChangeRefusal::IncompatibleWithPlanTier(
+            record.plan_tier.clone(),
+        ));
     }
     // A plan family with no documented composition is still held to the one rule every
     // subscription keeps: `resourceArns` is `@required` with `@length(min: 1)`.
@@ -421,7 +404,7 @@ mod tests {
     use ::aws_smithy_types::DateTime;
 
     /// A stored subscription of `plan_family` covering `resources`, in `status`, with a
-    /// change already scheduled on it when `scheduled`.
+    /// change already scheduled on it when `scheduled`. Its plan tier is [`TIER`].
     fn record(
         plan_family: &str,
         resources: &[&str],
@@ -432,7 +415,7 @@ mod tests {
         SubscriptionRecord {
             arn: "arn:aws:pricingplanmanager::000000000000:subscription:sub_test".to_string(),
             plan_family: plan_family.to_string(),
-            plan_tier: "FREE".to_string(),
+            plan_tier: TIER.to_string(),
             usage_level: None,
             status,
             status_reason: None,
@@ -455,6 +438,12 @@ mod tests {
     const HOSTED_ZONE: &str = "arn:aws:route53:::hostedzone/Z1EXAMPLE";
     const KEY_VALUE_STORE: &str = "arn:aws:cloudfront::000000000000:key-value-store/kvs-1";
     const SECOND_DISTRIBUTION: &str = "arn:aws:cloudfront::000000000000:distribution/E2EXAMPLE";
+
+    /// The plan tier the subscriptions below are on, one of the published tiers "`FREE`,
+    /// `PRO`, `BUSINESS`, or `PREMIUM`" (`smithy_query(query="doc", shape="Subscription",
+    /// member="planTier")`). A refusal about the resulting set states the tier the
+    /// subscription is on, so the rows that expect one expect this value.
+    const TIER: &str = "FREE";
 
     /// Which resources a plan family requires a subscription to keep: for the CloudFront
     /// family its distribution and its web ACL, and nothing else anywhere.
@@ -485,9 +474,9 @@ mod tests {
 
     /// A removal is weighed against the set it leaves behind: the optional resources come
     /// off, the plan family's required ones do not, the set never empties, a resource the
-    /// subscription does not cover is refused, and a subscription that is not active, or
-    /// that is already applying or pending a change of its own, refuses the change
-    /// outright.
+    /// subscription does not cover takes nothing off the set and so leaves it as it stands,
+    /// and a subscription that is not active, or that is already applying or pending a
+    /// change of its own, refuses the change outright.
     #[test]
     fn a_removal_is_weighed_against_the_set_it_leaves_behind() {
         struct Case {
@@ -527,9 +516,9 @@ mod tests {
                 status: Status::Active,
                 scheduled: false,
                 removed: &[DISTRIBUTION],
-                expected: Err(ResourceChangeRefusal::Required(vec![
-                    DISTRIBUTION.to_string()
-                ])),
+                expected: Err(ResourceChangeRefusal::IncompatibleWithPlanTier(
+                    TIER.to_string(),
+                )),
             },
             Case {
                 label: "the required web ACL, named after an optional resource",
@@ -538,7 +527,9 @@ mod tests {
                 status: Status::Active,
                 scheduled: false,
                 removed: &[HOSTED_ZONE, WEB_ACL],
-                expected: Err(ResourceChangeRefusal::Required(vec![WEB_ACL.to_string()])),
+                expected: Err(ResourceChangeRefusal::IncompatibleWithPlanTier(
+                    TIER.to_string(),
+                )),
             },
             Case {
                 label: "both required resources at once",
@@ -547,10 +538,9 @@ mod tests {
                 status: Status::Active,
                 scheduled: false,
                 removed: &[DISTRIBUTION, WEB_ACL],
-                expected: Err(ResourceChangeRefusal::Required(vec![
-                    DISTRIBUTION.to_string(),
-                    WEB_ACL.to_string(),
-                ])),
+                expected: Err(ResourceChangeRefusal::IncompatibleWithPlanTier(
+                    TIER.to_string(),
+                )),
             },
             Case {
                 label: "a resource the subscription does not cover",
@@ -559,9 +549,34 @@ mod tests {
                 status: Status::Active,
                 scheduled: false,
                 removed: &[HOSTED_ZONE],
-                expected: Err(ResourceChangeRefusal::NotAssociated(
-                    HOSTED_ZONE.to_string(),
-                )),
+                expected: Ok(&[DISTRIBUTION, WEB_ACL]),
+            },
+            Case {
+                label: "a resource of a required kind the subscription does not cover",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: false,
+                removed: &[SECOND_DISTRIBUTION],
+                expected: Ok(&[DISTRIBUTION, WEB_ACL]),
+            },
+            Case {
+                label: "several resources the subscription does not cover",
+                plan_family: "Route53",
+                held: &[HOSTED_ZONE],
+                status: Status::Active,
+                scheduled: false,
+                removed: &[KEY_VALUE_STORE, SECOND_DISTRIBUTION],
+                expected: Ok(&[HOSTED_ZONE]),
+            },
+            Case {
+                label: "a covered resource beside one the subscription does not cover",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL, HOSTED_ZONE],
+                status: Status::Active,
+                scheduled: false,
+                removed: &[HOSTED_ZONE, KEY_VALUE_STORE],
+                expected: Ok(&[DISTRIBUTION, WEB_ACL]),
             },
             Case {
                 label: "the only resource of a family with no required composition",
@@ -633,10 +648,9 @@ mod tests {
                 status: Status::Active,
                 scheduled: false,
                 removed: &[DISTRIBUTION, SECOND_DISTRIBUTION],
-                expected: Err(ResourceChangeRefusal::Required(vec![
-                    DISTRIBUTION.to_string(),
-                    SECOND_DISTRIBUTION.to_string(),
-                ])),
+                expected: Err(ResourceChangeRefusal::IncompatibleWithPlanTier(
+                    TIER.to_string(),
+                )),
             },
             Case {
                 label: "a subscription with a change already scheduled",
@@ -662,6 +676,47 @@ mod tests {
                 "case {:?}: expected {expected:?}, got {actual:?}",
                 case.label
             );
+        }
+    }
+
+    /// RULE: a removal the resulting resource set does not admit is a statement about the
+    /// PLAN — the modelled business-rule failure whose fixed sentence quotes the plan tier
+    /// the subscription is on and names no resource, with no single resource identified.
+    ///
+    /// The rows differ along the tier the subscription is on, every published one plus one
+    /// the docs do not publish, and along which required resource the removal would strip.
+    #[test]
+    fn a_removal_the_resulting_set_does_not_admit_states_the_plan_tier() {
+        // Every published tier — "`FREE`, `PRO`, `BUSINESS`, or `PREMIUM`"
+        // (`smithy_query(query="doc", shape="Subscription", member="planTier")`) — and one
+        // outside that list, since `planTier` is a plain string in the model.
+        for tier in ["FREE", "PRO", "BUSINESS", "PREMIUM", "ENTERPRISE"] {
+            for removed in [DISTRIBUTION, WEB_ACL] {
+                let case = format!("{tier} losing {removed}");
+                let mut subject =
+                    record("CloudFront", &[DISTRIBUTION, WEB_ACL], Status::Active, false);
+                subject.plan_tier = tier.to_string();
+                let refusal = plan_resource_removal(&subject, &[removed.to_string()])
+                    .expect_err(&format!("case {case:?}: the removal must be refused"));
+                let modelled = match refusal.into_modelled(&subject.arn) {
+                    ResourceChangeError::Validation(validation) => validation,
+                    other => panic!("case {case:?}: expected a validation failure, got {other:?}"),
+                };
+                let expected = format!(
+                    "Resources are incompatible with plan tier '{tier}': modify resources \
+                     or select a different tier."
+                );
+                assert_eq!(
+                    modelled.message, expected,
+                    "case {case:?}: expected {expected:?}, got {:?}",
+                    modelled.message
+                );
+                assert_eq!(
+                    modelled.resource_id, None,
+                    "case {case:?}: the refusal identifies no single resource, got {:?}",
+                    modelled.resource_id
+                );
+            }
         }
     }
 

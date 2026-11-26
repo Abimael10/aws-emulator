@@ -30,6 +30,9 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
 // response reader, the router or the create helper. Making a pending change's
 // confirmation due belongs to the suite that owns that rule.
 use super::scheduled_change_confirmation::make_confirmation_due;
+// The sentence AWS states a plan-tier incompatibility with is the suite that owns that
+// wording's, so this one asserts against the same expected text.
+use super::plan_tier_incompatibility_refusal::incompatible_with_tier;
 use super::subscription_wire_form::{
     call, create, create_body as subscription_body, router, router_on, Answer,
 };
@@ -2590,22 +2593,21 @@ async fn disassociating_optional_resources_leaves_the_rest_of_the_set() {
     }
 }
 
-/// What a removal is refused for, and how: the plan family's required resources stay, the
-/// set never empties, a resource the subscription does not cover cannot be removed, and a
-/// subscription whose status does not admit a change refuses one — each the modelled
-/// `ValidationException` (HTTP 400) naming the offending value, and each inert.
+/// What a removal is refused for, and how: a resulting set the plan does not admit is
+/// refused as a statement about the plan, the set never empties, and a subscription whose
+/// status does not admit a change refuses one — each the modelled `ValidationException`
+/// (HTTP 400), and each inert.
 ///
 /// The rows differ along which element of the rule stops the request, which kind of
-/// resource is named, where in the request list it is named, the plan family, and the
-/// subscription's status.
+/// resource is named, where in the request list it is named, the plan family, the plan tier
+/// and the subscription's status.
 #[tokio::test]
 async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
-    /// What the refusal must state, given the subscription's own ARN.
+    /// What the refusal must state, given the subscription's own ARN and plan tier.
     enum Expected {
-        /// The plan family requires the subscription keep these resources.
-        Required(Vec<String>),
-        /// The subscription does not cover this resource.
-        NotAssociated(String),
+        /// The set the removal would leave behind is not one the subscription's plan
+        /// admits.
+        IncompatibleWithPlanTier,
         /// Nothing would be left covered.
         LeavesNoResources,
         /// The subscription's status does not admit a resource change.
@@ -2613,19 +2615,9 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
     }
 
     impl Expected {
-        fn message(&self, arn: &str) -> String {
+        fn message(&self, arn: &str, tier: &str) -> String {
             match self {
-                Self::Required(required) => format!(
-                    "For subscriptions in the CloudFront plan family, the associated \
-                     resources must always include exactly one Amazon CloudFront \
-                     distribution and exactly one WAF web ACL. You cannot remove these \
-                     required resources: {}.",
-                    required.join(", ")
-                ),
-                Self::NotAssociated(resource) => format!(
-                    "Cannot remove {resource} from subscription {arn}: the resource is \
-                     not associated with this subscription."
-                ),
+                Self::IncompatibleWithPlanTier => incompatible_with_tier(tier),
                 Self::LeavesNoResources => format!(
                     "Cannot remove every resource from subscription {arn}: a subscription \
                      must always include at least one resource."
@@ -2638,15 +2630,11 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
         }
 
         /// `resourceId` is "the identifier of the resource that failed validation": the
-        /// offending resource when exactly one failed, and the subscription when the
-        /// failure is about its own state or its set as a whole.
+        /// subscription when the failure is about its own state, and nothing at all when
+        /// what failed is its resulting resource set against its plan.
         fn resource_id(&self, arn: &str) -> Option<String> {
             match self {
-                Self::Required(required) => match required.as_slice() {
-                    [only] => Some(only.clone()),
-                    _ => None,
-                },
-                Self::NotAssociated(resource) => Some(resource.clone()),
+                Self::IncompatibleWithPlanTier => None,
                 Self::LeavesNoResources | Self::NotActive(_) => Some(arn.to_string()),
             }
         }
@@ -2675,7 +2663,7 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
             approval: Some("IMMEDIATE"),
             held: vec![dist.clone(), acl.clone(), zone.clone()],
             removed: vec![dist.clone()],
-            expected: Expected::Required(vec![dist.clone()]),
+            expected: Expected::IncompatibleWithPlanTier,
         },
         Case {
             label: "the required WAF web ACL",
@@ -2684,7 +2672,7 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
             approval: None,
             held: vec![dist.clone(), acl.clone(), zone.clone()],
             removed: vec![acl.clone()],
-            expected: Expected::Required(vec![acl.clone()]),
+            expected: Expected::IncompatibleWithPlanTier,
         },
         Case {
             label: "the required pair, named behind an optional resource",
@@ -2693,34 +2681,16 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
             approval: Some("IMMEDIATE"),
             held: vec![dist.clone(), acl.clone(), zone.clone()],
             removed: vec![zone.clone(), acl.clone()],
-            expected: Expected::Required(vec![acl.clone()]),
+            expected: Expected::IncompatibleWithPlanTier,
         },
         Case {
             label: "the whole CloudFront pair at once",
             family: "CloudFront",
-            tier: "PRO",
+            tier: "PREMIUM",
             approval: Some("IMMEDIATE"),
             held: vec![dist.clone(), acl.clone()],
             removed: vec![dist.clone(), acl.clone()],
-            expected: Expected::Required(vec![dist.clone(), acl.clone()]),
-        },
-        Case {
-            label: "a resource the subscription does not cover",
-            family: "CloudFront",
-            tier: "PRO",
-            approval: Some("IMMEDIATE"),
-            held: vec![dist.clone(), acl.clone()],
-            removed: vec![zone.clone()],
-            expected: Expected::NotAssociated(zone.clone()),
-        },
-        Case {
-            label: "a distribution another subscription covers",
-            family: "Route53",
-            tier: "FREE",
-            approval: None,
-            held: vec![zone.clone(), kvs.clone()],
-            removed: vec![distribution("E9ABSENT")],
-            expected: Expected::NotAssociated(distribution("E9ABSENT")),
+            expected: Expected::IncompatibleWithPlanTier,
         },
         Case {
             label: "the only resource of a subscription",
@@ -2784,7 +2754,7 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             refused.message(label),
-            case.expected.message(&arn),
+            case.expected.message(&arn, case.tier),
             "case {label:?}: unexpected message for {:?}",
             refused.body
         );
