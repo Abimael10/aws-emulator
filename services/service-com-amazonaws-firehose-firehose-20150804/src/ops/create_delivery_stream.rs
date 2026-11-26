@@ -1000,7 +1000,7 @@ fn source_description(
                 kinesis_stream_source_description: Some(KinesisStreamSourceDescription {
                     kinesis_stream_arn: Some(config.kinesis_stream_arn.clone()),
                     role_arn: Some(config.role_arn.clone()),
-                    delivery_start_timestamp: Some(::aws_smithy_types::DateTime::from(
+                    delivery_start_timestamp: Some(crate::state::reported_instants::reported(
                         ::std::time::SystemTime::now(),
                     )),
                 }),
@@ -1021,7 +1021,7 @@ fn source_description(
                     msk_cluster_arn: Some(config.msk_cluster_arn.clone()),
                     topic_name: Some(config.topic_name.clone()),
                     authentication_configuration: Some(config.authentication_configuration.clone()),
-                    delivery_start_timestamp: Some(::aws_smithy_types::DateTime::from(
+                    delivery_start_timestamp: Some(crate::state::reported_instants::reported(
                         ::std::time::SystemTime::now(),
                     )),
                     read_from_timestamp: config.read_from_timestamp,

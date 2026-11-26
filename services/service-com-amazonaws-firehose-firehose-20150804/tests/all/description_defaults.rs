@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What `DescribeDeliveryStream` reports for the members a create left unset.
+//! What `DescribeDeliveryStream` reports for the members a create left unset, and the
+//! resolution it reports an INSTANT at.
 //!
-//! The rule under test: a `DeliveryStreamDescription` member whose default the service
+//! The rules under test: a `DeliveryStreamDescription` member whose default the service
 //! documents is reported with that default materialised, never omitted — so a stream's
 //! server-side-encryption state is always readable (`DISABLED` for a stream that was
 //! never encrypted), and a destination description carries the `S3BackupMode` its own
-//! documentation gives that destination kind.
+//! documentation gives that destination kind; and every instant the description reports
+//! travels as the epoch-seconds number the wire carries a `Timestamp` as, stated at
+//! millisecond resolution.
 //!
 //! Every request goes through the real router, so what is asserted is the wire body a
 //! client sees. The harness (`Emulator`, the ARNs, `at`) is the one
@@ -388,6 +391,171 @@ async fn a_destination_description_reports_its_documented_s3_backup_mode() {
                 "case {:?}: {path} is {:?}, expected {expected:?}",
                 case.stream,
                 at(&description, path)
+            );
+        }
+    }
+}
+
+/// The most a reported epoch-seconds number may be away from a whole millisecond, in
+/// milliseconds.
+///
+/// Reading an epoch-seconds number back through a binary float lands it a fraction of a
+/// microsecond either side of the number that was written (a second near 1.7e9 is
+/// representable to about 2e-7), so a whole millisecond arrives as that millisecond give or
+/// take far less than this; a number carrying sub-millisecond digits is away from one by
+/// whole fractions of a millisecond and is caught.
+const MILLISECOND_TOLERANCE: f64 = 0.01;
+
+/// The epoch-seconds number at `path` of `description`, and whether it names a whole
+/// millisecond.
+fn reported_instant(description: &Value, path: &str) -> (f64, bool) {
+    let seconds = at(description, path)
+        .as_f64()
+        .unwrap_or_else(|| panic!("{path} is not an epoch-seconds number: {description:?}"));
+    let millis = seconds * 1_000.0;
+    (seconds, (millis - millis.round()).abs() < MILLISECOND_TOLERANCE)
+}
+
+/// The `DeliveryStreamDescription` of `stream`, as a reporting call answers it.
+async fn describe(emulator: &Emulator, stream: &str) -> Value {
+    let (status, described) = emulator
+        .call(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": stream }),
+        )
+        .await;
+    assert_eq!(status, 200, "describe {stream}: got {described:?}");
+    described["DeliveryStreamDescription"].clone()
+}
+
+/// RULE: every `Timestamp` member of this service targets a plain timestamp with no
+/// `@timestampFormat` (`smithy_query(query="shape", shape="Timestamp")`), so on the
+/// `awsJson1_1` wire it travels as an epoch-seconds NUMBER — and Firehose states such an
+/// instant at millisecond resolution, never at the host clock's own.
+///
+/// Asserted over every reported instant of the description and over the calls that set
+/// them: a fresh create (`CreateTimestamp`, `LastUpdateTimestamp`), an `UpdateDestination`
+/// (which moves `LastUpdateTimestamp`), a tag change, and a stream fed by a configured
+/// source (whose `Source` carries `DeliveryStartTimestamp`). Nothing here asserts the
+/// INSTANT, which is a per-run value: the resolution is the rule.
+#[tokio::test]
+async fn every_reported_instant_is_stated_at_millisecond_resolution() {
+    let emulator = Emulator::new();
+
+    // (the stream, the create's destination member, its configuration, the stream type and
+    // the source configuration it is fed by)
+    let kinesis_source = json!({
+        "KinesisStreamARN": format!("arn:aws:kinesis:{REGION}:000000000000:stream/sourced"),
+        "RoleARN": ROLE_ARN,
+    });
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "direct-put",
+            json!({ "DeliveryStreamName": "instants-direct-put", "S3DestinationConfiguration": s3_configuration() }),
+            vec!["CreateTimestamp", "LastUpdateTimestamp"],
+        ),
+        (
+            "kinesis-sourced",
+            json!({
+                "DeliveryStreamName": "instants-sourced",
+                "DeliveryStreamType": "KinesisStreamAsSource",
+                "KinesisStreamSourceConfiguration": kinesis_source,
+                "S3DestinationConfiguration": s3_configuration(),
+            }),
+            vec![
+                "CreateTimestamp",
+                "LastUpdateTimestamp",
+                "Source/KinesisStreamSourceDescription/DeliveryStartTimestamp",
+            ],
+        ),
+    ];
+
+    for (case, request, paths) in rows {
+        let stream = request["DeliveryStreamName"].as_str().unwrap_or_default().to_string();
+        let (status, created) = emulator.call("CreateDeliveryStream", request).await;
+        assert_eq!(status, 200, "case {case:?}: create got {created:?}");
+
+        let described = describe(&emulator, &stream).await;
+        for path in &paths {
+            let (seconds, whole) = reported_instant(&described, path);
+            assert!(
+                whole,
+                "case {case:?}: expected {path} at millisecond resolution, got {seconds:?}"
+            );
+        }
+
+        // The same instants READ BACK are the ones that were reported: a reporting call
+        // states them, it does not re-stamp them.
+        let again = describe(&emulator, &stream).await;
+        for path in &paths {
+            assert_eq!(
+                at(&again, path),
+                at(&described, path),
+                "case {case:?}: {path} changed between two reads, {:?} then {:?}",
+                at(&described, path),
+                at(&again, path)
+            );
+        }
+
+        // A call that touches the stream's own version moves `LastUpdateTimestamp`, and the
+        // instant it moves to is stated at the same resolution. It waits for the stream to
+        // be `ACTIVE` first, because a stream the clock still owes its creation to does not
+        // take an update.
+        emulator.await_active(&stream).await;
+        let settled = describe(&emulator, &stream).await;
+        let version = settled["VersionId"].as_str().unwrap_or_default().to_string();
+        let destination_id = settled["Destinations"][0]["DestinationId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, updated) = emulator
+            .call(
+                "UpdateDestination",
+                json!({
+                    "DeliveryStreamName": stream,
+                    "CurrentDeliveryStreamVersionId": version,
+                    "DestinationId": destination_id,
+                    "S3DestinationUpdate": { "Prefix": "updated/" },
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "case {case:?}: update got {updated:?}");
+        let after = describe(&emulator, &stream).await;
+        for path in ["CreateTimestamp", "LastUpdateTimestamp"] {
+            let (seconds, whole) = reported_instant(&after, path);
+            assert!(
+                whole,
+                "case {case:?}: after the update, expected {path} at millisecond \
+                 resolution, got {seconds:?}"
+            );
+        }
+        assert_eq!(
+            at(&after, "CreateTimestamp"),
+            at(&described, "CreateTimestamp"),
+            "case {case:?}: an update does not re-create the stream, so CreateTimestamp \
+             stands: {:?} then {:?}",
+            at(&described, "CreateTimestamp"),
+            at(&after, "CreateTimestamp")
+        );
+
+        // And a tag change, which is another call that writes to the stream.
+        let (status, tagged) = emulator
+            .call(
+                "TagDeliveryStream",
+                json!({
+                    "DeliveryStreamName": stream,
+                    "Tags": [{ "Key": "team", "Value": "data" }],
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "case {case:?}: tag got {tagged:?}");
+        let tagged = describe(&emulator, &stream).await;
+        for path in ["CreateTimestamp", "LastUpdateTimestamp"] {
+            let (seconds, whole) = reported_instant(&tagged, path);
+            assert!(
+                whole,
+                "case {case:?}: after the tag change, expected {path} at millisecond \
+                 resolution, got {seconds:?}"
             );
         }
     }

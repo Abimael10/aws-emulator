@@ -179,6 +179,59 @@ impl Emulator {
             tokio::task::yield_now().await;
         }
     }
+
+    /// Call the endpoint with the protocol headers and the body BYTES a client sent,
+    /// rather than with an operation name and a JSON document: what the endpoint answers
+    /// a request whose media type, whose target or whose body is not one the API can be
+    /// read from is a wire-level answer, so the test has to be able to send one.
+    ///
+    /// `media_type` is the whole `content-type` header and `target` the whole
+    /// `x-amz-target` one, each `None` for a request carrying none.
+    pub(crate) async fn call_raw(
+        &self,
+        media_type: Option<&str>,
+        target: Option<&str>,
+        body: &'static [u8],
+    ) -> RawAnswer {
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/firehose/\
+                     aws4_request, SignedHeaders=host, Signature=deadbeef"
+                ),
+            );
+        if let Some(media_type) = media_type {
+            request = request.header("content-type", media_type);
+        }
+        if let Some(target) = target {
+            request = request.header("x-amz-target", target);
+        }
+        let request = request
+            .body(Bytes::from_static(body))
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        RawAnswer {
+            status: response.status().as_u16(),
+            content_type: response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            body: serde_json::from_slice(response.body()).unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// What the endpoint answered a raw request ([`Emulator::call_raw`]): the status, the media
+/// type the answer is announced in, and its body as the JSON document a client parses
+/// (`Value::Null` for a body that is not one).
+pub(crate) struct RawAnswer {
+    pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// An IAM role ARN satisfying `RoleARN`'s modelled pattern.

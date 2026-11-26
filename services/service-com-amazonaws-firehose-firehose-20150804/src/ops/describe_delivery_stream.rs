@@ -225,10 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 delivery_stream_type: stream.stream_type.clone(),
                 version_id: stream.version_id.to_string(),
-                create_timestamp: Some(::aws_smithy_types::DateTime::from(
+                // Reported at the resolution this service reports an instant at: the
+                // epoch-seconds number a `Timestamp` member travels as carries whole
+                // milliseconds (`crate::state::reported_instants`).
+                create_timestamp: Some(crate::state::reported_instants::reported(
                     stream.create_timestamp,
                 )),
-                last_update_timestamp: Some(::aws_smithy_types::DateTime::from(
+                last_update_timestamp: Some(crate::state::reported_instants::reported(
                     stream.last_update_timestamp,
                 )),
                 source: stream.source.clone(),

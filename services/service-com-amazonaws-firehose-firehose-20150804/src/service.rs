@@ -21,8 +21,10 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: a request this endpoint's own JSON-RPC surface owns — one
+//!   whose `x-amz-target` names no operation of this API, and one whose body the JSON wire
+//!   could not read — is served by that surface (`front_door`); every other request
+//!   resolves through the generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. Firehose words those refusals itself: the clause names the
 //!   member path and the constraint and never the value that was rejected, a
@@ -33,9 +35,9 @@
 //!   listed in the order the table it is held in is walked, over the order this service's
 //!   own set is built in (`enum_value_sets`).
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. EDITED HERE: a target naming this API and an operation
+//!   it does not publish is this endpoint's own unknown-operation refusal (`front_door`),
+//!   not the framework's modelled-but-unregistered signal.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -58,6 +60,7 @@
 //! is built in, for the one type this checkout's model declares in another order.
 
 mod enum_value_sets;
+pub mod front_door;
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -1208,6 +1211,11 @@ pub fn unauthorized_source_read_message(role_arn: &str, action: &str, source_arn
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The endpoint's own JSON-RPC surface, which answers a request no operation of this
+    /// API serves ([`front_door`]). Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of one of its own operations;
+    /// it carries no state, so holding it costs nothing.
+    front_door: front_door::EndpointSurface,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -1217,6 +1225,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            front_door: front_door::EndpointSurface,
         }
     }
 }
@@ -1247,8 +1256,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // A request this endpoint's own JSON-RPC surface owns is served by that surface
+        // ([`front_door`]): one whose `x-amz-target` names no operation of this API, and
+        // one whose body the JSON wire could not read into the operation it does name.
+        // Which operations this endpoint publishes is the generated table's answer, so no
+        // operation list is restated. Every other request resolves to `None` exactly as it
+        // would in an unedited service and is served by that table.
+        front_door::unserved(req, |operation| {
+            self.entry.routing_table().get(operation).is_some()
+        })
+        .map(|_| &self.front_door as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -1290,10 +1308,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // Such a request carries a target that names THIS endpoint's API and an operation
+        // it does not publish (a target that names no operation of this API at all is owned
+        // by the surface above, which answers the framework's own envelope for it). The
+        // target was read and resolved nothing, so the answer is this endpoint's
+        // unknown-operation refusal ([`front_door::unknown_operation_response`]) and not
+        // the framework's default, which reports an operation that is modelled but
+        // unregistered — a state this service has none of, since every operation its model
+        // binds is served.
+        //
+        // A request in NONE of this service's protocols reaches here too, and is left to
+        // the framework: there is no protocol to answer it in, so there is no envelope of
+        // this endpoint's to answer it with.
+        if self.entry.wire_protocol(req).is_unrecognised() {
+            return None;
+        }
+        front_door::unknown_operation_response(self.entry.wire_protocol(req).protocol())
     }
 
     fn override_framework_error(

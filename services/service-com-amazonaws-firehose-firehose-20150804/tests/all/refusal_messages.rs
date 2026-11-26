@@ -16,7 +16,16 @@
 //!    state, and a create that does not name exactly one destination configuration is
 //!    refused with the one fixed sentence stating that arity rule;
 //! 4. a put to a stream that is not accepting data states the stream the request named
-//!    and the account the put was scoped to, and not the state the stream is in.
+//!    and the account the put was scoped to, and not the state the stream is in;
+//! 5. a request this endpoint names no operation for is refused by its own JSON-RPC
+//!    surface rather than by an operation: a target that names THIS API and an operation it
+//!    does not publish is `400 UnknownOperationException` with no prose, and a request that
+//!    names no API of this endpoint at all — an unresolvable target, or a media type this
+//!    endpoint reads no document in — identifies nothing to answer for and is answered the
+//!    request framework's `200 application/json` unknown-operation envelope;
+//! 6. a request body the JSON wire could not read is a serialization fault and not a
+//!    constraint violation: `400 SerializationException`, carrying only the sentence that
+//!    framework states for the token the body opened with, under the capitalized `Message`.
 //!
 //! Every request goes through the real router, so what is asserted is the body a client
 //! reads. The harness (`Emulator`, `s3_configuration`, …) is the lifecycle suite's.
@@ -902,5 +911,324 @@ async fn destinations_that_exclude_each_other_are_refused_with_the_arity_rule() 
         listed["DeliveryStreamNames"],
         json!([]),
         "a refused create stores nothing, got {listed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The endpoint's own JSON-RPC surface: rules 5 and 6 of this suite's header.
+// ---------------------------------------------------------------------------
+
+/// The class the endpoint answers a target it read and resolved no operation from.
+const UNKNOWN_OPERATION: &str = "UnknownOperationException";
+
+/// The class the endpoint answers a body its JSON wire could not read.
+const SERIALIZATION_EXCEPTION: &str = "SerializationException";
+
+/// The sentence the request framework states for a list opening where the input structure
+/// must open. Fixed text: it names the token CLASS and no value of the request.
+const START_OF_LIST: &str = "Start of list found where not expected";
+
+/// The whole document the endpoint answers a request that named no operation of this API —
+/// the request framework's JSON-RPC envelope, every byte of it fixed text.
+fn unrouted_envelope() -> Value {
+    json!({
+        "Output": { "__type": "com.amazon.coral.service#UnknownOperationException" },
+        "Version": "1.0",
+    })
+}
+
+/// The media type that framework's own envelope is announced in, which is not the
+/// `awsJson1_1` one this service's own documents carry.
+const FRAMEWORK_MEDIA_TYPE: &str = "application/json";
+
+/// The media type this endpoint serves its API under, which every request below announces
+/// unless the case under test is the announcement itself.
+const PROTOCOL_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+
+/// RULE 5a: a target that names THIS endpoint's API and an operation it does not publish
+/// was read and resolved nothing, so it is refused 400 `UnknownOperationException` with no
+/// prose at all — there is no operation, member or value for a sentence to state.
+#[tokio::test]
+async fn a_target_naming_no_operation_of_this_api_is_refused_without_prose() {
+    let emulator = Emulator::new();
+
+    // Every row carries this endpoint's own target prefix; what differs is the NAME after
+    // it, none of which the service binds (`smithy_query(query="list_operations")`).
+    let rows: &[(&str, &str)] = &[
+        // The plural of an operation the API does publish.
+        ("a near miss of a published name", "DescribeDeliveryStreams"),
+        ("a name of another API", "CreateStream"),
+        ("a published name in another case", "listdeliverystreams"),
+        ("an empty name", ""),
+    ];
+
+    for (case, operation) in rows {
+        let target = format!("Firehose_20150804.{operation}");
+        let answer = emulator
+            .call_raw(Some(PROTOCOL_MEDIA_TYPE), Some(&target), b"{}")
+            .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?} ({target}): expected 400, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer.body),
+            UNKNOWN_OPERATION,
+            "case {case:?} ({target}): expected {UNKNOWN_OPERATION}, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("message"),
+            None,
+            "case {case:?} ({target}): expected no lowercase message, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("Message"),
+            None,
+            "case {case:?} ({target}): expected no Message, got {:?}",
+            answer.body
+        );
+    }
+}
+
+/// RULE 5b: a target that does not name this endpoint's API at all — no target, no
+/// separator, or another endpoint's prefix — identifies no operation to answer for, so the
+/// endpoint answers the request framework's JSON-RPC envelope: 200 `application/json`
+/// carrying the unknown-operation report INSIDE it. An operation name this API DOES publish
+/// after a foreign prefix is no exception: the prefix is what names the API.
+#[tokio::test]
+async fn a_target_that_names_no_api_of_this_endpoint_is_answered_in_the_framework_envelope() {
+    let emulator = Emulator::new();
+
+    // (case, the whole x-amz-target header the request carries)
+    let rows: &[(&str, Option<&str>)] = &[
+        (
+            "another endpoint's prefix over a name this API publishes",
+            Some("Kinesis_20131202.ListDeliveryStreams"),
+        ),
+        (
+            "this prefix at another API version",
+            Some("Firehose_20150805.ListDeliveryStreams"),
+        ),
+        (
+            "this prefix in another case, which is another prefix",
+            Some("firehose_20150804.ListDeliveryStreams"),
+        ),
+        (
+            "a name with no prefix and no separator",
+            Some("ListDeliveryStreams"),
+        ),
+        ("an empty prefix", Some(".ListDeliveryStreams")),
+        ("no target at all", None),
+    ];
+
+    for (case, target) in rows {
+        let answer = emulator
+            .call_raw(Some(PROTOCOL_MEDIA_TYPE), *target, b"{}")
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?} ({target:?}): expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.content_type.as_deref(),
+            Some(FRAMEWORK_MEDIA_TYPE),
+            "case {case:?} ({target:?}): expected {FRAMEWORK_MEDIA_TYPE}, got {:?}",
+            answer.content_type
+        );
+        assert_eq!(
+            answer.body,
+            unrouted_envelope(),
+            "case {case:?} ({target:?}): expected {:?}, got {:?}",
+            unrouted_envelope(),
+            answer.body
+        );
+    }
+
+    // The refusal is the endpoint's answer and not a call: nothing was served for any of
+    // those requests, so no stream was created by the create-shaped one below either.
+    let created = emulator
+        .call_raw(
+            Some(PROTOCOL_MEDIA_TYPE),
+            Some("Kinesis_20131202.CreateDeliveryStream"),
+            br#"{"DeliveryStreamName":"unrouted-create","S3DestinationConfiguration":{"RoleARN":"arn:aws:iam::000000000000:role/firehose-delivery","BucketARN":"arn:aws:s3:::demo-bucket"}}"#,
+        )
+        .await;
+    assert_eq!(
+        created.body,
+        unrouted_envelope(),
+        "a create under a foreign prefix is not served, got {:?}",
+        created.body
+    );
+    let (_, listed) = emulator.call("ListDeliveryStreams", json!({})).await;
+    assert_eq!(
+        listed["DeliveryStreamNames"],
+        json!([]),
+        "a request the endpoint does not route stores nothing, got {listed:?}"
+    );
+}
+
+/// RULE 5c: the endpoint reads a document only in the media type its own protocol publishes,
+/// so a request announcing another one — with a target this API does publish — announces a
+/// protocol no operation of this endpoint is read in and is answered the same framework
+/// envelope. A request announcing NONE has announced no other protocol and is served.
+#[tokio::test]
+async fn a_request_announcing_another_media_type_is_answered_in_the_framework_envelope() {
+    let emulator = Emulator::new();
+
+    // (case, the media type the request announces, whether the API serves it)
+    let rows: &[(&str, Option<&str>, bool)] = &[
+        ("this protocol's own media type", Some(PROTOCOL_MEDIA_TYPE), true),
+        (
+            "it with a parameter, which is the same media type",
+            Some("application/x-amz-json-1.1; charset=utf-8"),
+            true,
+        ),
+        ("none announced at all", None, true),
+        (
+            "plain JSON, which is another protocol of this family",
+            Some("application/json"),
+            false,
+        ),
+        (
+            "another version of the awsJson family",
+            Some("application/x-amz-json-1.0"),
+            false,
+        ),
+        ("XML, which is no JSON at all", Some("application/xml"), false),
+        ("plain text", Some("text/plain"), false),
+    ];
+
+    for (case, media_type, served) in rows {
+        let answer = emulator
+            .call_raw(
+                *media_type,
+                Some("Firehose_20150804.ListDeliveryStreams"),
+                b"{}",
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        if *served {
+            assert_eq!(
+                answer.body["DeliveryStreamNames"],
+                json!([]),
+                "case {case:?}: expected the operation's own answer, got {:?}",
+                answer.body
+            );
+        } else {
+            assert_eq!(
+                answer.body,
+                unrouted_envelope(),
+                "case {case:?}: expected {:?}, got {:?}",
+                unrouted_envelope(),
+                answer.body
+            );
+            assert_eq!(
+                answer.content_type.as_deref(),
+                Some(FRAMEWORK_MEDIA_TYPE),
+                "case {case:?}: expected {FRAMEWORK_MEDIA_TYPE}, got {:?}",
+                answer.content_type
+            );
+        }
+    }
+}
+
+/// RULE 6: a body the JSON wire could not read into the operation's input is a fault in the
+/// caller's SERIALIZER, not in a value — nothing became a value, so no constraint on one
+/// was reached. It is refused 400 `SerializationException`, never the constraint class, and
+/// the only prose it carries is the sentence this request framework states for the token
+/// the body opened with, under the capitalized `Message`.
+#[tokio::test]
+async fn a_body_the_wire_cannot_read_is_a_serialization_fault() {
+    let emulator = Emulator::new();
+
+    // (case, the body's bytes, the sentence the answer carries under `Message`)
+    let rows: &[(&str, &'static [u8], Option<&str>)] = &[
+        (
+            "a truncated document, which is no document",
+            br#"{"DeliveryStreamName""#,
+            None,
+        ),
+        ("bytes that are no JSON at all", b"not json at all", None),
+        ("a document opening with a list", b"[]", Some(START_OF_LIST)),
+        (
+            "a list carrying what the input structure would have been",
+            br#"[{"DeliveryStreamName":"listed"}]"#,
+            Some(START_OF_LIST),
+        ),
+        (
+            "a string where the input structure must open",
+            br#""DeliveryStreamName""#,
+            None,
+        ),
+        ("a number where it must open", b"42", None),
+        ("null where it must open", b"null", None),
+    ];
+
+    // The fault is in the body and not in the operation, so every operation of this API
+    // answers it the same way: one that takes a required member, and one whose input shape
+    // requires none at all.
+    for operation in ["DescribeDeliveryStream", "ListDeliveryStreams"] {
+        let target = format!("Firehose_20150804.{operation}");
+        for (case, body, message) in rows {
+            let answer = emulator
+                .call_raw(Some(PROTOCOL_MEDIA_TYPE), Some(&target), body)
+                .await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?} on {operation}: expected 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer.body),
+                SERIALIZATION_EXCEPTION,
+                "case {case:?} on {operation}: expected {SERIALIZATION_EXCEPTION}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body.get("message"),
+                None,
+                "case {case:?} on {operation}: expected no lowercase message, got {:?}",
+                answer.body
+            );
+            let stated = answer.body.get("Message").and_then(Value::as_str);
+            assert_eq!(
+                stated, *message,
+                "case {case:?} on {operation}: expected {message:?} under Message, got \
+                 {stated:?}"
+            );
+        }
+    }
+
+    // A body the wire CAN read is untouched by that layer: the empty document every
+    // all-optional input is read from is served, and a value the body did carry that breaks
+    // a modelled rule is still the constraint refusal.
+    let served = emulator
+        .call_raw(
+            Some(PROTOCOL_MEDIA_TYPE),
+            Some("Firehose_20150804.ListDeliveryStreams"),
+            b"{}",
+        )
+        .await;
+    assert_eq!(
+        served.status, 200,
+        "the empty document is read, got {} {:?}",
+        served.status, served.body
+    );
+    let (status, refused) = emulator
+        .call("DescribeDeliveryStream", json!({ "DeliveryStreamName": "" }))
+        .await;
+    assert_eq!(status, 400, "an empty name: got {refused:?}");
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "a value that WAS read and broke a rule stays the constraint class, got {refused:?}"
     );
 }
