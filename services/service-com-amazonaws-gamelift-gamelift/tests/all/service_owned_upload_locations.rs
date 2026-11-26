@@ -200,6 +200,7 @@ async fn a_script_upload_location_names_the_regions_script_bucket_and_is_read_ba
                 "CreateScript",
                 json!({
                     "Name": "upload-location",
+                    "NodeJsVersion": "24.x",
                     "ZipFile": zip_file_member(&zip_bytes(32 + index)),
                 }),
             )

@@ -301,6 +301,18 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // Studio's session mapping).
     ("elasticmapreduce", "Emr", SdkDiagnostic::Attempts),
     ("es", "OpenSearch", SdkDiagnostic::Attempts),
+    // Amazon GameLift Servers' SDK names it `GameLift` — that model's own `sdkId`, which is
+    // also the `cloudFormationName` its resource types are spelled with
+    // (`smithy_query(query="service_info")` on that service's model). The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::GameLift::Script` declared with no runtime version carries it (in the behavioral
+    // corpus `simparity-behavioral-aws-v1`, check `cloudformation__gamelift__iam__\
+    // s3.deploy-gamelift-script-missing-nodejs-version-rejected-and-rolled-back`, whose reason
+    // reads `Resource handler returned message: "<the service's sentence> (Service: GameLift,
+    // Status Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: InvalidRequest)`). Both resource types this emulator provisions over
+    // this signing name are that service's ([`provisioner::gamelift_resources`]).
+    ("gamelift", "GameLift", SdkDiagnostic::Attempts),
     ("iam", "Iam", SdkDiagnostic::Attempts),
     // Amazon MSK's SDK names it `Kafka` — that model's own `sdkId` (`Kafka`,
     // `smithy_query(query="service_info")` on that service's model), which is the signing name

@@ -2441,3 +2441,51 @@ pub(super) const VPCLATTICE_RESOURCE_ACCESS_ATTRIBUTES: &[&str] = &["Arn", "Id"]
 /// re-points them at what the create really answered cannot spell them differently.
 pub const VPCLATTICE_ARN_ATTRIBUTE: &str = "Arn";
 pub const VPCLATTICE_ID_ATTRIBUTE: &str = "Id";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two Amazon GameLift Servers
+/// resources a template ships game code as. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`GameLift`).
+///
+/// * a BUILD — the custom game server build `CreateBuild` records for the zip file at the
+///   declared Amazon S3 storage location. "Ref returns the build ID", and `Fn::GetAtt` reads
+///   the `BuildId` and the `Arn` that service built around it;
+/// * a SCRIPT — the Realtime script `CreateScript` records the same way. "Ref returns the
+///   script ID", and `Fn::GetAtt` reads the `Id` and the `Arn`.
+///
+/// That service MINTS each identity — neither create takes an identifier for the resource,
+/// and each answers the `build-…`/`script-…` id it drew with the ARN built around it
+/// (`Build$BuildArn`: `^arn:.*:build\/build-\S+$`, `Script$ScriptArn`:
+/// `^arn:.*:script\/script-\S+$`, each documented "the resource ID matches the
+/// *BuildId*/*ScriptId* value") — so [`identity_is_service_assigned`] names both types and
+/// neither value can be recomputed from the template.
+pub const GAMELIFT_BUILD: &str = "AWS::GameLift::Build";
+pub const GAMELIFT_SCRIPT: &str = "AWS::GameLift::Script";
+
+/// Amazon GameLift Servers' ARN namespace, which that model carries as
+/// `awsService.arnNamespace` (`gamelift`) and both resources' ARNs are named under.
+pub const GAMELIFT_ARN_NAMESPACE: &str = "gamelift";
+
+/// The resource paths those two ARNs carry before the id that service minted, from those
+/// same patterns.
+pub(super) const GAMELIFT_BUILD_PATH: &str = "build";
+pub(super) const GAMELIFT_SCRIPT_PATH: &str = "script";
+
+/// The prefix each of those minted ids carries (`BuildId`: `^build-\S+$`, `ScriptId`:
+/// `^script-\S+$`), which the STAND-IN computed before the create carries as well.
+pub(super) const GAMELIFT_BUILD_ID_PREFIX: &str = "build-";
+pub(super) const GAMELIFT_SCRIPT_ID_PREFIX: &str = "script-";
+
+/// Every `Fn::GetAtt` attribute each of the two types publishes, in the sorted order a
+/// resource's own attribute map holds them in: the ARN that service minted and the id
+/// inside it, which are the two read-only values its create answers the resource's identity
+/// in.
+pub(super) const GAMELIFT_BUILD_ATTRIBUTES: &[&str] =
+    &[GAMELIFT_ARN_ATTRIBUTE, GAMELIFT_BUILD_ID_ATTRIBUTE];
+pub(super) const GAMELIFT_SCRIPT_ATTRIBUTES: &[&str] =
+    &[GAMELIFT_ARN_ATTRIBUTE, GAMELIFT_ID_ATTRIBUTE];
+
+/// Those three attributes by name, so the arms that compute a stand-in and the provisioner
+/// that re-points them at what the create really answered cannot spell them differently.
+pub const GAMELIFT_ARN_ATTRIBUTE: &str = "Arn";
+pub const GAMELIFT_BUILD_ID_ATTRIBUTE: &str = "BuildId";
+pub const GAMELIFT_ID_ATTRIBUTE: &str = "Id";

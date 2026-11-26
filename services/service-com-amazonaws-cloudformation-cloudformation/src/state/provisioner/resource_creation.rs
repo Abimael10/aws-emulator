@@ -121,7 +121,9 @@ impl Provisioner {
             // `AWS::S3::BucketPolicy` publishes `Bucket` and `PolicyDocument` and no
             // `Tags`: a bucket's policy is no taggable resource, so no tags are
             // propagated to one.
-            Self::S3BucketPolicy => put_bucket_policy(ctx, region, resource).await,
+            // Boxed for the same reason the bucket's create is: a put of the declared
+            // document reaches Amazon S3 through that service's own SDK client.
+            Self::S3BucketPolicy => Box::pin(put_bucket_policy(ctx, region, resource)).await,
             // `AWS::S3Tables::TableBucket` publishes `Tags`, and `CreateTableBucket` takes
             // a tag MAP of its own, so a table bucket a stack creates carries the tags
             // CloudFormation gives it beside the ones the declaration asks for.
@@ -135,18 +137,26 @@ impl Provisioner {
                 create_vector_bucket(ctx, region, resource, propagated).await
             }
             Self::S3VectorsIndex => create_index(ctx, region, resource, propagated).await,
-            Self::IamRole => create_role(ctx, region, resource, propagated).await,
+            // Boxed for the reason the bucket's arm above is: each of these reaches IAM
+            // through that service's own SDK client, whose future is among the largest this
+            // match holds, and the stack it shares with the provisioning walk above it is the
+            // scarce resource. The sizes of this match's arms are what every deployment pays,
+            // whichever type it declares ([`super::provisioning::Owner::create`] boxes this
+            // whole match for the same reason).
+            Self::IamRole => Box::pin(create_role(ctx, region, resource, propagated)).await,
             // `AWS::IAM::InstanceProfile` publishes no `Tags` property and
             // `CreateInstanceProfile` takes none from this arm, so no tags are propagated to
             // a profile.
-            Self::IamInstanceProfile => create_instance_profile(ctx, region, resource).await,
-            Self::IamUser => create_iam_user(ctx, region, resource, propagated).await,
+            Self::IamInstanceProfile => {
+                Box::pin(create_instance_profile(ctx, region, resource)).await
+            }
+            Self::IamUser => Box::pin(create_iam_user(ctx, region, resource, propagated)).await,
             // `AWS::IAM::AccessKey` publishes no `Tags` property and `CreateAccessKey` takes
             // none, so no tags are propagated to an access key.
-            Self::IamAccessKey => create_iam_access_key(ctx, region, resource).await,
+            Self::IamAccessKey => Box::pin(create_iam_access_key(ctx, region, resource)).await,
             // `AWS::IAM::ManagedPolicy` publishes no `Tags` property and `CreatePolicy`
             // takes none from this arm, so no tags are propagated to a policy.
-            Self::IamManagedPolicy => create_managed_policy(ctx, region, resource).await,
+            Self::IamManagedPolicy => Box::pin(create_managed_policy(ctx, region, resource)).await,
             Self::CodePipelinePipeline => {
                 create_pipeline(ctx, region, resource, propagated).await
             }
@@ -1000,6 +1010,18 @@ impl Provisioner {
             // declaration asks for.
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
+            }
+            // Both `AWS::GameLift::*` types publish `Tags` as the `[{Key, Value}]` list
+            // `CreateBuild`'s and `CreateScript`'s own `Tags` member takes, so a build and a
+            // script a stack creates each carry the tags CloudFormation gives them beside the
+            // ones their declaration asks for. Boxed, as the arms that reach a service through
+            // another of this emulator's own are, so this arm's future does not widen the one
+            // every create is polled through.
+            Self::GameLiftBuild => {
+                Box::pin(create_gamelift_build(ctx, region, resource, propagated)).await
+            }
+            Self::GameLiftScript => {
+                Box::pin(create_gamelift_script(ctx, region, resource, propagated)).await
             }
             // `AWS::HealthLake::FHIRDatastore` publishes `Tags` as the `[{Key, Value}]` list
             // `CreateFHIRDatastore`'s own `Tags` member takes, and

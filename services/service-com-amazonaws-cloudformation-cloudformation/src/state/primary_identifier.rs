@@ -121,6 +121,12 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // An Amazon GameLift Servers build and a Realtime script, each identified by the id
+        // that service minted for it ("Ref returns the build ID" / "the script ID") — the
+        // `BuildId`/`ScriptId` every call on one takes; each type's own `Name` is only what
+        // the resource is called, and "build names do not need to be unique".
+        GAMELIFT_BUILD => GAMELIFT_BUILD_ID_ATTRIBUTE,
+        GAMELIFT_SCRIPT => GAMELIFT_ID_ATTRIBUTE,
         // An Amazon Lex V2 BOT is identified by the `Id` that service minted for it ("Ref
         // returns the bot Id") — the `botId` every bot-addressed call takes; its `Name` is only
         // what the bot is called. (A version and an alias are identified by the PAIR each of

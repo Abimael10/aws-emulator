@@ -498,6 +498,7 @@ use super::template::{
     BEDROCK_KNOWLEDGE_BASE,
     BEDROCK_SESSION,
     BRAKET_SPENDING_LIMIT, CLEANROOMSML_TRAINING_DATASET,
+    GAMELIFT_BUILD, GAMELIFT_SCRIPT,
     VPCLATTICE_ACCESS_LOG_SUBSCRIPTION, VPCLATTICE_SERVICE_NETWORK,
     CLOUDHSM_CLUSTER,
     CLOUDWATCH_DASHBOARD,
@@ -1438,6 +1439,16 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::GameLift::Build` and `AWS::GameLift::Script`: the custom game server build and
+    /// the Realtime script Amazon GameLift Servers' own `CreateBuild` and `CreateScript`
+    /// record for the zip file at the Amazon S3 location the template names, `UpdateBuild` and
+    /// `UpdateScript` change and `DeleteBuild` and `DeleteScript` remove. That service MINTS
+    /// each identity — neither create takes an identifier and each answers the
+    /// `build-…`/`script-…` id it drew with the ARN built around it — so the id it answered is
+    /// the resource's physical id and the identity a `Ref` resolves to
+    /// ([`gamelift_resources`]).
+    GameLiftBuild,
+    GameLiftScript,
     /// `AWS::HealthLake::FHIRDatastore`: the FHIR-enabled data store AWS HealthLake's own
     /// `CreateFHIRDatastore` makes and `DeleteFHIRDatastore` removes. That service MINTS the
     /// `DatastoreId` the type's `Ref` returns, and the ARN and the FHIR endpoint built around
@@ -2007,6 +2018,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        GAMELIFT_BUILD => Some(Provisioner::GameLiftBuild),
+        GAMELIFT_SCRIPT => Some(Provisioner::GameLiftScript),
         HEALTHLAKE_FHIR_DATASTORE => Some(Provisioner::HealthLakeFhirDatastore),
         HEALTHLAKE_DATA_TRANSFORMATION_PROFILE => {
             Some(Provisioner::HealthLakeDataTransformationProfile)
@@ -2209,10 +2222,10 @@ impl Provisioner {
             Self::OpenSearchServiceDomain => {
                 delete_domain(ctx, region, physical_resource_id).await
             }
-            Self::S3Bucket => delete_bucket(ctx, region, physical_resource_id).await,
+            Self::S3Bucket => Box::pin(delete_bucket(ctx, region, physical_resource_id)).await,
             // The policy is the named BUCKET's, and only the resource's own declaration
             // says which bucket that is.
-            Self::S3BucketPolicy => delete_bucket_policy(ctx, region, resource).await,
+            Self::S3BucketPolicy => Box::pin(delete_bucket_policy(ctx, region, resource)).await,
             Self::S3TablesTableBucket => {
                 delete_table_bucket(ctx, region, physical_resource_id).await
             }
@@ -2235,20 +2248,24 @@ impl Provisioner {
                 delete_emr_studio_session_mapping(ctx, region, resource).await
             }
             // The role's policies have to go first, and only the resource's own record
-            // says which ones there are.
-            Self::IamRole => delete_role(ctx, region, resource).await,
+            // says which ones there are. Boxed, as the heavy arms of this match are: each of
+            // these teardowns reaches IAM through that service's own SDK client, and this
+            // match's size is what every deletion pays, whichever type it removes.
+            Self::IamRole => Box::pin(delete_role(ctx, region, resource)).await,
             // The roles the profile holds have to be taken out of it first, and only the
             // resource's own record says which ones there are.
-            Self::IamInstanceProfile => delete_instance_profile(ctx, region, resource).await,
+            Self::IamInstanceProfile => {
+                Box::pin(delete_instance_profile(ctx, region, resource)).await
+            }
             // The user's password, policies and memberships have to go first, and only the
             // resource's own record says which ones there are.
-            Self::IamUser => delete_iam_user(ctx, region, resource).await,
+            Self::IamUser => Box::pin(delete_iam_user(ctx, region, resource)).await,
             // The key is addressed by the PAIR IAM keys one by — the user that holds it and
             // the id IAM minted — and the user half is on the resource's own declaration.
-            Self::IamAccessKey => delete_iam_access_key(ctx, region, resource).await,
+            Self::IamAccessKey => Box::pin(delete_iam_access_key(ctx, region, resource)).await,
             // The policy's attachments and its non-default versions have to go first, and
             // only the resource's own record says which entities it was attached to.
-            Self::IamManagedPolicy => delete_managed_policy(ctx, region, resource).await,
+            Self::IamManagedPolicy => Box::pin(delete_managed_policy(ctx, region, resource)).await,
             Self::CodePipelinePipeline => {
                 delete_pipeline(ctx, region, physical_resource_id).await
             }
@@ -2931,6 +2948,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Each delete addresses the build or the script by the id Amazon GameLift Servers
+            // minted for it, which is this resource's physical id.
+            Self::GameLiftBuild => {
+                Box::pin(delete_gamelift_build(ctx, region, physical_resource_id)).await
+            }
+            Self::GameLiftScript => {
+                Box::pin(delete_gamelift_script(ctx, region, physical_resource_id)).await
+            }
             // The delete addresses the data store by the `DatastoreId` HealthLake minted for
             // it, which is this resource's physical id, and the profile by the `ProfileId`
             // inside the ARN that is the profile resource's physical id.
@@ -3527,6 +3552,12 @@ use cleanrooms_ml_training_datasets::*;
 /// entry for the type these arms provision.
 pub(in crate::state) mod cloudhsm_clusters;
 use cloudhsm_clusters::*;
+/// The Amazon GameLift Servers arms: the custom game build an `AWS::GameLift::Build` declares
+/// and the Realtime script an `AWS::GameLift::Script` declares, each created in the service
+/// that owns it so a client's own `DescribeBuild` and `DescribeScript` resolve the identities
+/// the stack publishes.
+mod gamelift_resources;
+use gamelift_resources::*;
 use backup_gateway_hypervisors::*;
 use amplify_ui_builder::*;
 use amplify_apps::*;

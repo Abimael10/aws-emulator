@@ -24,7 +24,11 @@ fn script_not_found_message(selector: &str) -> String {
 
 /// Create one script of `index` in the store and report the stored `Script`.
 async fn create_script(gamelift: &GameLift, index: usize, from_caller_bucket: bool, tags: usize) -> Value {
-    let mut request = json!({"Name": format!("deletable-{index}"), "Version": format!("{index}.0")});
+    let mut request = json!({
+        "Name": format!("deletable-{index}"),
+        "Version": format!("{index}.0"),
+        "NodeJsVersion": "24.x",
+    });
     if from_caller_bucket {
         request["StorageLocation"] = caller_location(&format!("scripts/deletable-{index}.zip"));
     } else {
@@ -357,6 +361,7 @@ async fn a_delete_frees_a_slot_in_the_accounts_script_collection() {
                 "CreateScript",
                 json!({
                     "Name": format!("quota-{index}"),
+                    "NodeJsVersion": "24.x",
                     "ZipFile": zip_file_member(&zip_bytes(8)),
                 }),
             )
@@ -367,7 +372,11 @@ async fn a_delete_frees_a_slot_in_the_accounts_script_collection() {
     let (status, code) = gamelift
         .err(
             "CreateScript",
-            json!({"Name": "before-the-delete", "ZipFile": zip_file_member(&zip_bytes(8))}),
+            json!({
+                "Name": "before-the-delete",
+                "NodeJsVersion": "24.x",
+                "ZipFile": zip_file_member(&zip_bytes(8)),
+            }),
         )
         .await;
     assert_eq!(
@@ -383,7 +392,11 @@ async fn a_delete_frees_a_slot_in_the_accounts_script_collection() {
     let created = gamelift
         .ok(
             "CreateScript",
-            json!({"Name": "after-the-delete", "ZipFile": zip_file_member(&zip_bytes(8))}),
+            json!({
+                "Name": "after-the-delete",
+                "NodeJsVersion": "24.x",
+                "ZipFile": zip_file_member(&zip_bytes(8)),
+            }),
         )
         .await;
     let fresh_id = script_id_of(&created["Script"]);
@@ -396,7 +409,11 @@ async fn a_delete_frees_a_slot_in_the_accounts_script_collection() {
     let (status, code) = gamelift
         .err(
             "CreateScript",
-            json!({"Name": "one-too-many-again", "ZipFile": zip_file_member(&zip_bytes(8))}),
+            json!({
+                "Name": "one-too-many-again",
+                "NodeJsVersion": "24.x",
+                "ZipFile": zip_file_member(&zip_bytes(8)),
+            }),
         )
         .await;
     assert_eq!(

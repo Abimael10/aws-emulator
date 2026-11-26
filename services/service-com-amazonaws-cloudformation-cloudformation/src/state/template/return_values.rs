@@ -390,6 +390,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // An Amazon GameLift Servers build and a Realtime script each publish the id that
+        // service minted and the ARN built around it, which are the two return values these
+        // naming rules compute a stand-in for before the resource exists.
+        GAMELIFT_BUILD => GAMELIFT_BUILD_ATTRIBUTES,
+        GAMELIFT_SCRIPT => GAMELIFT_SCRIPT_ATTRIBUTES,
         // Each Amazon VPC Lattice RESOURCE-ACCESS type publishes the ARN that service minted
         // and the id inside it, which are the two return values these naming rules compute a
         // stand-in for before the resource exists.
@@ -1162,6 +1167,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // The two Amazon GameLift Servers types are two more: neither `CreateBuild` nor
+        // `CreateScript` takes an identifier for the resource — a template declares the
+        // name, the runtime and the Amazon S3 storage location the code is shipped from —
+        // and each answers the `build-…`/`script-…` id that service drew, which is what the
+        // type's `Ref` returns and the handle every later call on a build or a script takes.
+        // No name CloudFormation decides is either, so the identity in force is the one that
+        // service answered.
+        || resource_type == GAMELIFT_BUILD
+        || resource_type == GAMELIFT_SCRIPT
         // The two AWS HEALTHLAKE types are two more: neither create takes an identifier for
         // the resource — a template declares a data store's name and FHIR release version,
         // and a profile's name, source format and initial content — and each answers the

@@ -2860,6 +2860,13 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             | AMPLIFYUIBUILDER_COMPONENT
             | AMPLIFYUIBUILDER_FORM
             | AMPLIFYUIBUILDER_THEME
+            // The two Amazon GameLift Servers types are in that position too: a build and a
+            // script are each identified by the id that service minted for it, and
+            // `UpdateBuild` and `UpdateScript` each take that id together with a new `Name`.
+            // Renaming one is a modification of the resource, not a recreation — and "build
+            // names do not need to be unique", so the name is not an identity at all.
+            | GAMELIFT_BUILD
+            | GAMELIFT_SCRIPT
             // The two AWS Direct Connect types are in that position too: each resource is
             // identified by the id that service minted for it, and `UpdateDirectConnectGateway`
             // takes that `directConnectGatewayId` with a new required
@@ -3061,6 +3068,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The CloudHSM cluster, publishing the ARN built around the id that service mints for it
     // and the read-only values it reports for the cluster.
     CLOUDHSM_CLUSTER,
+    // The Amazon GameLift Servers custom game build and Realtime script, each publishing the
+    // id that service mints for it and the ARN built around that id.
+    GAMELIFT_BUILD,
+    GAMELIFT_SCRIPT,
     CLOUDFRONT_CACHE_POLICY,
     CLOUDFRONT_CONNECTION_FUNCTION,
     CLOUDFRONT_CONNECTION_GROUP,

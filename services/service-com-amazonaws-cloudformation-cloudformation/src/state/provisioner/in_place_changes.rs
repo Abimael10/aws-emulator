@@ -532,6 +532,20 @@ impl Provisioner {
             Self::BraketSpendingLimit => update_braket_spending_limit(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateBuild` and `UpdateScript` each change the resource the stack created by
+            // the id Amazon GameLift Servers minted for it: a build's name and version, and a
+            // script's name, version and content source, are what those calls take — so a
+            // declaration restating one of them is applied to the build or the script rather
+            // than replacing it. Every other property of either type is fixed when the
+            // resource is made ([`super::template::replacement_properties`]).
+            Self::GameLiftBuild => Box::pin(update_gamelift_build(ctx, region, resource, declared))
+                .await
+                .map(Some),
+            Self::GameLiftScript => {
+                Box::pin(update_gamelift_script(ctx, region, resource, declared))
+                    .await
+                    .map(Some)
+            }
             // Either `Update…` of AWS Direct Connect renames the resource the stack created,
             // by the identifier that service minted for it — the one thing either call
             // changes — so a declaration stating another name is applied to the gateway or
@@ -906,11 +920,17 @@ impl Provisioner {
             }
             // A role's tags are IAM's own `TagRole`/`UntagRole`, which is also why
             // [`update_role`] does not carry them: this is the one place the tag set a role
-            // is to end up with is reconciled.
-            Self::IamRole => retag_role(ctx, region, resource, declared, propagated).await,
+            // is to end up with is reconciled. Boxed, as the heavy arms of this file's other
+            // matches are: the reconciliation reaches IAM through that service's own SDK
+            // client, and this match's size is what every carried-forward resource pays.
+            Self::IamRole => {
+                Box::pin(retag_role(ctx, region, resource, declared, propagated)).await
+            }
             // A user's tags are IAM's own `TagUser`/`UntagUser`, for the same reason a
             // role's are not carried by [`update_iam_user`].
-            Self::IamUser => retag_iam_user(ctx, region, resource, declared, propagated).await,
+            Self::IamUser => {
+                Box::pin(retag_iam_user(ctx, region, resource, declared, propagated)).await
+            }
             // A key's tags are KMS's own `TagResource`/`UntagResource`, which is why
             // [`update_kms_key`] does not carry them either.
             Self::KmsKey => retag_kms_key(ctx, region, resource, declared, propagated).await,

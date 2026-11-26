@@ -102,6 +102,7 @@ fn kinds() -> Vec<Kind> {
             create: json!({
                 "Name": "gone-script",
                 "Version": "1.0.0",
+                "NodeJsVersion": "24.x",
                 "ZipFile": zip_file_member(&zip_bytes(256)),
             }),
             delete_op: "DeleteScript",

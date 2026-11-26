@@ -208,6 +208,7 @@ fn rows() -> Vec<(Kind, Scenario)> {
                 request: json!({
                     "Name": "tagged-script",
                     "Version": "1.0.0",
+                    "NodeJsVersion": "24.x",
                     "ZipFile": zip_file_member(&zip_bytes(256)),
                 }),
             },

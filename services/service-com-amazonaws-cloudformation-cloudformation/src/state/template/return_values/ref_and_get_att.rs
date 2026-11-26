@@ -2718,6 +2718,42 @@ pub(crate) fn return_values(
             }
             (arn, attributes)
         }
+        // Amazon GameLift Servers' own control plane: the custom game BUILD an
+        // `AWS::GameLift::Build` declares and the Realtime SCRIPT an `AWS::GameLift::Script`
+        // declares. "Ref returns the build ID" / "the script ID" (each type's primary
+        // identifier); Fn::GetAtt reads that id and the `Arn` built around it
+        // ([`GAMELIFT_BUILD_ATTRIBUTES`], [`GAMELIFT_SCRIPT_ATTRIBUTES`]). That service MINTS
+        // the identity — neither `CreateBuild` nor `CreateScript` takes an identifier for the
+        // resource, and each answers the `build-…`/`script-…` id it drew — so the id here is a
+        // STAND-IN of that form with the ARN built around it, and `super::provisioning`
+        // re-points both at what the create really answered
+        // ([`super::provisioner::Provisioner::GameLiftBuild`],
+        // [`super::provisioner::Provisioner::GameLiftScript`]).
+        GAMELIFT_BUILD | GAMELIFT_SCRIPT => {
+            let (prefix, path, id_attribute) = match resource_type {
+                GAMELIFT_BUILD => (
+                    GAMELIFT_BUILD_ID_PREFIX,
+                    GAMELIFT_BUILD_PATH,
+                    GAMELIFT_BUILD_ID_ATTRIBUTE,
+                ),
+                _ => (
+                    GAMELIFT_SCRIPT_ID_PREFIX,
+                    GAMELIFT_SCRIPT_PATH,
+                    GAMELIFT_ID_ATTRIBUTE,
+                ),
+            };
+            let id = format!("{prefix}{}", generated_uuid(resource_type, name));
+            attributes.insert(
+                GAMELIFT_ARN_ATTRIBUTE.to_string(),
+                ::emulator_server::emulator_arn(
+                    GAMELIFT_ARN_NAMESPACE,
+                    region,
+                    &format!("{path}/{id}"),
+                ),
+            );
+            attributes.insert(id_attribute.to_string(), id.clone());
+            (id, attributes)
+        }
         // AWS IoT Core Device Advisor's own control plane: the test suite an
         // `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` declares. "Ref returns the suite
         // definition id" (the type's primary identifier); Fn::GetAtt reads

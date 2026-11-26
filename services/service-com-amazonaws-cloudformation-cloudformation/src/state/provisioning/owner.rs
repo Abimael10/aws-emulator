@@ -54,8 +54,10 @@ impl Owner {
                 dynamodb_table::global_table::create(ctx, region, resource, propagated).await
             }
             // An inline policy carries no tags of its own: it is not a resource, so
-            // CloudFormation propagates none to it.
-            Self::IamPolicy(kind) => iam_policy::create(ctx, region, kind, resource)
+            // CloudFormation propagates none to it. Boxed for the reason the catalogue's own
+            // arm above is: the call reaches IAM through that service's SDK client, and this
+            // match's size is what every deployment carries.
+            Self::IamPolicy(kind) => Box::pin(iam_policy::create(ctx, region, kind, resource))
                 .await
                 .map(|()| Created::default()),
             // Neither an alias nor a published version takes tags: Lambda's tagging calls
@@ -71,8 +73,11 @@ impl Owner {
             Self::LambdaEventInvokeConfig => {
                 lambda_event_invoke_config::create(ctx, region, resource).await
             }
+            // Boxed for the same reason: a function's create reaches Lambda, reads its code
+            // from Amazon S3 where the declaration names an object there, and is one of the
+            // largest futures this match holds.
             Self::LambdaFunction => {
-                lambda_function::create(ctx, region, resource, propagated).await
+                Box::pin(lambda_function::create(ctx, region, resource, propagated)).await
             }
             // A layer version takes no tags: Lambda's tagging calls address FUNCTIONS, so
             // there is no call that could carry a tag to one.

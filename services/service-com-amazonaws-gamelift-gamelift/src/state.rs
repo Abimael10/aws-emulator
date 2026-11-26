@@ -1757,9 +1757,20 @@ impl ScriptRecord {
 /// request is served.
 pub const NODE_JS_VERSIONS: [&str; 2] = ["10.x", "24.x"];
 
-/// The `NodeJsVersion` a script created without one carries: same doc — "By default,
-/// `NodeJsVersion` is `10.x`."
-pub const DEFAULT_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[0];
+/// What the service answers a `CreateScript` that names NO runtime version: the member is
+/// REQUIRED, so there is no script to record without it.
+///
+/// The member's own doc still states a default ("By default, `NodeJsVersion` is `10.x`")
+/// beside the note that "Node.js 10 will reach end of support on September 30, 2026", and
+/// the service applies none: a create that omits the member is refused with this sentence.
+/// Recorded behaviour, read from the reason of the failed resource of a CloudFormation
+/// stack whose `AWS::GameLift::Script` declares no runtime version (in the behavioral
+/// corpus `simparity-behavioral-aws-v1`, check `cloudformation__gamelift__iam__\
+/// s3.deploy-gamelift-script-missing-nodejs-version-rejected-and-rolled-back`, whose reason
+/// quotes this sentence verbatim before its SDK's own diagnostic).
+pub const NODE_JS_VERSION_REQUIRED_MESSAGE: &str =
+    "The NodeJsVersion parameter is required. See the GameLift API Reference for \
+     CreateScript() for a list of supported runtime versions.";
 
 /// The Amazon GameLift Servers-owned S3 location a script uploaded as a local zip file is
 /// held at.

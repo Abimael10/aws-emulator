@@ -184,6 +184,7 @@ async fn create_script(gamelift: &GameLift, name: &str) -> String {
             json!({
                 "Name": name,
                 "Version": "1.0.0",
+                "NodeJsVersion": "24.x",
                 "ZipFile": zip_file_member(&zip_bytes(256)),
             }),
         )

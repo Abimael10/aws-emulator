@@ -113,6 +113,7 @@ use super::template::{
     CUSTOMER_PROFILES_DOMAIN, DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
     DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
     DLM_LIFECYCLE_POLICY, ECR_PULL_TIME_UPDATE_EXCLUSION, ECR_SIGNING_CONFIGURATION,
+    GAMELIFT_BUILD, GAMELIFT_SCRIPT,
     GLUE_TABLE_OPTIMIZER,
     HEALTHLAKE_DATA_TRANSFORMATION_PROFILE, HEALTHLAKE_FHIR_DATASTORE,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
@@ -681,6 +682,11 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::FIS::ExperimentTemplate",
     // Amazon FSx
     "AWS::FSx::FileSystem",
+    // Amazon GameLift Servers. The custom game server BUILD and the Realtime SCRIPT a
+    // template ships game code as are both created in the owning service
+    // (`super::provisioner`), from the Amazon S3 storage location the declaration names.
+    GAMELIFT_BUILD,
+    GAMELIFT_SCRIPT,
     // AWS Global Accelerator
     "AWS::GlobalAccelerator::Accelerator",
     "AWS::GlobalAccelerator::EndpointGroup",

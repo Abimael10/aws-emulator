@@ -171,6 +171,19 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // A custom game build keeps what its create made it with: the operating system its
+        // binaries run on, the server SDK version they were integrated with and the Amazon S3
+        // location the files were read from are members of `CreateBuild` and of no member of
+        // `UpdateBuild` — which takes a build's id with a new name and version and nothing
+        // else — so a declaration restating one of them asks for a DIFFERENT build, which
+        // CloudFormation replaces.
+        GAMELIFT_BUILD => &["OperatingSystem", "ServerSdkVersion", "StorageLocation"],
+        // A Realtime script keeps the runtime it was created on: `NodeJsVersion`'s own doc is
+        // "This value cannot be updated later", and `UpdateScript` takes a script's id with a
+        // new name, version and content source — so a declaration restating the runtime asks
+        // for a different script. (Its `Name` is renamable in place through
+        // [`name_is_create_only`], as a build's is.)
+        GAMELIFT_SCRIPT => &["NodeJsVersion"],
         // Amazon VPC Lattice publishes an update for a resource gateway's SECURITY GROUPS
         // (`UpdateResourceGateway` takes `securityGroupIds` and nothing else) and for a
         // configuration's port ranges and allowed sharing (`UpdateResourceConfiguration`), so

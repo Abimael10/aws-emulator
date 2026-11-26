@@ -85,7 +85,7 @@ async fn describe_script(gamelift: &GameLift, selector: &str) -> Value {
 /// Create one script from `source` carrying the metadata the revisions below change, and
 /// report its id.
 async fn create_script(gamelift: &GameLift, name: &str, source: Source) -> String {
-    let mut request = json!({"Name": name, "Version": "1.0.0"});
+    let mut request = json!({"Name": name, "Version": "1.0.0", "NodeJsVersion": "24.x"});
     for (member, value) in source.members().as_object().expect("source members") {
         request[member] = value.clone();
     }

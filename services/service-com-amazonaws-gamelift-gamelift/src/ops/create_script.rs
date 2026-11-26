@@ -198,7 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{DEFAULT_NODE_JS_VERSION, MAX_SCRIPTS_PER_ACCOUNT, NODE_JS_VERSIONS};
+        use crate::state::{
+            MAX_SCRIPTS_PER_ACCOUNT, NODE_JS_VERSIONS, NODE_JS_VERSION_REQUIRED_MESSAGE,
+        };
 
         let invalid = |message: String| -> Self::Error {
             CreateScriptErrorModeled::InvalidRequestException(InvalidRequestException {
@@ -255,15 +257,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `NodeJsVersion`: "The valid values are 10.x | 24.x. By default, NodeJsVersion is
-        // 10.x." The modelled pattern (`^[0-9]+\.(?:x|[0-9]+)$`) accepts any version
-        // string, so the documented catalog is what decides here — and a script created
-        // without the member carries the documented default, a decision the SERVICE made,
-        // which is why the stored record reports it.
-        let node_js_version = input
-            .node_js_version
-            .clone()
-            .unwrap_or_else(|| DEFAULT_NODE_JS_VERSION.to_string());
+        // `NodeJsVersion` is REQUIRED: the member's doc still states a default ("By default,
+        // `NodeJsVersion` is `10.x`") beside the note that Node.js 10 reaches end of support
+        // on September 30, 2026, and the service applies none — a create that names no
+        // runtime version is refused ([`crate::state::NODE_JS_VERSION_REQUIRED_MESSAGE`]
+        // records where that is read from). Refused before any state is locked, so a request
+        // without it stores nothing.
+        let Some(node_js_version) = input.node_js_version.clone() else {
+            return Err(invalid(NODE_JS_VERSION_REQUIRED_MESSAGE.to_string()));
+        };
+        // "The valid values are 10.x | 24.x." The modelled pattern
+        // (`^[0-9]+\.(?:x|[0-9]+)$`) accepts any version string, so the documented catalog is
+        // what decides which of them a script runs on.
         if !NODE_JS_VERSIONS.contains(&node_js_version.as_str()) {
             return Err(invalid(format!(
                 "NodeJsVersion {node_js_version} is not a Node.js version a Realtime script runs \

@@ -17,9 +17,10 @@ use super::hosting_loop::{gamelift_arn, GameLift};
 /// which is also what the handler enforces (`state::NODE_JS_VERSIONS`).
 const NODE_JS_VERSIONS: [&str; 2] = ["10.x", "24.x"];
 
-/// The `NodeJsVersion` a script created without one carries: same doc — "By default,
-/// `NodeJsVersion` is `10.x`."
-const DEFAULT_NODE_JS_VERSION: &str = "10.x";
+/// The `NodeJsVersion` the rows below that are not ABOUT the runtime version declare: the
+/// member is required (`state::NODE_JS_VERSION_REQUIRED_MESSAGE`), so every accepted create
+/// names one.
+const SOME_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[1];
 
 /// The modelled bounds of `CreateScriptInput$Name` and `$Version`
 /// (`smithy_query operation=CreateScript`: `NonZeroAndMaxString`, len 1..1024).
@@ -92,8 +93,8 @@ pub(crate) fn script_arn(script_id: &str) -> String {
 ///
 /// The rows differ along what the rule generalises over: which of the two documented
 /// sources provides the zip file, the size of that zip file (including each modelled
-/// bound), which optional members the request sets, each documented `NodeJsVersion` and
-/// the default, and how many tags the request assigns.
+/// bound), which optional members the request sets, each documented `NodeJsVersion`, and
+/// how many tags the request assigns.
 #[tokio::test]
 async fn a_created_script_is_reported_as_stored_by_create_and_by_describe() {
     struct Case {
@@ -109,43 +110,51 @@ async fn a_created_script_is_reported_as_stored_by_create_and_by_describe() {
     let cases = [
         Case {
             label: "a local zip upload with a name and a version",
-            request: json!({"Name": "realtime-core", "Version": "1.0.0"}),
+            request: json!({
+                "Name": "realtime-core",
+                "Version": "1.0.0",
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
+            }),
             source: Source::LocalZip(512),
             expected: json!({
                 "Name": "realtime-core",
                 "Version": "1.0.0",
                 "SizeOnDisk": 512,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
             label: "a one-byte local zip upload with only a name",
-            request: json!({"Name": "tiny"}),
+            request: json!({"Name": "tiny", "NodeJsVersion": SOME_NODE_JS_VERSION}),
             source: Source::LocalZip(1),
             expected: json!({
                 "Name": "tiny",
                 "SizeOnDisk": 1,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
             label: "a zip upload at the modelled minimum size, carrying no name at all",
-            request: json!({}),
+            request: json!({"NodeJsVersion": SOME_NODE_JS_VERSION}),
             source: Source::LocalZip(0),
             expected: json!({
                 "SizeOnDisk": 0,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
             label: "a zip upload at the modelled maximum size",
-            request: json!({"Name": "five-megabytes", "Version": "max"}),
+            request: json!({
+                "Name": "five-megabytes",
+                "Version": "max",
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
+            }),
             source: Source::LocalZip(MAX_ZIP_BYTES),
             expected: json!({
                 "Name": "five-megabytes",
                 "Version": "max",
                 "SizeOnDisk": MAX_ZIP_BYTES,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
@@ -173,31 +182,37 @@ async fn a_created_script_is_reported_as_stored_by_create_and_by_describe() {
             request: json!({
                 "Name": "n".repeat(MAX_NAME_LENGTH),
                 "Version": "v".repeat(MAX_NAME_LENGTH),
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
             source: Source::LocalZip(64),
             expected: json!({
                 "Name": "n".repeat(MAX_NAME_LENGTH),
                 "Version": "v".repeat(MAX_NAME_LENGTH),
                 "SizeOnDisk": 64,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
             label: "a zip upload with one tag",
-            request: json!({"Name": "tagged-once", "Tags": [{"Key": "owner", "Value": "liveops"}]}),
+            request: json!({
+                "Name": "tagged-once",
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
+                "Tags": [{"Key": "owner", "Value": "liveops"}],
+            }),
             source: Source::LocalZip(128),
             // `Script` carries no `Tags` member — tags are read back through
             // `ListTagsForResource` — so a tagged script reports what an untagged one does.
             expected: json!({
                 "Name": "tagged-once",
                 "SizeOnDisk": 128,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
             label: "a zip upload with three tags",
             request: json!({
                 "Name": "tagged-thrice",
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
                 "Tags": [
                     {"Key": "owner", "Value": "liveops"},
                     {"Key": "env", "Value": "prod"},
@@ -208,19 +223,23 @@ async fn a_created_script_is_reported_as_stored_by_create_and_by_describe() {
             expected: json!({
                 "Name": "tagged-thrice",
                 "SizeOnDisk": 256,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
             label: "a script pulled from the caller's own S3 bucket",
-            request: json!({"Name": "from-s3", "Version": "2.1"}),
+            request: json!({
+                "Name": "from-s3",
+                "Version": "2.1",
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
+            }),
             source: Source::CallerBucket(caller_location("scripts/realtime.zip")),
             expected: json!({
                 "Name": "from-s3",
                 "Version": "2.1",
                 // "When files are uploaded from an S3 location, this value remains at 0."
                 "SizeOnDisk": 0,
-                "NodeJsVersion": DEFAULT_NODE_JS_VERSION,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         },
         Case {
@@ -344,7 +363,11 @@ async fn script_names_need_not_be_unique() {
         let script = gamelift
             .ok(
                 "CreateScript",
-                json!({"Name": "shared", "ZipFile": zip_file_member(&zip_bytes(len))}),
+                json!({
+                    "Name": "shared",
+                    "ZipFile": zip_file_member(&zip_bytes(len)),
+                    "NodeJsVersion": SOME_NODE_JS_VERSION,
+                }),
             )
             .await;
         created.push(script["Script"].clone());
@@ -375,8 +398,8 @@ async fn script_names_need_not_be_unique() {
 }
 
 /// A create that does not name exactly one documented source for the zip file, names an
-/// incomplete storage location, or asks for a Node.js version the service does not run, is
-/// refused with the modelled client error — and stores nothing.
+/// incomplete storage location, names NO Node.js version, or asks for a Node.js version the
+/// service does not run, is refused with the modelled client error — and stores nothing.
 #[tokio::test]
 async fn a_create_outside_the_documented_contract_is_refused() {
     struct Case {
@@ -432,6 +455,11 @@ async fn a_create_outside_the_documented_contract_is_refused() {
             code: "InvalidRequestException",
         },
         Case {
+            label: "no Node.js version at all, the member being required",
+            request: json!({"Name": "no-runtime", "ZipFile": zip.clone()}),
+            code: "InvalidRequestException",
+        },
+        Case {
             label: "a Node.js version the service does not run, in the modelled form",
             request: json!({"Name": "node-twelve", "ZipFile": zip.clone(), "NodeJsVersion": "12.x"}),
             code: "InvalidRequestException",
@@ -464,6 +492,7 @@ async fn a_create_outside_the_documented_contract_is_refused() {
             request: json!({
                 "Name": "repeated-tag-key",
                 "ZipFile": zip.clone(),
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
                 "Tags": [
                     {"Key": "owner", "Value": "liveops"},
                     {"Key": "owner", "Value": "platform"},
@@ -485,12 +514,45 @@ async fn a_create_outside_the_documented_contract_is_refused() {
         );
     }
 
+    // The refusal of the one REQUIRED member carries the service's own SENTENCE, not just its
+    // code: the message is part of what a client is answered. Its fixed text, as Amazon
+    // GameLift Servers words that class.
+    let (status, refused) = gamelift
+        .call(
+            "CreateScript",
+            &json!({
+                "Name": "no-runtime-message",
+                "ZipFile": zip_file_member(&zip_bytes(64)),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a create that names no NodeJsVersion must be refused, got {status} with {refused}"
+    );
+    assert_eq!(
+        refused
+            .get("Message")
+            .or_else(|| refused.get("message"))
+            .and_then(Value::as_str),
+        Some(
+            "The NodeJsVersion parameter is required. See the GameLift API Reference for \
+             CreateScript() for a list of supported runtime versions."
+        ),
+        "the refusal must carry the service's sentence for a missing runtime version, got \
+         {refused}"
+    );
+
     // Every refused create stored nothing: the next accepted create mints the FIRST script
     // of the store, and it is the only one a describe can find.
     let created = gamelift
         .ok(
             "CreateScript",
-            json!({"Name": "the-first-stored-script", "ZipFile": zip}),
+            json!({
+                "Name": "the-first-stored-script",
+                "ZipFile": zip,
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
+            }),
         )
         .await;
     let described = gamelift
@@ -521,6 +583,7 @@ async fn the_script_quota_is_the_bound_on_the_stored_collection() {
                 json!({
                     "Name": format!("quota-{index}"),
                     "ZipFile": zip_file_member(&zip_bytes(8)),
+                    "NodeJsVersion": SOME_NODE_JS_VERSION,
                 }),
             )
             .await;
@@ -533,6 +596,7 @@ async fn the_script_quota_is_the_bound_on_the_stored_collection() {
             json!({
                 "Name": "one-script-too-many",
                 "ZipFile": zip_file_member(&zip_bytes(8)),
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         )
         .await;
@@ -565,6 +629,7 @@ async fn describing_a_script_that_is_not_stored_is_refused() {
             json!({
                 "Name": "the-only-script",
                 "ZipFile": zip_file_member(&zip_bytes(96)),
+                "NodeJsVersion": SOME_NODE_JS_VERSION,
             }),
         )
         .await;

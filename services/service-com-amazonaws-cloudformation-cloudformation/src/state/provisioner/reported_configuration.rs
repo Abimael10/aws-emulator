@@ -805,6 +805,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Amazon GameLift Servers' own reads of the build and of the script, each by the
+            // id it minted for the resource.
+            Self::GameLiftBuild => {
+                Box::pin(describe_gamelift_build(ctx, region, physical_resource_id)).await
+            }
+            Self::GameLiftScript => {
+                Box::pin(describe_gamelift_script(ctx, region, physical_resource_id)).await
+            }
             // AWS HealthLake's own reads: the data store by the `DatastoreId` it minted for
             // it, and the profile by the `ProfileId` inside the ARN the stack published.
             Self::HealthLakeFhirDatastore => {
