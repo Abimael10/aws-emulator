@@ -42,14 +42,20 @@ pub const AUTO_ML_JOB_QUOTA: usize = 1_000;
 /// the work in turn before the terminal status. Nothing sleeps: the due instant is stored and
 /// materialised by the next call that reads the record.
 ///
-/// What it has to be long enough for is OBSERVATION by a client in ANOTHER PROCESS, which
-/// learns how far the work has got only by POLLING `DescribeAutoMLJobV2` — seconds apart,
-/// commonly ten of them. So each stage gets a whole span of its own rather than a share of one,
-/// and the span is sized so the stages of the WORK (`AnalyzingData` through
-/// `CandidateDefinitionsGenerated`, four of them for a run that gets through its candidates)
-/// are together in effect for longer than such an interval; a walk narrower than that is a
-/// sequence the API reports and no client ever observes.
-pub const AUTO_ML_JOB_PHASE_SPAN: Duration = Duration::from_secs(3);
+/// It is a SHARE of the span the whole walk is owed in rather than a span of its own
+/// ([`super::stage_span`], [`super::LIFECYCLE_WALK_SETTLES_AFTER`]): such a job is one leg of
+/// what a client does with it — a flow that fits candidates, registers the best one and hosts
+/// it on an endpoint waits out one clock-owed lifecycle after another inside a single budget of
+/// its own — so what the schedule is sized against is the WALK, and the stages of the work
+/// divide it.
+pub const AUTO_ML_JOB_PHASE_SPAN: Duration =
+    super::stage_span(AUTO_ML_JOB_TERMINAL_AFTER, AUTO_ML_JOB_WALK_STAGES);
+
+/// The stages of the LONGEST walk an AutoML job here takes, which
+/// [`AUTO_ML_JOB_TERMINAL_AFTER`] is shared out between: the four stages of a run that gets
+/// through its candidates (`AnalyzingData` through `CandidateDefinitionsGenerated`,
+/// [`AutoMLRunOutcome::phases`]) and the terminal status that follows them.
+const AUTO_ML_JOB_WALK_STAGES: u32 = 5;
 
 /// How long after `CreateAutoMLJobV2` the clock owes the job's terminal transition.
 ///
@@ -58,7 +64,11 @@ pub const AUTO_ML_JOB_PHASE_SPAN: Duration = Duration::from_secs(3);
 /// before it. This is the span of a run that reads its data, fits and measures its candidates
 /// and writes their artifacts — the longest a job here takes — so a caller that waits this
 /// long observes a terminal status and a waiter terminates.
-pub const AUTO_ML_JOB_TERMINAL_AFTER: Duration = AUTO_ML_JOB_PHASE_SPAN.saturating_mul(5);
+///
+/// It is the span this crate gives any such walk ([`super::LIFECYCLE_WALK_SETTLES_AFTER`]), so
+/// a client that chains this lifecycle with the ones it feeds reaches the end of the chain
+/// inside one budget of its own.
+pub const AUTO_ML_JOB_TERMINAL_AFTER: Duration = super::LIFECYCLE_WALK_SETTLES_AFTER;
 
 /// `AutoMLJobStatus`'s members an AutoML job V2 created here passes through
 /// (`smithy_query` shape=AutoMLJobStatus: Completed | InProgress | Failed | Stopped |

@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHAT A CLIENT IN ANOTHER PROCESS SEES of an AutoML job V2's work: whether the
-//! `AutoMLJobSecondaryStatus` stages the job walks while it is `InProgress` are in effect long
-//! enough for a poll loop of its own to land inside one of them.
+//! WHAT A CLIENT SEES of an AutoML job V2's work: whether the `AutoMLJobSecondaryStatus` stages
+//! the job walks while it is `InProgress` are each in effect for a window of their own for a poll
+//! loop to land inside.
 //!
 //! RULE — the same one [`crate::training_job_phase_window`] holds for a training job, applied to
 //! the other lifecycle of this service whose model documents a non-terminal status as an ORDERED
-//! SEQUENCE of sub-stages: each stage is revealed for a whole span of its own, and the stages of
-//! the WORK are together in effect for longer than the interval a polling client sleeps between
-//! two reads. `DescribeAutoMLJobV2` reports `AutoMLJobSecondaryStatus` so that a client can tell
+//! SEQUENCE of sub-stages: each stage is revealed for a whole span of its own, and those spans
+//! are SHARES of the one compressed span the clock owes the whole walk rather than spans sized on
+//! their own. `DescribeAutoMLJobV2` reports `AutoMLJobSecondaryStatus` so that a client can tell
 //! how far an Autopilot job has got — the data analysed, the features engineered, the model
 //! tuned, the candidate definitions written — and the only way it finds that out is by POLLING,
-//! seconds apart. A walk narrower than that interval is a sequence the API reports and no client
-//! ever observes.
+//! so no stage may be in effect for no time at all; and a client chains this lifecycle with the
+//! ones it feeds inside one budget of its own, so the walk of those stages is over inside a small
+//! part of such a budget ([`crate::deploy_chain_settles_for_a_client`] holds that ceiling).
 //!
 //! The table's rows differ along what the rule generalises over: how the channel's location is
 //! addressed and whether the request names its problem type and objective or leaves the run to
@@ -32,13 +33,21 @@ use serde_json::{json, Value};
 
 use crate::training_job_execution::{csv_records, read_and_write, str_field, Emulator, BUCKET};
 
-/// The cadence a client in ANOTHER PROCESS polls `DescribeAutoMLJobV2` on.
+/// The cadence the poller below reads `DescribeAutoMLJobV2` on.
 ///
-/// Ten seconds is what a progress view, a waiter or a test harness sleeps between two reads of
-/// an Autopilot job, so it is the interval the stages of the work have to outlast. It is a
-/// CADENCE, not a timeout: nothing below fails because a span elapsed, only because the service
-/// answered the wrong thing.
-const POLL_CADENCE: Duration = Duration::from_secs(10);
+/// A fraction of the span the state gives ONE stage of an AutoML job's work, read from that span
+/// rather than restated here, so a poller looks several times inside every stage the clock lays
+/// out. It is a CADENCE, not a timeout: nothing below fails because a span elapsed, only because
+/// the service answered the wrong thing.
+const POLL_CADENCE: Duration = match STAGE_SPAN.checked_div(4) {
+    Some(cadence) => cadence,
+    None => STAGE_SPAN,
+};
+
+/// How long the clock keeps an AutoML job in each stage of its work, out of the crate's own state
+/// rather than restated here.
+const STAGE_SPAN: Duration =
+    service_com_amazonaws_sagemaker_sagemaker::state::AUTO_ML_JOB_PHASE_SPAN;
 
 /// How long the poll loop keeps looking before the suite calls the emulator broken. Far longer
 /// than the whole walk of a job's work (`state::AUTO_ML_JOB_TERMINAL_AFTER`), so it bounds a
@@ -73,8 +82,8 @@ struct Row {
     named: bool,
 }
 
-/// The table of the RULE: the walk has to outlast a client's cadence whatever the run's own work
-/// before each stage is.
+/// The table of the RULE: every stage of the walk has a window of its own whatever the run's own
+/// work before it is.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -128,8 +137,8 @@ fn create_body(row: &Row, role_arn: &str) -> Value {
     body
 }
 
-/// RULE: a client polling at its own cadence observes one of the stages of the job's work while
-/// the job is still `InProgress`.
+/// RULE: a client polling inside a stage's span observes one of the stages of the job's work
+/// while the job is still `InProgress`.
 #[tokio::test]
 async fn a_poller_on_a_client_cadence_observes_a_stage_of_the_work() {
     let emulator = Emulator::new();

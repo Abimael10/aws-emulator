@@ -254,6 +254,41 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// the span is compressed, never zero.
 pub const ENDPOINT_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
 
+/// How long after the call that starts it the clock owes a resource whose non-terminal status
+/// is a WALK of several reported stages — a training job's `SecondaryStatus` phases, an AutoML
+/// job's — its terminal status: the WHOLE walk, stages and all.
+///
+/// AWS documents no duration for any of those walks (they take minutes to hours there), so the
+/// span is this emulator's own, compressed and never zero, like every other clock-owed span in
+/// this crate: a caller that reads the record straight after the call that started it still
+/// observes the non-terminal status, and one that keeps reading observes each stage in turn
+/// before the terminal one. Nothing sleeps for it — the due instant is stored and materialised
+/// by the next call that reads the record.
+///
+/// What bounds it is the WALK rather than one stage of it, because a resource with such a walk
+/// is one LEG of what a client does: the documented way to deploy a model trains it, registers
+/// the model, configures an endpoint, hosts it and then updates that endpoint, waiting out one
+/// clock-owed lifecycle after another inside a single budget of its own. A per-stage span sized
+/// against a polling client's own sleep interval would put a single walk past that budget and
+/// leave every behaviour that follows a settled resource unreachable, however right each
+/// individual answer is. The stages of a walk therefore SHARE this span
+/// ([`stage_span`]).
+pub const LIFECYCLE_WALK_SETTLES_AFTER: Duration = Duration::from_secs(3);
+
+/// One stage's share of a walk of `stages` stages that settles in `walk`
+/// ([`LIFECYCLE_WALK_SETTLES_AFTER`]): the span each stage of that walk is in effect for.
+///
+/// Never zero, whatever is asked for, so every stage of a walk has a window of its own and a
+/// caller reading as the stages fall due observes them in order rather than finding the whole
+/// walk already over.
+#[must_use]
+pub const fn stage_span(walk: Duration, stages: u32) -> Duration {
+    match walk.checked_div(stages) {
+        Some(span) if !span.is_zero() => span,
+        _ => Duration::from_nanos(1),
+    }
+}
+
 /// How long after `CreateMlflowApp` the clock owes the `Creating` -> `Created`
 /// transition of `MlflowAppStatus`.
 ///

@@ -18,43 +18,46 @@ use super::*;
 /// secondary status of a job whose work has not started, and one that keeps polling observes
 /// each stage of the work in turn before the terminal status.
 ///
-/// What the span has to be long enough for is OBSERVATION, and the observer is a client in
-/// ANOTHER PROCESS: `DescribeTrainingJob` reports `SecondaryStatus` so that such a client can
-/// tell when the container is really running and when the artifact has been uploaded, and the
-/// only way it finds that out is by POLLING — a progress UI, a waiter or a test harness sleeps
-/// SECONDS, commonly ten of them, between two reads of a job (the SDK waiter for this very
-/// operation sleeps far longer still). A stage narrower than that interval is reported by the
-/// API and observed by nobody, and a whole walk narrower than it is a job that teleports from
-/// `InProgress` to its terminal status for every client there is. So each stage is in effect for
-/// a whole span of its own, and the span is sized so that the stages which run the CONTAINER —
-/// at the fewest the `Training` and `Uploading` of a job with no data to bring down — are
-/// together in effect for LONGER than one such interval, which is what makes a poll loop land
-/// inside one of them while the job is still `InProgress`.
+/// It is a SHARE of the span the whole walk is owed in rather than a span of its own
+/// ([`crate::state::stage_span`], [`crate::state::LIFECYCLE_WALK_SETTLES_AFTER`]): a training
+/// job is one leg of what a client does with it — a flow that trains a model, registers it,
+/// hosts it on an endpoint and then updates that endpoint waits out one clock-owed lifecycle
+/// after another inside a single budget of its own — so what the schedule is sized against is
+/// the WALK, and the stages of the work divide it. A per-stage span sized against a polling
+/// client's own sleep interval instead would put this one lifecycle past such a budget, and
+/// every behaviour that follows a settled job (the model it feeds, the endpoint that hosts it,
+/// the inference that endpoint serves) would be unreachable however right each answer is.
 ///
-/// It stays as small as that rule allows, because a training job is one leg of what a client
-/// does with it: a flow that trains a model, registers it and then transforms data with it waits
-/// out one such lifecycle after another inside a single budget of its own, so a per-stage span
-/// on the scale AWS takes (minutes) leaves that flow with no terminal status to observe at all.
-/// The stage that runs the CONTAINER is in effect for as long as that container's own work took
-/// besides ([`MAX_REVEALED_CONTAINER_WORK`]).
-pub const TRAINING_JOB_PHASE_SPAN: Duration = Duration::from_secs(6);
+/// Nothing sleeps for it: each stage's due instant is stored and materialised by the next call
+/// that reads the job ([`TrainingJob::settle_status`]), so a client reading as the stages fall
+/// due observes them in order, and one reading coarsely observes the terminal status. The stage
+/// that runs the CONTAINER is in effect for as long as that container's own work took besides
+/// ([`MAX_REVEALED_CONTAINER_WORK`]).
+pub const TRAINING_JOB_PHASE_SPAN: Duration =
+    crate::state::stage_span(TRAINING_JOB_ENDS_AFTER, TRAINING_JOB_WALK_STAGES);
+
+/// The stages of the LONGEST walk a training job here takes, which
+/// [`TRAINING_JOB_ENDS_AFTER`] is shared out between: the three stages of a run that downloads
+/// its data, fits a model and uploads the artifact
+/// ([`crate::state::TrainingRunOutcome::phases`]), and the terminal status that follows them.
+const TRAINING_JOB_WALK_STAGES: u32 = 4;
 
 /// How long after `CreateTrainingJob` the clock owes the job's move out of `InProgress`
 /// into its terminal status.
 ///
-/// The whole of the work: the `Starting` the job is accepted in, then the stages a run gets
-/// through ([`crate::state::TrainingRunOutcome::phases`]), each owed
+/// THE transition the clock owes a training job, and the whole of its work: the `Starting` the
+/// job is accepted in, then the stages a run gets through
+/// ([`crate::state::TrainingRunOutcome::phases`]), each owed one
 /// [`TRAINING_JOB_PHASE_SPAN`] after the one before it. This is the span of a run that
 /// downloads its data, fits a model and uploads the artifact — the longest a job here takes —
 /// so a caller that waits this long (as `aws sagemaker wait training-job-completed-or-stopped`
 /// does) observes a terminal status and a waiter terminates.
 ///
-/// This is THE transition the clock owes a training job, `InProgress` to its terminal status.
-/// It is one [`TRAINING_JOB_PHASE_SPAN`] per stage of that walk rather than one span shared out
-/// between them, because every stage is a status the API reports and so has to outlast a
-/// polling client's own interval on its own; a walk measured in tens of seconds is still
-/// compressed by orders of magnitude against the real service's.
-pub const TRAINING_JOB_ENDS_AFTER: Duration = TRAINING_JOB_PHASE_SPAN.saturating_mul(4);
+/// It is the span this crate gives any such walk ([`crate::state::LIFECYCLE_WALK_SETTLES_AFTER`]),
+/// so a client that chains this lifecycle with the ones it feeds reaches the end of the chain
+/// inside one budget of its own, and still compressed by orders of magnitude against the real
+/// service's.
+pub const TRAINING_JOB_ENDS_AFTER: Duration = crate::state::LIFECYCLE_WALK_SETTLES_AFTER;
 
 /// The most of a container's own stated work the clock REVEALS a job over, on top of the span
 /// each stage of the work is given ([`TRAINING_JOB_PHASE_SPAN`]).

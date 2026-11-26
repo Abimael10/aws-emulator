@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHAT A CLIENT IN ANOTHER PROCESS SEES of a training job's work: whether the stages
-//! `DescribeTrainingJob` groups under `InProgress` are in effect long enough for a poll loop of
-//! its own to land inside one of them.
+//! WHAT A CLIENT SEES of a training job's work: whether the stages `DescribeTrainingJob` groups
+//! under `InProgress` are each in effect for a window of their own for a poll loop to land
+//! inside, and whether the WHOLE walk of them still settles inside one client budget.
 //!
 //! RULE — a non-terminal status whose model documents an ordered sequence of observable
-//! sub-stages is revealed one whole span per stage, and the stages that run the CONTAINER are
-//! together in effect for LONGER than the interval a polling client sleeps between two reads.
+//! sub-stages is revealed one whole span per stage, and those spans are SHARES of the one
+//! compressed span the clock owes the whole walk rather than spans sized on their own.
 //! `DescribeTrainingJob$SecondaryStatus` is exactly such a status: while `TrainingJobStatus` is
 //! `InProgress` the secondary status walks `Starting`, the optional `Downloading`, `Training`
 //! and `Uploading`, and a client learns that the container is running — and that the model
-//! artifact has been written — only by POLLING. A client polls a job on the scale of SECONDS,
-//! commonly ten of them, so a walk narrower than that interval is reported by the API and
-//! observed by nobody: every such client sees the job teleport from `InProgress` to its terminal
-//! status, and `SecondaryStatusTransitions` names stages it never had a chance to see.
+//! artifact has been written — only by POLLING, so no stage may be in effect for no time at all.
+//! A client also CHAINS this lifecycle with the ones it feeds — it trains a model, registers it
+//! and hosts it on an endpoint inside one budget of its own — so the walk of those stages must
+//! be over inside a small part of such a budget, which is what fixes the stages at a share of it
+//! ([`crate::deploy_chain_settles_for_a_client`] holds that ceiling).
 //!
-//! The suite below therefore polls at a CLIENT's cadence ([`POLL_CADENCE`]) rather than as fast
-//! as an in-process caller can, and asserts twice over:
+//! The suite below therefore polls at a cadence inside one stage's span ([`POLL_CADENCE`]) and
+//! asserts twice over:
 //!
 //! * end to end, that such a poller finds the job in one of the stages that run the container
 //!   while it is still `InProgress`;
-//! * against the job's OWN reported schedule, that the window those stages occupy is wider than
-//!   that cadence — which is the rule itself, and is decided by the instants the job reports
-//!   rather than by how fast this host ran the poller.
+//! * against the job's OWN reported schedule, that each of those stages was in effect over a
+//!   window of its own and that the whole walk of them is over inside the compressed band —
+//!   which is the rule itself, and is decided by the instants the job reports rather than by how
+//!   fast this host ran the poller.
 //!
 //! The table spans what the rule generalises over: how many channels the job declares and
 //! whether it declares any at all (a job with no data to bring down has the FEWEST such stages,
@@ -48,13 +50,29 @@ use crate::sagemaker_job_execution_over_s3::{
 /// The bucket every object of this suite lives in.
 const BUCKET: &str = "training-job-phase-window";
 
-/// The cadence a client in ANOTHER PROCESS polls `DescribeTrainingJob` on.
+/// The cadence the poller below reads `DescribeTrainingJob` on.
 ///
-/// Ten seconds is what a progress view, a waiter or a test harness sleeps between two reads of
-/// a training job — the SDK's own waiter for this operation sleeps far longer — so it is the
-/// interval the stages of the work have to outlast. It is a CADENCE, not a timeout: nothing
-/// below fails because a span elapsed, only because the service answered the wrong thing.
-const POLL_CADENCE: Duration = Duration::from_secs(10);
+/// A fraction of the span the state gives ONE stage of a job's work, read from that span rather
+/// than restated here, so a poller looks several times inside every stage the clock lays out. It
+/// is a CADENCE, not a timeout: nothing below fails because a span elapsed, only because the
+/// service answered the wrong thing.
+const POLL_CADENCE: Duration = match STAGE_SPAN.checked_div(4) {
+    Some(cadence) => cadence,
+    None => STAGE_SPAN,
+};
+
+/// How long the clock keeps a job in each stage of its work, out of the crate's own state rather
+/// than restated here.
+const STAGE_SPAN: Duration =
+    service_com_amazonaws_sagemaker_sagemaker::state::TRAINING_JOB_PHASE_SPAN;
+
+/// The longest the WHOLE walk of a job's work may be in flight for, as the job's own reported
+/// schedule puts it.
+///
+/// The band this project gives a transition the clock owes, stated as the ceiling the rule fixes
+/// rather than read from the constant under test: a client chains this lifecycle with the ones it
+/// feeds inside one budget of about a minute, so the walk is over inside a small part of one.
+const WALK_CEILING: Duration = Duration::from_secs(10);
 
 /// How long the poll loop keeps looking before the suite calls the emulator broken. Far longer
 /// than the whole walk of a job's work, so it bounds a lifecycle that never settles rather than
@@ -85,8 +103,8 @@ struct Row {
     works_for: Option<u64>,
 }
 
-/// The table of the RULE: the window has to outlast a client's cadence whatever the job's work
-/// is, and least of all for the job with the fewest stages.
+/// The table of the RULE: every stage has a window of its own and the whole walk is over inside
+/// the band, whatever the job's work is — least of all for the job with the fewest stages.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -185,9 +203,9 @@ fn history(read: &Value, case: &str) -> Vec<Stage> {
         .collect()
 }
 
-/// RULE: a client polling at its own cadence observes one of the stages that run the container
-/// while the job is still `InProgress`, and the job's own schedule says that window is wider
-/// than such a cadence.
+/// RULE: a client polling inside a stage's span observes one of the stages that run the container
+/// while the job is still `InProgress`, and the job's own schedule gives every stage a window of
+/// its own inside a walk that is over in the compressed band.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_poller_on_a_client_cadence_observes_an_active_container_phase() {
     let emulator = Emulator::new();
@@ -300,8 +318,8 @@ async fn a_poller_on_a_client_cadence_observes_an_active_container_phase() {
         }
 
         // And the RULE itself, weighed against the instants the JOB reports rather than against
-        // how fast this host polled: the stages that run the container are in effect, together,
-        // for longer than a client's cadence.
+        // how fast this host polled: the stages that run the container are each in effect over a
+        // window of their own, and the whole walk of them is over inside the band.
         let opened = walked
             .iter()
             .find(|(status, ..)| ACTIVE_CONTAINER.contains(&status.as_str()))
@@ -317,10 +335,23 @@ async fn a_poller_on_a_client_cadence_observes_an_active_container_phase() {
                 panic!("case {case:?}: expected the last container stage to have ended in {read}")
             });
         assert!(
-            closed - opened > POLL_CADENCE.as_secs_f64(),
-            "case {case:?}: the stages that run the container must be in effect for longer than \
-             a client's {POLL_CADENCE:?} cadence, got {} seconds of them in {read}",
+            closed - opened >= STAGE_SPAN.as_secs_f64(),
+            "case {case:?}: the stages that run the container must be in effect for a whole \
+             {STAGE_SPAN:?} each, got {} seconds of them together in {read}",
             closed - opened
+        );
+        let walk = walked
+            .last()
+            .map(|(_, start, _)| *start)
+            .unwrap_or_default()
+            - walked
+                .first()
+                .map(|(_, start, _)| *start)
+                .unwrap_or_default();
+        assert!(
+            walk > 0.0 && walk <= WALK_CEILING.as_secs_f64(),
+            "case {case:?}: the whole walk of the work must be over inside {WALK_CEILING:?} and \
+             not in no time at all, got {walk} seconds of it in {read}"
         );
         assert_eq!(
             (
