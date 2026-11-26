@@ -7,7 +7,7 @@
 //! them cannot answer differently:
 //!
 //! * a model carries the identifier the write that CREATED it minted
-//!   ([`minted_anomaly_detector_id`]) — an opaque value of this service's, not a function of
+//!   ([`minted_anomaly_detector_id`]) — ONE opaque token of this service's, not a function of
 //!   what the model watches, so a model deleted and created again is a DIFFERENT model with a
 //!   different identifier, which is what lets a client tell a re-created model from the one it
 //!   replaced. Which model a write updates is decided by what the model WATCHES
@@ -166,12 +166,19 @@ pub fn detector_account_id(named: Option<&str>) -> String {
 /// for identical definitions carry different identifiers, and a model deleted and created again
 /// never reproduces the identifier it had.
 ///
-/// Through [`super::alarm_reads::minted_identity`], the ONE minting of an identity of this
-/// service, so a model's identifier carries the same `<uuid>/<epoch-millis>` form as every other
-/// identity this service mints — the uuid of the write that minted it and the instant that write
-/// happened at, `now_secs`. That form is inside the modelled `AnomalyDetectorId` (length 1..128,
-/// pattern `^[A-Za-z0-9_./:%()+-]+$`), whose character set admits the separator and the digits.
+/// ONE TOKEN: the identifier is a single run of hexadecimal characters, two for each of the
+/// opaque bytes it is minted from, well inside the modelled `AnomalyDetectorId` (length
+/// 1..128, pattern `^[A-Za-z0-9_./:%()+-]+$`). An identifier a service hands a client is
+/// opaque, so its text carries NO separator a client could split it into segments on and NO
+/// clock a client could read the creation instant out of: a client that validates the
+/// identifier, places it in a path or interpolates it into an ARN or a URL reads one token, and
+/// nothing the identifier says changes with the instant the write happened at.
+///
+/// The bytes are the mixing every identity this service mints draws from
+/// ([`super::alarm_reads::minted_bytes`]), which is where one identifier's uniqueness comes
+/// from; the RENDERING is this identifier's own, since the creation identity an alarm read
+/// reports is a composite of a uuid and the instant of its write and this identifier is not.
 #[must_use]
-pub fn minted_anomaly_detector_id(now_secs: f64) -> String {
-    super::alarm_reads::minted_identity(now_secs)
+pub fn minted_anomaly_detector_id() -> String {
+    ::hex::encode(super::alarm_reads::minted_bytes())
 }

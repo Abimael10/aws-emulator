@@ -43,22 +43,25 @@ impl StoredAlarm {
 /// milliseconds. One minting for every resource whose reads carry a creation identity (a metric
 /// alarm, an alarm mute rule), so no two of them report the identity in different forms.
 ///
-/// Through [`minted_identity`], the ONE minting of an identity of this service, so the form a
-/// creation identity carries and the form the identifier of an anomaly detection model carries
-/// cannot drift apart.
+/// Through [`minted_identity`], the ONE minting of a CREATION IDENTITY of this service. The
+/// identifier of an anomaly detection model is a different value in a different form — one
+/// opaque token, naming neither a write nor an instant
+/// ([`super::anomaly_detector_reads::minted_anomaly_detector_id`]) — so only the opaque bytes
+/// ([`minted_bytes`]) are shared with it.
 pub fn alarm_creation_id(now_secs: f64) -> String {
     minted_identity(now_secs)
 }
 
-/// The ONE form every identity this service mints takes: `<uuid>/<epoch-millis>` — a uuid
+/// The ONE form a CREATION IDENTITY of this service takes: `<uuid>/<epoch-millis>` — a uuid
 /// identifying the write that minted it, and the instant that write happened at in
 /// milliseconds.
 ///
-/// Every value this service mints to name a resource or the write that created one goes through
-/// this minting — the creation identity a metric alarm and an alarm mute rule report
-/// ([`alarm_creation_id`]), and the identifier a write mints for an anomaly detection model
-/// ([`super::anomaly_detector_reads::minted_anomaly_detector_id`]) — so no two of them are
-/// shaped differently and nothing has to know which resource an identity came from to parse it.
+/// Every value this service mints to name the WRITE that created a resource goes through this
+/// minting — the creation identity a metric alarm and an alarm mute rule report
+/// ([`alarm_creation_id`]) — so no two of them are shaped differently and nothing has to know
+/// which resource an identity came from to parse it. The identifier a write mints for an anomaly
+/// detection model names no write and no instant, so it is minted in its own, single-token form
+/// ([`super::anomaly_detector_reads::minted_anomaly_detector_id`]) rather than through here.
 ///
 /// The uuid is minted from this process's own opaque bytes ([`minted_bytes`]) and rendered by
 /// the workspace's ONE rendering of 16 opaque bytes as a version-4 uuid, so neither the version
@@ -84,7 +87,7 @@ fn epoch_millis(secs: f64) -> i64 {
     super::to_timestamp(secs).to_millis().unwrap_or_default()
 }
 
-/// Unique, opaque bytes for one minted creation identity.
+/// Unique, opaque bytes for one minted identity.
 ///
 /// SHA-256 over three independent inputs: a process-wide monotonic counter (so two mints in the
 /// same instant differ), the wall clock in nanoseconds (so two processes differ), and the
