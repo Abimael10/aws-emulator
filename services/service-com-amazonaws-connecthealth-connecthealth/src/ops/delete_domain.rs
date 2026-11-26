@@ -4,9 +4,13 @@
 //! IMPLEMENTED: moves the PERSISTED domain into `DELETING` and records when the purge
 //! the clock then owes falls due; the stored record is what the response reports.
 //! Repeating the call is harmless (`@idempotent`). A `domainId` this Region holds no
-//! domain under — never created here, purged after an earlier delete, or held in another
+//! domain under is refused on the id's own ALLOCATION HISTORY, the ONE answer of this
+//! service that depends on it (`crate::state::ComAmazonawsConnecthealthConnecthealthState::has_allocated_domain`):
+//! an id this service DID allocate — purged after an earlier delete, or live in another
 //! Region — is the modelled 404 `ResourceNotFoundException`, the ONE error the operation
-//! declares, naming the id the request addressed.
+//! declares, naming the id the request addressed; an id with no allocation history
+//! anywhere resolves no ARN for the front door to authorize the call against and is
+//! refused there instead, with no detail member at all ([`AUTHORIZER_CONFIGURATION`]).
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +75,10 @@
 //!   below): this SERVICE models the shape, this operation's own `errors` list does not
 //!   name it, and it is the channel for the one server-side failure this handler can
 //!   meet — a store it cannot reach ([`crate::state::store_unreachable`]).
+//! * `AuthorizerConfigurationException` — declared on NO shape of this model, so it is
+//!   hand-built through [`crate::scaffolded::Scaffolded::unmodeled`]: the RECORDED answer
+//!   for a `domainId` with no allocation history anywhere. See
+//!   [`AUTHORIZER_CONFIGURATION`].
 //!
 //! ## Beside the model
 //!
@@ -103,6 +111,27 @@ const DELETED_AT_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Sche
 /// What `DeleteDomain` answers: the modelled `DeleteDomainOutput` plus the recorded
 /// top-level `deletedAt`.
 pub type DeleteDomainResponse = crate::state::RecordedMembers<DeleteDomainOutput>;
+
+/// The error code a `domainId` with NO allocation history anywhere is refused with.
+///
+/// RECORDED behaviour, and unmodelled: the code is declared on no shape of this model
+/// (`smithy_query(query="operation", operation="DeleteDomain")` lists
+/// `ResourceNotFoundException` alone), so it is hand-built. An id this service never
+/// allocated resolves no ARN, so the front door's own authorizer configuration fails
+/// before the resource is looked up at all — which is why the refusal carries NO detail
+/// member ([`AUTHORIZER_CONFIGURATION_DETAIL`]): there is no resource for a sentence to be
+/// about.
+const AUTHORIZER_CONFIGURATION: &str = "AuthorizerConfigurationException";
+
+/// The HTTP status [`AUTHORIZER_CONFIGURATION`] is answered on: a request the front door
+/// would not authorize is forbidden. Not a 5xx — the condition is permanent and lies in
+/// the request's own id, and an SDK retries a server fault.
+const AUTHORIZER_CONFIGURATION_STATUS: u16 = 403;
+
+/// The detail member [`AUTHORIZER_CONFIGURATION`] carries: NONE. Its absence is the
+/// requirement — the recorded body carries no detail member at all — so a client reading
+/// an error's text on this path is handed nothing rather than text AWS does not send.
+const AUTHORIZER_CONFIGURATION_DETAIL: Option<String> = None;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,19 +233,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialise_due(now);
 
         let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
-            // A `domainId` this Region resolves no domain for is a resource the request
-            // asked to delete and this endpoint does not have, whatever the id's own
-            // history: one this service never minted, one it minted and has since purged
-            // (the idempotent-cleanup path — delete a domain that is already gone — which
-            // has to terminate), and one live in another Region are all of them that.
-            // `smithy_query(query="operation", operation="DeleteDomain")` lists exactly one
-            // error for this operation — `ResourceNotFoundException` at 404, "thrown when
-            // the requested resource is not found" — so that is what every one of them is
-            // answered with, naming the id the request addressed through the shared
-            // constructor.
+            // A `domainId` this Region resolves no domain for is refused on the id's own
+            // ALLOCATION HISTORY, which is the ONE answer of this service that depends on
+            // it (`crate::state::ComAmazonawsConnecthealthConnecthealthState::has_allocated_domain`
+            // documents the split, and `CreateDomain` is what writes the ledger).
             //
-            // Not a 5xx: the condition is permanent and lies in the request's own id, and
-            // an SDK retries a server fault.
+            // An id this service DID allocate names a resource this account had: one it
+            // minted and has since purged (the idempotent-cleanup path — delete a domain
+            // that is already gone — which has to terminate) and one live in another
+            // Region are both that, and both take the ONE error
+            // `smithy_query(query="operation", operation="DeleteDomain")` lists —
+            // `ResourceNotFoundException` at 404, "thrown when the requested resource is
+            // not found" — naming the id the request addressed through the shared
+            // constructor. Not a 5xx: the condition is permanent and lies in the request's
+            // own id, and an SDK retries a server fault.
+            //
+            // An id with NO allocation history anywhere resolves no ARN at all, so the
+            // front door cannot authorize the call against a resource and the refusal is
+            // its own ([`AUTHORIZER_CONFIGURATION`]), with no detail member. Keeping the
+            // two apart is what lets a cleanup routine that swallows "already gone" still
+            // surface a typo'd or wrong-account id instead of reporting a deletion it
+            // never made.
+            if !store.has_allocated_domain(&input.domain_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    AUTHORIZER_CONFIGURATION,
+                    AUTHORIZER_CONFIGURATION_STATUS,
+                    AUTHORIZER_CONFIGURATION_DETAIL,
+                ));
+            }
             return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(

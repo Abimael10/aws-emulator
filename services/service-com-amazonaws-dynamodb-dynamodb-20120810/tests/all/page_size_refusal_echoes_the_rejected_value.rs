@@ -12,12 +12,12 @@
 //! rather than fixed, which is the diagnostic a caller reads the offending value out of.
 //!
 //! Every row drives the SAME violation class, and they differ along what the rule generalises
-//! over: the operation (the two control-plane listings whose page size takes that form),
-//! which published bound the
+//! over: the operation (the table WALK and the two control-plane listings whose page size takes
+//! that form), which published bound the
 //! value broke (the minimum, and a maximum where the member declares one), how far past it the
 //! value went (one past, a handful, and the integral extremes a 32-bit member can carry), and
 //! how the rejected value is written (zero, a negative, a large magnitude). The contrast test
-//! drives the same sweep through the two ITEM READS, whose form quotes NO value, so a value
+//! drives the same sweep through the KEYED read, whose form quotes NO value, so a value
 //! that happens to appear in a message cannot pass for a value the clause echoed.
 
 use serde_json::{json, Value};
@@ -109,6 +109,12 @@ async fn an_echoing_page_size_clause_quotes_the_value_the_request_carried() {
         // Each row: the case, the operation, its request, and the bound the value broke.
         let rows: Vec<(&str, &str, Value, String)> = vec![
             (
+                "a table walk's page size below its minimum",
+                "Scan",
+                walk(rejected),
+                at_least(1),
+            ),
+            (
                 "a table listing's page size below its minimum",
                 "ListTables",
                 json!({"Limit": rejected}),
@@ -146,8 +152,8 @@ async fn an_echoing_page_size_clause_quotes_the_value_the_request_carried() {
     }
 }
 
-/// RULE: the other form quotes NO value — the two ITEM READS, whose clause about their page
-/// size names the member alone, state the same requirement whatever value was rejected, so
+/// RULE: the other form quotes NO value — the KEYED read, whose clause about its page
+/// size names the member alone, states the same requirement whatever value was rejected, so
 /// none of the rejected values appears in the message at all.
 #[tokio::test]
 async fn a_wire_form_page_size_clause_quotes_none_of_the_rejected_value() {
@@ -158,18 +164,11 @@ async fn a_wire_form_page_size_clause_quotes_none_of_the_rejected_value() {
         at_least(1)
     );
     for rejected in REJECTED_BELOW {
-        for (case, operation, request) in [
-            (
-                "a keyed read's page size below its minimum",
-                "Query",
-                keyed(rejected),
-            ),
-            (
-                "a table walk's page size below its minimum",
-                "Scan",
-                walk(rejected),
-            ),
-        ] {
+        for (case, operation, request) in [(
+            "a keyed read's page size below its minimum",
+            "Query",
+            keyed(rejected),
+        )] {
             let stated = refusal(&router, case, operation, request).await;
             assert_eq!(
                 stated, expected,

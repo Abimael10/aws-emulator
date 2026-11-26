@@ -18,8 +18,8 @@
 //! `@range{min:1,max:1000000}` and `Scan$Segment` `@range{min:0,max:999999}`
 //! (`smithy_query(query="operation", operation="Scan")`) — and `Query$Limit` targets the very
 //! same shape as the walk's page size (`smithy_query(query="operation", operation="Query")`),
-//! which both item reads state in the item-request form while a control-plane
-//! listing states it, of the same violation class, in the other form. So the form has to be read
+//! which the keyed read states in the item-request form while the WALK and a control-plane
+//! listing state it, of the same violation class, in the other form. So the form has to be read
 //! off the operation being served and the member the clause is about, which is what the rows
 //! below read back.
 //!
@@ -103,10 +103,10 @@ async fn refusal(
     message(&body)
 }
 
-/// RULE: both item reads state their page size by its wire spelling with nothing echoed,
-/// whatever value was rejected, while a control-plane listing states the SAME member
-/// name breaking the SAME kind of bound with the rejected value echoed under the validator's
-/// path.
+/// RULE: the KEYED read states its page size by its wire spelling with nothing echoed,
+/// whatever value was rejected, while the table WALK and a control-plane listing state the
+/// SAME member name breaking the SAME kind of bound with the rejected value echoed under the
+/// validator's path.
 #[tokio::test]
 async fn one_member_name_is_stated_in_the_form_each_operation_gives_it() {
     let router = seeded().await;
@@ -121,16 +121,11 @@ async fn one_member_name_is_stated_in_the_form_each_operation_gives_it() {
             json!({"TableName": TABLE, "Limit": rejected}),
         )
         .await;
-        let expected = envelope(&[wire_clause("Limit", &at_least(1))]);
+        let expected = envelope(&[echoing_clause("limit", rejected, &at_least(1))]);
         assert_eq!(
             walk, expected,
             "case \"a table walk's page size\" (Limit {rejected}): expected {expected:?}, got \
              {walk:?}"
-        );
-        assert!(
-            !walk.contains(&format!("'{rejected}'")),
-            "case \"a table walk's page size\" (Limit {rejected}): this form echoes no part of \
-             the rejected value, got {walk:?}"
         );
 
         let keyed = refusal(
@@ -202,7 +197,7 @@ async fn every_other_member_of_the_walk_keeps_its_operations_form() {
             "the page size and the segment count at once",
             json!({"TableName": TABLE, "Limit": 0, "TotalSegments": 0}),
             envelope(&[
-                wire_clause("Limit", &at_least(1)),
+                echoing_clause("limit", 0, &at_least(1)),
                 wire_clause("TotalSegments", &at_least(1)),
             ]),
         ),
@@ -210,7 +205,7 @@ async fn every_other_member_of_the_walk_keeps_its_operations_form() {
             "the page size and the segment at once",
             json!({"TableName": TABLE, "Limit": -3, "Segment": -1}),
             envelope(&[
-                wire_clause("Limit", &at_least(1)),
+                echoing_clause("limit", -3, &at_least(1)),
                 wire_clause("Segment", &at_least(0)),
             ]),
         ),

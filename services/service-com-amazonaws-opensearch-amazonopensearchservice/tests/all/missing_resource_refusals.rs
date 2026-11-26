@@ -212,9 +212,9 @@ async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve
                 "case {case}: expected {resource_not_found:?}, got {:?}",
                 answer.body
             );
-            // Neither half of the address the request carried is disclosed: a caller
-            // cannot tell an entity this account does not hold from an insight that
-            // entity does not hold.
+            // Neither half of the address the request carried is disclosed: the refusal
+            // names the entity it could not resolve no more than the id it was asked
+            // about.
             assert!(
                 !said.contains(absent) && !said.contains(id.as_str()),
                 "case {case}: expected the refusal to name neither half of the address, got \
@@ -248,9 +248,10 @@ async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve
         );
     }
 
-    // Only ONE refusal answers both halves of the address: the insight this entity DOES
-    // hold is reported, and an id it holds no insight under is refused exactly as an
-    // entity this account does not hold is — a caller cannot tell the two apart.
+    // The ENTITY half is the one that refuses: the insight this entity DOES hold is
+    // reported, and an id it holds no insight under is this informational read's own 200
+    // carrying the service's guidance rather than a refusal — so the refusals above are
+    // about the entity, not about every address that resolves no stored insight.
     let held_id = guid("00000000000a");
     raise_on_domain(
         &emulator,
@@ -267,17 +268,18 @@ async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve
     for id in &ids {
         let answer = describe_insight(&emulator, domain_entity(held), id, json!({})).await;
         let case = format!("DescribeInsightDetails(DomainName {held:?}, {id})");
-        assert_missing_resource(&answer, &case);
-        let said = message(&answer);
         assert_eq!(
-            said, resource_not_found,
-            "case {case}: expected {resource_not_found:?}, got {:?}",
-            answer.body
+            answer.status, 200,
+            "case {case}: expected the detail read of a resolvable entity to report, got {} \
+             with {:?}",
+            answer.status, answer.body
         );
         assert!(
-            !said.contains(held) && !said.contains(id.as_str()),
-            "case {case}: expected the refusal to name neither half of the address, got \
-             {said:?}"
+            answer.body["Fields"]
+                .as_array()
+                .is_some_and(|fields| !fields.is_empty()),
+            "case {case}: expected the required Fields, got {:?}",
+            answer.body
         );
     }
 }

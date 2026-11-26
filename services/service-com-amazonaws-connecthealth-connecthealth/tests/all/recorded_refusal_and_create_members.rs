@@ -19,14 +19,15 @@
 //!    this service answers (404, 400 from a handler's bound, 400 from the boundary walk,
 //!    401) across the operations that answer them and across both planes, so the rule is
 //!    not keyed to the two operations the corpus exercises.
-//! 2. `DeleteDomain` reports every `domainId` it resolves no domain for through its ONE
-//!    modelled error, `ResourceNotFoundException` at HTTP 404
+//! 2. `DeleteDomain` refuses every `domainId` it resolves no domain for on the id's own
+//!    ALLOCATION HISTORY: an id this service DID allocate — minted and since purged, or
+//!    naming a domain live in another Region — is its ONE modelled error,
+//!    `ResourceNotFoundException` at HTTP 404
 //!    (`smithy_query(query="operation",operation="DeleteDomain")` lists exactly that one),
-//!    naming the requested id — whether the id was never minted, was minted and has since
-//!    been purged, or names a domain live in another Region. Never a 5xx, which an SDK
-//!    would retry on the normal idempotent-cleanup path, and never an authorization class,
-//!    which a caller cannot tell from broken credentials. Every way an id can fail to
-//!    resolve is a row.
+//!    naming the requested id; an id with no allocation history anywhere resolves no ARN
+//!    for the front door to authorize the call against and is refused there, with no detail
+//!    member at all. Never a 5xx either way, which an SDK would retry on the normal
+//!    idempotent-cleanup path. Every way an id can fail to resolve is a row.
 //! 3. `CreateSubscription`'s 201 reports the instants creation ESTABLISHED and no others:
 //!    `createdAt` always, and `lastUpdatedAt` / `activatedAt` / `deactivatedAt` only from
 //!    the transition each one records, so a subscription no call has updated comes back
@@ -215,10 +216,10 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
             });
         }
     }
-    // 404 from `DeleteDomain`, which is what every id it resolves no domain for earns
-    // (pinned over the whole class in
-    // `delete_domain_reports_the_modelled_not_found_for_every_unresolvable_id` below); the
-    // id this row addresses is one the service minted and has since purged.
+    // 404 from `DeleteDomain`, which is what an id this service ALLOCATED and resolves no
+    // domain for earns (pinned over the whole class in
+    // `delete_domain_refuses_every_unresolvable_id_on_the_ids_allocation_history` below);
+    // the id this row addresses is one the service minted and has since purged.
     let purged = string_at(
         &emulator
             .create_domain(&json!({ "name": "clinic-purged" }))
@@ -379,17 +380,20 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
 }
 
 #[tokio::test]
-async fn delete_domain_refuses_every_unresolvable_id_with_the_modelled_not_found() {
+async fn delete_domain_refuses_every_unresolvable_id_on_the_ids_allocation_history() {
     let emulator = Emulator::new("us-east-1");
 
     // Every way a well-formed `domainId` can name no domain this Region holds, spanning what
     // the rule generalises over: ids no account was ever allocated (both modelled prefixes,
     // both ends of the modelled length, digits, repeated letters and a pronounceable id),
     // an id this service minted whose domain it has since purged, and one that is live in
-    // another Region. Each one names a resource this endpoint does not have, which is the
-    // ONE error this operation models
+    // another Region. The refusal splits on the id's own ALLOCATION HISTORY: an id this
+    // service DID allocate names a resource this endpoint does not have, which is the ONE
+    // error this operation models
     // (`smithy_query(query="operation",operation="DeleteDomain")` reports
-    // `ResourceNotFoundException` alone), so the id's own history cannot change the answer.
+    // `ResourceNotFoundException` alone), while an id with no history anywhere resolves no
+    // ARN for the front door to authorize the call against and is refused there, with no
+    // detail member at all.
     let mut rows: Vec<(String, bool, String)> = Vec::new();
     for (label, id) in [
         (
@@ -451,6 +455,24 @@ async fn delete_domain_refuses_every_unresolvable_id_with_the_modelled_not_found
                 .send("DELETE", &format!("/domain/{domain_id}"), None)
                 .await;
             let case = format!("{case} ({domain_id}), allocated={allocated}, attempt {attempt}");
+            if !allocated {
+                // No allocation history anywhere: the front door's own refusal, which
+                // carries neither of this service's detail keys.
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (403, "AuthorizerConfigurationException"),
+                    "case {case:?}: expected the front door's own refusal, got {status} \
+                     with {body}"
+                );
+                for member in [MODEL_MEMBER_DETAIL, SUBSCRIPTION_PLANE_DETAIL] {
+                    assert!(
+                        body.get(member).and_then(serde_json::Value::as_str).is_none(),
+                        "case {case:?}: this refusal carries no detail member, got \
+                         {member} in {body}"
+                    );
+                }
+                continue;
+            }
             assert_eq!(
                 (status, error_code(&body).as_str()),
                 (404, "ResourceNotFoundException"),

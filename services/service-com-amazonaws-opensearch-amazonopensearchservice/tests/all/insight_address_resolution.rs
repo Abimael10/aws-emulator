@@ -14,14 +14,19 @@
 //! this suite adds no second copy of any of them.
 //!
 //! The rule under test: an insight is addressed by the entity that holds it and the
-//! insight's own id TOGETHER, so an operation that addresses one resolves both halves and
-//! an address that resolves to no insight — an entity this account holds nothing for, or
-//! an id that entity holds no insight under — is refused as ONE missing resource, on the
-//! status this service answers that shape on and with a sentence that names neither half,
-//! so a caller cannot tell the two apart. `DescribeInsightDetails` and `InsightFeedback`
-//! are the two operations that take such an address, and they answer it identically: the
-//! rule belongs to the address, not to the operation, and neither operation reports a
-//! success for an insight that does not exist.
+//! insight's own id TOGETHER, and the two halves of that address are NOT alike. The ENTITY
+//! half has to resolve for either operation: an entity this account holds nothing for is
+//! refused as ONE missing resource, on the status this service answers that shape on and
+//! with a sentence that names neither half of the address, identically from both
+//! operations — that part of the rule belongs to the address, not to the operation. The ID
+//! half is resolved by what the OPERATION does with it: `InsightFeedback` rates "an
+//! EXISTING insight", so an id the entity holds no insight under leaves nothing to rate
+//! and is the same missing resource, while `DescribeInsightDetails` REPORTS on an insight
+//! of a resolvable entity and answers every id inside the modelled `GUID` form with its
+//! `@required` `Fields` — the stored fields where an insight was raised under that id, and
+//! the service's own guidance about an insight's details otherwise. Neither operation
+//! reports a success for an ENTITY that does not exist, and neither writes anything on a
+//! read.
 //!
 //! So the assertions span a SET of inputs rather than one call: a table of addresses
 //! crossing three kinds of entity half (a domain holding the insight, a sibling domain
@@ -137,22 +142,12 @@ fn assert_unresolved_address(
     );
 }
 
-/// Every address this suite is asserted over that resolves to NO insight, as
+/// Every address this suite is asserted over whose ENTITY half resolves to nothing, as
 /// `(entity value, insight id)` pairs of a `DomainName` entity — the entity type both
-/// operations take.
-fn unresolvable_addresses() -> Vec<(String, String)> {
+/// operations take. The id half varies beside it (one held elsewhere, one held nowhere), to
+/// show the refusal is the entity's and not the pair's.
+fn unresolvable_entities() -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
-    // The entity resolves and the id does not.
-    for unheld in unheld_ids() {
-        rows.push((HELD.to_string(), unheld.clone()));
-        rows.push((SIBLING.to_string(), unheld));
-    }
-    // Both halves name something the account holds, but not together: an insight is
-    // reported by the entity that holds it, so one domain's id is no insight of the other.
-    rows.push((HELD.to_string(), sibling_id()));
-    rows.push((SIBLING.to_string(), held_id()));
-    // The entity does not resolve, with an id that is held elsewhere and one that is held
-    // nowhere.
     for absent in ABSENT {
         rows.push((absent.to_string(), held_id()));
         rows.push((
@@ -166,11 +161,56 @@ fn unresolvable_addresses() -> Vec<(String, String)> {
     rows
 }
 
+/// Every address this suite is asserted over whose entity RESOLVES and whose ID half
+/// selects no insight: ids no entity holds, and each domain addressed with the other's
+/// held id — an insight is reported by the entity that holds it, so one domain's id names
+/// no insight of the other.
+fn unselected_ids() -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for unheld in unheld_ids() {
+        rows.push((HELD.to_string(), unheld.clone()));
+        rows.push((SIBLING.to_string(), unheld));
+    }
+    rows.push((HELD.to_string(), sibling_id()));
+    rows.push((SIBLING.to_string(), held_id()));
+    rows
+}
+
+/// Every address this suite is asserted over that resolves to NO insight at all — both
+/// tables above, which is what a call that must write nothing is driven over.
+fn unresolvable_addresses() -> Vec<(String, String)> {
+    let mut rows = unresolvable_entities();
+    rows.extend(unselected_ids());
+    rows
+}
+
+/// The `Fields` a detail read answers with, asserted non-empty: `Fields` is `@required`, so
+/// a detailed view this service answers is never the empty set.
+fn detailed_fields(answer: &Answer, case: &str) -> Vec<Value> {
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected the detail read to report, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let fields = answer.body["Fields"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case}: expected the required Fields, got {:?}", answer.body)
+        })
+        .clone();
+    assert!(
+        !fields.is_empty(),
+        "case {case}: expected a non-empty Fields list, got {:?}",
+        answer.body
+    );
+    fields
+}
+
 #[tokio::test]
-async fn an_address_that_resolves_to_no_insight_is_refused_by_both_operations_alike() {
+async fn an_entity_that_resolves_to_nothing_is_refused_by_both_operations_alike() {
     let emulator = given_two_domains().await;
 
-    for (entity_value, insight_id) in unresolvable_addresses() {
+    for (entity_value, insight_id) in unresolvable_entities() {
         let entity = domain_entity(&entity_value);
 
         let detail_case = format!("DescribeInsightDetails({entity_value:?}, {insight_id})");
@@ -181,16 +221,48 @@ async fn an_address_that_resolves_to_no_insight_is_refused_by_both_operations_al
         let rated = rate(&emulator, entity, &insight_id).await;
         assert_unresolved_address(&rated, &feedback_case, &entity_value, &insight_id);
 
-        // The rule belongs to the ADDRESS, so the two operations refuse it identically:
-        // same status, same shape, same sentence.
+        // The ENTITY half of the rule belongs to the ADDRESS, so the two operations refuse
+        // it identically: same status, same shape, same sentence.
         assert_eq!(
             (detailed.status, error_code(&detailed), detailed.body["message"].clone()),
             (rated.status, error_code(&rated), rated.body["message"].clone()),
             "case {detail_case} against {feedback_case}: expected one refusal for the \
-             address, got {:?} and {:?}",
+             entity, got {:?} and {:?}",
             detailed.body,
             rated.body
         );
+    }
+}
+
+#[tokio::test]
+async fn an_id_the_entity_holds_no_insight_under_is_detailed_and_refused_by_the_submission() {
+    let emulator = given_two_domains().await;
+
+    // The guidance a detail read states where it has no stored field to report is the same
+    // sentence whichever id selected nothing, so it is read off the first row and every
+    // later row is asserted to match it rather than against a literal of this suite's own
+    // (`tests/all/insight_details.rs` pins the sentence itself).
+    let mut guidance: Option<Vec<Value>> = None;
+    for (entity_value, insight_id) in unselected_ids() {
+        let entity = domain_entity(&entity_value);
+
+        let detail_case = format!("DescribeInsightDetails({entity_value:?}, {insight_id})");
+        let detailed = describe_insight(&emulator, entity.clone(), &insight_id, json!({})).await;
+        let fields = detailed_fields(&detailed, &detail_case);
+        match &guidance {
+            None => guidance = Some(fields),
+            Some(stated) => assert_eq!(
+                &fields, stated,
+                "case {detail_case}: expected the one guidance every id that selects no \
+                 insight is detailed with, got {fields:?}"
+            ),
+        }
+
+        // The SUBMISSION rates an existing insight, so the id half IS a requirement there:
+        // the same address it leaves nothing to rate under is the missing resource.
+        let feedback_case = format!("InsightFeedback({entity_value:?}, {insight_id})");
+        let rated = rate(&emulator, entity, &insight_id).await;
+        assert_unresolved_address(&rated, &feedback_case, &entity_value, &insight_id);
     }
 }
 
@@ -202,7 +274,8 @@ async fn an_account_entity_resolves_the_id_the_same_way() {
     // insights and those of every domain it holds" — named both ways the model allows,
     // since `Value` is optional and the only account served is the one the request was made
     // for. The id half is resolved there exactly as it is for a domain: the insights of
-    // both domains are reachable, and an id no insight was raised under is refused.
+    // both domains are reachable, and an id no insight was raised under is detailed with
+    // the service's guidance rather than refused.
     for entity in [
         json!({"Type": "Account"}),
         json!({"Type": "Account", "Value": engine::emulator_account_id()}),
@@ -221,7 +294,7 @@ async fn an_account_entity_resolves_the_id_the_same_way() {
         for unheld in unheld_ids() {
             let case = format!("DescribeInsightDetails({entity:?}, {unheld})");
             let answer = describe_insight(&emulator, entity.clone(), &unheld, json!({})).await;
-            assert_unresolved_address(&answer, &case, "Account", &unheld);
+            detailed_fields(&answer, &case);
         }
     }
 }
@@ -260,8 +333,9 @@ async fn the_address_that_does_resolve_is_still_served_and_the_refusals_wrote_no
         );
     }
 
-    // And the refused calls left the insights each domain holds exactly as they were: a
-    // call that resolved no insight neither raised one nor took one away.
+    // And the calls that resolved no insight left the insights each domain holds exactly as
+    // they were: neither the refusals nor the informational detail reads raised an insight
+    // or took one away.
     for (entity_value, insight_id) in unresolvable_addresses() {
         let entity = domain_entity(&entity_value);
         describe_insight(&emulator, entity.clone(), &insight_id, json!({})).await;

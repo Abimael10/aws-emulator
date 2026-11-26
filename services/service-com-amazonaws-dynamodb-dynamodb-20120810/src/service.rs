@@ -641,24 +641,23 @@ fn stated_enum_order(allowed: &[String]) -> Vec<String> {
 //
 //   * the ITEM-REQUEST form, which names the member by its WIRE spelling and
 //     echoes NO value — `Value at 'Limit' failed to satisfy constraint: Member
-//     must have value greater than or equal to 1` for an ITEM READ's page size
-//     below its `@range` minimum, whether that read is the keyed one or the table
-//     walk, `Value at 'TotalSegments' …` for a table walk's parallel-scan bounds,
-//     and `Value at 'RequestItems.<table>.member.Keys' …` for a batched key list
-//     past its cap;
+//     must have value greater than or equal to 1` for the KEYED read's page size
+//     below its `@range` minimum, `Value at 'TotalSegments' …` for a table walk's
+//     parallel-scan bounds, and `Value at 'RequestItems.<table>.member.Keys' …`
+//     for a batched key list past its cap;
 //   * the VALIDATOR-PATH form, which echoes no value either but names the member
 //     by the lowerCamel path the request validator builds — `Value at
 //     'requestItems' …` for a `BatchWriteItem` request map past either end of its
 //     `@length` bound;
 //   * the REQUEST-VALIDATOR form, which names the member by that same lowerCamel
 //     path and DOES echo the rejected value — `Value '0' at
-//     'limit' …` for a backup listing's page size, `Value
+//     'limit' …` for the table WALK's page size and for a backup listing's, `Value
 //     '26' at 'maxResults' …` for an export listing's, `Value '' at
 //     'timeToLiveSpecification.attributeName' …` for an empty TTL attribute name.
 //
 // All three are observed for the SAME violation class on the SAME member name
-// (`Limit`, `@range` min 1, in the item-request form on both of the item reads and
-// in the request validator's form on the control-plane listings;
+// (`Limit`, `@range` min 1, in the item-request form on the keyed read and in the
+// request validator's form on the table walk and on the control-plane listings;
 // `RequestItems`, `@length` min 1, on `BatchGetItem` and on `BatchWriteItem`), so
 // nothing about the model or about the violation distinguishes them: the form is a
 // fact of the served OPERATION and of the MEMBER the clause is about, which is why
@@ -715,11 +714,13 @@ const EVERY_MEMBER_ALIKE: &[(&str, ClauseForm)] = &[];
 ///
 /// This is the ONE place the choice is recorded. Nothing in the model distinguishes these
 /// sentences — the same member name, the same trait, a different sentence — and the choice is
-/// not derivable from the violation either: an ITEM READ's page size and a control-plane
-/// listing's are the same kind of scalar `@range` member (`smithy_query(query="operation",
-/// operation="Query,Scan")`: both `Limit` target `PositiveIntegerObject` `@range{min:1}`,
-/// while `ListBackups$Limit` targets `BackupsInputLimit`) and are nevertheless stated
-/// differently, while `BatchGetItem`'s and `BatchWriteItem`'s
+/// not derivable from the violation either: the KEYED read's page size, the table WALK's and a
+/// control-plane listing's are the same kind of scalar `@range` member
+/// (`smithy_query(query="operation", operation="Query,Scan")`: both `Limit` target
+/// `PositiveIntegerObject` `@range{min:1}`, while `ListBackups$Limit` targets
+/// `BackupsInputLimit`) and the three are nevertheless stated in two different forms — the
+/// keyed read alone naming the member with nothing echoed — while `BatchGetItem`'s and
+/// `BatchWriteItem`'s
 /// `RequestItems` maps are the same non-scalar member of the same `@length` bound and are
 /// stated in two different forms. So the form is read off the operation being served, with
 /// the members that operation is recorded to state otherwise named beside it — an operation
@@ -751,10 +752,19 @@ const CLAUSE_FORMS: &[ClauseFormRow] = &[
     ),
     // The keyed read's page size is `Value at 'Limit' …`, with no value echoed.
     ("Query", ClauseForm::WireMemberOnly, EVERY_MEMBER_ALIKE),
-    // The table walk states its own page size the same way — it is the same member of the
-    // same target shape as the keyed read's — and so are its parallel-scan bounds:
-    // `Value at 'Limit' …`, `Value at 'TotalSegments' …` and `Value at 'Segment' …`.
-    ("Scan", ClauseForm::WireMemberOnly, EVERY_MEMBER_ALIKE),
+    // The table walk states its parallel-scan bounds the same way — `Value at
+    // 'TotalSegments' …` and `Value at 'Segment' …` — but NOT its page size: the one
+    // member the two item reads share is recorded worded differently by each of them, and
+    // the walk states it in the request validator's own form, with the lowerCamel path and
+    // the rejected value echoed (`Value '0' at 'limit' …`). Nothing in the model
+    // distinguishes the two (`smithy_query(query="operation", operation="Query,Scan")`:
+    // both `Limit` target `PositiveIntegerObject` `@range{min:1}`), which is exactly why
+    // the form is read off the operation being served and the member it is about.
+    (
+        "Scan",
+        ClauseForm::WireMemberOnly,
+        &[("limit", ClauseForm::PathAndValue)],
+    ),
     // The VECTOR search states its members the same way — `Value at 'TopK' …`, with no
     // value echoed — which is the one form its whole input is recorded in; it is also the
     // surface whose body reader words an absent member itself
@@ -2245,12 +2255,12 @@ mod tests {
 
     #[test]
     fn each_member_states_the_form_its_operation_gives_it() {
-        // The form is read off the served OPERATION and the member it is about: both item
-        // reads state their page size — and the table walk its two parallel-scan bounds —
-        // in the item-request form, while a control-plane listing states its own page size
-        // in the request validator's.
+        // The form is read off the served OPERATION and the member it is about: the keyed
+        // read states its page size — and the table walk its two parallel-scan bounds — in
+        // the item-request form, while the WALK's own page size and a control-plane
+        // listing's are stated in the request validator's.
         for (operation, member, expected) in [
-            ("Scan", "limit", ClauseForm::WireMemberOnly),
+            ("Scan", "limit", ClauseForm::PathAndValue),
             ("Scan", "totalSegments", ClauseForm::WireMemberOnly),
             ("Scan", "segment", ClauseForm::WireMemberOnly),
             ("Query", "limit", ClauseForm::WireMemberOnly),

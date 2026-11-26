@@ -786,18 +786,18 @@ async fn a_numeric_member_outside_its_range_is_refused_in_its_operation_s_form()
         },
         RangeRow {
             // The SAME bound on the SAME member name as the keyed read above, through the
-            // other data-plane read, which states it the same way: both item reads name the
-            // page size as the model spells it and echo nothing, and the walk's
-            // parallel-scan bounds below keep that form too
+            // other data-plane read, which is recorded stating it the OTHER way: the walk
+            // names the page size by the validator's lowerCamel path and echoes the value,
+            // while its parallel-scan bounds below keep the wire form
             // (`tests/all/clause_form_per_member.rs` pins every form side by side).
             case: "the same bound on another data-plane read, far below it",
             operation: "Scan",
             member: "Limit",
-            path: "Limit",
+            path: "limit",
             value: -7,
             requirement: "",
             table: Some(TABLE),
-            echoes: false,
+            echoes: true,
         },
         RangeRow {
             case: "a parallel-scan segment count one past its maximum",

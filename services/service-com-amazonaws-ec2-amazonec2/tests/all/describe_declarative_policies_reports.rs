@@ -663,11 +663,13 @@ async fn an_id_the_service_cannot_resolve_is_refused() {
             .iter()
             .find(|report_id| *report_id != &held)
             .expect("every row names an id the service cannot resolve");
-        // The message is part of the contract: the sentence AWS words this refusal with,
-        // with the id taken from the REQUEST.
+        // The message is part of the contract: the sentence AWS words THIS operation's
+        // refusal with, with the id taken from the REQUEST. The summary read words the same
+        // class its own way, which `tests/all/aws_worded_refusal_sentences.rs` pins beside
+        // this one.
         assert_eq!(
             error_message(&body),
-            format!("The declarative-policies-report ID '{named}' does not exist"),
+            format!("The report ID '{named}' does not exist."),
             "case {case:?}: expected the sentence this refusal is worded with, got {body}"
         );
         assert!(

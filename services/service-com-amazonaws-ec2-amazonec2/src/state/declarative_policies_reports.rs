@@ -95,7 +95,8 @@ pub const INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND: &str =
 /// answers. The operations that REPORT reports (`GetDeclarativePoliciesReportSummary` and
 /// `DescribeDeclarativePoliciesReports`) answer the NOT-FOUND half for every id they cannot
 /// resolve, whatever its form, which is what their own recorded contracts answer — so a reader
-/// of this surface does not reach for this function at all.
+/// of this surface does not reach for this function at all. Which SENTENCE each of those two
+/// states is its own ([`declarative_policies_reports_report_id_not_found`] for the listing).
 pub fn declarative_policies_report_id_is_well_formed(report_id: &str) -> bool {
     report_id
         .strip_prefix(DECLARATIVE_POLICIES_REPORT_ID_PREFIX)
@@ -134,7 +135,11 @@ pub fn invalid_declarative_policies_report_id_malformed<E>(report_id: &str) -> S
 /// The same wording the sibling kinds of this crate are refused with (a capacity
 /// reservation's, an instance event window's, a capacity manager data export's): how the
 /// resource is spelled, and that the sentence stops after the quoted id, are facts of the
-/// FAMILY rather than of one operation, so no operation words its own.
+/// FAMILY rather than of one operation.
+///
+/// What `GetDeclarativePoliciesReportSummary` and `CancelDeclarativePoliciesReport` state. The
+/// LISTING is recorded stating the same class in its own words and takes
+/// [`declarative_policies_reports_report_id_not_found`] instead.
 pub fn invalid_declarative_policies_report_id_not_found<E>(report_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND,
@@ -142,6 +147,30 @@ pub fn invalid_declarative_policies_report_id_not_found<E>(report_id: &str) -> S
         format!(
             "The {resource} ID '{report_id}' does not exist",
             resource = DECLARATIVE_POLICIES_REPORT_TAGGABLE_RESOURCE,
+            report_id = echoed_resource_id(report_id)
+        ),
+    )
+}
+
+/// Refuse a report id the LISTING cannot resolve: HTTP 400
+/// [`INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND`], in the sentence
+/// `DescribeDeclarativePoliciesReports` is RECORDED answering such an id with — `The report ID
+/// '<id>' does not exist.`, naming the resource by the one word that operation's own sentence
+/// uses and closing with a full stop, with the id taken from the REQUEST.
+///
+/// Why this is not [`invalid_declarative_policies_report_id_not_found`]: the two readers of a
+/// report are recorded wording ONE unresolvable-id class differently, and nothing in the model
+/// distinguishes them (`smithy_query(query="operation",
+/// operation="DescribeDeclarativePoliciesReports,GetDeclarativePoliciesReportSummary")` gives
+/// both the same `DeclarativePoliciesReportId` member and neither any error of its own), so
+/// the sentence is a fact of the OPERATION that answered. The summary read and the cancel keep
+/// the family sentence above; this listing states its own.
+pub fn declarative_policies_reports_report_id_not_found<E>(report_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND,
+        400,
+        format!(
+            "The report ID '{report_id}' does not exist.",
             report_id = echoed_resource_id(report_id)
         ),
     )

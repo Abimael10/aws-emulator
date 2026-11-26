@@ -9,15 +9,16 @@
 //! listing from [`super::insights`] and the constraint report from
 //! [`super::constraint_refusal_messages`]; this suite adds no second copy of any of them.
 //!
-//! The rule under test: a detail read details the ONE insight its address resolves, and
-//! an address that resolves to no insight is refused as ONE missing resource naming
-//! neither half of it — so against a store that holds no insight at all EVERY detail read
-//! is refused, whichever entity this service resolves and whichever well-formed id the
-//! read names, and the refusal is the same fixed sentence either way. Nothing else is
-//! changed by that: an entity whose type is outside `InsightEntityType`, an `Account`
-//! entity naming another account and a `DomainName` this account holds no domain under
-//! are refused as the malformed requests and missing resources they are, and a read
-//! writes nothing — it does not raise the insight it failed to resolve.
+//! The rule under test: a detail read is an INFORMATIONAL report about an insight of the
+//! entity its address names, so only the ENTITY half of that address refuses — against a
+//! store that holds no insight at all EVERY detail read of a resolvable entity is answered
+//! 200 with the one field the service states about an insight's details, whichever entity
+//! this service resolves and whichever well-formed id the read names, and the view is the
+//! same either way. Nothing else is changed by that: an entity whose type is outside
+//! `InsightEntityType`, an `Account` entity naming another account and a `DomainName` this
+//! account holds no domain under are refused as the malformed requests and missing
+//! resources they are, and a read writes nothing — it does not raise the insight it found
+//! no stored field for.
 //!
 //! No insight is seeded anywhere, which is what tells this suite apart from
 //! [`super::insight_details`]: an insight is RAISED by the service observing a domain, so
@@ -37,7 +38,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::INSIGH
 use super::constraint_refusal_messages::{clause, message, report, value_set};
 use super::domain_lifecycle::{create_baseline, settled_domain, Answer, Emulator};
 use super::insight_address_resolution::RESOURCE_NOT_FOUND;
-use super::insight_details::{describe_insight, domain_entity, guid};
+use super::insight_details::{describe_insight, domain_entity, guid, guidance};
 use super::insights::{list, refused};
 
 /// The domain a case reads against once the clock owes it its terminal status — the
@@ -124,7 +125,7 @@ async fn empty_listing(emulator: &Emulator, entity: &Value, case: &str) {
 }
 
 #[tokio::test]
-async fn a_detail_read_against_a_store_holding_no_insight_is_refused() {
+async fn a_detail_read_against_a_store_holding_no_insight_is_answered() {
     let emulator = Emulator::new();
     create_baseline(&emulator, READY_DOMAIN).await;
     // The precondition a client polls for: the domain has reached the status the clock
@@ -167,8 +168,9 @@ async fn a_detail_read_against_a_store_holding_no_insight_is_refused() {
         empty_listing(&emulator, entity, &format!("ListInsights({entity:?})")).await;
 
         for unheld in unheld_ids() {
-            // The three ways a request can answer `ShowHtmlContent`: what a field would be
-            // rendered as does not decide whether the insight the read addresses exists.
+            // The three ways a request can answer `ShowHtmlContent`: the guidance is
+            // content the service states rather than content it marks up, so a read is
+            // answered with the same field whichever rendering it asked for.
             for extra in [
                 json!({}),
                 json!({"ShowHtmlContent": false}),
@@ -177,20 +179,19 @@ async fn a_detail_read_against_a_store_holding_no_insight_is_refused() {
                 let case = format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
                 let answer =
                     describe_insight(&emulator, entity.clone(), &unheld, extra.clone()).await;
-                assert_missing_resource(&answer, &case);
+                guidance(&answer, &case);
 
-                // A report: the same request is refused the same way again.
+                // A report: the same request is answered the same way again.
                 let again = describe_insight(&emulator, entity.clone(), &unheld, extra).await;
                 assert_eq!(
                     again.body, answer.body,
-                    "case {case}(twice): expected the same refusal, got {:?}",
+                    "case {case}(twice): expected the same view, got {:?}",
                     again.body
                 );
             }
         }
 
-        // The refused reads raised no insight for the entity, so its listing is what it
-        // was.
+        // The reads raised no insight for the entity, so its listing is what it was.
         empty_listing(
             &emulator,
             entity,
@@ -200,7 +201,7 @@ async fn a_detail_read_against_a_store_holding_no_insight_is_refused() {
     }
 
     // And nothing was written: a detail read reports, it does not raise the insight it
-    // failed to resolve.
+    // found no stored field for.
     assert!(
         holds_no_insight(&emulator),
         "case the whole table: expected a detail read to store no insight"
@@ -267,10 +268,10 @@ async fn an_entity_this_account_holds_nothing_for_is_refused_the_same_way() {
         .to_owned();
 
     // A `DomainName` this account holds no domain under names no entity to report on, so
-    // the read is refused as one missing resource — the SAME refusal an id the entity holds
-    // no insight under gets, because which half of the address resolved to nothing is not
-    // disclosed. Rows differ along the shape of the name: one never created, and one at
-    // each end of the modelled length.
+    // the read is refused as one missing resource — the ENTITY half of the address is the
+    // one that refuses, where an id the entity holds no insight under is answered. Rows
+    // differ along the shape of the name: one never created, and one at each end of the
+    // modelled length.
     for name in ["never-created", "abc", "a-domain-name-at-its-upper-b"] {
         let answer =
             describe_insight(&emulator, domain_entity(name), &insight_id, json!({})).await;

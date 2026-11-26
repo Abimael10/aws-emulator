@@ -1131,13 +1131,19 @@ const REPORT_MALFORMED: &str = "InvalidDeclarativePoliciesReportId.Malformed";
 
 /// A `ReportId` this organization started no report under is refused
 /// [`REPORT_NOT_FOUND`], and a value outside the id form every report id carries is refused
-/// [`REPORT_MALFORMED`] — each in the sentence EC2 words that family with for a TAGGED
-/// resource kind: `The <resource> ID '<id>' does not exist` and `The <resource> ID '<id>' is
-/// malformed`, where the resource is spelled as the `ResourceType` member that kind is tagged
-/// under spells it (`declarative-policies-report`), the sentence ends at the quoted id, and
-/// the id is the only variable part — taken from the request. It is the wording the sibling
-/// kinds of this service are refused with (`The capacity-reservation ID '…' does not exist`,
-/// `The instance-event-window ID '…' does not exist`), so one kind cannot word its own.
+/// [`REPORT_MALFORMED`] — each in the sentence the OPERATION that answered is recorded wording
+/// that refusal with. The summary read and the cancel state the sentence EC2 words this family
+/// with for a TAGGED resource kind: `The <resource> ID '<id>' does not exist` and `The
+/// <resource> ID '<id>' is malformed`, where the resource is spelled as the `ResourceType`
+/// member that kind is tagged under spells it (`declarative-policies-report`), the sentence
+/// ends at the quoted id, and the id is the only variable part — taken from the request. It is
+/// the wording the sibling kinds of this service are refused with (`The capacity-reservation ID
+/// '…' does not exist`, `The instance-event-window ID '…' does not exist`).
+///
+/// The LISTING words the SAME class differently, and that is recorded too: `The report ID
+/// '<id>' does not exist.` — the resource in one word and a closing full stop. Nothing in the
+/// model tells the two readers apart, so each states what it is recorded stating, which is
+/// asserted here side by side rather than as one shared sentence.
 ///
 /// The rows span the operations that resolve such an id — the summary and the describe report
 /// every id they cannot resolve not found, whatever its form, while the cancel tells the two
@@ -1145,7 +1151,7 @@ const REPORT_MALFORMED: &str = "InvalidDeclarativePoliciesReportId.Malformed";
 /// suffix lengths with digits nothing was started for, the all-zero placeholder, another
 /// resource kind's prefix, the bare prefix, and a value that is no id at all.
 ///
-/// Only the NOT-FOUND sentence is recorded for this kind; the malformed one is pinned as this
+/// Only the NOT-FOUND sentences are recorded for this kind; the malformed one is pinned as this
 /// family's wording — the resource spelled the same way, the sentence ending at the id —
 /// rather than as a sentence a recording of its own shows.
 #[tokio::test]
@@ -1190,25 +1196,27 @@ async fn one_sentence_words_an_unresolvable_declarative_policies_report_id() {
         let not_found =
             format!("The declarative-policies-report ID '{report_id}' does not exist");
         // The two readers of a report answer the not-found half for every id they cannot
-        // resolve, whichever member the id arrived in.
-        let readers: [(&str, Vec<Param>); 2] = [
+        // resolve, whichever member the id arrived in — each in its OWN recorded sentence.
+        let readers: [(&str, Vec<Param>, String); 2] = [
             (
                 "GetDeclarativePoliciesReportSummary",
                 vec![param("ReportId", report_id)],
+                not_found.clone(),
             ),
             (
                 "DescribeDeclarativePoliciesReports",
                 vec![param("ReportId.1", report_id)],
+                format!("The report ID '{report_id}' does not exist."),
             ),
         ];
-        for (action, params) in readers {
+        for (action, params, sentence) in readers {
             assert_refusal(
                 &format!("{action} for {case}"),
                 &router,
                 action,
                 &params,
                 REPORT_NOT_FOUND,
-                &not_found,
+                &sentence,
             )
             .await;
         }

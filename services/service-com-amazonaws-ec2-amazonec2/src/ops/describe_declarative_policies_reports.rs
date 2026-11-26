@@ -15,11 +15,14 @@
 //! "One or more report IDs" (`$ReportIds`) NARROWS that set: every id this operation cannot
 //! resolve to a report of the organization is reported NOT FOUND, whatever its form — the
 //! half the recorded contract of this operation answers an id no report was started under
-//! with, and the one `GetDeclarativePoliciesReportSummary` answers the same id with. The
-//! malformed half of that family belongs to the operation that ACTS on one named report
-//! (`CancelDeclarativePoliciesReport`), where a value that is no report id names nothing to
-//! cancel; a report READS the set it was asked about, so it has one answer for every id it
-//! cannot resolve.
+//! with, and the one `GetDeclarativePoliciesReportSummary` answers the same id with. WHICH
+//! SENTENCE that refusal carries is this operation's own — `The report ID '<id>' does not
+//! exist.` ([`crate::state::declarative_policies_reports_report_id_not_found`]) — because the
+//! two readers are recorded wording that one class differently and nothing in the model
+//! distinguishes them. The malformed half of that family belongs to the operation that ACTS on
+//! one named report (`CancelDeclarativePoliciesReport`), where a value that is no report id
+//! names nothing to cancel; a report READS the set it was asked about, so it has one answer
+//! for every id it cannot resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -159,9 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            MAX_PAGE_SIZE, MAX_RESOURCE_IDS, PageTokenRule, decode_page_token,
-            dry_run_operation, invalid_declarative_policies_report_id_not_found,
-            invalid_pagination_token_for, page_from_cursor, require_service_state,
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS, PageTokenRule,
+            declarative_policies_reports_report_id_not_found, decode_page_token,
+            dry_run_operation, invalid_pagination_token_for, page_from_cursor,
+            require_service_state,
         };
 
         // `ctx` carries request metadata only, and this operation reads none of it: a report
@@ -216,15 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ids name this operation's OWN resource, so one the organization started no
         // report under is an error rather than an absent row — reported NOT FOUND whatever
-        // its form, which is what this operation's recorded contract answers and the half
-        // `GetDeclarativePoliciesReportSummary` answers the same id with (see the module
-        // docs). Asked before anything is reported, so a request naming one id it cannot
-        // resolve is refused rather than answered with the rest, and asked in the order the
-        // REQUEST listed its ids, so the refusal names the first one it could not resolve
-        // rather than whichever sorts lowest.
+        // its form, which is the half `GetDeclarativePoliciesReportSummary` answers the same
+        // id with too (see the module docs). The SENTENCE is this operation's own
+        // ([`crate::state::declarative_policies_reports_report_id_not_found`]): the two
+        // readers are recorded wording one class differently, and the sentence a caller reads
+        // is the one the operation it called states. Asked before anything is reported, so a
+        // request naming one id it cannot resolve is refused rather than answered with the
+        // rest, and asked in the order the REQUEST listed its ids, so the refusal names the
+        // first one it could not resolve rather than whichever sorts lowest.
         for report_id in requested_ids {
             if !store.declarative_policies_reports.contains_key(report_id) {
-                return Err(invalid_declarative_policies_report_id_not_found(report_id));
+                return Err(declarative_policies_reports_report_id_not_found(report_id));
             }
         }
 

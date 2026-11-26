@@ -13,11 +13,11 @@
 //! its stored name, type and value, in the order the insight holds them — rendering
 //! each value with the markup the field carries when the request asks for HTML content
 //! and as plain content otherwise; the insight is addressed by the ENTITY and the id
-//! together and BOTH halves have to resolve, so an address that resolves to no insight
-//! — an entity this account does not hold, or an id the entity holds no insight under —
-//! is refused as ONE missing resource naming neither half of it; an insight the service
-//! has raised no detail field for details with the one field the service states about an
-//! insight's details; and nothing is written.
+//! together, and only the ENTITY half refuses — an entity this account does not hold is
+//! the ONE missing resource naming neither half of the address, while an id a resolvable
+//! entity holds no insight under is this INFORMATIONAL read's own 200, carrying the one
+//! field the service states about an insight's details, exactly as an insight the service
+//! has raised no detail field for is detailed; and nothing is written.
 //!
 //! So the assertions span a SET of inputs rather than one call: a table of fields
 //! covering both values of `InsightFieldType`, a field with a marked-up rendering and
@@ -274,7 +274,7 @@ fn reported_value(reported: &[Value], name: &str, case: &str) -> String {
 /// and carrying the service's own sentence — whichever insight a read details, and in
 /// either rendering, because the guidance is content the service states rather than
 /// content it marks up.
-fn guidance(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn guidance(answer: &Answer, case: &str) -> Vec<Value> {
     /// The sentence the service states about an insight's details, as the wire answer
     /// recorded for a detail read words it.
     const GUIDANCE: &str = "Please use the Amazon OpenSearch Console to view the Insight \
@@ -502,9 +502,9 @@ async fn an_insight_is_addressed_through_the_entity_that_holds_it() {
 
     // A sibling domain of the same account does not hold this insight, and no
     // `DomainName` entity holds the account's own one: an insight is reported by the
-    // entity that holds it, so another entity of the same account resolves no insight
-    // under that id and the read is refused as one missing resource — the id itself
-    // never widens the entity a read is scoped to.
+    // entity that holds it, so another entity of the same account selects no insight
+    // under that id — the id itself never widens the entity a read is scoped to, and the
+    // read reports the service's guidance rather than that entity's stored fields.
     for (entity, insight_id) in [
         (domain_entity("insight-detail-other"), id.clone()),
         (
@@ -514,17 +514,12 @@ async fn an_insight_is_addressed_through_the_entity_that_holds_it() {
     ] {
         let case = format!("DescribeInsightDetails({entity:?}, {insight_id:?})");
         let answer = describe_insight(&emulator, entity.clone(), &insight_id, json!({})).await;
-        refused(
-            &answer,
-            &case,
-            RECORDED_NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
-        );
+        guidance(&answer, &case);
     }
 }
 
 #[tokio::test]
-async fn an_id_the_entity_holds_no_insight_under_is_refused_as_a_missing_resource() {
+async fn an_id_the_entity_holds_no_insight_under_details_with_the_services_guidance() {
     let emulator = Emulator::new();
     let id = seeded(&emulator, "insight-detail-missing").await;
     create_baseline(&emulator, "insight-detail-nothing").await;
@@ -557,9 +552,9 @@ async fn an_id_the_entity_holds_no_insight_under_is_refused_as_a_missing_resourc
                 unheld, &id,
                 "case DescribeInsightDetails({unheld:?}): the row must name another id"
             );
-            // The three ways a request can answer `ShowHtmlContent`: what the request
-            // asks a field to be rendered as does not decide whether the insight it
-            // addresses exists, so every one of them is refused the same way.
+            // The three ways a request can answer `ShowHtmlContent`: the guidance is
+            // content the service states rather than content it marks up, so every one of
+            // them is detailed with the same field.
             for extra in [
                 json!({}),
                 json!({"ShowHtmlContent": false}),
@@ -568,29 +563,19 @@ async fn an_id_the_entity_holds_no_insight_under_is_refused_as_a_missing_resourc
                 let case = format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
                 let answer =
                     describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
-                refused(
-                    &answer,
-                    &case,
-                    RECORDED_NOT_FOUND_STATUS,
-                    "ResourceNotFoundException",
-                );
-                // ONE refusal for both halves of the address: a caller cannot tell an
-                // entity this account does not hold from an insight it does not hold, so
-                // the sentence is fixed and names neither half.
+                // The informational 200 of a resolvable entity: the id half selects, so an
+                // id it holds no insight under is detailed with the guidance and never the
+                // missing resource an unresolvable ENTITY is.
+                guidance(&answer, &case);
                 let said = answer.body["message"].as_str().unwrap_or_default();
-                assert_eq!(
+                assert_ne!(
                     said, RESOURCE_NOT_FOUND,
-                    "case {case}: expected the fixed missing-resource sentence, got {said:?}"
-                );
-                assert!(
-                    answer.body["Fields"].is_null(),
-                    "case {case}: a refused read carries no detailed view, got {:?}",
+                    "case {case}: expected no missing-resource refusal, got {:?}",
                     answer.body
                 );
             }
         }
-        // The refused reads raised no insight: the entity's listing is exactly what it
-        // was.
+        // The reads raised no insight: the entity's listing is exactly what it was.
         let after = list(&emulator, entity.clone()).await;
         assert_eq!(
             after.body, before.body,
@@ -601,7 +586,7 @@ async fn an_id_the_entity_holds_no_insight_under_is_refused_as_a_missing_resourc
     }
 
     // The insight the entity DOES hold is still reported in full, so an id it holds
-    // none under leaves the set it was looked up in as it was.
+    // none under left the set it was looked up in as it was.
     let answer = describe_insight(
         &emulator,
         domain_entity("insight-detail-missing"),

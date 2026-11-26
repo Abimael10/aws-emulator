@@ -326,13 +326,20 @@ enum Unresolvable {
     AllocatedAndLost,
 }
 
-/// Assert how `DeleteDomain` refuses an id that resolves nothing: the modelled 404 naming
-/// the requested id, whatever the id's own allocation history.
+/// Assert how `DeleteDomain` refuses an id that resolves nothing, which splits on the id's
+/// own ALLOCATION HISTORY:
 ///
-/// `kind` is carried by the rows so each case NAMES the history it was driven with; it
-/// does not change what is asserted, which is the point — `smithy_query(query="operation",
-/// operation="DeleteDomain")` lists `ResourceNotFoundException` as this operation's only
-/// error, so there is no second refusal for an unresolvable id to take.
+/// * [`Unresolvable::AllocatedAndLost`] — an id this service DID allocate names a resource
+///   this account had, so it is the modelled not-found naming the requested id;
+///   `smithy_query(query="operation", operation="DeleteDomain")` lists
+///   `ResourceNotFoundException` as this operation's only error.
+/// * [`Unresolvable::NeverAllocated`] — an id with no allocation history anywhere resolves
+///   no ARN for the front door to authorize the call against, so the refusal is that door's
+///   own, carrying no detail member at all. The code is declared on no shape of this model,
+///   which is why it is asserted by name here.
+///
+/// Either way the status is a CLIENT fault: the condition is permanent and lies in the
+/// request's own id, and an SDK retries a server fault.
 fn assert_delete_refusal(
     case: &str,
     kind: Unresolvable,
@@ -340,20 +347,46 @@ fn assert_delete_refusal(
     status: u16,
     body: &Value,
 ) {
-    assert_eq!(
-        (status, error_code(body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case {case:?} ({kind:?}): expected the modelled not-found, got {status} {body:?}"
-    );
-    assert_eq!(
-        detail_text(case, body),
-        format!("Domain not found: {domain_id}"),
-        "case {case:?} ({kind:?}): the not-found must name the requested id, got {body:?}"
+    match kind {
+        Unresolvable::AllocatedAndLost => {
+            assert_eq!(
+                (status, error_code(body).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?} ({kind:?}): expected the modelled not-found, got {status} \
+                 {body:?}"
+            );
+            assert_eq!(
+                detail_text(case, body),
+                format!("Domain not found: {domain_id}"),
+                "case {case:?} ({kind:?}): the not-found must name the requested id, got \
+                 {body:?}"
+            );
+        }
+        Unresolvable::NeverAllocated => {
+            assert_eq!(
+                (status, error_code(body).as_str()),
+                (403, "AuthorizerConfigurationException"),
+                "case {case:?} ({kind:?}): expected the front door's own refusal, got \
+                 {status} {body:?}"
+            );
+            for member in crate::domain_subscription_lifecycle::DETAIL_MEMBERS {
+                assert!(
+                    body.get(member).and_then(Value::as_str).is_none(),
+                    "case {case:?} ({kind:?}): this refusal carries no detail member, got \
+                     {member} in {body:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        status < 500,
+        "case {case:?} ({kind:?}): the condition lies in the request's own id and is \
+         permanent, so it is never the server fault an SDK retries, got {status} {body:?}"
     );
 }
 
 #[tokio::test]
-async fn delete_domain_refuses_every_unresolvable_id_with_the_modelled_not_found() {
+async fn delete_domain_refuses_every_unresolvable_id_on_the_ids_allocation_history() {
     let emulator = Emulator::new("us-east-1");
 
     // Every way a well-formed `domainId` can resolve no domain in the Region a request is
@@ -492,15 +525,14 @@ fn assert_one_detail_stated(case: &str, body: &Value) {
 }
 
 #[tokio::test]
-async fn delete_domain_answers_one_and_the_same_id_alike_whatever_its_allocation_history() {
+async fn delete_domain_splits_one_and_the_same_id_on_its_allocation_history() {
     let emulator = Emulator::new("us-east-1");
     // The rows differ along everything the modelled `DomainId` generalises over — both
     // prefixes, both ends of the 20..25 length range, and digits-only, letters-only and
     // mixed bodies. Each one is driven TWICE: once with no allocation history anywhere,
     // then with that same id remembered as allocated and still resolving no domain. The
-    // request is identical in both passes, and so is the answer: what the operation
-    // reports is that this endpoint holds no such domain, which the id's own history
-    // cannot change.
+    // request is identical in both passes, so what the answer turns on is the HISTORY
+    // alone and nothing about the id itself.
     let rows = [
         (
             "the shortest dom- id (20), letters only",
@@ -526,26 +558,19 @@ async fn delete_domain_answers_one_and_the_same_id_alike_whatever_its_allocation
 
     for (row, domain_id) in &rows {
         let path = format!("/domain/{domain_id}");
-        // An id with no allocation history anywhere: the resource the request asks to
-        // delete is not here, which is the one error this operation models. The repeat is
-        // answered identically: the model declares the operation `@idempotent` and a
-        // refused delete writes nothing.
+        // An id with no allocation history anywhere: no ARN resolves for the front door to
+        // authorize the call against, so the refusal is that door's own and carries no
+        // detail member. The repeat is answered identically: the model declares the
+        // operation `@idempotent` and a refused delete writes nothing.
         for attempt in 1..=2 {
             let case = format!("{row} ({domain_id}), never allocated, attempt {attempt}");
             let (status, body) = emulator.send("DELETE", &path, None).await;
             assert_delete_refusal(&case, Unresolvable::NeverAllocated, domain_id, status, &body);
-            assert_one_detail_stated(&case, &body);
-            assert!(
-                status < 500,
-                "case {case:?}: the condition lies in the request's own id and is \
-                 permanent, so it is never the server fault an SDK retries, got {status} \
-                 {body:?}"
-            );
         }
 
         // The SAME id, now remembered as allocated and still resolving no domain here: a
-        // resource this account had and has lost is the same missing resource, answered
-        // the same way.
+        // resource this account had and has lost is the modelled missing resource, worded
+        // by this service and stated once.
         remember_allocation(&emulator, domain_id);
         for attempt in 1..=2 {
             let case = format!("{row} ({domain_id}), once allocated, attempt {attempt}");
