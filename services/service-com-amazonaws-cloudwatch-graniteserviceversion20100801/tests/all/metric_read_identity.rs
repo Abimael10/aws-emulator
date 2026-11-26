@@ -21,7 +21,8 @@
 //!    parameter specifies a time stamp that is greater than 3 hours ago, you must specify the
 //!    period as follows or no data points in that time range is returned".
 //! 3. A read asking for more datapoints than one call returns is refused with the count the
-//!    REQUEST asked for, the cap, and the two remedies the operation documents.
+//!    REQUEST asked for — the WHOLE periods of the half-open range it named — the cap, and the
+//!    two remedies the operation documents.
 //! 4. `Statistics` and `ExtendedStatistics` are an either/or combination, and a constraint the
 //!    boundary validator catches on a dimension collection or inside a statistic list is
 //!    answered as the parameter fault those operations model.
@@ -452,6 +453,142 @@ async fn the_count_a_capped_read_names_is_the_periods_of_the_range_the_request_n
             &read("Skewed", start, end, period, None),
         )
         .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterCombinationException",
+            "case {case:?}: expected the combination fault, got {body}"
+        );
+        let expected = format!(
+            "You have requested up to {periods} datapoints, which exceeds the limit of \
+             {MAX_DATAPOINTS}. You may reduce the datapoints requested by increasing Period, or \
+             decreasing the time range."
+        );
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            error_message(&body)
+        );
+    }
+}
+
+/// One row of the trailing-part-of-a-period table: a requested range that spans `periods` whole
+/// periods and then part of one more.
+struct BudgetRow {
+    /// What this row varies, named in every assertion it makes.
+    case: &'static str,
+    /// The `Period`, in seconds, the read asks for.
+    period: i64,
+    /// How many WHOLE periods the requested range spans — the count the request asked for.
+    periods: i64,
+    /// How far into a FURTHER period the range runs past those whole ones, in seconds.
+    remainder: f64,
+    /// Whether the range ends AHEAD of the instant the read is answered at, as a caller reading
+    /// up to the next window does.
+    ends_ahead: bool,
+}
+
+#[tokio::test]
+async fn the_count_a_capped_read_names_excludes_a_trailing_part_of_a_period() {
+    let router = build_router();
+    let now = crate::harness::now_secs();
+
+    // "The value specified is inclusive" (`GetMetricStatisticsInput$StartTime`) against "The
+    // value specified is exclusive" (`$EndTime`): the datapoints a range asks for are the whole
+    // periods that FIT in it, so a range running part-way into a further period has asked for
+    // the same count as one that stops at the last whole period. The rows differ along what
+    // that generalises over: the period, how much of a further period the range runs into (a
+    // fraction of a second, one second, half a period, all but a second of one), whether the
+    // range ends ahead of now, and how the count sits against the cap — over it, exactly on it
+    // with part of a further period still to run, and far under it.
+    let rows = vec![
+        BudgetRow {
+            case: "a fortnight and a minute of one-minute periods ending ahead of now",
+            period: 60,
+            periods: 14 * 24 * 60 + 1,
+            remainder: 37.0,
+            ends_ahead: true,
+        },
+        BudgetRow {
+            case: "ten days of one-minute periods, a fraction of a second over",
+            period: 60,
+            periods: 10 * 24 * 60,
+            remainder: 0.25,
+            ends_ahead: false,
+        },
+        BudgetRow {
+            case: "five-minute periods, one second over",
+            period: 300,
+            periods: 4_000,
+            remainder: 1.0,
+            ends_ahead: false,
+        },
+        BudgetRow {
+            case: "one-second periods over four hours and a minute, a fraction of a second over",
+            period: 1,
+            periods: 4 * 60 * 60 + 60,
+            remainder: 0.25,
+            ends_ahead: true,
+        },
+        BudgetRow {
+            case: "one-hour periods, half a period over",
+            period: 3_600,
+            periods: 1_800,
+            remainder: 1_800.0,
+            ends_ahead: false,
+        },
+        BudgetRow {
+            case: "exactly the cap with part of a further period still to run",
+            period: 60,
+            periods: MAX_DATAPOINTS,
+            remainder: 59.0,
+            ends_ahead: true,
+        },
+        BudgetRow {
+            case: "one period and part of another",
+            period: 60,
+            periods: 1,
+            remainder: 30.0,
+            ends_ahead: false,
+        },
+    ];
+
+    for BudgetRow {
+        case,
+        period,
+        periods,
+        remainder,
+        ends_ahead,
+    } in rows
+    {
+        let span = f64::from(period as i32);
+        let aligned = (now / span).floor() * span;
+        let end = if ends_ahead { aligned + span } else { aligned };
+        #[allow(clippy::cast_precision_loss)]
+        let whole = span * periods as f64;
+        let start = end - whole - remainder;
+        let (status, body) = call(
+            &router,
+            "GetMetricStatistics",
+            &read("Trailing", start, end, period, None),
+        )
+        .await;
+
+        // The count decides the refusal as well as its wording: a request whose whole periods
+        // reach only the cap is SERVED, however far into a further period its range runs.
+        if periods <= MAX_DATAPOINTS {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {periods} whole periods is inside the cap and is served, got \
+                 {status} with {body}"
+            );
+            continue;
+        }
+
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with {body}"

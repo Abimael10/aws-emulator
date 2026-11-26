@@ -149,22 +149,26 @@ pub fn resolution_refusal(
     None
 }
 
-/// How many datapoints an array asks for over `[start, end)`: one per `Period` of the range for
-/// each query that RETRIEVES a metric, summed over those queries.
+/// How many datapoints an array asks for over `[start, end)`: one per whole `Period` of the
+/// range for each query that RETRIEVES a metric, summed over those queries.
+///
+/// Each query's own count is the one shared rule every reader held against a datapoint cap
+/// counts by ([`super::requested_datapoint_count`]), so what one array is said to have
+/// requested and what a single-metric read is said to have requested are the same arithmetic.
 ///
 /// A query that retrieves no metric requests no datapoint: an expression's own series is
 /// computed from the values of the queries it reads, bounded by the evaluator's budget.
 #[must_use]
 pub fn requested_datapoints(queries: &[MetricDataQuery], start: f64, end: f64) -> usize {
-    let span = (end - start).max(0.0);
     let mut requested = 0usize;
     for query in queries {
         if query.metric_stat.is_none() {
             continue;
         }
-        let period = query_period(query).max(1.0);
+        let period = query_period(query);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let asked = (span / period).ceil().min(f64::from(u32::MAX)) as usize;
+        let asked = super::requested_datapoint_count(start, end, period)
+            .min(f64::from(u32::MAX)) as usize;
         requested = requested.saturating_add(asked);
     }
     requested

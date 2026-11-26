@@ -3132,6 +3132,33 @@ pub const MAX_DATAPOINTS_PER_SERIES: usize = 50_000;
 /// minute it happened in.
 pub const SELF_METERED_STORAGE_RESOLUTION: i32 = 60;
 
+/// How many data points a read over `[start, end)` at a `period`-wide window HAS REQUESTED:
+/// the WHOLE `period`-long buckets the range the request named spans.
+///
+/// The range is half-open — "The value specified is inclusive; results include data points with
+/// the specified time stamp" (`GetMetricStatisticsInput$StartTime`) against "The value specified
+/// is exclusive" (`$EndTime`) — so the buckets it asks for are the ones that FIT in it: a range
+/// of exactly N periods asks for N data points, and one that runs part-way into a further period
+/// asks for N as well, because that part is not a period of the window the caller named. A range
+/// narrower than one period therefore asks for none.
+///
+/// Counted over the range the REQUEST named, not over the rounded one: the documented rounding
+/// of a start time ([`rounded_start`]) decides which windows are READ, so a caller that moves
+/// its start time by less than one period has asked for the same number of data points.
+///
+/// One computation for every reader that holds a request against a datapoint cap and states
+/// the count in the refusal ([`datapoint_cap_exceeded`]), so the number a read decides by and
+/// the number its sentence names cannot drift apart.
+#[must_use]
+pub fn requested_datapoint_count(start: f64, end: f64, period: f64) -> f64 {
+    let width = if period.is_finite() && period >= 1.0 {
+        period
+    } else {
+        1.0
+    };
+    ((end - start).max(0.0) / width).floor()
+}
+
 /// What a read that asks for more data points than one call returns is told.
 ///
 /// "The maximum number of data points returned from a single call is 1,440. If you request
