@@ -10,6 +10,39 @@ Issue-Commit: 1cf5471edbe600272181c2f2fbc34afdc114dc10
 
 > _Note: this issue was identified against the code base at commit `1cf5471edbe600272181c2f2fbc34afdc114dc10`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Cause 1's behaviour is already correct in this tree and is now PINNED on the ASSEMBLED emulator; its
+replay key still times out for a reason outside the emulator.
+
+An accepted invocation leaves `InProgress` as soon as the clock makes that transition due and reaches
+the modelled `Completed` with `endTime` and `lastModifiedTime` set, having first written its output —
+the generated media object and the manifest beside it — under the configured
+`outputDataConfig.s3OutputDataConfig.s3Uri`, so no read reports `Completed` before the artifact is
+there to read (`src/state.rs` `ASYNC_INVOKE_SETTLE_MILLIS` / `due_async_invokes` /
+`settle_async_invoke`, `src/state/async_invoke_output.rs`, `src/state/async_invoke_video.rs`, driven
+from `src/ops/get_async_invoke.rs` and `src/ops/list_async_invokes.rs`). That was not the state of the
+code at the commit this report was filed against (`1cf5471`), which is what its drift note warns about.
+
+What this change adds is the evidence for the whole emulator rather than for a two-service router:
+`core/router/tests/all/bedrock_runtime_async_invoke_settles_on_the_assembled_router.rs` drives
+`s3:CreateBucket -> StartAsyncInvoke -> poll GetAsyncInvoke -> ListObjectsV2` through
+`aws_emulator_router::build_router` — every service mounted, as the binary serves it — over three rows
+spanning two providers, their published payload members and three shapes of the configured location,
+and asserts convergence to `Completed`, the unchanged `s3Uri` on every later read, a non-empty object
+under the configured prefix read back through Amazon S3's own operation, and that re-reads keep
+answering the identical record and the identical objects. Routing on the assembled router (a claim
+collision on `GET /async-invoke/{invocationArn}`) is therefore ruled out as a cause of the harness
+timeout as well.
+
+What is left is the check's own shape: it observes the retention window for ~60 s in `time.sleep(2)`
+steps, which is the harness's whole 60 s check budget, so it is killed in a sleep whatever the emulator
+answers. The same replay key carries that finding on the landed report
+`issues/things-that-now-work/20261114T192735Z-bedrock-runtime-async-invoke-writes-no-model-output.md`
+(its Cause 2), and the sibling check
+`bedrock-runtime.async-invoke-output-written-to-configured-destination-serverside` runs the same
+start -> poll-to-terminal -> list sequence over the same wire and passes.
+
 ## Operation
 GetAsyncInvoke
 
