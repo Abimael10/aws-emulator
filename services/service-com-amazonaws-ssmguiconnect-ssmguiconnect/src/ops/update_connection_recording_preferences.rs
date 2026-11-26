@@ -5,6 +5,10 @@
 //! Creates-or-replaces the per-account/per-Region connection recording preferences
 //! singleton held in [`crate::state`], and reports back what was stored.
 //!
+//! IN THE REQUESTING REGION: the record written is the one the Region this request was
+//! signed for holds ([`crate::state::request_region`]), so a call never replaces another
+//! Region's record — the resource exists per account and Region.
+//!
 //! `@idempotent` with an `@idempotencyToken` `ClientToken`, so a replay of the same
 //! token returns the first outcome instead of writing a second time; a request that
 //! omits the token gets a service-provided one
@@ -22,6 +26,14 @@
 //! policies do not allow this action is refused with the same modeled error and its own
 //! sentence ([`crate::state::authorization`]), so the two denial causes — a missing IAM
 //! grant and the account's enrollment — never share a message.
+//!
+//! BOUNDED: the Region a record is filed under comes from the caller's own credential
+//! scope, so an Update that would configure a FURTHER Region past
+//! [`crate::state::MAX_CONFIGURED_REGIONS`] is refused with the modeled
+//! `ServiceQuotaExceededException` (402) and writes nothing; its message
+//! ([`crate::state::region_ceiling_message`]) says the ceiling is this emulator's own.
+//! Replacing a Region's existing record needs no further room and is never refused for
+//! it.
 //!
 //! ## Reaching this service's state
 //!
@@ -81,7 +93,8 @@
 use super::types::*;
 
 use crate::state::{
-    audit, AuditOutcome, IdempotentOperation, RecordingPrefsRecord, StoredResponse,
+    audit, idempotency_key, AuditOutcome, IdempotentOperation, RecordingPrefsRecord,
+    StoredResponse,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -236,7 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .client_token
             .unwrap_or_else(crate::state::mint_client_token);
 
-        let key = (IdempotentOperation::Update, client_token.clone());
+        // PER REGION: the record this call writes, and the idempotency outcome it
+        // records, both belong to the Region the request was signed for — the scope the
+        // resource exists in — so a token replayed in another Region addresses another
+        // record and runs there for real.
+        let region = crate::state::request_region(ctx.parts());
+        let key = idempotency_key(IdempotentOperation::Update, &region, &client_token);
 
         // THIS service's own store, taken only once every gate above has passed: the
         // cross-crate reads those gates make are done with no guard of it held.
@@ -244,8 +262,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation is `@idempotent`: a replayed token answers with the record
         // the FIRST call persisted and writes nothing — but only while that record is
-        // still the stored singleton, so a replay can never report a resource a later
-        // Delete or Update has already changed.
+        // still the one its Region holds, so a replay can never report a resource a
+        // later Delete or Update has already changed.
         if let Some(StoredResponse::Updated(record)) = store.replayable_outcome(&key) {
             let replayed = UpdateConnectionRecordingPreferencesOutput {
                 client_token: Some(record.client_token.clone()),
@@ -256,13 +274,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(replayed);
         }
 
-        // Create-or-REPLACE: the singleton holds exactly what this request asked for,
-        // never the union of this request and the last one.
+        // BOUNDED STATE, the other half: the Region a record is filed under is the
+        // caller's own credential scope, so configuring a Region the store holds none for
+        // is what grows the records. Past `crate::state::MAX_CONFIGURED_REGIONS` such a
+        // call is refused with the modelled quota error and nothing is written; replacing
+        // a Region's existing record needs no further room, so it is never refused here.
+        if !store.has_room_for(&region) {
+            drop(store);
+            audit(Self::NAME, ctx, AuditOutcome::QuotaExceeded);
+            return Err(
+                UpdateConnectionRecordingPreferencesErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: crate::state::region_ceiling_message(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Create-or-REPLACE: the Region's record holds exactly what this request asked
+        // for, never the union of this request and the last one.
         let record = RecordingPrefsRecord::from_request(
             &input.connection_recording_preferences,
             client_token,
         );
-        store.put_preferences(record.clone());
+        store.put_preferences(&region, record.clone());
         drop(store);
         audit(Self::NAME, ctx, AuditOutcome::PreferencesWritten);
 

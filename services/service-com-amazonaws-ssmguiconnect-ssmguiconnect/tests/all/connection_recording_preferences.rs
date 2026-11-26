@@ -18,6 +18,11 @@
 //!    same `ClientToken` replayed answers with the first call's outcome and does not
 //!    mutate again; a request that omits it gets a service-provided token back.
 //! 3. A value outside a modeled constraint is `ValidationException` (400).
+//! 4. The resource exists PER REGION: a call reaches the record of the Region its own
+//!    credential scope names and of no other, so a read answers that Region's record (or
+//!    404), and a write or a delete leaves every other Region's record exactly as it was.
+//!    The Regions that hold a record at once are capped, because that Region is a value
+//!    the caller chooses.
 //!
 //! Each rule is asserted over a TABLE of inputs spanning what it generalises over
 //! (bucket name form and length, owner-id shape, list length, key-ARN length, token
@@ -32,15 +37,18 @@
 use std::sync::Arc;
 
 use service_com_amazonaws_ssmguiconnect_ssmguiconnect::state::{
-    bucket_name_matches_model_pattern, IdempotentOperation, BUCKET_NAME_PATTERN,
-    MAX_IDEMPOTENCY_OUTCOMES,
+    bucket_name_matches_model_pattern, idempotency_key, region_ceiling_message,
+    IdempotentOperation, BUCKET_NAME_PATTERN, MAX_CONFIGURED_REGIONS, MAX_IDEMPOTENCY_OUTCOMES,
 };
 use service_com_amazonaws_ssmguiconnect_ssmguiconnect::{
     ComAmazonawsSsmguiconnectSsmguiconnectState, EmulatedService,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::identity_authorization::{register_systems_manager, REGION};
+use crate::identity_authorization::{
+    enroll as enroll_region, error_code as shared_error_code, error_message,
+    register_systems_manager, request as signed_request, REGION,
+};
 
 /// A router carrying this service, over a fresh engine — one isolated store per test —
 /// for an account as AWS leaves it: NOT enrolled in just-in-time node access, which is
@@ -92,23 +100,11 @@ const DEFAULT_AKID: &str = "AKIDEXAMPLE";
 
 /// A restJson1 request for `op`, routed by the SigV4 credential scope the way every
 /// signed AWS SDK request is, presenting `akid` as its access key id.
+///
+/// Signed for [`REGION`] through the Region-parameterised builder the sibling
+/// authorization suite owns, so there is one way a request to this service is built.
 fn request(op: &str, body: &serde_json::Value, akid: &str) -> http::Request<bytes::Bytes> {
-    http::Request::builder()
-        .method("POST")
-        .uri(format!("/{op}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 \
-                 Credential={akid}/20260101/us-east-1/ssm-guiconnect/aws4_request, \
-                 SignedHeaders=host, Signature=0"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("serialize the request body"),
-        ))
-        .expect("build the request")
+    signed_request(REGION, akid, op, body)
 }
 
 /// Status code plus parsed JSON body of one call.
@@ -128,7 +124,12 @@ async fn call_as(
     body: serde_json::Value,
     akid: &str,
 ) -> (u16, serde_json::Value) {
-    let response = router.dispatch(request(op, &body, akid)).await;
+    reply_of(router.dispatch(request(op, &body, akid)).await)
+}
+
+/// One response reduced to what every case below reads: its status and its parsed body.
+/// The one place a response is read, so a call signed for any Region is reported alike.
+fn reply_of(response: http::Response<bytes::Bytes>) -> (u16, serde_json::Value) {
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let json = if bytes.is_empty() {
@@ -139,15 +140,10 @@ async fn call_as(
     (status, json)
 }
 
-/// The `__type` of a restJson1 error body, shortened to the shape name.
+/// The `__type` of a restJson1 error body, shortened to the shape name — read through
+/// the sibling authorization suite's reader, so an error body is read one way here.
 fn error_code(body: &serde_json::Value) -> String {
-    body.get("__type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', '/'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    shared_error_code(body)
 }
 
 fn preferences(owner: &str, bucket: &str, key_arn: &str) -> serde_json::Value {
@@ -1006,7 +1002,9 @@ async fn a_re_recorded_outcome_outlives_the_outcomes_recorded_before_it() {
             retained, MAX_IDEMPOTENCY_OUTCOMES,
             "case {case:?}: the store must stay full at its cap once passed, got {retained}"
         );
-        let reused_key = (reused_op, REUSED.to_string());
+        // The key an outcome is recorded under carries the Region the call was made in,
+        // which for every call above is the one `request` signs for.
+        let reused_key = idempotency_key(reused_op, REGION, REUSED);
         assert!(
             store.recorded_outcome(&reused_key).is_some(),
             "case {case:?}: the outcome re-recorded under {REUSED:?} was recorded after every \
@@ -1017,7 +1015,7 @@ async fn a_re_recorded_outcome_outlives_the_outcomes_recorded_before_it() {
         for n in 0..EARLIER {
             let expected_retained = n >= overflow;
             let actual_retained = store
-                .recorded_outcome(&(other_op, format!("earlier-{n}")))
+                .recorded_outcome(&idempotency_key(other_op, REGION, &format!("earlier-{n}")))
                 .is_some();
             assert_eq!(
                 actual_retained, expected_retained,
@@ -1542,4 +1540,460 @@ fn audit_records(captured: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4 — the resource exists per Region
+// ---------------------------------------------------------------------------
+
+/// One call to `op` signed for `region`, built with the same request builder the
+/// authorization suite routes every Region's call with — so the only thing that differs
+/// between two calls here is the Region of the credential scope.
+async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    op: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    reply_of(
+        router
+            .dispatch(signed_request(region, DEFAULT_AKID, op, &body))
+            .await,
+    )
+}
+
+/// Enroll the account in just-in-time node access in `region`, over Systems Manager's own
+/// API — the precondition every Update below has to satisfy in the Region it is made in.
+async fn enroll_in(router: &MultiServiceRouter, region: &str) {
+    enroll_region(router, region, true).await;
+}
+
+/// A well-formed Update in `region` storing `bucket` under `token`.
+async fn update_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    bucket: &str,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    call_in(
+        router,
+        region,
+        "UpdateConnectionRecordingPreferences",
+        serde_json::json!({
+            "ConnectionRecordingPreferences": preferences("123456789012", bucket, KEY_ARN),
+            "ClientToken": token,
+        }),
+    )
+    .await
+}
+
+/// A Delete in `region` carrying `token`.
+async fn delete_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    call_in(
+        router,
+        region,
+        "DeleteConnectionRecordingPreferences",
+        serde_json::json!({ "ClientToken": token }),
+    )
+    .await
+}
+
+/// A Get in `region`.
+async fn get_in(router: &MultiServiceRouter, region: &str) -> (u16, serde_json::Value) {
+    call_in(
+        router,
+        region,
+        "GetConnectionRecordingPreferences",
+        serde_json::json!({}),
+    )
+    .await
+}
+
+/// The bucket name a Get (or an Update) response reports, or `None` when it carries no
+/// preferences at all.
+fn reported_bucket(body: &serde_json::Value) -> Option<&str> {
+    body["ConnectionRecordingPreferences"]["RecordingDestinations"]["S3Buckets"][0]["BucketName"]
+        .as_str()
+}
+
+/// Assert that `region` reports exactly the record `bucket` and `token` describe.
+async fn assert_reports(
+    router: &MultiServiceRouter,
+    region: &str,
+    bucket: &str,
+    token: &str,
+    case: &str,
+) {
+    let (status, got) = get_in(router, region).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {region} to report its own record, got {status} with {got:?}"
+    );
+    assert_eq!(
+        reported_bucket(&got),
+        Some(bucket),
+        "case {case:?}: expected {region} to report {bucket:?}, got {got:?}"
+    );
+    assert_eq!(
+        got["ClientToken"].as_str(),
+        Some(token),
+        "case {case:?}: expected {region} to report the token of its own last write \
+         ({token:?}), got {got:?}"
+    );
+}
+
+/// Assert that `region` has no configured resource: 404 `ResourceNotFoundException`.
+async fn assert_reports_nothing(router: &MultiServiceRouter, region: &str, case: &str) {
+    let (status, response) = get_in(router, region).await;
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected {region} to have nothing configured, got {status} with \
+         {response:?}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ResourceNotFoundException",
+        "case {case:?}: expected ResourceNotFoundException in {region}, got {response:?}"
+    );
+}
+
+/// Region pairs the mutation cases below run over: the Region the sibling cases use,
+/// another one of the same partition, and a pair in which neither is the Region an
+/// unsigned request would default to.
+const REGION_PAIRS: [(&str, &str, &str); 3] = [
+    ("the Region the sibling cases use", REGION, "eu-west-1"),
+    ("another Region", "eu-west-1", REGION),
+    ("neither Region the default one", "ap-south-1", "eu-central-1"),
+];
+
+/// A read reports the record of the Region its own credential scope names: each
+/// configured Region answers with ITS record, and a Region nothing configured has no
+/// resource to report at all — whatever another Region holds.
+///
+/// The table varies the Region together with every stored member, so a row answered from
+/// another Region's record could not pass; the unconfigured rows are the other side of
+/// the same rule.
+#[tokio::test]
+async fn each_region_reports_its_own_record_and_no_other() {
+    // (case, region, bucket owner, bucket name, kms key arn)
+    let configured: [(&str, &str, &str, &str, &str); 3] = [
+        (
+            "the Region the sibling cases use",
+            REGION,
+            "123456789012",
+            "home-rdp-recordings",
+            KEY_ARN,
+        ),
+        (
+            "another Region of the same partition",
+            "eu-west-1",
+            "210987654321",
+            "eu.rdp.recordings",
+            "k",
+        ),
+        (
+            "a third Region",
+            "ap-south-1",
+            "999999999999",
+            "ap-recordings-1",
+            KEY_ARN,
+        ),
+    ];
+    // Regions no call configured.
+    let unconfigured = ["eu-central-1", "us-west-2"];
+
+    let router = router();
+
+    for (case, region, owner, bucket, key_arn) in configured {
+        enroll_in(&router, region).await;
+        let (status, written) = call_in(
+            &router,
+            region,
+            "UpdateConnectionRecordingPreferences",
+            serde_json::json!({
+                "ConnectionRecordingPreferences": preferences(owner, bucket, key_arn),
+                "ClientToken": format!("token-in-{region}"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the write in {region} to answer 200, got {status} with \
+             {written:?}"
+        );
+    }
+
+    // Every write is in, so each Region's read has to pick out its own record.
+    for (case, region, owner, bucket, key_arn) in configured {
+        let (status, got) = get_in(&router, region).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected {region} to report its record, got {status} with {got:?}"
+        );
+        let stored = &got["ConnectionRecordingPreferences"];
+        assert_eq!(
+            stored["KMSKeyArn"].as_str(),
+            Some(key_arn),
+            "case {case:?}: expected the KMSKeyArn written in {region}, got {got:?}"
+        );
+        assert_eq!(
+            reported_bucket(&got),
+            Some(bucket),
+            "case {case:?}: expected the BucketName written in {region}, got {got:?}"
+        );
+        assert_eq!(
+            stored["RecordingDestinations"]["S3Buckets"][0]["BucketOwner"].as_str(),
+            Some(owner),
+            "case {case:?}: expected the BucketOwner written in {region}, got {got:?}"
+        );
+        assert_eq!(
+            got["ClientToken"].as_str(),
+            Some(format!("token-in-{region}").as_str()),
+            "case {case:?}: expected the ClientToken of {region}'s own write, got {got:?}"
+        );
+    }
+
+    for region in unconfigured {
+        assert_reports_nothing(&router, region, &format!("a read in unconfigured {region}")).await;
+    }
+}
+
+/// A write and a delete reach the record of the Region the request was signed for and no
+/// other: replacing one Region's record leaves another's as it was, and removing one
+/// Region's record leaves another's readable.
+#[tokio::test]
+async fn a_write_or_a_delete_reaches_only_the_requesting_region() {
+    for (case, mutated, untouched) in REGION_PAIRS {
+        let router = router();
+        for region in [mutated, untouched] {
+            enroll_in(&router, region).await;
+        }
+
+        // Each Region starts with a record of its own, told apart by its bucket name and
+        // by the token its write carried.
+        for region in [mutated, untouched] {
+            let bucket = format!("{region}-first-bucket");
+            let token = format!("first-in-{region}");
+            let (status, written) = update_in(&router, region, &bucket, &token).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the setup write in {region} to answer 200, got \
+                 {status} with {written:?}"
+            );
+        }
+        let kept_bucket = format!("{untouched}-first-bucket");
+        let kept_token = format!("first-in-{untouched}");
+
+        // A second write in `mutated` replaces ITS record only.
+        let (status, replaced) = update_in(&router, mutated, "replacement-bucket", "replacement")
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the replacing write in {mutated} to answer 200, got \
+             {status} with {replaced:?}"
+        );
+        assert_reports(&router, mutated, "replacement-bucket", "replacement", case).await;
+        assert_reports(&router, untouched, &kept_bucket, &kept_token, case).await;
+
+        // A delete in `mutated` removes ITS record only.
+        let (status, removed) = delete_in(&router, mutated, "removal").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete in {mutated} to answer 200, got {status} with \
+             {removed:?}"
+        );
+        assert_reports_nothing(&router, mutated, case).await;
+        assert_reports(&router, untouched, &kept_bucket, &kept_token, case).await;
+    }
+}
+
+/// An `@idempotencyToken` is scoped to the Region it was used in, because the resource it
+/// describes is: the same token in another Region is a different call and runs there for
+/// real, while a replay within ONE Region still answers that Region's first outcome.
+#[tokio::test]
+async fn an_idempotency_token_is_scoped_to_its_own_region() {
+    /// The one token every call of a case carries, so the only thing telling two calls
+    /// apart is the Region they were made in.
+    const SHARED: &str = "shared-client-token";
+
+    for (case, first, second) in REGION_PAIRS {
+        let router = router();
+        for region in [first, second] {
+            enroll_in(&router, region).await;
+        }
+
+        let (status, written) = update_in(&router, first, "first-region-bucket", SHARED).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the write in {first} to answer 200, got {status} with \
+             {written:?}"
+        );
+
+        // The same token in the other Region: a different call, which stores that
+        // Region's own values rather than replaying the first Region's record.
+        let (status, elsewhere) = update_in(&router, second, "second-region-bucket", SHARED).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the write in {second} to answer 200, got {status} with \
+             {elsewhere:?}"
+        );
+        assert_eq!(
+            reported_bucket(&elsewhere),
+            Some("second-region-bucket"),
+            "case {case:?}: expected the call in {second} to store its own values rather than \
+             replay {first}'s, got {elsewhere:?}"
+        );
+        assert_reports(&router, first, "first-region-bucket", SHARED, case).await;
+        assert_reports(&router, second, "second-region-bucket", SHARED, case).await;
+
+        // Within ONE Region the token still replays: the same token answers the record
+        // the first call wrote, and writes nothing.
+        let (status, replayed) = update_in(&router, first, "would-be-a-replacement", SHARED).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the replay in {first} to answer 200, got {status} with \
+             {replayed:?}"
+        );
+        assert_eq!(
+            reported_bucket(&replayed),
+            Some("first-region-bucket"),
+            "case {case:?}: expected the replay in {first} to answer the first call's record, \
+             got {replayed:?}"
+        );
+        assert_reports(&router, first, "first-region-bucket", SHARED, case).await;
+
+        // A Delete token is scoped the same way: the delete in `first` is not the
+        // outcome the same token names in `second`, which still has a record to remove.
+        let (status, removed) = delete_in(&router, first, SHARED).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete in {first} to answer 200, got {status} with \
+             {removed:?}"
+        );
+        assert_reports_nothing(&router, first, case).await;
+        assert_reports(&router, second, "second-region-bucket", SHARED, case).await;
+
+        let (status, removed) = delete_in(&router, second, SHARED).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete in {second} to answer 200, got {status} with \
+             {removed:?}"
+        );
+        assert_reports_nothing(&router, second, case).await;
+    }
+}
+
+/// The Region a record is filed under comes from the caller's own credential scope, so
+/// the records this store holds are capped: an Update that would configure a FURTHER
+/// Region past the ceiling is refused with the modelled `ServiceQuotaExceededException`
+/// (402) and writes nothing, while a Region already configured keeps serving Update,
+/// Get and Delete, and a Delete returns the room it frees.
+///
+/// The ceiling itself is tested, plus one Region past it and the three operations at it,
+/// so each side of the bound is a case.
+#[tokio::test]
+async fn the_regions_holding_a_record_are_capped() {
+    let (router, engine) = router_with_engine();
+    // Region names of the store's own making, one per entry up to the ceiling. They are
+    // not AWS Region names: what is under test is that the Region of a credential scope
+    // cannot grow the store without bound, whatever text it carries.
+    let filled: Vec<String> = (0..MAX_CONFIGURED_REGIONS)
+        .map(|n| format!("emu-test-{n}"))
+        .collect();
+
+    for region in &filled {
+        enroll_in(&router, region).await;
+        let (status, written) = update_in(&router, region, "capped-bucket", "at-the-cap").await;
+        assert_eq!(
+            status, 200,
+            "case \"filling up to the ceiling\": expected the write in {region} to answer 200, \
+             got {status} with {written:?}"
+        );
+    }
+
+    // One Region past the ceiling: refused, and the refusal says whose ceiling it is.
+    let past = "emu-test-one-too-many";
+    enroll_in(&router, past).await;
+    let (status, refused) = update_in(&router, past, "over-the-cap-bucket", "past-the-cap").await;
+    assert_eq!(
+        status, 402,
+        "case \"one Region past the ceiling\": expected the modelled quota refusal, got {status} \
+         with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ServiceQuotaExceededException",
+        "case \"one Region past the ceiling\": expected ServiceQuotaExceededException, got \
+         {refused:?}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        region_ceiling_message(),
+        "case \"one Region past the ceiling\": expected the ceiling's own sentence, got {refused:?}"
+    );
+    assert_reports_nothing(&router, past, "one Region past the ceiling").await;
+    // Nothing was written: the store still holds exactly the Regions it was full with,
+    // which the wire cannot show (the refused Region reads 404 whether or not an entry
+    // was added for it).
+    let configured = engine
+        .state::<ComAmazonawsSsmguiconnectSsmguiconnectState>()
+        .lock()
+        .configured_region_count();
+    assert_eq!(
+        configured, MAX_CONFIGURED_REGIONS,
+        "case \"one Region past the ceiling\": the refused write must leave the store at its \
+         ceiling, got {configured} Regions holding a record"
+    );
+
+    // At the ceiling the Regions that DO hold a record are served as ever: a replacing
+    // Update needs no further room.
+    let held = &filled[0];
+    let (status, replaced) = update_in(&router, held, "replacement-at-the-cap", "replacement").await;
+    assert_eq!(
+        status, 200,
+        "case \"replacing a record at the ceiling\": expected 200, got {status} with {replaced:?}"
+    );
+    assert_reports(
+        &router,
+        held,
+        "replacement-at-the-cap",
+        "replacement",
+        "replacing a record at the ceiling",
+    )
+    .await;
+    let configured = engine
+        .state::<ComAmazonawsSsmguiconnectSsmguiconnectState>()
+        .lock()
+        .configured_region_count();
+    assert_eq!(
+        configured, MAX_CONFIGURED_REGIONS,
+        "case \"replacing a record at the ceiling\": replacing a record must not add a Region, \
+         got {configured} Regions holding a record"
+    );
+
+    // A Delete frees the room it took, so the Region that was refused can be configured.
+    let (status, removed) = delete_in(&router, held, "freeing-room").await;
+    assert_eq!(
+        status, 200,
+        "case \"freeing room\": expected the delete to answer 200, got {status} with {removed:?}"
+    );
+    let (status, written) = update_in(&router, past, "over-the-cap-bucket", "after-room-freed").await;
+    assert_eq!(
+        status, 200,
+        "case \"freeing room\": expected the write in {past} to be served once a Region's \
+         record was removed, got {status} with {written:?}"
+    );
+    assert_reports(
+        &router,
+        past,
+        "over-the-cap-bucket",
+        "after-room-freed",
+        "freeing room",
+    )
+    .await;
+    assert_reports_nothing(&router, held, "freeing room").await;
 }

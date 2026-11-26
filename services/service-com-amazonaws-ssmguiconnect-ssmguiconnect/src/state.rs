@@ -6,7 +6,16 @@
 //! *connection recording preferences* singleton. `UpdateConnectionRecordingPreferences`
 //! creates-or-replaces it, `GetConnectionRecordingPreferences` reports it, and
 //! `DeleteConnectionRecordingPreferences` removes it — so the whole service is the
-//! lifecycle of the one [`RecordingPrefsRecord`] held here.
+//! lifecycle of one [`RecordingPrefsRecord`].
+//!
+//! PER REGION, because that is the scope the resource exists in: this service is a
+//! regional one, so the record a call reaches is the record of the Region its own
+//! credential scope names ([`request_region`]) and of no other. The store therefore
+//! holds one record per configured Region rather than one for the whole process, and a
+//! Region nothing has configured has no resource to report — which is what every read
+//! answers [`resource_not_found_message`] for. The account side of that scope is the
+//! single account this emulator serves (`::emulator_server::emulator_account_id`), so
+//! the Region is what a request varies.
 //!
 //! Besides the record this module owns the rules the operations share, so no handler
 //! can drift from another:
@@ -25,6 +34,8 @@
 //! * [`authorization`] — whether the CALLER's own identity-based IAM policies allow the
 //!   action an operation asks for, which every operation is refused by before it reads
 //!   or writes anything, and before the account gate above.
+//! * [`request_region`] — the Region a request addresses its resources in, the key
+//!   every record here is held under.
 //! * [`mint_client_token`] — the service-provided value for an `@idempotencyToken`
 //!   member the caller left unset.
 //! * [`audit`] — the structured access record every operation emits, so a call to this
@@ -47,6 +58,15 @@ pub mod authorization;
 /// that module's docs.
 pub mod just_in_time_node_access;
 
+/// The Region a request addresses this service's resources in: the one its SigV4
+/// credential scope names, defaulting to [`authorization::DEFAULT_REGION`] for a request
+/// that carries none.
+///
+/// Re-exported from [`authorization`], which reads it to scope the resource an
+/// authorization decision is taken against, so the Region a record is STORED under and
+/// the Region a call is DECIDED for are read from the request in exactly one way.
+pub use authorization::request_region;
+
 /// Most idempotency outcomes retained at once, after which the OLDEST is evicted.
 ///
 /// The map is keyed by a caller-supplied `ClientToken`, so without a cap a client
@@ -62,23 +82,58 @@ pub mod just_in_time_node_access;
 /// held.
 pub const MAX_IDEMPOTENCY_OUTCOMES: usize = 1024;
 
+/// Most Regions this store holds a record for at once: past it an Update that would give
+/// a FURTHER Region its first record is refused with the modelled
+/// `ServiceQuotaExceededException` ([`region_ceiling_message`]) and nothing is written.
+///
+/// A request's Region is its own SigV4 credential scope, which the caller chooses, so
+/// without a ceiling a caller could repeat an Update under fresh Region names until the
+/// process ran out of memory. A partition's Regions are a fixed, published set and AWS
+/// publishes no limit of this kind, so the figure is this emulator's own, set well above
+/// the largest partition. A Delete frees its Region's entry, so the room a caller used is
+/// returned by the call that removes the record.
+pub const MAX_CONFIGURED_REGIONS: usize = 64;
+
+/// The `message` an Update refused for want of room for a further Region carries.
+///
+/// It names the ceiling that was reached and says whose it is: AWS publishes no quota on
+/// the Regions an account may configure recording preferences in, so this bound is THIS
+/// EMULATOR's, and the sentence says so rather than claiming a limit the service does not
+/// have.
+#[must_use]
+pub fn region_ceiling_message() -> String {
+    format!(
+        "this emulator holds connection recording preferences in at most \
+         {MAX_CONFIGURED_REGIONS} Regions at once"
+    )
+}
+
 /// Per-service state for com-amazonaws-ssmguiconnect-ssmguiconnect. A handler reaches it through [`service_state`].
 ///
-/// Every field is private and reached through the methods below: the singleton and
+/// Every field is private and reached through the methods below: a Region's record and
 /// the idempotency record have to move together (an outcome that outlived the record
-/// it describes would answer a replay with a state the store no longer holds), and
-/// the idempotency store has to stay inside [`MAX_IDEMPOTENCY_OUTCOMES`].
+/// it describes would answer a replay with a state the store no longer holds), the
+/// records have to stay inside [`MAX_CONFIGURED_REGIONS`] and the idempotency store
+/// inside [`MAX_IDEMPOTENCY_OUTCOMES`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsmguiconnectSsmguiconnectState {
-    /// The one per-account/per-Region connection recording preferences record.
-    /// `None` means never configured (or deleted), which every read reports as
-    /// `ResourceNotFoundException`.
-    connection_recording_preferences: Option<RecordingPrefsRecord>,
+    /// The connection recording preferences record of each Region that has one, keyed
+    /// by the Region a request reaches it in ([`request_region`]). The resource is a
+    /// per-account/per-Region singleton, so a Region holds at most one record and no
+    /// entry at all means never configured (or deleted) there, which every read of THAT
+    /// Region reports as `ResourceNotFoundException` — whatever another Region holds.
+    ///
+    /// A request's Region is the caller's own credential scope, so the ONE call that can
+    /// add an entry here ([`Self::put_preferences`]) is held to
+    /// [`MAX_CONFIGURED_REGIONS`] entries by [`Self::has_room_for`], which the Update
+    /// handler asks before writing; a read materialises nothing and a Delete frees the
+    /// entry it removes.
+    connection_recording_preferences: HashMap<String, RecordingPrefsRecord>,
     /// First outcome per `@idempotencyToken`, so replaying an `@idempotent`
     /// Update/Delete with the same `ClientToken` returns that outcome instead of
-    /// mutating twice. Keyed by operation as well as token: the same token
-    /// replayed against a *different* operation is a different call. Bounded at
-    /// [`MAX_IDEMPOTENCY_OUTCOMES`] entries.
+    /// mutating twice. Keyed by operation and Region as well as token: the same token
+    /// replayed against a *different* operation, or in a different Region, is a
+    /// different call. Bounded at [`MAX_IDEMPOTENCY_OUTCOMES`] entries.
     idempotency_tokens: HashMap<IdempotencyKey, StoredResponse>,
     /// The order the retained outcomes were recorded in — least recently first — which
     /// is what makes the eviction above FIFO. Holds exactly the map's keys, once each,
@@ -114,7 +169,7 @@ pub struct S3BucketRecord {
     pub bucket_name: String,
 }
 
-/// The operations that carry an `@idempotencyToken`, used as the first half of
+/// The operations that carry an `@idempotencyToken`, used as the first part of
 /// [`IdempotencyKey`] so one token replayed against two operations is two calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdempotentOperation {
@@ -124,8 +179,26 @@ pub enum IdempotentOperation {
     Delete,
 }
 
-/// What [`ComAmazonawsSsmguiconnectSsmguiconnectState`]'s idempotency store is keyed by.
-pub type IdempotencyKey = (IdempotentOperation, String);
+/// What [`ComAmazonawsSsmguiconnectSsmguiconnectState`]'s idempotency store is keyed by:
+/// the operation, the Region the call was made in ([`request_region`]) and the
+/// `ClientToken` it carried.
+///
+/// The Region is part of the key because the resource the outcome describes is itself
+/// per-Region: a token replayed in another Region addresses another record, so it is a
+/// different call and has to run for real there.
+pub type IdempotencyKey = (IdempotentOperation, String, String);
+
+/// The key an `@idempotent` call's outcome is recorded under — the one place the three
+/// parts of [`IdempotencyKey`] are put in order, so a handler and this store cannot
+/// spell it differently.
+#[must_use]
+pub fn idempotency_key(
+    operation: IdempotentOperation,
+    region: &str,
+    client_token: &str,
+) -> IdempotencyKey {
+    (operation, region.to_string(), client_token.to_string())
+}
 
 /// The first outcome of an `@idempotent` call, replayed when the store is still in
 /// the state that call left it in.
@@ -133,38 +206,61 @@ pub type IdempotencyKey = (IdempotentOperation, String);
 pub enum StoredResponse {
     /// An Update that persisted this record.
     Updated(RecordingPrefsRecord),
-    /// A Delete that removed the singleton. The response carries only the
+    /// A Delete that removed a Region's record. The response carries only the
     /// `ClientToken`, which is the key's own token, so there is nothing to hold.
     Deleted,
 }
 
 impl ComAmazonawsSsmguiconnectSsmguiconnectState {
-    /// The stored singleton, or `None` when nothing is configured.
-    pub fn preferences(&self) -> Option<&RecordingPrefsRecord> {
-        self.connection_recording_preferences.as_ref()
+    /// The record `region` holds, or `None` when nothing is configured there — whatever
+    /// another Region holds.
+    pub fn preferences(&self, region: &str) -> Option<&RecordingPrefsRecord> {
+        self.connection_recording_preferences.get(region)
     }
 
-    /// Create-or-REPLACE the singleton, and record the outcome under `record`'s own
-    /// `ClientToken`. The stored value is exactly `record`, never a merge with what
-    /// was there before.
-    pub fn put_preferences(&mut self, record: RecordingPrefsRecord) {
-        let key = (IdempotentOperation::Update, record.client_token.clone());
-        self.connection_recording_preferences = Some(record.clone());
+    /// Whether a record may be written for `region`: either the store already holds one
+    /// there — replacing it needs no further room — or the Regions it holds records for
+    /// are inside [`MAX_CONFIGURED_REGIONS`].
+    ///
+    /// What the Update handler asks before [`Self::put_preferences`], the one call that
+    /// can give a further Region an entry.
+    pub fn has_room_for(&self, region: &str) -> bool {
+        self.connection_recording_preferences.contains_key(region)
+            || self.connection_recording_preferences.len() < MAX_CONFIGURED_REGIONS
+    }
+
+    /// How many Regions hold a record. Never above [`MAX_CONFIGURED_REGIONS`].
+    pub fn configured_region_count(&self) -> usize {
+        self.connection_recording_preferences.len()
+    }
+
+    /// Create-or-REPLACE `region`'s record, and record the outcome under `record`'s own
+    /// `ClientToken` in that Region. The stored value is exactly `record`, never a merge
+    /// with what was there before, and no other Region's record is touched.
+    ///
+    /// The ONE growth site of the per-Region records, so a caller asks
+    /// [`Self::has_room_for`] first — see
+    /// `crate::ops::update_connection_recording_preferences`.
+    pub fn put_preferences(&mut self, region: &str, record: RecordingPrefsRecord) {
+        let key = idempotency_key(IdempotentOperation::Update, region, &record.client_token);
+        self.connection_recording_preferences
+            .insert(region.to_string(), record.clone());
         self.record_outcome(key, StoredResponse::Updated(record));
     }
 
-    /// Remove the singleton and record the outcome under `client_token`.
+    /// Remove `region`'s record and record the outcome under `client_token` in that
+    /// Region. No other Region's record is touched.
     ///
-    /// SUCCEEDS whether or not anything was configured: Delete is `@idempotent`, and
-    /// "there are no preferences now" is the state it is asked for, not a resource it
+    /// SUCCEEDS whether or not anything was configured there: Delete is `@idempotent`,
+    /// and "there are no preferences now" is the state it is asked for, not a resource it
     /// failed to find. The outcome is therefore recorded on both paths — a replay of
     /// the token answers the same way the first call did.
     ///
     /// The returned flag says whether a record was actually removed, which is what the
     /// caller audits; it is not a success/failure signal.
-    pub fn remove_preferences(&mut self, client_token: &str) -> bool {
-        let removed = self.connection_recording_preferences.take().is_some();
-        let key = (IdempotentOperation::Delete, client_token.to_string());
+    pub fn remove_preferences(&mut self, region: &str, client_token: &str) -> bool {
+        let removed = self.connection_recording_preferences.remove(region).is_some();
+        let key = idempotency_key(IdempotentOperation::Delete, region, client_token);
         self.record_outcome(key, StoredResponse::Deleted);
         removed
     }
@@ -173,17 +269,17 @@ impl ComAmazonawsSsmguiconnectSsmguiconnectState {
     /// to run for real.
     ///
     /// An outcome is replayable only while the store is still in the state that call
-    /// left it in: the record an Update wrote is still the stored singleton, or the
-    /// singleton a Delete removed is still absent. Otherwise a later call changed the
-    /// resource out from under the token, and answering from the cache would report a
-    /// state the next reader does not see.
+    /// left it in, IN THE REGION the key names: the record an Update wrote is still the
+    /// record that Region holds, or the record a Delete removed is still absent there.
+    /// Otherwise a later call changed the resource out from under the token, and
+    /// answering from the cache would report a state the next reader does not see.
     pub fn replayable_outcome(&self, key: &IdempotencyKey) -> Option<&StoredResponse> {
         let outcome = self.recorded_outcome(key)?;
+        let (_, region, _) = key;
+        let held = self.preferences(region);
         let still_current = match outcome {
-            StoredResponse::Updated(record) => {
-                self.connection_recording_preferences.as_ref() == Some(record)
-            }
-            StoredResponse::Deleted => self.connection_recording_preferences.is_none(),
+            StoredResponse::Updated(record) => held == Some(record),
+            StoredResponse::Deleted => held.is_none(),
         };
         still_current.then_some(outcome)
     }
@@ -699,6 +795,8 @@ pub enum AuditOutcome {
     IdempotentReplay,
     /// The request was refused as invalid (400).
     ValidationRefused,
+    /// A write was refused for want of room for a further Region's record (402).
+    QuotaExceeded,
     /// The caller was refused 403: either by its own IAM policies
     /// ([`authorization`]) or by the account-level just-in-time node access gate.
     AccessDenied,
@@ -718,6 +816,7 @@ impl AuditOutcome {
             Self::PreferencesAlreadyAbsent => "preferences-already-absent",
             Self::IdempotentReplay => "idempotent-replay",
             Self::ValidationRefused => "validation-refused",
+            Self::QuotaExceeded => "quota-exceeded",
             Self::AccessDenied => "access-denied",
             Self::NotFound => "not-found",
             Self::StoreUnavailable => "store-unavailable",

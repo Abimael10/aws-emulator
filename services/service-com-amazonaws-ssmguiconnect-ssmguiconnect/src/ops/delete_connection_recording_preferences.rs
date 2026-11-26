@@ -5,13 +5,17 @@
 //! Removes the per-account/per-Region connection recording preferences singleton held
 //! in [`crate::state`], so the next read reports `ResourceNotFoundException`.
 //!
+//! IN THE REQUESTING REGION: what is removed is the record of the Region this request
+//! was signed for ([`crate::state::request_region`]), so a Delete never removes another
+//! Region's record — the resource exists per account and Region.
+//!
 //! `@idempotent` with an `@idempotencyToken` `ClientToken`, so a replay of the same
 //! token returns the first outcome instead of refusing a second time; a request that
 //! omits the token gets a service-provided one
 //! ([`crate::state::mint_client_token`]).
 //!
 //! Idempotent in the full sense: "nothing configured" is the state this operation is
-//! asked for, so a Delete on an account with no preferences SUCCEEDS (200, echoing the
+//! asked for, so a Delete in a Region with no preferences SUCCEEDS (200, echoing the
 //! effective `ClientToken`) rather than reporting a resource it did not find. It is
 //! also not gated by just-in-time node access — unlike
 //! `UpdateConnectionRecordingPreferences`.
@@ -70,7 +74,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{audit, AuditOutcome, IdempotentOperation, StoredResponse};
+use crate::state::{audit, idempotency_key, AuditOutcome, IdempotentOperation, StoredResponse};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -183,15 +187,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .client_token
             .unwrap_or_else(crate::state::mint_client_token);
 
+        // PER REGION: the record this call removes, and the idempotency outcome it
+        // records, both belong to the Region the request was signed for — the scope the
+        // resource exists in — so a token replayed in another Region addresses another
+        // record and runs there for real.
+        let region = crate::state::request_region(ctx.parts());
+
         let mut store = state.lock();
-        let key = (IdempotentOperation::Delete, client_token.clone());
+        let key = idempotency_key(IdempotentOperation::Delete, &region, &client_token);
 
         // This operation is `@idempotent`: a replayed token answers with the outcome
-        // of the FIRST call — which succeeded — rather than reporting the singleton
-        // it already removed as missing. The replay holds only while the singleton is
-        // still absent, so a 200 from here always means "there are no preferences
-        // now": once a later Update reconfigures the resource, the token describes a
-        // state the store no longer holds and the call runs for real.
+        // of the FIRST call — which succeeded — rather than reporting the record
+        // it already removed as missing. The replay holds only while that Region's
+        // record is still absent, so a 200 from here always means "there are no
+        // preferences now": once a later Update reconfigures the resource, the token
+        // describes a state the store no longer holds and the call runs for real.
         if matches!(
             store.replayable_outcome(&key),
             Some(StoredResponse::Deleted)
@@ -203,10 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // Deleting with nothing configured removes nothing and still succeeds: the
-        // caller asked for a state the store is already in. The flag distinguishes the
-        // two for the audit record only — both answer 200 with the effective token.
-        let removed = store.remove_preferences(&client_token);
+        // Deleting with nothing configured in this Region removes nothing and still
+        // succeeds: the caller asked for a state the store is already in. The flag
+        // distinguishes the two for the audit record only — both answer 200 with the
+        // effective token.
+        let removed = store.remove_preferences(&region, &client_token);
         drop(store);
         audit(
             Self::NAME,

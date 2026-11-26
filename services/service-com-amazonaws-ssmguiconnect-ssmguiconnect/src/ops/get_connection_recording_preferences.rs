@@ -6,10 +6,14 @@
 //! held in [`crate::state`], as the last successful
 //! `UpdateConnectionRecordingPreferences` wrote it.
 //!
+//! IN THE REQUESTING REGION: what is reported is the record of the Region this request
+//! was signed for ([`crate::state::request_region`]) and of no other, which is the scope
+//! the operation's own documentation states. With nothing configured THERE there is no
+//! resource to report, which is `ResourceNotFoundException` (HTTP 404), never an empty
+//! 200 and never another Region's record.
+//!
 //! `@readonly`: this handler only reads the store — it never writes, so a Get leaves
-//! the next caller seeing exactly what it saw. With nothing configured there is no
-//! resource to report, which is `ResourceNotFoundException` (HTTP 404), never an
-//! empty 200.
+//! the next caller seeing exactly what it saw.
 //!
 //! AUTHORIZED FIRST: a caller whose identity-based IAM policies do not allow this
 //! action is refused with the modeled `AccessDeniedException` (403) before the
@@ -174,9 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The resource is per-account/per-Region, so what this read answers from is the
+        // record of the Region the request was signed for: a Region nothing has
+        // configured has no resource to report, whatever another Region holds.
+        let region = crate::state::request_region(ctx.parts());
+
         // Read-only: take the guard, copy what is stored, release it. No branch of
         // this handler writes.
-        let stored = state.lock().preferences().cloned();
+        let stored = state.lock().preferences(&region).cloned();
 
         let Some(record) = stored else {
             audit(Self::NAME, ctx, AuditOutcome::NotFound);
