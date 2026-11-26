@@ -84,7 +84,7 @@ fn a_query_selects_by_the_clause_it_states() {
         ),
     ];
     for (case, query, expected) in rows {
-        let select = selector(Some(query), 0)
+        let select = selector(Some(query), 0, None)
             .map_err(|_| ())
             .unwrap_or_else(|()| panic!("case {case:?}: expected the query to be read"));
         // No index schema and no mounted file: the fields a `match` names are analyzed
@@ -108,7 +108,7 @@ fn a_query_selects_by_the_clause_it_states() {
             "case {case:?}: expected {expected}, got {matched}"
         );
     }
-    let refused = selector(Some(&json!({ "wildcard": { "level": "w*" } })), 0);
+    let refused = selector(Some(&json!({ "wildcard": { "level": "w*" } })), 0, None);
     assert!(
         refused.is_err(),
         "case \"a clause the engine registers no query for\": expected a refusal"
@@ -119,7 +119,7 @@ fn a_query_selects_by_the_clause_it_states() {
         nested = json!({ "bool": { "must": [nested] } });
     }
     assert!(
-        selector(Some(&nested), 0).is_err(),
+        selector(Some(&nested), 0, None).is_err(),
         "case \"a bool nested past the engine's bound\": expected a refusal"
     );
 }

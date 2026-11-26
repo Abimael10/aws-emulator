@@ -71,6 +71,12 @@ service-com-amazonaws-acm-certificatemanager = { workspace = true }
 # UAX#29 word segmentation: the word boundaries the engine's standard tokenizer splits
 # text on (`state::analysis`), rather than a hand-written scanner here.
 unicode-segmentation = "1"
+# Unicode canonical/compatibility decomposition, which is what the `asciifolding` token
+# filter folds a character outside Basic Latin to its ASCII equivalent with
+# (`state::analysis::ascii_folding`): the decomposition and the combining classes are
+# published Unicode data, read from the maintained implementation rather than from a
+# character table written here.
+unicode-normalization = "0.1"
 # The calendar a value of a field mapped as a date is read against (`state::date_values`):
 # an ISO-8601 instant with an optional time and offset is parsed — leap years, month
 # lengths and the offset it carries — by the maintained implementation rather than by

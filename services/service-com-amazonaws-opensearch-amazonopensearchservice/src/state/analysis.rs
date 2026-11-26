@@ -39,6 +39,10 @@ use super::*;
 use ::serde_json::{Map, Value};
 use ::unicode_segmentation::UnicodeSegmentation;
 
+/// The `asciifolding` token filter's own reading: which ASCII characters a character
+/// outside Basic Latin stands for.
+mod ascii_folding;
+
 /// The analyzer an index uses for a field that names none, and the one the analyze API
 /// reports with when neither the request nor the index names one.
 pub const DEFAULT_ANALYZER: &str = "standard";
@@ -479,6 +483,10 @@ pub enum Filter {
     Stem(String),
     /// `length`: keep the tokens whose character count is within the bounds.
     Length { min: usize, max: usize },
+    /// `asciifolding`: each character outside Basic Latin replaced by the ASCII characters it
+    /// stands for ([`ascii_folding`]), keeping the token as it was written beside the folded
+    /// one where the filter is configured to preserve it.
+    AsciiFolding { preserve_original: bool },
     /// `fingerprint`: the distinct tokens, sorted and joined, as one token.
     Fingerprint,
 }
@@ -507,6 +515,9 @@ impl Filter {
                 })
                 .collect(),
             Self::Fingerprint => fingerprint(tokens),
+            Self::AsciiFolding { preserve_original } => {
+                ascii_folding::applied(tokens, *preserve_original)
+            }
         }
     }
 }
@@ -1399,6 +1410,9 @@ fn configured_filter(
             min: bounded(definition, "min").unwrap_or(0),
             max: bounded(definition, "max").unwrap_or(usize::MAX),
         },
+        "asciifolding" => Filter::AsciiFolding {
+            preserve_original: switched(definition, PRESERVE_ORIGINAL_SETTING),
+        },
         _ => return Err(Unresolved::Filter(kind.to_string())),
     })
 }
@@ -1406,6 +1420,20 @@ fn configured_filter(
 /// The whole number `definition` gives `member`, where it gives one at all.
 fn bounded(definition: &Value, member: &str) -> Option<usize> {
     usize::try_from(definition.get(member)?.as_u64()?).ok()
+}
+
+/// The member an `asciifolding` filter asks for the unfolded token to be kept under.
+const PRESERVE_ORIGINAL_SETTING: &str = "preserve_original";
+
+/// Whether `definition` switches `member` ON, written as the boolean it is or as the text an
+/// index setting carries one as — index settings are a map of strings, so a caller's `"true"`
+/// is the same switch as `true`.
+fn switched(definition: &Value, member: &str) -> bool {
+    match definition.get(member) {
+        Some(Value::Bool(switched)) => *switched,
+        Some(Value::String(written)) => written.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
 }
 
 /// The built-in filter `name` names — one the engine ships ready to use, which a chain may
@@ -1418,6 +1446,9 @@ fn built_in_filter(name: &str) -> Option<Filter> {
         "fingerprint" => Filter::Fingerprint,
         "porter_stem" | "kstem" | "snowball" | "stemmer" => Filter::Stem(ENGLISH.to_string()),
         "stop" => Filter::Stop(language_stop_words(ENGLISH).unwrap_or_default()),
+        "asciifolding" => Filter::AsciiFolding {
+            preserve_original: false,
+        },
         _ => return None,
     })
 }

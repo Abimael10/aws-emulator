@@ -27,10 +27,18 @@
 //! A request naming any other type is REFUSED, rather than answered with a section it did not
 //! ask for or with one silently left out.
 //!
-//! Both factors of the work one request causes are bounded: how many aggregations one request
-//! may name ([`MAX_AGGREGATIONS`]) and how many distinct buckets one of them may open
-//! ([`MAX_BUCKETS`]), so neither the body a caller wrote nor the documents the domain holds
-//! can make one response unbounded.
+//! A BUCKET aggregation may carry an `aggs` section of its own, and those sub-aggregations are
+//! computed over the documents that fell in each bucket — a bucket is a subset of the
+//! documents the query selected, so the sub-aggregations of one are the same reading of that
+//! subset, reported inside the bucket beside its `doc_count`. A METRIC opens no bucket and so
+//! has no subset to aggregate over, which is why one carrying sub-aggregations is refused.
+//!
+//! Every factor of the work one request causes is bounded, and so is their PRODUCT: how many
+//! aggregations one request may name ([`MAX_AGGREGATIONS`]), how deep they may nest
+//! ([`MAX_AGGREGATION_DEPTH`]), how many buckets ONE REQUEST may open over all of them together
+//! ([`MAX_BUCKETS`]) and how many per-document VALUES one request may read into them, at every
+//! level ([`MAX_VALUES_READ`]) — so neither the body a caller wrote, nor the documents the
+//! domain holds, nor the way the body nests one inside another can make one request unbounded.
 
 use std::collections::BTreeMap;
 
@@ -48,12 +56,40 @@ use super::{error, scalar_text, Terms, PARSING_EXCEPTION};
 /// than their product with a count the request chose.
 const MAX_AGGREGATIONS: usize = 32;
 
-/// How many distinct buckets ONE aggregation may open.
+/// How many buckets ONE REQUEST may open, over every aggregation it names and every level
+/// they nest.
 ///
-/// The engine's own `search.max_buckets` is the bound of this kind; this is the value this
-/// cluster holds it at, because every bucket lives in this process's heap until the response
-/// is rendered.
+/// The engine's own `search.max_buckets` is the bound of this kind — the buckets of the whole
+/// response, which is why it is counted across the request rather than per aggregation; this
+/// is the value this cluster holds it at, because every bucket lives in this process's heap
+/// until the response is rendered. Counting them together is also what keeps a nested section
+/// bounded: without it, each level would multiply the level above it.
 const MAX_BUCKETS: usize = 1_000;
+
+/// How deep one aggregations section may nest.
+///
+/// The emulator's OWN bound, beside the two above: a sub-aggregation is read into every bucket
+/// its parent opens, so the depth is what the section's shape multiplies, and a body past this
+/// is refused while it is being read rather than walked.
+const MAX_AGGREGATION_DEPTH: usize = 8;
+
+/// How many per-document VALUES one request may read into its aggregations, over every
+/// aggregation and every level they nest.
+///
+/// The emulator's OWN bound, and the one that bounds the PRODUCT the three above leave open: a
+/// bucket's sub-aggregations read each document of that bucket again, so without a budget over
+/// the whole reading a body nesting one aggregation inside another would multiply the values
+/// each level walks by the values of the level above it — a number the caller's body and the
+/// documents the domain holds choose together. Charged per value read at EVERY level and
+/// checked before those values are walked ([`Requested::consider`]), so nothing past it is read
+/// whatever shape the section has; a request that reaches it is refused rather than answered
+/// from a reading that stopped halfway.
+///
+/// Sized well above what a plain section reads — a scan of every document one domain may hold
+/// ([`super::MAX_DOCUMENTS_VISITED`]) with a handful of values at each — and far below what the
+/// nesting could otherwise reach, because each value read costs this process a value clone and
+/// a rendering of its text.
+const MAX_VALUES_READ: usize = 10_000_000;
 
 /// How many buckets a `terms` aggregation REPORTS when the request names no `size`, which is
 /// that aggregation's own documented default.
@@ -96,9 +132,8 @@ const AVG: &str = "avg";
 #[derive(Debug, Clone, Default)]
 struct Observed {
     /// The buckets a `terms` aggregation has opened, keyed by the TEXT of the value they
-    /// bucket — the form every value of a field is compared by — holding that value as it
-    /// was read and how many documents fell in it.
-    buckets: BTreeMap<String, (Value, usize)>,
+    /// bucket — the form every value of a field is compared by.
+    buckets: BTreeMap<String, Bucket>,
     /// How many values the field held over the documents selected.
     values: usize,
     /// The arithmetic the metrics report, over the values that ARE numbers: a value a field
@@ -109,13 +144,29 @@ struct Observed {
     greatest: Option<f64>,
 }
 
-/// One aggregation a request asked for: the name it is reported under, the field it reads and
-/// what it computes from it.
+/// One bucket a `terms` aggregation has opened: the value it buckets as it was read, how many
+/// documents fell in it, and what this bucket's own sub-aggregations have observed of THOSE
+/// documents.
+#[derive(Debug, Clone)]
+struct Bucket {
+    key: Value,
+    count: usize,
+    /// The sub-aggregations over the documents of this bucket — a fresh copy of the ones the
+    /// request named, since each bucket aggregates its own subset.
+    subs: Vec<Requested>,
+}
+
+/// One aggregation a request asked for: the name it is reported under, the field it reads,
+/// what it computes from it, and the aggregations it asks OVER each bucket it opens.
 #[derive(Debug, Clone)]
 struct Requested {
     name: String,
     field: String,
     kind: Kind,
+    /// The section this aggregation carries of its own, computed per bucket. Empty for an
+    /// aggregation that carries none, and never non-empty for a metric, which opens no
+    /// bucket to compute them over.
+    subs: Vec<Requested>,
     observed: Observed,
 }
 
@@ -123,6 +174,12 @@ struct Requested {
 #[derive(Debug, Clone, Default)]
 pub(super) struct Aggregations {
     requested: Vec<Requested>,
+    /// How many buckets this request has opened so far, over every aggregation and every
+    /// level: what [`MAX_BUCKETS`] bounds.
+    opened: usize,
+    /// How many per-document values this request has read so far, over every aggregation and
+    /// every level: what [`MAX_VALUES_READ`] bounds.
+    read: usize,
 }
 
 impl Aggregations {
@@ -131,21 +188,12 @@ impl Aggregations {
         let Some(named) = AGGS.iter().find_map(|member| body.get(*member)) else {
             return Ok(Self::default());
         };
-        let Some(named) = named.as_object() else {
-            return Err(unreadable("[aggs] must be an object naming each aggregation"));
-        };
-        if named.len() > MAX_AGGREGATIONS {
-            return Err(unreadable(&format!(
-                "a request may name at most {MAX_AGGREGATIONS} aggregations, and this one \
-                 names {}",
-                named.len()
-            )));
-        }
-        let mut requested = Vec::new();
-        for (name, definition) in named {
-            requested.push(one(name, definition)?);
-        }
-        Ok(Self { requested })
+        let mut counted = 0_usize;
+        Ok(Self {
+            requested: section(named, 0, &mut counted)?,
+            opened: 0,
+            read: 0,
+        })
     }
 
     /// Whether this names no aggregation at all.
@@ -163,8 +211,7 @@ impl Aggregations {
     pub(super) fn without_doc_values(&self, analysis: &IndexAnalysis) -> Option<&str> {
         self.requested
             .iter()
-            .map(|requested| requested.field.as_str())
-            .find(|field| analysis.needs_fielddata(field))
+            .find_map(|requested| requested.without_doc_values(analysis))
     }
 
     /// Read one SELECTED document into every aggregation.
@@ -176,9 +223,13 @@ impl Aggregations {
         terms: &Terms<'_>,
         source: &Value,
     ) -> Result<(), Box<RtResponse>> {
+        let mut opened = self.opened;
+        let mut read = self.read;
         for requested in &mut self.requested {
-            requested.consider(terms, source)?;
+            requested.consider(terms, source, &mut opened, &mut read)?;
         }
+        self.opened = opened;
+        self.read = read;
         Ok(())
     }
 
@@ -193,9 +244,49 @@ impl Aggregations {
 }
 
 impl Requested {
+    /// The first field this aggregation or one of its sub-aggregations names that the index
+    /// whose mappings are `analysis` holds no per-document values for.
+    fn without_doc_values(&self, analysis: &IndexAnalysis) -> Option<&str> {
+        if analysis.needs_fielddata(&self.field) {
+            return Some(self.field.as_str());
+        }
+        self.subs
+            .iter()
+            .find_map(|sub| sub.without_doc_values(analysis))
+    }
+
     /// Read one document's values for this aggregation's field into it.
-    fn consider(&mut self, terms: &Terms<'_>, source: &Value) -> Result<(), Box<RtResponse>> {
-        for held in terms.held(source, &self.field) {
+    ///
+    /// `opened` carries how many buckets the whole request has opened and `read` how many
+    /// values it has read, over every aggregation and every level — the two budgets this
+    /// reading is bounded by ([`MAX_BUCKETS`], [`MAX_VALUES_READ`]).
+    ///
+    /// A document falls in a bucket ONCE however many of its values map to that bucket's key:
+    /// a `doc_count` counts documents, and a bucket's own sub-aggregations read the document
+    /// once, the way they would read it if the bucket's documents were the whole selection.
+    /// That is also what keeps this reading bounded by the budgets above rather than by the
+    /// product of the per-level value counts: the values are read once per level, and what
+    /// recurses is the DISTINCT buckets the document opened.
+    fn consider(
+        &mut self,
+        terms: &Terms<'_>,
+        source: &Value,
+        opened: &mut usize,
+        read: &mut usize,
+    ) -> Result<(), Box<RtResponse>> {
+        let held_values = terms.held(source, &self.field);
+        // Charged BEFORE the values are walked, and at every level, so no reading past the
+        // budget is performed whatever the section's shape: a level that recurses charges the
+        // values of each level below it too.
+        *read = read.saturating_add(held_values.len().max(1));
+        if *read > MAX_VALUES_READ {
+            return Err(too_many_values());
+        }
+        // The buckets THIS document opens, keyed by the TEXT every value of a field is
+        // compared by, holding the value as it was read — so a value the document repeats
+        // opens one bucket and is counted once.
+        let mut keyed: BTreeMap<String, Value> = BTreeMap::new();
+        for held in held_values {
             if held.is_null() {
                 continue;
             }
@@ -217,18 +308,28 @@ impl Requested {
             if !matches!(self.kind, Kind::Terms { .. }) {
                 continue;
             }
-            let key = scalar_text(&held);
-            if !self.observed.buckets.contains_key(&key)
-                && self.observed.buckets.len() >= MAX_BUCKETS
-            {
-                return Err(too_many_buckets(self.observed.buckets.len()));
+            keyed.entry(scalar_text(&held)).or_insert(held);
+        }
+        for (key, value) in keyed {
+            if !self.observed.buckets.contains_key(&key) {
+                if *opened >= MAX_BUCKETS {
+                    return Err(too_many_buckets(*opened));
+                }
+                *opened = opened.saturating_add(1);
             }
-            let bucket = self
-                .observed
-                .buckets
-                .entry(key)
-                .or_insert_with(|| (held.clone(), 0));
-            bucket.1 = bucket.1.saturating_add(1);
+            let subs = self.subs.clone();
+            let bucket = self.observed.buckets.entry(key).or_insert_with(|| Bucket {
+                key: value,
+                count: 0,
+                subs,
+            });
+            bucket.count = bucket.count.saturating_add(1);
+            // The document fell in this bucket, so this bucket's own sub-aggregations read it
+            // — a bucket is a subset of the selected documents, and its sub-aggregations are
+            // that subset's summaries.
+            for sub in &mut bucket.subs {
+                sub.consider(terms, source, opened, read)?;
+            }
         }
         Ok(())
     }
@@ -239,24 +340,31 @@ impl Requested {
     /// equally frequent values is broken by the value itself — so one set of documents
     /// reports the same buckets in the same order on every read. The documents whose value
     /// fell outside the reported buckets are counted in `sum_other_doc_count`, which is what
-    /// tells a caller there were more.
+    /// tells a caller there were more. Each bucket carries its own sub-aggregations' reports
+    /// beside its `doc_count`, computed over the documents that fell in it.
     fn reported(&self) -> Value {
         match self.kind {
             Kind::Terms { size } => {
-                let mut ranked: Vec<(&String, &(Value, usize))> =
-                    self.observed.buckets.iter().collect();
-                ranked.sort_by(|(left_key, (_, left)), (right_key, (_, right))| {
-                    right.cmp(left).then_with(|| left_key.cmp(right_key))
+                let mut ranked: Vec<(&String, &Bucket)> = self.observed.buckets.iter().collect();
+                ranked.sort_by(|(left_key, left), (right_key, right)| {
+                    right
+                        .count
+                        .cmp(&left.count)
+                        .then_with(|| left_key.cmp(right_key))
                 });
-                let other: usize = ranked
-                    .iter()
-                    .skip(size)
-                    .map(|(_, (_, count))| *count)
-                    .sum();
+                let other: usize = ranked.iter().skip(size).map(|(_, bucket)| bucket.count).sum();
                 let buckets: Vec<Value> = ranked
                     .iter()
                     .take(size)
-                    .map(|(_, (key, count))| json!({ "key": key, "doc_count": count }))
+                    .map(|(_, bucket)| {
+                        let mut reported = Map::new();
+                        reported.insert("key".to_string(), bucket.key.clone());
+                        reported.insert("doc_count".to_string(), json!(bucket.count));
+                        for sub in &bucket.subs {
+                            reported.insert(sub.name.clone(), sub.reported());
+                        }
+                        Value::Object(reported)
+                    })
                     .collect();
                 json!({
                     // Every document the scan selected was read, so no bucket's count is an
@@ -282,15 +390,68 @@ impl Requested {
     }
 }
 
-/// One aggregation of the section: the single type it names, and the field that type reads.
-fn one(name: &str, definition: &Value) -> Result<Requested, Box<RtResponse>> {
+/// The aggregations ONE `aggs` section names — the request's own, or the one a bucket
+/// aggregation carries for the documents of each bucket it opens.
+///
+/// `counted` carries how many aggregations the whole section has named so far, so the bound is
+/// on the request rather than on one level of it, and `depth` is how deep this level sits.
+fn section(
+    named: &Value,
+    depth: usize,
+    counted: &mut usize,
+) -> Result<Vec<Requested>, Box<RtResponse>> {
+    let Some(named) = named.as_object() else {
+        return Err(unreadable("[aggs] must be an object naming each aggregation"));
+    };
+    if depth > MAX_AGGREGATION_DEPTH {
+        return Err(unreadable(&format!(
+            "an aggregation may nest at most {MAX_AGGREGATION_DEPTH} levels of \
+             sub-aggregations"
+        )));
+    }
+    let mut requested = Vec::new();
+    for (name, definition) in named {
+        *counted = counted.saturating_add(1);
+        if *counted > MAX_AGGREGATIONS {
+            return Err(unreadable(&format!(
+                "a request may name at most {MAX_AGGREGATIONS} aggregations, and this one \
+                 names {counted}"
+            )));
+        }
+        requested.push(one(name, definition, depth, counted)?);
+    }
+    Ok(requested)
+}
+
+/// One aggregation of the section: the single type it names, the field that type reads, and
+/// the sub-aggregations it asks over each bucket it opens.
+fn one(
+    name: &str,
+    definition: &Value,
+    depth: usize,
+    counted: &mut usize,
+) -> Result<Requested, Box<RtResponse>> {
     let Some(members) = definition.as_object() else {
         return Err(unreadable(&format!(
             "[{name}] must be an object naming the aggregation it asks for"
         )));
     };
-    let mut entries = members.iter();
-    let (Some((named, options)), None) = (entries.next(), entries.next()) else {
+    // One member names the TYPE and one may name the section computed per bucket, in either
+    // order, so the two are told apart by name rather than by position.
+    let mut typed: Option<(&String, &Value)> = None;
+    let mut nested: Option<&Value> = None;
+    for (member, value) in members {
+        if AGGS.contains(&member.as_str()) {
+            nested = Some(value);
+            continue;
+        }
+        if typed.replace((member, value)).is_some() {
+            return Err(unreadable(&format!(
+                "[{name}] aggregation must name exactly one type"
+            )));
+        }
+    }
+    let Some((named, options)) = typed else {
         return Err(unreadable(&format!(
             "[{name}] aggregation must name exactly one type"
         )));
@@ -326,6 +487,16 @@ fn one(name: &str, definition: &Value) -> Result<Requested, Box<RtResponse>> {
         name: name.to_string(),
         field: field.to_string(),
         kind,
+        subs: match nested {
+            // A metric opens no bucket, so there is no subset of the documents for a section
+            // under it to be computed over: it is refused rather than answered with the
+            // section left out.
+            Some(_) if !matches!(kind, Kind::Terms { .. }) => {
+                return Err(no_sub_aggregations(name, named))
+            }
+            Some(nested) => section(nested, depth.saturating_add(1), counted)?,
+            None => Vec::new(),
+        },
         observed: Observed::default(),
     })
 }
@@ -360,3 +531,28 @@ fn too_many_buckets(opened: usize) -> Box<RtResponse> {
 
 /// The engine's error type for a request past that ceiling.
 const TOO_MANY_BUCKETS_EXCEPTION: &str = "too_many_buckets_exception";
+
+/// The engine's refusal of sub-aggregations under an aggregation that opens no bucket, which
+/// names the aggregation and the type that cannot carry them.
+fn no_sub_aggregations(name: &str, kind: &str) -> Box<RtResponse> {
+    Box::new(error(
+        400,
+        AGGREGATION_INITIALIZATION_EXCEPTION,
+        &format!("Aggregator [{name}] of type [{kind}] cannot accept sub-aggregations"),
+    ))
+}
+
+/// The engine's error type for an aggregations section it cannot build the aggregators of.
+const AGGREGATION_INITIALIZATION_EXCEPTION: &str = "aggregation_initialization_exception";
+
+/// The refusal of a request whose aggregations would read more per-document values than one
+/// request may read — the emulator's own bound, stated as the argument failure it is.
+fn too_many_values() -> Box<RtResponse> {
+    Box::new(error(
+        400,
+        crate::state::ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+        &format!(
+            "a request may read at most {MAX_VALUES_READ} values into its aggregations"
+        ),
+    ))
+}

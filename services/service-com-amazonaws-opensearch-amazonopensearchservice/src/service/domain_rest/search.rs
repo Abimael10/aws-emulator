@@ -58,6 +58,24 @@ const DESCENDING: &str = "desc";
 /// `sort=<field>:<direction>`.
 const DIRECTION_SEPARATOR: char = ':';
 
+/// The members one sort key may carry beside its direction: which of a field's several values
+/// the key reads, and what to do with a document holding none.
+const MODE: &str = "mode";
+const MISSING: &str = "missing";
+
+/// The two values `missing` names a PLACE with, rather than naming the value a document
+/// missing the field sorts by.
+const MISSING_LAST: &str = "_last";
+const MISSING_FIRST: &str = "_first";
+
+/// The mapped field types whose sort values are LONGS: the engine's integral numeric types,
+/// and a date, whose key is the milliseconds its instant stands for.
+///
+/// What this decides is the SENTINEL a document missing the field carries
+/// ([`SortKey::missing_value`]): the engine sorts such a field at long precision, so the value
+/// it puts a missing document at is the end of the long range.
+const LONG_TYPES: [&str; 4] = ["long", "integer", "short", "byte"];
+
 /// The sort keys that name no field of the document: its score, and the order the shard
 /// holds it in.
 const SCORE_KEY: &str = "_score";
@@ -138,12 +156,48 @@ enum Order {
     Descending,
 }
 
-/// One key of a `sort`: the field whose per-document values order the hits, and which way
-/// they order them.
+/// Which of the values a field holds for ONE document the key is ordered by — the sort
+/// `mode`.
+///
+/// A key naming none reads the smallest value ascending and the largest descending, which is
+/// the mode's own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Min,
+    Max,
+    Sum,
+    Avg,
+    Median,
+}
+
+/// Where a document holding NO value for the key sorts, and what it carries as its sort
+/// value — the `missing` option.
+#[derive(Debug, Clone, PartialEq)]
+enum Missing {
+    /// `_last`, the option's own default: after every document that holds a value.
+    Last,
+    /// `_first`: before every document that holds one.
+    First,
+    /// A value the request stated, which the document is ordered by as if it held it.
+    Stated(Value),
+}
+
+/// One key of a `sort`: the field whose per-document values order the hits, which of those
+/// values it reads, which way they order them, and where a document holding none goes.
 #[derive(Debug, Clone)]
 struct SortKey {
     field: String,
     order: Order,
+    mode: Option<Mode>,
+    missing: Missing,
+    /// Whether this key's values are LONGS, which is what decides the sentinel a document
+    /// missing the field carries.
+    ///
+    /// Set while the scan reads the key off each document, because the answer is each index's
+    /// own: the mappings name the type where they map the field, and for a field no mapping
+    /// covers it is the values the documents hold — the type a write would have mapped it as.
+    /// A `Cell` because a key is read through a shared reference, once per selected document.
+    long_valued: ::std::cell::Cell<bool>,
 }
 
 /// The order a search answers its hits in — empty for a request that names none, where the
@@ -163,6 +217,8 @@ impl Sorting {
                 None => return Ok(Self::default()),
             },
         };
+        // The body AS SENT, which a refusal of one of a key's options names the position in.
+        let source = ::std::str::from_utf8(request.body).ok();
         let entries: Vec<Value> = match named {
             Value::Array(entries) => entries,
             one => vec![one],
@@ -189,7 +245,7 @@ impl Sorting {
                         if keys.len() >= MAX_SORT_KEYS {
                             return Err(too_many_sort_keys(keys.len().saturating_add(1)));
                         }
-                        keys.push(key_of(field, options)?);
+                        keys.push(key_of(field, options, source)?);
                     }
                 }
                 other => return Err(unparsed_sort(&other)),
@@ -223,14 +279,33 @@ impl Sorting {
             .collect()
     }
 
+    /// Those values as the HIT carries them: a key the document holds no value for carries
+    /// the sentinel its own kind and direction put the document at, so every value a client
+    /// reads back is one it can resume a paged walk from.
+    pub(super) fn answered(&self, values: Vec<Value>) -> Vec<Value> {
+        self.keys
+            .iter()
+            .zip(values)
+            .map(|(key, value)| {
+                if value.is_null() {
+                    key.missing_value()
+                } else {
+                    value
+                }
+            })
+            .collect()
+    }
+
     /// How two documents' sort values order: by the first key they differ on, with a document
-    /// holding no value for a key last whichever way that key orders — the `missing` default.
+    /// holding no value for a key placed where that key's `missing` option puts it — after
+    /// every document holding one unless the request asked for `_first`, whichever way the key
+    /// orders.
     pub(super) fn compare(&self, left: &[Value], right: &[Value]) -> Ordering {
         for (key, (held, other)) in self.keys.iter().zip(left.iter().zip(right.iter())) {
             let ordering = match (held.is_null(), other.is_null()) {
                 (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
+                (true, false) => key.missing_order(),
+                (false, true) => key.missing_order().reverse(),
                 (false, false) => {
                     let ordering = value_order(held, other);
                     match key.order {
@@ -251,9 +326,11 @@ impl SortKey {
     /// The value this key reads off one document: its score, the order the scan reached it
     /// in, or the value the document holds at the key's field.
     ///
-    /// A field holding SEVERAL values orders the document by one of them — the smallest on an
-    /// ascending key and the largest on a descending one, which is the sort mode's own
-    /// default — and a document holding none orders by no value at all.
+    /// A field holding SEVERAL values orders the document by the one the key's `mode` names —
+    /// the smallest on an ascending key and the largest on a descending one, which is that
+    /// option's own default — and a document holding none orders by no value at all, which is
+    /// where the `missing` option places it ([`Self::missing_order`]) and what decides the
+    /// value the hit carries ([`Self::missing_value`]).
     ///
     /// A field mapped as an INSTANT orders by the instant its value stands for, answered as
     /// the milliseconds since the epoch the engine answers such a key's sort value in: the
@@ -264,10 +341,14 @@ impl SortKey {
             SCORE_KEY => json!(MATCH_SCORE),
             DOC_KEY => json!(ordinal),
             field => {
-                let instants = terms
-                    .mapped_type(field)
-                    .is_some_and(crate::state::date_values::is_date_type);
-                let mut best: Option<Value> = None;
+                let kind = terms.mapped_type(field);
+                let instants = kind.is_some_and(crate::state::date_values::is_date_type);
+                // The index's mappings answer what the key's values ARE where they map the
+                // field; where they do not, the values the documents hold answer it.
+                if instants || kind.is_some_and(|kind| LONG_TYPES.contains(&kind)) {
+                    self.long_valued.set(true);
+                }
+                let mut held_values: Vec<Value> = Vec::new();
                 for held in terms.held(source, field) {
                     if held.is_null() {
                         continue;
@@ -282,21 +363,212 @@ impl SortKey {
                     } else {
                         held
                     };
-                    let better = match &best {
-                        None => true,
-                        Some(current) => matches!(
-                            (value_order(&held, current), self.order),
-                            (Ordering::Less, Order::Ascending)
-                                | (Ordering::Greater, Order::Descending)
-                        ),
-                    };
-                    if better {
-                        best = Some(held);
+                    if kind.is_none() && integral(&held).is_some() {
+                        self.long_valued.set(true);
                     }
+                    held_values.push(held);
                 }
-                best.unwrap_or(Value::Null)
+                self.picked(held_values)
             }
         }
+    }
+
+    /// The ONE value this key orders a document by, out of the values it holds for the key's
+    /// field, or no value at all for a document holding none.
+    fn picked(&self, held: Vec<Value>) -> Value {
+        if held.is_empty() {
+            // A `missing` naming a VALUE orders the document by that value, as if the
+            // document held it; the two that name a PLACE are answered by the sentinel the
+            // hit carries and by where the comparison puts it.
+            return match &self.missing {
+                Missing::Stated(stated) => stated.clone(),
+                Missing::Last | Missing::First => Value::Null,
+            };
+        }
+        let mode = self.mode.unwrap_or(match self.order {
+            Order::Ascending => Mode::Min,
+            Order::Descending => Mode::Max,
+        });
+        match mode {
+            Mode::Min | Mode::Max => held
+                .into_iter()
+                .reduce(|best, next| {
+                    let better = match mode {
+                        Mode::Max => value_order(&next, &best) == Ordering::Greater,
+                        _ => value_order(&next, &best) == Ordering::Less,
+                    };
+                    if better {
+                        next
+                    } else {
+                        best
+                    }
+                })
+                .unwrap_or(Value::Null),
+            // The arithmetic modes are over the values that ARE numbers; a key whose values
+            // hold none is ordered by the one the direction's own default picks, since there
+            // is no sum of text.
+            Mode::Sum | Mode::Avg | Mode::Median => match arithmetic(&held, mode) {
+                Some(value) => value,
+                None => {
+                    let fallback = Self {
+                        mode: Some(match self.order {
+                            Order::Ascending => Mode::Min,
+                            Order::Descending => Mode::Max,
+                        }),
+                        ..self.clone()
+                    };
+                    fallback.picked(held)
+                }
+            },
+        }
+    }
+
+    /// Where a document holding no value for this key sorts against one that holds a value:
+    /// after it, unless the request asked for `_first`.
+    ///
+    /// The place is the same whichever way the key orders, which is what `_last` means.
+    fn missing_order(&self) -> Ordering {
+        match self.missing {
+            Missing::First => Ordering::Less,
+            Missing::Last | Missing::Stated(_) => Ordering::Greater,
+        }
+    }
+
+    /// The value a HIT carries for this key where the document holds none.
+    ///
+    /// A key whose values are longs carries the END of the long range the document was sorted
+    /// at — the greatest long where the missing document sorts last ascending or first
+    /// descending, and the least where it sorts the other way — so the value a client reads
+    /// back is the key the order really used, and a paged walk can resume from it. A key whose
+    /// values are not longs has no such sentinel and carries no value.
+    fn missing_value(&self) -> Value {
+        if let Missing::Stated(stated) = &self.missing {
+            return stated.clone();
+        }
+        if !self.long_valued.get() {
+            return Value::Null;
+        }
+        let last = matches!(self.missing, Missing::Last);
+        let ascending = matches!(self.order, Order::Ascending);
+        if last == ascending {
+            json!(i64::MAX)
+        } else {
+            json!(i64::MIN)
+        }
+    }
+}
+
+/// The whole number `value` holds exactly, where it holds one.
+fn integral(value: &Value) -> Option<i128> {
+    let number = value.as_number()?;
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+/// What a `sum`, an `avg` or a `median` mode reads off the values a document holds, or `None`
+/// where none of them is a number.
+///
+/// Computed at the precision the values hold: over whole numbers the arithmetic is exact and
+/// the result is a whole number, as the engine's own long arithmetic is, and a value that is
+/// not a whole number makes the whole computation a floating-point one.
+fn arithmetic(held: &[Value], mode: Mode) -> Option<Value> {
+    let numbers: Vec<&Value> = held.iter().filter(|value| value.is_number()).collect();
+    if numbers.is_empty() {
+        return None;
+    }
+    let whole: Option<Vec<i128>> = numbers.iter().map(|value| integral(value)).collect();
+    let count = numbers.len();
+    match whole {
+        Some(mut whole) => {
+            whole.sort_unstable();
+            let total: i128 = whole.iter().sum();
+            let count = i128::try_from(count).unwrap_or(1).max(1);
+            let value = match mode {
+                Mode::Sum => total,
+                Mode::Avg => rounded(total, count),
+                _ => middle(&whole),
+            };
+            Some(whole_number(value))
+        }
+        None => {
+            let mut magnitudes: Vec<f64> = numbers
+                .iter()
+                .filter_map(|value| value.as_f64())
+                .collect();
+            magnitudes.sort_by(f64::total_cmp);
+            let total: f64 = magnitudes.iter().sum();
+            #[allow(clippy::cast_precision_loss)]
+            let value = match mode {
+                Mode::Sum => total,
+                Mode::Avg => total / magnitudes.len().max(1) as f64,
+                _ => middle_magnitude(&magnitudes),
+            };
+            ::serde_json::Number::from_f64(value).map(Value::Number)
+        }
+    }
+}
+
+/// The middle of the SORTED whole numbers `values`, which for an even count is the mean of
+/// the two in the middle — at the same whole-number precision as the values themselves, so
+/// rounded the way the mean of whole numbers is ([`rounded`]).
+fn middle(values: &[i128]) -> i128 {
+    let count = values.len();
+    if count == 0 {
+        return 0;
+    }
+    let at = count / 2;
+    if count % 2 == 1 {
+        values.get(at).copied().unwrap_or_default()
+    } else {
+        let lower = values.get(at.saturating_sub(1)).copied().unwrap_or_default();
+        let upper = values.get(at).copied().unwrap_or_default();
+        rounded(lower.saturating_add(upper), 2)
+    }
+}
+
+/// `total` over `count` as a WHOLE number: the nearest one, with a half going UP.
+///
+/// The engine rounds the mean of a whole-number key rather than truncating it, so a key whose
+/// values average to a half sorts at the value above it. Computed in whole numbers, so a key
+/// whose values are longs past what a magnitude carries exactly rounds exactly too.
+fn rounded(total: i128, count: i128) -> i128 {
+    let count = count.max(1);
+    let numerator = total.saturating_mul(2).saturating_add(count);
+    let denominator = count.saturating_mul(2);
+    let quotient = numerator / denominator;
+    // Rust divides toward zero while the nearest-with-halves-up rounding is the FLOOR of
+    // that quotient, so a negative remainder takes the quotient one below.
+    if numerator % denominator != 0 && (numerator < 0) {
+        quotient.saturating_sub(1)
+    } else {
+        quotient
+    }
+}
+
+/// The same middle over magnitudes.
+fn middle_magnitude(values: &[f64]) -> f64 {
+    let count = values.len();
+    if count == 0 {
+        return 0.0;
+    }
+    let at = count / 2;
+    if count % 2 == 1 {
+        values.get(at).copied().unwrap_or_default()
+    } else {
+        let lower = values.get(at.saturating_sub(1)).copied().unwrap_or_default();
+        let upper = values.get(at).copied().unwrap_or_default();
+        (lower + upper) / 2.0
+    }
+}
+
+/// A whole number as a JSON number, which is exact for every value a long holds.
+fn whole_number(value: i128) -> Value {
+    match i64::try_from(value) {
+        Ok(value) => json!(value),
+        #[allow(clippy::cast_precision_loss)]
+        Err(_) => ::serde_json::Number::from_f64(value as f64).map_or(Value::Null, Value::Number),
     }
 }
 
@@ -313,39 +585,88 @@ fn written_key(written: &str) -> Result<SortKey, Box<RtResponse>> {
     };
     let order = match direction {
         None => default_order(field),
-        Some(ASCENDING) => Order::Ascending,
-        Some(DESCENDING) => Order::Descending,
-        Some(_) => return Err(unparsed_order()),
+        // A key written as text carries its direction in the TEXT rather than as a member of
+        // a body, so a refusal of it names no member's position.
+        Some(direction) => order_named(direction, None)?,
     };
     Ok(SortKey {
         field: field.to_string(),
         order,
+        mode: None,
+        missing: Missing::Last,
+        long_valued: ::std::cell::Cell::new(false),
     })
 }
 
-/// The key one member of a sort object states: the field it names, and the direction it
-/// gives as its value or under [`ORDER`].
-fn key_of(field: &str, options: &Value) -> Result<SortKey, Box<RtResponse>> {
+/// The key one member of a sort object states: the field it names, the direction it gives as
+/// its value or under [`ORDER`], and the two options it may carry beside it — which of the
+/// field's values the key reads ([`MODE`]) and where a document holding none goes
+/// ([`MISSING`]).
+fn key_of(field: &str, options: &Value, source: Option<&str>) -> Result<SortKey, Box<RtResponse>> {
     let direction = match options {
         Value::String(direction) => Some(direction.as_str()),
         Value::Object(_) => match options.get(ORDER) {
             None | Some(Value::Null) => None,
             Some(Value::String(direction)) => Some(direction.as_str()),
-            Some(_) => return Err(unparsed_order()),
+            Some(_) => return Err(unparsed_sort_member(ORDER, source)),
         },
         Value::Null => None,
         other => return Err(unparsed_sort(other)),
     };
     let order = match direction {
         None => default_order(field),
-        Some(ASCENDING) => Order::Ascending,
-        Some(DESCENDING) => Order::Descending,
-        Some(_) => return Err(unparsed_order()),
+        Some(direction) => order_named(direction, source)?,
+    };
+    let mode = match options.get(MODE) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(named)) => Some(mode_named(named, source)?),
+        Some(_) => return Err(unparsed_sort_member(MODE, source)),
+    };
+    let missing = match options.get(MISSING) {
+        None | Some(Value::Null) => Missing::Last,
+        Some(Value::String(named)) if named == MISSING_LAST => Missing::Last,
+        Some(Value::String(named)) if named == MISSING_FIRST => Missing::First,
+        // "The missing value can be set to _last, _first, or a custom value (that will be
+        // used as a sort value for missing docs)."
+        Some(stated) => Missing::Stated(stated.clone()),
     };
     Ok(SortKey {
         field: field.to_string(),
         order,
+        mode,
+        missing,
+        long_valued: ::std::cell::Cell::new(false),
     })
+}
+
+/// The mode `named` names, or the refusal of one the engine does not read.
+///
+/// Read without regard to case, as the direction is ([`order_named`]).
+fn mode_named(named: &str, source: Option<&str>) -> Result<Mode, Box<RtResponse>> {
+    let named = named.to_ascii_lowercase();
+    Ok(match named.as_str() {
+        "min" => Mode::Min,
+        "max" => Mode::Max,
+        "sum" => Mode::Sum,
+        "avg" => Mode::Avg,
+        "median" => Mode::Median,
+        _ => return Err(unparsed_sort_member(MODE, source)),
+    })
+}
+
+/// The direction `named` names, or the refusal of one the engine does not read.
+///
+/// The two directions are read without regard to CASE: the engine takes the name of its own
+/// order as the enumeration value it is, so `desc` and `DESC` name the same direction, and a
+/// request writing either is answered in that order rather than refused.
+fn order_named(named: &str, source: Option<&str>) -> Result<Order, Box<RtResponse>> {
+    if named.eq_ignore_ascii_case(ASCENDING) {
+        return Ok(Order::Ascending);
+    }
+    if named.eq_ignore_ascii_case(DESCENDING) {
+        return Ok(Order::Descending);
+    }
+    Err(unparsed_order(source, named))
 }
 
 /// The direction a key naming none orders in: a field ascends, while the score descends —
@@ -358,9 +679,9 @@ fn default_order(field: &str) -> Order {
     }
 }
 
-/// How two values of one sort key order: numbers by their magnitude, text by its code
-/// points, booleans with `false` first, and two values of different KINDS by the order of
-/// the kinds themselves ([`value_kind`]).
+/// How two values of one sort key order: numbers by their magnitude, at the PRECISION the
+/// values hold ([`number_order`]), text by its code points, booleans with `false` first, and
+/// two values of different KINDS by the order of the kinds themselves ([`value_kind`]).
 ///
 /// A TOTAL order, which it has to be: it is what the page's ranking is taken with, and a
 /// comparison that put a number before a text, that text before a second number and that
@@ -369,15 +690,36 @@ fn default_order(field: &str) -> Order {
 /// the kind decides first and the values are compared only within one kind.
 fn value_order(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
-        (Value::Number(one), Value::Number(two)) => one
-            .as_f64()
-            .unwrap_or_default()
-            .total_cmp(&two.as_f64().unwrap_or_default()),
+        (Value::Number(one), Value::Number(two)) => number_order(one, two),
         (Value::String(one), Value::String(two)) => one.cmp(two),
         (Value::Bool(one), Value::Bool(two)) => one.cmp(two),
         (one, two) => value_kind(one)
             .cmp(&value_kind(two))
             .then_with(|| scalar_text(one).cmp(&scalar_text(two))),
+    }
+}
+
+/// How two numbers of one sort key order: exactly, where both are whole numbers, and by
+/// magnitude otherwise.
+///
+/// Two whole numbers are compared AS whole numbers, never as magnitudes: the engine sorts an
+/// integral field at long precision, and a long past the 53 bits a magnitude carries exactly
+/// would compare equal to its neighbours — so two ids or two nanosecond timestamps either
+/// side of that boundary would tie or transpose, and a paged walk taken on such a key would
+/// skip or repeat documents.
+fn number_order(one: &::serde_json::Number, two: &::serde_json::Number) -> Ordering {
+    let whole = |number: &::serde_json::Number| {
+        number
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| number.as_u64().map(i128::from))
+    };
+    match (whole(one), whole(two)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => one
+            .as_f64()
+            .unwrap_or_default()
+            .total_cmp(&two.as_f64().unwrap_or_default()),
     }
 }
 
@@ -406,11 +748,54 @@ fn unparsed_sort(named: &Value) -> Box<RtResponse> {
 }
 
 /// The refusal a sort key naming a direction the engine does not read earns.
-fn unparsed_order() -> Box<RtResponse> {
-    Box::new(error(
+///
+/// The direction NAMES a value of the engine's own order enumeration, so what failed under the
+/// parse failure is that lookup: an illegal argument naming the enumeration and the name it
+/// was given, which is the cause the refusal carries.
+fn unparsed_order(source: Option<&str>, named: &str) -> Box<RtResponse> {
+    unparsed_sort_member_caused(
+        ORDER,
+        source,
+        Some(json!({
+            "type": ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+            "reason":
+                format!(
+                    "No enum constant {SORT_ORDER_ENUMERATION}.{}",
+                    named.to_uppercase()
+                ),
+        })),
+    )
+}
+
+/// The engine's own order enumeration, which a direction names a value of.
+const SORT_ORDER_ENUMERATION: &str = "org.opensearch.search.sort.SortOrder";
+
+/// The refusal a sort key whose member `member` the engine cannot read earns, naming WHERE in
+/// the body as sent that member's value sits ([`super::body_position`]) — which is what the
+/// engine's reader reports beside what it could not read. A key the body does not carry (one
+/// the query string named) has no such position.
+fn unparsed_sort_member(member: &str, source: Option<&str>) -> Box<RtResponse> {
+    unparsed_sort_member_caused(member, source, None)
+}
+
+/// That same refusal carrying the failure UNDER it, where the member's own reading has one.
+fn unparsed_sort_member_caused(
+    member: &str,
+    source: Option<&str>,
+    caused_by: Option<Value>,
+) -> Box<RtResponse> {
+    let at = source.and_then(|source| super::body_position::member_value_at(source, member));
+    let reason = match at {
+        Some((line, column)) => {
+            format!("[{line}:{column}] [field_sort] failed to parse field [{member}]")
+        }
+        None => format!("[field_sort] failed to parse field [{member}]"),
+    };
+    Box::new(super::caused_error(
         400,
         super::X_CONTENT_PARSE_EXCEPTION,
-        &format!("[field_sort] failed to parse field [{ORDER}]"),
+        &reason,
+        caused_by,
     ))
 }
 
@@ -914,6 +1299,82 @@ fn passages(text: &str, fragment_size: usize) -> Vec<(usize, usize)> {
 /// read off it, and the fragments its fields produced.
 pub(super) const SORT_MEMBER: &str = SORT;
 pub(super) const HIGHLIGHT_MEMBER: &str = HIGHLIGHT;
+
+/// The members a SEARCH BODY may name — the search source's own vocabulary.
+///
+/// The engine reads the search body member by member and refuses one it has no key for, so a
+/// body is answered for what it says or refused for what it does not: a misspelled member
+/// silently dropped would answer the search the caller did NOT write — every document, where
+/// the member was meant to narrow, order or summarise them. The members this surface does not
+/// yet act on are still the engine's own keys and are taken rather than refused, because what
+/// a member MEANS and whether the body may name it are two different questions.
+const SEARCH_SOURCE_MEMBERS: [&str; 36] = [
+    "query",
+    "from",
+    "size",
+    "sort",
+    "aggs",
+    "aggregations",
+    "highlight",
+    "post_filter",
+    "_source",
+    "fields",
+    "stored_fields",
+    "docvalue_fields",
+    "script_fields",
+    "indices_boost",
+    "rescore",
+    "suggest",
+    "collapse",
+    "search_after",
+    "slice",
+    "pit",
+    "knn",
+    "stats",
+    "ext",
+    "explain",
+    "profile",
+    "version",
+    "seq_no_primary_term",
+    "min_score",
+    "timeout",
+    "terminate_after",
+    "track_scores",
+    "track_total_hits",
+    "batched_reduce_size",
+    "derived",
+    "search_pipeline",
+    "verbose_pipeline",
+];
+
+/// The engine's refusal of a search body naming a member it has no key for, where `body` names
+/// one.
+pub(super) fn unreadable_member(body: &Value) -> Option<Box<RtResponse>> {
+    let unknown = body
+        .as_object()?
+        .iter()
+        .find(|(member, _)| !SEARCH_SOURCE_MEMBERS.contains(&member.as_str()))?;
+    let (member, value) = unknown;
+    Some(Box::new(error(
+        400,
+        PARSING_EXCEPTION,
+        // The engine names the TOKEN it was on beside the key it could not place, which is
+        // what the member's own value begins with.
+        &format!("Unknown key for a {} in [{member}].", token_of(value)),
+    )))
+}
+
+/// The name the engine's reader gives the token a value begins with.
+fn token_of(value: &Value) -> &'static str {
+    match value {
+        Value::Object(_) => "START_OBJECT",
+        Value::Array(_) => "START_ARRAY",
+        Value::String(_) => "VALUE_STRING",
+        Value::Number(_) => "VALUE_NUMBER",
+        Value::Bool(_) => "VALUE_BOOLEAN",
+        Value::Null => "VALUE_NULL",
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -24,6 +24,20 @@ const EXISTS_FIELD: &str = "field";
 /// own clause, which changes nothing about which documents it selects.
 const RANGE_MEMBERS: [&str; 5] = ["gt", "gte", "lt", "lte", "boost"];
 
+/// The members a `bool` may carry: the four clause lists it composes, and the options that
+/// change how its own clauses are weighed, counted and reported rather than which documents
+/// each selects.
+const BOOL_MEMBERS: [&str; 8] = [
+    "must",
+    "filter",
+    "must_not",
+    "should",
+    "minimum_should_match",
+    "adjust_pure_negative",
+    "boost",
+    "_name",
+];
+
 /// The members a clause carries its text, its fields and its options in.
 const QUERY_MEMBER: &str = "query";
 const FIELDS_MEMBER: &str = "fields";
@@ -523,7 +537,9 @@ impl Comparable {
     }
 }
 
-/// The selector the query clause `query` states.
+/// The selector the query clause `query` states, read out of the body text `source` — which
+/// a refusal names the POSITION in ([`Counted::source`]), and which code reading a query from
+/// somewhere other than a request body has none of.
 ///
 /// The clauses are counted AS THEY ARE READ, against the number one body may name at all
 /// ([`MAX_QUERY_CLAUSE_NODES`]): a body past it is refused while it is being read rather than
@@ -531,8 +547,15 @@ impl Comparable {
 /// causes is sized by the body a caller sent. A `bool` composition counts here even though
 /// the engine's own clause ceiling does not count it ([`Selector::clauses`]), because walking
 /// its list is work every document pays for.
-pub(super) fn selector(query: Option<&Value>, depth: usize) -> Result<Selector, Box<RtResponse>> {
-    let mut counted = Counted::default();
+pub(super) fn selector(
+    query: Option<&Value>,
+    depth: usize,
+    source: Option<&str>,
+) -> Result<Selector, Box<RtResponse>> {
+    let mut counted = Counted {
+        source,
+        ..Counted::default()
+    };
     read_selector(query, depth, &mut counted)
 }
 
@@ -545,12 +568,15 @@ pub(super) fn selector(query: Option<&Value>, depth: usize) -> Result<Selector, 
 /// every document pays for, so the objects are counted too, against the emulator's own
 /// [`MAX_QUERY_CLAUSE_NODES`].
 #[derive(Debug, Default)]
-pub(super) struct Counted {
+pub(super) struct Counted<'s> {
     pub(super) evaluated: usize,
     pub(super) named: usize,
+    /// The request body AS SENT, where this query was read out of one: what a parse failure
+    /// takes the position it names from.
+    pub(super) source: Option<&'s str>,
 }
 
-impl Counted {
+impl Counted<'_> {
     /// Count one clause OBJECT the body names, refusing past what one body may name.
     pub(super) fn named(&mut self) -> Result<(), Box<RtResponse>> {
         self.named = self.named.saturating_add(1);
@@ -590,7 +616,7 @@ pub(super) fn too_many_clauses() -> Box<RtResponse> {
 pub(super) fn read_selector(
     query: Option<&Value>,
     depth: usize,
-    counted: &mut Counted,
+    counted: &mut Counted<'_>,
 ) -> Result<Selector, Box<RtResponse>> {
     counted.named()?;
     // The engine's own bound on how far a `bool` composition may nest
@@ -632,7 +658,7 @@ pub(super) fn read_selector(
         // `match_phrase` ask the question of the TERMS the field's analyzer produces, which
         // is what makes an index's own analysis settings decide what a query finds.
         "term" => {
-            let (field, wanted) = single_field(value)?;
+            let (field, wanted) = single_field(name, value)?;
             let wanted = wanted
                 .get("value")
                 .or_else(|| wanted.get("query"))
@@ -644,7 +670,7 @@ pub(super) fn read_selector(
             })
         }
         "match" | "match_phrase" => {
-            let (field, wanted) = single_field(value)?;
+            let (field, wanted) = single_field(name, value)?;
             let wanted = wanted
                 .get("query")
                 .or_else(|| wanted.get("value"))
@@ -657,7 +683,7 @@ pub(super) fn read_selector(
             })
         }
         "terms" => {
-            let (field, wanted) = single_field(value)?;
+            let (field, wanted) = single_field(name, value)?;
             let values = match wanted {
                 Value::Array(elements) => {
                     // The engine's own ceiling on how many terms ONE such clause may name,
@@ -689,7 +715,7 @@ pub(super) fn read_selector(
                 return Err(Box::new(error(
                     400,
                     PARSING_EXCEPTION,
-                    &format!("[{name}] query requires '{EXISTS_FIELD}' to be specified"),
+                    &format!("[{name}] must be provided with a [{EXISTS_FIELD}]"),
                 )));
             };
             Ok(Selector::Exists {
@@ -699,7 +725,7 @@ pub(super) fn read_selector(
         // A `range` asks which SIDE of each bound it names the field's value is on, compared
         // as that field's own mapping says its values are ([`Comparable`]).
         "range" => {
-            let (field, bounds) = single_field(value)?;
+            let (field, bounds) = single_field(name, value)?;
             let Value::Object(members) = &bounds else {
                 return Err(Box::new(error(
                     400,
@@ -818,7 +844,22 @@ pub(super) fn read_selector(
             ))
         }
         "bool" => {
-            let clauses = |name: &str, counted: &mut Counted| -> Result<Vec<Selector>, Box<RtResponse>> {
+            // A `bool` composes the clause lists it is documented to compose, beside the
+            // options that change how its own clauses are weighed and reported. A member
+            // outside that vocabulary is REFUSED rather than ignored: a misspelled list
+            // silently dropped would answer the documents of a composition the caller did
+            // not write — every document, where the clause was meant to narrow them.
+            if let Some(members) = value.as_object() {
+                if let Some(unsupported) = members
+                    .keys()
+                    .find(|member| !BOOL_MEMBERS.contains(&member.as_str()))
+                {
+                    return Err(unknown_field(name, unsupported, counted.source));
+                }
+            }
+            let clauses = |name: &str,
+                           counted: &mut Counted<'_>|
+             -> Result<Vec<Selector>, Box<RtResponse>> {
                 let listed = match value.get(name) {
                     None => Vec::new(),
                     Some(Value::Array(elements)) => elements.clone(),
@@ -839,32 +880,86 @@ pub(super) fn read_selector(
             }
             Ok(Selector::All_(composed))
         }
-        other => Err(Box::new(error(
-            400,
-            PARSING_EXCEPTION,
-            &format!("no [query] registered for [{other}]"),
-        ))),
+        other => Err(unknown_query(other, counted.source)),
     }
 }
 
-/// The one field a `term`/`terms`/`match` clause names, and the value it wants.
-pub(super) fn single_field(value: &Value) -> Result<(String, Value), Box<RtResponse>> {
-    match value {
-        Value::Object(members) if members.len() == 1 => members
-            .iter()
-            .next()
-            .map(|(field, wanted)| (field.clone(), wanted.clone()))
-            .ok_or_else(|| {
-                Box::new(error(
-                    400,
-                    PARSING_EXCEPTION,
-                    "[term] query does not support an empty field list",
-                ))
-            }),
+/// The refusal a query naming a clause the engine has nothing registered for earns.
+///
+/// The engine reads a query clause as a NAMED OBJECT — the name decides which reader the
+/// object is handed to — so the failure is the parse failure of the query, caused by the
+/// lookup of that name finding nothing, and the cause names WHERE in the body the name was
+/// read ([`body_position`]). A query read from somewhere other than a request body has no such
+/// position and carries no cause.
+fn unknown_query(name: &str, source: Option<&str>) -> Box<RtResponse> {
+    let caused_by = source
+        .and_then(|source| body_position::member_value_at(source, name))
+        .map(|(line, column)| {
+            ::serde_json::json!({
+                "type": NAMED_OBJECT_NOT_FOUND_EXCEPTION,
+                "reason": format!("[{line}:{column}] unknown field [{name}]"),
+            })
+        });
+    Box::new(caused_error(
+        400,
+        PARSING_EXCEPTION,
+        &format!("unknown query [{name}]"),
+        caused_by,
+    ))
+}
+
+/// The engine's error type for the lookup of a named object's name finding no reader for it.
+const NAMED_OBJECT_NOT_FOUND_EXCEPTION: &str = "named_object_not_found_exception";
+
+/// The refusal a clause carrying a member its own reader has no place for earns.
+///
+/// Such a reader reads a clause member by member, so what it reports is the FIELD it could
+/// not place and the position that field's NAME sits at in the body as sent — a different
+/// failure from a clause name nothing is registered for ([`unknown_query`]), which is why it
+/// is worded and typed differently. A clause read from somewhere other than a request body
+/// has no position to name and is refused without one.
+fn unknown_field(clause: &str, field: &str, source: Option<&str>) -> Box<RtResponse> {
+    let at = source.and_then(|source| body_position::member_name_at(source, field));
+    let reason = match at {
+        Some((line, column)) => {
+            format!("[{line}:{column}] [{clause}] unknown field [{field}]")
+        }
+        None => format!("[{clause}] unknown field [{field}]"),
+    };
+    Box::new(error(400, X_CONTENT_PARSE_EXCEPTION, &reason))
+}
+
+/// The one field a `term`/`terms`/`match`/`range` clause names, and the value it wants.
+///
+/// Such a clause asks its question of ONE field — the one member of its own object — so a
+/// clause naming two is refused, and the refusal names the clause and the two fields it found,
+/// which is what tells a caller which member of its body to drop.
+pub(super) fn single_field(
+    clause: &str,
+    value: &Value,
+) -> Result<(String, Value), Box<RtResponse>> {
+    let Value::Object(members) = value else {
+        return Err(Box::new(error(
+            400,
+            PARSING_EXCEPTION,
+            &format!("[{clause}] query must name exactly one field"),
+        )));
+    };
+    let mut named = members.iter();
+    match (named.next(), named.next()) {
+        (Some((field, wanted)), None) => Ok((field.clone(), wanted.clone())),
+        (Some((first, _)), Some((second, _))) => Err(Box::new(error(
+            400,
+            PARSING_EXCEPTION,
+            &format!(
+                "[{clause}] query doesn't support multiple fields, found [{first}] and \
+                 [{second}]"
+            ),
+        ))),
         _ => Err(Box::new(error(
             400,
             PARSING_EXCEPTION,
-            "[term] query must name exactly one field",
+            &format!("[{clause}] query does not support an empty field list"),
         ))),
     }
 }

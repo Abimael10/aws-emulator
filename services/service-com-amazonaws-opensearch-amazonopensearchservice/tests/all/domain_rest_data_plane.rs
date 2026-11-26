@@ -685,7 +685,10 @@ async fn every_bound_the_data_plane_declares_refuses_rather_than_serving() {
             path: "/catalog/_search",
             body: Some(json!({ "from": 9_999, "size": 100 })),
             status: 400,
-            error_type: Some("illegal_argument_exception"),
+            // The window is a bound a SHARD applies while it executes the query, so the
+            // refusal arrives through the search-phase envelope with the argument failure as
+            // its cause.
+            error_type: Some("search_phase_execution_exception"),
         },
         Row {
             case: "a create body that is not a JSON object",

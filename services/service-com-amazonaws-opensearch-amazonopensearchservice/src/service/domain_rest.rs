@@ -246,6 +246,9 @@ mod security_audit;
 /// their clauses in.
 mod query_string;
 
+/// WHERE in a request body a member's value sits, which a parse failure names.
+mod body_position;
+
 /// The most bytes one data-plane request body is read as JSON.
 ///
 /// The emulator's OWN bound, like [`crate::state::INDEX_QUOTA`]: every byte lives in this
@@ -425,9 +428,6 @@ struct CrossCluster {
     /// its index the way a cross-cluster hit does — `<cluster>:<index>` — so a client can
     /// tell which cluster answered.
     resolved: BTreeMap<String, Vec<Hit>>,
-    /// The cluster aliases the request named that resolve to no connection this domain can
-    /// search through: none at all, or one that is not yet (or no longer) `ACTIVE`.
-    unknown: BTreeSet<String>,
 }
 
 /// What a request ADDRESSES, as the wire carries it: the host it was sent to — absent on a
@@ -1233,11 +1233,9 @@ fn cross_cluster(
                 .then(|| connection.remote_domain.domain_name.clone())
         });
         let Some(remote_domain) = remote_domain else {
-            across.unknown.insert(alias.to_string());
             continue;
         };
         let Some(remote) = store.settled_mut(&remote_domain, now) else {
-            across.unknown.insert(alias.to_string());
             continue;
         };
         let mut hits = Vec::new();
@@ -3301,8 +3299,10 @@ fn dls_selector(visibility: &fgac_permissions::Visibility) -> Option<Selector> {
         .map(|document| {
             // The member travels as the query itself, which is the form the plugin's own
             // `dls` carries, and a document that wraps it in `query` names the same thing.
+            // The role's own document is not a request body, so a refusal of it names no
+            // position in one.
             let query = document.get("query").unwrap_or(document);
-            selector(Some(query), 0).unwrap_or_else(|_| Selector::Ids(Vec::new()))
+            selector(Some(query), 0, None).unwrap_or_else(|_| Selector::Ids(Vec::new()))
         })
         .collect();
     Some(Selector::Any(clauses))
@@ -3696,24 +3696,39 @@ fn search(
         Ok(body) => body.unwrap_or_else(|| json!({})),
         Err(refusal) => return *refusal,
     };
-    let from = usize::try_from(numbered(&body, "from", request, 0)).unwrap_or(0);
-    let size = usize::try_from(numbered(
+    // The body is read before anything is scanned, so a member the engine has no key for is
+    // refused rather than dropped from a search that then answers something else.
+    if let Some(refusal) = search::unreadable_member(&body) {
+        return *refusal;
+    }
+    let from = match paged(&body, "from", request, 0) {
+        Ok(from) => from,
+        Err(refusal) => return *refusal,
+    };
+    let size = match paged(
         &body,
         "size",
         request,
         i64::try_from(DEFAULT_SEARCH_SIZE).unwrap_or(10),
-    ))
-    .unwrap_or(DEFAULT_SEARCH_SIZE);
+    ) {
+        Ok(size) => size,
+        Err(refusal) => return *refusal,
+    };
     // The engine's own bound on how much one search may answer with, which is also what
     // bounds the hits this request materialises: past it the search is refused rather than
-    // served.
-    if from.saturating_add(size) > MAX_RESULT_WINDOW {
-        return error(
-            400,
+    // served. The bound is each INDEX's own `index.max_result_window`, and the refusal is a
+    // shard's — the engine applies it while a shard executes the query — so it is answered
+    // through the search-phase envelope with the argument failure as its cause.
+    let (window, shard_index) = result_window(domain, index_name);
+    if from.saturating_add(size) > window {
+        return all_shards_failed(
+            &shard_index,
             ingest::ILLEGAL_ARGUMENT_EXCEPTION,
             &format!(
                 "Result window is too large, from + size must be less than or equal to: \
-                 [{MAX_RESULT_WINDOW}] but was [{}].",
+                 [{window}] but was [{}]. See the scroll api for a more efficient way to \
+                 request large data sets. This limit can be set by changing the \
+                 [index.{MAX_RESULT_WINDOW_SETTING}] index level setting.",
                 from.saturating_add(size)
             ),
         );
@@ -3756,7 +3771,7 @@ fn search(
             if sorted {
                 hit.insert(
                     search::SORT_MEMBER.to_string(),
-                    Value::Array(selection.sort),
+                    Value::Array(sorting.answered(selection.sort)),
                 );
             }
             if let Some(highlight) = selection.highlight {
@@ -3818,14 +3833,63 @@ fn record_searched(domain: &Domain, request: &Request<'_>, named: &str) {
     request.record_served(domain, &served);
 }
 
-/// The number a search names for `name`, in the body or in the query string, falling back
-/// to `default`.
-fn numbered(body: &Value, name: &str, request: &Request<'_>, default: i64) -> i64 {
-    body.get(name)
+/// The PAGE a search asks for under `name` — `from` or `size` — or the engine's refusal of a
+/// negative one.
+///
+/// Either names a count of hits, and no count is negative: the engine refuses such a request
+/// rather than reading the value as another number, because a page the caller did not ask for
+/// is not the page it asked for. Stated as the illegal argument it is, naming the member and
+/// the value the request sent.
+fn paged(
+    body: &Value,
+    name: &str,
+    request: &Request<'_>,
+    default: i64,
+) -> Result<usize, Box<RtResponse>> {
+    let stated = body
+        .get(name)
         .and_then(Value::as_i64)
         .or_else(|| request.parameter(name).and_then(|text| text.parse().ok()))
-        .unwrap_or(default)
-        .max(0)
+        .unwrap_or(default);
+    usize::try_from(stated).map_err(|_| {
+        Box::new(error(
+            400,
+            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+            &format!("[{name}] parameter cannot be negative, found [{stated}]"),
+        ))
+    })
+}
+
+/// The setting an index carries its own result window in, which is the one the refusal past
+/// that window names as the way to change it — under the `index` section every index setting
+/// is addressed in.
+const MAX_RESULT_WINDOW_SETTING: &str = "max_result_window";
+
+/// The window a search over the indexes `named` names is bounded by, and the index whose
+/// shard the refusal past it comes from.
+///
+/// `index.max_result_window` is each INDEX's own setting, and the engine applies it per shard,
+/// so a request over several indexes is bounded by the SMALLEST window among them — the first
+/// shard to refuse is the one whose index holds that window. An index that states none has the
+/// setting's own default ([`MAX_RESULT_WINDOW`]), which is also what bounds a request that
+/// resolves to no index of this domain at all.
+fn result_window(domain: &Domain, named: &str) -> (usize, String) {
+    let mut window = MAX_RESULT_WINDOW;
+    let mut index_name = named.to_string();
+    for index in resolved_indexes(domain, Some(named))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|name| domain.indexes.get(name))
+    {
+        let stated = setting_number(&index.schema, MAX_RESULT_WINDOW_SETTING)
+            .and_then(|stated| usize::try_from(stated).ok())
+            .unwrap_or(MAX_RESULT_WINDOW);
+        if stated <= window {
+            window = stated;
+            index_name = index.index_name.clone();
+        }
+    }
+    (window, index_name)
 }
 
 /// How a search asks for its answer beside the query that selects the documents: the page it
@@ -3866,13 +3930,15 @@ fn selected_documents(
         ..
     } = *asked;
     let body = request.json()?.unwrap_or_else(|| json!({}));
+    // The body AS SENT, which a refusal of the query names the position in.
+    let source = ::std::str::from_utf8(request.body).ok();
     // The query a request states in its BODY, or — where it states none there — the one its
     // QUERY STRING states, which is the URI form of a search ([`query_string`]).
     let select = match body.get("query") {
-        Some(query) => selector(Some(query), 0)?,
+        Some(query) => selector(Some(query), 0, source)?,
         None => match query_string::requested(request)? {
             Some(select) => select,
-            None => selector(None, 0)?,
+            None => selector(None, 0, source)?,
         },
     };
     let patterns = named_patterns(index_name)?;
@@ -3883,10 +3949,11 @@ fn selected_documents(
     // remote clusters answered rather than against this domain's own indexes.
     let mut remote = BTreeSet::new();
     for pattern in patterns {
-        if let Some((alias, _)) = pattern.split_once(REMOTE_CLUSTER_SEPARATOR) {
-            if across.unknown.contains(alias) {
-                return Err(Box::new(no_such_remote_cluster(alias)));
-            }
+        if pattern.contains(REMOTE_CLUSTER_SEPARATOR) {
+            // A `<cluster>:<index>` pattern names a TARGET of another cluster, and a target
+            // this domain cannot resolve — an alias no connection of it carries, or an index
+            // the cluster that alias names does not hold — is a target that is not there,
+            // which is the missing index the pattern names.
             if !across.resolved.contains_key(pattern) {
                 return Err(Box::new(index_not_found(pattern)));
             }
@@ -4774,23 +4841,6 @@ fn index_not_found(index_name: &str) -> RtResponse {
     )
 }
 
-/// The refusal for a cluster alias the request named that this domain cannot search
-/// through: the engine's own answer for a remote cluster it has no connection to.
-///
-/// 400 rather than 404: the request named a cluster the local cluster does not know, which
-/// the engine reports as an argument it cannot act on rather than as a missing resource.
-fn no_such_remote_cluster(alias: &str) -> RtResponse {
-    error(
-        400,
-        NO_SUCH_REMOTE_CLUSTER_EXCEPTION,
-        &format!("no such remote cluster: [{alias}]"),
-    )
-}
-
-/// The engine's error type for a cross-cluster request naming a cluster it has no
-/// connection to.
-const NO_SUCH_REMOTE_CLUSTER_EXCEPTION: &str = "no_such_remote_cluster_exception";
-
 /// An error naming the index it is about, which is what the engine's index errors carry
 /// beside the type and the reason.
 fn indexed_error(status: u16, error_type: &str, reason: &str, index_name: &str) -> RtResponse {
@@ -4820,14 +4870,30 @@ fn indexed_error(status: u16, error_type: &str, reason: &str, index_name: &str) 
 /// The engine's error envelope: the type and the reason, with the status repeated in the
 /// body as every OpenSearch error carries it.
 fn error(status: u16, error_type: &str, reason: &str) -> RtResponse {
+    caused_error(status, error_type, reason, None)
+}
+
+/// The same envelope carrying the failure UNDER this one, where the refusal has one: a
+/// `caused_by` beside the type and the reason, which is what the engine answers when what went
+/// wrong is a step of what the request asked for.
+fn caused_error(
+    status: u16,
+    error_type: &str,
+    reason: &str,
+    caused_by: Option<Value>,
+) -> RtResponse {
+    let mut refusal = json!({
+        "root_cause": [{ "type": error_type, "reason": reason }],
+        "type": error_type,
+        "reason": reason,
+    });
+    if let (Some(cause), Some(refusal)) = (caused_by, refusal.as_object_mut()) {
+        refusal.insert("caused_by".to_string(), cause);
+    }
     rendered(
         status,
         &json!({
-            "error": {
-                "root_cause": [{ "type": error_type, "reason": reason }],
-                "type": error_type,
-                "reason": reason,
-            },
+            "error": refusal,
             "status": status,
         }),
     )

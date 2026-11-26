@@ -9,10 +9,9 @@
 //! > a search that names `<cluster>:<index>` is answered from the REMOTE domain the source
 //! > domain's ACTIVE outbound connection carrying that `ConnectionAlias` names — never from
 //! > the local cluster's own indexes — and each hit it answers names its index the way a
-//! > cross-cluster hit does, `<cluster>:<index>`; a pattern naming an alias the domain has
-//! > no active connection for is refused as a remote cluster the local one does not know,
-//! > and one naming an index the remote cluster does not hold is refused exactly as a local
-//! > index that is absent.
+//! > cross-cluster hit does, `<cluster>:<index>`; a `<cluster>:<index>` target the domain
+//! > cannot resolve — an alias it has no active connection for, or an index the remote
+//! > cluster does not hold — is refused exactly as a local index that is absent.
 //!
 //! The rows span the class: the remote index alone, a local and a remote index in one
 //! request, a wildcard across the remote cluster, a query filter applied to the remote
@@ -322,10 +321,10 @@ async fn a_cross_cluster_search_answers_the_remote_clusters_documents() {
     );
 }
 
-/// RULE (the refusals of the same rule): a pattern naming an alias the domain has no
-/// ACTIVE connection for is refused as a remote cluster the local one does not know, and
-/// one naming an index the remote cluster does not hold is refused exactly as an absent
-/// local index is.
+/// RULE (the refusals of the same rule): a `<cluster>:<index>` target this domain cannot
+/// resolve — an alias no ACTIVE connection of it carries, or an index the cluster that alias
+/// names does not hold — is refused exactly as an absent LOCAL index is: the target named is
+/// not there.
 #[tokio::test]
 async fn a_cross_cluster_search_refuses_a_cluster_or_an_index_it_cannot_resolve() {
     let emulator = Emulator::new();
@@ -345,23 +344,23 @@ async fn a_cross_cluster_search_refuses_a_cluster_or_an_index_it_cannot_resolve(
         (
             "an alias no connection of this domain carries",
             format!("{UNCONNECTED_ALIAS}:{SHARED_INDEX}"),
-            400,
-            "no_such_remote_cluster_exception",
-            format!("no such remote cluster: [{UNCONNECTED_ALIAS}]"),
+            404,
+            "index_not_found_exception",
+            format!("no such index [{UNCONNECTED_ALIAS}:{SHARED_INDEX}]"),
         ),
         (
             "an alias whose connection has not been accepted",
             format!("{PENDING_ALIAS}:{SHARED_INDEX}"),
-            400,
-            "no_such_remote_cluster_exception",
-            format!("no such remote cluster: [{PENDING_ALIAS}]"),
+            404,
+            "index_not_found_exception",
+            format!("no such index [{PENDING_ALIAS}:{SHARED_INDEX}]"),
         ),
         (
             "a local index beside an unresolvable cluster",
             format!("{SHARED_INDEX},{UNCONNECTED_ALIAS}:{SHARED_INDEX}"),
-            400,
-            "no_such_remote_cluster_exception",
-            format!("no such remote cluster: [{UNCONNECTED_ALIAS}]"),
+            404,
+            "index_not_found_exception",
+            format!("no such index [{UNCONNECTED_ALIAS}:{SHARED_INDEX}]"),
         ),
     ];
 
