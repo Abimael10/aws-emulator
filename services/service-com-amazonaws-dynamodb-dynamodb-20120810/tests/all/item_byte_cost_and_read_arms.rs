@@ -6,15 +6,14 @@
 //! The rules pinned here, each over a SET of inputs rather than one example:
 //!
 //! 1. the stored width of an `N` attribute value is "1 byte per two significant digits"
-//!    rounded up "plus 1 byte" (the Developer Guide's "Item sizes and formats"), and one
-//!    more byte for a negative number — which is what makes an `N` value at the
-//!    documented 38-digit precision ceiling the documented 21 bytes wide at most. The
-//!    significant digits are the ones the value's own canonical decimal form spells with
-//!    its leading zeros left out: the zeros a whole number carries before the decimal
-//!    point are digits of it, the zeros a fraction ends with are not, and a zero between
-//!    two significant digits always is. The boundary the rule is read at is the documented
-//!    item ceiling — "The maximum item size in DynamoDB is 400 KB" — which an item one
-//!    byte past is refused with HTTP 400 `ValidationException`;
+//!    "plus 1 byte" (the Developer Guide's "Item sizes and formats"), and one more byte
+//!    for a negative number — which is what makes an `N` value at the documented 38-digit
+//!    precision ceiling the documented 21 bytes wide at most. The digits are stored in
+//!    PAIRS aligned on the decimal point, so a pair of zeros at either end falls away and
+//!    a zero between two significant digits does not; the alignment itself is pinned by
+//!    `number_stored_width_pair_alignment`. The boundary the rule is read at is the
+//!    documented item ceiling — "The maximum item size in DynamoDB is 400 KB" — which an
+//!    item one byte past is refused with HTTP 400 `ValidationException`;
 //! 2. `ReturnConsumedCapacity=TOTAL` asks for "only the aggregate ConsumedCapacity for
 //!    the operation" (the `ReturnConsumedCapacity` doc), so that answer carries the table
 //!    and the aggregate and nothing else, while `INDEXES` carries the itemisation beside
@@ -91,12 +90,12 @@ fn number_cases() -> Vec<NumberCase> {
             bytes: 3,
         },
         NumberCase {
-            case: "the trailing zeros of a whole number are digits of it",
+            case: "the trailing zeros of a whole number pair off and fall away",
             literal: "1200",
-            bytes: 3,
+            bytes: 2,
         },
         NumberCase {
-            case: "the trailing zeros of a fraction are not",
+            case: "and so do the trailing zeros of a fraction",
             literal: "12.00",
             bytes: 2,
         },

@@ -529,7 +529,7 @@ const MAX_EXPONENT: i32 = 125;
 /// The quota above bounds the SIGNIFICANT digits and the exponent, not the text: a run
 /// of zeros normalises to the value zero however long it is, so without this bound a
 /// caller could store an arbitrarily long numeric text whose accounted size
-/// ([`attribute_value_size`], which sizes a number from its significant digits) is one
+/// ([`attribute_value_size`], which sizes a number from its stored digit pairs) is one
 /// byte — growing what the process retains without moving the budgets measured against
 /// it. A text with more digits than 38 significant ones plus the whole exponent span
 /// denotes no value inside the documented range that a shorter text does not also
@@ -4494,9 +4494,10 @@ fn byte_len(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
-/// A number's stored size: 1 byte per two significant digits (rounded up), plus 1 byte,
-/// plus one byte for a negative number ([`NumberKey::stored_bytes`]). An unparseable
-/// value is sized by its text, which is all there is to store.
+/// A number's stored size: 1 byte per PAIR of stored digits, the pairs aligned on the
+/// decimal point, plus 1 byte for the exponent, plus one byte for a negative number
+/// ([`NumberKey::stored_bytes`]). An unparseable value is sized by its text, which is all
+/// there is to store.
 fn number_size(text: &str) -> i64 {
     match NumberKey::parse(text) {
         Some(number) => number.stored_bytes(),

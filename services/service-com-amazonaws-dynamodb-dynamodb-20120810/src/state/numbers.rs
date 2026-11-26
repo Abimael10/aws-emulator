@@ -139,45 +139,52 @@ impl NumberKey {
         }
     }
 
-    /// The number of significant digits, which is what an `N` value's stored size is
-    /// computed from.
+    /// How many PAIRS of decimal digits the stored form of this number is made of, which
+    /// is what an `N` value's accounted size is computed from.
     ///
-    /// The digits are the ones the number is SPELLED with, leading zeros left out:
-    /// "Leading and trailing zeroes are trimmed" (the `AttributeValue$N` numeric domain),
-    /// and a decimal point is where a trailing zero can be trimmed at all — so the zeros a
-    /// whole number carries BEFORE the point are digits of it (`100` spells three), while
-    /// the zeros a fraction ends with are not (`1.100` spells two), and a zero between two
-    /// significant digits is always one of them (`1.0001` spells five).
+    /// "1 byte per two significant digits" (the Developer Guide's "Item sizes and
+    /// formats") is a rule about the stored form, not about a digit run: a stored number
+    /// is a decimal exponent and a run of digit PAIRS, and the pairs are aligned on the
+    /// DECIMAL POINT — the integral digits pair off leftwards from the point and the
+    /// fractional ones rightwards — so which pairs a value occupies follows where its
+    /// point falls and not only how many digits it is written with. A pair of zeros at
+    /// either end is not stored at all, because the exponent states it instead
+    /// ("Leading and trailing zeroes are trimmed", the `AttributeValue$N` numeric
+    /// domain), while a zero sitting between two significant digits is part of the pair
+    /// it falls in.
     ///
-    /// A value whose decimal point sits just past the digits it holds is spelled with the
-    /// zeros that point asks for, and counts them. A magnitude past the documented
-    /// precision ceiling is not: a number that would need more digits than a stored number
-    /// can hold is spelled with an EXPONENT instead of with that run of zeros, so what it
-    /// is spelled with is its mantissa — which is also what keeps every `N` value inside
-    /// the documented maximum width of one.
-    pub(super) fn significant_digits(&self) -> i64 {
-        let held = i64::try_from(self.digits.len()).unwrap_or(i64::MAX);
-        let ceiling = i64::try_from(MAX_SIGNIFICANT_DIGITS).unwrap_or(i64::MAX);
-        let spelled = i64::from(self.point).max(0);
-        if spelled > ceiling {
-            return held;
+    /// Two consequences, which is what makes the rule observable: a whole number's
+    /// trailing zeros pair off and fall away (`100` occupies one pair, `1010` two), and
+    /// the same integral digits KEEP their zeros once a fraction follows, because the
+    /// point moves and the pairs realign (`100.5` occupies three — `1`, `00` and `5`).
+    /// It also bounds the width of every `N` value: the documented 38 digits of precision
+    /// span at most 20 pairs, however they are aligned.
+    fn stored_digit_pairs(&self) -> i64 {
+        if self.digits.is_empty() {
+            return 0;
         }
-        held.max(spelled)
+        let digits = i64::try_from(self.digits.len()).unwrap_or(i64::MAX);
+        let point = i64::from(self.point);
+        // The value is 0.<digits> * 10^point, so its digits occupy the decimal places
+        // 10^(point-1) down to 10^(point-digits), and both ends are significant: parsing
+        // dropped the leading and the trailing zeros. A pair covers the two places that
+        // share a half when their exponent is halved towards minus infinity, so the pairs
+        // the value occupies are the ones between its two ends, inclusive.
+        let highest = pair_of(point.saturating_sub(1));
+        let lowest = pair_of(point.saturating_sub(digits));
+        highest.saturating_sub(lowest).saturating_add(1)
     }
 
-    /// The bytes storing this number is accounted for: "1 byte per two significant
-    /// digits" — so an odd digit count fills the second half of a byte and pays for it —
-    /// "+ 1 byte" (the Developer Guide's "Item sizes and formats"), and one more byte for
-    /// a negative number, which is what makes an `N` value at the documented precision
-    /// ceiling the documented 21 bytes wide at most.
+    /// The bytes storing this number is accounted for: one per pair of stored digits
+    /// ([`Self::stored_digit_pairs`]), "+ 1 byte" (the Developer Guide's "Item sizes and
+    /// formats") for the exponent, and one more byte for a negative number — which is
+    /// what puts a negative value at the documented 38-digit precision ceiling at the
+    /// documented width of 21 bytes.
     ///
-    /// Zero holds no significant digits, so it is the base byte alone.
+    /// Zero holds no digits at all, so it is the base byte alone.
     pub(super) fn stored_bytes(&self) -> i64 {
-        let digits = self.significant_digits();
         let sign = i64::from(self.negative);
-        digits
-            .saturating_add(1)
-            .saturating_div(2)
+        self.stored_digit_pairs()
             .saturating_add(1)
             .saturating_add(sign)
     }
@@ -222,6 +229,15 @@ impl NumberKey {
             magnitude
         }
     }
+}
+
+/// Which stored digit pair the decimal place `10^exponent` falls in.
+///
+/// The pairs are aligned on the decimal point: places `10^0` and `10^1` share one, `10^-1`
+/// and `10^-2` the next one down, and so on in both directions — which is halving towards
+/// minus infinity rather than towards zero, so the alignment does not break at the point.
+fn pair_of(exponent: i64) -> i64 {
+    exponent.div_euclid(2)
 }
 
 /// The decimal exponent `text` states, or the rule it breaks.
