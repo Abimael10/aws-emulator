@@ -557,6 +557,47 @@ pub enum GroupToken {
     /// are that call's arguments — so a pair written around one argument is not a pair
     /// around a group.
     Call,
+    /// A token the grammar reads as a COMPARATOR: what tells a group that states an
+    /// operand from a group that states a condition ([`group_states_an_operand`]). Which
+    /// words a grammar compares with is its own vocabulary, so each grammar marks its own.
+    Comparator,
+}
+
+/// Whether the group that opens at `at` states an OPERAND of a comparison rather than a
+/// condition: the token after its closing `)` is a comparator.
+///
+/// Parentheses group whatever the grammar reads at the position they stand in, and both a
+/// condition and an operand can stand where a condition begins, so the two are told apart
+/// by what FOLLOWS the group — a comparator after it makes the group one side of that
+/// comparison, since a condition is not compared against anything. A group the expression
+/// never closes is no group to read either way, so it is left to the condition reading,
+/// which reports where the text ran out.
+///
+/// Stated over the GROUPING alone, like the redundant-parenthesis rule beside it
+/// ([`states_redundant_parentheses`]), so the condition and filter grammar and the
+/// `KeyConditionExpression` grammar — which tokenize their own text and share no parser —
+/// are held to one reading of the rule rather than two. A call's parentheses close with a
+/// `)` like a group's do, so the walk pairs them with one just the same.
+pub fn group_states_an_operand(tokens: &[GroupToken], at: usize) -> bool {
+    let mut depth = 0usize;
+    for (position, token) in tokens.iter().enumerate().skip(at) {
+        match token {
+            GroupToken::Open | GroupToken::Call => depth += 1,
+            GroupToken::Close => {
+                // A `)` closing nothing is unbalanced, which the grammar states on its
+                // own: there is no group here to read as either.
+                depth = match depth.checked_sub(1) {
+                    Some(depth) => depth,
+                    None => return false,
+                };
+                if depth == 0 {
+                    return matches!(tokens.get(position + 1), Some(GroupToken::Comparator));
+                }
+            }
+            GroupToken::Comparator | GroupToken::Other => {}
+        }
+    }
+    false
 }
 
 /// Whether a token stream holds a pair of parentheses that groups what is already
@@ -601,7 +642,7 @@ pub fn states_redundant_parentheses(tokens: &[GroupToken]) -> bool {
                     return true;
                 }
             }
-            GroupToken::Other => {}
+            GroupToken::Comparator | GroupToken::Other => {}
         }
     }
     false
@@ -3539,21 +3580,33 @@ impl<'a> ExprParser<'a> {
     /// parentheses ([`states_redundant_parentheses`]); this is where this grammar's tokens
     /// are read as grouping.
     pub(crate) fn check_no_redundant_parentheses(&self) -> Result<(), RequestError> {
-        let grouping: Vec<GroupToken> = self
-            .tokens
+        if states_redundant_parentheses(&self.grouping()) {
+            return Err(redundant_parentheses(self.member));
+        }
+        Ok(())
+    }
+
+    /// This grammar's tokens as the rules about GROUPING read them: what opens a group,
+    /// what closes one, what carries this grammar's CALLS' arguments, what it compares
+    /// with, and everything else ([`GroupToken`]).
+    fn grouping(&self) -> Vec<GroupToken> {
+        self.tokens
             .iter()
             .enumerate()
             .map(|(at, token)| match token {
                 ExprToken::Open if self.opens_a_call(at) => GroupToken::Call,
                 ExprToken::Open => GroupToken::Open,
                 ExprToken::Close => GroupToken::Close,
+                ExprToken::Compare(_) => GroupToken::Comparator,
+                ExprToken::Word(word)
+                    if word.eq_ignore_ascii_case(BETWEEN_OPERATOR)
+                        || word.eq_ignore_ascii_case(IN_OPERATOR) =>
+                {
+                    GroupToken::Comparator
+                }
                 _ => GroupToken::Other,
             })
-            .collect();
-        if states_redundant_parentheses(&grouping) {
-            return Err(redundant_parentheses(self.member));
-        }
-        Ok(())
+            .collect()
     }
 
     /// The refusal the position the parse stopped at earns.
@@ -4135,36 +4188,11 @@ impl<'a> ExprParser<'a> {
     }
 
     /// Whether the group that starts here states an OPERAND of a comparison rather than a
-    /// condition: the token after its closing `)` is a comparison's own operator.
-    ///
-    /// Parentheses group what the grammar reads at the position they stand in, and both a
-    /// condition and an operand can stand where a condition primary begins, so the two are
-    /// told apart by what FOLLOWS the group: a comparator, `BETWEEN` or `IN` after it makes
-    /// the group one side of that comparison, since a condition is not compared against
-    /// anything. A group the expression never closes is no group to read either way, so it
-    /// is left to the condition reading, which reports where the text ran out.
+    /// condition, in the one reading of that rule every grammar of this service that groups
+    /// with parentheses is held to ([`group_states_an_operand`]); this is where this
+    /// grammar's own tokens are read as grouping and as comparing ([`Self::grouping`]).
     fn group_states_an_operand(&self) -> bool {
-        let mut depth = 0usize;
-        for (at, token) in self.tokens.iter().enumerate().skip(self.at) {
-            match token {
-                ExprToken::Open => depth += 1,
-                ExprToken::Close => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return match self.tokens.get(at + 1) {
-                            Some(ExprToken::Compare(_)) => true,
-                            Some(ExprToken::Word(word)) => {
-                                word.eq_ignore_ascii_case(BETWEEN_OPERATOR)
-                                    || word.eq_ignore_ascii_case("IN")
-                            }
-                            _ => false,
-                        };
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
+        group_states_an_operand(&self.grouping(), self.at)
     }
 
     /// One operand of a comparison, which the grammar also reads inside a group:

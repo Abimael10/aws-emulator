@@ -2256,9 +2256,9 @@ fn parse_key_condition_expression(
     Ok(comparisons)
 }
 
-/// This grammar's tokens as the redundant-parenthesis rule reads them: what opens a group,
-/// what closes one, what carries this grammar's one CALL's arguments, and everything else
-/// ([`crate::state::GroupToken`]).
+/// This grammar's tokens as the rules about GROUPING read them: what opens a group, what
+/// closes one, what carries this grammar's one CALL's arguments, what it compares with, and
+/// everything else ([`crate::state::GroupToken`]).
 fn grouping_of(tokens: &[Token]) -> Vec<crate::state::GroupToken> {
     tokens
         .iter()
@@ -2274,6 +2274,7 @@ fn grouping_of(tokens: &[Token]) -> Vec<crate::state::GroupToken> {
             }
             Token::Open => crate::state::GroupToken::Open,
             Token::Close => crate::state::GroupToken::Close,
+            Token::Compare(_) | Token::Between => crate::state::GroupToken::Comparator,
             _ => crate::state::GroupToken::Other,
         })
         .collect()
@@ -2320,6 +2321,19 @@ struct Parser<'a> {
     /// STOPS later still answers the defect the expression's text states first
     /// ([`parse_key_condition_expression`]).
     undefined: Option<String>,
+}
+
+/// Which of a key condition's two operand kinds the comparison's FIRST operand turned out
+/// to be, once whatever parentheses group that position have been read through.
+///
+/// A key condition compares one key attribute against one value, and the member's grammar
+/// writes that either way round, so the side the attribute stands on is a fact of the
+/// operand rather than of the token the comparison opens with.
+enum ComparisonSide {
+    /// The key attribute, resolved through `ExpressionAttributeNames`.
+    Attribute(String),
+    /// The value the attribute is compared against.
+    Value(Operand),
 }
 
 impl Parser<'_> {
@@ -2378,21 +2392,32 @@ impl Parser<'_> {
         Ok(comparisons)
     }
 
+    /// Enter one more level of parentheses, or refuse the expression for nesting deeper
+    /// than this member reads ([`MAX_EXPRESSION_DEPTH`]): the nesting is caller-chosen, so
+    /// without the cap the number of stack frames one request drives would be too.
+    fn descend(&mut self) -> Result<(), crate::state::RequestError> {
+        if self.depth >= MAX_EXPRESSION_DEPTH {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeyConditionExpression: an expression may nest at most \
+                 {MAX_EXPRESSION_DEPTH} levels of parentheses"
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     /// `primary := '(' conjunction ')' | comparison`
     ///
-    /// The one recursive rule, bounded by [`MAX_EXPRESSION_DEPTH`] so the number of
-    /// frames a request can drive is a constant rather than the number of `(`
-    /// characters it sends.
+    /// The one recursive rule, bounded by [`Self::descend`] so the number of frames a
+    /// request can drive is a constant rather than the number of `(` characters it sends.
+    ///
+    /// A group whose closing `)` one of this member's comparators follows groups an
+    /// OPERAND of that comparison rather than a condition
+    /// ([`Self::group_states_an_operand`]), so it is left to the comparison below.
     fn primary(&mut self) -> Result<Vec<Comparison>, crate::state::RequestError> {
-        if self.peek() == Some(&Token::Open) {
-            if self.depth >= MAX_EXPRESSION_DEPTH {
-                return Err(crate::state::RequestError::Validation(format!(
-                    "Invalid KeyConditionExpression: an expression may nest at most \
-                     {MAX_EXPRESSION_DEPTH} levels of parentheses"
-                )));
-            }
+        if self.peek() == Some(&Token::Open) && !self.group_states_an_operand() {
             self.at += 1;
-            self.depth += 1;
+            self.descend()?;
             let inner = self.conjunction();
             self.depth -= 1;
             let inner = inner?;
@@ -2402,37 +2427,75 @@ impl Parser<'_> {
         Ok(vec![self.comparison()?])
     }
 
-    /// `comparison := name <op> :value | :value <op> name
-    ///              | name BETWEEN :low AND :high
-    ///              | begins_with '(' name ',' :prefix ')'`
+    /// Whether the group that starts here states an OPERAND of a comparison rather than a
+    /// condition, in the one reading of that rule every grammar of this service that groups
+    /// with parentheses is held to ([`crate::state::group_states_an_operand`]); this is
+    /// where this grammar's own tokens are read as grouping and as comparing
+    /// ([`grouping_of`]).
+    fn group_states_an_operand(&self) -> bool {
+        crate::state::group_states_an_operand(&grouping_of(self.tokens), self.at)
+    }
+
+    /// One OPERAND position of a key condition, read through the parentheses that group it.
+    ///
+    /// Parentheses group what the grammar reads at the position they stand in, and an
+    /// operand position reads an operand, so a pair written around one states that operand.
+    /// A pair that groups what is already grouped is refused once the whole expression has
+    /// parsed ([`crate::state::states_redundant_parentheses`]), and the nesting one operand
+    /// can state is bounded like every other ([`Self::descend`]).
+    fn grouped<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, crate::state::RequestError>,
+    ) -> Result<T, crate::state::RequestError> {
+        let mut groups = 0usize;
+        while self.peek() == Some(&Token::Open) {
+            self.at += 1;
+            self.descend()?;
+            groups += 1;
+        }
+        // The nesting this position entered is left behind whichever way the operand reads,
+        // so the level is given back before the read's own refusal is raised.
+        let read = read(self);
+        self.depth -= groups;
+        let read = read?;
+        for _ in 0..groups {
+            self.expect(&Token::Close)?;
+        }
+        Ok(read)
+    }
+
+    /// `comparison := operand <op> operand
+    ///              | operand BETWEEN operand AND operand
+    ///              | begins_with '(' operand ',' operand ')'`,
+    /// where `operand := '(' operand ')' | name | :value`.
     ///
     /// Either side of a comparison may carry the operand: a comparison written operand
     /// first states the MIRROR image of the operator it reads about the attribute
     /// ([`Operator::mirrored`]), while a refusal about the operand names the operator as
-    /// written.
+    /// written. Each operand position is read through whatever parentheses group it
+    /// ([`Self::grouped`]), so which side carries the attribute is read from the operand
+    /// itself rather than from the token the comparison opens with.
     fn comparison(&mut self) -> Result<Comparison, crate::state::RequestError> {
-        match self.peek().cloned() {
-            Some(Token::BeginsWith) => {
-                self.at += 1;
-                self.expect(&Token::Open)?;
-                let attribute = self.attribute()?;
-                self.expect(&Token::Comma)?;
-                let prefix = self.value()?;
-                self.expect(&Token::Close)?;
-                Ok(Comparison {
-                    attribute,
-                    operator: Operator::BeginsWith,
-                    written: Some(Operator::BeginsWith),
-                    operands: vec![prefix],
-                })
-            }
-            Some(Token::Value(placeholder)) => {
-                self.at += 1;
+        if self.peek() == Some(&Token::BeginsWith) {
+            self.at += 1;
+            self.expect(&Token::Open)?;
+            let attribute = self.attribute()?;
+            self.expect(&Token::Comma)?;
+            let prefix = self.value()?;
+            self.expect(&Token::Close)?;
+            return Ok(Comparison {
+                attribute,
+                operator: Operator::BeginsWith,
+                written: Some(Operator::BeginsWith),
+                operands: vec![prefix],
+            });
+        }
+        match self.grouped(Self::comparison_side)? {
+            ComparisonSide::Value(operand) => {
                 let Some(Token::Compare(written)) = self.peek().cloned() else {
                     return Err(self.syntax());
                 };
                 self.at += 1;
-                let operand = self.placeholder_value(&placeholder);
                 let attribute = self.attribute()?;
                 Ok(Comparison {
                     attribute,
@@ -2441,48 +2504,62 @@ impl Parser<'_> {
                     operands: vec![operand],
                 })
             }
+            ComparisonSide::Attribute(attribute) => match self.peek().cloned() {
+                Some(Token::Compare(operator)) => {
+                    self.at += 1;
+                    let operand = self.value()?;
+                    Ok(Comparison {
+                        attribute,
+                        operator,
+                        written: Some(operator),
+                        operands: vec![operand],
+                    })
+                }
+                Some(Token::Between) => {
+                    self.at += 1;
+                    let low = self.value()?;
+                    self.expect(&Token::And)?;
+                    let high = self.value()?;
+                    Ok(Comparison {
+                        attribute,
+                        operator: Operator::Between,
+                        written: Some(Operator::Between),
+                        operands: vec![low, high],
+                    })
+                }
+                _ => Err(self.syntax()),
+            },
+        }
+    }
+
+    /// The operand a comparison opens with: the key ATTRIBUTE, or the `:value` a condition
+    /// written operand-first compares it against.
+    fn comparison_side(&mut self) -> Result<ComparisonSide, crate::state::RequestError> {
+        match self.peek().cloned() {
+            Some(Token::Value(placeholder)) => {
+                self.at += 1;
+                Ok(ComparisonSide::Value(
+                    self.placeholder_value(&placeholder),
+                ))
+            }
             Some(Token::Name(name)) => {
                 self.at += 1;
-                let attribute = self.resolve_name(&name)?;
-                match self.peek().cloned() {
-                    Some(Token::Compare(operator)) => {
-                        self.at += 1;
-                        let operand = self.value()?;
-                        Ok(Comparison {
-                            attribute,
-                            operator,
-                            written: Some(operator),
-                            operands: vec![operand],
-                        })
-                    }
-                    Some(Token::Between) => {
-                        self.at += 1;
-                        let low = self.value()?;
-                        self.expect(&Token::And)?;
-                        let high = self.value()?;
-                        Ok(Comparison {
-                            attribute,
-                            operator: Operator::Between,
-                            written: Some(Operator::Between),
-                            operands: vec![low, high],
-                        })
-                    }
-                    _ => Err(self.syntax()),
-                }
+                Ok(ComparisonSide::Attribute(self.resolve_name(&name)?))
             }
             _ => Err(self.syntax()),
         }
     }
 
-    /// An attribute name token, resolved through `ExpressionAttributeNames`.
+    /// An attribute name token, resolved through `ExpressionAttributeNames` and read
+    /// through whatever parentheses group that operand position ([`Self::grouped`]).
     fn attribute(&mut self) -> Result<String, crate::state::RequestError> {
-        match self.peek().cloned() {
+        self.grouped(|parser| match parser.peek().cloned() {
             Some(Token::Name(name)) => {
-                self.at += 1;
-                self.resolve_name(&name)
+                parser.at += 1;
+                parser.resolve_name(&name)
             }
-            _ => Err(self.syntax()),
-        }
+            _ => Err(parser.syntax()),
+        })
     }
 
     /// A `:placeholder` token, read through `ExpressionAttributeValues`. Neither what the
@@ -2496,16 +2573,17 @@ impl Parser<'_> {
     /// `begins_with` reads as an operand that is itself an OPERATION, which is the member's
     /// other named defect ([`nested_operation_key_condition`] — a function written as a NAME
     /// applied to arguments never reaches here, because the lexer answers it there).
+    /// Read through whatever parentheses group that operand position ([`Self::grouped`]).
     fn value(&mut self) -> Result<Operand, crate::state::RequestError> {
-        match self.peek().cloned() {
+        self.grouped(|parser| match parser.peek().cloned() {
             Some(Token::Value(placeholder)) => {
-                self.at += 1;
-                Ok(self.placeholder_value(&placeholder))
+                parser.at += 1;
+                Ok(parser.placeholder_value(&placeholder))
             }
             Some(Token::Name(_)) => Err(multiple_attribute_names_in_one_condition()),
             Some(Token::BeginsWith) => Err(nested_operation_key_condition()),
-            _ => Err(self.syntax()),
-        }
+            _ => Err(parser.syntax()),
+        })
     }
 
     /// What a `:placeholder` stands for, or the placeholder itself where the request never
