@@ -51,6 +51,12 @@ pub(crate) const PREVIOUS: &[u8] = br#"{"tier":"one"}"#;
 /// See [`PREVIOUS`].
 pub(crate) const NEW: &[u8] = br#"{"tier":"two"}"#;
 
+/// How far into the future a HELD rollout's start instant is moved ([`pin_percentage`]), so
+/// nothing the deployment's own schedule owes falls due while the sessions below poll it.
+/// Orders of magnitude beyond what any host takes over a sweep of in-process polls, so no
+/// verdict here turns on how fast the host ran them.
+pub(crate) const HELD_FOR: Duration = Duration::from_secs(3_600);
+
 /// RULE: the position a session is minted at is its own — successive sessions are spread
 /// over the whole range of percentage points a rollout advances through, so a rollout
 /// part-way through has reached some sessions and not others.
@@ -309,8 +315,12 @@ pub(crate) fn fix_position(emulator: &Emulator, token: &str, position: f32) {
 }
 
 /// Pin the in-flight deployment's `PercentageComplete` at `percentage`, with its start
-/// instant moved to now so the clock owes the record nothing while the poll below reads
-/// it. How far a rollout has got is owed by the clock and no operation sets it.
+/// instant moved [`HELD_FOR`] into the future so every instant the deployment's own schedule
+/// owes it — the next growth interval, the end of the rollout window, the completion — is
+/// still ahead of the polls taken under the hold. How far a rollout has got is owed by the
+/// clock and no operation sets it, so the share a poll is served at is the share written here
+/// however long the host takes over it; the span is a ceiling on those polls and never a
+/// wait.
 pub(crate) fn pin_percentage(emulator: &Emulator, hierarchy: &Hierarchy, percentage: f32) {
     let state = emulator.control_plane();
     let mut store = state.lock();
@@ -318,13 +328,20 @@ pub(crate) fn pin_percentage(emulator: &Emulator, hierarchy: &Hierarchy, percent
         .application_mut(&hierarchy.application_id)
         .and_then(|application| application.environments.get_mut(&hierarchy.environment_id))
         .expect("the environment the rollout is deploying into");
-    let now = SystemTime::now();
+    let held_until = SystemTime::now() + HELD_FOR;
+    let mut holding = 0;
     for deployment in environment.deployments.values_mut() {
         if deployment.is_in_flight() {
-            deployment.started_at = now;
+            deployment.started_at = held_until;
             deployment.percentage_complete = percentage;
+            holding += 1;
         }
     }
+    assert!(
+        holding > 0,
+        "the rollout must still be under way to be held at {percentage}% of its targets, and \
+         the environment holds none that is"
+    );
 }
 
 /// Write one hosted configuration version, answering the version number AppConfig minted.

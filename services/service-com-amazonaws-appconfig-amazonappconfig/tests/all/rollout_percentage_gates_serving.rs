@@ -390,6 +390,12 @@ const CLIENTS: usize = 80;
 /// rule.
 const SHARE_SLACK_IN_POINTS: f32 = 30.0;
 
+/// How far into the future a HELD rollout's start instant is moved ([`pin_percentage`]), so
+/// nothing the deployment's own schedule owes falls due while the fleet is read under that
+/// hold. Orders of magnitude beyond what any host takes over a sweep of in-process reads, so
+/// no verdict here turns on how fast the host ran them.
+const HELD_FOR: Duration = Duration::from_secs(3_600);
+
 /// RULE over HTTP: while a rollout is part-way through, the clients reading the
 /// configuration are SPLIT — each is served one version's exact bytes, the share on the
 /// new version tracks `PercentageComplete`, and a client keeps whichever version it got
@@ -428,10 +434,10 @@ async fn clients_are_split_across_a_partial_rollout_and_a_stop_withdraws_it() {
         share.on_new
     );
 
-    // Version 2 then rolls out gradually. The strategy's one growth interval falls due at
-    // the end of its rollout window, so the deployment stays in flight at whatever
-    // percentage each row pins while the clients below read it.
-    let gradual = create_strategy(&router, "gradual", 100.0, 1440, 1440).await;
+    // Version 2 then rolls out gradually, growing by a percentage point per interval, so the
+    // deployment is still under way for far longer than the sweeps below take and stays in
+    // flight at whatever percentage each row holds it at while the clients read it.
+    let gradual = create_strategy(&router, "gradual", 1.0, 1440, 1440).await;
     let number = deploy(&router, &application, &environment, &profile, &gradual, "2").await;
 
     // The rows span the rollout: none of the fleet reached, three partial shares, and the
@@ -561,8 +567,14 @@ async fn measure_share(
 /// Pin the in-flight deployment's `PercentageComplete` at `percentage`, the one thing no
 /// operation exposes: how far a rollout has got is owed by the CLOCK, and a test that
 /// needs the fleet read at a given share writes that share rather than sleeping through
-/// the schedule. The start instant is moved with it, so the clock owes the record nothing
-/// while the clients below read it.
+/// the schedule.
+///
+/// The start instant is moved [`HELD_FOR`] into the FUTURE with it, so every instant the
+/// deployment's own schedule owes it — the next growth interval, the end of the rollout
+/// window, the completion — is still ahead of the reads taken under the hold, and the share
+/// those reads are taken at is the share written here however long the host takes over them.
+/// It is a ceiling on those reads and never a wait: nothing sleeps for it and no assertion is
+/// about it.
 fn pin_percentage(
     engine: &Arc<engine::InMemoryEngine>,
     application_id: &str,
@@ -575,13 +587,20 @@ fn pin_percentage(
         .application_mut(application_id)
         .and_then(|application| application.environments.get_mut(environment_id))
         .expect("the environment the rollout is deploying into");
-    let now = SystemTime::now();
+    let held_until = SystemTime::now() + HELD_FOR;
+    let mut holding = 0;
     for deployment in environment.deployments.values_mut() {
         if deployment.is_in_flight() {
-            deployment.started_at = now;
+            deployment.started_at = held_until;
             deployment.percentage_complete = percentage;
+            holding += 1;
         }
     }
+    assert!(
+        holding > 0,
+        "the rollout must still be under way to be held at {percentage}% of its targets, and \
+         the environment holds none that is"
+    );
 }
 
 /// Write one hosted configuration version.

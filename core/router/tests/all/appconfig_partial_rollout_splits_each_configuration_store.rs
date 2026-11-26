@@ -126,6 +126,28 @@ const LOOK: Duration = Duration::from_millis(50);
 /// See [`LOOK`].
 const SETTLED_BY: Duration = Duration::from_secs(120);
 
+/// How far into the future a HELD rollout's start instant is moved
+/// ([`hold_the_rollout_at`]), so nothing the deployment's own schedule owes — a growth
+/// interval, the end of the rollout window, the completion — falls due while the reads taken
+/// under that hold run.
+///
+/// A ceiling on those reads and nothing else: it is never waited for, no assertion is about
+/// it, and it is orders of magnitude beyond what any host takes over a handful of in-process
+/// calls, so the share the fleet is read at is the share this suite wrote however slowly the
+/// host is running.
+const HELD_FOR: Duration = Duration::from_secs(3_600);
+
+/// The `GrowthFactor` the gradual rollout of each row grows by per interval: the smallest
+/// share the member admits (`smithy_query(query="shape", shape="GrowthFactor")` gives the
+/// range 1 to 100), so the rollout has a growth interval for every percentage point and is
+/// still under way — `DEPLOYING`, at a share of its own — for a span no host can run out of
+/// before the first hold takes it.
+const GRADUAL_GROWTH_FACTOR: f32 = 1.0;
+
+/// The `GrowthFactor` of the strategy that paces nothing, which reaches every target in its
+/// one step.
+const INSTANT_GROWTH_FACTOR: f32 = 100.0;
+
 /// Which store a row's two configuration versions live in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Store {
@@ -213,7 +235,7 @@ async fn a_partial_rollout_of_a_parameter_named_by_arn_splits_the_fleet() {
 /// fleet at each share of [`SHARES`]: the share the control plane reports is the share the
 /// readers serve at, a partial one serves BOTH versions' exact bytes, a rollout that has
 /// reached nobody serves the previous version to every target, and the fleet converges on the
-/// new version once the rollout — carried by the CLOCK, with nothing pinned — has reached
+/// new version once the rollout — carried by the CLOCK, with nothing held — has reached
 /// every target.
 async fn watch_a_rollout(row: &Row) {
     let case = row.case;
@@ -223,7 +245,7 @@ async fn watch_a_rollout(row: &Row) {
     // The previous version goes out with a strategy that paces nothing, so it is in force for
     // every target before the rollout starts — which is what makes the previous version the
     // one a target the rollout has not reached must be served.
-    let instant = given_strategy(&router, case, "instant", 0).await;
+    let instant = given_strategy(&router, case, "instant", 0, INSTANT_GROWTH_FACTOR).await;
     let seeded = start_deployment(&router, case, &hierarchy, &instant, "1").await;
     let settled = settled_deployment(&router, case, &hierarchy, seeded).await;
     assert_eq!(
@@ -239,9 +261,12 @@ async fn watch_a_rollout(row: &Row) {
         baseline.on_new.len()
     );
 
-    // The rollout of the new version declares a window to grow over, so the deployment is in
-    // flight at whatever share it has reached while the fleet below reads it.
-    let gradual = given_strategy(&router, case, "gradual", 1_440).await;
+    // The rollout of the new version declares a window to grow over, in an interval per
+    // percentage point ([`GRADUAL_GROWTH_FACTOR`]), so the deployment is in flight at
+    // whatever share it stands at while the fleet below reads it — and stays in flight for
+    // far longer than the reads below take, so which share that is, is the one each read is
+    // taken under rather than one the host's speed decided.
+    let gradual = given_strategy(&router, case, "gradual", 1_440, GRADUAL_GROWTH_FACTOR).await;
     let number = start_deployment(&router, case, &hierarchy, &gradual, "2").await;
 
     let mut reached_before: BTreeSet<String> = BTreeSet::new();
@@ -251,7 +276,7 @@ async fn watch_a_rollout(row: &Row) {
 
         // What the CONTROL plane reports of the same rollout the readers below are served
         // from: the readers must serve at the share it reports, not at one of their own.
-        pin_the_share(&engine, &hierarchy, share);
+        hold_the_rollout_at(&engine, &hierarchy, case, share);
         let document = deployment(&router, case, &hierarchy, number).await;
         let reported = document["PercentageComplete"].as_f64().unwrap_or_else(|| {
             panic!("case {at}: a Deployment document reports a PercentageComplete, got {document}")
@@ -327,8 +352,11 @@ async fn watch_a_rollout(row: &Row) {
         }
     }
 
-    // And the fleet converges, with nothing pinned: the rollout is carried to its end by the
-    // clock, and from there every reader of either surface is served the new version.
+    // And the fleet converges, with nothing held: the rollout is handed back to the clock one
+    // interval short of its end, carried from there by the SERVICE — the wait below looks for
+    // that completion rather than timing it — and from there every reader of either surface is
+    // served the new version.
+    release_the_rollout(&engine, &hierarchy, case);
     let settled = settled_deployment(&router, case, &hierarchy, number).await;
     assert_eq!(
         settled["State"],
@@ -364,9 +392,9 @@ struct ClientFleet {
 /// Read the configuration once for each of [`CLIENTS`] clients through `GetConfiguration` and
 /// report which version each was served.
 ///
-/// `share`, when a caller names one, is re-pinned immediately before each read: how far a
-/// rollout has got is owed by the CLOCK, so a sweep that must read the fleet AT one share puts
-/// the rollout back at that share rather than racing the schedule.
+/// `share`, when a caller names one, is held again immediately before each read: how far a
+/// rollout has got is owed by the CLOCK, so a sweep that must read the fleet AT one share
+/// holds the rollout at that share rather than racing the schedule.
 async fn read_the_client_fleet(
     router: &MultiServiceRouter,
     case: &str,
@@ -378,7 +406,7 @@ async fn read_the_client_fleet(
     for index in 0..CLIENTS {
         let client = format!("canary-client-{index:02}");
         if let Some(share) = share {
-            pin_the_share(&hierarchy.engine, hierarchy, share);
+            hold_the_rollout_at(&hierarchy.engine, hierarchy, case, share);
         }
         let read = appconfig(
             router,
@@ -421,8 +449,8 @@ struct SessionFleet {
 }
 
 /// Open [`SESSIONS`] independent sessions over the triple, poll each once, and report which
-/// version each was served — with the rollout re-pinned at `share` before each session, which
-/// is the share that session's own place in the rollout is read against.
+/// version each was served — with the rollout held at `share` again before each session,
+/// which is the share that session's own place in the rollout is read against.
 async fn read_the_session_fleet(
     router: &MultiServiceRouter,
     case: &str,
@@ -432,13 +460,13 @@ async fn read_the_session_fleet(
 ) -> SessionFleet {
     let mut fleet = SessionFleet::default();
     for index in 0..SESSIONS {
-        pin_the_share(&hierarchy.engine, hierarchy, share);
+        hold_the_rollout_at(&hierarchy.engine, hierarchy, case, share);
         classify_a_session(router, case, hierarchy, row, index, &mut fleet).await;
     }
     fleet
 }
 
-/// The same sweep with NOTHING pinned, for the fleet a settled rollout has reached.
+/// The same sweep with NOTHING held, for the fleet a settled rollout has reached.
 async fn read_the_session_fleet_unpinned(
     router: &MultiServiceRouter,
     case: &str,
@@ -519,32 +547,81 @@ async fn classify_a_session(
     );
 }
 
-/// Pin the in-flight deployment's `PercentageComplete` at `share`, with its start instant
-/// moved to now so the clock owes the record nothing while the read that follows takes it.
+/// HOLD the in-flight rollout at `share` of its targets: its `PercentageComplete` is written
+/// there and its start instant is moved [`HELD_FOR`] into the future, so every instant its own
+/// schedule owes it — the next growth interval, the end of the rollout window, the completion
+/// — is still ahead of the reads taken under the hold, however long the host takes over them.
 ///
-/// The one thing no operation exposes: how far a rollout has got is owed by the CLOCK, and a
-/// suite that reads the fleet AT a given share writes that share rather than sleeping through
-/// the schedule. Nothing else is written — no state, no event — and a deployment that is not
-/// in flight is left exactly as it stands, because the share it reached is not the share it is
-/// available to once it has been undone.
-fn pin_the_share(engine: &Arc<engine::InMemoryEngine>, hierarchy: &Hierarchy, share: f32) {
+/// The share is the one thing no operation exposes: how far a rollout has got is owed by the
+/// CLOCK, and a suite that reads the fleet AT a given share writes that share rather than
+/// sleeping through the schedule. Moving the start instant is how it stays written — the same
+/// move the clock-driven suites of these crates make to let a stage fall due, in the other
+/// direction — and it is a ceiling on the reads, never a wait: nothing here sleeps for it and
+/// no assertion is about it. Nothing else is written — no state, no event — and a deployment
+/// that is not in flight is left exactly as it stands, because the share it reached is not the
+/// share it is available to once it has been undone.
+fn hold_the_rollout_at(
+    engine: &Arc<engine::InMemoryEngine>,
+    hierarchy: &Hierarchy,
+    case: &str,
+    share: f32,
+) {
+    let held_until = SystemTime::now() + HELD_FOR;
+    let holding = write_to_the_rollouts_in_flight(engine, hierarchy, |deployment| {
+        deployment.started_at = held_until;
+        deployment.percentage_complete = share;
+    });
+    assert!(
+        holding > 0,
+        "case {case:?}: the rollout must still be under way to be held at {share}% of its \
+         targets, and the environment holds none that is"
+    );
+}
+
+/// Hand the held rollout back to the clock ONE growth interval short of its end: its start
+/// instant goes back to where its own schedule puts its last interval one span from now, so
+/// what finishes the rollout is the SERVICE reaching that instant rather than anything written
+/// here. The wait that follows looks for that completion.
+fn release_the_rollout(engine: &Arc<engine::InMemoryEngine>, hierarchy: &Hierarchy, case: &str) {
+    let now = SystemTime::now();
+    let released = write_to_the_rollouts_in_flight(engine, hierarchy, |deployment| {
+        let still_to_run = deployment
+            .rollout_duration()
+            .saturating_sub(deployment.growth_interval());
+        deployment.started_at = now - still_to_run;
+    });
+    assert!(
+        released > 0,
+        "case {case:?}: the rollout must still be under way when the hold on it is released, \
+         and the environment holds none that is"
+    );
+}
+
+/// Apply `write` to each deployment of the row's environment that is still in flight, and
+/// answer how many that was — the one place this suite writes to a deployment.
+fn write_to_the_rollouts_in_flight(
+    engine: &Arc<engine::InMemoryEngine>,
+    hierarchy: &Hierarchy,
+    mut write: impl FnMut(&mut appconfig_state::Deployment),
+) -> usize {
     let held = engine.state::<appconfig_state::ComAmazonawsAppconfigAmazonappconfigState>();
     let mut store = held.lock();
     let environment = store
         .application_mut(&hierarchy.application)
         .and_then(|application| application.environments.get_mut(&hierarchy.environment))
         .expect("the environment the rollout is deploying into");
-    let now = SystemTime::now();
+    let mut written = 0;
     for deployment in environment.deployments.values_mut() {
         if deployment.is_in_flight() {
-            deployment.started_at = now;
-            deployment.percentage_complete = share;
+            write(deployment);
+            written += 1;
         }
     }
+    written
 }
 
 /// One row's AppConfig hierarchy as the control plane minted it, beside the engine the
-/// emulator runs on — which is what the share a rollout has reached is pinned through.
+/// emulator runs on — which is where the share a rollout is held at is written.
 struct Hierarchy {
     application: String,
     environment: String,
@@ -711,14 +788,16 @@ async fn put_parameter(
     })
 }
 
-/// A deployment strategy that reaches every target in one growth step and bakes for no time,
-/// over a rollout window of `duration_in_minutes` — a strategy that declares neither paces
-/// nothing at all, so its deployment is already settled when `StartDeployment` answers.
+/// A deployment strategy that reaches `growth_factor` percent of its targets per growth
+/// interval and bakes for no time, over a rollout window of `duration_in_minutes` — a strategy
+/// that declares neither paces nothing at all, so its deployment is already settled when
+/// `StartDeployment` answers.
 async fn given_strategy(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     duration_in_minutes: i32,
+    growth_factor: f32,
 ) -> String {
     let created = appconfig(
         router,
@@ -727,7 +806,7 @@ async fn given_strategy(
         &json!({
             "Name": name,
             "DeploymentDurationInMinutes": duration_in_minutes,
-            "GrowthFactor": 100.0,
+            "GrowthFactor": growth_factor,
             "GrowthType": "LINEAR",
             "FinalBakeTimeInMinutes": 0,
             "ReplicateTo": "NONE",
@@ -843,7 +922,7 @@ fn minted_id(case: &str, what: &str, answered: &Answered) -> String {
 }
 
 /// The whole emulator over one engine, exactly as the binary assembles it, with the engine
-/// handed back beside it: the share a rollout has reached is pinned through that engine.
+/// handed back beside it: the share a rollout is held at is written through that engine.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
