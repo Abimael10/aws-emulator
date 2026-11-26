@@ -542,8 +542,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// The AMI a completed import image task created, as [`Self::insert_image`] takes it.
     ///
     /// Everything comes off the task: the AMI is named after the import that created it,
-    /// carries the architecture, platform and boot mode the request named, and its root
-    /// volume is as large as the largest disk the import converted. The task's own tags are
+    /// carries the architecture, platform and boot mode the request named, its root volume is
+    /// as large as the largest disk the import converted, and that volume restores with the
+    /// encryption the import asked for. The task's own tags are
     /// NOT copied onto it — "the tags to apply to the import image task during creation"
     /// (`ImportImageRequest$TagSpecifications`) tags the task, not the image.
     pub(super) fn imported_image_spec(&self, task_id: &str) -> Option<ImageSpec> {
@@ -592,6 +593,12 @@ impl ComAmazonawsEc2Amazonec2State {
                 LINUX_ROOT_DEVICE_NAME.to_string()
             },
             root_volume_size,
+            // "Specifies whether the destination AMI of the imported image should be
+            // encrypted" (`ImportImageRequest$Encrypted`): the import's own answer, which
+            // the AMI's root block device mapping reports as the state the device restores
+            // with — so the image, and the snapshot behind it, report the encryption the
+            // import asked for rather than always reporting none.
+            root_volume_encrypted: record.view.encrypted.unwrap_or(false),
             state: IMAGE_STATE_AVAILABLE.to_string(),
             ..defaults
         })

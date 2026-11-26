@@ -1390,6 +1390,17 @@ pub struct ImageSpec {
     pub root_volume_size: i32,
     /// The EBS volume type that volume is created as.
     pub root_volume_type: String,
+    /// Whether the root volume the DERIVED root block device mapping restores is encrypted.
+    ///
+    /// Read only where this store derives the mapping itself, the `block_device_mappings`
+    /// field below carrying none: an AMI whose creation asked for an encrypted
+    /// destination — "specifies whether the destination AMI of the imported image should be
+    /// encrypted" (`ImportImageRequest$Encrypted`) — restores its root device from an
+    /// encrypted snapshot, so the mapping it reports carries that state. `false` is the
+    /// state of an image nothing asked to encrypt, which is every image Amazon publishes.
+    /// A spec that supplies its own mappings answers the question per device instead, from
+    /// the snapshot each one restores.
+    pub root_volume_encrypted: bool,
     /// One of `VIRTUALIZATION_TYPE_VALUES` ([`IMAGE_VIRTUALIZATION_TYPE_HVM`]).
     pub virtualization_type: String,
     /// Where the image's root file system lives ([`IMAGE_ROOT_DEVICE_TYPE_EBS`]). An
@@ -1480,6 +1491,7 @@ impl Default for ImageSpec {
             root_device_name: LINUX_ROOT_DEVICE_NAME.to_string(),
             root_volume_size: LINUX_ROOT_VOLUME_SIZE,
             root_volume_type: IMAGE_ROOT_VOLUME_TYPE.to_string(),
+            root_volume_encrypted: false,
             virtualization_type: IMAGE_VIRTUALIZATION_TYPE_HVM.to_string(),
             root_device_type: IMAGE_ROOT_DEVICE_TYPE_EBS.to_string(),
             state: IMAGE_STATE_AVAILABLE.to_string(),
@@ -1746,9 +1758,11 @@ impl ComAmazonawsEc2Amazonec2State {
                         snapshot_id: Some(snapshot_id),
                         volume_size: Some(spec.root_volume_size),
                         volume_type: Some(spec.root_volume_type),
-                        // The snapshot was minted for this image by the line above and
-                        // nothing asked for it to be encrypted.
-                        encrypted: Some(false),
+                        // The snapshot was minted for this image by the line above, so the
+                        // device restores with the encryption state the image was created
+                        // with: what the creation asked for, and unencrypted where nothing
+                        // asked for encryption at all.
+                        encrypted: Some(spec.root_volume_encrypted),
                         iops: provisions_throughput.then_some(DEFAULT_GP3_IOPS),
                         kms_key_id: None,
                         throughput: provisions_throughput.then_some(DEFAULT_GP3_THROUGHPUT),
