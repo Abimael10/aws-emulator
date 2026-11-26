@@ -59,11 +59,10 @@ fn seed_finished_run(
             started_at: Some(created_at),
             end_at: Some(created_at + Duration::from_secs(1)),
             error_reason: None,
-            endpoint: iotdeviceadvisor::state::endpoint_for(
-                ::smithy_server_runtime::UNSERVED_URL_BASE,
-                REGION,
-                &Default::default(),
-            ),
+            // A seeded record carries an address of this machine, as a start that resolved
+            // one would (`state::announced_endpoint` opens the real socket; nothing is
+            // opened for a record written straight into the store).
+            endpoint: "127.0.0.1:8883".to_string(),
             next_transition_at: None,
         },
     );

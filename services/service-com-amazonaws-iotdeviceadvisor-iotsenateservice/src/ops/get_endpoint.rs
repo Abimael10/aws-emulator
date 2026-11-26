@@ -2,13 +2,14 @@
 
 //! @op GetEndpoint
 //!
-//! Reports WHERE a device under test connects: this emulator's Device Advisor hostname for
-//! the account, the region the request is signed for and the device it names — an
-//! endpoint-id label over `deviceadvisor.iot.<region>` in a zone this process answers in,
-//! inside the modelled `Endpoint` length bound. A pure read, derived by
+//! Reports WHERE a device under test connects: the ADDRESS this emulator serves the account's
+//! Device Advisor endpoint at — the `host:port` of the socket its MQTT message broker answers
+//! on, which is what a device handed the value dials — resolved by
 //! [`crate::state::announced_endpoint`], the single derivation `StartSuiteRun` also reports
-//! its run's endpoint from, so nothing is written and the endpoint a run carries for its
-//! primary device and the one this vends for that device cannot disagree.
+//! its run's endpoint from, so the endpoint a run carries for its primary device and the one
+//! this vends cannot disagree. Nothing of this service's own state is written; the endpoint's
+//! socket is opened on first use and the first one opened is kept, as the account's endpoint
+//! is created by the first call that asks for it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,10 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The endpoint this operation reports is derived from the account, the region and
-        // the device named, so there is no per-endpoint record to read and none to write. A
-        // request that cannot reach this service's store at all is still the modelled
-        // server failure rather than a host answered from nowhere.
+        // The endpoint this operation reports is the account's — the address this emulator
+        // serves the Device Advisor endpoint at — so there is no per-endpoint record to read
+        // and none to write. A request that cannot reach this service's store at all is
+        // still the modelled server failure rather than an address answered from nowhere.
         if crate::state::service_state(&*self.engine).is_none() {
             return Err(GetEndpointErrorModeled::InternalServerException(
                 InternalServerException {
@@ -186,19 +187,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `authenticationMethod` says HOW the device connects, not WHICH device it is: the
         // model documents it as "the authentication method used during the device
         // connection" and couples it to none of the three identity members, each of which is
-        // "an optional parameter" on its own. It therefore takes no part in the host this
+        // "an optional parameter" on its own. It therefore takes no part in the address this
         // reports and imposes no requirement on the members the request carries — the only
         // values validated here are the device ARNs above, whose modelled length bounds and
         // enum membership the framework already enforced.
 
-        // `endpoint` is a Device Advisor hostname: the endpoint-id label AWS vends per
-        // account and per device, the plane's labels, the region the request is signed for —
-        // the same region that scopes the ARNs this service mints — and a zone this emulator
-        // answers in, so a client reads the region off it and tells this device's host from
-        // another device's and from the account-level one. See
-        // `crate::state::endpoint_addressing`.
-        let region = crate::state::request_region(ctx.parts());
-        let endpoint = crate::state::announced_endpoint(ctx, &region, &device);
+        // `endpoint` is an ADDRESS a device DIALS: the `host:port` this emulator serves the
+        // Device Advisor endpoint at, which is the socket its MQTT message broker answers
+        // on — opened on first use, as the account's endpoint is, and the same for every
+        // device, because a device connects to what it is told rather than reading a label
+        // out of it. An emulator that can open no socket serves the device wire nowhere and
+        // has no endpoint to report, which is the modelled server failure rather than an
+        // address no device could speak to. See `crate::state::endpoint_addressing`.
+        let Some(endpoint) = crate::state::announced_endpoint(&*self.engine, ctx).await else {
+            return Err(GetEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::NO_ENDPOINT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
         Ok(GetEndpointOutput {
             endpoint: Some(endpoint),
         })

@@ -131,11 +131,10 @@ pub(crate) fn seed_run(emulator: &Emulator, definition_id: &str, status: &str) -
             started_at: (status != "PENDING").then_some(created_at),
             end_at: terminal.then_some(created_at + Duration::from_secs(1)),
             error_reason: None,
-            endpoint: iotdeviceadvisor::state::endpoint_for(
-                ::smithy_server_runtime::UNSERVED_URL_BASE,
-                REGION,
-                &Default::default(),
-            ),
+            // A seeded record carries an address of this machine, as a start that resolved
+            // one would (`state::announced_endpoint` opens the real socket; nothing is
+            // opened for a record written straight into the store).
+            endpoint: "127.0.0.1:8883".to_string(),
             // No transition is left owed, so the seeded status is the one the case reads.
             next_transition_at: None,
         },

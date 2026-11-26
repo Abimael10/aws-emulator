@@ -22,14 +22,12 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Used in `src/state/endpoint_addressing.rs`: the one reading of which address this emulator
-# is served at, and of the DNS zone it may announce a host of its own in, which the endpoint
-# this service reports is rooted in.
+# is reached and served at, and the MQTT message broker whose socket is the address the
+# endpoint this service reports is served at.
 service-common = { path = "../common" }
-# `sha2` derives the endpoint-id label of the host `GetEndpoint` and `StartSuiteRun` report,
-# from the account, the region and the device named (`src/state/endpoint_addressing.rs`).
+# `sha2` derives the ids a suite run's result reports from the run and the case they belong
+# to (`src/state/suite_execution.rs`).
 sha2 = { workspace = true }
-# `hex` renders that digest as the lower-case alphanumeric label a hostname carries.
-hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

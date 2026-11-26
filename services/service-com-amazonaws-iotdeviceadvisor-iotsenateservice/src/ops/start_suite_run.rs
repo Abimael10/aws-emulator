@@ -3,8 +3,8 @@
 //! @op StartSuiteRun
 //!
 //! Creates and PERSISTS a suite run of one definition version: a new UUID id, the ARN, the
-//! endpoint the run's primary device connects to, and the `PENDING` status the run starts
-//! in.
+//! endpoint the run's primary device connects to (the address this emulator serves the
+//! Device Advisor endpoint at), and the `PENDING` status the run starts in.
 //!
 //! ## The run executes what its suite names, for as long as that takes
 //!
@@ -33,10 +33,12 @@
 //! `suiterun/<suiteDefinitionId>/<suiteRunId>`, so a run is not addressable apart from
 //! that definition. The scope it is minted in therefore comes from the parent definition's
 //! STORED ARN ([`crate::state::ArnScope`]), not from whichever request started it: the
-//! run's ARN and the endpoint it reports name the same partition, region and account the
-//! definition's own ARN names, so one scope addresses parent and child alike. The
-//! request's region still stamps the audit record, which is about the CALL rather than
-//! about the resource.
+//! run's ARN names the same partition, region and account the definition's own ARN names,
+//! so one scope addresses parent and child alike. The request's region still stamps the
+//! audit record, which is about the CALL rather than about the resource. The endpoint the
+//! run reports is no part of that scope: it is the ADDRESS this emulator serves the Device
+//! Advisor endpoint at ([`crate::state::announced_endpoint`]), which names a socket of this
+//! process rather than a region.
 //!
 //! ## An unknown definition is a `ValidationException`, not a `ResourceNotFoundException`
 //!
@@ -223,6 +225,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // WHERE the run's primary device connects, resolved the one way `GetEndpoint`
+        // reports it (`crate::state::announced_endpoint`): the address this emulator serves
+        // the Device Advisor endpoint at. Resolved BEFORE the store is taken — the socket it
+        // may have to open is awaited, and no lock is held across that — and persisted on the
+        // run, so every later read of the run reports the address the start published and a
+        // client told where to connect by this call is told the same address when it asks
+        // `GetEndpoint`. A run cannot be started against an endpoint that does not exist, so
+        // an emulator that can open no socket refuses with the modelled server failure rather
+        // than minting a run whose device has nowhere to connect.
+        let Some(endpoint) = crate::state::announced_endpoint(&*self.engine, ctx).await else {
+            return Err(trail.refused(
+                StartSuiteRunErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(crate::state::NO_ENDPOINT_MESSAGE.to_string()),
+                })
+                .into(),
+            ));
+        };
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -317,16 +337,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             || crate::state::arn(run_region, &resource),
             |scope| scope.arn(&resource),
         );
-        // The endpoint this run reports is where its PRIMARY DEVICE connects, reported
-        // the one way `GetEndpoint` reports it (`crate::state::announced_endpoint`): this
-        // emulator's Device Advisor hostname for that device, in the run's own scope, so the
-        // run's ARN and its endpoint name one region. A client told this host by the start
-        // call is told the same one when it asks `GetEndpoint` where that device should
-        // connect. Resolved once, here, and persisted, so every later read of the run
-        // reports the host the start published.
-        let device =
-            crate::state::DeviceIdentity::of(&input.suite_run_configuration.primary_device);
-        let endpoint = crate::state::announced_endpoint(ctx, run_region, &device);
         // Retention, so a definition run over and over cannot grow the store without
         // limit: make room for this run by dropping the oldest finished ones.
         store.prune_runs(

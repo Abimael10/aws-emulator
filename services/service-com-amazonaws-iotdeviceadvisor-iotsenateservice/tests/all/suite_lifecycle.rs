@@ -144,11 +144,11 @@ impl Emulator {
                         started_at: Some(created_at),
                         end_at: Some(created_at + Duration::from_secs(1)),
                         error_reason: None,
-                        endpoint: iotdeviceadvisor::state::endpoint_for(
-                            ::smithy_server_runtime::UNSERVED_URL_BASE,
-                            "us-east-1",
-                            &Default::default(),
-                        ),
+                        // A seeded record carries an address of this machine, as a start
+                        // that resolved one would (`state::announced_endpoint` opens the
+                        // real socket; nothing is opened for a record written straight
+                        // into the store).
+                        endpoint: "127.0.0.1:8883".to_string(),
                         next_transition_at: None,
                     },
                 );
@@ -1029,21 +1029,9 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             "case {case:?}: unexpected suiteRunArn"
         );
         let endpoint = started.string("endpoint");
-        let expected = iotdeviceadvisor::state::endpoint_for(
-            ::smithy_server_runtime::UNSERVED_URL_BASE,
-            "us-west-2",
-            &iotdeviceadvisor::state::DeviceIdentity {
-                thing_arn: Some(&primary_thing_arn),
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            endpoint, expected,
-            "case {case:?}: the endpoint must be this emulator's Device Advisor host for the \
-             run's primary device ({expected:?}), got {endpoint:?}"
-        );
-        // The endpoint is where the device CONNECTS, so it is the host `GetEndpoint` vends
-        // over the wire for that same device — one derivation, so the two cannot drift.
+        // The endpoint is WHERE the device connects, so it is the address `GetEndpoint`
+        // vends over the wire — one derivation, so the two cannot drift, and one address of
+        // this emulator's, so naming a device moves it no more than naming none does.
         let vended = emulator
             .call(
                 "GET",
@@ -1058,18 +1046,18 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             .string("endpoint");
         assert_eq!(
             endpoint, vended,
-            "case {case:?}: the run must report the host GetEndpoint vends for its primary \
-             device, got {endpoint:?} and {vended:?}"
+            "case {case:?}: the run must report the address GetEndpoint vends for its \
+             primary device, got {endpoint:?} and {vended:?}"
         );
         let no_device = emulator
             .call("GET", "/endpoint", "us-west-2", None)
             .await
             .string("endpoint");
-        assert_ne!(
+        assert_eq!(
             endpoint, no_device,
-            "case {case:?}: a host is vended per device, so a run naming a primary device \
-             must not report the host a caller naming none is answered, got {endpoint:?} \
-             for both"
+            "case {case:?}: the endpoint is the address this emulator serves, so a request \
+             naming no device must be answered the same one, got {endpoint:?} and \
+             {no_device:?}"
         );
 
         let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");

@@ -15,11 +15,10 @@
 //! `state::parse_resource_arn` accepts), so the table below is the CROSS PRODUCT of the
 //! region a definition is created in with the region its run is started from: the same
 //! region, the service's fallback region on either side, and regions of the other published
-//! shapes. (The host the child's device connects through names the same scope: its
-//! definition's region, under a zone this emulator answers in.)
+//! shapes. (The endpoint the child's device connects through names no scope at all: it is
+//! the address this emulator answers on, which is the same whichever region is asked.)
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 
 use super::endpoint::percent_encode;
 use super::suite_lifecycle::{thing_arn, Answer, Emulator, ROLE_ARN};
@@ -151,23 +150,19 @@ async fn a_suite_run_is_minted_in_its_definitions_scope() {
                  {run_arn:?} beside definition {definition_arn:?}"
             );
 
-            // The endpoint the run reports names the scope the run is minted in — its
-            // DEFINITION's region, which the ARN assertion above pins — and the primary
-            // device the run drives, never the region the start call was signed for.
+            // The endpoint the run reports is no part of that scope: it is the ADDRESS this
+            // emulator serves the Device Advisor endpoint at, so a run in either region
+            // reports the one address this process answers on — the same one `GetEndpoint`
+            // vends.
             let endpoint = started.string("endpoint");
-            let thing = thing_arn(3);
-            let expected = iotdeviceadvisor::state::endpoint_for(
-                ::smithy_server_runtime::UNSERVED_URL_BASE,
-                definition_region,
-                &iotdeviceadvisor::state::DeviceIdentity {
-                    thing_arn: Some(&thing),
-                    ..Default::default()
-                },
-            );
+            let vended = emulator
+                .call("GET", "/endpoint", definition_region, None)
+                .await
+                .string("endpoint");
             assert_eq!(
-                endpoint, expected,
-                "case {case:?}: the run's endpoint must be the Device Advisor host of its \
-                 definition's region for its primary device ({expected:?}), got {endpoint:?}"
+                endpoint, vended,
+                "case {case:?}: the run's endpoint must be the address GetEndpoint vends \
+                 ({vended:?}), got {endpoint:?}"
             );
 
             // Round trip: the reader answers the stored ARN, read from either region.
