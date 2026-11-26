@@ -96,6 +96,15 @@
 //! service's own refusal ([`record_refused_registrations`]) — rather than leaving the
 //! attachment silently inert.
 //!
+//! A LAUNCH that would have to make such a registration is a different step, because
+//! registering the instance is part of bringing it INTO service: the launch is cancelled, the
+//! instance Amazon EC2 made for it is taken back, and the activity of each unit of capacity
+//! it did not place carries that same refusal followed by the launch that was not made
+//! ([`refused_launch_registrations`], [`refused_launch_message`]). So an instance already in
+//! service when the client attached such a target group stays in service with the refusal
+//! recorded against the registration, while an instance that would have been launched into one
+//! never reaches service at all.
+//!
 //! LOCKING. A reconcile reads the wanted set under this service's own lock, RELEASES it,
 //! and only then takes the Elastic Load Balancing v2 store's lock for the one pass that
 //! registers and deregisters; nothing awaits while either is held. A read of that store
@@ -468,6 +477,13 @@ where
 /// group attached to a target group of another VPC is therefore NOT registered there, while
 /// the attachment itself stands exactly as the client made it.
 ///
+/// Registering the instance is PART of bringing it into service, so a LAUNCH that would have
+/// to be registered there does not come into service either: the instance Amazon EC2 made
+/// for it is taken back and the group records the refusal naming that target group
+/// ([`refused_launch_registrations`], [`refused_launch_message`]). An instance ALREADY in
+/// service when the registration was refused stays in service, and the refusal is recorded
+/// for the registration alone ([`record_refused_registrations`]).
+///
 /// `false` whenever the question is not decided — a target group carrying no VPC (a `lambda`
 /// or `alb` group belongs to none) and an instance whose VPC the account's Amazon EC2 store
 /// did not answer ([`crate::state::ec2_instances::vpcs_of`]) — because a value neither side
@@ -549,11 +565,32 @@ const FAILED_TARGET_GROUP_UPDATE: &str = "Failed to update target group";
 /// again: the launch it did not make.
 pub fn launch_blocked_message(unresolved: &[String]) -> String {
     format!(
-        "{FAILED_TARGET_GROUP_UPDATE} {}: {} (Service: {ELBV2_SERVICE_NAME}, Status Code: \
-         {TARGET_GROUP_NOT_FOUND_STATUS}, Error Code: {TARGET_GROUP_NOT_FOUND_CODE}). Launching \
-         EC2 instance failed.",
-        unresolved.join(", "),
-        elbv2::target_groups_not_found_message(unresolved.iter().map(String::as_str))
+        "{} {}",
+        failed_target_group_update(
+            &unresolved.join(", "),
+            &elbv2::target_groups_not_found_message(unresolved.iter().map(String::as_str)),
+            TARGET_GROUP_NOT_FOUND_STATUS,
+            TARGET_GROUP_NOT_FOUND_CODE,
+        ),
+        crate::state::LAUNCH_FAILED_SENTENCE,
+    )
+}
+
+/// The SENTENCE Amazon EC2 Auto Scaling states a target-group update it could not make with:
+/// its own fixed text for one ([`FAILED_TARGET_GROUP_UPDATE`]), the target group it could not
+/// update, and the refusal `detail` that Elastic Load Balancing v2 answered — carried with the
+/// service, status and code an AWS SDK renders beside the message of a failed call to it, so a
+/// client reads here exactly what it would read from a call of its own.
+///
+/// THE ONE spelling of that sentence for every condition that makes the update impossible: a
+/// target group the other service no longer holds ([`launch_blocked_message`]) and a target it
+/// will take no registration of ([`refused_registration_message`],
+/// [`refused_launch_message`]) differ only in that service's own detail and in the error it
+/// answers with, so what is fixed about the sentence is written once.
+fn failed_target_group_update(target_group: &str, detail: &str, status: u16, code: &str) -> String {
+    format!(
+        "{FAILED_TARGET_GROUP_UPDATE} {target_group}: {detail} (Service: {ELBV2_SERVICE_NAME}, \
+         Status Code: {status}, Error Code: {code})."
     )
 }
 
@@ -565,6 +602,112 @@ pub fn launch_blocked_message(unresolved: &[String]) -> String {
 /// an unsupported instance type".
 const INVALID_TARGET_CODE: &str = "InvalidTarget";
 const INVALID_TARGET_STATUS: u16 = 400;
+
+/// Every registration one of the target groups `arns` would REFUSE for the instances a launch
+/// has just made: the FIRST attachment, in attachment order, whose VPC does not hold them,
+/// with one entry per instance it will not take, in launch order. Empty when every attachment
+/// would take every one of them.
+///
+/// "The specified target does not exist, is not in the same VPC as the target group, or has
+/// an unsupported instance type" is what Elastic Load Balancing v2 refuses a `RegisterTargets`
+/// of such a target with, and an Auto Scaling group's own registration is the same write into
+/// the same target group ([`in_another_vpc`]) — so an instance a launch would have to register
+/// there cannot be brought into service at all, which is what the caller records for it
+/// ([`refused_launch_message`]).
+///
+/// Asked of the instances a launch has MADE, before any of them is a member of the group,
+/// which is what tells this apart from [`reconcile`]: that pass answers the registrations
+/// refused for instances already IN the group, whose own activity says the registration failed
+/// and nothing about a launch ([`refused_registration_message`]).
+///
+/// Decided only where BOTH VPCs are known: a target group carrying none, an instance whose
+/// VPC the account's Amazon EC2 store did not answer ([`crate::state::ec2_instances::vpcs_of`],
+/// which is what a group placed by Availability Zone alone has), and an ARN that resolves to
+/// no target group at all answer nothing here — a value neither side reports cannot disagree,
+/// and an attachment that resolves to nothing is what [`unresolved_attachments`] answers for.
+/// Neither does an attachment whose target group takes a different KIND of target than an
+/// Amazon EC2 instance: a reconcile registers nothing in one ([`reconcile`]), and what is
+/// wrong with such an attachment is its target type ([`invalid_target_type_message`]).
+///
+/// Two READS, one store at a time: the instances' VPCs come from Amazon EC2's store, which is
+/// released before Elastic Load Balancing v2's is taken for the pass over the attachments —
+/// the lock order this module's header states, with nothing of this service held across
+/// either.
+#[must_use]
+pub fn refused_launch_registrations<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arns: &[String],
+    instance_ids: &[String],
+) -> Vec<RefusedRegistration> {
+    if arns.is_empty() || instance_ids.is_empty() {
+        return Vec::new();
+    }
+    let vpcs = crate::state::ec2_instances::vpcs_of(engine, instance_ids.iter().map(String::as_str));
+    let Some(state) = elbv2::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    arns.iter()
+        .find_map(|arn| {
+            let target_group = store.target_groups.get(arn)?;
+            // An Amazon EC2 instance is a target of an `instance` target group alone, which is
+            // the only kind a reconcile registers one in: what is wrong with an attachment of
+            // any other target type is the TARGET TYPE ([`invalid_target_type_message`]), not
+            // the network, so one rule is not reported as the other.
+            if target_group.target_type != TARGET_TYPE_INSTANCE {
+                return None;
+            }
+            let vpc_id = target_group.vpc_id.as_deref()?;
+            // In launch order, each instance once: the refusal names the targets a caller
+            // would have to correct, exactly as that service words it for a call of its own.
+            let refused: Vec<RefusedRegistration> = instance_ids
+                .iter()
+                .filter(|instance_id| {
+                    in_another_vpc(Some(vpc_id), vpcs.get(*instance_id).map(String::as_str))
+                })
+                .map(|instance_id| RefusedRegistration {
+                    target_group_arn: arn.clone(),
+                    instance_id: instance_id.clone(),
+                    target_group_vpc_id: vpc_id.to_string(),
+                })
+                .collect();
+            (!refused.is_empty()).then_some(refused)
+        })
+        .unwrap_or_default()
+}
+
+/// What the scaling activity of a LAUNCH whose registration Elastic Load Balancing v2 refused
+/// reports as its `StatusMessage`: the target group the launch could not be brought into, that
+/// service's own refusal for the targets it would not take, and the launch that therefore did
+/// not happen. `None` for a launch nothing refused.
+///
+/// The sentence a refused registration states ([`refused_registration_message`], the same
+/// fixed text, detail and code), with Amazon EC2 Auto Scaling's own sentence for a launch it
+/// did not make after it ([`crate::state::LAUNCH_FAILED_SENTENCE`]) — because here the
+/// registration was part of bringing a NEW instance into service, so what the client is told
+/// is that the launch was not made.
+///
+/// One sentence for the whole launch, naming every instance of it the refusing attachment
+/// would not take: that is the one update the launch could not make, and the activity of each
+/// unit of capacity it did not place reports it.
+#[must_use]
+pub fn refused_launch_message(refused: &[RefusedRegistration]) -> Option<String> {
+    let first = refused.first()?;
+    let instances = refused
+        .iter()
+        .filter(|refusal| refusal.target_group_arn == first.target_group_arn)
+        .map(|refusal| refusal.instance_id.as_str());
+    Some(format!(
+        "{} {}",
+        failed_target_group_update(
+            &first.target_group_arn,
+            &elbv2::targets_not_in_target_group_vpc_message(&first.target_group_vpc_id, instances),
+            INVALID_TARGET_STATUS,
+            INVALID_TARGET_CODE,
+        ),
+        crate::state::LAUNCH_FAILED_SENTENCE,
+    ))
+}
 
 /// One registration of a group that Elastic Load Balancing v2 will take no target for: the
 /// instance is not in the VPC the target group is in.
@@ -608,14 +751,14 @@ impl RefusedRegistration {
 /// registration alone.
 #[must_use]
 pub fn refused_registration_message(refused: &RefusedRegistration) -> String {
-    format!(
-        "{FAILED_TARGET_GROUP_UPDATE} {}: {} (Service: {ELBV2_SERVICE_NAME}, Status Code: \
-         {INVALID_TARGET_STATUS}, Error Code: {INVALID_TARGET_CODE}).",
-        refused.target_group_arn,
-        elbv2::targets_not_in_target_group_vpc_message(
+    failed_target_group_update(
+        &refused.target_group_arn,
+        &elbv2::targets_not_in_target_group_vpc_message(
             &refused.target_group_vpc_id,
-            [refused.instance_id.as_str()]
-        )
+            [refused.instance_id.as_str()],
+        ),
+        INVALID_TARGET_STATUS,
+        INVALID_TARGET_CODE,
     )
 }
 

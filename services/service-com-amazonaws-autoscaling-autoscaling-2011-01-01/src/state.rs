@@ -672,8 +672,10 @@ impl BlockedLaunch {
         }
     }
 
-    /// A launch Amazon EC2 did not carry out: the launch source it would have run resolves to
-    /// nothing there, so no attempt was made at all — and the capacity change ends CANCELLED.
+    /// A launch that produced no instance IN SERVICE: the launch source it would have run
+    /// resolves to nothing in Amazon EC2, so no attempt was made at all, or the attempt that
+    /// was made cannot be brought into service and is taken back — and the capacity change
+    /// ends CANCELLED either way.
     #[must_use]
     pub fn cancelled(status_message: String) -> Self {
         Self {
@@ -2924,7 +2926,11 @@ impl AutoScalingState {
     /// attachment whose target group Elastic Load Balancing v2 no longer holds stops it
     /// before anything is minted: nothing is placed and the sentence the caller records for
     /// each unplaced unit names that target group
-    /// ([`elbv2_targets::unresolved_attachments`]). The ATTACHMENT itself stays exactly as
+    /// ([`elbv2_targets::unresolved_attachments`]). An attachment that RESOLVES and would
+    /// refuse the registration — a target group whose VPC does not hold the instance — stops
+    /// it once the attempt has been made: that instance is taken back and the sentence names
+    /// the target group and that service's own refusal
+    /// ([`elbv2_targets::refused_launch_registrations`]). The ATTACHMENT itself stays exactly as
     /// the client left it — it is the client's to remove
     /// (`DetachLoadBalancerTargetGroups`), and a group that reported an attachment the
     /// client never detached cannot refuse that detach.
@@ -3017,6 +3023,23 @@ impl AutoScalingState {
         // takes it out of the pool ([`warm_pools`]) — so it is marked there instead.
         let withhold_registration = request.destination == LaunchDestination::Group
             && !group.registers_with_load_balancers();
+        // The attachments an instance this launch brings INTO SERVICE has to be registered
+        // in, read off the group before anything is launched: a launch Elastic Load Balancing
+        // v2 would refuse the registration of brings nothing into service
+        // ([`elbv2_targets::refused_launch_registrations`], below). A launch into the warm pool
+        // owes none of them, and neither does a group whose registering process is suspended
+        // — there is then no registration for an attachment to refuse.
+        let registration_attachments: Vec<String> = if request.destination
+            == LaunchDestination::Group
+            && group.registers_with_load_balancers()
+        {
+            elbv2_targets::attached_arns(group)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Everything the group already holds, its warm pool included: the placement of a
         // fresh instance follows how many the group has placed so far.
         let placed = group.instances.len() + group.warm_pool_instance_count();
@@ -3117,6 +3140,42 @@ impl AutoScalingState {
             }
         }
         let launched = ec2_instances::launch(engine, &launch_request);
+        // Registering the instance is PART of bringing it into service, so an attachment
+        // Elastic Load Balancing v2 would REFUSE that registration into stops the launch
+        // there: the instance Amazon EC2 made is taken back where every instance of the
+        // account lives, the group holds none of them — none ever reaches service, so the
+        // capacity it was asked for stays owed — and what the caller records for each unit
+        // nothing was placed for is that service's own refusal, naming the target group
+        // ([`elbv2_targets::refused_launch_message`]).
+        //
+        // The ATTACHMENT stays: the group keeps reporting what the client attached until the
+        // client detaches it, so the cancelled launch is the whole of what happened.
+        if !registration_attachments.is_empty() {
+            let attempts: Vec<String> = launched
+                .iter()
+                .map(|instance| instance.instance_id.clone())
+                .collect();
+            let refused = elbv2_targets::refused_launch_registrations(
+                engine,
+                &registration_attachments,
+                &attempts,
+            );
+            if let Some(message) = elbv2_targets::refused_launch_message(&refused) {
+                ec2_instances::terminate(engine, &attempts, request.launched_at);
+                // Each of those attempts is an instance Amazon EC2 creates and this service
+                // takes back, so the group makes one when the next one is DUE rather than on
+                // every pass over the store ([`StoredGroup::launch_retry_due`]), exactly as a
+                // launch Amazon EC2 itself withdraws is retried.
+                if let Some(group) = self.groups.get_mut(request.group_name) {
+                    group.launch_retry_due = Some(request.launched_at + WITHDRAWN_LAUNCH_RETRY);
+                }
+                return GroupLaunchOutcome::withdrawn(
+                    request.count,
+                    BlockedLaunch::cancelled(message),
+                    attempts,
+                );
+            }
+        }
         let unplaced = request.count.saturating_sub(launched.len());
         // Amazon EC2 launches the instances of one capacity change one after another, so
         // each of them is a little newer than the last even though they were asked for

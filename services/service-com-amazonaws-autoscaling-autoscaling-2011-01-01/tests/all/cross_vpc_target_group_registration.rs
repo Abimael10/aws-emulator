@@ -16,12 +16,20 @@
 //! the attach itself is ANSWERED, so the activity log is the only place the failure appears.
 //!
 //! The tables below span what the rule generalises over: whether the target group is in the
-//! group's own VPC or in another, how the attachment was made (the create's own
-//! `TargetGroupARNs`, a later `AttachLoadBalancerTargetGroups`, a later
-//! `AttachTrafficSources` of an `elbv2` traffic source), and how many instances the group
-//! holds — one refused registration per instance. Every assertion is made where a client
-//! sees it: Auto Scaling's own `DescribeScalingActivities`, and Elastic Load Balancing v2's
-//! own `DescribeTargetHealth` for the targets, with the three services on ONE engine.
+//! group's own VPC or in another, how the attachment was made (a later
+//! `AttachLoadBalancerTargetGroups`, a later `AttachTrafficSources` of an `elbv2` traffic
+//! source), and how many instances the group holds — one refused registration per instance.
+//! Every assertion is made where a client sees it: Auto Scaling's own
+//! `DescribeScalingActivities`, and Elastic Load Balancing v2's own `DescribeTargetHealth` for
+//! the targets, with the three services on ONE engine.
+//!
+//! An attachment the group's own CREATE made is weighed on the LAUNCH instead, because
+//! registering the instance is part of bringing it into service: such a launch is cancelled
+//! and no instance of it ever reaches service, so there is no in-service registration for this
+//! rule to be about. That case — the `Cancelled` activity, the whole sentence it carries and
+//! the attempt Amazon EC2 takes back — is spanned by
+//! `launch_refused_by_an_attachment_of_another_vpc.rs`; the rows here are the attachments made
+//! to a group whose instances are already in service, which is what the attach APIs do.
 
 use std::time::{Duration, Instant};
 
@@ -78,16 +86,13 @@ struct RefusedRow {
     instances: usize,
 }
 
-/// The rows: each of the three ways a client associates a target group with a group, and a
-/// group holding more than one instance — the refusal is owed per INSTANCE, so the count is
-/// what the rule generalises over beside the form of the attachment.
+/// The rows: each of the two ways a client associates a target group with a group whose
+/// instances are already in service, and a group holding more than one instance — the refusal
+/// is owed per INSTANCE, so the count is what the rule generalises over beside the form of the
+/// attachment. An association the group's own create made is a launch that is cancelled
+/// instead (this suite's header says where that is spanned), so it is not a row here.
 fn refused_rows() -> Vec<RefusedRow> {
     vec![
-        RefusedRow {
-            case: "attached by the create's TargetGroupARNs",
-            attached_as: AttachedAs::CreateTargetGroupArns,
-            instances: 1,
-        },
         RefusedRow {
             case: "attached by AttachLoadBalancerTargetGroups",
             attached_as: AttachedAs::LegacyAttach,
