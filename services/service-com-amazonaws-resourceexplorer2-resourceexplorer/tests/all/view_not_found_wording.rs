@@ -451,6 +451,13 @@ async fn every_operation_words_a_missing_view_the_same_way() {
 /// that failed nor the value the request submitted, so there is no variable part.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
 
+/// The WHOLE message `ListResources` answers a filter string that is not composed solely
+/// of supported filter operators with. Spelled out here for the same reason: the sentence
+/// is the requirement, and it names the member and no submitted value, so it has no
+/// variable part either.
+const FILTER_STRING_SYNTAX_MESSAGE: &str =
+    "FilterString must contain only AREX supported filter operators and no freeform text.";
+
 /// The minimum every paginated input's `MaxResults` declares
 /// (`smithy_query(query="shape",shape="ListResourcesInput,SearchInput,ListIndexesInput,ListViewsInput,GetResourceExplorerSetupInput")`
 /// -> `MaxResults` `range {min: 1, max: …}`). Spelled out independently of the crate's
@@ -920,22 +927,32 @@ async fn a_rule_the_model_states_in_prose_keeps_the_wording_that_names_it() {
 
     // A filter string carrying free-form text: a restriction `ListResourcesInput$Filters`
     // documents in prose, which no constraint in the model expresses, so the operation
-    // refuses it and names the member it is about.
-    let case = "ListResources with a free-form term in its filter string";
-    let answer = emulator
-        .call(
-            region,
-            "ListResources",
-            json!({ "Filters": { "FilterString": "orders" } }),
-        )
-        .await;
-    answer.failed(case, 400, "ValidationException");
-    let message = answer.error_message();
-    assert!(
-        message != INVALID_REQUEST_BODY && message.contains("Filters.FilterString"),
-        "case {case:?}: a prose rule is refused naming the member it is about, got \
-         {message:?}"
-    );
+    // refuses it and names the member it is about. A documented filter prefix carrying no
+    // value is the same rule: it is not a complete filter operator either.
+    for (case, filter_string) in [
+        ("ListResources with a free-form term in its filter string", "orders"),
+        ("ListResources with a filter prefix carrying no value", "service:"),
+    ] {
+        let answer = emulator
+            .call(
+                region,
+                "ListResources",
+                json!({ "Filters": { "FilterString": filter_string } }),
+            )
+            .await;
+        answer.failed(case, 400, "ValidationException");
+        let message = answer.error_message();
+        assert_ne!(
+            message, INVALID_REQUEST_BODY,
+            "case {case:?}: a prose rule is the operation's own refusal, not the body \
+             rejection, got {message:?}"
+        );
+        assert_eq!(
+            message, FILTER_STRING_SYNTAX_MESSAGE,
+            "case {case:?}: a prose rule is refused naming the member it is about, got \
+             {message:?}"
+        );
+    }
 
     // A tag filter through a view that does not include the `tags` property: another rule
     // of the operation's own, which names the filter at fault.

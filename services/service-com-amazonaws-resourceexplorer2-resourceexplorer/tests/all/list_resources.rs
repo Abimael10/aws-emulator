@@ -851,18 +851,28 @@ async fn a_views_filter_string_scopes_what_it_can_return() {
     }
 }
 
+/// The one sentence `ListResources` answers a filter string that is not composed solely
+/// of supported filter operators with. The text is fixed for the class: it states the
+/// member and the requirement and carries no part of the submitted filter string, which
+/// `SearchFilter` being `@sensitive` is what requires.
+const FILTER_STRING_SYNTAX_MESSAGE: &str =
+    "FilterString must contain only AREX supported filter operators and no freeform text.";
+
 /// The filter string "supports only filter prefixes with optional operators. It doesn't
-/// support free-form text", so a term that carries no documented filter prefix is
-/// refused with 400 `ValidationException` naming the term — never matched as text, and
-/// never a 501. The accepted rows show the refusal is about the PREFIX and not about the
-/// value: every documented prefix is served, even one that selects nothing.
+/// support free-form text", so a term that is not a COMPLETE filter operator — a
+/// documented prefix followed by a value — is refused with 400 `ValidationException` and
+/// the sentence that class fixes, never matched as text and never a 501. The accepted
+/// rows show what a complete operator is: every documented prefix is served with a
+/// value, even a value that selects nothing.
 #[tokio::test]
 async fn a_filter_string_carrying_free_form_text_is_refused() {
     let fixture = Fixture::new().await;
 
-    // The rows differ along the FORM of the offending term: a bare word, a word beside
-    // a well-formed filter, a negated bare word, a prefix that is not a filter name, and
-    // one that is nearly a filter name.
+    // The rows differ along the FORM of the offending term: a bare word, a word beside a
+    // well-formed filter, a negated bare word, a prefix that is not a filter name, one
+    // that is nearly a filter name, and a documented prefix carrying no value at all —
+    // an operator without the value that completes it, which is a prefix rather than a
+    // pair however well the name itself is spelled.
     let refused = [
         ("a bare word", "orders"),
         ("a word beside a filter", "service:sqs orders"),
@@ -871,24 +881,37 @@ async fn a_filter_string_carrying_free_form_text_is_refused() {
         ("a negated unknown prefix", "-queuename:orders"),
         ("a prefix nearly a filter name", "resourcetypes:sqs:queue"),
         ("a prefix nearly a tag filter name", "tag.name:stage"),
+        ("a service prefix with no value", "service:"),
+        ("a region prefix with no value", "region:"),
+        ("a resource type prefix with no value", "resourcetype:"),
+        ("an arn prefix with no value", "arn:"),
+        ("an id prefix with no value", "id:"),
+        ("an account prefix with no value", "accountid:"),
+        ("a tag prefix with no value", "tag:"),
+        ("a tag key prefix with no value", "tag.key:"),
+        ("a negated prefix with no value", "-service:"),
+        ("a valueless prefix beside a filter", "service:sqs region:"),
+        ("a valueless prefix before a filter", "service: region:us-east-1"),
+        ("a colon with no filter name", ":sqs"),
     ];
     for (case, filter_string) in refused {
         let answer = fixture.emulator.list(REGION, filter_string).await;
         answer.failed(case, 400, "ValidationException");
         let message = answer.error_message();
-        assert!(
-            message.contains("free-form text") && message.contains("Filters.FilterString"),
-            "case {case:?}: the refusal names the member and the requirement, got {message:?}"
+        assert_eq!(
+            message, FILTER_STRING_SYNTAX_MESSAGE,
+            "case {case:?}: expected the sentence this class fixes, got {message:?}"
         );
         // `SearchFilter` is @sensitive, so the string the caller sent is not echoed.
         assert!(
-            !message.contains(filter_string) || filter_string.is_empty(),
-            "case {case:?}: a sensitive member's value must not be echoed, got {message:?}"
+            !answer.body.to_string().contains(filter_string) || filter_string.is_empty(),
+            "case {case:?}: a sensitive member's value must not be echoed, got {}",
+            answer.body
         );
     }
 
-    // Every documented filter prefix is served. `tag` filters are included because the
-    // fixture's default view includes the `tags` property.
+    // Every documented filter prefix is served WITH a value. `tag` filters are included
+    // because the fixture's default view includes the `tags` property.
     let accepted = [
         ("an empty filter string", ""),
         ("a service filter", "service:sqs"),
@@ -903,12 +926,116 @@ async fn a_filter_string_carrying_free_form_text_is_refused() {
         ("a tag value filter", "tag.value:prod"),
         ("a negated filter", "-service:sns"),
         ("a wildcard filter", "service:sq*"),
+        ("a wildcard value of one character", "service:*"),
+        ("a value that selects nothing", "service:no-such-service"),
         ("filters AND-ed", "service:sqs region:us-east-1 -id:orders"),
     ];
     for (case, filter_string) in accepted {
         let answer = fixture.emulator.list(REGION, filter_string).await;
         answer.ok(case);
     }
+}
+
+/// The filter-operator requirement belongs to `ListResources`' `Filters.FilterString`
+/// ALONE: `Search`'s `QueryString` "supports the search keywords, prefixes, and
+/// operators" with no such restriction, so the very strings `ListResources` refuses are
+/// queries `Search` answers — reporting whatever they match, which for a term that
+/// matches nothing is an empty result set with a complete count.
+///
+/// The rows span both ways a term fails `ListResources`' requirement (free-form text, a
+/// documented prefix with no value) and, as positive controls, strings both operations
+/// accept.
+#[tokio::test]
+async fn the_filter_operator_requirement_is_list_resources_own() {
+    let fixture = Fixture::new().await;
+
+    // (case, the string, whether ListResources accepts it)
+    let rows = [
+        ("free-form text", "orders", false),
+        ("an unknown prefix", "name:orders", false),
+        ("a prefix with no value", "service:", false),
+        ("a negated prefix with no value", "-service:", false),
+        ("a complete filter", "service:sqs", true),
+        ("an empty query", "", true),
+    ];
+    for (case, query, listable) in rows {
+        let listed = fixture.emulator.list(REGION, query).await;
+        if listable {
+            listed.ok(case);
+        } else {
+            listed.failed(case, 400, "ValidationException");
+            assert_eq!(
+                listed.error_message(),
+                FILTER_STRING_SYNTAX_MESSAGE,
+                "case {case:?}: expected the sentence this class fixes, got {}",
+                listed.body
+            );
+        }
+
+        // The same string through `Search`, which validates no operator syntax.
+        let searched = fixture
+            .emulator
+            .explorer(
+                REGION,
+                "Search",
+                json!({ "QueryString": query, "MaxResults": 5 }),
+            )
+            .await;
+        let page = searched.arns(case).len() as u64;
+        let body = searched.ok(case);
+        let total = body["Count"]["TotalResources"].as_u64();
+        assert!(
+            total.is_some_and(|total| total >= page),
+            "case {case:?}: Search reports the count of the whole match, got {}",
+            searched.body
+        );
+        assert_eq!(
+            body["Count"]["Complete"],
+            json!(true),
+            "case {case:?}: a match under the result limit is complete, got {}",
+            searched.body
+        );
+    }
+
+    // A term carrying a prefix with no value selects no value of that field, so `Search`
+    // answers it with nothing at all — while the well-formed neighbour selects the
+    // queues, which is what makes the empty answer about the term and not about the index.
+    let case = "Search with a prefix carrying no value";
+    let searched = fixture
+        .emulator
+        .explorer(
+            REGION,
+            "Search",
+            json!({ "QueryString": "service:", "MaxResults": 5 }),
+        )
+        .await;
+    assert_eq!(
+        searched.arns(case),
+        BTreeSet::new(),
+        "case {case:?}: expected no match at all, got {}",
+        searched.body
+    );
+    assert_eq!(
+        searched.body["Count"],
+        json!({ "TotalResources": 0, "Complete": true }),
+        "case {case:?}: expected a complete count of nothing, got {}",
+        searched.body
+    );
+    let case = "Search with the well-formed neighbour";
+    let searched = fixture
+        .emulator
+        .explorer(
+            REGION,
+            "Search",
+            json!({ "QueryString": "service:sqs", "MaxResults": 5 }),
+        )
+        .await;
+    assert_eq!(
+        searched.arns(case),
+        set(&[&fixture.queue, &fixture.fifo_queue]),
+        "case {case:?}: expected the queues, got {}",
+        searched.body
+    );
 }
 
 /// The match pages by `MaxResults` with an OPAQUE `NextToken` that resumes where the
@@ -1260,7 +1387,12 @@ async fn a_listing_with_no_view_reports_the_regions_index() {
         (
             "free-form text with no view",
             json!({ "Filters": { "FilterString": "orders" } }),
-            "free-form text",
+            FILTER_STRING_SYNTAX_MESSAGE,
+        ),
+        (
+            "a prefix with no value and no view",
+            json!({ "Filters": { "FilterString": "service:" } }),
+            FILTER_STRING_SYNTAX_MESSAGE,
         ),
         (
             "a tag filter with no view",
@@ -2059,7 +2191,14 @@ async fn a_failures_detail_text_is_reported_in_the_message_member() {
             json!({ "Filters": { "FilterString": "orders" } }),
             400,
             "ValidationException",
-            None,
+            Some(FILTER_STRING_SYNTAX_MESSAGE),
+        ),
+        (
+            "a filter string carrying a prefix with no value",
+            json!({ "Filters": { "FilterString": "service:" } }),
+            400,
+            "ValidationException",
+            Some(FILTER_STRING_SYNTAX_MESSAGE),
         ),
         (
             "a page size outside the modelled range",

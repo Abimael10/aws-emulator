@@ -1254,19 +1254,23 @@ fn valueless_resource() -> &'static IndexedResource {
     })
 }
 
-/// The first term of `query` that is NOT a documented filter prefix, written the way the
-/// query wrote it, or `None` when every term carries one.
+/// The first term of `query` that is NOT a complete supported filter operator, written
+/// the way the query wrote it, or `None` when every term is one.
 ///
-/// A term is free-form text when it has no `name:value` prefix at all, or when its
-/// prefix is not a filter name ([`is_filter_name`]) — exactly the terms
-/// [`term_matches`] falls back to matching as text. An empty term contributes nothing
-/// either way, so it is not free-form text.
+/// A term is a complete filter operator when it is a documented filter name
+/// ([`is_filter_name`]) followed by `:` and a NON-EMPTY value — the `name:value` pair the
+/// search query syntax reference spells out, optionally negated with `-`. Every other
+/// term is free-form text: one with no `name:value` prefix at all, one whose prefix is
+/// not a filter name (exactly the terms [`term_matches`] falls back to matching as text),
+/// and one carrying a filter prefix with nothing after the colon, which is a prefix and
+/// not a pair — it selects no value of the field it names. An empty term contributes
+/// nothing either way, so it is not free-form text.
 pub fn free_form_term(query: &str) -> Option<&str> {
     query.split_whitespace().find(|term| {
         let (_, body, filter) = split_term(term);
         !body.is_empty()
             && match filter {
-                Some((name, _)) => !is_filter_name(name),
+                Some((name, value)) => !is_filter_name(name) || value.is_empty(),
                 None => true,
             }
     })

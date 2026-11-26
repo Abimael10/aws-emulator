@@ -7,9 +7,10 @@
 //!
 //! The one thing this operation does that `Search` does not is refuse free-form text:
 //! its filter string "supports only filter prefixes with optional operators. It doesn't
-//! support free-form text" (`ListResourcesInput$Filters`), so a term carrying no
-//! documented filter prefix is a 400 `ValidationException` rather than a term matched
-//! against every indexed field.
+//! support free-form text" (`ListResourcesInput$Filters`), so a term that is not a
+//! complete `name:value` filter pair — one carrying no documented filter prefix, or a
+//! prefix with no value after the colon — is a 400 `ValidationException` rather than a
+//! term matched against every indexed field.
 //!
 //! An explicit `ViewArn` identifies the view wherever the request was signed for, and
 //! the index read is the one belonging to THAT view's Region; an ARN that resolves to no
@@ -253,14 +254,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::free_form_term(query).is_some() {
             return Err(ListResourcesErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "1 validation error detected: Value at '{FILTER_STRING_MEMBER}' failed \
-                         to satisfy constraint: {FREE_FORM_TEXT_ISSUE}"
-                    ),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: FILTER_STRING_MEMBER.to_string(),
-                        validation_issue: FREE_FORM_TEXT_ISSUE.to_string(),
-                    }]),
+                    message: FILTER_STRING_SYNTAX_MESSAGE.to_string(),
+                    field_list: None,
                 },
             )
             .into());
@@ -350,16 +345,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The input member a free-form-text refusal blames, spelled as the member path to it.
-const FILTER_STRING_MEMBER: &str = "Filters.FilterString";
-
-/// What that member has to satisfy, from the restriction `ListResourcesInput$Filters`
-/// documents for it: the query string "supports only filter prefixes with optional
-/// operators. It doesn't support free-form text."
+/// The one sentence this refusal class carries, for the restriction
+/// `ListResourcesInput$Filters` documents: the filter string "supports only filter
+/// prefixes with optional operators. It doesn't support free-form text."
 ///
-/// The refusal states the requirement and the member and NO value: `SearchFilter` is
-/// `@sensitive`, so the string a caller sent is not echoed into the response and the
-/// logs it travels through.
-const FREE_FORM_TEXT_ISSUE: &str =
-    "Member must contain only filter prefixes with optional operators, and no free-form \
-     text";
+/// Entirely fixed text — it names the member, states the requirement and carries no
+/// submitted value, which is also what `SearchFilter` being `@sensitive` requires: the
+/// string a caller sent is never echoed into the response or the logs it travels
+/// through. One sentence answers every way a term fails the requirement, because the
+/// requirement is one.
+const FILTER_STRING_SYNTAX_MESSAGE: &str =
+    "FilterString must contain only AREX supported filter operators and no freeform text.";
