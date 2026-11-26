@@ -195,6 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let link_id = link.link_id.clone();
+        // A link in a status nothing moves it out of carries no traffic and never
+        // will, so it has no configuration left to take: `UpdateLink` and
+        // `UpdateLinkModuleFlow` refuse a configuration change to such a link, and a
+        // rule that routes for it is one of those. The words of the refusal are read
+        // off the record here, while the link is still in hand; the refusal itself is
+        // returned below, after the client token, so a retry of an accepted create
+        // replays its own rule rather than being refused by it.
+        let link_terminal_conflict = link
+            .terminal()
+            .then(|| link.status_conflict_message(&input.gateway_id, "routed for"));
 
         // Every member of the modelled `RuleCondition` is optional, so a structure
         // stating no condition at all passes the schema layer and has to be refused
@@ -243,6 +253,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     created_at: crate::state::timestamp(rule.created_at),
                 });
             }
+        }
+
+        // Nothing is stored for a link that has finished: the rule would claim to
+        // route traffic for a link that can carry none.
+        if let Some(message) = link_terminal_conflict {
+            return Err(
+                CreateLinkRoutingRuleErrorModeled::ConflictException(ConflictException { message })
+                    .into(),
+            );
         }
 
         // A priority orders the link's rules against each other, so the link's
