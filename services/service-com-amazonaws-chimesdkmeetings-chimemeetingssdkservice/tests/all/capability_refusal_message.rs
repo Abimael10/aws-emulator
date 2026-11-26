@@ -20,11 +20,13 @@
 //! are shared with the sibling suite that spans the whole catalog of modelled maximum
 //! resolutions, so the expected wording lives in exactly one place.
 //!
-//! The last suite below pins WHEN that judgement happens: a set the meeting does not admit
-//! is refused for every request that carries one, so a create for an identity the meeting
+//! Two suites below pin WHEN that judgement happens: a set the meeting does not admit is
+//! refused for every request that carries one, so a create for an identity the meeting
 //! already holds an attendee for is refused too — the same answer through each of the three
 //! creation paths — while an admissible set is answered with the stored attendee and is
-//! never applied to it.
+//! never applied to it. The last suite drives the same rule WITHIN one request, where the
+//! identity an item names is one an earlier item of that same request already minted an
+//! attendee for: every occurrence of it is judged on its own.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -926,4 +928,343 @@ async fn a_per_item_capability_conflict_carries_the_same_message() {
             }
         }
     }
+}
+
+/// One row of the repetition table: the meeting's `MeetingFeatures`, its effective maximum
+/// resolutions (so the expectation is read from the documentation and not from the handler),
+/// and the capability set each OCCURRENCE of ONE identity carries in a single request —
+/// `None` for an occurrence that carries no `Capabilities` at all.
+struct RepetitionCase {
+    name: &'static str,
+    features: Option<Value>,
+    resolutions: (&'static str, &'static str),
+    occurrences: Vec<Option<Value>>,
+}
+
+/// The sentence each occurrence of the identity must be refused with, in request order, read
+/// from the documented rule alone: an occurrence carrying no set breaks no rule, and one
+/// carrying a set is judged against the meeting's features exactly as a single
+/// `CreateAttendee` carrying it is.
+fn expected_per_occurrence(case: &RepetitionCase) -> Vec<Option<&'static str>> {
+    case.occurrences
+        .iter()
+        .map(|carried| {
+            carried.as_ref().and_then(|set| {
+                expected_refusal(
+                    &axis(set, "Video"),
+                    &axis(set, "Content"),
+                    case.resolutions.0,
+                    case.resolutions.1,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The set the identity's attendee must end up holding: the one the FIRST occurrence the
+/// meeting admits carried, since a later occurrence never replaces it — changing a stored set
+/// is `UpdateAttendeeCapabilities`. `None` when that occurrence carried no set, which leaves
+/// the stored value to the documented defaults the sibling suites cover.
+fn applied_set(case: &RepetitionCase, expected: &[Option<&'static str>]) -> Option<Value> {
+    case.occurrences
+        .iter()
+        .zip(expected.iter())
+        .find(|(_, refusal)| refusal.is_none())
+        .and_then(|(carried, _)| carried.clone())
+}
+
+/// Where one repetition request went and what it named: the row it came from, the operation
+/// that answered it (both must answer identically, so this only names the path in the
+/// assertion messages), the identity every occurrence carries, the meeting the request filled
+/// and the set the attendee must end up holding.
+struct Repeated<'a> {
+    case: &'a str,
+    operation: &'a str,
+    user: &'a str,
+    meeting_id: &'a str,
+    applied: Option<&'a Value>,
+}
+
+/// Check one repetition request's answer, and the state it left, against the rule.
+///
+/// `expected` is the per-occurrence verdict the documentation gives, in request order.
+async fn assert_repetition(
+    router: &MultiServiceRouter,
+    sent: &Repeated<'_>,
+    reply: &Reply,
+    expected: &[Option<&'static str>],
+) {
+    let Repeated {
+        case,
+        operation,
+        user,
+        meeting_id,
+        applied,
+    } = *sent;
+    let attendees = list_of(reply, "Attendees");
+    let errors = list_of(reply, "Errors");
+    let refused: Vec<&str> = expected.iter().filter_map(|refusal| *refusal).collect();
+    let admitted = expected.iter().filter(|refusal| refusal.is_none()).count();
+
+    assert_eq!(
+        attendees.len(),
+        admitted,
+        "case {case:?} via {operation}: expected the {admitted} occurrence(s) the meeting \
+         admits reported in Attendees, got {attendees:?}"
+    );
+    // One identity gets ONE attendee however many times it is named, so every admitted
+    // occurrence reports the attendee the first of them minted.
+    if let Some(first) = attendees.first() {
+        for (position, reported) in attendees.iter().enumerate() {
+            assert_eq!(
+                reported, first,
+                "case {case:?} via {operation}: occurrence {position} must report the one \
+                 attendee the identity has, got {reported:?} against {first:?}"
+            );
+        }
+    }
+
+    let served: Vec<&str> = errors
+        .iter()
+        .map(|error| {
+            error
+                .get("ErrorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("<no ErrorMessage>")
+        })
+        .collect();
+    assert_eq!(
+        served, refused,
+        "case {case:?} via {operation}: expected one refusal per inadmissible occurrence, in \
+         request order, got {errors:?}"
+    );
+    for error in &errors {
+        assert_eq!(
+            (
+                error.get("ExternalUserId").and_then(Value::as_str),
+                error.get("ErrorCode").and_then(Value::as_str),
+            ),
+            (Some(user), Some("BadRequest")),
+            "case {case:?} via {operation}: a per-item refusal names the identity the caller \
+             sent and the refusal's code, got {error:?}"
+        );
+    }
+
+    // The state the request left: at most ONE attendee for the identity, holding the set the
+    // first admitted occurrence carried, and nothing minted for a refused one.
+    let listed = list_attendees(router, meeting_id).await;
+    let held: Vec<&Value> = listed
+        .iter()
+        .filter(|attendee| attendee.get("ExternalUserId").and_then(Value::as_str) == Some(user))
+        .collect();
+    let expected_held = usize::from(admitted > 0);
+    assert_eq!(
+        held.len(),
+        expected_held,
+        "case {case:?} via {operation}: the meeting must hold {expected_held} attendee(s) for \
+         the identity, got {listed:?}"
+    );
+    let Some(stored) = held.first().copied() else {
+        return;
+    };
+    assert_eq!(
+        Some(stored),
+        attendees.first(),
+        "case {case:?} via {operation}: ListAttendees must read back exactly the attendee the \
+         answer reported, got {stored:?}"
+    );
+    let attendee_id = stored
+        .get("AttendeeId")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: a stored attendee carries its id"));
+
+    let read_back = get_attendee(router, meeting_id, attendee_id).await;
+    assert_eq!(
+        read_back.body.get("Attendee"),
+        Some(stored),
+        "case {case:?} via {operation}: GetAttendee must read back the stored attendee, got \
+         {:?}",
+        read_back.body
+    );
+    if let Some(applied) = applied {
+        assert_eq!(
+            stored.get("Capabilities"),
+            Some(applied),
+            "case {case:?} via {operation}: the stored set must be the one the first admitted \
+             occurrence carried, got {:?}",
+            stored.get("Capabilities")
+        );
+    }
+}
+
+/// A capability set is judged for EVERY occurrence of an identity in one request, so
+/// repeating an `ExternalUserId` inside a single request never carries an inadmissible set
+/// past the judgement: each occurrence that breaks a documented rule is reported in `Errors`
+/// on its own, the occurrences the meeting admits all report the one attendee the first of
+/// them minted, and that attendee's stored set is never replaced.
+///
+/// The rows span what the rule generalises over: which of the three documented classes the
+/// set breaks, where in the request the inadmissible occurrence sits (first, last, between
+/// two admitted ones), how many times the identity is repeated, whether an occurrence carries
+/// a set at all, and which meeting features make it inadmissible. Each row is driven through
+/// both operations that take a list of items — `CreateMeetingWithAttendees`, which mints the
+/// meeting in the same call, and `BatchCreateAttendee` against a meeting that already exists
+/// — which must answer it identically.
+#[tokio::test]
+async fn every_occurrence_of_a_repeated_external_user_id_is_judged_on_its_own() {
+    let cases = [
+        RepetitionCase {
+            name: "the inadmissible occurrence first, the repeat carrying no set",
+            features: Some(json!({ "Content": { "MaxResolution": "None" } })),
+            resolutions: ("HD", "None"),
+            occurrences: vec![Some(capability_set("Send", "SendReceive", "Send")), None],
+        },
+        RepetitionCase {
+            name: "the inadmissible occurrence last, after one carrying no set",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            occurrences: vec![None, Some(capability_set("SendReceive", "Send", "None"))],
+        },
+        RepetitionCase {
+            name: "the inadmissible occurrence between two the meeting admits",
+            features: Some(json!({ "Content": { "MaxResolution": "None" } })),
+            resolutions: ("HD", "None"),
+            occurrences: vec![
+                None,
+                Some(capability_set("None", "None", "Receive")),
+                Some(capability_set("Send", "None", "None")),
+            ],
+        },
+        RepetitionCase {
+            name: "every occurrence inadmissible, each refused on its own",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            occurrences: vec![
+                Some(capability_set("SendReceive", "SendReceive", "None")),
+                Some(capability_set("None", "Receive", "None")),
+            ],
+        },
+        RepetitionCase {
+            name: "content reception without video reception, under the default features",
+            features: None,
+            resolutions: ("HD", "FHD"),
+            occurrences: vec![
+                None,
+                Some(capability_set("SendReceive", "None", "SendReceive")),
+                None,
+            ],
+        },
+        RepetitionCase {
+            name: "an admissible set first, which a bare repeat must not re-default",
+            features: None,
+            resolutions: ("HD", "FHD"),
+            occurrences: vec![Some(capability_set("None", "Receive", "Receive")), None],
+        },
+        RepetitionCase {
+            name: "a set a meeting capping both axes at None admits, named four times",
+            features: Some(json!({
+                "Video": { "MaxResolution": "None" },
+                "Content": { "MaxResolution": "None" },
+            })),
+            resolutions: ("None", "None"),
+            occurrences: vec![
+                Some(capability_set("Send", "None", "None")),
+                Some(capability_set("None", "Send", "None")),
+                None,
+                Some(capability_set("SendReceive", "None", "None")),
+            ],
+        },
+    ];
+
+    let router = router();
+    let mut refused_occurrences = 0usize;
+    let mut admitted_occurrences = 0usize;
+
+    for (index, case) in cases.iter().enumerate() {
+        let expected = expected_per_occurrence(case);
+        refused_occurrences += expected.iter().filter(|refusal| refusal.is_some()).count();
+        admitted_occurrences += expected.iter().filter(|refusal| refusal.is_none()).count();
+        let applied = applied_set(case, &expected);
+        let user = format!("user-repeat-{index}");
+        let items = Value::Array(
+            case.occurrences
+                .iter()
+                .map(|carried| match carried {
+                    Some(set) => json!({ "ExternalUserId": user, "Capabilities": set }),
+                    None => json!({ "ExternalUserId": user }),
+                })
+                .collect(),
+        );
+
+        // The path that mints the meeting in the same call.
+        let minted = create_meeting_with_attendees(
+            &router,
+            &format!("tok-repeat-{index}"),
+            case.features.clone(),
+            &items,
+        )
+        .await;
+        assert_eq!(
+            minted.status, 200,
+            "case {:?} via CreateMeetingWithAttendees: a per-item refusal never fails the \
+             call, got {} with {:?}",
+            case.name, minted.status, minted.body
+        );
+        let minted_meeting = minted
+            .body
+            .get("Meeting")
+            .and_then(|meeting| meeting.get("MeetingId"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: CreateMeetingWithAttendees returned no MeetingId",
+                    case.name
+                )
+            })
+            .to_string();
+        assert_repetition(
+            &router,
+            &Repeated {
+                case: case.name,
+                operation: "CreateMeetingWithAttendees",
+                user: &user,
+                meeting_id: &minted_meeting,
+                applied: applied.as_ref(),
+            },
+            &minted,
+            &expected,
+        )
+        .await;
+
+        // The same items against a meeting with the same features that already exists, which
+        // must answer every occurrence the same way.
+        let stored_meeting =
+            new_meeting(&router, &format!("tok-repeat-batch-{index}"), case.features.clone()).await;
+        let batched = batch_create_attendees(&router, &stored_meeting, &items).await;
+        assert_eq!(
+            batched.status, 200,
+            "case {:?} via BatchCreateAttendee: a per-item refusal never fails the call, got \
+             {} with {:?}",
+            case.name, batched.status, batched.body
+        );
+        assert_repetition(
+            &router,
+            &Repeated {
+                case: case.name,
+                operation: "BatchCreateAttendee",
+                user: &user,
+                meeting_id: &stored_meeting,
+                applied: applied.as_ref(),
+            },
+            &batched,
+            &expected,
+        )
+        .await;
+    }
+
+    assert!(
+        refused_occurrences > 0 && admitted_occurrences > 0,
+        "the table must span both verdicts, got {refused_occurrences} refused and \
+         {admitted_occurrences} admitted occurrences"
+    );
 }
