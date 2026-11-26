@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIdentityStores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIdentityStores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIdentityStores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,10 +87,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `ListIdentityStoresError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#ListIdentityStores")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#ListIdentityStores",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListIdentityStoresErrorModeled {
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on the
+    /// service rather than on this operation. Answered when the store is unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,20 +148,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIdentityStores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIdentityStoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // WHICH identity stores the caller has is IAM Identity Center's answer — an
+        // identity store is the store OF one of the account's instances and no operation
+        // of this API creates one — so the set this listing reports is asked of the
+        // service that owns instances, exactly as the resolution every store-addressed
+        // operation goes through asks it (`crate::state::addressed_store_key`): a store
+        // this listing names is a store a later request may be addressed to, and a store
+        // it leaves out is one that resolution refuses.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIdentityStores"))
+        // Asked BEFORE this service's own state is locked, which is the lock order that
+        // resolution documents, so the two locks are never held together.
+        let account_stores = crate::state::account_identity_store_keys(&*self.engine);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListIdentityStoresErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        // `@readonly`: the stores are READ and nothing is written — a listing of them
+        // registers no store record — so this cannot change what a later caller sees.
+        let state = state.lock();
+        // While Identity Center knows nothing about the account's enablement, the stores
+        // the account has are not knowable from instances; the stores this emulator can
+        // report are then the ones it HOLDS A RECORD of, which is the set every
+        // store-addressed read of this service answers from.
+        let store_keys = crate::state::stores_in_listing_order(
+            account_stores.unwrap_or_else(|| state.recorded_store_keys()),
+        );
+
+        // `MaxResults` is "the maximum number of results to return per request … If you
+        // don't specify a value, the operation uses a default page size", and this
+        // operation's member carries no `@default` of its own, so an absent one asks for
+        // this service's default page ([`crate::state::DEFAULT_MAX_RESULTS`]). A value
+        // outside the modelled 1..100 is refused rather than coerced into it: the
+        // constraint is checked before this handler runs, so this cannot be reached from
+        // the wire today, and refusing keeps it a refusal rather than a silently resized
+        // page if it ever is.
+        let requested = input.max_results.unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        if !(1..=crate::state::MAX_MAX_RESULTS).contains(&requested) {
+            return Err(ListIdentityStoresErrorModeled::ValidationException(
+                crate::state::validation(format!(
+                    "MaxResults must be between 1 and {}, got {requested}",
+                    crate::state::MAX_MAX_RESULTS
+                )),
+            )
+            .into());
+        }
+        let page_size = requested as usize;
+
+        // A `NextToken` is this service's own opaque cursor: it names the identity store
+        // the next page starts at, the way every other paged read of this service names
+        // the resource its next page starts at. One this service did not mint, or one
+        // naming a store this listing no longer reports, is refused rather than silently
+        // restarting the walk.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume_at = crate::state::decode_cursor(token)
+                    .and_then(|store_key| store_keys.iter().position(|held| *held == store_key));
+                resume_at.ok_or_else(|| {
+                    ListIdentityStoresErrorModeled::ValidationException(crate::state::validation(
+                        "NextToken is not a cursor this service issued for this listing",
+                    ))
+                })?
+            }
+        };
+
+        // Both members of an `IdentityStore` are required, and the ARN is DERIVED from the
+        // id through the one builder every answer of this service builds a store ARN with,
+        // so a store's two identifiers cannot disagree.
+        let identity_stores: Vec<IdentityStore> = store_keys
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|store_key| IdentityStore {
+                identity_store_id: store_key.clone(),
+                identity_store_arn: crate::state::identity_store_arn(store_key),
+            })
+            .collect();
+        // A `NextToken` only when something is left: the store the next page starts at.
+        let next_token = store_keys
+            .get(start + identity_stores.len())
+            .map(|store_key| crate::state::encode_cursor(store_key));
+
+        Ok(ListIdentityStoresOutput {
+            identity_stores,
+            next_token,
+        })
     }
 }

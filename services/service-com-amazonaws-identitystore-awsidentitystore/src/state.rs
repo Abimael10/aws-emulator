@@ -944,6 +944,37 @@ impl ComAmazonawsIdentitystoreAwsidentitystoreState {
     pub fn store(&self, identifier: &str) -> Option<&IdentityStoreData> {
         self.stores.get(&identity_store_key(identifier)?)
     }
+
+    /// The store keys this emulator holds a RECORD for.
+    ///
+    /// What a reader of the identity stores themselves falls back to while IAM Identity
+    /// Center knows nothing about the account's enablement
+    /// ([`account_identity_store_keys`]): in that window the stores the emulator can
+    /// report are the ones it HOLDS — the store another service advertises
+    /// ([`SEED_IDENTITY_STORE_ID`]) plus every store a create has registered — rather than
+    /// the 10^12 ids the modelled pattern admits.
+    ///
+    /// A READ: it reports the keys the map holds at this instant and registers none.
+    pub fn recorded_store_keys(&self) -> Vec<String> {
+        self.stores.keys().cloned().collect()
+    }
+}
+
+/// `store_keys` as the stable order a paged read of identity stores walks them in, with
+/// each store named once.
+///
+/// The order is the key's own, ascending: an identity store carries no creation time in
+/// this emulator's state (this API creates none — see [`SEED_IDENTITY_STORE_ID`]), and the
+/// keys come out of a hash map on either side of
+/// [`ComAmazonawsIdentitystoreAwsidentitystoreState::recorded_store_keys`] /
+/// [`account_identity_store_keys`], so the identifier is what makes the sequence total and
+/// therefore a paginated walk of it repeatable. Two Identity Center instances cannot share
+/// an identity store, but the sequence is de-duplicated regardless so one store is one
+/// entry of one page.
+pub fn stores_in_listing_order(mut store_keys: Vec<String>) -> Vec<String> {
+    store_keys.sort();
+    store_keys.dedup();
+    store_keys
 }
 
 /// The modelled form of a stored list: `None` when it is empty.

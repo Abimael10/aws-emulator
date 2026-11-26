@@ -16,7 +16,12 @@
 //!   modelled `ResourceNotFoundException` naming `IDENTITY_STORE` — having created
 //!   nothing ([`an_identity_store_the_account_does_not_have_is_refused`]);
 //! * an identifier that names a store this emulator cannot serve at all (an ARN carrying
-//!   another account) is refused either way.
+//!   another account) is refused either way;
+//! * and the same set is what `ListIdentityStores` REPORTS, each store as its id and the
+//!   ARN derived from that id, paged by `MaxResults` with an opaque `NextToken`
+//!   ([`list_identity_stores_reports_every_store_this_emulator_holds`]) — so a store the
+//!   listing names is a store a request may be addressed to, and one it leaves out is one
+//!   that resolution refuses.
 //!
 //! A value the modelled `@length`/`@pattern` refuse is a `ValidationException`, never a
 //! not-found.
@@ -869,4 +874,397 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
         let case = format!("create in fresh store {index}");
         create_group(&router, &store, &format!("group-{index}"), &case).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The same set of identity stores, REPORTED: `ListIdentityStores`.
+// ---------------------------------------------------------------------------
+
+/// The published bounds of the modelled `MaxResults` range this listing carries (range
+/// 1..100, from `smithy_query(query="operation",operation="ListIdentityStores")`). The
+/// operation's member declares no `@default`, so an absent one asks for this service's
+/// default page size.
+const LIST_STORES_MAX_RESULTS_MIN: i64 = 1;
+const LIST_STORES_MAX_RESULTS_MAX: i64 = 100;
+
+/// An `IdentityStoreId` the suites below write nothing to until they say so: it must not be
+/// reported, which is what makes the listing a report of STATE rather than of the ids the
+/// modelled pattern admits.
+const UNWRITTEN_STORE: &str = "d-1111111111";
+
+/// One page of `ListIdentityStores`: the `(IdentityStoreId, IdentityStoreArn)` pairs it
+/// reported, in the order it reported them, and its `NextToken`.
+async fn identity_stores_page(
+    router: &MultiServiceRouter,
+    request: Value,
+    case: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let answer = ok(router, "ListIdentityStores", request, case).await;
+    let entries = answer["IdentityStores"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the required IdentityStores list, got {answer}")
+        });
+    let stores = entries
+        .iter()
+        .map(|entry| {
+            (
+                string(entry, "IdentityStoreId", case),
+                string(entry, "IdentityStoreArn", case),
+            )
+        })
+        .collect();
+    (stores, answer["NextToken"].as_str().map(str::to_string))
+}
+
+/// Every identity store the listing reports, walked to its end at `max_results` per page.
+///
+/// Each page is judged as it arrives — no page carries more entries than it was asked for,
+/// a `NextToken` only ever follows a FULL page, each entry's ARN is the one derived from
+/// its own id, and the walk terminates — so this helper is also what pins pagination
+/// itself.
+async fn walk_identity_stores(
+    router: &MultiServiceRouter,
+    max_results: Option<i64>,
+    case: &str,
+) -> Vec<String> {
+    let page_size = max_results.unwrap_or(LIST_STORES_MAX_RESULTS_MAX) as usize;
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    // A page reports at least one store, so a walk needs no more pages than this emulator
+    // records stores, plus one for the page that carries no cursor.
+    let page_budget = identitystore::state::MAX_IDENTITY_STORES + 1;
+    for page_number in 1..=page_budget {
+        let mut request = json!({});
+        if let Some(max_results) = max_results {
+            request["MaxResults"] = json!(max_results);
+        }
+        if let Some(token) = token.clone() {
+            request["NextToken"] = json!(token);
+        }
+        let row = format!("{case}, page {page_number}");
+        let (stores, next_token) = identity_stores_page(router, request, &row).await;
+        assert!(
+            stores.len() <= page_size,
+            "case {row:?}: expected at most {page_size} stores on a page, got {}",
+            stores.len()
+        );
+        for (identity_store_id, identity_store_arn) in &stores {
+            // The ARN is DERIVED from the id, so one store's two identifiers cannot
+            // disagree.
+            assert_eq!(
+                identity_store_arn,
+                &store_arn("aws", &account_id(), identity_store_id),
+                "case {row:?}: expected the ARN derived from {identity_store_id:?}, \
+                 got {identity_store_arn:?}"
+            );
+            collected.push(identity_store_id.clone());
+        }
+        match next_token {
+            None => return collected,
+            Some(next) => {
+                assert_eq!(
+                    stores.len(),
+                    page_size,
+                    "case {row:?}: expected a NextToken only after a full page of \
+                     {page_size}, got {} stores beside {next:?}",
+                    stores.len()
+                );
+                token = Some(next);
+            }
+        }
+    }
+    panic!(
+        "case {case:?}: the paged walk did not finish within {page_budget} pages: {collected:?}"
+    )
+}
+
+/// The listing reports the identity stores this emulator HOLDS — each under its own id,
+/// once, whatever form the caller addressed it in — and reports nothing it holds no record
+/// of.
+#[tokio::test]
+async fn list_identity_stores_reports_every_store_this_emulator_holds() {
+    let router = emulator();
+
+    // Before anything is written, the one store this emulator holds is the one another
+    // service advertises.
+    let (stores, next_token) = identity_stores_page(&router, json!({}), "a fresh emulator").await;
+    assert_eq!(
+        stores,
+        vec![(STORE.to_string(), store_arn("aws", &account_id(), STORE))],
+        "case \"a fresh emulator\": expected the advertised store alone"
+    );
+    assert_eq!(
+        next_token, None,
+        "case \"a fresh emulator\": expected no NextToken for a listing that fits one page"
+    );
+
+    // The table every suite here shares: each row writes to the store its identifier
+    // names, and the listing then reports that store under its own id — two rows that name
+    // ONE store (bare and by its ARN) are one entry, never two.
+    let mut expected: Vec<String> = vec![STORE.to_string()];
+    for (case, identity_store_id, reported_id) in served_rows() {
+        let display_name = format!("listed-group-for-{}", case.replace(' ', "-"));
+        create_group(&router, &identity_store_id, &display_name, case).await;
+        expected.push(reported_id.clone());
+        expected.sort();
+        expected.dedup();
+
+        let listed = walk_identity_stores(&router, None, case).await;
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected every store held so far, once each, in id order"
+        );
+        assert!(
+            !listed.contains(&UNWRITTEN_STORE.to_string()),
+            "case {case:?}: expected a store nothing has written to to be absent, \
+             got {listed:?}"
+        );
+    }
+
+    // A listing is a READ: repeating it answers the same stores, and it records none.
+    let again = walk_identity_stores(&router, None, "a repeated listing").await;
+    assert_eq!(
+        again, expected,
+        "case \"a repeated listing\": expected the same stores as before, got {again:?}"
+    );
+
+    // The store those listings did not report is still unrecorded rather than hidden: the
+    // first create addressed to it is what puts it in the listing.
+    let case = "a store the listings did not record";
+    create_group(&router, UNWRITTEN_STORE, "after the listings", case).await;
+    let listed = walk_identity_stores(&router, None, case).await;
+    assert!(
+        listed.contains(&UNWRITTEN_STORE.to_string()),
+        "case {case:?}: expected the store just written to to be reported, got {listed:?}"
+    );
+}
+
+/// Whatever the page size, the walk reports every store exactly once in one order: a page
+/// resumed with a `NextToken` continues where the previous page stopped.
+#[tokio::test]
+async fn list_identity_stores_pages_every_store_exactly_once() {
+    let router = emulator();
+
+    // Six stores beside the advertised one, so pages of 1, 2, 3 and 7 split the set
+    // differently.
+    let written = [
+        "d-0000000001",
+        "d-0000000002",
+        "d-00000000a3",
+        "d-00000000b4",
+        "d-00000000c5",
+        "d-00000000d6",
+    ];
+    for identity_store_id in written {
+        create_group(
+            &router,
+            identity_store_id,
+            &format!("group-in-{identity_store_id}"),
+            "pagination setup",
+        )
+        .await;
+    }
+    let mut expected: Vec<String> = written.iter().map(|id| (*id).to_string()).collect();
+    expected.push(STORE.to_string());
+    expected.sort();
+
+    // (case, MaxResults): absent, both published bounds of the modelled range, and sizes
+    // that split the set evenly and unevenly.
+    let rows: [(&str, Option<i64>); 6] = [
+        ("no MaxResults, the default page size", None),
+        (
+            "MaxResults at the published minimum",
+            Some(LIST_STORES_MAX_RESULTS_MIN),
+        ),
+        ("MaxResults of 2, an uneven split", Some(2)),
+        ("MaxResults of 3, an uneven split", Some(3)),
+        (
+            "MaxResults of exactly the number held",
+            Some(expected.len() as i64),
+        ),
+        (
+            "MaxResults at the published maximum",
+            Some(LIST_STORES_MAX_RESULTS_MAX),
+        ),
+    ];
+    for (case, max_results) in rows {
+        let listed = walk_identity_stores(&router, max_results, case).await;
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: expected every store once, in one order, got {listed:?}"
+        );
+    }
+}
+
+/// A page size outside the modelled range, and a `NextToken` this listing never issued,
+/// are refused with the modelled `ValidationException` — while a cursor it DID issue
+/// resumes the walk.
+#[tokio::test]
+async fn list_identity_stores_refuses_a_page_it_cannot_answer() {
+    let router = emulator();
+    let created = create_group(
+        &router,
+        "d-00000000e7",
+        "group-for-token-rows",
+        "refusal setup",
+    )
+    .await;
+    let group_id = string(&created, "GroupId", "refusal setup");
+
+    // The modelled range is 1..100: one past each published bound is refused…
+    for (case, max_results) in [
+        (
+            "MaxResults one below the published minimum",
+            LIST_STORES_MAX_RESULTS_MIN - 1,
+        ),
+        (
+            "MaxResults one above the published maximum",
+            LIST_STORES_MAX_RESULTS_MAX + 1,
+        ),
+    ] {
+        refused(
+            &router,
+            "ListIdentityStores",
+            json!({ "MaxResults": max_results }),
+            400,
+            "ValidationException",
+            case,
+        )
+        .await;
+    }
+    // … and both bounds themselves are served.
+    for (case, max_results) in [
+        (
+            "MaxResults at the published minimum",
+            LIST_STORES_MAX_RESULTS_MIN,
+        ),
+        (
+            "MaxResults at the published maximum",
+            LIST_STORES_MAX_RESULTS_MAX,
+        ),
+    ] {
+        let (stores, _) =
+            identity_stores_page(&router, json!({ "MaxResults": max_results }), case).await;
+        assert!(
+            !stores.is_empty(),
+            "case {case:?}: expected a served page to report at least one store"
+        );
+    }
+
+    // A cursor this listing issued resumes the walk at the store it names.
+    let (first, token) =
+        identity_stores_page(&router, json!({ "MaxResults": 1 }), "the first page").await;
+    let first = first
+        .first()
+        .expect("case \"the first page\": a page of one reports one store")
+        .0
+        .clone();
+    let token = token.expect("case \"the first page\": two stores are held, so a cursor follows");
+    let (second, _) = identity_stores_page(
+        &router,
+        json!({ "MaxResults": 1, "NextToken": token }),
+        "the resumed page",
+    )
+    .await;
+    let second = second
+        .first()
+        .expect("case \"the resumed page\": a page of one reports one store")
+        .0
+        .clone();
+    assert_ne!(
+        first, second,
+        "case \"the resumed page\": expected the page after {first:?} to start at another \
+         store"
+    );
+
+    // (case, a NextToken this listing never issued for this walk)
+    let rows: [(&str, String); 4] = [
+        (
+            "a cursor naming a store this emulator holds no record of",
+            hex::encode(UNWRITTEN_STORE.as_bytes()),
+        ),
+        (
+            "a cursor of another listing of this service",
+            hex::encode(group_id.as_bytes()),
+        ),
+        (
+            "a token this service never minted",
+            "not-a-cursor".to_string(),
+        ),
+        (
+            // Inside the modelled pattern and length, so only the handler can refuse it.
+            "a token of the right alphabet and nothing else",
+            "abcdef".to_string(),
+        ),
+    ];
+    for (case, next_token) in rows {
+        refused(
+            &router,
+            "ListIdentityStores",
+            json!({ "NextToken": next_token }),
+            400,
+            "ValidationException",
+            case,
+        )
+        .await;
+    }
+}
+
+/// Once Identity Center HAS answered, the listing is the set of its instances' identity
+/// stores: a store a caller addressed while that answer was still open is no longer
+/// reported.
+///
+/// The cross-service half — that the set FOLLOWS the instances that service holds, and that
+/// every store the listing reports is one the resolution admits, through the assembled
+/// router — is `core/router/tests/all/identitystore_identity_store_listing.rs`.
+#[tokio::test]
+async fn list_identity_stores_reports_the_stores_identity_center_answers() {
+    let router = emulator_with_identity_center();
+
+    // While nothing is decided, the store the caller's own environment names is served, so
+    // this emulator comes to hold a record of it — and reports it.
+    let caller_store = "d-00000000f8";
+    create_group(
+        &router,
+        caller_store,
+        "group-in-the-callers-store",
+        "an undecided account",
+    )
+    .await;
+    let listed = walk_identity_stores(&router, None, "an undecided account").await;
+    assert!(
+        listed.contains(&caller_store.to_string()),
+        "case \"an undecided account\": expected the store just written to, got {listed:?}"
+    );
+
+    // Identity Center's own listing of its instances is where a client reads the identity
+    // store it has; asking also settles the account's enablement.
+    let instances = identity_center_call(&router, "ListInstances", json!({})).await;
+    let mut account_stores: Vec<String> = instances["Instances"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|instance| instance["IdentityStoreId"].as_str().map(str::to_string))
+        .collect();
+    account_stores.sort();
+    assert!(
+        !account_stores.is_empty(),
+        "case \"a decided account\": expected Identity Center to report an instance, \
+         got {instances}"
+    );
+
+    let listed = walk_identity_stores(&router, None, "a decided account").await;
+    assert_eq!(
+        listed, account_stores,
+        "case \"a decided account\": expected the stores of the account's instances, \
+         got {listed:?}"
+    );
+    assert!(
+        !listed.contains(&caller_store.to_string()),
+        "case \"a decided account\": expected a store the account does not have to be \
+         absent, got {listed:?}"
+    );
 }
