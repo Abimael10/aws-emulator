@@ -117,6 +117,93 @@ pub struct NodegroupCapacitySpec<'a> {
     /// remote access, which is also when no remote-access security group is
     /// created.
     pub ec2_ssh_key: Option<&'a str>,
+    /// The node group's effective `amiType`, which decides the image its nodes
+    /// boot ([`nodegroup_image_id`]).
+    pub ami_type: &'a str,
+}
+
+/// The processor architecture, as Amazon EC2 names it, that nodes of a node group
+/// with `ami_type` run.
+///
+/// Every published AMI type carries its architecture in its own name
+/// (`smithy_query(query="shape",shape="AMITypes")`): one naming `ARM` runs 64-bit
+/// Arm nodes, every other one runs 64-bit x86.
+fn nodegroup_architecture(ami_type: &str) -> &'static str {
+    if ami_type.contains("ARM") {
+        "arm64"
+    } else {
+        "x86_64"
+    }
+}
+
+/// The owner alias Amazon's own published images carry, which is how a client asks
+/// for the images AWS publishes rather than its own ("The images available to you
+/// include public images", `DescribeImages`).
+const AMAZON_IMAGE_OWNER_ALIAS: &str = "amazon";
+
+/// The `DescribeImages` filters this service asks the image catalog with.
+const IMAGE_OWNER_ALIAS_FILTER: &str = "owner-alias";
+const IMAGE_ARCHITECTURE_FILTER: &str = "architecture";
+const IMAGE_STATE_FILTER: &str = "state";
+
+/// The image state an instance can be launched from.
+const IMAGE_STATE_AVAILABLE: &str = "available";
+
+/// The image the nodes of a node group with `ami_type` boot, as the service that
+/// OWNS images reports it — or `None` when Amazon EC2 reported no image the node
+/// group's nodes could run.
+///
+/// A managed node group's launch template states the AMI its nodes boot: it is why
+/// a node group reports a `releaseVersion` at all ("the AMI version of the Amazon
+/// EKS optimized AMI to use with your node group",
+/// `CreateNodegroupRequest$releaseVersion`) and why updating a node group's version
+/// replaces that AMI. An Auto Scaling group is configured against the launch
+/// parameters of the version it launches from, so a template stating no image backs
+/// no node group at all.
+///
+/// The id is therefore TAKEN from Amazon EC2's own catalog rather than written here:
+/// the newest build Amazon publishes for the architecture the node group's AMI type
+/// names, which is the choice a client resolving an AMI by publisher makes
+/// ("`creation_date` — the date and time the image was created", `DescribeImages`).
+async fn nodegroup_image_id(
+    ec2: &::aws_sdk_ec2::Client,
+    nodegroup_name: &str,
+    ami_type: &str,
+) -> Option<String> {
+    let filter = |name: &str, value: &str| {
+        ::aws_sdk_ec2::types::Filter::builder()
+            .name(name)
+            .values(value)
+            .build()
+    };
+    let described = ec2
+        .describe_images()
+        .filters(filter(
+            IMAGE_OWNER_ALIAS_FILTER,
+            AMAZON_IMAGE_OWNER_ALIAS,
+        ))
+        .filters(filter(
+            IMAGE_ARCHITECTURE_FILTER,
+            nodegroup_architecture(ami_type),
+        ))
+        .filters(filter(IMAGE_STATE_FILTER, IMAGE_STATE_AVAILABLE))
+        .send()
+        .await;
+    match described {
+        Ok(output) => output
+            .images()
+            .iter()
+            .max_by_key(|image| image.creation_date().unwrap_or_default())
+            .and_then(|image| image.image_id().map(str::to_string)),
+        Err(error) => {
+            ::tracing::warn!(
+                nodegroup = %nodegroup_name,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the image the node group's nodes run could not be resolved in EC2"
+            );
+            None
+        }
+    }
 }
 
 /// The tag Amazon EKS stamps on the capacity of a node group, naming the cluster
@@ -200,10 +287,23 @@ pub async fn provision_nodegroup_capacity(
         }
     }
 
-    // The launch template the group launches its nodes from: the instance type and
-    // the key pair the node group was created with, and the remote-access group
-    // when there is one.
+    // The launch template the group launches its nodes from: the image those nodes
+    // boot, the instance type and the key pair the node group was created with, and
+    // the remote-access group when there is one.
     let mut data = ::aws_sdk_ec2::types::RequestLaunchTemplateData::builder();
+    match nodegroup_image_id(&ec2, spec.nodegroup_name, spec.ami_type).await {
+        Some(image_id) => data = data.image_id(image_id),
+        // A template that states no image backs no Auto Scaling group — Amazon EC2
+        // Auto Scaling reads the launch parameters when the group is configured — so
+        // the node group gets no capacity at all, and the reason says so here rather
+        // than only through the refusal that follows.
+        None => ::tracing::warn!(
+            nodegroup = %spec.nodegroup_name,
+            ami_type = %spec.ami_type,
+            "EC2 reported no image for the node group's nodes, so its launch template \
+             states none and no Auto Scaling group is created for it"
+        ),
+    }
     if let Some(instance_type) = spec.instance_type {
         data = data.instance_type(::aws_sdk_ec2::types::InstanceType::from(instance_type));
     }

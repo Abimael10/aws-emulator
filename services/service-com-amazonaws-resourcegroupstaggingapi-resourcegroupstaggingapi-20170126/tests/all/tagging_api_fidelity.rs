@@ -55,6 +55,10 @@ const CAPACITY_LAUNCH_TEMPLATE: &str = "tagging-capacity";
 
 /// Put that launch template in the account's own Amazon EC2 store, through Amazon EC2's own
 /// writer.
+///
+/// It states the image its instances run, because a group is refused a launch-template version
+/// no instance could be launched from: "An AMI ID is required to launch an instance"
+/// (`smithy_query(query="doc",shape="RunInstancesRequest",member="ImageId")`).
 fn seed_capacity_launch_template(engine: &Arc<engine::InMemoryEngine>) {
     let ec2 = service_com_amazonaws_ec2_amazonec2::state::service_state(&**engine)
         .expect("the shared engine carries the Amazon EC2 store");
@@ -66,12 +70,19 @@ fn seed_capacity_launch_template(engine: &Arc<engine::InMemoryEngine>) {
             create_time: SystemTime::now(),
             tags: Vec::new(),
             operator: None,
+            data: service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData {
+                image_id: Some(CAPACITY_IMAGE_ID.to_string()),
+                ..Default::default()
+            },
             version_description: None,
-            data: service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData::default(
-            ),
         },
     );
 }
+
+/// The image the instances of that group would run, in the printed form Amazon EC2 issues an
+/// AMI id in: the group this suite creates holds no instance, so what matters is that its
+/// template states an image at all.
+const CAPACITY_IMAGE_ID: &str = "ami-0123456789abcdef0";
 
 /// A router carrying the tagging API and the owning services it resolves ARNs
 /// against, all over ONE engine — exactly the arrangement `core/router` builds.

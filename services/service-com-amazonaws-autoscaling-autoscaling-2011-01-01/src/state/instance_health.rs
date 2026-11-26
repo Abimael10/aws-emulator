@@ -34,10 +34,13 @@
 //! (`smithy_query(query="doc",shape="SetInstanceHealthQuery",member="ShouldRespectGracePeriod")`).
 //!
 //! The grace period is the wait a group gives an instance it has just brought into service
-//! before a failed health check replaces it, so a call that respects it records the status
-//! at once and leaves the replacement owed from the END of that period; one that does not
-//! leaves it owed from the call. Either way the status itself is recorded: the grace period
-//! is about when the group ACTS on a failed check, not about whether the check was made.
+//! before a failed health check replaces it, so a call that respects it cannot condemn an
+//! instance the period still covers: an `Unhealthy` status for an instance younger than its
+//! group's `HealthCheckGracePeriod` is REFUSED while the call respects the period
+//! ([`HealthRefusal::InsideGracePeriod`]) and nothing is written — the instance keeps running
+//! and is not replaced. A call that does not respect the period, and one for an instance
+//! already past it, records the status, and the replacement it leaves owed falls due
+//! [`UNHEALTHY_INSTANCE_REPLACEMENT`] from the call.
 //!
 //! An instance parked in `Standby` is left in place while it is parked — it is out of
 //! service already, and the group performs no health check on an instance it has parked —
@@ -126,6 +129,21 @@ pub fn absent_instance_message(instance_id: &str) -> String {
     format!("{}Instance {instance_id} not found", super::ABSENT_INSTANCE_PREFIX)
 }
 
+/// The message a call that respects the grace period is refused with for recording
+/// `Unhealthy` against an instance the period still covers.
+///
+/// It weighs the two spans against each other: how long the instance has been there, measured
+/// by the service against its own clock, and the period the GROUP is configured with. The
+/// fixed text is the service's own sentence for that class; the two numbers are the only
+/// variable parts, and both come from state rather than from the request.
+#[must_use]
+pub fn inside_grace_period_message(age_seconds: u64, grace_period: i32) -> String {
+    format!(
+        "The age of the instance ({age_seconds} seconds) is less than the configured grace \
+         period of {grace_period} seconds"
+    )
+}
+
 /// Why a health status could not be recorded, for the operation to state the refusal each
 /// situation belongs to.
 #[derive(Debug)]
@@ -135,6 +153,9 @@ pub enum HealthRefusal {
     /// No Auto Scaling group of the account holds the instance the request named; carries
     /// that instance id.
     ManagedByNoGroup(String),
+    /// The call respects the group's grace period and the instance it named is still inside
+    /// it; carries the instance's age in seconds and the group's configured period.
+    InsideGracePeriod { age_seconds: u64, grace_period: i32 },
 }
 
 impl HealthRefusal {
@@ -145,6 +166,10 @@ impl HealthRefusal {
         match self {
             Self::UnknownStatus => health_status_violation_message(),
             Self::ManagedByNoGroup(instance_id) => absent_instance_message(instance_id),
+            Self::InsideGracePeriod {
+                age_seconds,
+                grace_period,
+            } => inside_grace_period_message(*age_seconds, *grace_period),
         }
     }
 }
@@ -155,13 +180,13 @@ impl AutoScalingState {
     ///
     /// An unhealthy status leaves the group owing the instance's replacement, at the
     /// instant the group's health check acts on it: [`UNHEALTHY_INSTANCE_REPLACEMENT`] from
-    /// now, and no earlier than the end of the group's own `HealthCheckGracePeriod` when
-    /// the call respects that period (see the module docs). A healthy status takes that
-    /// debt back off, which is how an instance recorded unhealthy is returned to service
-    /// before the check has acted on it.
+    /// now. A healthy status takes that debt back off, which is how an instance recorded
+    /// unhealthy is returned to service before the check has acted on it.
     ///
     /// Writes nothing when the request cannot be satisfied: a status outside the admissible
-    /// set, or an instance no group of the account manages.
+    /// set, an instance no group of the account manages, or an unhealthy status recorded by a
+    /// call that respects the group's grace period against an instance that period still
+    /// covers (see the module docs).
     pub fn set_instance_health(
         &mut self,
         instance_id: &str,
@@ -196,13 +221,23 @@ impl AutoScalingState {
         else {
             return Err(HealthRefusal::ManagedByNoGroup(instance_id.to_string()));
         };
-        instance.health_status = health_status.to_string();
-        instance.health_check_due = (health_status == HEALTH_STATUS_UNHEALTHY).then(|| {
-            HealthCheckDebt {
-                due: unhealthy_check_due(instance, grace_period, respect_grace_period, now),
-                reason: USER_HEALTH_CHECK_REASON,
+        // A call that respects the period cannot condemn an instance the period still
+        // covers: the status is refused rather than recorded, so the instance keeps running
+        // and the group replaces nothing.
+        if health_status == HEALTH_STATUS_UNHEALTHY && respect_grace_period {
+            if let Some(age_seconds) = age_inside_grace_period(instance, grace_period, now) {
+                return Err(HealthRefusal::InsideGracePeriod {
+                    age_seconds,
+                    grace_period,
+                });
             }
-        });
+        }
+        instance.health_status = health_status.to_string();
+        instance.health_check_due =
+            (health_status == HEALTH_STATUS_UNHEALTHY).then(|| HealthCheckDebt {
+                due: now + UNHEALTHY_INSTANCE_REPLACEMENT,
+                reason: USER_HEALTH_CHECK_REASON,
+            });
         Ok(group_name)
     }
 
@@ -276,28 +311,22 @@ impl AutoScalingState {
     }
 }
 
-/// When the group's health check acts on `instance`, which a failed check has just recorded
-/// unhealthy.
+/// How long `instance` has been there, in whole seconds, when the group's grace period still
+/// covers it at `now` — and `None` when the period has elapsed for it.
 ///
-/// [`UNHEALTHY_INSTANCE_REPLACEMENT`] from the call, and no earlier than the end of the
-/// group's grace period for this instance when the call respects that period: the period
-/// runs from the instant the instance came into service, so an instance that has been in
-/// service longer than it is outside the period altogether and is acted on as soon as any
-/// other. A grace period of no seconds — or of none at all — ends the moment the instance
-/// came into service, so it holds nothing off.
-fn unhealthy_check_due(
+/// The period runs from the instant the instance came up, so an instance that has been there
+/// longer than the period is outside it altogether. A grace period of no seconds — or of none
+/// at all — ends the moment the instance came up and so covers nothing.
+fn age_inside_grace_period(
     instance: &StoredInstance,
     grace_period: i32,
-    respect_grace_period: bool,
     now: SystemTime,
-) -> SystemTime {
-    let acts_at = now + UNHEALTHY_INSTANCE_REPLACEMENT;
-    if !respect_grace_period {
-        return acts_at;
-    }
-    let grace_ends = instance.launched_at
-        + Duration::from_secs(u64::try_from(grace_period).unwrap_or_default());
-    acts_at.max(grace_ends)
+) -> Option<u64> {
+    let grace = Duration::from_secs(u64::try_from(grace_period).unwrap_or_default());
+    let age = now
+        .duration_since(instance.launched_at)
+        .unwrap_or(Duration::ZERO);
+    (age < grace).then_some(age.as_secs())
 }
 
 /// Whether the group's health check acts on `instance` at `now`: a check has recorded it

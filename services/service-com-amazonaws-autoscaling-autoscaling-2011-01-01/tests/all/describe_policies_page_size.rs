@@ -14,8 +14,11 @@
 //!
 //! The tables span what the rule generalises over — the page size: a read naming none,
 //! each published bound (1 and 100) and one past each of them (0 and 101) — rather than
-//! the single page size any one caller happens to ask for. The group holds one more
-//! policy than the default page size, which is what makes the default observable.
+//! the single page size any one caller happens to ask for. The ACCOUNT holds one more
+//! policy than the default page size, which is what makes the default observable; they are
+//! spread over two groups because one group holds at most the 50 its own quota allows, and
+//! the reads are therefore account-wide — "If you omit this property, all policies are
+//! described" (`DescribePoliciesType$AutoScalingGroupName`).
 
 use std::sync::Arc;
 
@@ -25,14 +28,20 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 
 use crate::support::{borrowed, new_engine, p, query, tag_value, tag_values, xml_unescape};
 
-/// The group every policy in this suite belongs to.
-const GROUP: &str = "asg-paged";
+/// The groups the policies of this suite belong to, named so the account-wide read reports
+/// the first group's policies before the second's.
+const GROUP: &str = "asg-paged-a";
+const SECOND_GROUP: &str = "asg-paged-b";
+
+/// How many policies ONE group may hold: the published quota "Scaling policies per Auto
+/// Scaling group", whose value is 50 — so the policy past it belongs to [`SECOND_GROUP`].
+const POLICIES_PER_GROUP: usize = 50;
 
 /// The launch source the group is created from — a launch TEMPLATE, because no account can
 /// create a launch configuration (see `launch_configurations_are_unavailable.rs`).
 const LAUNCH_SOURCE: (&str, &str) = ("LaunchTemplate.LaunchTemplateName", "lt-1");
 
-/// How many policies the group holds: ONE MORE than the documented default page size of
+/// How many policies the ACCOUNT holds: ONE MORE than the documented default page size of
 /// 50, so a read that names no `MaxRecords` has a policy left over for a second page.
 const POLICY_COUNT: usize = 51;
 
@@ -75,13 +84,13 @@ fn policy_name(index: usize) -> String {
     format!("policy-{index:02}")
 }
 
-/// POST one `DescribePolicies` for [`GROUP`] and answer its status and body.
+/// POST one account-wide `DescribePolicies` and answer its status and body.
 async fn describe(
     router: &MultiServiceRouter,
     max_records: Option<i32>,
     next_token: Option<&str>,
 ) -> (u16, String) {
-    let mut params = vec![p("AutoScalingGroupName", GROUP)];
+    let mut params: Vec<(String, String)> = Vec::new();
     if let Some(max_records) = max_records {
         params.push(p("MaxRecords", max_records.to_string()));
     }
@@ -91,35 +100,45 @@ async fn describe(
     query(router, "DescribePolicies", &borrowed(&params)).await
 }
 
-/// A router holding [`GROUP`] with [`POLICY_COUNT`] simple-scaling policies, plus the
-/// names those policies carry in the order a read reports them.
+/// A router holding [`POLICY_COUNT`] simple-scaling policies over two groups of one
+/// account — [`POLICIES_PER_GROUP`] on the first and the rest on the second — plus the
+/// names those policies carry in the order an account-wide read reports them.
 async fn seeded() -> (MultiServiceRouter, Vec<String>) {
     let router = router();
-    let (status, body) = query(
-        &router,
-        "CreateAutoScalingGroup",
-        &[
-            ("AutoScalingGroupName", GROUP),
-            LAUNCH_SOURCE,
-            ("MinSize", "0"),
-            ("MaxSize", "4"),
-            ("DesiredCapacity", "0"),
-            ("AvailabilityZones.member.1", "us-west-2a"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "the group {GROUP:?} must be created, got {status} with {body:?}"
-    );
+    for group in [GROUP, SECOND_GROUP] {
+        let (status, body) = query(
+            &router,
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", group),
+                LAUNCH_SOURCE,
+                ("MinSize", "0"),
+                ("MaxSize", "4"),
+                ("DesiredCapacity", "0"),
+                ("AvailabilityZones.member.1", "us-west-2a"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the group {group:?} must be created, got {status} with {body:?}"
+        );
+    }
 
     let names: Vec<String> = (0..POLICY_COUNT).map(policy_name).collect();
-    for name in &names {
+    for (index, name) in names.iter().enumerate() {
+        // A group holds at most the policies its own quota allows, so the ones past that
+        // belong to the account's second group.
+        let group = if index < POLICIES_PER_GROUP {
+            GROUP
+        } else {
+            SECOND_GROUP
+        };
         let (status, body) = query(
             &router,
             "PutScalingPolicy",
             &[
-                ("AutoScalingGroupName", GROUP),
+                ("AutoScalingGroupName", group),
                 ("PolicyName", name.as_str()),
                 ("PolicyType", "SimpleScaling"),
                 ("AdjustmentType", "ChangeInCapacity"),
@@ -129,7 +148,7 @@ async fn seeded() -> (MultiServiceRouter, Vec<String>) {
         .await;
         assert_eq!(
             status, 200,
-            "the put of {name:?} must succeed, got {status} with {body:?}"
+            "the put of {name:?} on {group:?} must succeed, got {status} with {body:?}"
         );
     }
     (router, names)
@@ -301,7 +320,7 @@ async fn a_page_size_outside_the_documented_range_is_refused_and_changes_nothing
     );
 }
 
-/// The page walk reaches every policy of the group exactly once, whatever page size it
+/// The page walk reaches every policy of the account exactly once, whatever page size it
 /// walks with — including the default no request named.
 #[tokio::test]
 async fn the_page_walk_reaches_every_policy_exactly_once() {
@@ -312,7 +331,7 @@ async fn the_page_walk_reaches_every_policy_exactly_once() {
         let limit = max_records.map_or(DEFAULT_PAGE, |value| value as usize);
         let mut walked: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
-        // A walk of a group holding POLICY_COUNT policies takes at most that many pages,
+        // A walk of an account holding POLICY_COUNT policies takes at most that many pages,
         // so a walk that has not ended by then is not converging.
         for _ in 0..=POLICY_COUNT {
             let (status, body) = describe(&router, max_records, token.as_deref()).await;
@@ -340,7 +359,7 @@ async fn the_page_walk_reaches_every_policy_exactly_once() {
         );
         assert_eq!(
             walked, names,
-            "case {case:?}: the walk must reach every policy of the group exactly once"
+            "case {case:?}: the walk must reach every policy of the account exactly once"
         );
     }
 }

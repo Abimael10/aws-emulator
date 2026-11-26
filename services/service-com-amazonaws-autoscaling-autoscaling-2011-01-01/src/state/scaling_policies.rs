@@ -367,6 +367,44 @@ pub const ALARMS_PER_TARGET_TRACKING_POLICY: usize = 2;
 pub const MAX_SCALING_POLICIES: usize =
     cloudwatch::state::MAX_ALARMS / ALARMS_PER_TARGET_TRACKING_POLICY;
 
+/// The most scaling policies ONE Auto Scaling group holds: the published Amazon EC2 Auto
+/// Scaling quota "Scaling policies per Auto Scaling group", whose value is 50.
+///
+/// A quota of the SERVICE, not a capacity of this store ([`MAX_SCALING_POLICIES`]), and
+/// counted per group — the resource the quota is stated per — so a group at the ceiling
+/// refuses a further policy while every other group of the account still takes 50 of its own.
+/// Checked only when a policy is CREATED: putting a policy the group already holds updates
+/// that policy and adds nothing to its set, so it still succeeds at the ceiling, and freeing
+/// a slot lets the same create succeed.
+pub const MAX_POLICIES_PER_GROUP: usize = 50;
+
+/// The sentence a put that would take a group past that quota is refused with.
+///
+/// Fixed text stating the quota it broke, with nothing of the request in it: neither the group
+/// nor the policy the caller named, exactly as the service's other quota refusals state the
+/// bound alone ([`too_many_step_adjustments_message`]).
+#[must_use]
+pub fn policy_limit_reached_message() -> String {
+    format!("The maximum limit of {MAX_POLICIES_PER_GROUP} policies has been reached.")
+}
+
+/// How many scaling policies the group `group_name` holds, counted over the one map every
+/// policy of the account lives in.
+///
+/// The count the per-group quota is weighed against ([`MAX_POLICIES_PER_GROUP`]), and the one
+/// `DescribePolicies` reports for the same group: a policy belongs to ONE group, so the
+/// group's set is the entries of that map whose key names it.
+#[must_use]
+pub fn policies_held_by_group(
+    policies: &BTreeMap<PolicyKey, StoredScalingPolicy>,
+    group_name: &str,
+) -> usize {
+    policies
+        .keys()
+        .filter(|key| key.auto_scaling_group_name == group_name)
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // The refusals a put answers
 // ---------------------------------------------------------------------------

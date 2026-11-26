@@ -27,8 +27,9 @@
 //!    specified for the group, by default, this call respects the grace period. Set this to
 //!    `False`, to have the call not respect the grace period associated with the group"
 //!    (`smithy_query(query="doc",shape="SetInstanceHealthQuery",member="ShouldRespectGracePeriod")`):
-//!    while a respected grace period has not elapsed the member stays in service with the
-//!    status recorded on it, and a call that does not respect it has the member replaced.
+//!    a call that respects a period the instance is still inside cannot condemn it, so it is
+//!    REFUSED and nothing is written, while the same call with the flag off is served and the
+//!    member is replaced.
 //! 4. Recording `Healthy` again takes the replacement back off: the member the call returned
 //!    to service is still the group's member afterwards.
 //! 5. A request that cannot be satisfied — a status outside the two the member documents, or
@@ -83,9 +84,18 @@ fn instance_read_health_token(held: &str) -> String {
 const IMAGE_ID: &str = "ami-00000000000000071";
 const INSTANCE_TYPE: &str = "t3.micro";
 
-/// A `HealthCheckGracePeriod` long enough that nothing in a test here outlives it, so a
-/// respected grace period holds the health check off for the whole of a case.
+/// A `HealthCheckGracePeriod` long enough that nothing in a test here outlives it, so an
+/// instance of such a group is inside its grace period for the whole of a case.
 const HOLDING_GRACE_PERIOD: i32 = 600;
+
+/// The group process that performs the replacement an unhealthy member is owed, from the
+/// catalog `SuspendProcesses` publishes
+/// (`smithy_query(query="doc",shape="ScalingProcessQuery",member="ScalingProcesses")`).
+///
+/// Suspended, the verdict a call records stands and the group acts on none of it, which is how
+/// a case that is about the STATUS a read reports holds the member still without racing the
+/// replacement.
+const REPLACE_UNHEALTHY: &str = "ReplaceUnhealthy";
 
 /// The sentence the service records as the reason a member went out of service because a
 /// health check of the CALLER's own found it unhealthy, and the sentence it records as the
@@ -302,6 +312,25 @@ fn held_off_window() -> Duration {
     autoscaling::state::UNHEALTHY_INSTANCE_REPLACEMENT * 2
 }
 
+/// Suspend the group's own `ReplaceUnhealthy` process, so a status a case records stands and
+/// the group acts on it at no instant at all.
+async fn suspend_replace_unhealthy(router: &MultiServiceRouter, case: &str, name: &str) {
+    let (status, body) = query(
+        router,
+        "SuspendProcesses",
+        &[
+            ("AutoScalingGroupName", name),
+            ("ScalingProcesses.member.1", REPLACE_UNHEALTHY),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: SuspendProcesses {REPLACE_UNHEALTHY} for {name} expected 200, got \
+         {status}: {body}"
+    );
+}
+
 /// Look again until the group holds `wanted` instances, every one in service, and `gone` is
 /// no longer one of them; answer the ids it then holds.
 async fn instances_after_replacement(
@@ -394,12 +423,14 @@ async fn the_recorded_health_status_is_what_every_read_reports() {
 
     for (index, row) in rows.iter().enumerate() {
         // One emulator per row: each row is its own account, so the ids of one row never
-        // explain another's. Every group here carries a grace period no case outlives, so
-        // the status a row records stands while the row reads it back.
+        // explain another's. The group states no grace period, so every status a row records
+        // is one the call accepts, and its own `ReplaceUnhealthy` is suspended, so the status
+        // recorded stands while the row reads it back.
         let (router, engine) = emulator();
         let name = format!("asg-health-{index}");
-        let held = group_holding(&router, &engine, &name, 1, Some(HOLDING_GRACE_PERIOD)).await;
+        let held = group_holding(&router, &engine, &name, 1, None).await;
         let instance_id = held[0].clone();
+        suspend_replace_unhealthy(&router, row.case, &name).await;
 
         for health_status in row.recorded {
             record_health(&router, row.case, &instance_id, health_status, row.respect).await;
@@ -454,10 +485,10 @@ async fn an_instance_recorded_unhealthy_is_taken_out_of_service_and_replaced() {
             respect: None,
         },
         ReplacementRow {
-            case: "a group of two whose grace period the member is already past",
+            case: "a group of two whose period of no seconds the call respects",
             capacity: 2,
-            grace_period: Some(1),
-            respect: None,
+            grace_period: Some(0),
+            respect: Some(true),
         },
         ReplacementRow {
             case: "a group of two with a long grace period the call does not respect",
@@ -553,10 +584,11 @@ async fn an_instance_recorded_unhealthy_is_taken_out_of_service_and_replaced() {
     }
 }
 
-/// A respected grace period holds the health check off: the member stays in service with the
-/// status recorded on it for as long as the period has not elapsed.
+/// A respected grace period refuses the verdict: an `Unhealthy` status for an instance the
+/// period still covers is refused with HTTP 400 `ValidationError`, nothing is written, and the
+/// member goes on running.
 #[tokio::test]
-async fn a_respected_grace_period_holds_the_health_check_off() {
+async fn a_respected_grace_period_refuses_the_unhealthy_status() {
     // The rows differ in HOW the request respects the period: by saying so, and by saying
     // nothing at all — which the member documents as the same thing.
     let rows = [
@@ -570,22 +602,32 @@ async fn a_respected_grace_period_holds_the_health_check_off() {
         let held = group_holding(&router, &engine, &name, 1, Some(HOLDING_GRACE_PERIOD)).await;
         let instance_id = held[0].clone();
 
-        record_health(&router, case, &instance_id, UNHEALTHY, *respect).await;
+        let (status, body) =
+            set_instance_health(&router, &instance_id, UNHEALTHY, *respect).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: SetInstanceHealth inside the grace period expected 400, got \
+             {status}: {body}"
+        );
+        assert_eq!(
+            tag_value(&body, "Code"),
+            "ValidationError",
+            "case {case:?}: the refusal carries this service's own error code, got {body}"
+        );
 
         // Looked at AGAIN and again, over a window several times the span the check takes
-        // once it is owed: the period has not elapsed, so every look must find the member
-        // where it was.
+        // once it is owed: the call wrote nothing, so every look must find the member in
+        // service and healthy.
         let until = Instant::now() + held_off_window();
         loop {
             let reported = reported_member(&router, case, &name, &instance_id).await;
             assert_eq!(
                 reported.lifecycle_state, IN_SERVICE,
-                "case {case:?}: a respected grace period leaves the member in service, got \
-                 {reported:?}"
+                "case {case:?}: a refused request moves no member, got {reported:?}"
             );
             assert_eq!(
-                reported.health_status, UNHEALTHY,
-                "case {case:?}: the status recorded on it stands, got {reported:?}"
+                reported.health_status, HEALTHY,
+                "case {case:?}: a refused request records no status, got {reported:?}"
             );
             if Instant::now() >= until {
                 break;

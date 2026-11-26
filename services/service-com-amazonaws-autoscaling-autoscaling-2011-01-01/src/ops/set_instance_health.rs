@@ -6,7 +6,8 @@
 //! becomes the `HealthStatus` the group holding that instance reports for it, and an
 //! instance recorded unhealthy is taken out of service and replaced by the group's own
 //! health check as the clock makes it due ([`crate::state::instance_health`], which holds
-//! the rule and the grace period this call respects).
+//! the rule and the grace period this call respects — a call that respects the period
+//! records no unhealthy status for an instance the period still covers).
 //!
 //! The request names no group, so the instance is resolved against the group that HOLDS
 //! it: an id no group of the account manages is refused and nothing is written.
@@ -199,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 Ok(SetInstanceHealthOutput)
             }
-            // Neither situation is one this operation models an error for, so both are
+            // None of these situations is one this operation models an error for, so each is
             // refused the way this service refuses a request it cannot satisfy: HTTP 400
             // `ValidationError`, carrying the sentence the refusal's own class states.
             Err(refusal) => Err(crate::scaffolded::Scaffolded::validation_error(

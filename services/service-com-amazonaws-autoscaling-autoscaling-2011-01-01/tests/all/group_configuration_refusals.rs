@@ -512,7 +512,7 @@ fn mint_another_version(engine: &Arc<engine::InMemoryEngine>, name: &str) -> i64
                 created_by: engine::emulator_arn("iam", "", "root"),
                 create_time: std::time::SystemTime::now(),
                 version_description: None,
-                data: service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData::default(),
+                data: crate::support::seeded_launch_template_data(),
             },
         )
         .expect("the account must be able to hold a second version of this launch template")

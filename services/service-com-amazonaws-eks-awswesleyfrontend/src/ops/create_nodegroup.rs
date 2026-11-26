@@ -790,6 +790,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DEFAULT_AMI_TYPE.to_string()
             }
         });
+        // The AMI type decides the image the node group's nodes boot, which the launch
+        // template the capacity is created from states
+        // ([`state::NodegroupCapacitySpec::ami_type`]); the stored record takes the
+        // value itself, so the capacity call keeps its own copy.
+        let ami_type_of_the_capacity = ami_type.clone();
 
         // `diskSize`, `instanceTypes` and `remoteAccess` are each reported as
         // `null` for a node group deployed with a launch template, because the
@@ -935,6 +940,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 desired_size,
                 instance_type: launch_instance_type.as_deref(),
                 ec2_ssh_key: ec2_ssh_key.as_deref(),
+                ami_type: ami_type_of_the_capacity.as_str(),
             },
         )
         .await;

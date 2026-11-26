@@ -60,10 +60,13 @@ const TEMPLATE: &str = "lt-instance-read-tokens";
 /// The `LifecycleState` of a member that is in service.
 const IN_SERVICE: &str = "InService";
 
-/// A `HealthCheckGracePeriod` long enough that nothing here outlives it, so the replacement a
-/// recorded `Unhealthy` leaves owed is held off for the whole of a case and the member stays
-/// readable in the state the call wrote.
-const HOLDING_GRACE_PERIOD: &str = "600";
+/// The group process that performs the replacement an unhealthy member is owed, from the
+/// catalog `SuspendProcesses` publishes
+/// (`smithy_query(query="doc",shape="ScalingProcessQuery",member="ScalingProcesses")`).
+///
+/// The group of this suite has it suspended, so a state a case records for the member stands
+/// and both surfaces go on reporting the one instance the case is about.
+const REPLACE_UNHEALTHY: &str = "ReplaceUnhealthy";
 
 /// One state a group can hold for a member: the value a caller records it with, the token the
 /// GROUP's own per-instance projection publishes, and the token the ACCOUNT-level instance
@@ -114,7 +117,6 @@ async fn fixture(case: &str) -> Fixture {
         p("MaxSize", "1"),
         p("DesiredCapacity", "1"),
         p("AvailabilityZones.member.1", zone),
-        p("HealthCheckGracePeriod", HOLDING_GRACE_PERIOD),
     ];
     let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
     assert_eq!(
@@ -122,6 +124,22 @@ async fn fixture(case: &str) -> Fixture {
         "case {case:?}: creating {group} expected HTTP 200, got {status} with {body:?}"
     );
     let instance_id = settled_instance(&router, case, &group).await;
+    // The group acts on no verdict of its own while this is suspended, so a state a case
+    // records for the member is one both surfaces go on reporting.
+    let (status, body) = query(
+        &router,
+        "SuspendProcesses",
+        &[
+            ("AutoScalingGroupName", group.as_str()),
+            ("ScalingProcesses.member.1", REPLACE_UNHEALTHY),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: suspending {REPLACE_UNHEALTHY} on {group} expected HTTP 200, got \
+         {status} with {body:?}"
+    );
     Fixture {
         router,
         group,

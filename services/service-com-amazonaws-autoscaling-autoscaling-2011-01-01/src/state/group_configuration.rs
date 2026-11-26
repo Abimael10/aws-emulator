@@ -292,6 +292,17 @@ const PUBLIC_ADDRESS_WITH_MULTIPLE_INTERFACES: &str =
     "The associatePublicIPAddress parameter cannot be specified when launching with multiple \
      network interfaces.";
 
+/// The launch parameter a version has to state for ANY instance to be launched from it, as the
+/// wire of the service that launches it spells the member.
+///
+/// "An AMI ID is required to launch an instance"
+/// (`smithy_query(query="doc",shape="RunInstancesRequest",member="ImageId")`) — a version
+/// stating no image names nothing to launch, so the detail a refusal carries for it is Amazon
+/// EC2's own sentence for that parameter left out
+/// ([`ec2::missing_wire_parameter_message`]), the one a caller launching from the same version
+/// against that service is told.
+const REQUIRED_LAUNCH_PARAMETER_IMAGE: &str = "ImageId";
+
 /// The refusal for a launch source whose launch-template version could launch NO instance at
 /// all, or `None` when every version it names could.
 ///
@@ -331,18 +342,32 @@ pub fn unlaunchable_launch_template_error<Eng: Send + Sync + 'static, E>(
 ///
 /// ONE reading of those parameters, so the two operations that configure a group and the
 /// refresh that states a desired configuration cannot disagree about which versions are
-/// launchable. The conflict read here is the ASSIGNMENT of a public address on a launch of
-/// more than one interface — `Some(true)` is what asks for the assignment, the reading Amazon
-/// EC2's own launch path takes of the same member.
+/// launchable. Two ways a version launches nothing are read here:
+///
+/// * it states none of the launch parameters a launch REQUIRES
+///   ([`REQUIRED_LAUNCH_PARAMETER_IMAGE`]) — a version carrying no image has nothing for an
+///   instance to run, and a value present but empty names no image either;
+/// * it asks for the ASSIGNMENT of a public address on a launch of more than one interface —
+///   `Some(true)` is what asks for the assignment, the reading Amazon EC2's own launch path
+///   takes of the same member.
 fn unlaunchable_launch_parameters(
     data: &::service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData,
-) -> Option<&'static str> {
+) -> Option<String> {
+    if data
+        .image_id
+        .as_deref()
+        .is_none_or(|image_id| image_id.trim().is_empty())
+    {
+        return Some(ec2::missing_wire_parameter_message(
+            REQUIRED_LAUNCH_PARAMETER_IMAGE,
+        ));
+    }
     let interfaces = data.network_interfaces.as_deref().unwrap_or_default();
     (interfaces.len() > 1
         && interfaces
             .iter()
             .any(|interface| interface.associate_public_ip_address == Some(true)))
-    .then_some(PUBLIC_ADDRESS_WITH_MULTIPLE_INTERFACES)
+    .then(|| PUBLIC_ADDRESS_WITH_MULTIPLE_INTERFACES.to_string())
 }
 
 /// The refusal for a launch source naming a launch template — or a VERSION of one — the

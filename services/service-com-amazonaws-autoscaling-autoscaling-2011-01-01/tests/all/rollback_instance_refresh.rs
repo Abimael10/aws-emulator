@@ -67,7 +67,7 @@ fn hold_version_up_to(engine: &Arc<engine::InMemoryEngine>, template: &str, vers
                     created_by: engine::emulator_arn("iam", "", "root"),
                     create_time: std::time::SystemTime::now(),
                     version_description: None,
-                    data: ec2_service::ops::types::RequestLaunchTemplateData::default(),
+                    data: crate::support::seeded_launch_template_data(),
                 },
             )
             .expect("the account must be able to hold another version of this template");

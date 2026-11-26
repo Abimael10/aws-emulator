@@ -343,7 +343,10 @@ pub(crate) const CAPACITY_LAUNCH_TEMPLATE: &str = "ecs-capacity";
 /// An Auto Scaling group launches from a launch template THE ACCOUNT HOLDS — Amazon EC2 Auto
 /// Scaling resolves the specification when the group is created, and refuses a request naming
 /// a template Amazon EC2 does not have — so the group these suites create beneath a capacity
-/// provider needs its template written first.
+/// provider needs its template written first. The template states the image its instances run,
+/// because a group is also refused a version no instance could be launched from: "An AMI ID is
+/// required to launch an instance"
+/// (`smithy_query(query="doc",shape="RunInstancesRequest",member="ImageId")`).
 pub(crate) fn seed_capacity_launch_template(engine: &engine::InMemoryEngine) {
     let ec2 = service_com_amazonaws_ec2_amazonec2::state::service_state(engine)
         .expect("the shared engine carries the Amazon EC2 store");
@@ -357,11 +360,18 @@ pub(crate) fn seed_capacity_launch_template(engine: &engine::InMemoryEngine) {
             operator: None,
             version_description: None,
             data:
-                service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData::default(
-                ),
+                service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData {
+                    image_id: Some(CAPACITY_IMAGE_ID.to_string()),
+                    ..Default::default()
+                },
         },
     );
 }
+
+/// The image the instances of those groups run, in the printed form Amazon EC2 issues an AMI id
+/// in: the groups these suites create hold no instance of their own, so what matters is that the
+/// template states an image at all.
+const CAPACITY_IMAGE_ID: &str = "ami-0123456789abcdef0";
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
 async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {

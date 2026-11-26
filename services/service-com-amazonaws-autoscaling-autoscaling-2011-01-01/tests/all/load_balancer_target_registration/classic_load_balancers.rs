@@ -72,7 +72,7 @@ fn serving_program() -> String {
 /// store, through EC2's own writer, carrying [`serving_program`] as its user data — which the
 /// launch of a group's instance passes on to that instance.
 ///
-/// The shared seam seeds a template with no launch parameters at all; this suite cares what
+/// The shared seam seeds a template with only the image a launch requires; this suite cares what
 /// its instances are launched WITH, because what answers a load balancer's health check is
 /// the server the instance's own program starts.
 fn seed_serving_launch_template(engine: &Arc<engine::InMemoryEngine>) {
@@ -90,7 +90,7 @@ fn seed_serving_launch_template(engine: &Arc<engine::InMemoryEngine>) {
             user_data: Some(
                 ::base64::engine::general_purpose::STANDARD.encode(serving_program()),
             ),
-            ..Default::default()
+            ..crate::support::seeded_launch_template_data()
         },
     });
 }

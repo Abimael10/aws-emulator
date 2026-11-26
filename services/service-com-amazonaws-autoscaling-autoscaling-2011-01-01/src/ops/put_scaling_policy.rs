@@ -289,6 +289,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 existing.alarm_id.clone(),
             ),
             None => {
+                // The published quota on ONE group's policies
+                // ([`policies::MAX_POLICIES_PER_GROUP`]), weighed against the set the group
+                // already holds: the ceiling is the group's, so a put that would be the
+                // group's 51st policy is refused the modelled `LimitExceededFault` and
+                // nothing is stored, while freeing a slot lets the same put succeed.
+                if policies::policies_held_by_group(
+                    &state.scaling_policies,
+                    &key.auto_scaling_group_name,
+                ) >= policies::MAX_POLICIES_PER_GROUP
+                {
+                    return Err(PutScalingPolicyErrorModeled::LimitExceededFault(
+                        LimitExceededFault {
+                            message: Some(policies::policy_limit_reached_message()),
+                        },
+                    )
+                    .into());
+                }
                 if state.scaling_policies.len() >= policies::MAX_SCALING_POLICIES {
                     return Err(PutScalingPolicyErrorModeled::LimitExceededFault(
                         LimitExceededFault {

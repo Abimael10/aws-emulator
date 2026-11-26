@@ -69,14 +69,36 @@ const SUITE_LAUNCH_TEMPLATES: &[&str] = &[
     "tags-template",
 ];
 
+/// The AMI the launch templates of this harness state.
+///
+/// "An AMI ID is required to launch an instance"
+/// (`smithy_query(query="doc",shape="RunInstancesRequest",member="ImageId")`), and Amazon
+/// EC2 Auto Scaling reads the launch parameters of the version a group points at when the group
+/// is configured: a template stating no image names nothing its instances could run, so every
+/// template a suite here creates a group from states this one.
+pub const SEEDED_IMAGE_ID: &str = "ami-0123456789abcdef0";
+
+/// The launch parameters a template this harness seeds carries: the image its instances run,
+/// and nothing else.
+///
+/// THE ONE COPY for every suite here that writes a launch-template version through Amazon EC2's
+/// own writer, so a seeded version is one a group can be configured against. A suite that cares
+/// what an instance is launched WITH adds the parameters it means to this.
+pub fn seeded_launch_template_data() -> ec2_service::ops::types::RequestLaunchTemplateData {
+    ec2_service::ops::types::RequestLaunchTemplateData {
+        image_id: Some(SEEDED_IMAGE_ID.to_string()),
+        ..Default::default()
+    }
+}
+
 /// Put the launch templates `names` in the account's own Amazon EC2 store, through EC2's
 /// own writer, so a group created from one launches from a template the account holds.
 ///
 /// THE ONE COPY for every suite here that creates a group: the launch templates an Auto
 /// Scaling request names are Amazon EC2's resources, so they are written through EC2's own
-/// store rather than invented here. Each carries no launch parameters of its own: a suite
-/// that cares what an instance is launched WITH creates its template over EC2's wire with
-/// the parameters it means.
+/// store rather than invented here. Each carries only the image a launch requires
+/// ([`seeded_launch_template_data`]): a suite that cares what an instance is launched WITH
+/// creates its template over EC2's wire with the parameters it means.
 pub fn seed_launch_templates(engine: &Arc<engine::InMemoryEngine>, names: &[&str]) {
     let state = ec2::service_state(&**engine).expect("the EC2 store is mounted on this engine");
     let mut store = state.lock();
@@ -88,7 +110,7 @@ pub fn seed_launch_templates(engine: &Arc<engine::InMemoryEngine>, names: &[&str
             tags: Vec::new(),
             operator: None,
             version_description: None,
-            data: ec2_service::ops::types::RequestLaunchTemplateData::default(),
+            data: seeded_launch_template_data(),
         });
     }
 }
@@ -358,7 +380,7 @@ pub async fn create_launch_template(router: &MultiServiceRouter, name: &str) -> 
         "CreateLaunchTemplate",
         &[
             p("LaunchTemplateName", name),
-            p("LaunchTemplateData.ImageId", "ami-0123456789abcdef0"),
+            p("LaunchTemplateData.ImageId", SEEDED_IMAGE_ID),
             p("LaunchTemplateData.InstanceType", "t3.micro"),
         ],
     )
