@@ -246,12 +246,16 @@ const VIRTUAL_MACHINE_ID_DIGITS: usize = 16;
 /// `ErrorCode` for a well-formed hypervisor ARN that names no hypervisor, and the
 /// sentence that states it. See [`MissingResource`].
 ///
-/// It is `ResourceNotFoundException$ErrorCode` for an operation that models that shape,
-/// and `ValidationException$ErrorCode` — "a description of what caused the validation
-/// error" — for one that does not: `AssociateGatewayToServer` models only
-/// `ConflictException` beside this service's common errors
-/// (`smithy_query(query="operation",operation="AssociateGatewayToServer")`), so the
-/// condition is named by the same code whichever modelled shape carries it.
+/// It is `ResourceNotFoundException$ErrorCode` — "a description of which resource wasn't
+/// found" (`smithy_query(query="shape",shape="ResourceNotFoundException")`) — for EVERY
+/// operation of this service that resolves an ARN, including one whose own `errors` list
+/// declares that shape nowhere: `AssociateGatewayToServer` models only `ConflictException`
+/// beside this service's common errors
+/// (`smithy_query(query="operation",operation="AssociateGatewayToServer")`) and carries
+/// this condition in that shape all the same, widening its error enum to reach it, because
+/// an ARN that resolves to nothing is a missing resource whichever operation resolved it
+/// and not an input-validation failure. So one condition is named one way AND carried by
+/// one shape, rather than re-told per operation.
 pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
 
 /// See [`HYPERVISOR_NOT_FOUND`].
@@ -261,10 +265,9 @@ pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
 /// states it. See [`MissingResource::Gateway`].
 ///
 /// Read like [`HYPERVISOR_NOT_FOUND`]: it is `ResourceNotFoundException$ErrorCode` — "a
-/// description of which resource wasn't found" — for an operation that models that shape,
-/// and the same code inside whatever other modelled shape an operation that does not model
-/// it has to carry the condition in, so one condition is named one way whichever shape
-/// carries it.
+/// description of which resource wasn't found" — for every operation of this service that
+/// resolves an ARN, the one whose model declares that shape nowhere included, so one
+/// condition is named one way and answered in one shape.
 pub const GATEWAY_NOT_FOUND: &str = "GatewayNotFound";
 
 /// See [`GATEWAY_NOT_FOUND`]: the sentence AWS states for that refusal, entirely fixed

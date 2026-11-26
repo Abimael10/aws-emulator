@@ -22,9 +22,10 @@
 //! came to name nothing (never created, created and deleted), in partition, in id, in
 //! resource-type segment and in length, including each published bound of the modelled
 //! `GatewayArn` (`@length(min: 50, max: 180)`,
-//! `smithy_query(query="shape",shape="GatewayArn")`); then the tagging operations crossed
-//! with every resource type this service's ARNs can name, which is the one member that has
-//! to tell them apart.
+//! `smithy_query(query="shape",shape="GatewayArn")`); then the same for the hypervisor end
+//! of the one operation whose own `errors` list declares no `ResourceNotFoundException`;
+//! then the tagging operations crossed with every resource type this service's ARNs can
+//! name, which is the one member that has to tell them apart.
 
 use std::collections::BTreeSet;
 
@@ -284,6 +285,141 @@ async fn the_operation_that_models_no_resource_not_found_states_the_same_refusal
             read.body
         );
     }
+}
+
+/// The `ServerArn`s that name no hypervisor this endpoint holds, each well formed enough to
+/// reach a handler rather than the boundary validator.
+///
+/// The rows differ along what the rule generalises over: how the ARN came to name nothing
+/// (never imported, imported and deleted), the resource-type segment it spells, the
+/// partition, the id, and the length — including each published bound of the modelled
+/// `ServerArn` (`@length(min: 50, max: 500)`,
+/// `smithy_query(query="shape",shape="ServerArn")`), which `GetHypervisor` takes in
+/// `HypervisorArn` too.
+async fn server_arns_naming_nothing(router: &MultiServiceRouter) -> Vec<(String, String)> {
+    // A hypervisor this service really imported and then deleted: its ARN was minted and
+    // served here, so the refusal cannot be about the ARN's shape.
+    let deleted = import(router, "hv-assoc-server-end-deleted", "198.51.100.91").await;
+    let removed = call(
+        router,
+        "DeleteHypervisor",
+        &json!({ "HypervisorArn": deleted.clone() }),
+    )
+    .await;
+    assert_eq!(
+        removed.status, 200,
+        "DeleteHypervisor must answer 200 before the ARN is reused as a missing one, got {} {:?}",
+        removed.status, removed.body
+    );
+
+    vec![
+        (
+            "a hypervisor that was never imported".to_string(),
+            arn_of("hypervisor", "hv-1111111111111111"),
+        ),
+        ("a hypervisor that was deleted".to_string(), deleted),
+        (
+            "another hypervisor id".to_string(),
+            arn_of("hypervisor", "hv-2222222222nonexistent"),
+        ),
+        (
+            "a ServerArn naming a virtual machine".to_string(),
+            arn_of("vm", "vm-3333333333333333"),
+        ),
+        (
+            "a resource type this service does not name".to_string(),
+            arn_of("appliance", "ap-3333333333333333"),
+        ),
+        (
+            "the china partition".to_string(),
+            format!(
+                "arn:aws-cn:backup-gateway:{REGION}:{}:hypervisor/hv-0000000000000888",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+        (
+            "the govcloud partition".to_string(),
+            format!(
+                "arn:aws-us-gov:backup-gateway:{REGION}:{}:hypervisor/hv-0000000000000777",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+        (
+            "at the modelled 50-character minimum length".to_string(),
+            arn_of_length(50),
+        ),
+        (
+            "at the modelled 500-character maximum length".to_string(),
+            arn_of_length(500),
+        ),
+    ]
+}
+
+/// The OTHER end of the link the operation that models no `ResourceNotFoundException`
+/// resolves: a `ServerArn` that names no hypervisor takes that same shape, status, code and
+/// sentence — the one `GetHypervisor`, which does declare the shape, gives for the very
+/// same ARN — so neither end of the link is re-told as an input-validation failure.
+#[tokio::test]
+async fn the_server_end_of_an_association_states_the_same_refusal() {
+    let engine = build_engine();
+    let router = build_router(&engine);
+    // A gateway that really exists, so the only end left to refuse is the server, and the
+    // refusal is about the ARN that was asked for rather than an empty store.
+    let gateway = create(&router, "gw-assoc-server-end").await;
+
+    let expected = not_found(HYPERVISOR_NOT_FOUND, HYPERVISOR_NOT_FOUND_MESSAGE);
+    for (case, arn) in server_arns_naming_nothing(&router).await {
+        let refused = call(
+            &router,
+            "AssociateGatewayToServer",
+            &json!({ "GatewayArn": gateway, "ServerArn": arn }),
+        )
+        .await;
+        let answer = refusal_of(&refused);
+        assert_eq!(
+            answer, expected,
+            "case {case:?}: AssociateGatewayToServer must answer the service's one refusal \
+             for a missing hypervisor with {expected:?}, got {answer:?}"
+        );
+        // Stated the other way round as well, because this is the half a reader could take
+        // for an invalid parameter: a missing resource is never re-told as one.
+        assert_ne!(
+            answer.shape.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: an ARN that resolves to nothing must not be refused as an \
+             invalid parameter, got {answer:?}"
+        );
+        assert!(
+            !answer.message.contains(arn.as_str()),
+            "case {case:?}: the refusal must not echo the ARN the request carried, got \
+             {answer:?}"
+        );
+
+        // And it really is the answer the operation that DOES declare the shape gives for
+        // the same ARN.
+        let read = call(&router, "GetHypervisor", &json!({ "HypervisorArn": arn })).await;
+        assert_eq!(
+            answer,
+            refusal_of(&read),
+            "case {case:?}: two operations must answer one condition one way, got {:?} and \
+             {:?}",
+            refused.body,
+            read.body
+        );
+    }
+
+    // Nothing above wrote: the gateway that exists is still associated with no server.
+    let fetched = call(&router, "GetGateway", &json!({ "GatewayArn": gateway })).await;
+    assert_eq!(
+        (
+            fetched.status,
+            fetched.str_at("/Gateway/HypervisorId").is_none()
+        ),
+        (200, true),
+        "a refused association must leave the gateway associated with no server, got {} {:?}",
+        fetched.status,
+        fetched.body
+    );
 }
 
 /// The other half of the rule: the operations that take ANY resource of this service in one
