@@ -182,6 +182,43 @@ pub const INVALID_MARKER_MESSAGE: &str = "Invalid marker value from user.";
 /// `400 InvalidParameterValueException` with `message` exactly this.
 pub const INVALID_PAGINATION_KEY_MESSAGE: &str = "Invalid pagination key.";
 
+/// What an operation that RESOLVES the function version its request names says it could not
+/// FIND: the fixed `Function not found: ` followed by the function's own ARN spelled AT that
+/// version.
+///
+/// Such an operation — the create and the update of an alias both name the version the alias
+/// is to invoke — resolves that version before it acts, so the resource it could not resolve
+/// is the function AT the version the request named, and the sentence names THAT however the
+/// resolution failed: whether the function holds no such version
+/// ([`super::FunctionRecord::versioned_arn`]) or this store holds no such function at all.
+/// One spelling for both, because a function that is not there has the requested version no
+/// more than one that is there without it.
+///
+/// `version` is the version the request named, and `None` a request that named none: then
+/// the call resolves the function's unpublished version, which this service spells as the
+/// unqualified ARN wherever it names the RESOURCE a version is ([`super::qualified_arn`]) —
+/// so the sentence a request naming no version gets is the function's own ARN, the same ARN
+/// the shared resolution words for it ([`super::resolve_function`]).
+///
+/// Recorded behaviour: corpus `simparity-behavioral-aws-v1`, trace
+/// `iam__lambda.cfnuf-unqualified-delete-function-ignores-the-alias-and-removes-versions-and-aliases`,
+/// where `UpdateAlias` naming a published version of a function that has been deleted is
+/// answered `404 ResourceNotFoundException` with the `:<FunctionVersion>`-qualified ARN after
+/// the fixed prefix — the same ARN `GetFunction` names for that version of the same deleted
+/// function.
+#[must_use]
+pub fn function_version_not_found_message(
+    region: &str,
+    name: &str,
+    version: Option<&str>,
+) -> String {
+    let arn = super::qualified_arn(
+        &super::function_arn(region, name),
+        version.unwrap_or(super::VERSION_LATEST),
+    );
+    format!("Function not found: {arn}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +265,41 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?} ({value:?}): expected names_a_qualifier {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// The sentence an operation that resolved a version states names the function's ARN at
+    /// exactly the version the request named, and the unqualified ARN for a request that
+    /// named none (and for the unpublished version, which is how this service spells it).
+    #[test]
+    fn a_resolved_version_is_named_in_the_arn_the_sentence_carries() {
+        let region = "eu-west-1";
+        // (case, the version the request named, the suffix the ARN carries)
+        let rows: [(&str, Option<&str>, &str); 5] = [
+            ("no version named", None, ""),
+            (
+                "the unpublished version",
+                Some(crate::state::VERSION_LATEST),
+                "",
+            ),
+            ("the first published version", Some("1"), ":1"),
+            ("a far published version", Some("4096"), ":4096"),
+            (
+                "a version number wider than 64 bits",
+                Some("999999999999999999999999999999"),
+                ":999999999999999999999999999999",
+            ),
+        ];
+        for (case, version, suffix) in rows {
+            let expected = format!(
+                "Function not found: {}{suffix}",
+                crate::state::function_arn(region, "ledger")
+            );
+            let actual = function_version_not_found_message(region, "ledger", version);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

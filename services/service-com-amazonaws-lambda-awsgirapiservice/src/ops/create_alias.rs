@@ -248,10 +248,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(message));
         }
 
+        // The version the alias is to invoke is resolved BEFORE the alias is created, so a
+        // store holding no function of this name holds the version the request named no more
+        // than a function without that version does: the refusal names the function's ARN at
+        // exactly that version, which is the one spelling this service gives a version it
+        // could not resolve (`crate::state::function_version_not_found_message`).
         let Some(record) = store.functions.get_mut(&reference.name) else {
-            return Err(not_found(format!(
-                "Function not found: {}",
-                crate::state::function_arn(&region, &reference.name)
+            return Err(not_found(crate::state::function_version_not_found_message(
+                &region,
+                &reference.name,
+                Some(&input.function_version),
             )));
         };
         record.materialize(now);
