@@ -224,12 +224,12 @@ pub mod recurrence;
 pub mod scheduled_actions;
 
 pub use scheduled_actions::{
-    absent_scheduled_action_message, invalid_recurrence_message,
-    scheduled_action_already_exists_message, scheduled_action_arn,
+    invalid_recurrence_message, scheduled_action_already_exists_message, scheduled_action_arn,
     too_many_scheduled_action_names_in_one_call_message,
     too_many_scheduled_actions_in_one_call_message, too_many_scheduled_actions_message,
     ScheduledActionPut, ScheduledActionRefusal, ScheduledActions, StoredScheduledAction,
-    ALREADY_EXISTS_ERROR_CODE, END_TIME_MESSAGE, INVALID_TIME_ZONE_MESSAGE,
+    ABSENT_SCHEDULED_ACTION_MESSAGE, ALREADY_EXISTS_ERROR_CODE, END_TIME_MESSAGE,
+    INVALID_TIME_ZONE_MESSAGE,
     LIMIT_EXCEEDED_ERROR_CODE, MAX_SCHEDULED_ACTIONS_PER_CALL, MAX_SCHEDULED_ACTIONS_PER_GROUP,
     SIZE_REQUIRED_MESSAGE, START_TIME_IN_PAST_MESSAGE, VALIDATION_ERROR_CODE,
 };

@@ -218,9 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 absent
                     .into_iter()
                     .map(|action_name| FailedScheduledUpdateGroupActionRequest {
-                        error_message: Some(crate::state::absent_scheduled_action_message(
-                            &action_name,
-                        )),
+                        error_message: Some(
+                            crate::state::ABSENT_SCHEDULED_ACTION_MESSAGE.to_string(),
+                        ),
                         scheduled_action_name: action_name,
                         error_code: Some(crate::state::VALIDATION_ERROR_CODE.to_string()),
                     })

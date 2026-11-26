@@ -38,12 +38,10 @@ const GROUP_B: &str = "scope-group-b";
 /// this service answers a request about a resource it has no record of with.
 const VALIDATION_ERROR: &str = "ValidationError";
 
-/// The whole message such a name is reported with: the `<subject> not found - <detail>` shape
-/// this service states an absent resource in. Written out here so the assertion does not take
-/// the handler's own word for it.
-fn absent_action_message(action: &str) -> String {
-    format!("Scheduled action name not found - Scheduled action {action} not found")
-}
+/// The whole message such a name is reported with: fixed text naming the subject that was
+/// not found, with the name itself carried by the entry's own `ScheduledActionName` member.
+/// Written out here so the assertion does not take the handler's own word for it.
+const ABSENT_ACTION_MESSAGE: &str = "Scheduled action name not found";
 
 /// Create the group `name` on `router`, with nothing to launch.
 async fn create_group(router: &MultiServiceRouter, name: &str) {
@@ -218,7 +216,7 @@ async fn one_call_deletes_only_out_of_the_group_it_names() {
                 (
                     (*name).to_string(),
                     VALIDATION_ERROR.to_string(),
-                    absent_action_message(name),
+                    ABSENT_ACTION_MESSAGE.to_string(),
                 )
             })
             .collect();

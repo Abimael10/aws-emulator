@@ -12,7 +12,7 @@
 //! resolved first: a name no group of the account answers to names no action to delete, and
 //! the request is refused for the group ([`crate::state::absent_group_message`]). A group the
 //! account does hold, under which it holds no action of that name, names no action either and
-//! is refused for the action ([`crate::state::absent_scheduled_action_message`]) — the same
+//! is refused for the action ([`crate::state::ABSENT_SCHEDULED_ACTION_MESSAGE`]) — the same
 //! answer the batch form of this delete reports that name under, because a delete that
 //! removed nothing is not a delete that succeeded.
 //!
@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "refused: no such scheduled action",
                 );
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::absent_scheduled_action_message(&action_name),
+                    crate::state::ABSENT_SCHEDULED_ACTION_MESSAGE.to_string(),
                 ));
             }
         }

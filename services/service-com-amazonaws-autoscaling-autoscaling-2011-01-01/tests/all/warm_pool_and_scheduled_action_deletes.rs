@@ -194,13 +194,13 @@ async fn deleting_one_scheduled_action_leaves_every_other_action_of_the_group() 
             "the name just deleted",
             group,
             "nightly",
-            autoscaling::state::absent_scheduled_action_message("nightly"),
+            autoscaling::state::ABSENT_SCHEDULED_ACTION_MESSAGE.to_string(),
         ),
         (
             "a name the group never held",
             group,
             "quarterly",
-            autoscaling::state::absent_scheduled_action_message("quarterly"),
+            autoscaling::state::ABSENT_SCHEDULED_ACTION_MESSAGE.to_string(),
         ),
         (
             "a group this service holds nothing for",

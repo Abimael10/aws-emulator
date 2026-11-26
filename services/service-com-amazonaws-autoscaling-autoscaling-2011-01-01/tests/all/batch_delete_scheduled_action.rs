@@ -47,11 +47,10 @@ const MAX_SCHEDULED_ACTION_NAMES_PER_CALL: usize = 50;
 /// service answers a request about a resource it has no record of with.
 const VALIDATION_ERROR: &str = "ValidationError";
 
-/// The whole message a name the group holds no action under is reported with: the
-/// `<subject> not found - <detail>` shape this service states an absent resource in.
-fn absent_action_message(action: &str) -> String {
-    format!("Scheduled action name not found - Scheduled action {action} not found")
-}
+/// The whole message a name the group holds no action under is reported with: fixed text
+/// naming the subject that was not found, with the name itself carried by the entry's own
+/// `ScheduledActionName` member rather than repeated in the message.
+const ABSENT_ACTION_MESSAGE: &str = "Scheduled action name not found";
 
 /// The whole message a call naming a group the account does not hold is refused with.
 fn absent_group_message(name: &str) -> String {
@@ -225,7 +224,7 @@ async fn one_call_deletes_the_names_the_group_holds_and_reports_the_rest() {
                 (
                     (*name).to_string(),
                     VALIDATION_ERROR.to_string(),
-                    absent_action_message(name),
+                    ABSENT_ACTION_MESSAGE.to_string(),
                 )
             })
             .collect();

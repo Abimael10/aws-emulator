@@ -34,12 +34,9 @@ const START_TIME: &str = "2035-06-01T00:00:00Z";
 /// The wire error code a refused delete carries.
 const VALIDATION_ERROR: &str = "ValidationError";
 
-/// The whole message a delete naming an action the group holds none of is refused with: the
-/// `<subject> not found - <detail>` shape this service states an absent resource in, with the
-/// action name taken from the request.
-fn absent_action_message(action: &str) -> String {
-    format!("Scheduled action name not found - Scheduled action {action} not found")
-}
+/// The whole message a delete naming an action the group holds none of is refused with:
+/// fixed text naming the subject that was not found, with no part of the request in it.
+const ABSENT_ACTION_MESSAGE: &str = "Scheduled action name not found";
 
 /// The whole message a delete naming a group the account does not hold is refused with.
 fn absent_group_message(group: &str) -> String {
@@ -239,13 +236,13 @@ async fn a_delete_naming_no_action_of_the_group_deletes_nothing() {
             "a name the group holds no action under",
             group,
             "nonesuch",
-            absent_action_message("nonesuch"),
+            ABSENT_ACTION_MESSAGE.to_string(),
         ),
         (
             "a name that differs from a held one only in case",
             group,
             "Alpha",
-            absent_action_message("Alpha"),
+            ABSENT_ACTION_MESSAGE.to_string(),
         ),
         (
             "a group the account does not hold",
@@ -281,7 +278,7 @@ async fn a_delete_naming_no_action_of_the_group_deletes_nothing() {
     let (status, code, message) = delete(&router, group, "alpha", Via::One).await;
     assert_eq!(
         (status, code.as_str(), message.as_str()),
-        (400, VALIDATION_ERROR, absent_action_message("alpha").as_str()),
+        (400, VALIDATION_ERROR, ABSENT_ACTION_MESSAGE),
         "deleting the same action again must be refused for the action, got {status} {code:?} \
          {message:?}"
     );

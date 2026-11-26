@@ -950,16 +950,15 @@ pub fn too_many_scheduled_action_names_in_one_call_message(count: usize) -> Stri
     super::too_many_items_message(count, "scheduledActionNames", MAX_SCHEDULED_ACTIONS_PER_CALL)
 }
 
-/// The sentence a request naming a scheduled action the group does not hold is answered with.
+/// The sentence a request naming a scheduled action the group does not hold is answered with:
+/// entirely FIXED text, naming the subject that was not found and nothing of the request.
 ///
-/// The `<subject> not found - <detail>` shape this service states its absent-resource
-/// refusals in ([`super::absent_group_message`]), for the resource word the model names a
-/// scheduled action by. The action name, taken verbatim from the request, is its only
-/// variable part.
-#[must_use]
-pub fn absent_scheduled_action_message(action_name: &str) -> String {
-    format!("Scheduled action name not found - Scheduled action {action_name} not found")
-}
+/// The name the request asked for is never part of it — a delete of one action states that
+/// name in its own request, and a delete of several carries it on the sibling
+/// `FailedScheduledUpdateGroupActionRequest$ScheduledActionName` of the entry this sentence
+/// is the `ErrorMessage` of, so repeating it in the sentence would say nothing the answer
+/// does not already say and would make an exact match of the sentence impossible.
+pub const ABSENT_SCHEDULED_ACTION_MESSAGE: &str = "Scheduled action name not found";
 
 /// The sentence a put stating none of the three sizes is refused with: the rule as the
 /// model's own documentation for `PutScheduledUpdateGroupActionType$DesiredCapacity` states
