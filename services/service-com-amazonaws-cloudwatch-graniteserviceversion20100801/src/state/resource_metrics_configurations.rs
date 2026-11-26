@@ -37,23 +37,36 @@ pub const RESOURCE_METRICS_CONFIGURATION: &str = "ResourceMetricsConfiguration";
 /// (`::service_common::arn::Arn::resource_type`).
 ///
 /// A resource metrics configuration "enables detailed metric collection for the resource"
-/// (`smithy_query(query="shape",shape="ResourceMetricsConfiguration")`) and the ARN its writer
-/// takes is "the Amazon Web Services resource to enable detailed monitoring for"
-/// (`smithy_query(query="operation",operation="CreateResourceMetricsConfiguration")`) — detailed
-/// monitoring being the per-resource, one-minute collection CloudWatch offers for the Amazon EC2
-/// compute resources: an instance, and the Amazon EBS volumes attached to one. Every other
-/// resource type is one no detailed metrics are collected for, so no configuration can exist for
-/// it and a request naming one is refused ([`UNSUPPORTED_RESOURCE_TYPE`]).
+/// (`smithy_query(query="shape",shape="ResourceMetricsConfiguration")`), naming the metrics
+/// CloudWatch is to gather for it ("The names of the metrics to collect for the resource. Amazon
+/// CloudWatch collects only the metrics that you list here.",
+/// `smithy_query(query="shape",shape="ResourceMetricSelection",member="IncludeMetrics")`) — so a
+/// resource that can hold one is a resource CLOUDWATCH ITSELF collects metrics for when asked,
+/// the container clusters whose per-cluster detailed metric collection is turned on through
+/// CloudWatch: an Amazon ECS cluster and an Amazon EKS cluster.
 ///
-/// The set is ENUMERATED here, rather than an unknown type being reported as a configuration
-/// that does not exist, because the service is recorded refusing a well-formed ARN under that
-/// code and sentence: it judges the TYPE of resource before it looks a configuration up, so
-/// "this type carries no detailed metrics" and "this resource has no configuration" are
-/// different answers and only the first can be given about a type at all. A type whose detailed
-/// metrics CloudWatch comes to collect is one entry added here, and every operation that reports,
-/// writes or removes a configuration follows.
+/// A resource whose extra metric collection is switched on where the resource LIVES rather than
+/// through a CloudWatch configuration — the per-resource one-minute monitoring an Amazon EC2
+/// instance or an Amazon EBS volume is put into through Amazon EC2 — is NOT one of these, and
+/// that EXCLUSION is the pinned half of this set: the service is observed refusing a well-formed
+/// ARN of such a resource under [`UNSUPPORTED_RESOURCE_TYPE`] rather than answering about a
+/// configuration of it, so that collection is not a resource metrics configuration and this
+/// service holds none for such a resource.
+///
+/// The MEMBERSHIP is provisional. The model publishes no list of covered types — `ResourceArn` is
+/// constrained by length and the ARN pattern alone
+/// (`smithy_query(query="shape",shape="ResourceArn")`) — and no documented list is reachable from
+/// this crate, so the entries above are this emulator's reading of which resources CloudWatch
+/// itself collects metrics for on request, not a published catalog. They are what makes the two
+/// answers distinguishable at all: the set is ENUMERATED here rather than an uncovered type being
+/// reported as a configuration that does not exist, because the service judges the TYPE of
+/// resource before it looks a configuration up, so "no detailed metrics are collected for this
+/// type" and "this resource has no configuration" are different answers and only the first can be
+/// given about a type at all. An entry is added when a type's coverage is observed, and removed
+/// when a refusal of it is — one edit here, which every operation that reports, writes or removes
+/// a configuration follows.
 pub const DETAILED_METRIC_RESOURCE_TYPES: [(&str, &str); 2] =
-    [("ec2", "instance"), ("ec2", "volume")];
+    [("ecs", "cluster"), ("eks", "cluster")];
 
 /// Whether this service collects detailed metrics for the resource `value` names — the one
 /// question every resource metrics configuration operation asks about the ARN it was given,

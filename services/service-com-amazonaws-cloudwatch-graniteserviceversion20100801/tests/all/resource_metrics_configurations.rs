@@ -5,11 +5,11 @@
 //! makes.
 //!
 //! Every table row is a distinct input along what the rule under test generalises over (the
-//! service and resource type the ARN names, the partition and Region it names them in, whether
-//! the resource part carries a type and an id at all, how many metric names a selection lists,
-//! whether a selection is present, and the Region the request is signed for), so neither the
-//! resource type a configuration is held for nor the one that is refused is a single case the
-//! suite was written around.
+//! service and resource type the ARN names, the partition and Region it names them in, which
+//! separator its resource part uses, how many metric names a selection lists, whether a selection
+//! is present, and the Region the request is signed for), so neither the resource type a
+//! configuration is held for nor the one that is refused is a single case the suite was written
+//! around.
 //!
 //! The configurations are seeded through the store those configurations' writers write
 //! (`state::ComAmazonawsCloudwatchGraniteserviceversion20100801State::keep_resource_metrics_configuration`),
@@ -39,10 +39,13 @@ const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
 const VALIDATION_REPORT: &str = "ValidationError;Sender";
 
 /// What a read refuses a resource this service collects no detailed metrics for with.
-const UNSUPPORTED_RESOURCE_TYPE: &str = "Unsupported resource type";
+///
+/// Shared with the sibling suite that drives the same rule off the published catalog
+/// (`crate::resource_metrics_coverage`), so the two cannot word the refusal differently.
+pub(crate) const UNSUPPORTED_RESOURCE_TYPE: &str = "Unsupported resource type";
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// An instant to hold a seeded configuration's `CreatedAt` at: epoch seconds, so the suite
 /// asserts on the instant the store holds rather than on when it ran.
@@ -52,19 +55,19 @@ const CREATED_SECS: f64 = 1_700_000_000.0;
 /// that reports both cannot pass by reporting one of them twice.
 const UPDATED_SECS: f64 = 1_700_086_400.5;
 
-/// The ARN of one EC2 instance, in `partition` and `region`.
-fn instance_arn(partition: &str, region: &str, instance_id: &str) -> String {
-    format!("arn:{partition}:ec2:{region}:{ACCOUNT}:instance/{instance_id}")
+/// The ARN of one Amazon ECS cluster, in `partition` and `region`.
+fn ecs_cluster_arn(partition: &str, region: &str, name: &str) -> String {
+    format!("arn:{partition}:ecs:{region}:{ACCOUNT}:cluster/{name}")
 }
 
-/// The ARN of one EBS volume, in `region`.
-fn volume_arn(region: &str, volume_id: &str) -> String {
-    format!("arn:aws:ec2:{region}:{ACCOUNT}:volume/{volume_id}")
+/// The ARN of one Amazon EKS cluster, in `region`.
+fn eks_cluster_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:eks:{region}:{ACCOUNT}:cluster/{name}")
 }
 
 /// Hold a configuration for `resource_arn` in the store, carrying `include_metrics` as its one
 /// metric selection when the case states one, and answer it.
-fn given_configuration(
+pub(crate) fn given_configuration(
     engine: &engine::InMemoryEngine,
     resource_arn: &str,
     include_metrics: Option<Vec<String>>,
@@ -94,7 +97,7 @@ fn held_configurations(engine: &engine::InMemoryEngine) -> Vec<String> {
 }
 
 /// Read the configuration of `resource_arn`, answering the HTTP status and body.
-async fn read(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+pub(crate) async fn read(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
     call(
         router,
         "GetResourceMetricsConfiguration",
@@ -104,7 +107,7 @@ async fn read(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
 }
 
 /// The configuration a successful read reports.
-fn reported(body: &Value) -> &Value {
+pub(crate) fn reported(body: &Value) -> &Value {
     body.get("ResourceMetricsConfiguration")
         .expect("a successful read reports the configuration")
 }
@@ -113,39 +116,39 @@ fn reported(body: &Value) -> &Value {
 /// this service collects it is held for, and however the configuration selects metrics.
 #[tokio::test]
 async fn reports_the_configuration_the_store_holds() {
-    // The rows span the resource type (an instance and a volume), the partition and Region the
-    // ARN names, and the metric selection (absent, one name, several names, and the modelled
-    // maximum of `MetricNameList` — `@length 1..500`,
+    // The rows span the resource type (a cluster of each covered service), the partition and
+    // Region the ARN names, and the metric selection (absent, one name, several names, and the
+    // modelled maximum of `MetricNameList` — `@length 1..500`,
     // `smithy_query(query="shape",shape="MetricNameList")`).
     let many: Vec<String> = (0..500).map(|index| format!("Metric{index}")).collect();
     let cases: [(&str, String, Option<Vec<String>>); 5] = [
         (
-            "an instance, collecting every available metric",
-            instance_arn("aws", "us-east-1", "i-0123456789abcdef0"),
+            "a cluster, collecting every available metric",
+            ecs_cluster_arn("aws", "us-east-1", "orders-production"),
             None,
         ),
         (
-            "an instance, one metric named",
-            instance_arn("aws", "eu-west-1", "i-00000000000000001"),
-            Some(vec!["CPUUtilization".to_string()]),
+            "a cluster, one metric named",
+            ecs_cluster_arn("aws", "eu-west-1", "checkout"),
+            Some(vec!["CpuUtilized".to_string()]),
         ),
         (
-            "an instance in another partition",
-            instance_arn("aws-us-gov", "us-gov-west-1", "i-abcdefabcdefabcde"),
-            Some(vec!["NetworkIn".to_string(), "NetworkOut".to_string()]),
+            "a cluster in another partition",
+            ecs_cluster_arn("aws-us-gov", "us-gov-west-1", "restricted"),
+            Some(vec!["MemoryUtilized".to_string(), "NetworkRxBytes".to_string()]),
         ),
         (
-            "a volume",
-            volume_arn("ap-southeast-2", "vol-0fedcba9876543210"),
+            "a cluster of the other covered service",
+            eks_cluster_arn("ap-southeast-2", "analytics"),
             Some(vec![
-                "VolumeReadOps".to_string(),
-                "VolumeWriteOps".to_string(),
-                "VolumeQueueLength".to_string(),
+                "pod_cpu_utilization".to_string(),
+                "pod_memory_utilization".to_string(),
+                "node_filesystem_utilization".to_string(),
             ]),
         ),
         (
-            "a volume, as many metrics named as one selection holds",
-            volume_arn("sa-east-1", "vol-00000000000000002"),
+            "a cluster, as many metrics named as one selection holds",
+            eks_cluster_arn("sa-east-1", "batch"),
             Some(many),
         ),
     ];
@@ -209,16 +212,17 @@ async fn reports_the_configuration_the_store_holds() {
 }
 
 /// A read of a resource whose detailed metrics this service collects none of is refused as a
-/// fault of the request, whatever that resource is — including a resource part that names no
-/// type of resource at all.
+/// fault of the request, whatever that resource is. (A resource part that names a covered type
+/// but no resource under it is the same refusal, asserted over every covered kind by the sibling
+/// suite `crate::resource_metrics_coverage`.)
 #[tokio::test]
 async fn refuses_a_resource_no_detailed_metrics_are_collected_for() {
     // The rows span the service namespace, the resource type within a service that DOES carry
-    // detailed metrics for other types, the separator the resource part uses, and a resource
-    // part carrying no type or no id at all. Each ARN satisfies the modelled `ResourceArn`
-    // pattern (`^arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-zA-Z0-9-]*:\d{12}:.+$`,
+    // detailed metrics for another type, and the separator the resource part uses. Each ARN
+    // satisfies the modelled `ResourceArn` pattern
+    // (`^arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-zA-Z0-9-]*:\d{12}:.+$`,
     // `smithy_query(query="shape",shape="ResourceArn")`), so each one reaches the handler.
-    let cases: [(&str, String); 9] = [
+    let cases: [(&str, String); 10] = [
         (
             "a queue",
             format!("arn:aws:sqs:us-east-1:{ACCOUNT}:orders"),
@@ -240,20 +244,24 @@ async fn refuses_a_resource_no_detailed_metrics_are_collected_for() {
             format!("arn:aws:cloudwatch:us-east-1:{ACCOUNT}:alarm:cpu-high"),
         ),
         (
-            "another type of the same service as a supported one",
-            format!("arn:aws:ec2:us-east-1:{ACCOUNT}:security-group/sg-0123456789abcdef0"),
+            "a compute instance, whose extra collection its own service switches on",
+            format!("arn:aws:ec2:us-west-2:{ACCOUNT}:instance/i-00000000000000001"),
         ),
         (
-            "a network of the same service as a supported one",
+            "a block volume, whose extra collection its own service switches on",
+            format!("arn:aws:ec2:eu-west-1:{ACCOUNT}:volume/vol-00000000000000002"),
+        ),
+        (
+            "a network of a service that covers no type",
             format!("arn:aws:ec2:us-east-1:{ACCOUNT}:vpc/vpc-0123456789abcdef0"),
         ),
         (
-            "a resource part naming a type with no id",
-            format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance"),
+            "another type of the same service as a covered one",
+            format!("arn:aws:ecs:us-east-1:{ACCOUNT}:service/orders/checkout"),
         ),
         (
-            "a resource part naming a type with an empty id",
-            format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/"),
+            "a node group of the same service as a covered one",
+            format!("arn:aws:eks:us-east-1:{ACCOUNT}:nodegroup/analytics/workers/abc"),
         ),
     ];
 
@@ -321,28 +329,28 @@ async fn judges_the_resource_before_looking_a_configuration_up() {
 /// was looked up by.
 #[tokio::test]
 async fn reports_a_configuration_that_does_not_exist() {
-    let seeded = instance_arn("aws", "us-east-1", "i-0123456789abcdef0");
+    let seeded = ecs_cluster_arn("aws", "us-east-1", "orders-production");
     // The rows span the resource type, the partition and Region, and whether the store holds a
     // configuration for ANOTHER resource of the same type.
     let cases: [(&str, String, bool); 4] = [
         (
-            "an instance nothing is held for, with an empty store",
-            instance_arn("aws", "us-east-1", "i-00000000000000003"),
+            "a cluster nothing is held for, with an empty store",
+            ecs_cluster_arn("aws", "us-east-1", "staging"),
             false,
         ),
         (
-            "an instance nothing is held for, beside one that is",
-            instance_arn("aws", "us-east-1", "i-00000000000000004"),
+            "a cluster nothing is held for, beside one that is",
+            ecs_cluster_arn("aws", "us-east-1", "development"),
             true,
         ),
         (
-            "a volume nothing is held for",
-            volume_arn("eu-central-1", "vol-00000000000000005"),
+            "a cluster of the other covered service nothing is held for",
+            eks_cluster_arn("eu-central-1", "analytics"),
             true,
         ),
         (
-            "an instance of another partition nothing is held for",
-            instance_arn("aws-cn", "cn-north-1", "i-00000000000000006"),
+            "a cluster of another partition nothing is held for",
+            format!("arn:aws-cn:ecs:cn-north-1:{ACCOUNT}:cluster/beijing"),
             false,
         ),
     ];
@@ -391,8 +399,8 @@ async fn reports_a_configuration_that_does_not_exist() {
 #[tokio::test]
 async fn reading_changes_nothing_a_later_caller_sees() {
     let (router, engine) = build_router_with_engine();
-    let resource_arn = instance_arn("aws", "us-east-1", "i-0123456789abcdef0");
-    given_configuration(&engine, &resource_arn, Some(vec!["CPUUtilization".to_string()]));
+    let resource_arn = ecs_cluster_arn("aws", "us-east-1", "orders-production");
+    given_configuration(&engine, &resource_arn, Some(vec!["CpuUtilized".to_string()]));
 
     let (first_status, first) = read(&router, &resource_arn).await;
     assert_eq!(
