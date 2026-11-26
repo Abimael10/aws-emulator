@@ -3840,14 +3840,17 @@ pub const EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE: &str =
 /// it names the call that was refused and the permission a client has to grant, and carries
 /// nothing of the request.
 ///
-/// The CODE it travels under is the one `CreateExportTask` models for a parameter the service
-/// cannot act on: the operation's own error set is `InvalidParameterException`,
-/// `LimitExceededException`, `OperationAbortedException`, `ResourceAlreadyExistsException`,
-/// `ResourceNotFoundException` and `ServiceUnavailableException` (smithy_query: operation
-/// CreateExportTask), and `AccessDeniedException` is NOT among them — so a refusal of the
-/// destination travels as `InvalidParameterException`, the same code the absent-bucket refusal
-/// above carries, and an SDK's generated error handling matches it. Both sentences below travel
-/// that way ([`crate::ops::create_export_task`]).
+/// The CODE it travels under is the PERMISSION class: the bucket is there and the request is
+/// well formed, and what is missing is a grant, so CloudWatch Logs answers the AWS-common
+/// `AccessDeniedException` (HTTP 400) — the code a caller branches on to tell "go and grant the
+/// destination's policy" from "a parameter is specified incorrectly". The operation's own
+/// modelled error set does not list it (smithy_query: operation CreateExportTask gives
+/// `InvalidParameterException`, `LimitExceededException`, `OperationAbortedException`,
+/// `ResourceAlreadyExistsException`, `ResourceNotFoundException` and
+/// `ServiceUnavailableException`), so the SERVICE-modelled shape is widened into this
+/// operation's channel the way every other refusal of that class is. Both sentences below
+/// travel that way, while the absent-bucket refusal above stays the incorrectly-stated
+/// parameter it is ([`crate::ops::create_export_task`]).
 pub const EXPORT_DESTINATION_ACL_READ_WITHHELD_MESSAGE: &str =
     "GetBucketAcl call on the given bucket failed. Please check if CloudWatch Logs has been \
      granted permission to perform this operation.";

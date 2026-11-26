@@ -7,13 +7,12 @@
 //! service, that the permissions that work needs are granted — here the destination bucket's
 //! own policy, which is the only document that can grant a service principal anything — and
 //! answers the refusal of that class when one of them is not, leaving no export task behind.
-//! The class is the one the OPERATION MODELS for a `destination` the service cannot act on:
-//! `InvalidParameterException` (smithy_query: operation CreateExportTask, errors are
-//! InvalidParameterException / LimitExceededException / OperationAbortedException /
-//! ResourceAlreadyExistsException / ResourceNotFoundException / ServiceUnavailableException —
-//! there is no permission code among them, so a refusal under one an SDK generated from this
-//! model would never match), the same code a bucket that is not there takes (that half is the
-//! sibling suite's subject).
+//! The class is the PERMISSION class: what is missing is a grant and not a value the request
+//! stated, so CloudWatch Logs answers `AccessDeniedException` (HTTP 400), the code a caller
+//! branches on to tell "go and grant the destination's policy" from "a parameter is specified
+//! incorrectly" — which is the code a bucket that is not there still takes (that half is the
+//! sibling suite's subject, and the class distinction is
+//! `logs_export_task_destination_refusal_class.rs`'s).
 //! `CreateExportTask` states the requirement itself — "you must use credentials that have
 //! permission to write to the S3 bucket that you specify as the destination" — and an export
 //! establishes it, as the CloudWatch Logs service principal, by READING the destination
@@ -72,9 +71,9 @@ const OBJECT_WRITE_WITHHELD_MESSAGE: &str =
 /// a value, the default is exportedlogs" (`CreateExportTask$destinationPrefix`).
 const DEFAULT_PREFIX: &str = "exportedlogs";
 
-/// The code a `destination` CloudWatch Logs cannot act on is refused under — the one class this
-/// operation models for it, written out here rather than read from the service.
-const INVALID_PARAMETER: &str = "InvalidParameterException";
+/// The code a destination whose policy withholds one of the export's calls is refused under —
+/// the AWS-common permission class, written out here rather than read from the service.
+const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them.
@@ -704,9 +703,9 @@ async fn an_export_task_is_created_only_for_a_destination_that_grants_the_export
             Some(expected) => {
                 assert_eq!(
                     (status, error_code(&body).as_str()),
-                    (400, INVALID_PARAMETER),
+                    (400, ACCESS_DENIED),
                     "case {case:?}: a destination that withholds one of the export's calls must \
-                     be refused 400 {INVALID_PARAMETER}, got {status} with {body}"
+                     be refused 400 {ACCESS_DENIED}, got {status} with {body}"
                 );
                 assert_eq!(
                     refusal_message(&body),
