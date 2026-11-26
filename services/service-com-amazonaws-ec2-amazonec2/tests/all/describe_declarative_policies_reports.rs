@@ -667,7 +667,7 @@ async fn an_id_the_service_cannot_resolve_is_refused() {
         // with the id taken from the REQUEST.
         assert_eq!(
             error_message(&body),
-            format!("The report ID '{named}' does not exist."),
+            format!("The declarative-policies-report ID '{named}' does not exist"),
             "case {case:?}: expected the sentence this refusal is worded with, got {body}"
         );
         assert!(

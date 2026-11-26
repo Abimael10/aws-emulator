@@ -78,10 +78,6 @@ pub const INVALID_DECLARATIVE_POLICIES_REPORT_ID_MALFORMED: &str =
 pub const INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND: &str =
     "InvalidDeclarativePoliciesReportId.NotFound";
 
-/// How this service names the resource in the refusal the recording settles: "report", which
-/// is how the recorded `InvalidDeclarativePoliciesReportId.NotFound` sentence words it.
-const REPORT_RESOURCE_NAME: &str = "report";
-
 /// Whether `report_id` READS as a report id: the `report-` prefix every id this service mints
 /// for one carries ([`DECLARATIVE_POLICIES_REPORT_ID_PREFIX`]), followed by something.
 ///
@@ -112,9 +108,10 @@ pub fn declarative_policies_report_id_is_well_formed(report_id: &str) -> bool {
 /// `ResourceType` enum spells it ([`DECLARATIVE_POLICIES_REPORT_TAGGABLE_RESOURCE`]) and the
 /// id the REQUEST sent.
 ///
-/// The resource word differs from the not-found half's below because only that half's
-/// sentence is recorded: this one keeps the wording it was written with rather than inferring
-/// AWS's from the other half.
+/// The same resource word the not-found half below names it by: both halves of this family
+/// refuse one id KIND, and EC2 spells that kind one way in the sentence whichever half
+/// answers. Only the not-found half's sentence is recorded, so this half's resource word is
+/// INFERRED from that family rather than read off a recording of its own.
 pub fn invalid_declarative_policies_report_id_malformed<E>(report_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_DECLARATIVE_POLICIES_REPORT_ID_MALFORMED,
@@ -128,14 +125,23 @@ pub fn invalid_declarative_policies_report_id_malformed<E>(report_id: &str) -> S
 }
 
 /// Refuse a report id this organization started no report under: HTTP 400
-/// [`INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND`], in the sentence the recorded refusal
-/// carries — "The report ID '<id>' does not exist.", with the id the REQUEST sent.
+/// [`INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND`], in the sentence EC2 words every
+/// `Invalid<Kind>Id.NotFound` of a tagged resource kind with — `The <resource> ID '<id>' does
+/// not exist`, the resource spelled as that kind's `ResourceType` member spells it
+/// ([`DECLARATIVE_POLICIES_REPORT_TAGGABLE_RESOURCE`]) and the sentence ending at the quoted
+/// id, with the id taken from the REQUEST.
+///
+/// The same wording the sibling kinds of this crate are refused with (a capacity
+/// reservation's, an instance event window's, a capacity manager data export's): how the
+/// resource is spelled, and that the sentence stops after the quoted id, are facts of the
+/// FAMILY rather than of one operation, so no operation words its own.
 pub fn invalid_declarative_policies_report_id_not_found<E>(report_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_DECLARATIVE_POLICIES_REPORT_ID_NOT_FOUND,
         400,
         format!(
-            "The {REPORT_RESOURCE_NAME} ID '{report_id}' does not exist.",
+            "The {resource} ID '{report_id}' does not exist",
+            resource = DECLARATIVE_POLICIES_REPORT_TAGGABLE_RESOURCE,
             report_id = echoed_resource_id(report_id)
         ),
     )

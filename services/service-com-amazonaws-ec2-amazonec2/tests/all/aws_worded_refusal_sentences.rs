@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WORDING of twelve families of EC2 refusal, driven over the wire the service actually
+//! The WORDING of thirteen families of EC2 refusal, driven over the wire the service actually
 //! speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST carrying
 //! `Action=<operation>`, answered with XML (README.md / OPERATIONS.md "Wire protocol").
 //!
@@ -1116,5 +1116,145 @@ async fn each_plane_words_an_unknown_local_gateway_its_own_way() {
         element(&created, "localGatewayId").as_deref(),
         Some(held.as_str()),
         "the held gateway {held} must serve a create, got {created}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Family 13: the sentence that words an unresolvable declarative-policies report id
+// ---------------------------------------------------------------------------
+
+/// The code for a `ReportId` this organization started no report under.
+const REPORT_NOT_FOUND: &str = "InvalidDeclarativePoliciesReportId.NotFound";
+
+/// The code for a value that is no declarative-policies report id at all.
+const REPORT_MALFORMED: &str = "InvalidDeclarativePoliciesReportId.Malformed";
+
+/// A `ReportId` this organization started no report under is refused
+/// [`REPORT_NOT_FOUND`], and a value outside the id form every report id carries is refused
+/// [`REPORT_MALFORMED`] — each in the sentence EC2 words that family with for a TAGGED
+/// resource kind: `The <resource> ID '<id>' does not exist` and `The <resource> ID '<id>' is
+/// malformed`, where the resource is spelled as the `ResourceType` member that kind is tagged
+/// under spells it (`declarative-policies-report`), the sentence ends at the quoted id, and
+/// the id is the only variable part — taken from the request. It is the wording the sibling
+/// kinds of this service are refused with (`The capacity-reservation ID '…' does not exist`,
+/// `The instance-event-window ID '…' does not exist`), so one kind cannot word its own.
+///
+/// The rows span the operations that resolve such an id — the summary and the describe report
+/// every id they cannot resolve not found, whatever its form, while the cancel tells the two
+/// halves apart — and the ways an id is not one of the organization's: both published EC2 id
+/// suffix lengths with digits nothing was started for, the all-zero placeholder, another
+/// resource kind's prefix, the bare prefix, and a value that is no id at all.
+///
+/// Only the NOT-FOUND sentence is recorded for this kind; the malformed one is pinned as this
+/// family's wording — the resource spelled the same way, the sentence ending at the id —
+/// rather than as a sentence a recording of its own shows.
+#[tokio::test]
+async fn one_sentence_words_an_unresolvable_declarative_policies_report_id() {
+    let router = emulator();
+
+    // (case, the id the request names, the code the CANCEL answers for it)
+    let unresolvable: [(&str, &str, &str); 6] = [
+        (
+            "a long-form id nothing was started for",
+            "report-0123456789abcdef0",
+            REPORT_NOT_FOUND,
+        ),
+        (
+            "a short-form id nothing holds",
+            "report-0badf00d",
+            REPORT_NOT_FOUND,
+        ),
+        (
+            "the all-zero placeholder id",
+            "report-00000000000000000",
+            REPORT_NOT_FOUND,
+        ),
+        (
+            "another resource kind's prefix",
+            "cr-00000000000000001",
+            REPORT_MALFORMED,
+        ),
+        (
+            "the prefix with nothing after it",
+            "report-",
+            REPORT_MALFORMED,
+        ),
+        (
+            "a value that is no id at all",
+            "not-a-report-id",
+            REPORT_MALFORMED,
+        ),
+    ];
+
+    for (case, report_id, cancel_code) in unresolvable {
+        let not_found =
+            format!("The declarative-policies-report ID '{report_id}' does not exist");
+        // The two readers of a report answer the not-found half for every id they cannot
+        // resolve, whichever member the id arrived in.
+        let readers: [(&str, Vec<Param>); 2] = [
+            (
+                "GetDeclarativePoliciesReportSummary",
+                vec![param("ReportId", report_id)],
+            ),
+            (
+                "DescribeDeclarativePoliciesReports",
+                vec![param("ReportId.1", report_id)],
+            ),
+        ];
+        for (action, params) in readers {
+            assert_refusal(
+                &format!("{action} for {case}"),
+                &router,
+                action,
+                &params,
+                REPORT_NOT_FOUND,
+                &not_found,
+            )
+            .await;
+        }
+        // The cancel tells a value that is no report id from one inside the form, and words
+        // whichever half it answers by the same resource.
+        let malformed = format!("The declarative-policies-report ID '{report_id}' is malformed");
+        let sentence = if cancel_code == REPORT_MALFORMED {
+            malformed.as_str()
+        } else {
+            not_found.as_str()
+        };
+        assert_refusal(
+            &format!("CancelDeclarativePoliciesReport for {case}"),
+            &router,
+            "CancelDeclarativePoliciesReport",
+            &[param("ReportId", report_id)],
+            cancel_code,
+            sentence,
+        )
+        .await;
+    }
+
+    // A report the organization DOES hold is read back by the very operation whose sentence
+    // the rows above pinned, so neither sentence is the answer to every id.
+    let started = ok(
+        "a started report",
+        &router,
+        "StartDeclarativePoliciesReport",
+        &[
+            param("S3Bucket", "declarative-policy-reports"),
+            param("TargetId", "r-ab12"),
+        ],
+    )
+    .await;
+    let report_id = element(&started, "reportId")
+        .unwrap_or_else(|| panic!("the start must answer a reportId, got {started}"));
+    let summary = ok(
+        "the started report",
+        &router,
+        "GetDeclarativePoliciesReportSummary",
+        &[param("ReportId", &report_id)],
+    )
+    .await;
+    assert_eq!(
+        element(&summary, "reportId").as_deref(),
+        Some(report_id.as_str()),
+        "the started report {report_id} must be summarised, got {summary}"
     );
 }

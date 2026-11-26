@@ -1,19 +1,54 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ec2.ec2mr-inv2-stopping-an-instance-releases-its-public-ip-and-drops-it-from-the-running-filter ec2.vscan-public-dns-name-appears-only-once-vpc-dns-hostnames-is-enabled ec2.hibernate-restores-the-running-process-and-a-plain-stop-does-not ec2.op-contract-get-declarative-policies-report-summary ec2.ec2-elastic-ip-association-moves-which-address-serves-the-instance ec2.ec2-security-group-ingress-decides-whether-the-instance-answers ec2.timesync-chrony-in-the-guest-locks-onto-the-link-local-amazon-time-sync-source ec2.timesync-guest-clock-agrees-with-the-aws-api-date-header-inside-two-seconds
+Issue-Trace-Ids: ec2.ec2mr-inv2-stopping-an-instance-releases-its-public-ip-and-drops-it-from-the-running-filter ec2.vscan-public-dns-name-appears-only-once-vpc-dns-hostnames-is-enabled ec2.op-contract-get-declarative-policies-report-summary
 Issue-Shape-Id: com.amazonaws.ec2#AmazonEC2
 Issue-Key: ec2.ec2mr-inv2-stopping-an-instance-releases-its-public-ip-and-drops-it-from-the-running-filter|run#19|AssertionError|assert "PublicIpAddress" not in stopped, (
 Issue-Key: ec2.vscan-public-dns-name-appears-only-once-vpc-dns-hostnames-is-enabled|run#12|AssertionError|assert before.get("PublicDnsName") == "", (
-Issue-Key: ec2.hibernate-restores-the-running-process-and-a-plain-stop-does-not|_build#3|AssertionError|assert volume["Encrypted"] is True, (
 Issue-Key: ec2.op-contract-get-declarative-policies-report-summary|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: ec2.ec2-elastic-ip-association-moves-which-address-serves-the-instance|_poll_until#13|TimeoutError|raise TimeoutError(f"{description}: the run budget ended first; not graded")
-Issue-Key: ec2.ec2-security-group-ingress-decides-whether-the-instance-answers|_poll_until#15|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.timesync-chrony-in-the-guest-locks-onto-the-link-local-amazon-time-sync-source|_poll_until#13|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.timesync-guest-clock-agrees-with-the-aws-api-date-header-inside-two-seconds|_poll_until#13|Timeout|time.sleep(interval_s)
 Issue-Commit: cdd06381ed07ce191d4321618e22d6aefb363f32
 
-# ec2: 7 net-new causes — a stopped instance keeps its mapped public IPv4, PublicDnsName ignores enableDnsHostnames, RunInstances drops Ebs.Encrypted, GetDeclarativePoliciesReportSummary's not-found text is re-authored, and three guest data-plane scenarios never reach a verdict
+# ec2: a stopped instance kept its mapped public IPv4, PublicDnsName ignored enableDnsHostnames, RunInstances dropped Ebs.Encrypted, and GetDeclarativePoliciesReportSummary's not-found text was re-authored (causes 1-4 of a seven-cause bundle)
+
+> _Provenance: this report was filed as a bundle of seven causes, "ec2: 7 net-new causes — a
+> stopped instance keeps its mapped public IPv4, PublicDnsName ignores enableDnsHostnames,
+> RunInstances drops Ebs.Encrypted, GetDeclarativePoliciesReportSummary's not-found text is
+> re-authored, and three guest data-plane scenarios never reach a verdict". What is FIXED, and
+> what this report now records, is causes 1 to 4 — and every paragraph below that says otherwise,
+> including the "a fixer must close ALL SEVEN before submitting" sentence and the sections for
+> causes 5, 6 and 7, is SUPERSEDED:_
+>
+> * _Cause 1: a mapped public IPv4 is released at the instant the stop completes and the member is
+>   then not serialized
+>   (`services/service-com-amazonaws-ec2-amazonec2/src/state/instance_mapped_public_ipv4.rs`,
+>   called from `materialize_due_transitions`)._
+> * _Cause 2: `PublicDnsName` is gated on the owning VPC's `enableDnsHostnames` through the one
+>   reading of that attribute (`.../src/state/vpcs_and_security_groups.rs`,
+>   `vpc_hands_out_public_hostnames` / `public_dns_name_in_vpc`)._
+> * _Cause 3: a launch carries `BlockDeviceMappings[].Ebs.Encrypted` and its `KmsKeyId` into the
+>   created volume (`.../src/state/launched_root_volumes.rs`, `launch_root_block_device` /
+>   `store_launched_volume`), pinned by `.../tests/all/launch_root_block_device.rs`._
+> * _Cause 4: the `InvalidDeclarativePoliciesReportId.NotFound` refusal carries AWS's fixed text —
+>   the resource named as EC2's own `ResourceType` enum spells it, and the sentence ending at the
+>   quoted id (`.../src/state/declarative_policies_reports.rs`), pinned by family 13 of
+>   `.../tests/all/aws_worded_refusal_sentences.rs`._
+>
+> _The three `Issue-Key` lines and three `Issue-Trace-Ids` kept above are the checks that PASS.
+> Causes 5, 6 and 7 are unfixed and are re-filed, carrying their own keys and trace ids so that no
+> still-failing check is recorded as working:_
+>
+> * _`issues/things-that-do-not-work/20261118T093000Z-ec2-an-instances-guest-is-unreachable-from-outside-and-has-no-chrony.md`
+>   (causes 5, 6 and 7, with their four `Issue-Key` lines). Causes 5 and 6 need a core listener
+>   that can answer at a named address and port — `vendor/server/src/listeners.rs`, read-only from
+>   inside the emulator — before an instance's guest can be reached at the address the control
+>   plane publishes for it; cause 7 needs in-process guest programs (`chronyc`, `awk`, a `date`
+>   that parses an HTTP date)._
+>
+> _Cause 3's own check, `ec2.hibernate-restores-the-running-process-and-a-plain-stop-does-not`, is
+> deliberately NOT among the trace ids above even though that cause is fixed: its unit now diverges
+> later, on the address causes 5 and 6 are about — it reads the hibernated process back through a
+> guest agent at the instance's published IPv4 — so that trace id is carried by the re-filed report
+> instead, without an `Issue-Key`, the key it had being this report's fixed cause 3._
 
 > _Note: this issue was identified against the code base at commit `cdd06381ed07ce191d4321618e22d6aefb363f32`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
