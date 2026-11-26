@@ -3933,3 +3933,381 @@ async fn a_playback_address_serves_nothing_it_cannot_resolve() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The documented span, along the axes the suite above holds fixed.
+// ---------------------------------------------------------------------------
+//
+// [`MAX_RANGE_SPAN_SECS`], [`RANGE_TOO_WIDE`] and [`RANGE_OUT_OF_ORDER`] above
+// state the bound and its two sentences; the two suites below vary what that one
+// holds fixed — where the range sits on the time line, which member addresses the
+// stream, which timestamp field is selected on — and what an admitted range is
+// actually answered with.
+
+/// The code a request refused on its arguments alone carries.
+const INVALID_ARGUMENT: &str = "InvalidArgumentException";
+
+/// The code a range the addressed archive holds no fragment in carries.
+const NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// An operation reading a timestamp range whose `EndTimestamp` documents a
+/// maximum span, with whatever a request to it needs beside that range, as the
+/// two suites below address it.
+#[derive(Clone, Copy)]
+struct AddressedRange {
+    /// The path a request is posted to.
+    path: &'static str,
+    /// The member a request carries its fragment selector in.
+    selector_member: &'static str,
+    /// The `PlaybackMode` a streaming-session request has to ask for to carry a
+    /// range at all; [`None`] for the clip, which has no playback mode.
+    playback_mode: Option<&'static str>,
+}
+
+/// `GetClip`, which reads its range from `ClipFragmentSelector`.
+const CLIP: AddressedRange = AddressedRange {
+    path: "/getClip",
+    selector_member: "ClipFragmentSelector",
+    playback_mode: None,
+};
+
+/// `GetHLSStreamingSessionURL` in `mode`, which reads its range from
+/// `HLSFragmentSelector`.
+const fn hls(mode: &'static str) -> AddressedRange {
+    AddressedRange {
+        path: "/getHLSStreamingSessionURL",
+        selector_member: "HLSFragmentSelector",
+        playback_mode: Some(mode),
+    }
+}
+
+/// `GetDASHStreamingSessionURL` in `mode`, which reads its range from
+/// `DASHFragmentSelector`.
+const fn dash(mode: &'static str) -> AddressedRange {
+    AddressedRange {
+        path: "/getDASHStreamingSessionURL",
+        selector_member: "DASHFragmentSelector",
+        playback_mode: Some(mode),
+    }
+}
+
+/// A request to `operation` addressing `stream` (the stream-naming members),
+/// selecting on `selector_type` over the range `[start, end]` given as offsets
+/// in seconds from [`T0_SECS`].
+fn addressed_range_request(
+    operation: AddressedRange,
+    stream: &serde_json::Value,
+    selector_type: &str,
+    start: i64,
+    end: i64,
+) -> serde_json::Value {
+    let mut extra = serde_json::json!({
+        operation.selector_member: {
+            "FragmentSelectorType": selector_type,
+            "TimestampRange": {
+                "StartTimestamp": T0_SECS + start,
+                "EndTimestamp": T0_SECS + end,
+            },
+        },
+    });
+    if let Some(mode) = operation.playback_mode {
+        extra["PlaybackMode"] = serde_json::json!(mode);
+    }
+    with_members(stream, &extra)
+}
+
+/// RULE: where a timestamp range's `EndTimestamp` documents how far past the
+/// start it may sit, a range reaching further than that span is refused
+/// `InvalidArgumentException` (400) with one fixed sentence naming that
+/// documented span — whatever else the request varies — and the other clause of
+/// the same documented sentence (the end must be later than the start) keeps its
+/// own sentence.
+///
+/// The rows differ along what the rule generalises over and the suite above holds
+/// fixed: where the range sits on the time line, which member addresses the
+/// stream, which timestamp field is selected on, how far past the span the range
+/// reaches, which operation reads it, which playback mode carries it, and which
+/// of the sentence's two clauses is broken.
+#[tokio::test]
+async fn the_documented_span_refusal_holds_however_the_range_is_addressed_and_placed() {
+    let harness = seeded();
+    let by_name = serde_json::json!({ "StreamName": STREAM });
+    let by_arn = serde_json::json!({ "StreamARN": harness.arn.clone() });
+    // (case, operation, the stream-naming members, selector, start, end, sentence)
+    let rows: Vec<(&str, AddressedRange, &serde_json::Value, &str, i64, i64, &str)> = vec![
+        (
+            "one second past the span, on a clip",
+            CLIP,
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS + 1,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "thirty days, on a clip read on server timestamps",
+            CLIP,
+            &by_name,
+            "SERVER_TIMESTAMP",
+            0,
+            30 * 86_400,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "a year, on a clip addressed by StreamARN",
+            CLIP,
+            &by_arn,
+            "PRODUCER_TIMESTAMP",
+            0,
+            365 * 86_400,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "twice the span, on a clip starting a day before the archive",
+            CLIP,
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            -86_400,
+            2 * MAX_RANGE_SPAN_SECS,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "a range that ends where it starts, on a clip",
+            CLIP,
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            0,
+            0,
+            RANGE_OUT_OF_ORDER,
+        ),
+        (
+            "a range that runs backwards, on a clip",
+            CLIP,
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            40,
+            10,
+            RANGE_OUT_OF_ORDER,
+        ),
+        (
+            "one second past the span, on an ON_DEMAND HLS session",
+            hls("ON_DEMAND"),
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS + 1,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "thirty days, on a LIVE_REPLAY HLS session by StreamARN",
+            hls("LIVE_REPLAY"),
+            &by_arn,
+            "SERVER_TIMESTAMP",
+            0,
+            30 * 86_400,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "a range that ends where it starts, on an ON_DEMAND HLS session",
+            hls("ON_DEMAND"),
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            0,
+            0,
+            RANGE_OUT_OF_ORDER,
+        ),
+        (
+            "an hour past the span, on an ON_DEMAND MPEG-DASH session",
+            dash("ON_DEMAND"),
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS + 3_600,
+            RANGE_TOO_WIDE,
+        ),
+        (
+            "a hundred days, on a LIVE_REPLAY MPEG-DASH session",
+            dash("LIVE_REPLAY"),
+            &by_name,
+            "PRODUCER_TIMESTAMP",
+            0,
+            100 * 86_400,
+            RANGE_TOO_WIDE,
+        ),
+    ];
+
+    for (case, operation, stream, selector_type, start, end, expected) in rows {
+        let body = addressed_range_request(operation, stream, selector_type, start, end);
+        let response = harness.post(operation.path, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "case {case:?}: expected HTTP 400, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        let reported = body_json(&response);
+        let code = reported["__type"].as_str().unwrap_or_default();
+        let message = reported["Message"]
+            .as_str()
+            .or_else(|| reported["message"].as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            (code, message),
+            (INVALID_ARGUMENT, expected),
+            "case {case:?}: expected ({INVALID_ARGUMENT:?}, {expected:?}), got \
+             ({code:?}, {message:?})"
+        );
+        // The sentence is fixed: nothing the request carried — the stream it
+        // addressed, either bound, the width it asked for — can be read out of it.
+        for carried in [
+            stream
+                .as_object()
+                .and_then(|members| members.values().next())
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            (T0_SECS + start).to_string(),
+            (T0_SECS + end).to_string(),
+            (end - start).to_string(),
+        ] {
+            assert!(
+                !carried.is_empty() && !message.contains(&carried),
+                "case {case:?}: the refusal must carry nothing of the request, but \
+                 {message:?} contains {carried:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the documented span is INCLUSIVE — a range exactly that wide, or
+/// narrower, is never refused for its span, and the request is then answered by
+/// the addressed archive: served with the media it holds when the range selects a
+/// fragment, and a missing resource when it holds none.
+///
+/// The rows differ along the width (the published bound, one second inside it,
+/// the narrowest range there is), which operation reads it, which timestamp
+/// field is selected on, and whether the archive answers the range at all.
+#[tokio::test]
+async fn a_range_on_or_inside_its_documented_span_is_answered_by_the_archive() {
+    let harness = seeded();
+    let by_name = serde_json::json!({ "StreamName": STREAM });
+    // (case, operation, selector, start, end, the status expected)
+    let rows: Vec<(&str, AddressedRange, &str, i64, i64, u16)> = vec![
+        (
+            "exactly the published span, on a clip over an archive that answers",
+            CLIP,
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS,
+            200,
+        ),
+        (
+            "one second inside the span, on a clip over an archive that answers",
+            CLIP,
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS - 1,
+            200,
+        ),
+        (
+            "exactly the published span, on a clip read on server timestamps",
+            CLIP,
+            "SERVER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS,
+            200,
+        ),
+        (
+            "the narrowest range, on a clip between two fragments",
+            CLIP,
+            "PRODUCER_TIMESTAMP",
+            1,
+            2,
+            404,
+        ),
+        (
+            "exactly the published span, on a clip ending before the archive",
+            CLIP,
+            "PRODUCER_TIMESTAMP",
+            -MAX_RANGE_SPAN_SECS - 1,
+            -1,
+            404,
+        ),
+        (
+            "exactly the published span, on an ON_DEMAND HLS session",
+            hls("ON_DEMAND"),
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS,
+            200,
+        ),
+        (
+            "exactly the published span, on a LIVE_REPLAY HLS session on server timestamps",
+            hls("LIVE_REPLAY"),
+            "SERVER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS,
+            200,
+        ),
+        (
+            "exactly the published span, on an ON_DEMAND MPEG-DASH session",
+            dash("ON_DEMAND"),
+            "PRODUCER_TIMESTAMP",
+            0,
+            MAX_RANGE_SPAN_SECS,
+            200,
+        ),
+        (
+            "exactly the published span, on an MPEG-DASH session before the archive",
+            dash("ON_DEMAND"),
+            "PRODUCER_TIMESTAMP",
+            -MAX_RANGE_SPAN_SECS - 1,
+            -1,
+            404,
+        ),
+    ];
+
+    for (case, operation, selector_type, start, end, status) in rows {
+        let body = addressed_range_request(operation, &by_name, selector_type, start, end);
+        let response = harness.post(operation.path, &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        if status == 404 {
+            let reported = body_json(&response);
+            let code = reported["__type"].as_str().unwrap_or_default();
+            assert_eq!(
+                code, NOT_FOUND,
+                "case {case:?}: expected {NOT_FOUND:?}, got {reported:?}"
+            );
+            continue;
+        }
+        if operation.path == CLIP.path {
+            assert_eq!(
+                content_type(&response),
+                MP4_FRAGMENT_TYPE,
+                "case {case:?}: GetClip downloads an MP4 clip"
+            );
+            assert_is_mp4(case, response.body());
+            continue;
+        }
+        // A session call answers the URL a player fetches, which must lead back
+        // to this emulator rather than to a real AWS host.
+        let reported = body_json(&response);
+        let url = reported
+            .as_object()
+            .and_then(|members| members.values().next())
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            url.starts_with(&format!("https://{EMULATOR_ENDPOINT}")),
+            "case {case:?}: expected a session URL on this emulator, got {reported:?}"
+        );
+    }
+}
+
+

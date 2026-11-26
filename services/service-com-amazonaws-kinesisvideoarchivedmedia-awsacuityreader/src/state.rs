@@ -950,10 +950,11 @@ pub fn session_parameters(request: SessionRequest<'_>) -> Result<SessionParamete
             ));
         }
         // STRICTER than the `TimestampRange` of `ListFragments`, which accepts a
-        // single-instant range: both streaming ranges' own documentation says the
-        // end "must be later than the StartTimestamp value", wording that range
-        // does not carry. The divergence is the model's, not an inconsistency
-        // here.
+        // single-instant range and bounds no span: both streaming ranges' own
+        // documentation says the end "must be within 24 hours of the specified
+        // StartTimestamp, and it must be later than the StartTimestamp value",
+        // wording that range does not carry. The divergence is the model's, not
+        // an inconsistency here.
         if let Some(end_millis) = range.end_millis {
             if end_millis <= start_millis {
                 return Err(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string());

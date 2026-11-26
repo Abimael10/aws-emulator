@@ -556,6 +556,9 @@ async fn a_session_with_no_fragments_to_serve_is_not_found() {
                 "DASHFragmentSelector": {
                     "FragmentSelectorType": "PRODUCER_TIMESTAMP",
                     "TimestampRange": {
+                        // Inside the 24 hours the range's own `EndTimestamp`
+                        // admits, so this row is answered by the archive rather
+                        // than refused for its span.
                         "StartTimestamp": T0_SECS + 100_000,
                         "EndTimestamp": T0_SECS + 150_000,
                     },
