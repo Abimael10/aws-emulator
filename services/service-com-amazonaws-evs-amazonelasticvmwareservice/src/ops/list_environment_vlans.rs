@@ -198,10 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The environment this list reports the VLANs of, resolved by the one two-step
         // every environment-scoped list of this service applies
         // ([`crate::state::ComAmazonawsEvsAmazonelasticvmwareserviceState::listed_environment`]):
-        // a regional resource is only listable at the endpoint of the Region it was
-        // created in, and a list is refused while the environment it addresses is still
-        // being built. All this operation adds is which of ITS modelled errors carries
-        // each outcome.
+        // a list addresses the environment it names by the rule every operation that acts
+        // on one shares — at the endpoint of the Region that environment was created in,
+        // and only while its record has not reached DELETED — and a list is refused while
+        // the environment it addresses is still being built. All this operation adds is
+        // which of ITS modelled errors carries each outcome.
         let environment = state
             .listed_environment(&region, &input.environment_id)
             .map_err(|refusal| match refusal {

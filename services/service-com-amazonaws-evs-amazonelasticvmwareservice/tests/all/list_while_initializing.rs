@@ -4,7 +4,8 @@
 //!
 //! The rule under test: an operation that LISTS the resources of one environment is
 //! refused with `ValidationException` — HTTP 400 — for exactly as long as that
-//! environment is still initializing, and answered in every other state.
+//! environment is still initializing, and answered in every other state the list
+//! addresses the environment in.
 //!
 //! "The input fails to satisfy the specified constraints. You will see this exception
 //! if invalid inputs are provided for any of the Amazon EVS environment operations, or
@@ -14,6 +15,12 @@
 //! `EnvironmentState` is `CREATING`; the other four values the model declares —
 //! `CREATED`, `DELETING`, `DELETED`, `CREATE_FAILED` (`smithy_query(query="shape",
 //! shape="EnvironmentState")`) — are past initialization.
+//!
+//! This refusal is the LATER half of what a list resolves: whether the request addresses
+//! the environment at all is decided first, by the one addressing rule every operation
+//! that acts on an environment shares, so a record that has reached `DELETED` is reported
+//! absent rather than reaching this rule (`tests/all/deleted_environment_lists.rs` and
+//! `tests/all/environment_addressing_rule.rs` own that half).
 //!
 //! The rule is about the CLASS of list operations addressed to an environment resource,
 //! not about one of them, so every table here spans all four
@@ -52,20 +59,35 @@ const VCENTER: &str = "VCENTER";
 /// (`smithy_query(query="shape", shape="EntitlementType")`).
 const WINDOWS_SERVER: &str = "WINDOWS_SERVER";
 
+/// What a list addressed to an environment in one state answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The `ValidationException` of the rule this suite owns: the environment is still
+    /// initializing.
+    RefusedAsInitializing,
+    /// The `ResourceNotFoundException` of the ADDRESSING rule, which decides whether a
+    /// list resolves the environment at all before this suite's rule is reached: a record
+    /// that has reached `DELETED` is addressed by no list ("The resource might not be
+    /// specified correctly, or it may have a `state` of `DELETED`",
+    /// `ResourceNotFoundException` doc). `tests/all/deleted_environment_lists.rs` and
+    /// `tests/all/environment_addressing_rule.rs` own that rule; this row is here so the
+    /// state table stays complete.
+    ReportedAbsent,
+    /// The page itself.
+    Page,
+}
+
 /// The `EnvironmentState` values the model declares
-/// (`smithy_query(query="shape", shape="EnvironmentState")`), each paired with whether
-/// an environment in that state is STILL INITIALIZING — `CREATING` and nothing else.
-const ENVIRONMENT_STATES: [(&str, bool); 5] = [
-    ("CREATING", true),
-    ("CREATED", false),
-    // `DELETED` answers a list as well: this rule is about the INITIALIZING state only,
-    // and whether a `DELETED` environment should instead be reported absent ("it may
-    // have a `state` of `DELETED`", `ResourceNotFoundException` doc) is a separate
-    // question this suite deliberately does not decide — the handlers' lookup is
-    // untouched here.
-    ("DELETING", false),
-    ("DELETED", false),
-    ("CREATE_FAILED", false),
+/// (`smithy_query(query="shape", shape="EnvironmentState")`), each paired with what a
+/// list addressed to an environment in that state answers — the initializing refusal for
+/// `CREATING` and nothing else, and a page for every state that is both past
+/// initialization and still addressable.
+const ENVIRONMENT_STATES: [(&str, Answer); 5] = [
+    ("CREATING", Answer::RefusedAsInitializing),
+    ("CREATED", Answer::Page),
+    ("DELETING", Answer::Page),
+    ("DELETED", Answer::ReportedAbsent),
+    ("CREATE_FAILED", Answer::Page),
 ];
 
 /// A Region other than [`REGION`], so a request signed for it reaches another endpoint
@@ -308,23 +330,27 @@ async fn a_list_is_refused_in_the_initializing_state_and_answered_in_every_other
     // soon as that transition came due.
     settle(&router);
 
-    for (state, initializing) in ENVIRONMENT_STATES {
+    for (state, answer) in ENVIRONMENT_STATES {
         force_state(&router, &id, state);
         for (operation, request, member) in list_requests(&id, &connector) {
             let case = format!("{operation} against an environment in {state}");
             let (status, body) = call(&router, operation, &request).await;
-            if initializing {
-                assert_initializing_refusal(&case, status, &body);
-            } else {
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: {state} is not the initializing state, so the list is \
-                     answered; got {status} {body}"
-                );
-                assert!(
-                    body[member].is_array(),
-                    "case {case:?}: expected a page in {member}, got {body}"
-                );
+            match answer {
+                Answer::RefusedAsInitializing => assert_initializing_refusal(&case, status, &body),
+                Answer::ReportedAbsent => {
+                    assert_environment_not_found(&case, status, &body, &id)
+                }
+                Answer::Page => {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: {state} is past initialization and still addressable, \
+                         so the list is answered; got {status} {body}"
+                    );
+                    assert!(
+                        body[member].is_array(),
+                        "case {case:?}: expected a page in {member}, got {body}"
+                    );
+                }
             }
         }
     }

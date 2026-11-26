@@ -630,8 +630,14 @@ pub fn environment_not_found_validation(environment_id: &str) -> ValidationExcep
 /// environment in and the one it leaves when the transition the clock owes it comes due
 /// ([`TRANSITION_DELAY`]). Every other `EnvironmentState` the model declares —
 /// `CREATED`, `DELETING`, `DELETED`, `CREATE_FAILED` (`smithy_query(query="shape",
-/// shape="EnvironmentState")`) — is past initialization, built or abandoned, so a list
-/// against one of those is answered: the doc names the initializing case and no other.
+/// shape="EnvironmentState")`) — is past initialization, built or abandoned, so this
+/// half of the step passes them: the doc names the initializing case and no other.
+///
+/// It is only HALF of what a list resolves, and the later half: an environment is asked
+/// about here once a request ADDRESSES it at all
+/// ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::listed_environment`]), so a record
+/// that has reached [`STATE_DELETED`] never reaches this predicate — it was already
+/// reported absent.
 ///
 /// The sentence is built from the request and the state the store holds, exactly as the
 /// equivalent precondition in `CreateEnvironmentHost` is, and its `fieldList` entry
@@ -664,7 +670,8 @@ pub fn list_refused_while_initializing(
 #[derive(Debug)]
 pub enum EnvironmentListRefusal {
     /// The request addresses no environment this service holds at the endpoint it was
-    /// sent to ([`environment_not_found`]).
+    /// sent to, the id naming nothing or naming a record that has reached
+    /// [`STATE_DELETED`] ([`environment_not_found`]).
     NotFound(ResourceNotFoundException),
     /// It addresses an environment that is still initializing
     /// ([`list_refused_while_initializing`]).
@@ -3302,21 +3309,30 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// that read answers instead of a page.
     ///
     /// The whole two-step every list addressed to ONE environment applies, stated once:
-    /// the addressed record is resolved at the endpoint of the Region it was created in
-    /// ([`Self::environment_in_region`]) and an id this service holds no such record for
-    /// is reported absent ([`environment_not_found`]); a record that is still being built
-    /// refuses the list rather than reporting the half-built inventory of one
-    /// ([`list_refused_while_initializing`]). It lives beside the two halves it joins, so
-    /// no two environment-scoped listings of this service can disagree about which
-    /// records a list resolves or about which states refuse one; a handler lifts the
-    /// refusal into its own modelled errors with one `map_err`.
+    /// the addressed record is the one the ADDRESSING rule every operation that acts on
+    /// an environment shares resolves ([`Self::live_environment_in_region`]) — held at
+    /// the endpoint of the Region it was created in and not yet at [`STATE_DELETED`] —
+    /// and anything else is reported absent ([`environment_not_found`]); a record that is
+    /// still being built then refuses the list rather than reporting the half-built
+    /// inventory of one ([`list_refused_while_initializing`]). It lives beside the two
+    /// halves it joins, so no two environment-scoped listings of this service can
+    /// disagree about which records a list resolves or about which states refuse one; a
+    /// handler lifts the refusal into its own modelled errors with one `map_err`.
+    ///
+    /// A list is a request that acts on the environment it names, so it addresses exactly
+    /// the records its thirteen siblings do: an environment that has reached `DELETED` is
+    /// gone for a reader of its inventory as much as for a writer ("The resource might
+    /// not be specified correctly, or it may have a `state` of `DELETED`",
+    /// `ResourceNotFoundException` doc). The two readers that deliberately report a
+    /// finished environment, `GetEnvironment` and `ListEnvironments`, are the only ones
+    /// outside the rule, and neither is addressed to one environment's inventory.
     pub fn listed_environment(
         &self,
         region: &str,
         environment_id: &str,
     ) -> Result<&StoredEnvironment, EnvironmentListRefusal> {
         let environment = self
-            .environment_in_region(region, environment_id)
+            .live_environment_in_region(region, environment_id)
             .ok_or_else(|| {
                 EnvironmentListRefusal::NotFound(environment_not_found(environment_id))
             })?;
@@ -3364,7 +3380,9 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// The two readers that deliberately report a finished environment —
     /// `GetEnvironment`, which describes the record whatever state it has reached, and
     /// `ListEnvironments`, which filters by `EnvironmentState` on request — resolve
-    /// through [`Self::environment_in_region`] instead.
+    /// through [`Self::environment_in_region`] instead. Every other operation reaches
+    /// this rule, the four lists addressed to one environment through
+    /// [`Self::listed_environment`], which adds the initializing refusal on top of it.
     pub fn live_environment_in_region(
         &self,
         region: &str,

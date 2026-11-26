@@ -17,7 +17,9 @@
 //! Every operation of this service that acts on an environment applies that one rule
 //! through the state module's `live_environment_in_region(_mut)` /
 //! `live_environment_by_arn(_mut)`, so the table below spans ALL of them — the
-//! environment-id-addressed ones and the three ARN-addressed tagging ones — rather than
+//! environment-id-addressed ones, the four lists addressed to one environment (which
+//! reach the rule through the state module's `listed_environment`) and the three
+//! ARN-addressed tagging ones — rather than
 //! one. What the rows differ along is the operation and the way it addresses the
 //! environment (by `environmentId`, or by `resourceArn`), and what each axis varies is
 //! the state of the record (`CREATED`, `DELETING`, `DELETED`) and the Region the request
@@ -272,6 +274,34 @@ fn rows(fixture: &Fixture) -> Vec<Row> {
         Row {
             operation: "GetDepotUrl",
             request: json!({ "environmentId": environment }),
+            refusal: Refusal::EnvironmentNotFound,
+        },
+        // The four lists addressed to ONE environment are part of this rule too: a list
+        // acts on the environment it names, so it resolves the same records its siblings
+        // do. The state each one is refused in beyond this rule — the environment still
+        // initializing — is `tests/all/list_while_initializing.rs`.
+        Row {
+            operation: "ListEnvironmentVlans",
+            request: json!({ "environmentId": environment }),
+            refusal: Refusal::EnvironmentNotFound,
+        },
+        Row {
+            operation: "ListEnvironmentHosts",
+            request: json!({ "environmentId": environment }),
+            refusal: Refusal::EnvironmentNotFound,
+        },
+        Row {
+            operation: "ListEnvironmentConnectors",
+            request: json!({ "environmentId": environment }),
+            refusal: Refusal::EnvironmentNotFound,
+        },
+        Row {
+            operation: "ListVmEntitlements",
+            request: json!({
+                "environmentId": environment,
+                "connectorId": connector,
+                "entitlementType": WINDOWS_SERVER,
+            }),
             refusal: Refusal::EnvironmentNotFound,
         },
         Row {

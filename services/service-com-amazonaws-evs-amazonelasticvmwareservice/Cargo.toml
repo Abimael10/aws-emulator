@@ -49,6 +49,9 @@ service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod::dir!` declares one
+# module per `tests/all/<name>.rs`, so a new suite needs no declaration.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 

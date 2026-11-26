@@ -21,12 +21,15 @@
 //!   entitlement's status enum declares nothing between tracking and stopped, so its
 //!   usage tracking stops at once and `stoppedAt` is stamped.
 //! * An entitlement is read through the connector it was created through
-//!   (`ListVmEntitlements`), and a connector that has reached `DELETED` resolves to
-//!   nothing ("The resource might not be specified correctly, or it may have a `state` of
+//!   (`ListVmEntitlements`), and both handles that list resolves go away with the
+//!   environment: once the deletion has come due the environment itself is addressed by
+//!   no list ("The resource might not be specified correctly, or it may have a `state` of
 //!   `DELETED`", `ResourceNotFoundException` doc;
-//!   `tests/all/list_vm_entitlements_connector.rs` owns that rule, and the in-flight read
-//!   the stopped records are kept for too) — so once the deletion has come due the
-//!   entitlements of the environment are no longer listable through it.
+//!   `tests/all/deleted_environment_lists.rs` owns that rule), and the connector has
+//!   reached `DELETED` as well (`tests/all/list_vm_entitlements_connector.rs` owns that
+//!   one, and the in-flight read the stopped records are kept for too) — so the stopped
+//!   entitlements of the environment are no longer listable, and what became of them is
+//!   read from the store.
 //!
 //! The harness (`emulator`, `call`, `create_settled`, `settle`) is the one
 //! `environment_lifecycle` already owns, so every test drives the service the way a
@@ -168,6 +171,59 @@ async fn assert_connectors(
             &connector["modifiedAt"], expected_modified_at,
             "case {case:?}: connector {}: expected modifiedAt {expected_modified_at}, got {}",
             connector["connectorId"], connector["modifiedAt"]
+        );
+    }
+}
+
+/// Every connector record one environment holds, read from the store.
+///
+/// The store rather than the wire, for the same reason [`stored_entitlements`] is read
+/// there: a list is addressed to the environment it names, so once that environment has
+/// reached `DELETED` no list resolves it at all
+/// (`tests/all/deleted_environment_lists.rs` owns that rule) — this is what shows what
+/// became of the connector records behind the refusal.
+fn stored_connectors(router: &Emulator, environment_id: &str) -> Vec<evs::state::StoredConnector> {
+    let store = evs::state::service_state(&*router.engine)
+        .expect("the in-memory engine carries this service's store");
+    let store = store.lock();
+    store
+        .environments
+        .get(environment_id)
+        .unwrap_or_else(|| panic!("the store holds the environment {environment_id}"))
+        .connectors
+        .values()
+        .cloned()
+        .collect()
+}
+
+/// The store-side form of [`assert_connectors`], for an environment that has reached
+/// `DELETED`: the same count, state and `modifiedAt` claim, read where the records still
+/// are.
+fn assert_stored_connectors(
+    router: &Emulator,
+    case: &str,
+    environment_id: &str,
+    expected_count: usize,
+    expected_state: &str,
+    expected_modified_at: &Value,
+) {
+    let expected_modified_at_ms = epoch_millis(expected_modified_at);
+    let stored = stored_connectors(router, environment_id);
+    assert_eq!(
+        stored.len(),
+        expected_count,
+        "case {case:?}: expected {expected_count} connector(s), got {stored:?}"
+    );
+    for connector in &stored {
+        assert_eq!(
+            connector.state, expected_state,
+            "case {case:?}: connector {}: expected state {expected_state}, got {}",
+            connector.connector_id, connector.state
+        );
+        assert_eq!(
+            connector.modified_at_ms, expected_modified_at_ms,
+            "case {case:?}: connector {}: expected modifiedAt {expected_modified_at_ms}, got {}",
+            connector.connector_id, connector.modified_at_ms
         );
     }
 }
@@ -351,7 +407,8 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
         }
 
         // Once the deletion comes due the environment and its connectors are DELETED
-        // together: one clock, one `modifiedAt`.
+        // together: one clock, one `modifiedAt`. The connectors are read from the store
+        // now: a DELETED environment is addressed by no list.
         settle(&router);
         let settled = fetched_environment(&router, case, &environment).await;
         assert_eq!(
@@ -359,21 +416,21 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
             json!("DELETED"),
             "case {case:?}: the environment settles to DELETED, got {settled}"
         );
-        assert_connectors(
+        assert_stored_connectors(
             &router,
             case,
             &environment,
             connector_types.len(),
             "DELETED",
             &settled["modifiedAt"],
-        )
-        .await;
+        );
 
-        // And with the connector they are read through DELETED, the stopped entitlements
-        // are no longer listable through it: the record it reached is the one a lookup
-        // resolves to nothing. While the deletion was still in flight the same list
-        // reported the stopped records — `tests/all/list_vm_entitlements_connector.rs`
-        // owns both halves of that rule, at the states this one only passes through.
+        // And the stopped entitlements are no longer listable at all: the environment the
+        // list addresses has reached DELETED, so the list resolves nothing to report from
+        // — `tests/all/deleted_environment_lists.rs` owns that rule, and
+        // `tests/all/list_vm_entitlements_connector.rs` the connector handle's own half,
+        // at the states this one only passes through. While the deletion was still in
+        // flight the same list reported the stopped records.
         let (status, body) = call(
             &router,
             "ListVmEntitlements",
@@ -386,8 +443,8 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
         .await;
         assert_eq!(
             status, 400,
-            "case {case:?}: a list through a connector the environment's deletion has \
-             DELETED is refused, got {status} {body}"
+            "case {case:?}: a list addressed to an environment that has reached DELETED is \
+             refused, got {status} {body}"
         );
         assert_eq!(
             error_type(&body).rsplit(['#', '/']).next().unwrap_or(""),
@@ -397,8 +454,8 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
         );
         assert_eq!(
             body["resourceId"],
-            json!(vcenter),
-            "case {case:?}: resourceId must echo the requested connector, got {body}"
+            json!(environment),
+            "case {case:?}: resourceId must echo the requested environment, got {body}"
         );
 
         // The control environment is untouched by every delete above.
@@ -500,23 +557,22 @@ async fn a_deleted_environment_holds_no_resource_created_while_it_was_going_away
         json!("DELETED"),
         "the environment settles to DELETED, got {settled}"
     );
-    let listed = listed_connectors(&router, "during the delete", &environment).await;
+    let listed = stored_connectors(&router, &environment);
     for connector in &listed {
         assert_eq!(
-            connector["state"],
-            json!("DELETED"),
-            "connector {}: a DELETED environment holds no live connector, got {connector}",
-            connector["connectorId"]
+            connector.state, "DELETED",
+            "connector {}: a DELETED environment holds no live connector, got {connector:?}",
+            connector.connector_id
         );
     }
     let ids: Vec<&str> = listed
         .iter()
-        .filter_map(|connector| connector["connectorId"].as_str())
+        .map(|connector| connector.connector_id.as_str())
         .collect();
     for expected in [&first, &during] {
         assert!(
             ids.contains(&expected.as_str()),
-            "the list must still report the connector {expected}, got {ids:?}"
+            "the store must still hold the connector {expected}, got {ids:?}"
         );
     }
     for entitlement in stored_entitlements(&router, &environment) {

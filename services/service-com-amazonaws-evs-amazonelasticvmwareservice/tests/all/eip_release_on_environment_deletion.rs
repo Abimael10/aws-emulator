@@ -237,6 +237,15 @@ async fn an_environment_being_deleted_releases_its_eips_and_takes_no_new_associa
             );
         }
 
+        // The deletion released every association the VLAN held, in this service's own
+        // record as much as in EC2's — read while the environment is still DELETING, the
+        // last state in which a list addresses it at all.
+        let left = vlan_associations(&router, &holder).await;
+        assert!(
+            left.is_empty(),
+            "case {case:?}: a departing environment's VLAN holds no association, got {left:?}"
+        );
+
         // Past the transition the deletion has come due.
         std::thread::sleep(PAST_THE_TRANSITION);
         let settled = environment_state(&router, &holder, case).await;
@@ -261,12 +270,25 @@ async fn an_environment_being_deleted_releases_its_eips_and_takes_no_new_associa
             );
         }
 
-        // The deletion released every association the VLAN held, in this service's own
-        // record as much as in EC2's.
-        let left = vlan_associations(&router, &holder).await;
+        // And once the deletion has come due nothing reports a VLAN of that environment
+        // at all: the record is addressed by no list either ("it may have a state of
+        // DELETED"), which `tests/all/deleted_environment_lists.rs` owns.
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "ListEnvironmentVlans",
+            &json!({ "environmentId": holder.environment_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a list of a deleted environment's VLANs expected HTTP 400, got \
+             {status} {body}"
+        );
         assert!(
-            left.is_empty(),
-            "case {case:?}: a deleted environment's VLAN holds no association, got {left:?}"
+            error_type(&body).contains("ResourceNotFoundException"),
+            "case {case:?}: expected a ResourceNotFoundException, got {} in {body}",
+            error_type(&body)
         );
         for (index, (allocation_id, public_ip, association_id)) in held.iter().enumerate() {
             let (held_ip, held_association) = ec2_address(&router, region, allocation_id).await;

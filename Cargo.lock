@@ -15185,6 +15185,7 @@ dependencies = [
 name = "service-com-amazonaws-evs-amazonelasticvmwareservice"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
