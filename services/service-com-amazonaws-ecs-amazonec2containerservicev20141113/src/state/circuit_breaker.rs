@@ -71,21 +71,21 @@ pub const CIRCUIT_BREAKER_STOPPED_REASON: &str =
 
 /// How long after FAILING a rollout the breaker's rollback falls due.
 ///
-/// EMULATOR-CHOSEN, and deliberately longer than the span every other transition here takes:
-/// `Deployment$rolloutState` makes `FAILED` the END of that rollout ("A deployment in
-/// `FAILED` state doesn't launch any new tasks") and the rollback is a rollout of its own, so
-/// the state the breaker produced is one a client WATCHES for rather than a step on the way
-/// somewhere. The span is what makes it observable: a client polling the rollout reads the
-/// `FAILED` rollout the breaker left before the rollback replaces it, instead of finding the
-/// service already back on the revision it was rolled back to with nothing to say which state
-/// took it there. Stored and compared, never slept on.
-///
-/// Which is why the span is wider than the interval such a client polls at: the AWS CLI's own
-/// `aws ecs wait services-stable` re-reads the service every 15 seconds, so that is the
-/// cadence a client waiting on a deployment looks at it with, and a state that lasted less
-/// than one interval would be one a conforming client never sees. This span is a whole
-/// interval and a margin wide, so a poll lands inside it wherever the client's grid falls.
-pub const CIRCUIT_BREAKER_ROLLBACK_SPAN: Duration = Duration::from_secs(20);
+/// EMULATOR-CHOSEN, and one of this emulator's ordinary transient steps: `Deployment$rolloutState`
+/// makes `FAILED` the END of that rollout ("A deployment in `FAILED` state doesn't launch any
+/// new tasks") and the rollback is a rollout of its own, so the state the breaker produced is
+/// one a client reads before the rollback replaces it. The span is what makes it observable —
+/// a client polling the rollout reads the `FAILED` rollout the breaker left rather than finding
+/// the service already back on the revision it was rolled back to — and it is deliberately
+/// SHORT, because the failure does not depend on that reading to be observable afterwards: the
+/// deployment the rollback replaces keeps the terminal state it failed in
+/// ([`ServiceRecord::supersede_deployment`]), and the rollout's own record keeps the monitor
+/// that fired, the reason it gives and the revision the rollback put back
+/// ([`Self::roll_back_failed_rollout`]). What a client watching a bad rollout is waiting for is
+/// the service being SAFE again, so making it wait longer than this emulator's own transitions
+/// take is time a deploy that AWS self-heals never gets back. Stored and compared, never slept
+/// on.
+pub const CIRCUIT_BREAKER_ROLLBACK_SPAN: Duration = Duration::from_secs(3);
 
 /// WHICH failure-detection method a deployment configuration turned on failed a rollout.
 ///
