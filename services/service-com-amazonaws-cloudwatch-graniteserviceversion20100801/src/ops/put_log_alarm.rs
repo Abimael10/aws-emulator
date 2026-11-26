@@ -152,6 +152,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ConfiguredActions;
+
 /// The most query results a log alarm may evaluate: "Valid range is 1 through 100."
 /// (`PutLogAlarmInput$QueryResultsToEvaluate`) — the model bounds the member below at 1 and
 /// states the upper bound in prose only, so it is enforced here.
@@ -284,14 +286,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An alarm's actions are executed in the Region the alarm lives in, so one naming
         // another Region could never run: the request is refused before the store is touched,
         // so nothing is created and an alarm this call would have replaced keeps its actions.
-        if let Some(message) = crate::state::foreign_action_region_error(
-            [
-                input.ok_actions.as_deref(),
-                input.alarm_actions.as_deref(),
-                input.insufficient_data_actions.as_deref(),
-            ],
-            &region,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_action_region_error(input.action_lists(), &region)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
+        // An action of a vendor whose relative-id FORM CloudWatch publishes has to be written
+        // in that form — this writer's action lists carry the same action values the metric
+        // alarm writer's do — so one written some other way names nothing that could ever be
+        // carried out and is refused here too, before the store is touched.
+        if let Some(message) =
+            crate::state::unknown_action_relative_id_error(input.action_lists())
+        {
             return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 

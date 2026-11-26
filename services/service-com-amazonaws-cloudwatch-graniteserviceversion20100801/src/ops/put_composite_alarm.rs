@@ -151,6 +151,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ConfiguredActions;
+
 /// The largest number of alarms one composite alarm's rule may reference: "The rule
 /// expression of a composite alarm can include as many as 100 underlying alarms."
 /// (`PutCompositeAlarm` documentation)
@@ -314,14 +316,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An alarm's actions are executed in the Region the alarm lives in, so one naming
         // another Region could never run: the request is refused before the write, so nothing
         // is created and an alarm this call would have replaced keeps the actions it had.
-        if let Some(message) = crate::state::foreign_action_region_error(
-            [
-                input.ok_actions.as_deref(),
-                input.alarm_actions.as_deref(),
-                input.insufficient_data_actions.as_deref(),
-            ],
-            &region,
-        ) {
+        if let Some(message) =
+            crate::state::foreign_action_region_error(input.action_lists(), &region)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
+        // An action of a vendor whose relative-id FORM CloudWatch publishes has to be written
+        // in that form — this writer's action lists carry the same action values the metric
+        // alarm writer's do — so one written some other way names nothing that could ever be
+        // carried out and is refused here, before the write, for the same reason.
+        if let Some(message) =
+            crate::state::unknown_action_relative_id_error(input.action_lists())
+        {
             return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 

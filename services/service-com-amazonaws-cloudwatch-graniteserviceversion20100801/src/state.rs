@@ -64,6 +64,12 @@ use crate::ops::types::{
 /// the ARNs the alarm names.
 pub mod alarm_actions;
 
+/// The action lists an alarm writer's request carries, and the refusal of an action ARN whose
+/// vendor publishes the form of its relative id — re-exported beside this module's own
+/// [`foreign_action_region_error`], the other rule every alarm writer judges those same lists
+/// by, so the pair reads alike wherever it is applied.
+pub use alarm_actions::{unknown_action_relative_id_error, ConfiguredActions};
+
 /// The event a change to an ALARM's CONFIGURATION publishes onto the account's default event
 /// bus, and the writes that publish none.
 pub mod alarm_configuration_events;

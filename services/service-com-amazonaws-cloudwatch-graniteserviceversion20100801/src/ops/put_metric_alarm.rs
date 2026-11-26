@@ -10,8 +10,9 @@
 //! `ValidationError` and stores nothing.
 //!
 //! Each action ARN is judged before that: an action naming a Region other than the alarm's own,
-//! and an action of a vendor whose actions CloudWatch carries out ITSELF
-//! (`automate`, `swf`) whose relative id names none of that vendor's actions, are both refused
+//! and an action of a vendor whose relative-id FORM CloudWatch itself publishes (the
+//! `automate` and `swf` EC2 instance actions, the `autoscaling` scaling policy) whose relative
+//! id that form does not admit, are both refused
 //! the same way, off the ARN alone and whatever the alarm's metric watches.
 //!
 //! The same refusal answers a configuration CloudWatch would not create: a `Period` it does
@@ -289,6 +290,7 @@ use std::collections::HashSet;
 // EC2 metric, come from the one definition this crate holds — the same one the EXECUTION of
 // such an action reads the instance off, so the precondition and the execution cannot drift.
 use crate::state::alarm_actions::ec2_instance_actions;
+use crate::state::ConfiguredActions;
 
 /// Whether `arn` names one of the four EC2 instance actions.
 ///
@@ -346,42 +348,12 @@ fn carries_unsatisfiable_ec2_action(input: &PutMetricAlarmInput) -> bool {
     if watches_instance_metric_only(input) {
         return false;
     }
-    [
-        input.alarm_actions.as_deref(),
-        input.ok_actions.as_deref(),
-        input.insufficient_data_actions.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .flatten()
-    .any(|arn| is_ec2_instance_action(arn))
-}
-
-/// The three action lists a request configures, in the order a refusal reads them.
-///
-/// Each one's documentation lists the same action values, so every rule that judges an action
-/// ARN judges all three — and reads them off ONE place, so two such rules cannot come to read
-/// different lists.
-fn configured_action_lists(input: &PutMetricAlarmInput) -> [Option<&[String]>; 3] {
-    [
-        input.ok_actions.as_deref(),
-        input.alarm_actions.as_deref(),
-        input.insufficient_data_actions.as_deref(),
-    ]
-}
-
-/// Why one of this request's actions names a vendor whose own actions CloudWatch carries out,
-/// with a relative id that vendor has no action for — `None` when every action names a
-/// resource of some other vendor, or an action of the set.
-///
-/// All three action lists count. Read through the one reading of those ARNs this crate has, so
-/// an action an alarm may carry is exactly one the execution can then perform.
-fn unknown_action_relative_id(input: &PutMetricAlarmInput) -> Option<String> {
-    configured_action_lists(input)
+    input
+        .action_lists()
         .into_iter()
         .flatten()
         .flatten()
-        .find_map(|action| ec2_instance_actions::unknown_relative_id_error(action))
+        .any(|arn| is_ec2_instance_action(arn))
 }
 
 /// The sub-minute `Period` values an ALARM is evaluated on: "Valid values are 10, 20, 30, and
@@ -1022,19 +994,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         // Each action ARN is judged BEFORE the members of the request are weighed against one
         // another: an action is executed in the Region the alarm lives in, so one naming
-        // another Region could never run, and an action of a vendor whose actions CloudWatch
-        // carries out itself has to name one of that vendor's own actions. Both are read off
+        // another Region could never run, and an action of a vendor whose relative-id form
+        // CloudWatch publishes has to be written in that form. Both are read off
         // the ARN alone, so neither waits on what the alarm watches — the refusal answers a
         // request whose metric already names an instance exactly as it answers one whose
         // metric does not. Refused before the write, so nothing is created and an alarm this
         // call would have replaced keeps the actions it already had.
         if let Some(message) =
-            crate::state::foreign_action_region_error(configured_action_lists(&input), &region)
+            crate::state::foreign_action_region_error(input.action_lists(), &region)
         {
             return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 
-        if let Some(message) = unknown_action_relative_id(&input) {
+        if let Some(message) =
+            crate::state::unknown_action_relative_id_error(input.action_lists())
+        {
             return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 

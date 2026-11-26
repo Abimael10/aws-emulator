@@ -9,6 +9,12 @@
 //! transition fires one of these ARNs hands the transition to the scaling service that owns
 //! the policy, and that service applies the policy to the resource it scales.
 //!
+//! Because that sentence publishes the FORM the relative id of an ARN of this vendor is
+//! written in, an ARN of it whose relative id is written some other way names no policy any
+//! scaling service could resolve: [`unknown_relative_id_error`] is the one reading that says
+//! so, and the alarm writers refuse such a request rather than storing an action that can
+//! never be delivered.
+//!
 //! # What executing one is, and where it ends
 //!
 //! Executing the action is the HAND-OVER: the notification is addressed to the policy and
@@ -47,6 +53,29 @@ const AUTOSCALING_ARN_VENDOR: &str = "autoscaling";
 /// The ARN resource type of a scaling policy, which is what tells one from any other ARN of
 /// this vendor (an Auto Scaling group, a launch configuration).
 const SCALING_POLICY_RESOURCE_TYPE: &str = "scalingPolicy";
+
+/// The field of a policy's relative id that names the policy itself, with the colon that
+/// separates it from the resource the policy scales:
+/// "…:policyName/`policy-friendly-name`" (`PutMetricAlarmInput$AlarmActions`).
+const POLICY_NAME_FIELD: &str = ":policyName/";
+
+/// The two forms the field BEFORE that one takes — the thing the policy scales.
+///
+/// "…:scalingPolicy:`policy-id`:autoScalingGroupName/`group-friendly-name`:policyName/…"
+/// (`PutMetricAlarmInput$AlarmActions`) is how an Amazon EC2 Auto Scaling policy names the
+/// group it scales; an Application Auto Scaling policy names the scalable target it scales in
+/// the same field instead (`scalingPolicy:<policy id>:resource/<service namespace>/<resource
+/// id>:policyName/<name>`, the `PolicyARN` that service mints), since both services mint their
+/// policies under this one vendor.
+const SCALED_RESOURCE_FIELDS: [&str; 2] = ["autoScalingGroupName/", "resource/"];
+
+/// The form the relative id of an action of this vendor has to be written in, as a refusal of
+/// one outside it states the form and as the documented action value spells it:
+/// "arn:aws:autoscaling:`region`:`account-id`:scalingPolicy:`policy-id`:autoScalingGroupName/`group-friendly-name`:policyName/`policy-friendly-name`"
+/// (`PutMetricAlarmInput$AlarmActions`).
+const SCALING_POLICY_RELATIVE_ID_FORM: &str = "scalingPolicy:policy-id:autoScalingGroupName/\
+                                               group-friendly-name:policyName/\
+                                               policy-friendly-name";
 
 /// How many undelivered scaling-policy invocations this store keeps.
 ///
@@ -93,13 +122,68 @@ pub struct ScalingPolicyInvocation {
 ///
 /// The partition, the Region and the account are not matched: a scaling-policy action is one
 /// whatever partition it names, and where the policy lives is part of resolving it rather than
-/// part of what makes the ARN a policy's.
+/// part of what makes the ARN a policy's. The relative id is read against the form a policy's
+/// is written in ([`names_a_scaling_policy`]), which is the same reading the alarm writers
+/// refuse an ARN of this vendor outside that form by — so an action an alarm may carry is
+/// exactly one this module can then hand over.
 #[must_use]
 pub fn of_action_arn(arn: &str) -> Option<&str> {
     let parsed = ::service_common::arn::parse(arn)?;
-    (parsed.vendor == AUTOSCALING_ARN_VENDOR
-        && parsed.resource_type() == SCALING_POLICY_RESOURCE_TYPE)
-        .then_some(arn)
+    (parsed.vendor == AUTOSCALING_ARN_VENDOR && names_a_scaling_policy(&parsed)).then_some(arn)
+}
+
+/// Whether the relative id of `parsed` is written in the form a scaling policy's is
+/// ([`SCALING_POLICY_RELATIVE_ID_FORM`]): the `scalingPolicy` resource type, the policy's id,
+/// the resource the policy scales ([`SCALED_RESOURCE_FIELDS`]) and the policy's own name
+/// ([`POLICY_NAME_FIELD`]), in that order and each of them named.
+///
+/// The id of the resource a policy scales may itself carry colons
+/// (`resource/lambda/function:send-mail:BLUE`, a Lambda alias's provisioned concurrency), so
+/// the fields are read from the two ends of the relative id inwards rather than by counting
+/// its colons. The policy's own NAME is the last field and is read to the end of the relative
+/// id, because a scaling policy's name may carry a colon too (`PutScalingPolicy$PolicyName` is
+/// one string of the printable range, which admits one), so there is no trailing field to
+/// reject after it.
+fn names_a_scaling_policy(parsed: &::service_common::arn::Arn<'_>) -> bool {
+    let Some((policy_id, scaled_and_policy)) = parsed
+        .resource
+        .strip_prefix(SCALING_POLICY_RESOURCE_TYPE)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    let Some((scaled, policy_name)) = scaled_and_policy.rsplit_once(POLICY_NAME_FIELD) else {
+        return false;
+    };
+    !policy_id.is_empty()
+        && !policy_name.is_empty()
+        && SCALED_RESOURCE_FIELDS
+            .iter()
+            .any(|field| scaled.strip_prefix(field).is_some_and(|named| !named.is_empty()))
+}
+
+/// Why no alarm can carry the action `arn`: it names this vendor, whose relative id CloudWatch
+/// publishes the FORM of, with a relative id that form does not admit — `None` when `arn` names
+/// another vendor's resource, or a policy.
+///
+/// The one reading of the relative id, shared with the reading a HAND-OVER does
+/// ([`of_action_arn`]), so an action an alarm is allowed to carry is exactly one that can then
+/// be delivered. The refusal names the RELATIVE ID the request sent — the resource field,
+/// everything the ARN names after its account, which is the part that says which policy is
+/// being asked for — and the form the vendor publishes for it. The second sentence runs
+/// straight into that form with no separator, as the service words it.
+#[must_use]
+pub fn unknown_relative_id_error(arn: &str) -> Option<String> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.vendor != AUTOSCALING_ARN_VENDOR || names_a_scaling_policy(&parsed) {
+        return None;
+    }
+    Some(format!(
+        "The vendor \"{AUTOSCALING_ARN_VENDOR}\" cannot be used with relative id {}. Allowed \
+         relative IDs must be in the format{SCALING_POLICY_RELATIVE_ID_FORM}",
+        parsed.resource,
+    ))
 }
 
 /// Execute the scaling-policy action `action` of `notification`: queue the hand-over for the
@@ -344,6 +428,71 @@ mod tests {
             assert_eq!(
                 found, expected,
                 "case {case:?}: expected {expected} for {arn:?}, got {found}"
+            );
+        }
+    }
+
+    /// A relative id of this vendor outside the published form is reported with the form, and
+    /// one inside it — including a scaled resource whose own id carries colons — with nothing;
+    /// an ARN of any other vendor is not judged by this rule at all.
+    #[test]
+    fn a_relative_id_outside_the_published_form_is_reported_with_that_form() {
+        let head = "arn:aws:autoscaling:us-west-2:000000000000:";
+        for (case, relative_id) in [
+            ("a policy with no policyName field", "scalingPolicy:1:autoScalingGroupName/web"),
+            ("a policy with no scaled resource", "scalingPolicy:1:policyName/out"),
+            ("a policy with no id", "scalingPolicy::autoScalingGroupName/web:policyName/out"),
+            ("a policy with no group named", "scalingPolicy:1:autoScalingGroupName/:policyName/out"),
+            ("a policy with no name named", "scalingPolicy:1:autoScalingGroupName/web:policyName/"),
+            ("a policy scaling something unnamed", "scalingPolicy:1:launchConfiguration/web:policyName/out"),
+            ("the resource type alone", "scalingPolicy"),
+            ("an Auto Scaling group", "autoScalingGroup:1:autoScalingGroupName/web"),
+        ] {
+            let reported = unknown_relative_id_error(&format!("{head}{relative_id}"));
+            assert_eq!(
+                reported.as_deref(),
+                Some(
+                    format!(
+                        "The vendor \"autoscaling\" cannot be used with relative id \
+                         {relative_id}. Allowed relative IDs must be in the \
+                         formatscalingPolicy:policy-id:autoScalingGroupName/group-friendly-name:\
+                         policyName/policy-friendly-name"
+                    )
+                    .as_str()
+                ),
+                "case {case:?}: expected the vendor refusal for {relative_id:?}, got {reported:?}"
+            );
+        }
+
+        for (case, arn) in [
+            (
+                "an Amazon EC2 Auto Scaling policy",
+                format!("{head}scalingPolicy:1:autoScalingGroupName/web:policyName/out"),
+            ),
+            (
+                "an Application Auto Scaling policy",
+                format!("{head}scalingPolicy:1:resource/ecs/service/web/api:policyName/out"),
+            ),
+            (
+                "a policy scaling a resource whose id carries colons",
+                format!("{head}scalingPolicy:1:resource/lambda/function:send-mail:BLUE:policyName/out"),
+            ),
+            (
+                "a policy whose own name carries a colon",
+                format!("{head}scalingPolicy:1:autoScalingGroupName/web:policyName/out:east"),
+            ),
+            (
+                "an SNS topic named like a policy",
+                "arn:aws:sns:us-west-2:000000000000:scalingPolicy".to_string(),
+            ),
+            ("an EC2 instance action", "arn:aws:automate:us-west-2:ec2:terminate".to_string()),
+            ("not an ARN at all", "scale-out".to_string()),
+        ] {
+            let reported = unknown_relative_id_error(&arn);
+            assert_eq!(
+                reported, None,
+                "case {case:?}: expected {arn:?} to be judged by no rule of this vendor, got \
+                 {reported:?}"
             );
         }
     }

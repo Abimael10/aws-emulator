@@ -124,6 +124,74 @@ const MAX_NOTIFICATIONS_PER_REQUEST: usize = 32;
 /// layout it is reading. The same version the alarm history documents declare.
 const NOTIFICATION_VERSION: &str = super::HISTORY_DATA_VERSION;
 
+/// The three action lists one alarm writer's request carries, in the order a refusal reads
+/// them.
+///
+/// Each writer of this service — `PutMetricAlarm`, `PutCompositeAlarm`, `PutLogAlarm` — takes
+/// `OKActions`, `AlarmActions` and `InsufficientDataActions`, and each member's documentation
+/// lists the same action values, so every rule that judges an action ARN judges all three on
+/// every writer. Stated ONCE here, so the lists two such rules read cannot drift apart and no
+/// writer can come to judge only some of them.
+pub trait ConfiguredActions {
+    /// This request's three action lists.
+    fn action_lists(&self) -> [Option<&[String]>; 3];
+}
+
+impl ConfiguredActions for crate::ops::types::PutMetricAlarmInput {
+    fn action_lists(&self) -> [Option<&[String]>; 3] {
+        [
+            self.ok_actions.as_deref(),
+            self.alarm_actions.as_deref(),
+            self.insufficient_data_actions.as_deref(),
+        ]
+    }
+}
+
+impl ConfiguredActions for crate::ops::types::PutCompositeAlarmInput {
+    fn action_lists(&self) -> [Option<&[String]>; 3] {
+        [
+            self.ok_actions.as_deref(),
+            self.alarm_actions.as_deref(),
+            self.insufficient_data_actions.as_deref(),
+        ]
+    }
+}
+
+impl ConfiguredActions for crate::ops::types::PutLogAlarmInput {
+    fn action_lists(&self) -> [Option<&[String]>; 3] {
+        [
+            self.ok_actions.as_deref(),
+            self.alarm_actions.as_deref(),
+            self.insufficient_data_actions.as_deref(),
+        ]
+    }
+}
+
+/// Why one of the actions in `actions` names a vendor whose relative-id FORM CloudWatch
+/// publishes, with a relative id that form does not admit — `None` when every action is one of
+/// that vendor's own, or names a resource of a vendor this rule does not judge.
+///
+/// A documented action value either names a RESOURCE the caller created, whose name is the
+/// caller's own to choose, or is written in a form the service itself publishes
+/// (`PutMetricAlarmInput$AlarmActions` lists both kinds). An ARN of the second kind written
+/// some other way names nothing that could ever be carried out, so the alarm writers refuse the
+/// whole request rather than storing an action that can never run: the vendors whose form is
+/// published are the two the EC2 instance actions are written under
+/// ([`ec2_instance_actions::unknown_relative_id_error`]) and the one a scaling policy is
+/// ([`scaling_policy_actions::unknown_relative_id_error`]).
+///
+/// Shared by the alarm writers, whose `OKActions`, `AlarmActions` and
+/// `InsufficientDataActions` carry the same action values — and read through the SAME readings
+/// the execution of each kind does, so an action an alarm may carry is exactly one that can
+/// then be delivered.
+#[must_use]
+pub fn unknown_action_relative_id_error(actions: [Option<&[String]>; 3]) -> Option<String> {
+    actions.into_iter().flatten().flatten().find_map(|action| {
+        ec2_instance_actions::unknown_relative_id_error(action)
+            .or_else(|| scaling_policy_actions::unknown_relative_id_error(action))
+    })
+}
+
 /// One notification an alarm state transition owes: the document, and the action ARNs the
 /// transition fires it at.
 #[derive(Debug, Clone)]
