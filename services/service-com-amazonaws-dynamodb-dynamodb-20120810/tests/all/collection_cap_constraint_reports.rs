@@ -37,11 +37,9 @@
 //! validator builds, so both are pinned here side by side (see "Which form a constraint
 //! clause takes" in `src/service.rs`).
 //!
-//! The transactional lists past their MAXIMUM are the one capped collection whose recorded
-//! refusal QUOTES the rejected list, at the validator's own member path, so they are pinned
-//! in `tests/all/refusal_messages_echo_the_requests_own_values.rs` instead; what stays here
-//! is the same members' EMPTY case, whose refusal echoes nothing, and the bound they are
-//! not refused at.
+//! The transactional `TransactItems` lists are pinned at BOTH ends of their `@length` bound
+//! here, because the two ends are one rule: `tests/all/transact_items_cap_refusal.rs`
+//! drives the maximum over the shapes of the actions those lists carry.
 
 use serde_json::{json, Value};
 
@@ -144,6 +142,18 @@ async fn a_collection_outside_its_modelled_length_bound_is_reported_against_that
     // Each row: the case, the operation, the request, and the WHOLE message the
     // refusal must carry.
     let cases: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "a transactional read one past the 100-action cap",
+            "TransactGetItems",
+            json!({"TransactItems": transact_gets(101)}),
+            report("TransactItems", &at_most(100)),
+        ),
+        (
+            "a transactional write one past the same cap",
+            "TransactWriteItems",
+            json!({"TransactItems": transact_puts(101)}),
+            report("TransactItems", &at_most(100)),
+        ),
         (
             "an empty transactional read, one below the same member's minimum",
             "TransactGetItems",

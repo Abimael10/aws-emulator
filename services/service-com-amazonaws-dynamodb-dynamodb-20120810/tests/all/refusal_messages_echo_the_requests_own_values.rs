@@ -11,19 +11,24 @@
 //! > substitution table sat under; and the value a caller ADDRESSED a resource by, echoed
 //! > rather than re-derived.
 //!
-//! The suites here pin the five classes of refusal that rule reaches, each over the inputs
+//! The suites here pin the four classes of refusal that rule reaches, each over the inputs
 //! the rule generalises across — the datatype of a set, the position of a value inside one,
-//! the operation that carried it, the element count of a capped list, the actions its
-//! elements state, the member a resource was addressed by, and which resource an ARN names:
+//! the operation that carried it, the member a resource was addressed by, and which resource
+//! an ARN names:
 //!
 //! * a `null` listed as a SET member is the parameter-value refusal AWS words for that set
 //!   type, not the reader's complaint about the class it found;
-//! * a transactional list past the cap the model declares is quoted back in full, at the
-//!   member path the request validator builds;
 //! * a clause quotes the WHOLE value the request submitted, with no elision of its own;
 //! * a not-found refusal echoes the value the request addressed the resource by;
 //! * a `*ResourcePolicy` `ResourceArn` is classified by what it names: no DynamoDB resource
 //!   at all, a DynamoDB resource a policy does not attach to, or one outside this endpoint.
+//!
+//! A capped LIST past its maximum is not one of them: that refusal states the member and
+//! the bound and echoes nothing of the list
+//! (`tests/all/collection_cap_constraint_reports.rs`,
+//! `tests/all/transact_items_cap_refusal.rs`). The one list whose recorded refusal quotes
+//! the rejected value is the PartiQL transaction's statement list, pinned in
+//! `tests/all/partiql_transaction_statement_cap.rs`.
 //!
 //! Every call goes over the wire (`POST /` with `X-Amz-Target: DynamoDB_20120810.<Operation>`)
 //! through the same `MultiServiceRouter` the emulator's front doors use.
@@ -209,217 +214,7 @@ async fn a_null_listed_as_a_set_member_is_refused_as_the_parameter_value_it_is()
 }
 
 // ===========================================================================
-// RULE 2. A transactional list past the cap the model declares
-// ===========================================================================
-
-/// The fields the service's own attribute-value object states, in the order it states
-/// them, as the recorded refusals of these members render them — six of them belong to no
-/// member this model declares (`smithy_query(query="shape",
-/// shape="com.amazonaws.dynamodb#AttributeValue")` gives `S N B SS NS BS M L NULL BOOL`),
-/// and they are part of the frame all the same. Written out here so this suite pins the
-/// rendering rather than the crate's own copy of it.
-const CORAL_FIELDS: [&str; 16] = [
-    "s", "n", "b", "iNT", "dECIMAL", "dOUBLE", "sS", "nS", "bS", "iNTSET", "dECIMALSET",
-    "dOUBLESET", "m", "l", "nULL", "bOOL",
-];
-
-/// One attribute value in that rendering: every field of the frame, with `field` carrying
-/// `value` and the rest unset.
-fn coral_value(field: &str, value: &str) -> String {
-    let fields: Vec<String> = CORAL_FIELDS
-        .iter()
-        .map(|declared| {
-            if *declared == field {
-                format!("{declared}={value}")
-            } else {
-                format!("{declared}=null")
-            }
-        })
-        .collect();
-    format!("AttributeValue({})", fields.join(", "))
-}
-
-/// One item or key map in that rendering: `{<attribute>=<value>}`.
-fn coral_item(attribute: &str, field: &str, value: &str) -> String {
-    format!("{{{attribute}={}}}", coral_value(field, value))
-}
-
-/// The members every action of a transactional write carries beyond the item or key it
-/// addresses and the table it names, in the order the model declares them, and the
-/// service's own trailing field after them.
-const ACTION_TAIL: &str = "conditionExpression=null, expressionAttributeNames=null, \
-                           expressionAttributeValues=null, \
-                           returnValuesOnConditionCheckFailure=null, workloadProfileName=null";
-
-/// One `TransactGetItem` of a read transaction, as the refusal quotes it.
-pub(crate) fn coral_transact_get(table: &str, key: &str) -> String {
-    format!(
-        "TransactGetItem(get=Get(key={}, tableName={table}, projectionExpression=null, \
-         expressionAttributeNames=null, workloadProfileName=null))",
-        coral_item(KEY, "s", key)
-    )
-}
-
-/// One `TransactWriteItem` carrying a `Put`, as the refusal quotes it.
-pub(crate) fn coral_transact_put(table: &str, key: &str) -> String {
-    format!(
-        "TransactWriteItem(conditionCheck=null, put=Put(item={}, tableName={table}, \
-         {ACTION_TAIL}), delete=null, update=null)",
-        coral_item(KEY, "s", key)
-    )
-}
-
-/// One `TransactWriteItem` carrying a `Delete`.
-fn coral_transact_delete(table: &str, key: &str) -> String {
-    format!(
-        "TransactWriteItem(conditionCheck=null, put=null, delete=Delete(key={}, \
-         tableName={table}, {ACTION_TAIL}), update=null)",
-        coral_item(KEY, "s", key)
-    )
-}
-
-/// The whole message a transactional list past its cap earns: the envelope over one clause
-/// that quotes the list, names the member by the path the request validator builds and
-/// states the bound that was broken.
-pub(crate) fn quoted_cap_message(elements: &[String], max: usize) -> String {
-    format!(
-        "1 validation error detected: Value '[{}]' at 'transactItems' failed to satisfy \
-         constraint: Member must have length less than or equal to {max}",
-        elements.join(", ")
-    )
-}
-
-/// `count` `Get` entries of that table, each addressing a distinct key.
-fn get_entries(count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| json!({"Get": {"TableName": TABLE, "Key": {KEY: {"S": format!("k{index}")}}}}))
-        .collect()
-}
-
-/// `count` `Put` entries of that table.
-fn put_entries(count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| {
-            json!({"Put": {"TableName": TABLE, "Item": {KEY: {"S": format!("k{index}")}}}})
-        })
-        .collect()
-}
-
-/// `count` entries alternating `Put` and `Delete`, so the quoting cannot depend on which
-/// action an element states.
-fn mixed_entries(count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| {
-            if index % 2 == 0 {
-                json!({"Put": {"TableName": TABLE, "Item": {KEY: {"S": format!("k{index}")}}}})
-            } else {
-                json!({"Delete": {"TableName": TABLE, "Key": {KEY: {"S": format!("k{index}")}}}})
-            }
-        })
-        .collect()
-}
-
-/// The cap the model declares on both transactional lists (`smithy_query(query="shape",
-/// shape="com.amazonaws.dynamodb#TransactGetItemList")` and `TransactWriteItemList` are
-/// `@length{min:1,max:100}`).
-const TRANSACT_CAP: usize = 100;
-
-#[tokio::test]
-async fn a_transactional_list_past_its_cap_is_quoted_back_at_the_validator_s_member_path() {
-    let router = emulator();
-    create_active_table(&router, TABLE, &[(KEY, "HASH", "S")]).await;
-
-    // The rows differ along the operation, the element count (one past the cap and half
-    // again as many) and the actions the elements state.
-    let rows: Vec<(&str, &str, Value, String)> = vec![
-        (
-            "a read transaction one past the cap",
-            "TransactGetItems",
-            json!({"TransactItems": get_entries(TRANSACT_CAP + 1)}),
-            quoted_cap_message(
-                &(0..TRANSACT_CAP + 1)
-                    .map(|index| coral_transact_get(TABLE, &format!("k{index}")))
-                    .collect::<Vec<String>>(),
-                TRANSACT_CAP,
-            ),
-        ),
-        (
-            "a read transaction half again past the cap",
-            "TransactGetItems",
-            json!({"TransactItems": get_entries(TRANSACT_CAP + TRANSACT_CAP / 2)}),
-            quoted_cap_message(
-                &(0..TRANSACT_CAP + TRANSACT_CAP / 2)
-                    .map(|index| coral_transact_get(TABLE, &format!("k{index}")))
-                    .collect::<Vec<String>>(),
-                TRANSACT_CAP,
-            ),
-        ),
-        (
-            "a write transaction of puts one past the cap",
-            "TransactWriteItems",
-            json!({"TransactItems": put_entries(TRANSACT_CAP + 1)}),
-            quoted_cap_message(
-                &(0..TRANSACT_CAP + 1)
-                    .map(|index| coral_transact_put(TABLE, &format!("k{index}")))
-                    .collect::<Vec<String>>(),
-                TRANSACT_CAP,
-            ),
-        ),
-        (
-            "a write transaction mixing two actions, past the same cap",
-            "TransactWriteItems",
-            json!({"TransactItems": mixed_entries(TRANSACT_CAP + 1)}),
-            quoted_cap_message(
-                &(0..TRANSACT_CAP + 1)
-                    .map(|index| {
-                        let key = format!("k{index}");
-                        if index % 2 == 0 {
-                            coral_transact_put(TABLE, &key)
-                        } else {
-                            coral_transact_delete(TABLE, &key)
-                        }
-                    })
-                    .collect::<Vec<String>>(),
-                TRANSACT_CAP,
-            ),
-        ),
-    ];
-
-    for (case, operation, body, expected) in rows {
-        let (status, answered) = call(&router, operation, body).await;
-        assert_eq!(
-            (status, error_code(&answered).as_str()),
-            (400, "ValidationException"),
-            "case {case:?} ({operation}): expected 400 ValidationException, got {status} with \
-             {answered}"
-        );
-        assert_eq!(
-            message(&answered),
-            expected,
-            "case {case:?} ({operation}): expected the rejected list quoted back, got {:?}",
-            message(&answered)
-        );
-    }
-
-    // AT the cap the list is not refused as a constraint violation at all, which is what
-    // makes the rows above about the bound and not an off-by-one.
-    for operation in ["TransactGetItems", "TransactWriteItems"] {
-        let entries = if operation == "TransactGetItems" {
-            get_entries(TRANSACT_CAP)
-        } else {
-            put_entries(TRANSACT_CAP)
-        };
-        let (status, answered) = call(&router, operation, json!({"TransactItems": entries})).await;
-        assert!(
-            !message(&answered).contains("failed to satisfy constraint"),
-            "case a list AT the cap ({operation}): expected no constraint clause, got {status} \
-             with {answered}"
-        );
-    }
-}
-
-// ===========================================================================
-// RULE 3. A clause quotes the WHOLE value the request submitted
+// RULE 2. A clause quotes the WHOLE value the request submitted
 // ===========================================================================
 
 /// The ceiling the model declares on a `ResourceArn` (`smithy_query(query="shape",
@@ -482,7 +277,7 @@ async fn a_clause_quotes_the_whole_value_the_request_submitted() {
 }
 
 // ===========================================================================
-// RULE 4. A not-found refusal echoes the value the request addressed by
+// RULE 3. A not-found refusal echoes the value the request addressed by
 // ===========================================================================
 
 #[tokio::test]
@@ -593,7 +388,7 @@ async fn a_not_found_refusal_echoes_the_value_the_request_addressed_the_resource
 }
 
 // ===========================================================================
-// RULE 5. A `ResourceArn` is classified by what it names
+// RULE 4. A `ResourceArn` is classified by what it names
 // ===========================================================================
 
 /// A policy document this emulator accepts, so a `PutResourcePolicy` row is refused for
@@ -719,7 +514,7 @@ async fn a_resource_policy_arn_is_classified_by_the_resource_it_names() {
 }
 
 // ===========================================================================
-// RULE 6. An expression-value entry that states no datatype
+// RULE 5. An expression-value entry that states no datatype
 // ===========================================================================
 
 /// The reader's own sentence for a value that states no datatype.

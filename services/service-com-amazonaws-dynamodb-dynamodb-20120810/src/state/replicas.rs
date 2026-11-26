@@ -1031,6 +1031,11 @@ impl Table {
             global_secondary_indexes: self
                 .global_secondary_indexes
                 .iter()
+                // An index whose delete this table has accepted is on its way out
+                // ([`super::GlobalSecondaryIndex::being_deleted`]), so a replica created now
+                // is given the index set the source table is left with — the same rule its
+                // vector indexes follow.
+                .filter(|index| !index.being_deleted())
                 .map(|index| super::GlobalSecondaryIndex {
                     arn: index_arn(&region, &self.name, &index.name),
                     throughput_history: ThroughputHistory::default(),

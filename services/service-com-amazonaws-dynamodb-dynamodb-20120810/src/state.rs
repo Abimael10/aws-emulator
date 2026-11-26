@@ -1246,9 +1246,11 @@ pub struct GlobalSecondaryIndex {
     pub key_schema: Vec<KeySchemaElement>,
     pub projection: Projection,
     pub provisioned_throughput: Option<ProvisionedThroughput>,
-    /// The transient status this index is in until [`Self::active_at`] falls due.
+    /// The transient status this index is in until [`Self::active_at`] falls due, which is
+    /// `DELETING` once a delete of it has been accepted ([`Self::begin_deletion`]).
     pub transient_status: IndexStatus,
-    /// When the clock owes this index its transient -> `ACTIVE` transition.
+    /// When the clock owes this index its transient -> `ACTIVE` transition — or, for an
+    /// index whose delete has been accepted, its REMOVAL from the table.
     pub active_at: SystemTime,
     /// When the last throughput increase and decrease were applied, and how many
     /// decreases have been applied today, as `ProvisionedThroughputDescription`
@@ -1274,12 +1276,51 @@ pub struct GlobalSecondaryIndex {
 
 impl GlobalSecondaryIndex {
     /// The status at `now`, derived from the stored instants.
+    ///
+    /// An index whose delete has been accepted reports `DELETING` — "the index is being
+    /// deleted" (`GlobalSecondaryIndexDescription$IndexStatus`) — for as long as the table
+    /// still carries it, whichever status it was in when the delete arrived: the removal is
+    /// the last thing that happens to it, so no build it had in flight can take it back to
+    /// `ACTIVE` ([`Self::begin_deletion`]).
     pub fn status(&self, now: SystemTime) -> IndexStatus {
-        if now >= self.active_at {
+        if self.being_deleted() {
+            IndexStatus::Deleting
+        } else if now >= self.active_at {
             IndexStatus::Active
         } else {
             self.transient_status
         }
+    }
+
+    /// Accept this index's DELETE, owing its removal at `due_at`.
+    ///
+    /// Removing an index is asynchronous work on the table: the call that asks for it
+    /// answers a description that still carries the index, in the `DELETING` status that
+    /// says what is happening to it, and the entry disappears only once the clock makes the
+    /// removal due ([`Table::apply_due_index_removals`]). A caller polling the index
+    /// therefore sees `DELETING` and then its absence, which is what tells "delete
+    /// requested" apart from "delete finished" — the same lifecycle a VECTOR index's delete
+    /// follows ([`VectorIndex::begin_deletion`]), because it is the one asynchronous removal
+    /// of an index whichever kind of index it is.
+    pub fn begin_deletion(&mut self, due_at: SystemTime) {
+        self.transient_status = IndexStatus::Deleting;
+        self.active_at = due_at;
+    }
+
+    /// Whether this index's delete has been accepted, so the table is only still carrying
+    /// it until the removal falls due.
+    ///
+    /// An index on its way out is no longer one of the indexes the TABLE is held to — it
+    /// takes no slot of the per-table quota and keeps no attribute definition alive — and it
+    /// is not addressable either: a read naming it is answered as a name no index of the
+    /// table has.
+    pub fn being_deleted(&self) -> bool {
+        self.transient_status == IndexStatus::Deleting
+    }
+
+    /// Whether the clock has already made this index's removal due at `now`.
+    pub fn removal_due(&self, now: SystemTime) -> bool {
+        self.being_deleted() && now >= self.active_at
     }
 }
 

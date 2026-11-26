@@ -51,6 +51,18 @@
 //! table that already has a stream, or ... disable a stream on a table that doesn't
 //! have a stream") are `ResourceInUseException`.
 //!
+//! A `GlobalSecondaryIndexUpdates` entry addresses one of the table's GLOBAL secondary
+//! indexes. A `Create` adds the index it describes, `CREATING` until its build is done
+//! ([`crate::state::IndexBackfill`]); a `Delete` puts the index on its way out — the
+//! description the call answers still carries it, reported `DELETING`
+//! ([`crate::state::GlobalSecondaryIndex::begin_deletion`]), and the index disappears when
+//! the clock makes the removal due, taking with it every attribute definition no remaining
+//! key schema uses. A `Delete` is served even for an index that is still being BUILT:
+//! cancelling a build is how a caller undoes an index it mis-specified, so that entry stops
+//! the build rather than asking for a second one, while any OTHER index change asked of a
+//! table that is still building one is past the one-online-index limit
+//! ([`index_build_refusal`]). An `Update` moves one index's provisioned throughput.
+//!
 //! A `VectorIndexUpdates` entry addresses one of the table's VECTOR indexes as the
 //! resource it changes. A `Delete` removes the index it names, so a name the table
 //! carries no vector index for is refused with `ResourceNotFoundException` — the modelled
@@ -634,6 +646,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table_throughput.iter().chain(
                 indexes
                     .iter()
+                    .filter(|index| !index.being_deleted())
                     .filter_map(|index| index.provisioned_throughput.as_ref()),
             ),
         ) {
@@ -653,6 +666,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_projection_budget(
             indexes
                 .iter()
+                .filter(|index| !index.being_deleted())
                 .map(|index| crate::state::projected_non_key_attributes(&index.projection))
                 .chain(table.local_secondary_indexes.iter().map(|index| {
                     crate::state::projected_non_key_attributes(&index.projection)
@@ -1423,28 +1437,10 @@ fn online_index_limit_message(per_call: usize) -> String {
 /// can be created or deleted simultaneously per table"
 /// ([`online_index_limit_message`]) — the limit each call is held to
 /// ([`index_lifecycle_actions_over_limit`], [`vector_index_actions_over_limit`]) and the
-/// limit the TABLE is held to across calls ([`refusal_while_updating`]), which is one
+/// limit the TABLE is held to across calls ([`index_build_refusal`]), which is one
 /// figure: a second index change cannot be started while the first is still being built,
 /// whether both were asked for in one request or in two.
 const ONLINE_INDEX_ACTIONS_AT_ONCE: usize = 1;
-
-/// How an index DELETE is refused while that index is still having the storage its entries
-/// need allocated: the phase the index is in, the phases a delete of it is served in, and
-/// the table and index the caller asked about.
-///
-/// A newly created index has that storage laid down before it starts reading the items the
-/// table already held ([`crate::state::IndexBackfill`]), and only once that reading is
-/// under way — or over — can the build be cancelled; a delete that arrives first is refused
-/// as the in-use resource it addresses, and the sentence tells the caller which phase to
-/// retry in. One sentence for both kinds of index, because the phases are the build's
-/// rather than the kind's.
-fn index_allocating_message(table: &str, index: &str) -> String {
-    format!(
-        "Attempt to change a resource which is still in use: Index creation is in resource \
-         allocation phase. Retry deletion during backfilling phase or when the index is active. \
-         Table: {table} Index: {index}"
-    )
-}
 
 /// The refusal an `UpdateTable` earns from the index BUILDS already running on the table
 /// it addresses, and from the table's own unsettled update, or `None` when the request is
@@ -1460,10 +1456,9 @@ fn index_allocating_message(table: &str, index: &str) -> String {
 ///   many of a table's indexes may be built at once ([`ONLINE_INDEX_ACTIONS_AT_ONCE`]), so
 ///   it is answered the control plane's `LimitExceededException` — the code a client backs
 ///   off and retries one index at a time on, rather than the in-use code it would abort on;
-/// * a DELETE of the very index that is being built cancels that build rather than asking
-///   for a second one, so it is served — unless the index is still having the storage its
-///   entries need allocated, which cannot be released yet
-///   ([`index_allocating_message`]);
+/// * a DELETE of the very index that is being built CANCELS that build rather than asking
+///   for a second one, so it is served — cancelling a build is the escape hatch a caller
+///   that mis-specified an index has, and the index moves to `DELETING` from there;
 /// * everything else asked of a table that is still UPDATING is the plain in-use refusal,
 ///   over the table this request addressed.
 ///
@@ -1483,27 +1478,25 @@ fn index_build_refusal(
         })
         .into()
     };
-    // Every index of this table the clock still owes its build, whichever KIND it is: each
-    // as the name it answers to and the backfill its build is made of
-    // ([`crate::state::IndexBackfill`]). One list, because both the per-table limit and the
+    // Every index of this table the clock still owes its build, whichever KIND it is, as
+    // the name it answers to. One list, because both the per-table limit and the
     // cancellation below are about an index being BUILT and neither is about its kind.
-    let building: Vec<(&str, crate::state::IndexBackfill)> = stored
+    let building: Vec<&str> = stored
         .vector_indexes
         .iter()
         .filter(|index| index.status(now) == crate::state::IndexStatus::Creating)
-        .map(|index| (index.name.as_str(), index.backfill))
+        .map(|index| index.name.as_str())
         .chain(
             stored
                 .global_secondary_indexes
                 .iter()
                 .filter(|index| index.status(now) == crate::state::IndexStatus::Creating)
-                .map(|index| (index.name.as_str(), index.backfill)),
+                .map(|index| index.name.as_str()),
         )
         .collect();
     // How many of the lifecycle actions this request asks for CANCEL a build that is still
     // running, which is work on the build already in flight rather than a second one — a
     // delete naming an index of either kind that is being built.
-    let mut cancels: usize = 0;
     let deleted = index_updates
         .iter()
         .filter_map(|update| update.delete.as_ref())
@@ -1514,18 +1507,9 @@ fn index_build_refusal(
                 .filter_map(|update| update.delete.as_ref())
                 .map(|delete| delete.index_name.as_str()),
         );
-    for index_name in deleted {
-        let Some((index_name, backfill)) = building
-            .iter()
-            .find(|(building, _)| *building == index_name)
-        else {
-            continue;
-        };
-        if backfill.allocating(now) {
-            return Some(in_use(index_allocating_message(name, index_name)));
-        }
-        cancels += 1;
-    }
+    let cancels = deleted
+        .filter(|index_name| building.contains(index_name))
+        .count();
     let lifecycle = index_updates
         .iter()
         .filter(|update| update.create.is_some() || update.delete.is_some())
@@ -1806,7 +1790,8 @@ fn merged_definitions(
 /// definition that was stored and whose index this same request deleted is dropped by
 /// the same rule, since removing an index removes its keys — and that holds from the
 /// instant the delete is ACCEPTED, so an index on its way out
-/// ([`crate::state::VectorIndex::being_deleted`]) keeps no definition alive even while the
+/// ([`crate::state::GlobalSecondaryIndex::being_deleted`],
+/// [`crate::state::VectorIndex::being_deleted`]) keeps no definition alive even while the
 /// table still reports it `DELETING`.
 ///
 /// The used attributes are collected ONCE into a set, so the filter costs one hash per
@@ -1820,7 +1805,12 @@ fn retained_definitions(
     let used: ::std::collections::HashSet<&str> = table
         .key_schema
         .iter()
-        .chain(indexes.iter().flat_map(|index| index.key_schema.iter()))
+        .chain(
+            indexes
+                .iter()
+                .filter(|index| !index.being_deleted())
+                .flat_map(|index| index.key_schema.iter()),
+        )
         .chain(
             table
                 .local_secondary_indexes
@@ -1909,9 +1899,18 @@ const INDEX_ALREADY_EXISTS_MESSAGE: &str = "Attempting to create an index which 
 /// The table's global secondary indexes after the update.
 ///
 /// A `Create` adds one (reported `CREATING` until the clock makes it `ACTIVE`), a
-/// `Delete` removes one, and an `Update` moves one's provisioned throughput and leaves
+/// `Delete` puts one on its way out — the index is KEPT in the list and reported
+/// `DELETING` ([`crate::state::GlobalSecondaryIndex::begin_deletion`]) until the clock
+/// makes the removal due ([`crate::state::Table::apply_due_index_removals`]) — and an
+/// `Update` moves one's provisioned throughput and leaves
 /// it `UPDATING` for the same span. A switch of the table's billing mode carries its
 /// indexes with it, because an index's capacity mode is the table's.
+///
+/// Which is also why the rules about what the TABLE may carry are asked of the indexes this
+/// update leaves it KEEPING rather than of the whole list: an index on its way out takes no
+/// slot of the per-table quota, keeps no attribute definition alive and needs no capacity
+/// of its own — the same rule a VECTOR index on its way out is held by
+/// ([`resolve_vector_indexes`]).
 ///
 /// `definitions` are the ones in force for the updated table — the stored ones plus the
 /// ones this request declares ([`merged_definitions`]) — and `requested_definitions` are
@@ -1951,7 +1950,12 @@ fn resolve_indexes(
                     INDEX_ALREADY_EXISTS_MESSAGE.to_string(),
                 ));
             }
-            if indexes.len() >= crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
+            if indexes
+                .iter()
+                .filter(|index| !index.being_deleted())
+                .count()
+                >= crate::state::MAX_GLOBAL_SECONDARY_INDEXES
+            {
                 return Err(crate::state::RequestError::Validation(format!(
                     "Invalid GlobalSecondaryIndexUpdates: table {} already carries the maximum \
                      of {} global secondary indexes",
@@ -2028,27 +2032,35 @@ fn resolve_indexes(
                     &delete.index_name,
                 ));
             }
-            let before = indexes.len();
-            indexes.retain(|index| index.name != delete.index_name);
-            if indexes.len() == before {
-                // An entry naming an index the table does not carry is a lookup miss on
-                // that index ([`crate::state::lifecycle_index_not_found`]). The stored
-                // indexes are left exactly as they were, because `handle` writes nothing
-                // until this whole list resolves.
+            let Some(index) = indexes
+                .iter_mut()
+                .find(|index| index.name == delete.index_name && !index.being_deleted())
+            else {
+                // An entry naming an index the table does not carry — or one whose delete
+                // has already been accepted — is a lookup miss on that index
+                // ([`crate::state::lifecycle_index_not_found`]). The stored indexes are left
+                // exactly as they were, because `handle` writes nothing until this whole
+                // list resolves.
                 return Err(crate::state::lifecycle_index_not_found(
                     &table.name,
                     &delete.index_name,
                 ));
-            }
+            };
+            // The removal falls due when the table's own update settles, which is the span
+            // this very call reports the table `UPDATING` for: a caller that waits for the
+            // table and then describes it sees the index gone, and one that acts straight
+            // after the call sees it `DELETING`
+            // ([`crate::state::GlobalSecondaryIndex::begin_deletion`]).
+            index.begin_deletion(now + crate::state::STATUS_TRANSITION);
         }
         if let Some(change) = &update.update {
             let Some(index) = indexes
                 .iter_mut()
-                .find(|index| index.name == change.index_name)
+                .find(|index| index.name == change.index_name && !index.being_deleted())
             else {
                 // An `Update` names the index the same way a `Delete` does, so an index
-                // the table does not carry is reported with the same sentence: one
-                // index-lifecycle surface, one wording.
+                // the table does not carry — or one already on its way out — is reported
+                // with the same sentence: one index-lifecycle surface, one wording.
                 return Err(crate::state::lifecycle_index_not_found(
                     &table.name,
                     &change.index_name,
@@ -2118,7 +2130,7 @@ fn resolve_indexes(
     // mode is the table's, so every index needs one too. Refusing names the index rather
     // than leaving it reporting a capacity of zero, which a PROVISIONED index never has.
     if billing_mode == "PROVISIONED" {
-        for index in &indexes {
+        for index in indexes.iter().filter(|index| !index.being_deleted()) {
             if index.provisioned_throughput.is_none() {
                 return Err(crate::state::RequestError::Validation(
                     crate::state::index_capacity_required_message(&index.name),

@@ -1019,11 +1019,16 @@ impl Table {
     /// "This index can be any local secondary index or global secondary index"
     /// (`Scan$IndexName`), so both lists answer; an index name is unique across the two
     /// of them, because a create refuses a name either list already holds.
+    ///
+    /// A global index whose delete has been ACCEPTED is not one of them: the table carries
+    /// it only until the removal falls due, and from the instant the delete was accepted it
+    /// is no longer addressable, so a read naming it is answered as a name no index of the
+    /// table has ([`GlobalSecondaryIndex::being_deleted`]).
     pub fn secondary_index(&self, name: &str) -> Option<SecondaryIndex<'_>> {
         let global = self
             .global_secondary_indexes
             .iter()
-            .find(|index| index.name == name)
+            .find(|index| index.name == name && !index.being_deleted())
             .map(|index| SecondaryIndex {
                 name: index.name.as_str(),
                 key_schema: &index.key_schema,
@@ -1223,13 +1228,19 @@ impl Table {
     /// Drop every index of this table whose REMOVAL the clock has already made due.
     ///
     /// Deleting an index is asynchronous work: the call that accepts it leaves the index
-    /// in place, reported `DELETING` ([`VectorIndex::begin_deletion`]), and the removal
+    /// in place, reported `DELETING` ([`GlobalSecondaryIndex::begin_deletion`],
+    /// [`VectorIndex::begin_deletion`]), and the removal
     /// that call owed falls due at the instant the table's own update settles — owed then
     /// whether or not anybody called, so a reporting operation may finish it. From that
     /// instant the table carries no such index at all, which is what tells a caller
     /// polling the index that the delete is finished rather than requested.
+    ///
+    /// One sweep for both kinds of index, because the removal belongs to the index
+    /// lifecycle and not to the kind of index being removed.
     pub fn apply_due_index_removals(&mut self, now: SystemTime) {
         self.vector_indexes.retain(|index| !index.removal_due(now));
+        self.global_secondary_indexes
+            .retain(|index| !index.removal_due(now));
     }
 
     /// Remove every item of this table whose TTL deletion the clock has already made
@@ -2347,6 +2358,11 @@ impl Table {
             global_secondary_indexes: self
                 .global_secondary_indexes
                 .iter()
+                // An index whose delete has been accepted is on its way out
+                // ([`GlobalSecondaryIndex::being_deleted`]), so the backup records the
+                // index set the table is left with rather than one it no longer keeps —
+                // the same rule the vector indexes below are recorded by.
+                .filter(|index| !index.being_deleted())
                 .map(|index| GlobalSecondaryIndexInfo {
                     index_name: Some(index.name.clone()),
                     key_schema: Some(index.key_schema.clone()),

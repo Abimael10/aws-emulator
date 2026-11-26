@@ -1276,8 +1276,9 @@ async fn one_update_carries_one_index_lifecycle_action_and_names_the_index_it_de
         );
     }
 
-    // The control: one delete of an index the table DOES carry is applied, and the index
-    // is gone from the description.
+    // The control: one delete of an index the table DOES carry is applied — the index is
+    // reported `DELETING` while the removal the call owed is outstanding, and the table
+    // carries none of it once that removal falls due.
     ok(
         &router,
         "UpdateTable",
@@ -1287,9 +1288,16 @@ async fn one_update_carries_one_index_lifecycle_action_and_names_the_index_it_de
     .await;
     let described = ok(&router, "DescribeTable", json!({"TableName": table})).await;
     assert_eq!(
-        crate::emulator::index_named(&described["Table"], "ByRank"),
+        crate::emulator::index_named(&described["Table"], "ByRank")["IndexStatus"],
+        json!("DELETING"),
+        "case the delete of an index the table carries: expected it on its way out, got \
+         {described}"
+    );
+    let settled = crate::emulator::describe_when_active(&router, "after the delete", table).await;
+    assert_eq!(
+        crate::emulator::index_named(&settled, "ByRank"),
         Value::Null,
-        "case the delete of an index the table carries: expected it gone, got {described}"
+        "case the delete of an index the table carries: expected it gone, got {settled}"
     );
     let _ = REGION;
 }

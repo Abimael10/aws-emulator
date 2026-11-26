@@ -22,8 +22,7 @@
 //! `crate::state::…`.
 //!
 //! The same instants are what an index's BUILD is made of, so they live here too: an added
-//! index has the storage its entries need allocated first
-//! ([`IndexBackfill::allocating`]) and then reads the items, and it is `ACTIVE` when that
+//! index reads the items its table already held, and it is `ACTIVE` when that
 //! reading is done and the table's own update has settled
 //! ([`IndexBackfill::settled_at`]) — which is why an index added to a table that already
 //! holds items is still being built once the table reports itself settled.
@@ -45,14 +44,6 @@ pub enum IndexBackfill {
     /// of the items it already held. An index added to a table holding none has that
     /// instant already behind it, because there was nothing to read.
     Added {
-        /// When the clock owes the END of the resource allocation an index's build starts
-        /// with: the storage the entries of the items it has to read will be held in.
-        ///
-        /// It is the phase a `Delete` of the index cannot be served in — that storage is
-        /// not there to release yet, which is what the refusal tells the caller to retry
-        /// past — and it is over well before the table's own update settles, so a caller
-        /// that waits for the table is always past it.
-        allocated_at: SystemTime,
         /// When every item the table already held has been processed, after which
         /// "the backfilling operation is complete and `Backfilling` is false".
         complete_at: SystemTime,
@@ -64,28 +55,21 @@ impl IndexBackfill {
     /// span the table's own update takes and `holds_items` says whether the table already
     /// held items for the new index to read.
     ///
-    /// The storage the index's entries need is laid down FIRST, which is done well before
-    /// the table's own update settles, and only then are the items read — which takes one
-    /// span more, so an index added to a table that already holds items is still being
-    /// built when the table reports itself settled, exactly as a client that waits for the
-    /// TABLE and then looks at the index sees. An index added to a table holding none has
-    /// nothing to read, so its reading is over the moment it is added and its build ends
-    /// with the table's own update ([`Self::settled_at`]).
+    /// Reading those items takes one span more than the table's own update, so an index
+    /// added to a table that already holds items is still being built when the table
+    /// reports itself settled, exactly as a client that waits for the TABLE and then looks
+    /// at the index sees. An index added to a table holding none has nothing to read, so
+    /// its reading is over the moment it is added and its build ends with the table's own
+    /// update ([`Self::settled_at`]).
     ///
-    /// WHY THESE SPANS. AWS publishes no duration for either phase — an index build takes
-    /// as long as the data takes — so what is modelled is the ORDER a client observes, in
-    /// the service's own transient span, and nothing is waited for:
-    ///
-    /// * the reading is a span of its OWN, after the table's, because the table returns to
-    ///   `ACTIVE` while the index it was given keeps building: a client that waits for the
-    ///   table and then reads the index has to be able to see that;
-    /// * the laying down of the storage is over inside the table's own span, because it is
-    ///   what the table's update is doing: a caller that waits for the table is past that
-    ///   phase, while one that acts straight after the call is inside it — which is what
-    ///   makes the phase observable at all without being a race at the boundary.
+    /// WHY THIS SPAN. AWS publishes no duration for an index build — it takes as long as
+    /// the data takes — so what is modelled is the ORDER a client observes, in the
+    /// service's own transient span, and nothing is waited for: the reading is a span of
+    /// its OWN, after the table's, because the table returns to `ACTIVE` while the index it
+    /// was given keeps building, and a client that waits for the table and then reads the
+    /// index has to be able to see that.
     pub fn added(holds_items: bool, now: SystemTime, span: Duration) -> Self {
         Self::Added {
-            allocated_at: now + span / 2,
             complete_at: if holds_items { now + span + span } else { now },
         }
     }
@@ -101,7 +85,7 @@ impl IndexBackfill {
     pub fn backfilling(&self, now: SystemTime) -> Option<bool> {
         match self {
             Self::WithTable => None,
-            Self::Added { complete_at, .. } => (now < *complete_at).then_some(true),
+            Self::Added { complete_at } => (now < *complete_at).then_some(true),
         }
     }
 
@@ -117,21 +101,7 @@ impl IndexBackfill {
     pub fn settled_at(&self, with_table: SystemTime) -> SystemTime {
         match self {
             Self::WithTable => with_table,
-            Self::Added { complete_at, .. } => with_table.max(*complete_at),
-        }
-    }
-
-    /// Whether the index this backfill belongs to is still having the storage its entries
-    /// need ALLOCATED at `now`, the phase the build of an added index begins with
-    /// ([`Self::added`]).
-    ///
-    /// An index defined with its table is being built for as long as the table itself is
-    /// being created, which the table's own status answers, so this speaks only about an
-    /// index that was ADDED.
-    pub fn allocating(&self, now: SystemTime) -> bool {
-        match self {
-            Self::WithTable => false,
-            Self::Added { allocated_at, .. } => now < *allocated_at,
+            Self::Added { complete_at } => with_table.max(*complete_at),
         }
     }
 }

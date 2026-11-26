@@ -134,36 +134,37 @@ fn transact_items_clauses(document: &Value) -> Vec<String> {
 // A CAPPED LIST PAST ITS MAXIMUM
 //
 // A list member carrying more elements than the model admits is a violation the validating
-// WALK reports — so the request is refused before the handler that has the decoded list in
-// hand runs — and AWS's recorded refusals of it state the REJECTED LIST:
-// `Value '[TransactGetItem(get=Get(key={pk=AttributeValue(s=…, n=null, …)}, …))]' at
-// 'transactItems' failed to satisfy constraint: …`, the same object rendering a refused
-// `BatchWriteItem` request map is quoted in, and
-// `Value '[ParameterizedStatement(statement=…, …)]' at 'transactStatements' …` for the
-// PartiQL transaction's own list. That walk hands
+// WALK reports, so the request is refused before the handler that has the decoded list in
+// hand runs, and the clause states what every other violation of a declared bound states:
+// the member path and the bound, in the form the served operation states its clauses in
+// (`super`'s "Which form a constraint clause takes"). Nothing of the rejected list belongs
+// in it — the clause a transactional list past its 100-action cap earns names
+// `TransactItems` and the bound and echoes NOTHING, exactly as the same member's EMPTY case
+// does (`tests/all/collection_cap_constraint_reports.rs` pins both, and
+// `tests/all/transact_items_cap_refusal.rs` drives the maximum over the two transaction
+// operations).
+//
+// ONE recorded refusal of such a list states the REJECTED LIST instead: the PartiQL
+// transaction's `TransactStatements`, quoted as
+// `Value '[ParameterizedStatement(statement=…, …)]' at 'transactStatements' …` — the same
+// object rendering a refused `BatchWriteItem` request map is quoted in. The walk hands
 // [`super::EmulatedService::override_refusal`] its own summary of the collection (`<n>
 // items`) rather than the collection, so there is nothing there to render from.
 //
-// The list is therefore read HERE, where the request still is: decoded by the framework's
+// That list is therefore read HERE, where the request still is: decoded by the framework's
 // OWN deserializer for the served operation's input — the same protocol, the same input
 // schema and the same generated reader the dispatch that follows uses, so this layer
 // cannot disagree with it — and rendered by the one renderer this crate states that form
-// with (`crate::state::rendered_transact_get_items`,
-// `crate::state::rendered_transact_write_items` and
-// `crate::state::rendered_parameterized_statements`). The BOUND is read off the same
+// with (`crate::state::rendered_parameterized_statements`). The BOUND is read off the same
 // generated input schema the walk reads it off, never off a second transcription of the
 // model.
 //
-// Only a list past the MAXIMUM is stated this way, which is the class the recorded
-// refusals carry. A list below the member's minimum is the empty list, whose recorded
-// refusal states the member and the bound alone, so it keeps the walk's own clause
-// (`tests/all/collection_cap_constraint_reports.rs` pins the two side by side).
+// Only a list past the MAXIMUM is stated this way, which is the class that recorded refusal
+// carries. A list below the member's minimum is the empty list, whose recorded refusal
+// states the member and the bound alone, so it keeps the walk's own clause.
 // =============================================================================
 
-/// The other operation whose `TransactItems` list is quoted back that way.
-const TRANSACT_GET_ITEMS: &str = "TransactGetItems";
-
-/// The PartiQL transaction, whose own statement list is quoted back the same way.
+/// The PartiQL transaction, whose own statement list is quoted back that way.
 const EXECUTE_TRANSACTION: &str = "ExecuteTransaction";
 
 /// The list member of `ExecuteTransaction`, as the model spells it on the wire.
@@ -193,28 +194,6 @@ pub fn capped_list_clause(
     req: &RtRequest,
 ) -> Option<CappedListClause> {
     let (path, rendered, requirement) = match operation {
-        TRANSACT_GET_ITEMS => {
-            let schema = crate::ops::types::TRANSACT_GET_ITEMS_INPUT_SCHEMA;
-            let input: crate::ops::types::TransactGetItemsInput = decoded(protocol, req, schema)?;
-            let requirement =
-                past_declared_maximum(schema, TRANSACT_ITEMS_MEMBER, input.transact_items.len())?;
-            (
-                crate::state::TRANSACT_ITEMS_MEMBER_PATH,
-                crate::state::rendered_transact_get_items(&input.transact_items),
-                requirement,
-            )
-        }
-        TRANSACT_WRITE_ITEMS => {
-            let schema = crate::ops::types::TRANSACT_WRITE_ITEMS_INPUT_SCHEMA;
-            let input: crate::ops::types::TransactWriteItemsInput = decoded(protocol, req, schema)?;
-            let requirement =
-                past_declared_maximum(schema, TRANSACT_ITEMS_MEMBER, input.transact_items.len())?;
-            (
-                crate::state::TRANSACT_ITEMS_MEMBER_PATH,
-                crate::state::rendered_transact_write_items(&input.transact_items),
-                requirement,
-            )
-        }
         EXECUTE_TRANSACTION => {
             let schema = crate::ops::types::EXECUTE_TRANSACTION_INPUT_SCHEMA;
             let input: crate::ops::types::ExecuteTransactionInput = decoded(protocol, req, schema)?;

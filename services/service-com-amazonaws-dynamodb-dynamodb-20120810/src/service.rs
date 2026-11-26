@@ -1236,28 +1236,26 @@ fn region_refusal<Eng: Send + Sync + 'static>(
 ///   recorded refusals of this service state, whichever member it is;
 ///
 /// A COLLECTION member past its cap is a clause like any other: in the item-request
-/// form the member and the bound, with nothing echoed. Some recorded AWS refusals of a
-/// capped collection — the transactional `TransactItems` lists and the PartiQL
-/// transaction's `TransactStatements`, each past its maximum — instead
-/// echo the rejected list as the service's OWN object rendering of it
-/// (`[TransactGetItem(get=Get(key={pk=AttributeValue(s=k0, n=null, …,
-/// iNT=null, dECIMALSET=null, …)}, …, workloadProfileName=null)), …]`), over
-/// fields this service's model does not declare:
-/// `smithy_query(query="shape", shape="com.amazonaws.dynamodb#AttributeValue")`
-/// gives `S N B SS NS BS M L NULL BOOL` and no `iNT`/`dECIMALSET`, and `Get`
-/// and `Put` carry no `workloadProfileName`. Those clauses are not rendered BY THIS
+/// form the member and the bound, with nothing echoed — which is what the transactional
+/// `TransactItems` lists past their 100-action maximum state, exactly as the same members'
+/// EMPTY case does. ONE recorded AWS refusal of a capped collection — the PartiQL
+/// transaction's `TransactStatements` past its maximum — instead
+/// echoes the rejected list as the service's OWN object rendering of it
+/// (`[ParameterizedStatement(statement=…, parameters=null,
+/// returnValuesOnConditionCheckFailure=null)]`). That clause is not rendered BY THIS
 /// FUNCTION, for a reason about this seam rather than about the rendering: the framework
 /// hands it a count (`<n> items`) rather than the collection, so there is nothing here to
-/// render FROM. They are rendered where the REQUEST still is and substituted for this
+/// render FROM. It is rendered where the REQUEST still is and substituted for this
 /// function's clause about that member
 /// (`request_constraints::capped_list_clause`), exactly as the one member whose
 /// refusal the HANDLER quotes is rendered where that handler has the request
-/// (`crate::state::rendered_batch_write_request_items`, the frame those fields belong to).
-/// Two recorded refusals of the SAME violation class (a `BatchGetItem` key list past the
-/// same 100 cap, and a transactional list below its minimum) state the no-value form this
-/// function builds, so a clause raised here states what it has: the member and the bound it
-/// broke. `tests/all/collection_cap_constraint_reports.rs` pins that over the capped
-/// collections of the batched and transactional operations.
+/// (`crate::state::rendered_batch_write_request_items`, the frame that rendering belongs
+/// to).
+/// Three recorded refusals of the SAME violation class (a `BatchGetItem` key list past the
+/// same 100 cap, a transactional list past its maximum, and one below its minimum) state the
+/// no-value form this function builds, so a clause raised here states what it has: the member
+/// and the bound it broke. `tests/all/collection_cap_constraint_reports.rs` pins that over the
+/// capped collections of the batched and transactional operations.
 fn violation_clause(violation: &Violation, forms: ClauseForms, alone: bool) -> Option<String> {
     match &violation.kind {
         // A member the service checks itself: the requirement with nothing echoed, over

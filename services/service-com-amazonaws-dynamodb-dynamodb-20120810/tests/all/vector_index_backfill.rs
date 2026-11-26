@@ -187,16 +187,12 @@ fn add_request(table: &str, kind: Kind) -> Value {
 /// way a later request's clock drives it, through the stored table — the pattern the
 /// metered-counter suite uses for a refresh no test can wait for. Everything the assertions
 /// then read is what the store actually holds, over the wire.
-///
-/// The index's resources are left ALLOCATED: this suite is about the reading of the items,
-/// which is the phase that follows.
 fn move_window(
     engine: &Arc<engine::InMemoryEngine>,
     table: &str,
     kind: Kind,
     complete_at: SystemTime,
 ) {
-    let allocated_at = SystemTime::now();
     let state = service_state(&**engine).expect("the shared engine holds this service's store");
     let mut store = state.lock();
     let table = store
@@ -206,10 +202,7 @@ fn move_window(
         Kind::Vector => {
             for index in table.vector_indexes.iter_mut().filter(|i| i.name == ADDED) {
                 index.active_at = complete_at;
-                index.backfill = IndexBackfill::Added {
-                    allocated_at,
-                    complete_at,
-                };
+                index.backfill = IndexBackfill::Added { complete_at };
             }
         }
         Kind::Global => {
@@ -219,10 +212,7 @@ fn move_window(
                 .filter(|i| i.name == ADDED)
             {
                 index.active_at = complete_at;
-                index.backfill = IndexBackfill::Added {
-                    allocated_at,
-                    complete_at,
-                };
+                index.backfill = IndexBackfill::Added { complete_at };
             }
         }
     }
