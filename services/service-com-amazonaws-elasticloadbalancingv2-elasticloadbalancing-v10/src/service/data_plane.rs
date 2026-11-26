@@ -1557,14 +1557,9 @@ fn conditions_met(
 }
 
 /// Whether one condition is met. A condition's values are alternatives — any one of them
-/// matching is a match — and each is written the wildcard language
-/// [`matches_within`] reads.
-///
-/// ONE condition form is NOT evaluated here, and is left UNMET with a warning naming it
-/// rather than matched on a guess — so a rule passed over for it is traceable to the form
-/// instead of looking like a rule the request simply did not match: `RegexValues`, because
-/// this emulator has no regular-expression engine for that dialect, and a hand-written
-/// approximation of one would match the wrong requests silently.
+/// matching is a match — and each is written either the wildcard language
+/// [`matches_within`] reads or, in `RegexValues`, the regular-expression dialect
+/// [`regex_matches_within`] reads.
 ///
 /// A `source-ip` condition IS evaluated, against the address the CONNECTION came from
 /// ([`DataPlaneRequest::source_address`]) and never against `X-Forwarded-For`, whose
@@ -1580,14 +1575,10 @@ fn condition_met(
 ) -> bool {
     let direct = condition.values.as_deref().unwrap_or_default();
     let field = condition.field.as_deref().unwrap_or_default();
-    if carries_regex_values(condition) {
-        tracing::warn!(
-            field,
-            "the condition matches on regular expressions, which this plane does not \
-             evaluate, so it is left unmet and its rule is passed over"
-        );
-        return false;
-    }
+    // The regular expressions this condition matches on, read through the ONE reading of a
+    // condition's two spellings, so an expression given either way is evaluated
+    // ([`crate::state::condition_regex_values`]).
+    let expressions = crate::state::condition_regex_values(condition);
     match field {
         // "path-pattern ... the comparison is case sensitive", and the pattern is matched
         // against the path alone, not the query string.
@@ -1601,6 +1592,9 @@ fn condition_met(
                 .iter()
                 .chain(configured)
                 .any(|pattern| matches_within(pattern, &request.path, CASE_SENSITIVE, budget))
+                || expressions.iter().any(|expression| {
+                    regex_matches_within(expression, &request.path, CASE_SENSITIVE, budget)
+                })
         }
         // A host name is case-insensitive, so the comparison is made without regard to
         // case rather than by folding either side here.
@@ -1614,6 +1608,9 @@ fn condition_met(
                 .iter()
                 .chain(configured)
                 .any(|pattern| matches_within(pattern, &request.host, CASE_INSENSITIVE, budget))
+                || expressions.iter().any(|expression| {
+                    regex_matches_within(expression, &request.host, CASE_INSENSITIVE, budget)
+                })
         }
         // "http-request-method ... the comparison is case sensitive", and a method is
         // upper case on the wire. No wildcard is documented for it, so the value is the
@@ -1644,6 +1641,9 @@ fn condition_met(
                 .unwrap_or_default()
                 .iter()
                 .any(|pattern| matches_within(pattern, value, CASE_SENSITIVE, budget))
+                || expressions.iter().any(|expression| {
+                    regex_matches_within(expression, value, CASE_SENSITIVE, budget)
+                })
         }
         // A query-string condition's pair matches when the request carries a parameter
         // whose key and value both match; an entry with no key matches on the value alone.
@@ -1700,24 +1700,54 @@ fn condition_met(
     }
 }
 
-/// Whether this condition matches on REGULAR EXPRESSIONS — in `RegexValues`, or in the
-/// `RegexValues` of the field's own configuration shape — which is what
-/// [`condition_met`] leaves unmet rather than approximating.
-fn carries_regex_values(condition: &RuleCondition) -> bool {
-    let listed = |values: Option<&Vec<String>>| values.is_some_and(|values| !values.is_empty());
-    listed(condition.regex_values.as_ref())
-        || condition
-            .path_pattern_config
-            .as_ref()
-            .is_some_and(|config| listed(config.regex_values.as_ref()))
-        || condition
-            .host_header_config
-            .as_ref()
-            .is_some_and(|config| listed(config.regex_values.as_ref()))
-        || condition
-            .http_header_config
-            .as_ref()
-            .is_some_and(|config| listed(config.regex_values.as_ref()))
+/// Whether `value` matches the regular expression `expression` — the dialect
+/// `RegexValues` is written in, "the regular expressions to compare against the request
+/// URL" — charged to this request's matching `budget`.
+///
+/// The expression is compiled by the ONE reading of such a value this crate has
+/// ([`crate::state::condition_regex`]), which is also what the operations that STORE a rule
+/// refuse an expression by: so an expression a rule holds is one that compiles, and what it
+/// matches here is what it was accepted as. The engine behind it has no backtracking, so one
+/// match costs time linear in the text it is run over.
+///
+/// Bounded exactly as [`matches_within`] is: an expression longer than AWS publishes for a
+/// condition value, or request text longer than this emulator matches against, is matched
+/// against nothing, and the product of the two lengths is charged to the budget before the
+/// expression is compiled — so neither compiling nor matching can be made to cost more than
+/// the request's whole budget.
+fn regex_matches_within(
+    expression: &str,
+    value: &str,
+    case_sensitive: bool,
+    budget: &mut usize,
+) -> bool {
+    let expression_chars = expression.chars().take(MAX_CONDITION_VALUE_CHARS + 1).count();
+    let value_chars = value.chars().take(MAX_MATCHED_CHARS + 1).count();
+    // At least one step per match, so a walk cannot repeat for free on empty text.
+    let cost = expression_chars.saturating_mul(value_chars).max(1);
+    if cost > *budget {
+        *budget = 0;
+        return false;
+    }
+    *budget -= cost;
+    if expression_chars > MAX_CONDITION_VALUE_CHARS || value_chars > MAX_MATCHED_CHARS {
+        tracing::warn!(
+            expression_chars,
+            value_chars,
+            "the condition expression or the request text is longer than this plane matches, \
+             so the condition is left unmet"
+        );
+        return false;
+    }
+    let Some(compiled) = crate::state::condition_regex(expression, case_sensitive) else {
+        // An expression the operations that store a rule refuse, so a stored rule carries
+        // none: were one ever there, it matches nothing rather than matching everything.
+        tracing::warn!(
+            "the condition expression compiles to no program, so the condition is left unmet"
+        );
+        return false;
+    };
+    compiled.is_match(value)
 }
 
 /// Whether `value` matches `pattern` in the wildcard language every condition's values

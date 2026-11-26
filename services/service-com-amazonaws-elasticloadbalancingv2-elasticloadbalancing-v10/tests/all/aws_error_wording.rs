@@ -67,12 +67,18 @@ const TOO_MANY_CERTIFICATES: &str = "TooManyCertificates";
 const VALIDATION_ERROR: &str = "ValidationError";
 
 /// The sentence `SetRulePriorities` refuses a request it cannot place the priorities of
-/// with — a pair naming no rule, a priority a rule outside the request holds: that
-/// operation addresses a LIST, so a refusal about what is STORED is about the set of
-/// priorities it asked for rather than about one value, and the error code tells the two
-/// apart. A value the list itself repeats is the request to fix instead, and names that
-/// value (`all/in_request_duplicate_rule_priorities.rs`).
+/// with — a priority a rule outside the request holds: that operation addresses a LIST, so a
+/// refusal about what is STORED is about the set of priorities it asked for rather than about
+/// one value, and the error code tells the two apart. A value the list itself repeats is the
+/// request to fix instead, and names that value
+/// (`all/in_request_duplicate_rule_priorities.rs`); a pair naming a rule the store does not
+/// hold is a refusal about the RULES, worded as [`RULES_NOT_FOUND_REFUSAL`].
 const SET_PRIORITIES_REFUSAL: &str = "One or more priorities not found";
+
+/// The sentence every refusal about a LIST of rules this store does not hold states — the
+/// one `SetRulePriorities` answers a pair naming a rule it holds none for with, and the one
+/// the rule reads answer a selection they cannot resolve with.
+const RULES_NOT_FOUND_REFUSAL: &str = "One or more rules not found";
 
 /// How many certificate ARNs one request may carry, from the documentation of the
 /// `Certificates` member every operation that takes one declares: "You must provide
@@ -201,8 +207,8 @@ async fn a_priority_already_in_use_is_refused_naming_only_the_priority() {
     }
 
     // The complement, which is what the sentence above is told apart from: a pair naming a
-    // rule this store does not hold is a refusal about the SET of priorities the request
-    // addresses rather than about one priority, under its own code.
+    // rule this store does not hold is a refusal about the RULES the request named rather
+    // than about one priority, under its own code.
     let mut form = action("SetRulePriorities");
     form.push(p("RulePriorities.member.1.RuleArn", "not-a-rule-arn"));
     form.push(p("RulePriorities.member.1.Priority", "5"));
@@ -211,7 +217,7 @@ async fn a_priority_already_in_use_is_refused_naming_only_the_priority() {
         "SetRulePriorities naming a rule the store does not hold",
         &missing,
         RULE_NOT_FOUND,
-        SET_PRIORITIES_REFUSAL,
+        RULES_NOT_FOUND_REFUSAL,
     );
 }
 

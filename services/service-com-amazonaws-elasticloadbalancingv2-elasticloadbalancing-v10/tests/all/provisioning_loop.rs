@@ -15,7 +15,7 @@
 
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
     ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, TrustStoreRecord,
-    TRUST_STORE_CREATING,
+    LISTENERS_PER_LOAD_BALANCER, TRUST_STORE_CREATING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::HashMap;
@@ -1630,7 +1630,7 @@ async fn a_store_bound_is_answered_with_the_modelled_quota_error() {
     let router = router();
     let lb_arn = create_alb(&router, "quota-alb").await;
     let tg_arn = create_http_target_group(&router, "quota-tg").await;
-    let bound = 100;
+    let bound = i32::try_from(LISTENERS_PER_LOAD_BALANCER).expect("the published bound");
 
     for port in 1..=bound {
         create_forward_listener(&router, &lb_arn, &tg_arn, port).await;

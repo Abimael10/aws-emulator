@@ -183,6 +183,49 @@ fn unmodified(component: Option<&str>, keywords: &[&str]) -> bool {
     component.is_none_or(|value| keywords.contains(&value))
 }
 
+/// How many target groups ONE forward action may distribute among, from the quota
+/// `DescribeAccountLimits` publishes as `target-groups-per-action-on-application-load-balancer`
+/// (`crate::ops::describe_account_limits`): a forward "distributes requests among multiple
+/// target groups", and this is how many of them one action may name.
+pub const TARGET_GROUPS_PER_FORWARD_ACTION: usize = 5;
+
+/// The refusal a forward action naming more target groups than that earns, in Elastic Load
+/// Balancing's own wording.
+///
+/// Fixed text quoting the published limit: the rule is about the ACTION as a whole — how many
+/// groups it names — so there is no one value of the request to name in it.
+#[must_use]
+pub fn forward_target_groups_message() -> String {
+    format!("You cannot specify more than {TARGET_GROUPS_PER_FORWARD_ACTION} target groups per action")
+}
+
+/// Enforce that no forward action of `actions` names more target groups than one action may
+/// distribute among ([`TARGET_GROUPS_PER_FORWARD_ACTION`]).
+///
+/// The groups are read through the ONE reading of a forward's two spellings
+/// (`crate::state::reported_forward_config`), so the distribution this counts is exactly the
+/// one a read reports and the data plane performs, whether the action named a single group
+/// directly or a list of them in its configuration.
+///
+/// Judged wherever an action is SET — a rule's actions and a listener's default actions, on
+/// the create that first stores them and on the modification that replaces them — exactly as
+/// the weights of those groups are ([`check_forward_weights`]), so a configuration one
+/// operation refuses cannot be reached through another.
+pub fn check_forward_target_groups(actions: &[Action]) -> Result<(), String> {
+    for action in actions
+        .iter()
+        .filter(|action| action.r#type == super::FORWARD_ACTION_TYPE)
+    {
+        let Some(config) = super::reported_forward_config(action) else {
+            continue;
+        };
+        if config.target_groups.unwrap_or_default().len() > TARGET_GROUPS_PER_FORWARD_ACTION {
+            return Err(forward_target_groups_message());
+        }
+    }
+    Ok(())
+}
+
 /// The refusal a forward action whose target groups leave nothing to select earns.
 ///
 /// Fixed text: the rule is about the WEIGHTS of the action as a whole — their total — so
@@ -527,6 +570,59 @@ mod tests {
                     Some(FORWARD_WEIGHTS_MESSAGE),
                     "case {case:?}: expected the refusal a forward with nothing to select \
                      earns, got {answer:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: a forward is accepted exactly when it names no more target groups than one
+    /// action may distribute among.
+    #[test]
+    fn a_forward_is_refused_when_it_names_more_target_groups_than_one_action_may() {
+        // The rows span what the rule generalises over: the single-group spelling, one group,
+        // the published limit, one past it, and a list far past it — and, for each accepted
+        // row, the weights are left out so only the COUNT decides.
+        let single = vec![Action {
+            r#type: super::super::FORWARD_ACTION_TYPE.to_string(),
+            target_group_arn: Some("tg-only".to_string()),
+            ..Action::default()
+        }];
+        let named = |count: usize| -> Vec<Action> {
+            let groups: Vec<(String, Option<i32>)> = (0..count)
+                .map(|index| (format!("tg-{index}"), Some(1)))
+                .collect();
+            forward(
+                &groups
+                    .iter()
+                    .map(|(arn, weight)| (arn.as_str(), *weight))
+                    .collect::<Vec<(&str, Option<i32>)>>(),
+            )
+        };
+        let rows: Vec<(&str, Vec<Action>, bool)> = vec![
+            ("the single-group spelling", single, true),
+            ("one group", named(1), true),
+            ("the published limit", named(TARGET_GROUPS_PER_FORWARD_ACTION), true),
+            (
+                "one past the published limit",
+                named(TARGET_GROUPS_PER_FORWARD_ACTION + 1),
+                false,
+            ),
+            ("far past the published limit", named(20), false),
+            ("no action at all", Vec::new(), true),
+        ];
+        for (case, actions, accepted) in rows {
+            let answer = check_forward_target_groups(&actions);
+            assert_eq!(
+                answer.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {answer:?}"
+            );
+            if !accepted {
+                assert_eq!(
+                    answer.as_ref().err(),
+                    Some(&forward_target_groups_message()),
+                    "case {case:?}: expected the refusal the published limit earns, got \
+                     {answer:?}"
                 );
             }
         }

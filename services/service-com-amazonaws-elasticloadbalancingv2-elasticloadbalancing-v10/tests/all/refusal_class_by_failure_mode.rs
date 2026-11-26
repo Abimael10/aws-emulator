@@ -775,18 +775,22 @@ async fn set_priorities(router: &MultiServiceRouter, pairs: &[(&str, i32)]) -> R
 
 /// Rule 5: `SetRulePriorities` tells three failures apart — a priority the request itself
 /// repeated, which is the request to fix and names the repeated value; a priority a rule
-/// OUTSIDE the request holds, which is the modelled conflict; and a pair naming no rule,
-/// which is the modelled not-found. The two modelled ones are worded about the SET of
-/// priorities it was asked to place, because the request carries one pair per rule and any
-/// of them may be the one to change.
+/// OUTSIDE the request holds, which is the modelled conflict and is worded about the SET of
+/// priorities it was asked to place, because the request carries one pair per rule and any of
+/// them may be the one to change; and a pair naming no rule, which is the modelled not-found
+/// and is worded about the RULES the request named.
 ///
 /// The rows vary the priority the request repeats, the rule the collision is with, and the
 /// shape of the ARN that names no rule — so each code is driven by several inputs rather
 /// than one.
 #[tokio::test]
 async fn set_rule_priorities_tells_a_repeated_priority_from_one_in_use_and_from_a_missing_rule() {
-    /// The sentence this operation words a refusal ABOUT THE SET it addresses with.
+    /// The sentence this operation words a refusal about the SET OF PRIORITIES it addresses
+    /// with.
     const ABOUT_THE_SET: &str = "One or more priorities not found";
+
+    /// And the sentence every refusal about a LIST OF RULES this store does not hold states.
+    const ABOUT_THE_RULES: &str = "One or more rules not found";
 
     let (router, _engine) = emulator();
     let lb = create_load_balancer(&router, "priority-classes-alb", &[]).await;
@@ -861,7 +865,7 @@ async fn set_rule_priorities_tells_a_repeated_priority_from_one_in_use_and_from_
     }
 
     // A pair naming a rule this store does not hold is the modelled not-found, worded about
-    // the SET the request addresses.
+    // the RULES the request named.
     let deleted = {
         let mut form = action("DeleteRule");
         form.push(p("RuleArn", &rules[2]));
@@ -883,7 +887,7 @@ async fn set_rule_priorities_tells_a_repeated_priority_from_one_in_use_and_from_
         ),
     ] {
         let reply = set_priorities(&router, &[(rule, 5)]).await;
-        assert_refused(case, &reply, RULE_NOT_FOUND, ABOUT_THE_SET);
+        assert_refused(case, &reply, RULE_NOT_FOUND, ABOUT_THE_RULES);
     }
 
     // The listener's own default rule has no numeric priority to move, and that refusal is
@@ -1160,15 +1164,27 @@ async fn a_rule_whose_actions_or_counts_the_model_refuses_states_which_bound_it_
             "You cannot specify multiple of the following action type: 'forward'".to_string(),
         ),
         (
+            // Two routing actions do not say which of them routes the request, and the
+            // refusal names the two TYPES that clash, the LAST routing action of the list
+            // first — the one a rule performs — then the one the caller has to drop.
             "a forward beside a fixed response",
             {
                 let mut fields = forward(1, &tg);
                 fields.extend(fixed_response(2, "200"));
                 fields
             },
-            "A rule must include exactly one of the following actions: forward, fixed-response, \
-             redirect"
-                .to_string(),
+            "Action types 'fixed-response,forward' cannot be specified together".to_string(),
+        ),
+        (
+            "the mirror: a fixed response beside a redirect",
+            {
+                let mut fields = fixed_response(1, "200");
+                fields.push(p("Actions.member.2.Type", "redirect"));
+                fields.push(p("Actions.member.2.RedirectConfig.StatusCode", "HTTP_301"));
+                fields.push(p("Actions.member.2.RedirectConfig.Host", "moved.example.com"));
+                fields
+            },
+            "Action types 'redirect,fixed-response' cannot be specified together".to_string(),
         ),
     ];
 

@@ -257,10 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The operation's own documented requirement: "You must specify either a
             // listener or rules." The model declares no error shape for breaking it, so
-            // this is the service's own `ValidationError` naming the two members.
+            // this is the service's own `ValidationError`, worded as Elastic Load Balancing
+            // words it ([`crate::state::rule_selector_required_message`]).
             None => {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    "You must specify either ListenerArn or RuleArns",
+                    crate::state::rule_selector_required_message(),
                 ));
             }
         };

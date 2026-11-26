@@ -79,8 +79,9 @@ pub use pagination::{invalid_marker_message, paginate, PageError, PageTokenKey, 
 pub mod rule_actions;
 
 pub use rule_actions::{
-    check_forward_weights, check_redirect_actions, redirects_to_itself, FORWARD_WEIGHTS_MESSAGE,
-    REDIRECT_LOOP_MESSAGE,
+    check_forward_target_groups, check_forward_weights, check_redirect_actions,
+    forward_target_groups_message, redirects_to_itself, FORWARD_WEIGHTS_MESSAGE,
+    REDIRECT_LOOP_MESSAGE, TARGET_GROUPS_PER_FORWARD_ACTION,
 };
 
 /// The address blocks a `source-ip` rule condition matches on: what makes one of its
@@ -92,6 +93,19 @@ pub mod source_ip_conditions;
 
 pub use source_ip_conditions::{
     check_source_ip_conditions, invalid_cidr_block_message, source_ip_block,
+};
+
+/// The regular expressions a rule condition matches on, and how many wildcards the values
+/// beside them may hold.
+///
+/// Public because the data plane that EVALUATES such a condition compiles a stored
+/// expression through the same reading (`crate::service::data_plane`).
+pub mod condition_regex;
+
+pub use condition_regex::{
+    check_condition_regex_values, check_condition_wildcards, condition_regex,
+    condition_regex_values, condition_wildcards_message, CONDITION_REGEX_MESSAGE,
+    CONDITION_WILDCARDS_PER_RULE,
 };
 
 /// The health state machine of a target group's registrations: the states a read reports
@@ -348,11 +362,23 @@ pub const LOAD_BALANCER_QUOTA: usize = 1_000;
 pub const TARGET_GROUP_QUOTA: usize = 1_000;
 
 /// How many listeners one load balancer carries before `CreateListener` refuses with
-/// the modelled `TooManyListenersException`. The emulator's own bound, as
-/// [`LOAD_BALANCER_QUOTA`]; a listener exists only under a load balancer, so the
-/// listener store is bounded by this times [`LOAD_BALANCER_QUOTA`], and deleting a load
-/// balancer releases its listeners.
-pub const LISTENERS_PER_LOAD_BALANCER: usize = 100;
+/// the modelled `TooManyListenersException`: the published default `DescribeAccountLimits`
+/// reports as `listeners-per-application-load-balancer` (and as
+/// `listeners-per-network-load-balancer`).
+///
+/// A listener exists only under a load balancer, so the listener store is bounded by this
+/// times [`LOAD_BALANCER_QUOTA`], and deleting a load balancer releases its listeners.
+pub const LISTENERS_PER_LOAD_BALANCER: usize = 50;
+
+/// The message Elastic Load Balancing refuses the listener past that bound with, in its own
+/// wording: fixed text around the `LoadBalancerArn` the request named, which is the load
+/// balancer whose listeners are full and the one value the caller can act on.
+pub fn listener_limit_message(load_balancer_arn: &str) -> String {
+    format!(
+        "The maximum number of listeners on load balancer '{load_balancer_arn}' has been \
+         reached"
+    )
+}
 
 /// How many rules one load balancer carries across its listeners before `CreateRule`
 /// refuses with the modelled `TooManyRulesException`: the published default
@@ -909,6 +935,17 @@ pub fn rule_selection_not_found_message() -> String {
     "One or more rules not found".to_string()
 }
 
+/// The message Elastic Load Balancing refuses a rule read that names NEITHER selector with:
+/// `DescribeRules` requires "either a listener or rules", and both members are optional in
+/// the model, so a request carrying neither is refused under this service's own
+/// `ValidationError`.
+///
+/// Fixed text, worded the way the service words it — about the two selectors rather than
+/// about the member names of the API — because the caller has to add one of them.
+pub fn rule_selector_required_message() -> String {
+    "You must specify either listener rule ARNs or a listener ARN".to_string()
+}
+
 /// The message Elastic Load Balancing answers a `RuleNotFound` with for an operation
 /// that addresses ONE rule through its own required `RuleArn` (`DeleteRule`).
 ///
@@ -927,12 +964,12 @@ pub fn rule_not_found_message(arn: &str) -> String {
 /// list-addressing operation of this service answers, worded for the member the list
 /// carries.
 ///
-/// One sentence for every way the list cannot be placed: a pair naming a rule this store
-/// does not hold (`RuleNotFound`), a priority a rule outside the request already evaluates
-/// at, and a priority the list itself asks two rules to evaluate at (`PriorityInUse`) — in
-/// each case any of the pairs may be the one to change, so none of them is named. The
-/// operation that places ONE rule at ONE priority states that priority instead
-/// ([`priority_in_use_message`]).
+/// This is the refusal about the PRIORITIES: one the list asks for that a rule outside the
+/// request already evaluates at, and one the list itself asks two rules to evaluate at
+/// (`PriorityInUse`) — in each case any of the pairs may be the one to change, so none of
+/// them is named. A pair naming a rule the store does not hold is a refusal about the RULES
+/// instead, and states that ([`rule_selection_not_found_message`]); the operation that
+/// places ONE rule at ONE priority states that priority ([`priority_in_use_message`]).
 pub fn rule_priorities_refusal_message() -> String {
     "One or more priorities not found".to_string()
 }
@@ -1977,6 +2014,47 @@ pub fn check_subnet_vpcs(
         .any(|subnet| subnet.vpc_id.as_deref().is_some_and(|held| held != vpc_id))
     {
         return Err(format!("All subnets must belong to the same VPC: '{vpc_id}'"));
+    }
+    Ok(())
+}
+
+/// The words Elastic Load Balancing refuses a placement that names two subnets of ONE
+/// Availability Zone with — the rule itself, with nothing of the request in it: a load
+/// balancer carries one node per zone, so which of the two subnets the caller drops is the
+/// caller's to decide.
+pub const ONE_SUBNET_PER_ZONE: &str =
+    "A load balancer cannot be attached to multiple subnets in the same Availability Zone";
+
+/// Whether the subnets a request places a load balancer in are in DISTINCT Availability
+/// Zones — "[y]ou can specify only one subnet per Availability Zone" (`Subnets`,
+/// `SubnetMappings`) — and, when they are not, the rule the request broke.
+///
+/// A load balancer has one node per zone it is placed in, so two subnets of one zone ask for
+/// a placement it cannot hold: the whole request is refused rather than creating a load
+/// balancer whose zone list names one zone twice, which is a list no read of AWS ever
+/// answers. Which zone a subnet is in is EC2's to say, so the comparison is made on what EC2
+/// reported (`resolved`); with no EC2 to ask nothing is known and nothing is refused, because
+/// a refusal has to be grounded in what EC2 reported rather than assumed from silence — and
+/// there the zones are stood in for, one per subnet ([`availability_zone_records`]).
+///
+/// The ONE reading of that rule, called by `CreateLoadBalancer` for the subnets a load
+/// balancer starts in and by `SetSubnets` for the subnets that replace them, beside the
+/// reading of the VPC they have to agree on ([`check_subnet_vpcs`]). It is the per-zone
+/// CEILING stated on the subnets themselves, where [`check_placement_count`] states it on
+/// how many of them one request may name.
+pub fn check_subnet_zones(resolved: Option<&[network::SubnetFacts]>) -> Result<(), Refusal> {
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    let mut zones: Vec<&str> = Vec::with_capacity(resolved.len());
+    for zone in resolved
+        .iter()
+        .filter_map(|subnet| subnet.availability_zone.as_deref())
+    {
+        if zones.contains(&zone) {
+            return Err(Refusal::Configuration(ONE_SUBNET_PER_ZONE.to_string()));
+        }
+        zones.push(zone);
     }
     Ok(())
 }
@@ -3198,10 +3276,11 @@ pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String>
         }
         values += condition_values(condition);
     }
-    // And what a `source-ip` condition matches ON is an address block: a value that is no
-    // block names a set of source addresses no request could ever come from, so the
-    // condition it was written in could never be met ([`source_ip_conditions`]).
-    check_source_ip_conditions(conditions)?;
+    // How many VALUES the whole rule matches on is judged next, and before anything READS
+    // one of them: it is the bound that dominates every per-value step below — the address
+    // blocks parsed, the regular expressions compiled and the wildcards counted — so the
+    // work of one call is bounded by the published quota rather than by the length of the
+    // lists a caller chose to send.
     if values > CONDITION_VALUES_PER_RULE {
         // AWS's own wording for this refusal, which states the published limit and names
         // neither the count the request carried nor the condition it sat in: "A rule can
@@ -3211,6 +3290,19 @@ pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String>
              regex values"
         ));
     }
+    // And what a `source-ip` condition matches ON is an address block: a value that is no
+    // block names a set of source addresses no request could ever come from, so the
+    // condition it was written in could never be met ([`source_ip_conditions`]).
+    check_source_ip_conditions(conditions)?;
+    // And what a `RegexValues` condition matches on is a regular expression the service
+    // COMPILES: one that compiles nowhere matches no request either, so it is refused here
+    // rather than stored as a condition the data plane could never meet
+    // ([`condition_regex`]).
+    check_condition_regex_values(conditions)?;
+    // The WILDCARDS of the values beside them are bounded for the rule as a whole: past
+    // that number the matching engine behind a rule holds no more of them
+    // ([`CONDITION_WILDCARDS_PER_RULE`]).
+    check_condition_wildcards(conditions)?;
     Ok(())
 }
 
@@ -3253,6 +3345,21 @@ pub const ROUTING_ACTION_TYPES: &[&str] = &["forward", "fixed-response", "redire
 pub const AUTHENTICATION_ACTION_TYPES: &[&str] =
     &["authenticate-oidc", "authenticate-cognito", "jwt-validation"];
 
+/// The message Elastic Load Balancing refuses an action list naming two actions that cannot
+/// be performed together with: fixed text around the TYPES that clash, comma-joined.
+///
+/// Built from the request, because which types clashed is what the caller has to choose
+/// between — unlike the refusal for a list naming NO routing action at all, which has no
+/// type of the request to name and states the three a rule may end with instead. The ORDER is
+/// the one [`check_rule_actions`] states: the LAST routing action of the list, which is the
+/// one a rule performs, then the ones before it, which are what the caller has to drop.
+pub fn incompatible_action_types_message(types: &[&str]) -> String {
+    format!(
+        "Action types '{}' cannot be specified together",
+        types.join(",")
+    )
+}
+
 /// How many actions one rule carries: the ONE routing action it must include, and the one
 /// user-authentication action it may include before it — the two sentences
 /// [`ROUTING_ACTION_TYPES`] and [`AUTHENTICATION_ACTION_TYPES`] quote, which is where this
@@ -3288,11 +3395,27 @@ pub fn check_rule_actions(actions: &[Action]) -> Result<(), String> {
             ));
         }
     }
-    let routing = kinds
+    let routing: Vec<&str> = kinds
         .iter()
+        .copied()
         .filter(|kind| ROUTING_ACTION_TYPES.contains(kind))
-        .count();
-    if routing != 1 {
+        .collect();
+    // Two routing actions do not say which of them routes the request. AWS's own wording for
+    // that refusal names the types that CLASH, comma-joined, with the action the rule cannot
+    // ADD named first and the one it clashes with after it: a rule's routing action is its
+    // LAST ("it must be the last action to be performed"), so the one the caller has to drop
+    // is the one before it, and that is the order the recorded refusal of a list naming a
+    // forward and then a redirect states ("Action types 'redirect,forward' …").
+    if routing.len() > 1 {
+        let mut clashing: Vec<&str> = Vec::with_capacity(routing.len());
+        let (last, earlier) = routing
+            .split_last()
+            .expect("a list of more than one routing action has a last entry");
+        clashing.push(last);
+        clashing.extend(earlier);
+        return Err(incompatible_action_types_message(&clashing));
+    }
+    if routing.is_empty() {
         return Err(format!(
             "A rule must include exactly one of the following actions: {}",
             ROUTING_ACTION_TYPES.join(", ")

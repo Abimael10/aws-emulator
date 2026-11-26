@@ -76,6 +76,13 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # (`src/state/certificate_resolution.rs`) rather than assuming a well-formed ARN names one.
 # Only the generated client is needed — the emulator supplies the transport.
 aws-sdk-acm = { version = "1", default-features = false }
+# The ENGINE a rule condition's `RegexValues` are compiled and matched by: those values are
+# regular expressions the service compiles ("the regular expressions to compare against the
+# request URL"), so the control plane refuses one that compiles nowhere and the data plane
+# matches a stored one with the same engine (`src/state/condition_regex.rs`). The maintained
+# linear-time matcher this workspace already matches caller-supplied patterns with, so a
+# pattern a caller wrote cannot cost more than the text it is run over.
+regex = "1.13"
 # The ONE reading of an IPv4/IPv6 CIDR block and of whether an address is inside it, which
 # is how an `ip` target is matched against the subnets and the VPC of its target group.
 ipnet = "2"

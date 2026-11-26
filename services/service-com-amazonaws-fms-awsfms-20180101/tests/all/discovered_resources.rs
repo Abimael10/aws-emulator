@@ -510,21 +510,30 @@ async fn discovers_what_the_owning_services_hold() {
             "subnet",
             &router,
             "CreateSubnet",
-            &[p("VpcId", &vpc), p("CidrBlock", "10.0.1.0/24")],
+            &[
+                p("VpcId", &vpc),
+                p("CidrBlock", "10.0.1.0/24"),
+                p("AvailabilityZone", "us-west-2a"),
+            ],
         )
         .await,
         "subnetId",
     );
     // A second subnet of the same VPC, because the load balancer below is an Application
     // Load Balancer: ELBv2 places one in at least two Availability Zones, and resolves the
-    // subnets a request names against EC2, which owns them.
+    // subnets a request names against EC2, which owns them. Each names its own ZONE, since
+    // one load balancer is attached to at most one subnet per Availability Zone.
     let second_subnet = element(
         "second subnet",
         &ec2_ok(
             "second subnet",
             &router,
             "CreateSubnet",
-            &[p("VpcId", &vpc), p("CidrBlock", "10.0.2.0/24")],
+            &[
+                p("VpcId", &vpc),
+                p("CidrBlock", "10.0.2.0/24"),
+                p("AvailabilityZone", "us-west-2b"),
+            ],
         )
         .await,
         "subnetId",

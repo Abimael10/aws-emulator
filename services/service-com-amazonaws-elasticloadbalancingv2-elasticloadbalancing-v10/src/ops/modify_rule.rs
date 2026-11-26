@@ -184,6 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether the rule this call leaves behind holds together does not depend on
         // what the store holds.
         if let Some(conditions) = input.conditions.as_deref() {
+            // The same BOUNDED walk `CreateRule` applies: the condition count and then the
+            // number of values across them (`crate::state::CONDITIONS_PER_RULE`,
+            // `crate::state::CONDITION_VALUES_PER_RULE`) are judged before any value is read,
+            // so at most that many are parsed, compiled as regular expressions (under
+            // `crate::state::condition_regex::CONDITION_VALUE_CHARS` and a program-size
+            // ceiling) and counted for their wildcards.
             crate::state::check_rule_conditions(conditions)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
@@ -279,6 +285,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // forward at once; the refusal is this service's own `ValidationError` and the rule
         // keeps the weights it held.
         crate::state::check_forward_weights(&updated.actions)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // And a forward distributes among no more target groups than one action may name,
+        // judged on the actions this call LEAVES the rule with
+        // ([`crate::state::TARGET_GROUPS_PER_FORWARD_ACTION`]).
+        crate::state::check_forward_target_groups(&updated.actions)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         // "You must modify at least one of the following components to avoid a redirect

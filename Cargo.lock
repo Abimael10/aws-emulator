@@ -14761,6 +14761,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.5",
  "rcgen",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "serde_json",

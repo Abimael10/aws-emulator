@@ -317,6 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_forward_weights(&input.default_actions)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
+        // And a forward distributes among no more target groups than one action may name
+        // ([`crate::state::TARGET_GROUPS_PER_FORWARD_ACTION`]), under the same code: a
+        // configuration past the published limit has no equivalent in the service.
+        crate::state::check_forward_target_groups(&input.default_actions)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // "You must modify at least one of the following components to avoid a redirect
         // loop: protocol, hostname, port, or path" — a default action redirecting to the
         // request's own protocol, host, port and path sends the client back to where it
@@ -460,15 +466,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The load balancer's own bound on listeners, enforced before the insert:
-        // past it the emulator answers the modelled quota error instead of growing
+        // The load balancer's own bound on listeners, enforced before the insert: past
+        // it the emulator answers the modelled quota error instead of growing
         // without end.
         if listener_arns.len() >= crate::state::LISTENERS_PER_LOAD_BALANCER {
             return Err(CreateListenerErrorModeled::TooManyListenersException(
                 TooManyListenersException {
-                    message: Some(format!(
-                        "This emulator holds at most {} listeners per load balancer",
-                        crate::state::LISTENERS_PER_LOAD_BALANCER
+                    message: Some(crate::state::listener_limit_message(
+                        &input.load_balancer_arn,
                     )),
                 },
             )

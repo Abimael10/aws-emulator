@@ -355,6 +355,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(invalid_configuration(rule));
         }
+        // And each of them is in an Availability Zone of its own: a load balancer carries
+        // one node per zone, so two subnets of one zone are a placement it cannot hold —
+        // the same reading `CreateLoadBalancer` applies to the subnets a load balancer
+        // STARTS in, refused before anything is written.
+        if let Err(refusal) = crate::state::check_subnet_zones(resolved_subnets.as_deref()) {
+            return Err(refuse(refusal));
+        }
         // A load balancer carries IPv6 addresses out of the IPv6 ranges of the subnets it
         // is placed in, so a placement that asks for them needs subnets that have one —
         // the same reading `CreateLoadBalancer` and `SetIpAddressType` apply.

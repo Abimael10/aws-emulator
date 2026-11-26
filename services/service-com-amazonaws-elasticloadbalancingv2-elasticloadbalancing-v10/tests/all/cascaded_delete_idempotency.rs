@@ -255,7 +255,7 @@ async fn a_repeat_delete_is_idempotent_only_where_this_store_released_the_resour
     );
 }
 
-/// `SetRulePriorities` addresses a LIST of priorities, so the refusal for a rule it cannot
+/// `SetRulePriorities` addresses a LIST of rules, so the refusal for a rule it cannot
 /// resolve is about that selection and names no value — the collection-level wording,
 /// exactly as every other list-addressing refusal of this service is worded.
 ///
@@ -343,7 +343,7 @@ async fn the_priorities_refusal_names_no_value() {
         );
         assert_eq!(
             reply.text("Message").unwrap_or_default(),
-            "One or more priorities not found",
+            "One or more rules not found",
             "case {case:?}: the refusal is about the selection and names no value, got body {}",
             reply.body
         );

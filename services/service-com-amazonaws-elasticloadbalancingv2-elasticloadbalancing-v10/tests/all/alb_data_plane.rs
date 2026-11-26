@@ -361,8 +361,8 @@ async fn deployment() -> Deployment {
     fields.extend(fixed_response("200", "internal", None));
     add_rule(&router, "source-ip", &listener_arn, 80, &fields).await;
 
-    // And one that matches on a regular expression, which this plane does not evaluate
-    // either.
+    // And one that matches on a regular expression, which this plane compiles and evaluates
+    // through the same reading the control plane accepted it by.
     let mut fields = vec![
         p("Conditions.member.1.Field", "path-pattern"),
         p(
@@ -372,6 +372,22 @@ async fn deployment() -> Deployment {
     ];
     fields.extend(fixed_response("200", "regex", None));
     add_rule(&router, "regex values", &listener_arn, 85, &fields).await;
+
+    // And one whose expression is matched against an HTTP HEADER, beside a wildcard path
+    // pattern: a rule matches when every condition of it does, whichever language each
+    // condition's values are written in.
+    let mut fields = path_pattern("/hr");
+    fields.push(p("Conditions.member.2.Field", "http-header"));
+    fields.push(p(
+        "Conditions.member.2.HttpHeaderConfig.HttpHeaderName",
+        "x-api-version",
+    ));
+    fields.push(p(
+        "Conditions.member.2.HttpHeaderConfig.RegexValues.member.1",
+        "^v[0-9]+$",
+    ));
+    fields.extend(fixed_response("200", "header-regex", None));
+    add_rule(&router, "header regex values", &listener_arn, 86, &fields).await;
 
     // A redirect that changes the host and keeps the request's own path.
     let mut fields = path_pattern("/old");
@@ -550,7 +566,7 @@ async fn a_listener_answers_a_request_from_the_rule_its_conditions_match() {
         // A `source-ip` condition is matched against the address the CONNECTION came from,
         // which AWS documents the forwarded-for header does NOT satisfy, so a block holding
         // no address of this machine leaves its rule unmatched however the request claims to
-        // come from it. A regex condition needs an engine this plane has none of.
+        // come from it.
         Row {
             headers: &[("x-forwarded-for", "10.1.2.3")],
             ..answers("a source-ip rule and a forwarded client address", "GET", "/ip", 404, DEFAULT_BODY)
@@ -559,7 +575,24 @@ async fn a_listener_answers_a_request_from_the_rule_its_conditions_match() {
             headers: &[],
             ..answers("a source-ip rule and no forwarded address", "GET", "/ip", 404, DEFAULT_BODY)
         },
-        answers("a rule matching on a regular expression", "GET", "/re/7", 404, DEFAULT_BODY),
+        // A regular-expression condition, and the near miss beside it: the request the
+        // expression matches is answered by that rule's action, and one it does not falls
+        // through to the listener's default.
+        answers("a rule matching on a regular expression", "GET", "/re/7", 200, "regex"),
+        answers("a near miss of that expression", "GET", "/re/x", 404, DEFAULT_BODY),
+        // The same, for an expression matched against a header value.
+        Row {
+            headers: &[("x-api-version", "v12")],
+            ..answers("a header value the expression matches", "GET", "/hr", 200, "header-regex")
+        },
+        Row {
+            headers: &[("x-api-version", "vX")],
+            ..answers("a header value it does not", "GET", "/hr", 404, DEFAULT_BODY)
+        },
+        Row {
+            headers: &[],
+            ..answers("the header absent", "GET", "/hr", 404, DEFAULT_BODY)
+        },
     ]);
 
     for row in &rows {

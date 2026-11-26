@@ -345,6 +345,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_forward_weights(&updated.default_actions)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
+        // And a forward distributes among no more target groups than one action may name,
+        // judged on the default actions this call LEAVES the listener with
+        // ([`crate::state::TARGET_GROUPS_PER_FORWARD_ACTION`]).
+        crate::state::check_forward_target_groups(&updated.default_actions)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
         // "You must modify at least one of the following components to avoid a redirect
         // loop: protocol, hostname, port, or path" — judged on the default actions this
         // call LEAVES the listener with, so a modification cannot turn an accepted redirect

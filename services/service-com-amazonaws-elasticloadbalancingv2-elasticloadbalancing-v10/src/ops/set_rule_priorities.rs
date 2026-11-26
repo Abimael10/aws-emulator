@@ -343,12 +343,15 @@ fn distinct_listeners(moves: &[Move]) -> Vec<&str> {
 /// The refusal for a `RuleArn` this store holds no rule for.
 ///
 /// This operation addresses a LIST — one `RulePriorityPair` per rule — so the refusal is
-/// about the set of priorities the request asked for rather than one rule it addresses,
-/// and it names no value ([`crate::state::rule_priorities_refusal_message`]), exactly as
-/// every other list-addressing refusal of this service does.
+/// about the SET of rules the request named rather than one rule it addresses, and it names
+/// no value: it is the same sentence every list-addressing rule read answers
+/// ([`crate::state::rule_selection_not_found_message`]), read from there rather than worded
+/// again, so one API cannot word that one fact two ways. A pair naming a rule this store
+/// does not hold refuses the WHOLE call, so the rules the other pairs name keep the
+/// priorities they held.
 fn rule_not_found() -> SetRulePrioritiesError {
     SetRulePrioritiesErrorModeled::RuleNotFoundException(RuleNotFoundException {
-        message: Some(crate::state::rule_priorities_refusal_message()),
+        message: Some(crate::state::rule_selection_not_found_message()),
     })
     .into()
 }

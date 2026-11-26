@@ -208,6 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The clauses the model states about a rule's conditions and transforms, read
         // once for every operation that SETS them ([`crate::state`]).
+        //
+        // That walk is BOUNDED before it reads a single value, which is what keeps the work of
+        // this call independent of the lists a caller sent: the number of conditions
+        // (`crate::state::CONDITIONS_PER_RULE`) and then the number of values across them
+        // (`crate::state::CONDITION_VALUES_PER_RULE`) are judged first, so at most that many
+        // values are then parsed as address blocks, compiled as regular expressions
+        // (`crate::state::condition_regex`, which refuses a value longer than
+        // `crate::state::condition_regex::CONDITION_VALUE_CHARS` before compiling it, under a
+        // program-size ceiling) and counted for their wildcards.
         crate::state::check_rule_conditions(&input.conditions)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The clauses the model states about a rule's ACTIONS: how many it carries, the one
@@ -236,6 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // select none would answer nothing the rule matches, so the action is refused with
         // this service's own `ValidationError` and no rule is created.
         crate::state::check_forward_weights(&input.actions)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // And a forward distributes among no more target groups than one action may name
+        // ([`crate::state::TARGET_GROUPS_PER_FORWARD_ACTION`]), under the same code: a
+        // configuration past the published limit has no equivalent in the service.
+        crate::state::check_forward_target_groups(&input.actions)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "You must modify at least one of the following components to avoid a redirect
         // loop: protocol, hostname, port, or path" — a redirect that leaves all four as the
