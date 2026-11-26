@@ -292,6 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
+        // This call left the store owing the query's own completion, and its settle may have
+        // left it OWING a step it put off — the end of a run whose result is not in yet. The
+        // clock pump is what materialises a step with no request waiting on it, so a door
+        // that leaves one owed leaves a pump behind for it. A pump already running keeps the
+        // claim, and a store that owes nothing has its pump stand down at once.
+        crate::state::drive_job_clock(ctx, &self.engine, &crate::state::request_region(ctx.parts()));
+
         match outcome {
             crate::state::AcceptOutcome::Stored(id) => Ok(StartJobsQueryOutput { id: Some(id) }),
             crate::state::AcceptOutcome::AtCapacity => Err(

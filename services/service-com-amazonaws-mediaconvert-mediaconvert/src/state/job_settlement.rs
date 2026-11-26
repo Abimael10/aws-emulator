@@ -199,11 +199,6 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         // Read before the record is borrowed for writing: the step the finish is owed after
         // is the same one the start was owed after.
         let settles_after = self.job_run_step();
-        // And whether a driver is still making this store's runs: the clock pump makes every
-        // run the clock owes with no request waiting on it ([`drive_job_clock`]), so while it
-        // holds this store's claim a run that has not been made yet is a run still to come.
-        // Without one, nothing will ever make it.
-        let a_driver_is_running = self.clock_pump_running;
         let Some(job) = self.jobs.get_mut(id) else {
             return;
         };
@@ -217,15 +212,20 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         let ends = job.status == JOB_STATUS_PROGRESSING;
         // A job whose RUN has not been MADE yet has not finished: its outputs are being
         // produced right now ([`JobRecord::run_claimed_at`]), or the run is still owed to it
-        // and a driver has yet to get to it ([`run_due_job_runs`] makes a bounded number of
-        // runs per pass, so a job submitted beside others waits for a later one). Either way
-        // no result is in, so the finish is owed again a span later rather than resolved over
-        // a result that is not there — a job whose transcode nothing has attempted yet is not
-        // a job that failed at it. A claim a driver abandoned is taken again by the next pass
-        // and the pump keeps waking while any job is owed a step, so nothing is left running
-        // for ever; a store no driver makes runs for is the one case nothing will ever run,
-        // and such a job reaches the no-engine failure below.
-        if ends && job.run.is_none() && (job.run_claimed_at.is_some() || a_driver_is_running) {
+        // and whichever driver makes this store's runs has yet to get to it
+        // ([`run_due_job_runs`] makes a bounded number of runs per pass, so a job submitted
+        // beside others waits for a later one). Either way no result is in, so the finish is
+        // owed again a span later rather than resolved over a result that is not there — a
+        // job whose transcode nothing has attempted yet is not a job that failed at it, and
+        // what it ends as is decided by its own run, never by which driver happened to be
+        // making this store's runs at the instant somebody read it.
+        //
+        // The postponement is what leaves the store OWING this step, and that is what every
+        // driver of this store's clock looks for: the pump keeps waking while any job is owed
+        // one, and a door that materialises a step leaves a pump behind for the steps it put
+        // off ([`drive_job_clock`]), so a run still to come is made and nothing waits for
+        // ever.
+        if ends && job.run.is_none() {
             // Strictly LATER than the instant this settle was handed, whatever the span is
             // pinned to, so the drain that popped this entry cannot pop its replacement in
             // the same pass.
@@ -256,10 +256,11 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             // input THIS emulator tried to read and could not is the service's own
             // input-probe failure, classified with the code MediaConvert publishes for it
             // and worded from the job's own `Settings.Inputs`; a run that failed reports
-            // its own failure the same way ([`JobRunFailure`]). A job nothing ran at all —
-            // an emulator with no object store to read the input from, or no runtime to run
-            // the transcode on — reports the missing engine, which no MediaConvert error
-            // code classifies, so none is reported rather than one invented.
+            // its own failure the same way ([`JobRunFailure`]). A run that established
+            // NOTHING — an emulator with no object store to read the input from, or an input
+            // that is not an address this emulator can read — is the one that reports the
+            // missing engine ([`JobRunFailure::EngineDidNotRun`]), which no MediaConvert
+            // error code classifies, so none is reported rather than one invented.
             let produced = job.run.as_ref().is_some_and(|run| run.failure.is_none());
             // An input the service could not OPEN is why such a job failed, whatever else
             // the run then could not do: MediaConvert opens a job's inputs before it can
@@ -281,6 +282,8 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                         job.error_message = Some(failure.message());
                     }
                     None => {
+                        // Defensive: the postponement above leaves a finish owed until the
+                        // job's run is in, so a finish that resolves has a run behind it.
                         job.error_code = None;
                         job.error_message = Some(NO_TRANSCODER_MESSAGE.to_string());
                     }

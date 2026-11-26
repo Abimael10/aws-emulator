@@ -240,6 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recording one publishes nothing of its own.
         crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
 
+        // The settle above may have left the store OWING a step it put off — the end of a
+        // run whose result is not in yet — and the clock pump is what materialises a step
+        // with no request waiting on it, so a door that put one off leaves a pump behind for
+        // it. A pump already running keeps the claim, and a store that owes nothing has its
+        // pump stand down at once, so this costs a call that put nothing off nothing. The
+        // share attempt this call recorded is itself owed its own exit, which is the same
+        // clock.
+        crate::state::drive_job_clock(ctx, &self.engine, &region);
+
         match outcome {
             // A repeat against the same support case asks for the state the job is
             // already in, so it answers the same empty 202 and leaves the recorded

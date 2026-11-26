@@ -2739,3 +2739,290 @@ async fn every_job_owed_a_run_at_once_waits_for_its_own_run() {
         }
     }
 }
+
+/// A job's finish is never resolved over a run that has not been made.
+///
+/// RULE: `JobStatus` is what a job's run REACHED and `Timing$FinishTime` is "the time ...
+/// that the transcoding job finished", so the end of a job's run is owed only once something
+/// has established what that run produced: a job whose transcode nothing has attempted yet
+/// has not finished, and its finish is owed again a step later. WHICH status it then reaches
+/// is decided by that job's own run and by nothing else — least of all by which driver of
+/// the store's clock happened to be alive at the instant somebody read it.
+///
+/// One pass of the driver makes a bounded number of runs, so a store owed more runs at once
+/// than one pass makes always holds jobs whose finish comes due with no result in. This case
+/// drives exactly such a store: first the settle a reporting door makes, with no pump
+/// running and no run made, which must put every finish off rather than resolve it; and then
+/// reads over the wire about ANOTHER job — a drain covers the whole already-due prefix, so
+/// one read settles every job the clock owed and not only the one it is about — which must
+/// leave every job reaching `COMPLETE` with the file its run wrote.
+///
+/// The rows span what the rule generalises over: how many runs the store is owed at the same
+/// instant, from one, through the bound one pass makes, to well past it.
+///
+/// The jobs are stored through the store's own submit path (`accept_job`, which arms the
+/// clock exactly as `CreateJob` does) rather than over the wire, and only once this store's
+/// clock pump has stood down: that is what makes their finishes come due with NO pump
+/// running, which is the state a pump that ended abnormally leaves behind and the one a
+/// machine under load reaches. The media is REAL, as in the case above.
+#[tokio::test]
+async fn a_finish_that_comes_due_before_its_run_waits_for_the_run() {
+    use service_com_amazonaws_mediaconvert_mediaconvert::state::AcceptOutcome;
+    use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState as Store;
+
+    use super::media_probe::{create_bucket, iso_bmff, put_object, s3_uri, VideoTrack, BUCKET};
+
+    /// A settle span so short that a job's finish is due at the very instant it begins,
+    /// which is the instant its run starts being owed: the run cannot have been made yet, so
+    /// every job below settles a finish over a result that is not in.
+    const FINISH_DUE_AT_ONCE: Duration = Duration::from_millis(2);
+
+    /// The input every job of a row reads: one small video track, so a row costs the number
+    /// of jobs it stores rather than the size of what each of them carries.
+    fn media() -> Vec<u8> {
+        iso_bmff(
+            b"isom",
+            Some(VideoTrack {
+                width: 320,
+                height: 240,
+                timescale: 30_000,
+                frames: 10,
+                sample_duration: 1_000,
+            }),
+            None,
+        )
+    }
+
+    /// Whether a pump is driving this store's clock right now.
+    fn pump_is_running(emulator: &Emulator) -> bool {
+        emulator.engine.state::<Store>().lock().clock_pump_is_running()
+    }
+
+    /// What the store holds for the job `id`: its status and the reason it carries, so a row
+    /// that finds the wrong status can report what the store said about it.
+    fn stored(emulator: &Emulator, id: &str) -> (String, Option<String>) {
+        emulator
+            .engine
+            .state::<Store>()
+            .lock()
+            .jobs
+            .get(id)
+            .map(|job| (job.status.clone(), job.error_message.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Where every job of a row writes its output, and the key the produced file lands
+    /// under: the destination names a PLACE, so the output is named after the input file.
+    const DESTINATION: &str = "finish-waits-out";
+    const INPUT_KEY: &str = "finish-waits/input.mp4";
+
+    // (case, how many runs the store is owed at the same instant)
+    let rows: [(&str, usize); 4] = [
+        ("one run owed", 1),
+        ("as many runs as one pass of the driver makes", 4),
+        ("two more runs than one pass makes", 6),
+        ("more than twice what one pass makes", 9),
+    ];
+
+    for (case, count) in rows {
+        let emulator = Emulator::with_settle_span(FINISH_DUE_AT_ONCE)
+            .mount(service_com_amazonaws_s3_amazons3::EmulatedService::new);
+        create_bucket(&emulator).await;
+
+        // One job submitted over the wire, so there is a stored record to submit `count`
+        // more like it — and so this store's clock pump starts, runs that job and stands
+        // down again.
+        put_object(&emulator, INPUT_KEY, &media()).await;
+        let seeded = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "settings": {
+                    "inputs": [{ "fileInput": s3_uri(INPUT_KEY) }],
+                    "outputGroups": [{
+                        "name": "File Group",
+                        "outputs": [{
+                            "nameModifier": "_out",
+                            "containerSettings": { "container": "MP4" }
+                        }],
+                        "outputGroupSettings": {
+                            "type": "FILE_GROUP_SETTINGS",
+                            "fileGroupSettings": {
+                                "destination": format!("s3://{BUCKET}/{DESTINATION}/")
+                            }
+                        }
+                    }]
+                }
+            }))
+            .await;
+        assert_eq!(
+            seeded.status, 201,
+            "case {case:?}: CreateJob must succeed, got {} with {}",
+            seeded.status, seeded.body
+        );
+        let seeded_id = seeded.string("/job/id");
+        emulator.await_run(case, &seeded_id).await;
+
+        // The CONDITION the rows need: a store NO pump is driving. A pump stands down inside
+        // the critical section that observes this store owing nothing, so whether one is
+        // running is owned by the store and read from it.
+        let started = std::time::Instant::now();
+        while pump_is_running(&emulator) {
+            assert!(
+                started.elapsed() < RUN_DEADLINE,
+                "case {case:?}: the clock pump never stood down, so the jobs below would not \
+                 settle a finish with no pump running"
+            );
+            tokio::time::sleep(RUN_POLL_PAUSE).await;
+        }
+
+        // `count` jobs stored through the store's own submit path, which arms each one's
+        // exit from `SUBMITTED` exactly as `CreateJob` does. Nothing starts a pump for them,
+        // so their finishes come due with no driver having made their runs.
+        let mut ids = Vec::new();
+        {
+            let state = emulator.engine.state::<Store>();
+            let mut guard = state.lock();
+            let record = guard
+                .jobs
+                .get(&seeded_id)
+                .cloned()
+                .expect("the job submitted above is in the store");
+            for index in 0..count {
+                let mut submitted = record.clone();
+                // A newly submitted job: nothing has run it and nothing is recorded about
+                // it, which is how `CreateJob` stores one.
+                submitted.status = "SUBMITTED".to_string();
+                submitted.run = None;
+                submitted.run_claimed_at = None;
+                submitted.client_request_token = None;
+                submitted.timing.start_time = None;
+                submitted.timing.finish_time = None;
+                submitted.error_code = None;
+                submitted.error_message = None;
+                match guard.accept_job(submitted, std::time::SystemTime::now()) {
+                    AcceptOutcome::Stored(id) => ids.push(id),
+                    other => panic!("case {case:?}: job {index} was not stored: {other:?}"),
+                }
+            }
+        }
+
+        // The write a reporting door makes: materialise what the clock had already made due
+        // at this instant. No pump is running and no run has been made, so this is the
+        // settle that must put each finish off rather than resolve it over a result that is
+        // not in.
+        let started = std::time::Instant::now();
+        loop {
+            emulator
+                .engine
+                .state::<Store>()
+                .lock()
+                .settle(std::time::SystemTime::now());
+            let statuses: Vec<(String, Option<String>)> =
+                ids.iter().map(|id| stored(&emulator, id)).collect();
+            for (index, (status, reason)) in statuses.iter().enumerate() {
+                assert_ne!(
+                    status, "ERROR",
+                    "case {case:?}: job {index} was failed while its run was still to come, \
+                     with {reason:?}"
+                );
+            }
+            if statuses.iter().all(|(status, _)| status != "SUBMITTED") {
+                assert!(
+                    statuses.iter().all(|(status, _)| status == "PROGRESSING"),
+                    "case {case:?}: a job that has begun and whose run is still to come is \
+                     PROGRESSING, got {statuses:?}"
+                );
+                break;
+            }
+            assert!(
+                started.elapsed() < RUN_DEADLINE,
+                "case {case:?}: the clock never let every job begin; they are {statuses:?}"
+            );
+            tokio::time::sleep(RUN_POLL_PAUSE).await;
+        }
+
+        // And every one of them still runs to COMPLETE: reads about the job that ALREADY ran
+        // settle the store exactly as the loop above did, and the runs those reads leave to
+        // the clock are made rather than lost.
+        let started = std::time::Instant::now();
+        loop {
+            let read = emulator.get_job(&seeded_id).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: GetJob must answer 200, got {} with {}",
+                read.status, read.body
+            );
+            let statuses: Vec<(String, Option<String>)> =
+                ids.iter().map(|id| stored(&emulator, id)).collect();
+            for (index, (status, reason)) in statuses.iter().enumerate() {
+                assert_ne!(
+                    status, "ERROR",
+                    "case {case:?}: job {index} was failed while its run was still to come, \
+                     with {reason:?}"
+                );
+            }
+            if statuses.iter().all(|(status, _)| status == "COMPLETE") {
+                break;
+            }
+            assert!(
+                started.elapsed() < RUN_DEADLINE,
+                "case {case:?}: the clock never ran every job to COMPLETE; they are \
+                 {statuses:?}"
+            );
+            tokio::time::sleep(RUN_POLL_PAUSE).await;
+        }
+
+        // Every one of them reports a run that produced what its settings describe ...
+        for (index, id) in ids.iter().enumerate() {
+            let read = emulator.get_job(id).await;
+            assert_eq!(
+                read.string("/job/status"),
+                "COMPLETE",
+                "case {case:?} job {index}: a job whose transcode this service can perform \
+                 must reach COMPLETE, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.at("/job/errorCode"),
+                &Value::Null,
+                "case {case:?} job {index}: a job that completed failed at nothing, so it \
+                 carries no ErrorCode, got {}",
+                read.body
+            );
+            assert_eq!(
+                read.at("/job/errorMessage"),
+                &Value::Null,
+                "case {case:?} job {index}: a job that completed carries no ErrorMessage, \
+                 got {}",
+                read.body
+            );
+            assert!(
+                read.at("/job/timing/finishTime").is_number(),
+                "case {case:?} job {index}: a job that has run reports when it finished, got \
+                 {}",
+                read.body
+            );
+        }
+
+        // ... and the status is backed by the file those runs really wrote, read back out of
+        // the S3 that owns it.
+        let object = format!("{DESTINATION}/input_out.mp4");
+        let (status, _, body) = emulator
+            .rest("s3", "GET", &format!("/{BUCKET}/{object}"), Vec::new())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the completed jobs' output {object:?} must be in the destination \
+             they named, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            body.get(4..8),
+            Some(b"ftyp".as_slice()),
+            "case {case:?}: the output {object:?} must be an ISO base media file, got {} \
+             bytes starting {:?}",
+            body.len(),
+            body.get(..8)
+        );
+    }
+}

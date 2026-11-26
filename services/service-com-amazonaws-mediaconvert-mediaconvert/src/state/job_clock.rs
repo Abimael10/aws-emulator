@@ -112,6 +112,20 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
     }
 
+    /// Whether a pump holds this store's single claim right now.
+    ///
+    /// The observer of that claim, for a caller that has to reach a store NO pump is
+    /// driving: the claim is taken and released inside this store's own critical sections,
+    /// so whether one is held is only ever answered by the store itself. The claim is a
+    /// liveness mechanism and never part of what a job REPORTS — which status the end of a
+    /// job's run reaches is decided by that job's own run
+    /// ([`ComAmazonawsMediaconvertMediaconvertState::settle_job`]) — so nothing on a request
+    /// path reads this.
+    #[must_use]
+    pub fn clock_pump_is_running(&self) -> bool {
+        self.clock_pump_running
+    }
+
     /// Claim the single pump for this store: the claim's GENERATION when the caller may
     /// start one, `None` when one is already running.
     ///

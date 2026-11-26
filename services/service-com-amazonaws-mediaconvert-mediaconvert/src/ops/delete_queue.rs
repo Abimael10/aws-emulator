@@ -183,6 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // by the call that materialised it (`state::publish_job_state_changes`).
         crate::state::publish_job_state_changes(ctx, &*self.engine, &region).await;
 
+        // The settle above may have left the store OWING a step it put off — the end of a
+        // run whose result is not in yet — and the clock pump is what materialises a step
+        // with no request waiting on it, so a door that put one off leaves a pump behind for
+        // it. A pump already running keeps the claim, and a store that owes nothing has its
+        // pump stand down at once, so this costs a delete that put nothing off nothing.
+        crate::state::drive_job_clock(ctx, &self.engine, &region);
+
         match outcome {
             // The delete is IDEMPOTENT on the name: a queue that was already gone leaves
             // the store in exactly the state the request asked for, so the repeat is the
