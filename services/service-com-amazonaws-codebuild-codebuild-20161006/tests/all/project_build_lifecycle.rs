@@ -271,6 +271,28 @@ pub(crate) async fn stored_build_batch(router: &MultiServiceRouter, id: &str) ->
     body["buildBatches"][0].clone()
 }
 
+/// Look again until the batch build `id` reports itself complete, and hand back that
+/// record as [`stored_build_batch`] reports it — the batch-build counterpart of
+/// [`settled_build`], so a suite whose subject is a settled BATCH waits for it the one way
+/// rather than writing the wait again.
+///
+/// The wait ends on the CONDITION; [`SETTLE_DEADLINE`] is only there so a batch that never
+/// settles fails the test instead of hanging it.
+pub(crate) async fn settled_build_batch(router: &MultiServiceRouter, id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let batch = stored_build_batch(router, id).await;
+        if batch["complete"] == json!(true) {
+            return batch;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "batch build {id}: expected it to complete, last read {batch}"
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+}
+
 /// The stored project `name`, through `BatchGetProjects` — the implemented reader a
 /// suite asserting what a write left behind reads it back through.
 pub(crate) async fn stored_project(router: &MultiServiceRouter, name: &str) -> Value {

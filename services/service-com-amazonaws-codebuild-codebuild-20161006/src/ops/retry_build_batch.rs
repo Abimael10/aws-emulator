@@ -179,12 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let build_batch = {
             let mut guard = state.lock();
 
+            // A batch build's id is `<projectName>:<uuid>`, so it names the PROJECT the
+            // batch belongs to as well as the batch: that project is what a retry runs
+            // again, and it is therefore the first precondition this call resolves, the
+            // way `crate::ops::retry_build` resolves it for the single build. A batch
+            // build cannot belong to a project this account does not hold, so a request
+            // naming an absent project is answered on the project — the resource the
+            // caller has to re-create — and the batch registry is never consulted for it.
+            if let Some(named_project) = crate::state::project_name_from_resource_id(&batch_id)
+                .filter(|named_project| !guard.projects.contains_key(*named_project))
+            {
+                return Err(project_not_found(&crate::state::project_arn(
+                    &region,
+                    named_project,
+                )));
+            }
+
             // Read through `settled_build_batch`, so the batch this retry is derived from
             // is the one the clock already owes: a batch whose span has elapsed is
-            // reported, and retried, as finished. The batch record is the authority on
-            // whether there is anything to restart — a request naming one this account
-            // holds no record of is answered on the BATCH, whatever its id's project half
-            // says.
+            // reported, and retried, as finished. With the id's project resolved, the
+            // batch record is the authority on whether that project has anything to
+            // restart under this id.
             let Some(retried) = guard
                 .settled_build_batch(&batch_id, now)
                 .map(|stored| stored.build_batch.clone())
@@ -206,7 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A retry runs the project's batch build again, so there has to be a project to
             // run: a batch build outlives the project it belongs to (AWS documents that
             // deleting a project leaves its build records), and there is nothing to build
-            // again once that project is gone.
+            // again once that project is gone. Reached only for a record whose own
+            // `projectName` differs from the project half of the id it is keyed by — the
+            // id's project was resolved above — and it reports the same refusal on the
+            // same project ARN.
             if !guard.projects.contains_key(&project_name) {
                 return Err(project_not_found(&crate::state::project_arn(
                     &region,
@@ -545,7 +563,8 @@ fn retried_destinations(
 }
 
 /// No batch build of this account answers to that identifier, so there is nothing to
-/// restart.
+/// restart. Answered only once the project the id names has been resolved: a request whose
+/// id names a project this account does not hold is answered on the project.
 ///
 /// The absent resource is named by its MODELLED shape name, `BuildBatch`, and then by the
 /// identifier the request gave, exactly as given — recorded behaviour of this operation,
