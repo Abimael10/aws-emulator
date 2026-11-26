@@ -50,8 +50,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
-    ec2_instances, AutoScalingState, StoredActivity, StoredInstance, LIFECYCLE_DETACHING,
-    LIFECYCLE_IN_SERVICE, LIFECYCLE_STANDBY, LIFECYCLE_TRANSITION,
+    ec2_instances, AutoScalingState, GroupSizeMove, GroupSizes, StoredActivity, StoredInstance,
+    LIFECYCLE_DETACHING, LIFECYCLE_IN_SERVICE, LIFECYCLE_STANDBY, LIFECYCLE_TRANSITION,
 };
 
 /// The `Activity$Description` the scaling activity for one detach carries, naming the
@@ -99,10 +99,9 @@ pub enum DetachRefusal {
     /// Releasing the named instances and decrementing the capacity would leave the group
     /// below its own `MinSize`.
     BelowMinSize {
-        /// The desired capacity it has now.
-        desired_capacity: i32,
-        /// The group's own `MinSize`, which it is never left under.
-        min_size: i32,
+        /// The three sizes the group holds now, which are what the caller has to change for
+        /// the same request to be admitted.
+        sizes: GroupSizes,
         /// How many instances the request asked to detach.
         detaching: usize,
     },
@@ -127,14 +126,14 @@ impl DetachRefusal {
                 "Instance {instance_id} is in {lifecycle_state} state, not in \
                  {LIFECYCLE_IN_SERVICE} or {LIFECYCLE_STANDBY} state, and cannot be detached."
             ),
-            Self::BelowMinSize {
-                desired_capacity,
-                min_size,
-                detaching,
-            } => super::min_size_decrement_breach_message(
-                "Detaching",
-                *desired_capacity,
-                *min_size,
+            // The refusal is about the sizes the GROUP is configured with rather than about
+            // any one instance of it, so it states all three of them and asks the caller to
+            // change them — the one template every refused move of a group's instances
+            // states ([`super::group_sizes_refuse_move_message`]).
+            Self::BelowMinSize { sizes, detaching } => super::group_sizes_refuse_move_message(
+                group_name,
+                *sizes,
+                GroupSizeMove::Detach,
                 *detaching,
             ),
         }
@@ -167,6 +166,14 @@ impl AutoScalingState {
         let arn = group.arn.clone();
         let desired_capacity = group.desired_capacity;
         let min_size = group.min_size;
+        // The sizes a refusal of this call states, read off the group as it stands: the
+        // refusal names what the caller has to change, which is the group's configuration
+        // and not just the floor the decrement crossed.
+        let sizes = GroupSizes {
+            min_size,
+            max_size: group.max_size,
+            desired_capacity,
+        };
 
         // Every named instance is checked BEFORE one is released: an id the group does not
         // hold, or one not in the state a detach starts from, refuses the whole call and
@@ -208,8 +215,7 @@ impl AutoScalingState {
             let after = desired_capacity.saturating_sub(units);
             if after < min_size {
                 return Err(DetachRefusal::BelowMinSize {
-                    desired_capacity,
-                    min_size,
+                    sizes,
                     detaching: detaching.len(),
                 });
             }

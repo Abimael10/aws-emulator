@@ -2280,22 +2280,29 @@ async fn a_detach_that_would_take_the_group_under_its_minimum_is_refused() {
     let subnets = seed_subnets(&engine, 2);
     let vpc_id = vpc_of(&router, &subnets[0]).await;
     create_launch_template(&router, "lt-detach-min-size").await;
-    // The two forms the refusal takes: a group whose desired capacity is AT its minimum (the
-    // sentence's singular form, which one detached instance is enough to reach) and one
-    // above it that a detach of several would cross. Each row has a target group of its own,
-    // so what one group registers is the whole of what the row reads.
+    // The two ways a detach crosses the floor: a group whose desired capacity is AT its
+    // minimum (one detached instance is enough to reach it) and one above it that a detach of
+    // several would cross. Both state the one template every refused move of a group's
+    // instances states, over the sizes the group holds. Each row has a target group of its
+    // own, so what one group registers is the whole of what the row reads.
     for (case, sizes, detached, expected) in [
         (
             "the desired capacity already at the group's minimum",
             (1usize, 4usize, 1usize),
             1usize,
-            autoscaling::state::min_size_decrement_breach_message("Detaching", 1, 1, 1),
+            "AutoScalingGroup asg-detach-min-size-1 has min-size=1, max-size=4, and \
+             desired-size=1. To detach 1 instance, please update the AutoScalingGroup sizes \
+             appropriately."
+                .to_string(),
         ),
         (
             "a detach of several crossing a minimum below the desired capacity",
             (2usize, 4usize, 3usize),
             2usize,
-            autoscaling::state::min_size_decrement_breach_message("Detaching", 3, 2, 2),
+            "AutoScalingGroup asg-detach-min-size-3 has min-size=2, max-size=4, and \
+             desired-size=3. To detach 2 instance, please update the AutoScalingGroup sizes \
+             appropriately."
+                .to_string(),
         ),
     ] {
         let name = format!("asg-detach-min-size-{}", sizes.2);

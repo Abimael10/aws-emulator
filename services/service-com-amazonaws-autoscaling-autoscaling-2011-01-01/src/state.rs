@@ -4344,35 +4344,17 @@ pub const GROUP_NAME_REQUIRED_WITH_INSTANCE_IDS_MESSAGE: &str =
 /// and how many instances it asked to terminate; the rest of the sentence is the same
 /// fixed text.
 pub fn min_size_breach_message(desired_capacity: i32, min_size: i32, terminating: usize) -> String {
-    min_size_decrement_breach_message("Terminating", desired_capacity, min_size, terminating)
-}
-
-/// The message a request that asks to decrement a group's desired capacity below its own
-/// `MinSize` is refused with, for the move `moving` names — THE ONE wording of that
-/// refusal, which `TerminateInstanceInAutoScalingGroup` ([`min_size_breach_message`]) and
-/// `DetachInstances` ([`detached_instances::DetachRefusal`]) both answer with.
-///
-/// The two refusals are about the same floor under the same member: a group never holds a
-/// desired capacity below the minimum it is configured with, so the decrement a request
-/// asked for is refused whole rather than applied in part. What differs between them is
-/// only WHICH move the request asked for, which is the sentence's subject.
-pub fn min_size_decrement_breach_message(
-    moving: &str,
-    desired_capacity: i32,
-    min_size: i32,
-    count: usize,
-) -> String {
     let remedy = "Either set shouldDecrementDesiredCapacity flag to false or lower group's \
                   min size.";
     if desired_capacity == min_size {
         format!(
-            "Currently, desiredSize equals minSize ({min_size}). {moving} instance without \
+            "Currently, desiredSize equals minSize ({min_size}). Terminating instance without \
              replacement will violate group's min size constraint. {remedy}"
         )
     } else {
         format!(
             "Currently, desiredSize is {desired_capacity} and minSize is {min_size}. \
-             {moving} {count} instances without replacement will violate group's min \
+             Terminating {terminating} instances without replacement will violate group's min \
              size constraint. {remedy}"
         )
     }

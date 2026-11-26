@@ -15,12 +15,13 @@
 //! states the three sizes the group holds now and asks the caller to change them, naming the
 //! move it was asked for and how many instances it named. The clause naming the move
 //! ([`GroupSizeMove`]) is the only thing that differs between the operations that answer it,
-//! which is why the sentence is written once here: `AttachInstances` and `EnterStandby` state
-//! one template, so neither can drift into a wording of its own.
+//! which is why the sentence is written once here: `AttachInstances`, `EnterStandby` and the
+//! release `DetachInstances` performs state one template, so none of them can drift into a
+//! wording of its own.
 //!
-//! A request that takes instances OUT of a group — `DetachInstances` and
-//! `TerminateInstanceInAutoScalingGroup` — crosses the same floor but states a different
-//! sentence ([`super::min_size_decrement_breach_message`]), so it is not worded here.
+//! `TerminateInstanceInAutoScalingGroup` crosses the same floor but states a sentence of its
+//! own class ([`super::min_size_breach_message`]), about the decrement rather than about the
+//! group's configuration, so it is not worded here.
 
 /// Which move a request asked for, which is the clause the refusal names it in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,9 @@ pub enum GroupSizeMove {
     Attach,
     /// `EnterStandby`: park instances of the group out of service.
     Standby,
+    /// `DetachInstances`: release instances of the group while the capacity follows them
+    /// down, which is the move the request's own decrement asked for.
+    Detach,
 }
 
 impl GroupSizeMove {
@@ -39,6 +43,7 @@ impl GroupSizeMove {
         match self {
             Self::Attach => "To attach",
             Self::Standby => "To place into standby",
+            Self::Detach => "To detach",
         }
     }
 }
@@ -86,17 +91,23 @@ pub fn group_sizes_refuse_move_message(
 mod tests {
     use super::{group_sizes_refuse_move_message, GroupSizeMove, GroupSizes};
 
-    /// One sentence, one template: the two moves differ in their own clause alone, and every
+    /// One sentence, one template: the moves differ in their own clause alone, and every
     /// other part — the group, the three sizes, the count and the remedy — is placed the same
-    /// way for both.
+    /// way for all of them.
     #[test]
-    fn both_moves_state_one_template() {
+    fn every_move_states_one_template() {
         let sizes = GroupSizes {
             min_size: 1,
             max_size: 2,
             desired_capacity: 2,
         };
         for (case, move_kind, expected) in [
+            (
+                "a detach",
+                GroupSizeMove::Detach,
+                "AutoScalingGroup asg has min-size=1, max-size=2, and desired-size=2. To detach \
+                 3 instance, please update the AutoScalingGroup sizes appropriately.",
+            ),
             (
                 "an attach",
                 GroupSizeMove::Attach,
