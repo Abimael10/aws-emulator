@@ -4,7 +4,8 @@
 //! IMPLEMENTED: PATCHes a persisted [`crate::state::Portal`] and answers 200 with the
 //! record the store now holds, which is the record `GetPortal` reports afterwards. A
 //! member the request carries replaces the stored one; a member it omits leaves the
-//! stored value as it was. This is the ONLY file to touch for this operation.
+//! stored value as it was, and an OPTIONAL string member carried EMPTY is REMOVED
+//! ([`crate::state::cleared_by_empty`]). This is the ONLY file to touch for this operation.
 //!
 //! The portal's publication is NOT this operation's to move: a patch asked for while a
 //! publish or a disable the service is still carrying out would replace the very
@@ -349,7 +350,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified = true;
         }
         if let Some(rum_app_monitor_name) = input.rum_app_monitor_name {
-            record.rum_app_monitor_name = Some(rum_app_monitor_name);
+            // An OPTIONAL string member the portal may simply not have, reported only
+            // while it holds a value, so the EMPTY string describes no value to store: it
+            // asks for the stored monitor name to be REMOVED, the one reading of an empty
+            // optional member every patch of this service applies
+            // ([`crate::state::cleared_by_empty`]).
+            record.rum_app_monitor_name = crate::state::cleared_by_empty(rum_app_monitor_name);
             modified = true;
         }
 

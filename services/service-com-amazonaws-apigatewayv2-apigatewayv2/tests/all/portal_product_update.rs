@@ -8,7 +8,10 @@
 //!   a member the request carries replaces the stored one, a member it omits leaves the
 //!   stored value exactly as it was, and the members this operation does not take (the
 //!   product's id, its ARN and its tags) are carried over untouched. The patched record
-//!   is what the response reports AND what a later `GetPortalProduct` reports.
+//!   is what the response reports AND what a later `GetPortalProduct` reports. An
+//!   OPTIONAL string member ([`CLEARED_BY_EMPTY`]) carried EMPTY is the one exception to
+//!   "replaces": it asks for the stored member to be REMOVED, so neither the patch's
+//!   answer nor any later read reports it.
 //! * **`LastModified` advances when the patch carries a member to apply**, and a patch
 //!   that carries none leaves the record — `LastModified` included — exactly as it was.
 //! * **A product is patched only through its own minted id**: an id nothing minted is
@@ -40,6 +43,12 @@ const COLLECTION: &str = "/v2/portalproducts";
 /// The members `UpdatePortalProduct` takes as values of the product, from the modelled
 /// input (`PortalProductId` is the httpLabel addressing the product, not a value of it).
 const PATCHABLE: [&str; 3] = ["displayName", "description", "displayOrder"];
+
+/// The members of a product a patch CLEARS by carrying them empty: its OPTIONAL string
+/// members, the ones a product may simply not have and whose readers report them only
+/// while they hold a value. `DisplayName` is not one of them — every product reports one,
+/// so an empty display name is refused rather than read as a clear.
+const CLEARED_BY_EMPTY: [&str; 1] = ["description"];
 
 /// How long to wait so a patch lands in a LATER second than the create. The service
 /// reports `LastModified` at whole-second granularity, so only a wait past a second
@@ -115,7 +124,8 @@ fn rows() -> Vec<Row> {
             patch: json!({ "description": "now it has one" }),
         },
         Row {
-            case: "the description set to empty, which the modelled bound allows (len 0..1024)",
+            case: "the description emptied, which the modelled bound allows (len 0..1024) \
+                   and which clears the member",
             create: json!({ "displayName": "Emptied", "description": "something" }),
             earlier_patch: None,
             patch: json!({ "description": "" }),
@@ -277,10 +287,15 @@ async fn a_patch_replaces_the_members_it_carries_and_leaves_the_others_as_they_w
 
         // Every patchable member: the one the request carried, else the stored one.
         for name in PATCHABLE {
-            let expected = if row.patch.get(name).is_some() {
-                member(&row.patch, name)
-            } else {
-                member(&before, name)
+            let carried = row.patch.get(name);
+            let cleared = CLEARED_BY_EMPTY.contains(&name)
+                && carried.and_then(Value::as_str) == Some("");
+            let expected = match carried {
+                // An optional string member carried EMPTY describes no value to store, so
+                // the stored one is removed and nobody reports the member afterwards.
+                Some(_) if cleared => Value::Null,
+                Some(_) => member(&row.patch, name),
+                None => member(&before, name),
             };
             assert_eq!(
                 member(&patched, name),

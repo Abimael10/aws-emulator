@@ -7,9 +7,11 @@
 //! * **`UpdatePortal` is a PATCH** (`PATCH /v2/portals/{PortalId}`): a member the request
 //!   carries replaces the stored one, a member it omits leaves the stored value exactly as
 //!   it was, and the members this operation does not take (the portal's id, its ARN, its
-//!   publication state and its tags) are carried over untouched. The patched record is
-//!   what the response reports AND what a later `GetPortal` reports, so the patch was
-//!   persisted rather than echoed.
+//!   publication state and its tags) are carried over untouched. An OPTIONAL string member
+//!   ([`CLEARED_BY_EMPTY`]) carried EMPTY is the one exception to "replaces": it asks for
+//!   the stored member to be REMOVED, so neither the patch's answer nor any later read
+//!   reports it. The patched record is what the response reports AND what a later
+//!   `GetPortal` reports, so the patch was persisted rather than echoed.
 //! * **`LastModified` advances when the patch carries a member to apply**, and a patch
 //!   that carries none leaves the record — `LastModified` included — exactly as it was.
 //! * **A value the SERVICE computes is not taken from the request**:
@@ -81,6 +83,12 @@ const PATCHABLE: [&str; 4] = [
     "portalContent",
     "rumAppMonitorName",
 ];
+
+/// The members of a portal a patch CLEARS by carrying them empty: its OPTIONAL string
+/// members, the ones a portal may simply not have and whose readers report them only while
+/// they hold a value. `LogoUri` is not one of them: no modelled reader reports it, and
+/// carrying the member at all is the upload `PortalTheme$LogoLastUploaded` records.
+const CLEARED_BY_EMPTY: [&str; 1] = ["rumAppMonitorName"];
 
 /// How long to wait so a patch lands in a LATER second than what came before it. The
 /// service reports its instants at whole-second granularity, so only a wait past a second
@@ -270,7 +278,8 @@ fn rows() -> Vec<Row> {
             patch: json!({ "rumAppMonitorName": "m".repeat(MAX_RUM_APP_MONITOR_NAME_LEN) }),
         },
         Row {
-            case: "the RUM app monitor name emptied, which the modelled bound allows (len 0..255)",
+            case: "the RUM app monitor name emptied, which the modelled bound allows \
+                   (len 0..255) and which clears the member",
             create: json!({
                 "authorization": { "none": {} },
                 "endpointConfiguration": { "none": {} },
@@ -506,10 +515,16 @@ async fn a_patch_replaces_the_members_it_carries_and_leaves_the_others_as_they_w
                     content_without_logo_instant(&patched),
                 )
             } else {
-                let expected = if row.patch.get(name).is_some() {
-                    member(&row.patch, name)
-                } else {
-                    member(&before, name)
+                // An optional string member ([`CLEARED_BY_EMPTY`]) carried EMPTY describes
+                // no value to store, so the stored one is removed and nobody reports the
+                // member afterwards.
+                let carried = row.patch.get(name);
+                let cleared = CLEARED_BY_EMPTY.contains(&name)
+                    && carried.and_then(Value::as_str) == Some("");
+                let expected = match carried {
+                    Some(_) if cleared => Value::Null,
+                    Some(_) => member(&row.patch, name),
+                    None => member(&before, name),
                 };
                 (expected, member(&patched, name))
             };

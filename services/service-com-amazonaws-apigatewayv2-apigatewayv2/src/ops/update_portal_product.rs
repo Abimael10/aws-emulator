@@ -2,7 +2,8 @@
 
 //! @op UpdatePortalProduct
 //! IMPLEMENTED: patches a persisted [`crate::state::PortalProduct`] — a member the request
-//! carries replaces the stored one, a member it omits leaves the stored value as it was —
+//! carries replaces the stored one, a member it omits leaves the stored value as it was, and
+//! an OPTIONAL string member carried EMPTY is REMOVED ([`crate::state::cleared_by_empty`]) —
 //! advances the record's `LastModified` when it carries a member to apply, and answers 200
 //! with the stored record. This is the ONLY file to touch for this operation.
 //!
@@ -215,8 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.display_name = display_name;
             modified = true;
         }
+        // `Description` is an OPTIONAL string member the product may simply not have, and
+        // its reader reports it only while it holds a value, so the EMPTY string describes
+        // no value to store: it asks for the stored one to be REMOVED, the one reading of
+        // an empty optional member every patch of this service applies
+        // ([`crate::state::cleared_by_empty`]). `DisplayName` is not one of them — a
+        // product always reports one — so an empty display name is refused above instead.
         if let Some(description) = input.description {
-            updated.description = Some(description);
+            updated.description = crate::state::cleared_by_empty(description);
             modified = true;
         }
         if let Some(display_order) = input.display_order {

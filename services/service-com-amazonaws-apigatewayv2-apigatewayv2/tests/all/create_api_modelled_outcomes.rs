@@ -402,9 +402,9 @@ async fn create_api_answers_only_a_status_its_model_declares() {
     );
 }
 
-/// What a patch of one member leaves behind: the value STORED, the member CLEARED (what a
-/// member whose shape admits no empty value asks for when it is carried empty), or the
-/// patch REFUSED for a value outside the member's documented window.
+/// What a patch of one member leaves behind: the value STORED, the member CLEARED (what an
+/// OPTIONAL member asks for when it is carried empty), or the patch REFUSED for a value
+/// outside the member's documented window.
 #[derive(Debug, PartialEq, Eq)]
 enum Patched {
     Stored,
@@ -414,8 +414,9 @@ enum Patched {
 
 /// The windows above, as the patch that rewrites each member: (member, the value, and what
 /// the api does with it). A value AT a bound is in range and one past it is not; the empty
-/// string is a VALUE for `description`, whose shape admits it, and a CLEAR for `version`,
-/// whose shape does not, while `name` — required on the modelled `Api` — refuses it.
+/// string is a CLEAR for the OPTIONAL members `description` and `version` — it describes no
+/// value to store, so the stored one is removed and no reader reports the member — while
+/// `name`, required on the modelled `Api`, refuses it.
 fn patch_rows() -> Vec<(&'static str, String, Patched)> {
     vec![
         ("name", "n".repeat(MAX_NAME_CHARS), Patched::Stored),
@@ -431,7 +432,7 @@ fn patch_rows() -> Vec<(&'static str, String, Patched)> {
             "d".repeat(MAX_DESCRIPTION_CHARS + 1),
             Patched::Refused,
         ),
-        ("description", String::new(), Patched::Stored),
+        ("description", String::new(), Patched::Cleared),
         ("version", "v".repeat(MAX_VERSION_CHARS), Patched::Stored),
         (
             "version",
@@ -491,8 +492,8 @@ async fn update_api_holds_a_patch_to_the_same_documented_windows() {
             Patched::Cleared => {
                 assert_eq!(
                     status, 201,
-                    "case {case:?}: a member whose shape admits no empty value is cleared \
-                     by one, which is accepted, got {status} {body}"
+                    "case {case:?}: an OPTIONAL member is cleared by an empty value, which \
+                     is accepted, got {status} {body}"
                 );
                 assert!(
                     body.get(member).is_none(),
