@@ -157,10 +157,10 @@ use super::types::*;
 use crate::state::{
     canonical_dns_name, invalid_domain_name_message, no_such_delegation_set,
     normalize_delegation_set_id, resource_location, vpc_id_is_well_formed, vpc_region_is_modelled,
-    RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
-    MAX_HOSTED_ZONES_PER_DELEGATION_SET,
+    RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, HOSTED_ZONE_TIER_STANDARD,
+    MAX_HOSTED_ZONES, MAX_HOSTED_ZONES_PER_DELEGATION_SET,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The TTL, in seconds, of the NS record Route 53 creates at a new zone's apex.
 ///
@@ -545,6 +545,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A zone is created with public DNS fallback off; nothing in this
             // API version turns it on.
             public_dns_fallback_enabled: false,
+            // CreateHostedZone names no tier, and this API version carries no
+            // operation that moves a zone between tiers, so a zone is created in
+            // the ordinary one.
+            tier: HOSTED_ZONE_TIER_STANDARD.to_string(),
+            // CreateHostedZone carries no guardrail input, so a zone is created
+            // with every change guardrail off; nothing in this API version turns
+            // one on.
+            enabled_change_guardrails: BTreeSet::new(),
         };
 
         let change = store.submit_change(None);

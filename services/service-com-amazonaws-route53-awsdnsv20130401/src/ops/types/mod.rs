@@ -60,6 +60,9 @@ pub mod get_reusable_delegation_set_types;
 pub mod get_traffic_policy_instance_count_types;
 pub mod get_traffic_policy_instance_types;
 pub mod get_traffic_policy_types;
+/// The shapes a hosted-zone projection is answered with, hand-written because the answer
+/// carries members the on-disk model does not declare; see the module's own docs.
+pub mod hosted_zone_projection;
 pub mod list_cidr_blocks_types;
 pub mod list_cidr_collections_types;
 pub mod list_cidr_locations_types;
@@ -179,6 +182,8 @@ pub use get_traffic_policy_instance_count_types::*;
 pub use get_traffic_policy_instance_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_traffic_policy_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use hosted_zone_projection::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_cidr_blocks_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

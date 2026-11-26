@@ -87,10 +87,13 @@ use crate::ops::types::list_cidr_blocks_types::CidrBlockSummary;
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
+use crate::ops::types::hosted_zone_projection::{
+    ChangeGuardrail, HostedZoneFeatures, ProjectedHostedZoneConfig,
+};
 use crate::ops::types::shared_types::{
     ChangeInfo, CloudWatchAlarmConfiguration, ConflictingDomainExists, DelegationSet, HealthCheck,
     HealthCheckConfig,
-    HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
+    HealthCheckObservation, HostedZone,
     InvalidInput,
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchCidrCollectionException,
     NoSuchDelegationSet,
@@ -141,6 +144,42 @@ pub const ACCELERATED_RECOVERY_DISABLING: &str = "DISABLING";
 /// The status of a zone whose accelerated recovery is off
 /// (`AcceleratedRecoveryStatus$DISABLED`).
 pub const ACCELERATED_RECOVERY_DISABLED: &str = "DISABLED";
+
+/// The tier an ordinary hosted zone is in.
+///
+/// A zone's tier is not in the model at all: it is read off the `HostedZoneTier` Route 53
+/// answers a hosted-zone projection's `Config` with. This API version (2013-04-01) carries
+/// no operation that creates a zone in another tier or moves one between tiers, so every
+/// zone this store holds is created in this one — and the tier is held ON the zone rather
+/// than answered as a constant by the projection, so the day an operation can set it,
+/// every projection already reports what was set.
+pub const HOSTED_ZONE_TIER_STANDARD: &str = "STANDARD";
+
+/// The change guardrails Route 53 defines, in the order a hosted-zone projection reports
+/// them in.
+///
+/// A guardrail is a check Route 53 can apply to a change before it accepts it, and the set
+/// is the SERVICE's, not the caller's: it is not in the model (no `ChangeGuardrails`
+/// member or shape is declared), so the names and their order are read off the
+/// `ChangeGuardrails` container Route 53 answers a hosted-zone projection with — the
+/// published set, reported for every zone the guardrails apply to. Whether one is ON is
+/// per-ZONE state ([`StoredZone::enabled_change_guardrails`]); this is the catalog of what
+/// there is to report.
+pub const CHANGE_GUARDRAILS: &[&str] = &[
+    "NS_OCCLUSION_CHECK",
+    "NS_DELEGATION_AUTHORITY_CHECK",
+    "NS_FORMAT_CHECK",
+    "ALIAS_TARGET_CHECK",
+    "ACTIVE_RECORD_CHECK",
+    "ACTIVE_DELEGATION_CHECK",
+];
+
+/// The status of a change guardrail that is on for a hosted zone.
+pub const CHANGE_GUARDRAIL_ENABLED: &str = "ENABLED";
+
+/// The status of a change guardrail that is off for a hosted zone, which is how every zone
+/// is created.
+pub const CHANGE_GUARDRAIL_DISABLED: &str = "DISABLED";
 
 /// The public-DNS fallback status of a hosted zone the feature is on for.
 pub const PUBLIC_DNS_FALLBACK_ENABLED: &str = "ENABLED";
@@ -983,106 +1022,150 @@ pub struct StoredZone {
     /// reports what was set. Which zones report it at all follows from the zone
     /// itself ([`StoredZone::public_dns_fallback_status`]).
     pub public_dns_fallback_enabled: bool,
+    /// The tier this zone is in — the state a hosted-zone projection reports as
+    /// `HostedZoneTier` inside `Config`.
+    ///
+    /// Every zone is created in [`HOSTED_ZONE_TIER_STANDARD`], the one tier this API
+    /// version (2013-04-01) can put a zone in, and is held ON the zone rather than
+    /// answered as a constant by the projection, so the day an operation can set it, every
+    /// projection already reports what was set. Which projections report it at all follows
+    /// from the zone itself ([`StoredZone::hosted_zone_tier`]).
+    pub tier: String,
+    /// The change guardrails turned ON for this zone, by name — the state a hosted-zone
+    /// projection reports as each guardrail's `Status` inside `Features`.
+    ///
+    /// A zone is created with none of them on: `CreateHostedZone` carries no guardrail
+    /// input, so every guardrail of the published set ([`CHANGE_GUARDRAILS`]) is off for a
+    /// new zone, and this API version carries no operation that turns one on. Held ON the
+    /// zone, like the signing flag and the tags beside it, so deleting the zone takes its
+    /// guardrail state with it and no second record can disagree about it; what a
+    /// projection reports for one guardrail is derived from this set
+    /// ([`StoredZone::change_guardrail_status`]).
+    pub enabled_change_guardrails: BTreeSet<String>,
 }
 
 impl StoredZone {
-    /// The modelled `HostedZone`, with a LIVE `ResourceRecordSetCount`.
+    /// The `HostedZone` a SINGLE-ZONE projection reports this zone as, with a LIVE
+    /// `ResourceRecordSetCount` — what the create, the single read and the comment update
+    /// all answer with, so the three cannot disagree about one zone.
     ///
-    /// `Config` is ALWAYS present: `HostedZoneConfig$PrivateZone` is a boolean
-    /// with `@default false`, so the zone's private flag always has a value to
-    /// report, and Route 53 answers every hosted-zone read with the `Config`
-    /// container carrying it — including for a public zone created with no
-    /// `HostedZoneConfig` at all. `Comment`, which has no default, is reported
-    /// only when the zone holds one; that is the member the `HostedZone$Config`
-    /// documentation ("the Config and Comment elements don't appear in the
-    /// response") is about.
+    /// Every member is the state the zone HOLDS, and a member is reported exactly where
+    /// the zone has that state to report, so a projection never answers a default for
+    /// state the zone does not have:
+    ///
+    /// * `Config` is ALWAYS present: `HostedZoneConfig$PrivateZone` is a boolean with
+    ///   `@default false`, so the zone's private flag always has a value to report —
+    ///   including for a public zone created with no `HostedZoneConfig` at all. `Comment`,
+    ///   which has no default, is reported only when the zone holds one; that is the
+    ///   member the `HostedZone$Config` documentation ("the Config and Comment elements
+    ///   don't appear in the response") is about. Beside them it carries the zone's TIER
+    ///   ([`StoredZone::hosted_zone_tier`]).
+    /// * `Features` is ALWAYS present too, carrying the status of each feature that
+    ///   applies to the zone ([`StoredZone::to_hosted_zone_features`]) — so a zone none of
+    ///   them applies to carries the container EMPTY rather than not at all.
     pub fn to_hosted_zone(&self) -> HostedZone {
-        let config = Some(HostedZoneConfig {
-            comment: self.comment.clone(),
-            private_zone: self.private_zone,
-        });
         HostedZone {
             id: format!("{HOSTED_ZONE_PREFIX}{}", self.id),
             name: self.name.clone(),
             caller_reference: self.caller_reference.clone(),
-            config,
+            config: Some(self.to_hosted_zone_config()),
             resource_record_set_count: Some(self.records.len() as i64),
             // Read off the zone through the one projection of this marker: a zone another
             // service created for one of its own resources reports that service and the
             // resource on every hosted-zone read, and a zone a client created for itself
             // reports none.
             linked_service: linked_service::of_zone(self),
-            // Read off the zone, so what the last accepted features update left
-            // is what every hosted-zone read reports — and nothing at all for a zone no
-            // feature is configured on ([`StoredZone::reported_features`]).
-            features: self.reported_features(),
+            // Read off the zone, so what the last accepted features update left, and the
+            // posture of every other feature the zone has one for, is what every
+            // single-zone projection reports.
+            features: Some(self.to_hosted_zone_features()),
         }
     }
 
     /// The `HostedZone` the ACCOUNT-WIDE listing projects this zone as.
     ///
-    /// The same zone as [`StoredZone::to_hosted_zone`], down to one member: the
-    /// listing reports every zone's public-DNS fallback POSTURE, so a client
-    /// enumerating the account reads each zone's posture off the listing instead
-    /// of having to tell "the feature is off for this zone" from "this row
-    /// reports no feature state at all" ([`StoredZone::listed_features`]). The
-    /// single-zone readers keep the projection they answer with, which carries
-    /// the features something configured on the zone.
+    /// The same zone as [`StoredZone::to_hosted_zone`], down to the two containers a ROW
+    /// of the listing reports less of than the zone's own read: a row's `Config` carries
+    /// the zone's comment and private flag but not the tier it is in, and its `Features`
+    /// reports every zone's public-DNS fallback POSTURE — so a client enumerating the
+    /// account reads each zone's posture off the listing instead of having to tell "the
+    /// feature is off for this zone" from "this row reports no feature state at all"
+    /// ([`StoredZone::listed_features`]). The single-zone readers keep the projection they
+    /// answer with, which carries every feature status and the tier the zone itself has.
     pub fn to_listed_hosted_zone(&self) -> HostedZone {
         HostedZone {
+            config: Some(self.to_listed_hosted_zone_config()),
             features: self.listed_features(),
             ..self.to_hosted_zone()
         }
     }
 
-    /// The `Features` the account-wide listing reports for this zone: the
-    /// statuses every hosted-zone projection carries, plus the public-DNS
-    /// fallback posture the zone is in.
-    ///
-    /// Every zone HAS that posture, whether or not anything configured the
-    /// feature on it ([`StoredZone::public_dns_fallback_posture`]), so every
-    /// listed zone carries the container and no listed zone carries it empty.
-    pub fn listed_features(&self) -> Option<HostedZoneFeatures> {
-        let features = HostedZoneFeatures {
-            public_dns_fallback_status: Some(self.public_dns_fallback_posture().to_string()),
-            ..self.to_hosted_zone_features()
-        };
-        Self::features_with_a_status(features)
+    /// The `Config` a ROW of the account-wide listing reports for this zone: the comment
+    /// it holds and its private flag, and no tier (see
+    /// [`StoredZone::to_listed_hosted_zone`]).
+    pub fn to_listed_hosted_zone_config(&self) -> ProjectedHostedZoneConfig {
+        ProjectedHostedZoneConfig {
+            hosted_zone_tier: None,
+            ..self.to_hosted_zone_config()
+        }
     }
 
-    /// The `Features` a hosted-zone projection reports for this zone, and NOTHING for a zone
-    /// no feature of the container is configured on.
+    /// The `Config` a single-zone projection reports for this zone: the comment it holds
+    /// and its private flag, plus the tier it is in.
+    pub fn to_hosted_zone_config(&self) -> ProjectedHostedZoneConfig {
+        ProjectedHostedZoneConfig {
+            comment: self.comment.clone(),
+            private_zone: self.private_zone,
+            // Read off the zone, so whatever puts a zone in a tier moves what every
+            // projection reports by itself.
+            hosted_zone_tier: self.hosted_zone_tier().map(str::to_string),
+        }
+    }
+
+    /// The tier a projection reports for this zone: the tier the zone is in, and NOTHING
+    /// for a private zone.
+    ///
+    /// A tier is a property of a zone ANSWERED on the public internet: a private hosted
+    /// zone is "visible only in the VPCs that you specify"
+    /// (`HostedZoneConfig$PrivateZone`), so it is in no tier and a projection of it reports
+    /// none rather than a default — the same rule that decides which feature statuses it
+    /// reports ([`StoredZone::to_hosted_zone_features`]).
+    pub fn hosted_zone_tier(&self) -> Option<&str> {
+        (!self.private_zone).then_some(self.tier.as_str())
+    }
+
+    /// The `Features` the account-wide listing reports for this zone: the public-DNS
+    /// fallback posture the zone is in, plus the status of the feature something
+    /// CONFIGURED on it.
+    ///
+    /// Every zone HAS that posture, whether or not anything configured the feature on it
+    /// ([`StoredZone::public_dns_fallback_posture`]), so every listed zone carries the
+    /// container and no listed zone carries it empty.
+    pub fn listed_features(&self) -> Option<HostedZoneFeatures> {
+        Some(HostedZoneFeatures {
+            accelerated_recovery_status: self
+                .configured_accelerated_recovery_status()
+                .map(str::to_string),
+            failure_reasons: None,
+            public_dns_fallback_status: Some(self.public_dns_fallback_posture().to_string()),
+            change_guardrails: None,
+        })
+    }
+
+    /// The `Features` container's CONTENTS for a single-zone projection of this zone: the
+    /// status of every feature of the container that APPLIES to the zone.
     ///
     /// `HostedZone$Features` carries "the features configuration for the hosted zone,
-    /// including accelerated recovery settings and status information": a zone that has no
-    /// such configuration has no features to report, so the container is left out of the
-    /// answer rather than reported empty. Whether it appears follows from the ZONE and not
-    /// from the operation that projected it, so the create, the single read, the comment
-    /// update and both account-wide listings all report the same zone the same way.
-    pub fn reported_features(&self) -> Option<HostedZoneFeatures> {
-        Self::features_with_a_status(self.to_hosted_zone_features())
-    }
-
-    /// The container itself when it carries a status, and NOTHING when it
-    /// carries none: the member is optional, so a zone with nothing to report in
-    /// it is answered without it rather than with an empty container, whichever
-    /// projection built the container.
-    fn features_with_a_status(features: HostedZoneFeatures) -> Option<HostedZoneFeatures> {
-        let configured = features.accelerated_recovery_status.is_some()
-            || features.failure_reasons.is_some()
-            || features.public_dns_fallback_status.is_some();
-        configured.then_some(features)
-    }
-
-    /// The `Features` container's CONTENTS for this zone: the status of each feature the
-    /// container covers that the zone HAS one for.
-    ///
-    /// Which statuses it carries is what the zone's state decides: the
-    /// accelerated-recovery status the zone is in or moving to, once a features
-    /// update has configured the feature on it (`UpdateHostedZoneFeatures`, the one
-    /// operation that configures one); the public-DNS fallback status of a zone the
-    /// feature is turned on for ([`StoredZone::public_dns_fallback_status`]); and no
-    /// `FailureReasons`, because no features change this store accepts fails.
+    /// including accelerated recovery settings and status information", and which of them
+    /// a zone has is what the zone's own state decides: the accelerated-recovery status it
+    /// is in or moving to ([`StoredZone::accelerated_recovery_status`]), the status of each
+    /// change guardrail Route 53 defines ([`StoredZone::to_change_guardrails`]), the
+    /// public-DNS fallback status of a zone the feature is turned on for
+    /// ([`StoredZone::public_dns_fallback_status`]), and no `FailureReasons`, because no
+    /// features change this store accepts fails. A PRIVATE zone has none of them — it is
+    /// answered only inside its VPCs, which is why accelerated recovery cannot be
+    /// configured on one (`crate::ops::update_hosted_zone_features`) — so its container is
+    /// EMPTY.
     pub fn to_hosted_zone_features(&self) -> HostedZoneFeatures {
         HostedZoneFeatures {
             accelerated_recovery_status: self.accelerated_recovery_status().map(str::to_string),
@@ -1090,19 +1173,66 @@ impl StoredZone {
             // Reported only for a zone the feature is turned ON for: see
             // [`StoredZone::public_dns_fallback_status`].
             public_dns_fallback_status: self.public_dns_fallback_status().map(str::to_string),
+            change_guardrails: self.to_change_guardrails(),
         }
     }
 
-    /// The `AcceleratedRecoveryStatus` this zone has, and `None` for a zone no
-    /// features update has configured the feature on.
+    /// The `AcceleratedRecoveryStatus` a single-zone projection reports for this zone: the
+    /// status it is in or moving to, the OFF status while nothing has configured the
+    /// feature, and NOTHING for a private zone, which the feature does not apply to.
     ///
     /// Derived from the setting the last accepted update left and the clock (see
-    /// [`AcceleratedRecovery::status`]), so a zone still moving to its setting
-    /// reports the moving status without anyone advancing it.
+    /// [`AcceleratedRecovery::status`]), so a zone still moving to its setting reports the
+    /// moving status without anyone advancing it.
     pub fn accelerated_recovery_status(&self) -> Option<&'static str> {
+        if self.private_zone {
+            return None;
+        }
+        Some(
+            self.configured_accelerated_recovery_status()
+                .unwrap_or(ACCELERATED_RECOVERY_DISABLED),
+        )
+    }
+
+    /// The `AcceleratedRecoveryStatus` an accepted features update left on this zone, and
+    /// `None` for a zone no update has configured the feature on.
+    pub fn configured_accelerated_recovery_status(&self) -> Option<&'static str> {
         self.accelerated_recovery
             .as_ref()
             .map(AcceleratedRecovery::status)
+    }
+
+    /// The change-guardrail statuses a single-zone projection reports for this zone: one
+    /// entry per guardrail Route 53 defines ([`CHANGE_GUARDRAILS`]), in the order it
+    /// publishes them, each carrying that guardrail's status ON THIS ZONE — and NOTHING for
+    /// a private zone, which the guardrails do not apply to (see
+    /// [`StoredZone::to_hosted_zone_features`]).
+    pub fn to_change_guardrails(&self) -> Option<Vec<ChangeGuardrail>> {
+        if self.private_zone {
+            return None;
+        }
+        Some(
+            CHANGE_GUARDRAILS
+                .iter()
+                .map(|guardrail| ChangeGuardrail {
+                    name: (*guardrail).to_string(),
+                    status: self.change_guardrail_status(guardrail).to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The status of one change guardrail on this zone: the on status while the zone has
+    /// it turned on, the off status while it does not.
+    ///
+    /// Derived from the zone's own state, like [`StoredZone::serve_signature`] beside it,
+    /// so whatever turns a guardrail on moves what every projection reports by itself.
+    pub fn change_guardrail_status(&self, guardrail: &str) -> &'static str {
+        if self.enabled_change_guardrails.contains(guardrail) {
+            CHANGE_GUARDRAIL_ENABLED
+        } else {
+            CHANGE_GUARDRAIL_DISABLED
+        }
     }
 
     /// The public-DNS fallback status a hosted-zone projection reports for this

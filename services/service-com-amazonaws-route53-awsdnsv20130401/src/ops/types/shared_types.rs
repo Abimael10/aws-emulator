@@ -257,6 +257,10 @@ pub struct Dimension {
     pub value: String,
 }
 
+/// The `HostedZoneConfig` a REQUEST carries. The config a hosted-zone projection is
+/// answered with is `types::hosted_zone_projection::ProjectedHostedZoneConfig`, which
+/// carries one member more than the on-disk model declares; that module's docs carry the
+/// reason the two are separate types.
 #[smithy_macros::smithy(shape = "com.amazonaws.route53#HostedZoneConfig")]
 #[derive(Debug, Clone, Default)]
 pub struct HostedZoneConfig {
@@ -270,18 +274,10 @@ pub struct HostedZone {
     pub id: String,
     pub name: String,
     pub caller_reference: String,
-    pub config: Option<HostedZoneConfig>,
+    pub config: Option<ProjectedHostedZoneConfig>,
     pub resource_record_set_count: Option<i64>,
     pub linked_service: Option<LinkedService>,
     pub features: Option<HostedZoneFeatures>,
-}
-
-#[smithy_macros::smithy(shape = "com.amazonaws.route53#HostedZoneFeatures")]
-#[derive(Debug, Clone, Default)]
-pub struct HostedZoneFeatures {
-    pub accelerated_recovery_status: Option<String>,
-    pub failure_reasons: Option<HostedZoneFailureReasons>,
-    pub public_dns_fallback_status: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.route53#HostedZoneFailureReasons")]

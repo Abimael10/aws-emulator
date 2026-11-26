@@ -19,12 +19,20 @@
 //! 3. `GetHostedZone` reports the zone's deletion protection alongside it, read
 //!    off the zone — `false` for every zone here, because this API version
 //!    carries no operation that turns it on.
+//! 4. The `Config` carries the TIER the zone is in beside those two, for a zone that is
+//!    in one: the state a projection reports is the state the zone holds, so a public
+//!    zone's config carries its tier on every projection of it and a private zone's
+//!    carries none. The tier table below spans the zones and asserts every row on all
+//!    three single-zone projections, and the account-wide listing's summary rows beside
+//!    them.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness `hosted_zone_records` uses, so what is asserted is the HTTP/restXml
 //! behaviour a Route 53 client sees.
 
 use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_route53_awsdnsv20130401::state::HOSTED_ZONE_TIER_STANDARD;
 
 use crate::hosted_zone_records::{call, escape_xml, router, Reply};
 use crate::resource_tags::element_text;
@@ -479,4 +487,147 @@ async fn a_comment_update_touches_only_the_zone_it_names() {
             read.body
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The TIER the Config of a projected zone carries
+// ---------------------------------------------------------------------------
+
+/// The `HostedZoneTier` the `Config` of the first `HostedZone` a reply projects reports,
+/// or `None` where that config carries none.
+fn config_tier(case: &str, reply: &Reply) -> Option<String> {
+    let block = config_block(reply).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: every HostedZone must carry a Config container; body {}",
+            reply.body
+        )
+    });
+    element_text(block, "HostedZoneTier")
+}
+
+/// One row of the tier table: how the zone is created, and whether it is private — which
+/// is what decides whether it is in a tier at all.
+struct TierRow {
+    case: &'static str,
+    name: &'static str,
+    /// The `HostedZoneConfig` (and, for a private zone, `VPC`) block sent.
+    extra: &'static str,
+    private: bool,
+}
+
+impl TierRow {
+    /// The `HostedZoneTier` a single-zone projection of this zone must report: the tier
+    /// every zone is created in, and nothing for a private zone, which is answered only
+    /// inside its VPCs and so is in no tier.
+    fn expected_tier(&self) -> Option<&'static str> {
+        (!self.private).then_some(HOSTED_ZONE_TIER_STANDARD)
+    }
+}
+
+/// The zones the tier table spans: label count, public/private, with and without a
+/// comment, and a name given with a trailing dot.
+fn tier_rows() -> [TierRow; 6] {
+    [
+        TierRow {
+            case: "a public zone created with no HostedZoneConfig",
+            name: "tier-plain.example.com",
+            extra: "",
+            private: false,
+        },
+        TierRow {
+            case: "a public zone created with a comment",
+            name: "tier-commented.example.com",
+            extra: "<HostedZoneConfig><Comment>tiered</Comment></HostedZoneConfig>",
+            private: false,
+        },
+        TierRow {
+            case: "a three-label public zone",
+            name: "zone.sub.tier.example.net",
+            extra: "",
+            private: false,
+        },
+        TierRow {
+            case: "a public zone named with a trailing dot",
+            name: "tier-dotted.example.org.",
+            extra: "",
+            private: false,
+        },
+        TierRow {
+            case: "a private zone with one VPC",
+            name: "tier-private.example.com",
+            extra: "<HostedZoneConfig><PrivateZone>true</PrivateZone></HostedZoneConfig>\
+                    <VPC><VPCRegion>us-east-1</VPCRegion><VPCId>vpc-1a2b3c4d</VPCId></VPC>",
+            private: true,
+        },
+        TierRow {
+            case: "a private zone with a comment, in another region",
+            name: "tier-private-commented.example.co.uk",
+            extra: "<HostedZoneConfig><Comment>private</Comment>\
+                    <PrivateZone>true</PrivateZone></HostedZoneConfig>\
+                    <VPC><VPCRegion>eu-west-1</VPCRegion><VPCId>vpc-9f8e7d6c</VPCId></VPC>",
+            private: true,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn every_single_zone_projection_reports_the_tier_the_zone_is_in() {
+    // The rule: a hosted-zone projection reports the state the zone HOLDS, so the `Config`
+    // of a zone that is in a tier carries that tier and the `Config` of a zone that is in
+    // none carries no tier element at all — and because the projection is the shape's, not
+    // one operation's, the create, the single read and the comment update all report it
+    // alike. A comment update writes only the comment, so the tier it answers with is the
+    // one the zone was created in.
+    let router = router();
+    for (index, row) in tier_rows().iter().enumerate() {
+        let created = create_zone(&router, row.name, &format!("tier-ref-{index}"), row.extra).await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            row.case, created.status, created.body
+        );
+        let zone_id = bare_zone_id(&created);
+        let updated = update_comment(&router, &zone_id, Some("a later comment")).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {:?}: expected 200 from UpdateHostedZoneComment, got {} with body {}",
+            row.case, updated.status, updated.body
+        );
+        for (reader, reply) in [
+            ("CreateHostedZone", created),
+            ("GetHostedZone", get_zone(&router, &zone_id).await),
+            ("UpdateHostedZoneComment", updated),
+        ] {
+            let case = format!("{} projected by {reader}", row.case);
+            let reported = config_tier(&case, &reply);
+            assert_eq!(
+                reported.as_deref(),
+                row.expected_tier(),
+                "case {case:?}: expected Config/HostedZoneTier {:?}, got {reported:?}; body {}",
+                row.expected_tier(),
+                reply.body
+            );
+        }
+    }
+
+    // The account-wide listing projects each zone as a summary ROW rather than as the zone
+    // its own read answers with: it reports every row's private flag and no row's tier.
+    let listed = call(&router, "GET", "/2013-04-01/hostedzone", "").await;
+    assert_eq!(
+        listed.status, 200,
+        "expected 200 from ListHostedZones, got {} with body {}",
+        listed.status, listed.body
+    );
+    assert_eq!(
+        listed.all("HostedZone/Config/PrivateZone").len(),
+        tier_rows().len(),
+        "ListHostedZones must project every created zone; body {}",
+        listed.body
+    );
+    let listed_tiers = listed.all("HostedZone/Config/HostedZoneTier");
+    assert!(
+        listed_tiers.is_empty(),
+        "the account-wide listing's rows carry no tier, got {listed_tiers:?}; body {}",
+        listed.body
+    );
 }
