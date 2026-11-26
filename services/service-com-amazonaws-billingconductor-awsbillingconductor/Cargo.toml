@@ -23,8 +23,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque pagination tokens the paginated reads mint.
 hex = { workspace = true }
-# SHA-256, for the integrity tag those tokens carry.
-sha2 = { workspace = true }
+# `page_tokens`: the per-store secret every `NextToken` this service hands out is
+# authenticated under, so a cursor a caller assembled is refused rather than served as a cut
+# point. One statement of that authenticator for every service that pages, rather than a
+# digest of this crate's own.
+service-common = { path = "../common" }
 # Which accounts a consolidated billing family holds, and the name and email each one
 # carries, is state the Organizations control plane owns: the account listing reads that
 # store through the one shared engine instead of reporting what this service was told.
@@ -37,6 +40,10 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<name>.rs` file, so a new suite is picked up by
 # adding the file.
 automod = { workspace = true }
+# `pagination_token_authenticator`: the cases there assemble the digest a caller can
+# compute over a token's own payload, which is exactly what a pagination token may not be
+# authenticated by. DEV-ONLY — nothing in `src/` digests a token.
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

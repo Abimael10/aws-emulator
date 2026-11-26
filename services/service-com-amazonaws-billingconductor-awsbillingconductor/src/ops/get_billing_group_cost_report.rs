@@ -431,6 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let periods_covered = billing_periods.join(SCOPE_VALUE_SEPARATOR);
 
         let (billing_group_cost_report_results, next_token) = crate::state::paginate_bounded(
+            &state.page_token_key(),
             &crate::state::page_scope_shaped(
                 Self::NAME,
                 &group.arn,

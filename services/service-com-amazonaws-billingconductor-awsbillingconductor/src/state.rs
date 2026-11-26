@@ -2992,6 +2992,16 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// the family is forgotten with it, so one that rejoins has joined again. Private so
     /// no handler can record an observation of its own: the one method above writes it.
     observed_family_accounts: BTreeSet<String>,
+    /// The secret every `NextToken` this store's paginated reads hand out is authenticated
+    /// under: ONE key per store, drawn from the system's randomness when the store is
+    /// created, held only in memory and never reported (see [`encode_next_token`]).
+    ///
+    /// It is what makes a cursor this service ISSUED decidable from one a caller assembled:
+    /// the payload a token carries is built from values the caller already knows, so only an
+    /// authenticator computed under a secret it does not have tells the two apart. Private,
+    /// and handed out by value through [`Self::page_token_key`] alone, so nothing can replace
+    /// a store's key with one of its own.
+    page_token_key: PageTokenKey,
 }
 
 /// The kind -> store-map dispatch both tag accessors share, written ONCE.
@@ -3040,6 +3050,14 @@ macro_rules! resource_tags_of {
 }
 
 impl ComAmazonawsBillingconductorAwsbillingconductorState {
+    /// The key this store's pagination tokens are minted and verified under.
+    ///
+    /// `Copy`, so a paginated read takes the key off the store and goes on to borrow the
+    /// records it is about to report in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
+    }
+
     /// Mint the next resource id for `kind`: [`TaggableResourceKind::id_width`]
     /// characters drawn from [`TaggableResourceKind::id_alphabet`], rendered from one
     /// counter shared by every kind. Monotonic, so no two resources of this service

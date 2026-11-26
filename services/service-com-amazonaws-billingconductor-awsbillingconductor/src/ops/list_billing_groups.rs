@@ -327,6 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read for another month, handed out — is refused rather than read as a cut point
         // into this sequence.
         let (page, next_token) = crate::state::paginate(
+            &state.page_token_key(),
             &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),

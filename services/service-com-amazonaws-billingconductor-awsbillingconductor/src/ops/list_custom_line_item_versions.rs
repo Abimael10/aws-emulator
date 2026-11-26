@@ -345,6 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (custom_line_item_versions, next_token) = crate::state::paginate(
+            &state.page_token_key(),
             &crate::state::page_scope_within(Self::NAME, &item_arn),
             selected,
             input.next_token.as_deref(),

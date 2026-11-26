@@ -231,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let keyed: Vec<(String, String)> =
             plan_arns.into_iter().map(|arn| (arn.clone(), arn)).collect();
         let (page, next_token) = crate::state::paginate(
+            &state.page_token_key(),
             &crate::state::page_scope_in_period(
                 Self::NAME,
                 Some(&pricing_rule_arn),

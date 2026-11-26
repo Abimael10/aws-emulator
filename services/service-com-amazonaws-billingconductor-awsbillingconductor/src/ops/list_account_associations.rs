@@ -278,6 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // each reported account was in, so a token it did not mint for the month being
         // read is refused.
         let (linked_accounts, next_token) = crate::state::paginate(
+            &state.page_token_key(),
             &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),

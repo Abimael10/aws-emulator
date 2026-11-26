@@ -33,85 +33,69 @@ pub(super) const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
 /// parts it has.
 pub(super) const PAGE_SCOPE_SEPARATOR: char = '\u{1e}';
 
-/// How many bytes of the digest a token carries ahead of the value it encodes, so a token
-/// a client truncated, re-typed or edited one character of no longer decodes at all.
-///
-/// A CHOSEN width: 64 bits is far past the chance of an edited token still agreeing with
-/// its own digest, while keeping the token short.
-pub(super) const PAGE_TOKEN_TAG_BYTES: usize = 8;
+/// The secret ONE store's pagination tokens are authenticated under, re-exported here so
+/// the store that holds a key and every read that mints under it name the same type.
+pub use ::service_common::page_tokens::PageTokenKey;
 
-/// The `NextToken` a truncated page hands back: the hex encoding of an integrity tag over
-/// the `scope` that minted it and the `cursor` the next page resumes from.
+/// The `NextToken` a truncated page hands back: the hex encoding of an authenticator over
+/// the `scope` that minted it and the `cursor` the next page resumes from, computed under
+/// the issuing store's `key`.
 ///
-/// A pagination token is OPAQUE — the only thing a caller may do with one is hand it back,
-/// unchanged, to the listing that returned it — so the cursor does not travel in the clear
-/// as the store key it is, and the scope travels with it: a token decodes to a cursor only
-/// under the scope it was minted for, which is what stops one listing's token from being a
-/// cursor into another's sequence. See [`page_scope_within`] for the scope of a listing
-/// read within one resource, and [`page_scope_in_period`] for the scope of one answered for
-/// a single billing period.
+/// A pagination token is this service's OWN value — the only thing a caller may do with one
+/// is hand it back, unchanged, to the listing that returned it — and the scope travels
+/// inside it: a token decodes to a cursor only under the scope it was minted for, which is
+/// what stops one listing's token from being a cursor into another's sequence. See
+/// [`page_scope_within`] for the scope of a listing read within one resource, and
+/// [`page_scope_in_period`] for the scope of one answered for a single billing period.
 ///
-/// The tag is what makes a token that was not minted whole DECIDABLE rather than read as
-/// some other cut point: a value that does not agree with its own tag was not produced
-/// here, so it is refused instead of resuming the listing somewhere the caller never asked
-/// for.
-pub fn encode_next_token(scope: &str, cursor: &str) -> String {
-    let payload = format!("{scope}{PAGE_TOKEN_SEPARATOR}{cursor}");
-    let mut encoded = page_token_tag(payload.as_bytes());
-    encoded.extend_from_slice(payload.as_bytes());
-    ::hex::encode(encoded)
+/// The authenticator is what makes a token that was not minted here DECIDABLE rather than
+/// read as some other cut point. It is computed under a secret the store drew from the
+/// system's randomness and never reveals ([`PageTokenKey`]), so a caller cannot produce one
+/// for a cursor of its own however much of the payload it already knows: a value that does
+/// not carry this store's authenticator over the cursor it travels with was not produced
+/// here, and is refused instead of resuming the listing somewhere the caller never asked
+/// for. The cursor itself is readable to whoever decodes the bytes, and nothing about it has
+/// to be hidden — what a caller cannot do is name a cut point of its own.
+pub fn encode_next_token(key: &PageTokenKey, scope: &str, cursor: &str) -> String {
+    ::hex::encode(key.mint(&format!("{scope}{PAGE_TOKEN_SEPARATOR}{cursor}")))
 }
 
 /// A CHOSEN ceiling on the characters a `NextToken` this service will even decode may
 /// have. The model constrains `Token` not at all, so the value is caller-sized: the
-/// longest token this service mints is an operation name, a resource ARN, the request
-/// values that shape the sequence being read ([`page_scope_shaped`]) and a store key, all
-/// far inside this, and anything longer was not minted here, so it is refused before its
-/// length decides any work.
+/// longest token this service mints is an authenticator, an operation name, a resource ARN,
+/// the request values that shape the sequence being read ([`page_scope_shaped`]) and a store
+/// key, all far inside this, and anything longer was not minted here, so it is refused
+/// before its length decides any work.
 pub(super) const MAX_PAGE_TOKEN_LENGTH: usize = 1024;
 
 /// The cursor `token` carries for the listing `scope`, or `None` when `token` is not one
-/// this service minted for that listing — a value longer than any token it mints, one that
-/// is not hex, is too short to carry a tag, does not agree with the tag it carries, does
-/// not decode to UTF-8, carries no scope at all, carries a different sequence's scope, or
-/// is spelled any way other than the ONE spelling [`encode_next_token`] writes.
+/// `key` minted for that listing — a value longer than any token it mints, one that is not
+/// hex, is too short to carry an authenticator, does not carry this store's authenticator
+/// over the cursor it travels with (a value a caller assembled, one another store minted,
+/// one changed on the way back), does not decode to UTF-8, carries no scope at all, carries
+/// a different sequence's scope, or is spelled any way other than the ONE spelling
+/// [`encode_next_token`] writes.
 ///
-/// Decoding the bytes is only the first half of reading a token: `::hex::decode` reads more
-/// spellings than `::hex::encode` writes — it accepts `A-F` as well as the `a-f` the minter
-/// emits — and the tag is computed over the DECODED payload, so it is identical for every
-/// spelling of one cursor. A token is therefore kept only when it is, byte for byte, the
-/// token this service would mint for the cursor it decodes to: re-minting is what compares
-/// the two, so the accepted spelling is the ENCODER's rather than a second grammar
-/// maintained beside it, and a re-cased copy of an issued token — a value no response of
-/// this service ever carried, so not one the caller handed back unchanged — is refused with
-/// [`invalid_next_token`] like every other value this service did not mint.
-pub fn decode_next_token(scope: &str, token: &str) -> Option<String> {
+/// Verifying the authenticator is only the first half of reading a token: `::hex::decode`
+/// reads more spellings than `::hex::encode` writes — it accepts `A-F` as well as the `a-f`
+/// the minter emits — and the authenticator is computed over the DECODED payload, so it is
+/// identical for every spelling of one cursor. A token is therefore kept only when it is,
+/// byte for byte, the token this store would mint for the cursor it decodes to: re-minting is
+/// what compares the two, so the accepted spelling is the ENCODER's rather than a second
+/// grammar maintained beside it, and a re-cased copy of an issued token — a value no response
+/// of this service ever carried, so not one the caller handed back unchanged — is refused
+/// with [`invalid_next_token`] like every other value this service did not mint.
+pub fn decode_next_token(key: &PageTokenKey, scope: &str, token: &str) -> Option<String> {
     if token.len() > MAX_PAGE_TOKEN_LENGTH {
         return None;
     }
     let encoded = ::hex::decode(token).ok()?;
-    if encoded.len() < PAGE_TOKEN_TAG_BYTES {
-        return None;
-    }
-    let (tag, payload) = encoded.split_at(PAGE_TOKEN_TAG_BYTES);
-    if tag != page_token_tag(payload).as_slice() {
-        return None;
-    }
-    let decoded = std::str::from_utf8(payload).ok()?;
-    let (minted_for, cursor) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+    let payload = key.cursor_of(&encoded)?;
+    let (minted_for, cursor) = payload.split_once(PAGE_TOKEN_SEPARATOR)?;
     if minted_for != scope {
         return None;
     }
-    (encode_next_token(scope, cursor) == token).then(|| cursor.to_string())
-}
-
-/// [`PAGE_TOKEN_TAG_BYTES`] bytes of the SHA-256 digest of a token's payload.
-///
-/// An integrity check over a value this service produced and the caller hands back
-/// unchanged, not a secret: it tells a token that was minted whole from one that was not.
-pub(super) fn page_token_tag(payload: &[u8]) -> Vec<u8> {
-    use ::sha2::Digest;
-    ::sha2::Sha256::digest(payload)[..PAGE_TOKEN_TAG_BYTES].to_vec()
+    (encode_next_token(key, scope, cursor) == token).then(|| cursor.to_string())
 }
 
 /// The scope of the tokens a listing read WITHIN one resource mints: the operation and
@@ -226,7 +210,8 @@ pub fn invalid_next_token() -> crate::ops::types::ValidationException {
 /// The `NextToken` carries the key of the first element left out, so it is a cursor rather
 /// than an offset: resuming skips every key below it. It is minted and read by
 /// [`encode_next_token`] / [`decode_next_token`] under `scope` — the listing it belongs to
-/// — so a token this service did not mint for THIS listing is refused with
+/// — and under `key`, the store's own secret, so a token this store did not mint for THIS
+/// listing is refused with
 /// [`invalid_next_token`] instead of being interpreted as a cut point. The page size is the
 /// request's `max_results` CLAMPED to 1..=[`DEFAULT_PAGE_SIZE`] — a request that
 /// names none, or names a value the modelled range does not allow, is served the
@@ -234,12 +219,13 @@ pub fn invalid_next_token() -> crate::ops::types::ValidationException {
 /// `MaxResults` range reaches past that default pages through
 /// [`paginate_bounded`] instead.
 pub fn paginate<T>(
+    key: &PageTokenKey,
     scope: &str,
     items: Vec<(String, T)>,
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<(Vec<T>, Option<String>), crate::ops::types::ValidationException> {
-    paginate_bounded(scope, items, next_token, max_results, DEFAULT_PAGE_SIZE)
+    paginate_bounded(key, scope, items, next_token, max_results, DEFAULT_PAGE_SIZE)
 }
 
 /// [`paginate`], for an operation whose own `MaxResults` member models a range the
@@ -250,6 +236,7 @@ pub fn paginate<T>(
 /// request names none, so a caller that asks for a page the model allows is served it
 /// whole and one that asks for nothing still gets a bounded page.
 pub fn paginate_bounded<T>(
+    key: &PageTokenKey,
     scope: &str,
     items: Vec<(String, T)>,
     next_token: Option<&str>,
@@ -257,7 +244,7 @@ pub fn paginate_bounded<T>(
     page_size_bound: i32,
 ) -> Result<(Vec<T>, Option<String>), crate::ops::types::ValidationException> {
     let start = match next_token {
-        Some(token) => Some(decode_next_token(scope, token).ok_or_else(invalid_next_token)?),
+        Some(token) => Some(decode_next_token(key, scope, token).ok_or_else(invalid_next_token)?),
         None => None,
     };
     let mut page: Vec<(String, T)> = match start.as_deref() {
@@ -274,7 +261,7 @@ pub fn paginate_bounded<T>(
     let limit = usize::try_from(requested).unwrap_or(1);
     let token = page
         .get(limit)
-        .map(|(key, _)| encode_next_token(scope, key));
+        .map(|(cursor, _)| encode_next_token(key, scope, cursor));
     page.truncate(limit);
     Ok((page.into_iter().map(|(_, element)| element).collect(), token))
 }

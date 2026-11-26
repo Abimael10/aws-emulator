@@ -249,6 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minted while paging one month is refused rather than read as a cut point into
         // another month's sequence.
         let (page, next_token) = crate::state::paginate(
+            &state.page_token_key(),
             &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),

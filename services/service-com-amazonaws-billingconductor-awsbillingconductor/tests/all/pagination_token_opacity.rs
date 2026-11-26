@@ -10,8 +10,10 @@
 //! another parent resource, a minted value one character of which changed) is refused with
 //! the modelled 400 `ValidationException`, `Reason` `CANNOT_PARSE` and `Fields` naming
 //! `NextToken`, rather than being read as a cut point and answered 200 with an arbitrarily
-//! truncated page. A token a listing DID mint resumes exactly where its page stopped, and
-//! carries neither an ARN nor an account id nor an index a caller could edit.
+//! truncated page. A token a listing DID mint resumes exactly where its page stopped, and is
+//! never a store key a caller could hand back as one: the position it names travels behind
+//! the issuing store's own authenticator, which is what no caller can produce
+//! (`tests/all/pagination_token_authenticator.rs`).
 //!
 //! A read ANSWERED FOR ONE BILLING PERIOD belongs to that month as well as to the listing,
 //! which [`a_period_scoped_token_is_refused_by_a_read_of_another_billing_period`] and
@@ -636,9 +638,11 @@ async fn every_paginated_read_refuses_a_next_token_it_did_not_mint() {
     }
 }
 
-/// THE RULE: a token a listing minted is opaque — it carries no ARN, no account id and no
-/// index a caller could read or edit — and handing it back resumes exactly where the page
-/// stopped, so a walk reports the whole sequence once, in the unpaged order.
+/// THE RULE: a token a listing minted is this service's own opaque value — never a store
+/// key a caller could hand back as one, and never a value a caller could edit into another
+/// cut point (`tests/all/pagination_token_authenticator.rs` pins what makes one
+/// unassemblable) — and handing it back resumes exactly where the page stopped, so a walk
+/// reports the whole sequence once, in the unpaged order.
 #[tokio::test]
 async fn a_minted_next_token_is_opaque_and_resumes_the_listing_it_belongs_to() {
     let world = fixture().await;

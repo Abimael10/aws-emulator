@@ -309,8 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::page_scope_in_period`): the period decides which items were in
         // effect and which generation of each is reported, so a cursor minted while paging
         // one month is refused rather than read as a cut point into another month's
-        // sequence.
+        // sequence. It is authenticated under the store's own key
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::page_token_key`),
+        // so a cursor a caller assembled is no cut point either.
         let (custom_line_items, next_token) = crate::state::paginate(
+            &state.page_token_key(),
             &crate::state::page_scope_in_period(Self::NAME, None, &billing_period),
             selected,
             input.next_token.as_deref(),
