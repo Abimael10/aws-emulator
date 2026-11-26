@@ -28,6 +28,10 @@
 //!   published at that location, each with its OWN `includedRegions` — any set of
 //!   Regions, in the order published, the location's own Region among them where that
 //!   mode's fee covers it;
+//! * a location's flat-rate tiers are DISJOINT bands: they come in ascending order and
+//!   each names only the Regions its own fee covers, so no Region a nearer tier covers
+//!   is named again further up and a Region no published fee covers is named by no
+//!   tier;
 //! * `availablePortSpeeds` is that location's own subset of the dedicated-connection
 //!   speeds and `availableMacSecPortSpeeds` that same list narrowed to the speeds
 //!   MACsec is offered on (or empty), so no two lists of one location disagree.
@@ -280,65 +284,53 @@ async fn a_published_location_is_answered_with_its_own_code_name_partners_and_mo
                 "availablePortSpeeds": ["10G", "100G"],
                 "includedRegions": ["us-east-2", "eu-west-1", "us-east-1", "us-west-2"],
             },
+            // Tiers 3, 4 and 5 are the farther BANDS, each naming the Regions its own
+            // fee covers and none that a nearer tier's does.
             {
                 "billingMode": "FlatRateTier3",
                 "availablePortSpeeds": ["10G", "100G"],
                 "includedRegions": [
-                    "us-east-2",
-                    "eu-west-1",
-                    "us-east-1",
-                    "us-west-2",
-                    "us-west-1",
-                    "ca-central-1",
-                    "eu-west-2",
-                    "eu-central-1",
                     "eu-north-1",
+                    "eu-west-3",
+                    "eu-central-1",
+                    "sa-east-1",
+                    "ap-northeast-3",
+                    "eu-west-2",
+                    "eu-south-1",
+                    "ap-northeast-1",
+                    "ap-southeast-1",
+                    "ca-central-1",
+                    "ca-west-1",
+                    "eu-south-2",
+                    "eu-central-2",
                 ],
             },
             {
                 "billingMode": "FlatRateTier4",
                 "availablePortSpeeds": ["10G", "100G"],
                 "includedRegions": [
-                    "us-east-2",
-                    "eu-west-1",
-                    "us-east-1",
-                    "us-west-2",
-                    "us-west-1",
-                    "ca-central-1",
-                    "eu-west-2",
-                    "eu-central-1",
-                    "eu-north-1",
-                    "ap-northeast-1",
-                    "ap-northeast-2",
-                    "ap-southeast-1",
-                    "ap-southeast-2",
                     "ap-south-1",
+                    "af-south-1",
+                    "ap-east-1",
+                    "ap-south-2",
+                    "ap-northeast-2",
+                    "ap-southeast-4",
+                    "mx-central-1",
+                    "ap-southeast-2",
+                    "il-central-1",
                 ],
             },
             {
                 "billingMode": "FlatRateTier5",
                 "availablePortSpeeds": ["10G", "100G"],
                 "includedRegions": [
-                    "us-east-2",
-                    "eu-west-1",
-                    "us-east-1",
-                    "us-west-2",
-                    "us-west-1",
-                    "ca-central-1",
-                    "eu-west-2",
-                    "eu-central-1",
-                    "eu-north-1",
-                    "ap-northeast-1",
-                    "ap-northeast-2",
-                    "ap-northeast-3",
-                    "ap-southeast-1",
-                    "ap-southeast-2",
-                    "ap-south-1",
-                    "ap-east-1",
-                    "sa-east-1",
+                    "ap-southeast-6",
                     "me-south-1",
-                    "af-south-1",
-                    "eu-south-1",
+                    "ap-southeast-7",
+                    "ap-southeast-3",
+                    "me-central-1",
+                    "ap-southeast-5",
+                    "ap-east-2",
                 ],
             },
         ],
@@ -1043,4 +1035,251 @@ async fn an_empty_catalog_answers_200_with_an_empty_list() {
         locations.is_empty(),
         "an empty catalog answers an empty list, got {locations:?}"
     );
+}
+
+/// The ladder FAMILY and the tier number a `BillingMode` names: `FlatRateTier3` is
+/// tier 3 of the per-port flat-rate ladder, `PortPairFlatRateTier1` tier 1 of the
+/// port-pair one — `BillingMode` carries five of each beside the usage-based mode
+/// (`smithy_query(query="shape",shape="BillingMode")`). `None` for a mode that is no
+/// tier, which is the usage-based one.
+fn tier_of(billing_mode: &str) -> Option<(&'static str, u64)> {
+    for (family, prefix) in [
+        ("port-pair flat-rate", "PortPairFlatRateTier"),
+        ("flat-rate", "FlatRateTier"),
+    ] {
+        if let Some(number) = billing_mode.strip_prefix(prefix) {
+            return number.parse().ok().map(|number| (family, number));
+        }
+    }
+    None
+}
+
+/// The ladders one answered `Location` publishes: per family, each tier it publishes
+/// in published order, with the Regions that tier's fee includes.
+fn ladders_of(location: &Value) -> BTreeMap<&'static str, Vec<(u64, Vec<String>)>> {
+    let mut ladders: BTreeMap<&'static str, Vec<(u64, Vec<String>)>> = BTreeMap::new();
+    for mode in location["availableBillingModes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some((family, number)) = tier_of(mode["billingMode"].as_str().unwrap_or_default())
+        else {
+            continue;
+        };
+        let included: Vec<String> = mode["includedRegions"]
+            .as_array()
+            .map(|regions| {
+                regions
+                    .iter()
+                    .map(|region| region.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ladders.entry(family).or_default().push((number, included));
+    }
+    ladders
+}
+
+#[tokio::test]
+async fn a_flat_rate_ladder_publishes_disjoint_bands_at_every_location() {
+    // The rule under test, over EVERY location of EVERY Region the catalog holds: a
+    // flat-rate tier is a distance band, so one ladder's tiers come in ascending order
+    // and each names only the Regions its OWN fee covers — a Region a nearer tier
+    // covers is never named again further up, which is what a tier built as "the tier
+    // below plus these" would do.
+    let catalog = built_in_location_catalog();
+    let regions: BTreeSet<&str> = catalog
+        .iter()
+        .map(|location| location.region.as_str())
+        .collect();
+
+    let mut deepest_ladder = 0_usize;
+    let mut ladder_families: BTreeSet<&'static str> = BTreeSet::new();
+
+    for region in regions {
+        let dx = Emulator::in_region(region);
+        let (status, locations) = describe_locations(&dx).await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: expected 200, got {status} with {locations:?}"
+        );
+
+        for location in &locations {
+            let code = location["locationCode"].as_str().unwrap_or_default();
+            for (family, tiers) in ladders_of(location) {
+                let case = format!("{code} {family}");
+                ladder_families.insert(family);
+                deepest_ladder = deepest_ladder.max(tiers.len());
+
+                let published: Vec<u64> = tiers.iter().map(|(number, _)| *number).collect();
+                let mut ascending = published.clone();
+                ascending.sort_unstable();
+                ascending.dedup();
+                assert_eq!(
+                    published, ascending,
+                    "case {case:?}: a ladder publishes each of its tiers once, in ascending order, got {published:?}"
+                );
+
+                // Every Region covered so far, with the tier whose fee covers it: a
+                // second tier naming it is the nesting this rule forbids.
+                let mut covered: BTreeMap<String, u64> = BTreeMap::new();
+                for (number, included) in &tiers {
+                    assert!(
+                        !included.is_empty(),
+                        "case {case:?}: tier {number} publishes the Regions its fee covers, got {included:?}"
+                    );
+                    for named in included {
+                        let already = covered.insert(named.clone(), *number);
+                        assert!(
+                            already.is_none(),
+                            "case {case:?}: tier {number} names {named:?}, which tier {already:?} already covers — each tier is its own band, not the tier below with more Regions added"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Both would be vacuous if the catalog published no ladder deep enough for a band
+    // to be able to repeat a nearer one.
+    assert!(
+        deepest_ladder >= 3,
+        "the catalog must publish a ladder of at least three tiers for disjointness to be observable, got {deepest_ladder}"
+    );
+    assert!(
+        ladder_families.contains("flat-rate") && ladder_families.contains("port-pair flat-rate"),
+        "the catalog must publish both ladder families, got {ladder_families:?}"
+    );
+}
+
+#[tokio::test]
+async fn each_region_a_published_fee_covers_is_named_by_one_tier() {
+    // Source: the recorded `DescribeLocations` response for `us-west-2` — the
+    // five-tier ladder its whole-building location publishes, whose tiers are the
+    // distance bands written in the service's `published_locations` module.
+    //
+    // The rows span the ladder: the nearest band, the trans-Atlantic band that also
+    // covers the location's own Region, the band reaching the rest of Europe, Canada,
+    // South America and the nearer Asia Pacific, the band reaching South Asia, Africa
+    // and Oceania, and the farthest band — including the newer Regions a ladder built
+    // by accumulation over a short roster leaves in no tier at all.
+    let dx = Emulator::in_region("us-west-2");
+    let (status, locations) = describe_locations(&dx).await;
+    assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
+
+    let five_tier = built_in_location_catalog()
+        .into_iter()
+        .find(|location| location.region == "us-west-2" && location.flat_rate_modes.len() == 5)
+        .expect("the catalog publishes a five-tier ladder in this Region");
+    let modes = billing_modes_of(&locations, &five_tier.location_code);
+
+    let tiers_naming = |region: &str| -> Vec<String> {
+        modes
+            .iter()
+            .filter(|mode| {
+                mode["includedRegions"]
+                    .as_array()
+                    .is_some_and(|included| included.iter().any(|named| named == &json!(region)))
+            })
+            .map(|mode| mode["billingMode"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // (case, the Region, the one tier whose fee covers it)
+    let rows: &[(&str, &str, &str)] = &[
+        ("the nearest Region", "us-west-1", "FlatRateTier1"),
+        ("the location's own Region", "us-west-2", "FlatRateTier2"),
+        ("across the Atlantic", "eu-west-1", "FlatRateTier2"),
+        ("the other side of this continent", "us-east-1", "FlatRateTier2"),
+        ("the rest of Europe", "eu-west-3", "FlatRateTier3"),
+        ("the nearer Asia Pacific", "ap-southeast-1", "FlatRateTier3"),
+        ("a newer Canadian Region", "ca-west-1", "FlatRateTier3"),
+        ("South America", "sa-east-1", "FlatRateTier3"),
+        ("South Asia", "ap-south-1", "FlatRateTier4"),
+        ("Africa", "af-south-1", "FlatRateTier4"),
+        ("Oceania", "ap-southeast-2", "FlatRateTier4"),
+        ("a newer Region in Israel", "il-central-1", "FlatRateTier4"),
+        ("a newer Region in Mexico", "mx-central-1", "FlatRateTier4"),
+        ("the Middle East", "me-central-1", "FlatRateTier5"),
+        ("the farthest Asia Pacific", "ap-east-2", "FlatRateTier5"),
+    ];
+
+    for (case, region, expected) in rows {
+        let answered = tiers_naming(region);
+        assert_eq!(
+            answered,
+            vec![(*expected).to_string()],
+            "case {case:?}: {region} is covered by {expected} and by no other tier, got {answered:?}"
+        );
+    }
+
+    // A Region no published fee covers is named by no tier, rather than falling into
+    // the widest one because that tier was written as "every Region the catalog knows".
+    for case in ["us-gov-west-1", "cn-north-1"] {
+        let answered = tiers_naming(case);
+        assert!(
+            answered.is_empty(),
+            "case {case:?}: a Region no published fee covers is named by no tier, got {answered:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_shorter_ladder_publishes_the_nearer_bands_unchanged() {
+    // The tier-to-Region mapping is the Region's published data, not each location's:
+    // a location offering fewer tiers publishes the nearer bands exactly as the
+    // five-tier location does, and publishes nothing past its own last tier.
+    let catalog = built_in_location_catalog();
+    let ladder_of = |depth: usize| {
+        catalog
+            .iter()
+            .find(|location| location.region == "us-west-2" && location.flat_rate_modes.len() == depth)
+            .map(|location| location.location_code.clone())
+            .unwrap_or_else(|| panic!("the catalog publishes a {depth}-tier ladder in this Region"))
+    };
+    let short = ladder_of(3);
+    let full = ladder_of(5);
+
+    let dx = Emulator::in_region("us-west-2");
+    let (status, locations) = describe_locations(&dx).await;
+    assert_eq!(status, 200, "expected 200, got {status} with {locations:?}");
+
+    let band = |code: &str, tier: &str| -> Value {
+        billing_modes_of(&locations, code)
+            .into_iter()
+            .find(|mode| mode["billingMode"] == json!(tier))
+            .map(|mode| mode["includedRegions"].clone())
+            .unwrap_or(Value::Null)
+    };
+
+    for case in ["FlatRateTier1", "FlatRateTier2", "FlatRateTier3"] {
+        assert_ne!(
+            band(&short, case),
+            Value::Null,
+            "case {case:?}: the shorter ladder publishes this tier, got {:?}",
+            band(&short, case)
+        );
+        assert_eq!(
+            band(&short, case),
+            band(&full, case),
+            "case {case:?}: both locations publish one Region's band, got {:?} and {:?}",
+            band(&short, case),
+            band(&full, case)
+        );
+    }
+    for case in ["FlatRateTier4", "FlatRateTier5"] {
+        assert_eq!(
+            band(&short, case),
+            Value::Null,
+            "case {case:?}: the shorter ladder stops at its own last tier, got {:?}",
+            band(&short, case)
+        );
+        assert_ne!(
+            band(&full, case),
+            Value::Null,
+            "case {case:?}: the five-tier ladder publishes this tier, got {:?}",
+            band(&full, case)
+        );
+    }
 }

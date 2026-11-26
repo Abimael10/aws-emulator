@@ -22,14 +22,23 @@
 //! ([`published_providers`]) are all rendered from the row's own speeds and partner
 //! membership.
 //!
+//! A flat-rate ladder is written as DISJOINT bands, never as an accumulation. A
+//! flat-rate tier is a distance band: its fee covers the Regions THAT tier names, and
+//! a Region a nearer tier already covers is not named again further up, so tier N+1
+//! names the Regions that are farther out rather than tier N's list with more names
+//! added. Writing a tier as "the tier below plus these" both repeats Regions a lower
+//! fee covers and leaves every Region outside the writer's roster named by no tier at
+//! all, which is why each tier below carries its own band and nothing is derived from
+//! the tier under it.
+//!
 //! WHICH rows are recorded: the `us-west-2` elements this emulator has a recorded
 //! `DescribeLocations` response for — the Seattle carrier hotel's two demarcations and
 //! the Las Vegas building, with their codes, names, speeds, partner rosters and (for
-//! the Las Vegas building) the first two flat-rate tiers' `includedRegions`. Every
-//! other row, and the wider tiers of every ladder, is CATALOGUED: written from the
-//! public location and delivery-partner lists under the same published shape, so a
-//! later fixer holding a recording for one of them should refine that row rather than
-//! read it as a recorded fact.
+//! the Las Vegas building) all five flat-rate tiers' `includedRegions`. Every other
+//! row, and every other Region's ladder, is CATALOGUED: written from the public
+//! location and delivery-partner lists under the same published shape, so a later
+//! fixer holding a recording for one of them should refine that row rather than read
+//! it as a recorded fact.
 //!
 //! The rows deliberately span the class: locations published for a whole building and
 //! for one partner's demarcation in it, port-speed sets with and without 100G and
@@ -127,7 +136,7 @@ const SUPERNAP_8_PROVIDERS: ProviderPresence = &[
     "XO Communications",
 ];
 
-/// `us-west-2`, tier 1: recorded.
+/// `us-west-2`, tier 1: recorded — the nearest band, one Region wide.
 const US_WEST_2_TIER_1: CatalogFlatRateMode = CatalogFlatRateMode {
     billing_mode: "FlatRateTier1",
     included_regions: &["us-west-1"],
@@ -136,73 +145,71 @@ const US_WEST_2_TIER_1: CatalogFlatRateMode = CatalogFlatRateMode {
 /// `us-west-2`, tier 2: recorded. A tier's Regions are published in the catalog's own
 /// order and include the location's OWN Region as well as one across the Atlantic,
 /// which is why a tier's list is written rather than walked out of a Region geography.
+/// It names no Region tier 1 covers, because the two fees cover different Regions.
 const US_WEST_2_TIER_2: CatalogFlatRateMode = CatalogFlatRateMode {
     billing_mode: "FlatRateTier2",
     included_regions: &["us-east-2", "eu-west-1", "us-east-1", "us-west-2"],
 };
 
-/// `us-west-2`, tier 3: catalogued — the tier-2 group with Canada and the rest of
-/// Europe.
+/// `us-west-2`, tier 3: recorded — the band reaching the rest of Canada, Europe,
+/// South America and the nearer Asia Pacific.
+///
+/// Its own band, not tier 2's with more Regions added: no Region tier 1 or tier 2
+/// covers is named again here.
 const US_WEST_2_TIER_3: CatalogFlatRateMode = CatalogFlatRateMode {
     billing_mode: "FlatRateTier3",
     included_regions: &[
-        "us-east-2",
-        "eu-west-1",
-        "us-east-1",
-        "us-west-2",
-        "us-west-1",
-        "ca-central-1",
-        "eu-west-2",
-        "eu-central-1",
         "eu-north-1",
+        "eu-west-3",
+        "eu-central-1",
+        "sa-east-1",
+        "ap-northeast-3",
+        "eu-west-2",
+        "eu-south-1",
+        "ap-northeast-1",
+        "ap-southeast-1",
+        "ca-central-1",
+        "ca-west-1",
+        "eu-south-2",
+        "eu-central-2",
     ],
 };
 
-/// `us-west-2`, tier 4: catalogued — the tier-3 group with Asia Pacific.
+/// `us-west-2`, tier 4: recorded — the band reaching South Asia, Africa, the rest of
+/// East Asia and Oceania, the Middle East's Israel Region and Mexico.
+///
+/// Disjoint from every nearer tier, which is what makes the Asia Pacific Regions tier
+/// 3 does not name land here rather than being repeated from it.
 const US_WEST_2_TIER_4: CatalogFlatRateMode = CatalogFlatRateMode {
     billing_mode: "FlatRateTier4",
     included_regions: &[
-        "us-east-2",
-        "eu-west-1",
-        "us-east-1",
-        "us-west-2",
-        "us-west-1",
-        "ca-central-1",
-        "eu-west-2",
-        "eu-central-1",
-        "eu-north-1",
-        "ap-northeast-1",
-        "ap-northeast-2",
-        "ap-southeast-1",
-        "ap-southeast-2",
         "ap-south-1",
+        "af-south-1",
+        "ap-east-1",
+        "ap-south-2",
+        "ap-northeast-2",
+        "ap-southeast-4",
+        "mx-central-1",
+        "ap-southeast-2",
+        "il-central-1",
     ],
 };
 
-/// `us-west-2`, tier 5: catalogued — every commercial Region the catalog knows.
+/// `us-west-2`, tier 5: recorded — the farthest band, the Regions no nearer tier's
+/// fee covers.
+///
+/// The widest fee is still a band and not a catalog of every Region: it names the
+/// Regions left over once tiers 1 to 4 have taken theirs.
 const US_WEST_2_TIER_5: CatalogFlatRateMode = CatalogFlatRateMode {
     billing_mode: "FlatRateTier5",
     included_regions: &[
-        "us-east-2",
-        "eu-west-1",
-        "us-east-1",
-        "us-west-2",
-        "us-west-1",
-        "ca-central-1",
-        "eu-west-2",
-        "eu-central-1",
-        "eu-north-1",
-        "ap-northeast-1",
-        "ap-northeast-2",
-        "ap-northeast-3",
-        "ap-southeast-1",
-        "ap-southeast-2",
-        "ap-south-1",
-        "ap-east-1",
-        "sa-east-1",
+        "ap-southeast-6",
         "me-south-1",
-        "af-south-1",
-        "eu-south-1",
+        "ap-southeast-7",
+        "ap-southeast-3",
+        "me-central-1",
+        "ap-southeast-5",
+        "ap-east-2",
     ],
 };
 
