@@ -177,9 +177,9 @@ async fn a_viewer_dialling_the_published_domain_delivers_a_record_through_each_p
     }
     awaited_deployment(&router, "dialled-realtime-logs", &subject.id).await;
 
-    // The name the distribution published is the DNS name CloudFront assigns one, and the
-    // address below is where a viewer handed that name dials it — which is what makes the
-    // dialled requests the thing a viewer does.
+    // The name the distribution published is the address this emulator answers for it, which
+    // is where a viewer handed that name dials — so the dialled requests below are the thing a
+    // viewer does.
     assert!(
         is_published_edge_address(&subject.domain),
         "expected an address this emulator answers on (host:port), \

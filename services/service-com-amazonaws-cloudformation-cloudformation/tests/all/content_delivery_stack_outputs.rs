@@ -317,7 +317,7 @@ fn cases() -> Vec<Case> {
                 ),
                 (
                     "DistributionUrl",
-                    form("https://<the published name>/index.html", |value| {
+                    form("https://<the published address>/index.html", |value| {
                         value
                             .strip_prefix("https://")
                             .and_then(|rest| rest.strip_suffix("/index.html"))

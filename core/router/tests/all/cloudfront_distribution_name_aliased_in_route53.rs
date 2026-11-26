@@ -3,20 +3,24 @@
 //! The ROUTE 53 ALIAS a client points at a CloudFront distribution, over the name that
 //! distribution published.
 //!
-//! RULE: **`Distribution$DomainName` is "the distribution's CloudFront domain name. For
-//! example: `d111111abcdef8.cloudfront.net`" — the DNS name CloudFront assigns, labels and
-//! nothing else — so an alias record set whose `AliasTarget` is `{HostedZoneId:
-//! Z2FDTNDATAQYW2, DNSName: <that name>}` lies inside the zone that id names and
-//! `ChangeResourceRecordSets` ACCEPTS it, while a target that does NOT lie in that zone is
-//! refused `InvalidChangeBatch`; and the emulator ANSWERS on the name it published, so a
-//! viewer that states it is served by that distribution's edge.**
+//! RULE: **`Distribution$DomainName` is "the domain name that CloudFront assigns when you
+//! create a distribution" — in this emulator the address it ANSWERS for that distribution at,
+//! a `host:port` a client on this machine can dial — so an alias record set whose
+//! `AliasTarget` is `{HostedZoneId: Z2FDTNDATAQYW2, DNSName: <that value>}` names an endpoint
+//! of the zone that id names and `ChangeResourceRecordSets` ACCEPTS it, while a target that
+//! does NOT lie in that zone is refused `InvalidChangeBatch`; and the emulator ANSWERS on the
+//! value it published, so a viewer that states it is served by that distribution's edge.**
 //!
 //! `AliasTarget$HostedZoneId` fixes the id — "CloudFront distribution: Specify
 //! `Z2FDTNDATAQYW2`" — and `AliasTarget$DNSName` the value that goes with it: for a
 //! "CloudFront distribution" you "Specify the domain name that CloudFront assigned when you
 //! created your distribution". The alias is the documented way to point a customer domain at
 //! a distribution, so a published value Route 53 cannot accept as a target makes that whole
-//! workflow unreachable — which is the failure this suite pins.
+//! workflow unreachable — which is the failure this suite pins. The ACCEPTANCE and the
+//! control row below are one rule, not an exception: a resource's endpoint in this emulator is
+//! published as the address a client dials, so a target that names an ADDRESS names an endpoint
+//! of the zone the id fixes and lies within it, while an ordinary NAME is still held to that
+//! zone's own domain — which is why `cdn.example.net` under the same id is refused.
 //!
 //! The rows span what the rule generalises over: the record TYPE an alias to a distribution
 //! may carry (`A` and `AAAA`), the OPERATION that minted the distribution
