@@ -2112,10 +2112,13 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-redshift-serverless-3",
         name: "Redshift Serverless workgroups should prohibit public access",
         // The implementing Security Hub control's own published text: what the control
-        // checks, followed by the condition under which it fails.
-        description: "This control checks whether an Amazon Redshift Serverless \
-                      workgroup is publicly accessible. The control fails if the \
-                      workgroup is publicly accessible.",
+        // checks, the configuration property it evaluates, and the value of that
+        // property under which it fails.
+        description: "This control checks whether public access is disabled for an \
+                      Amazon Redshift Serverless workgroup. It evaluates the \
+                      publiclyAccessible property of a Redshift Serverless workgroup. \
+                      The control fails if public access is enabled (true) for the \
+                      workgroup.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: SECURITY_HUB_CONTROL,

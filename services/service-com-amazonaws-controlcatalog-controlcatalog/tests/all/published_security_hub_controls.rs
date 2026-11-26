@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+use service_com_amazonaws_controlcatalog_controlcatalog::state::ComAmazonawsControlcatalogControlcatalogState as Catalog;
 
 use crate::control_catalog::{catalog_arn, drain, strings, Emulator};
 
@@ -208,9 +209,11 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         identifier: "1ks6hwrtiiia8t2djn1iys62x",
         implementation_identifier: "RedshiftServerless.3",
         name: "Redshift Serverless workgroups should prohibit public access",
-        description: "This control checks whether an Amazon Redshift Serverless \
-                      workgroup is publicly accessible. The control fails if the \
-                      workgroup is publicly accessible.",
+        description: "This control checks whether public access is disabled for an \
+                      Amazon Redshift Serverless workgroup. It evaluates the \
+                      publiclyAccessible property of a Redshift Serverless workgroup. \
+                      The control fails if public access is enabled (true) for the \
+                      workgroup.",
         severity: "HIGH",
         parameter_requirement_summary: "NONE",
         release_time: 1_765_929_600,
@@ -764,4 +767,92 @@ async fn a_controls_published_description_is_served_byte_for_byte() {
         "case text form: the table must span a published description carrying a \
          parenthesised service-name expansion"
     );
+    assert!(
+        PUBLISHED_SECURITY_HUB_CONTROLS
+            .iter()
+            .any(|row| sentences(row.description) > 2),
+        "case text form: the table must span a published description that states the \
+         check, the configuration property it evaluates and its failing value in \
+         separate sentences"
+    );
+}
+
+/// Every control's `Description` is the published text the catalog STORES for it, handed
+/// to the caller unchanged.
+///
+/// The rule above pins the published sentence each recorded control carries; this one
+/// pins the path that text travels. `ListControls` projects the stored catalog record and
+/// `GetControl` reports it, so for EVERY control the catalog holds — not only the rows of
+/// the table above — the text on the wire is the stored string byte for byte, whichever
+/// page size or implementation filter the client read it with. The stored string is
+/// itself published prose rather than a composed one: it carries no leading or trailing
+/// space, no run of spaces, and no line break or tab left behind by the text it was
+/// written from.
+#[tokio::test]
+async fn every_controls_description_is_the_stored_published_text() {
+    let catalog = Catalog::default();
+    assert!(
+        catalog.controls.len() > PUBLISHED_SECURITY_HUB_CONTROLS.len(),
+        "the catalog must hold more controls than the table above for this rule to be \
+         tested over the whole catalogue, holds {}",
+        catalog.controls.len()
+    );
+
+    let emulator = Emulator::new();
+
+    // Whatever a client narrowed or paged the listing by, each control it served carries
+    // the stored published text.
+    for body in requests() {
+        for page_size in PAGE_SIZES {
+            for (arn, served) in listed_by_arn(&emulator, page_size, &body).await {
+                let case = format!("{arn} maxResults={page_size:?} {body}");
+                let stored = catalog
+                    .controls
+                    .get(&arn)
+                    .unwrap_or_else(|| panic!("case {case}: the catalog must store {arn}"));
+                assert_eq!(
+                    served["Description"].as_str(),
+                    Some(stored.description.as_str()),
+                    "case {case}: expected the stored published description {:?}, got {:?}",
+                    stored.description,
+                    served["Description"]
+                );
+            }
+        }
+    }
+
+    // And so does every control read by its ARN, for the whole stored catalogue.
+    for (arn, stored) in &catalog.controls {
+        let read_back = emulator
+            .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+            .await;
+        assert_eq!(
+            read_back["Description"].as_str(),
+            Some(stored.description.as_str()),
+            "case {arn}: expected the stored published description {:?}, got {:?}",
+            stored.description,
+            read_back["Description"]
+        );
+
+        let published = stored.description.as_str();
+        assert_eq!(
+            published.trim(),
+            published,
+            "case {arn}: a published description carries no surrounding whitespace, got \
+             {published:?}"
+        );
+        assert!(
+            !published.is_empty(),
+            "case {arn}: expected the catalog's published description, got {published:?}"
+        );
+        assert!(
+            !published.contains("  "),
+            "case {arn}: a published description runs on single spaces, got {published:?}"
+        );
+        assert!(
+            !published.contains('\n') && !published.contains('\t'),
+            "case {arn}: a published description carries no line break or tab, got \
+             {published:?}"
+        );
+    }
 }
