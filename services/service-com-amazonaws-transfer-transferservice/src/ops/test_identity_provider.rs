@@ -14,16 +14,19 @@
 //! HTTP status it answered, its response body and a message saying whether the test
 //! succeeded.
 //!
-//! One of those provider kinds is served INSIDE this emulator: an `AWS_LAMBDA` server's
+//! Two of those provider kinds are served INSIDE this emulator: an `AWS_LAMBDA` server's
 //! `IdentityProviderDetails.Function` names a function the Lambda emulation beside this
-//! service holds, so the authentication request is really made against it over the
-//! in-process callback ([`crate::state::identity_provider`]) and the status that
-//! invocation answered and the payload it returned are what `StatusCode` and `Response`
-//! carry. For a provider endpoint this emulator does NOT serve — an API Gateway REST
-//! endpoint, a directory — no request is made: the answer reports the endpoint the
-//! server is configured with, `StatusCode`'s modelled default — the value for an answer
-//! that carries no HTTP status (`crate::state::IDENTITY_PROVIDER_NO_RESPONSE_STATUS`) —
-//! no `Response`, as the operation documents for a test that got none, and the message
+//! service holds, and an `API_GATEWAY` server's `IdentityProviderDetails.Url` names a
+//! deployed REST API stage the API Gateway emulation beside this service holds whenever the
+//! API is one the client created here. For either, the authentication request is really made
+//! over the in-process callback ([`crate::state::identity_provider`]) and the status that
+//! invocation answered and the body it returned are what `StatusCode` and `Response`
+//! carry. For a provider endpoint this emulator does NOT serve — a REST endpoint of an API
+//! no emulation here holds, a directory — no request is answered: the answer reports the
+//! endpoint the server is configured with, `StatusCode`'s modelled default — the value for
+//! an answer that carries no HTTP status
+//! (`crate::state::IDENTITY_PROVIDER_NO_RESPONSE_STATUS`) — no `Response`, as the operation
+//! documents for a test that got none, and the message
 //! `crate::state::identity_provider_test_message` decides from the stored
 //! configuration. Nothing here claims an outcome for a request nothing sent.
 //!
@@ -246,8 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation reports is the OUTCOME of an authentication request against it. The
         // request is made wherever the provider is one this emulator serves — an
         // `AWS_LAMBDA` server's function is held by the Lambda emulation beside this
-        // service — and then the status it answered and the body it returned are the
-        // answer (`crate::state::identity_provider`).
+        // service, an `API_GATEWAY` server's endpoint by the API Gateway emulation — and
+        // then the status it answered and the body it returned are the answer
+        // (`crate::state::identity_provider`).
         let answered = st::identity_provider::authenticate(
             ctx,
             &st::request_region(ctx.parts()),

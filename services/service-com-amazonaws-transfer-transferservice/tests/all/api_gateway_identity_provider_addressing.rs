@@ -24,6 +24,14 @@
 //! API, every stage/method/path of it, every method and path of one stage, or the very
 //! method and path — which is the second rule asserted below.
 //!
+//! `UpdateServer` reads the grant against the same invoke resource, so the forms that verify
+//! a create verify an update, and the ones that do not leave the stored provider alone.
+//!
+//! The last section drives the INVOCATION itself, with the API Gateway emulation mounted
+//! beside this service: a server whose `Url` names a deployed stage that emulation serves has
+//! the authentication request really made against it, and the answer reports that
+//! invocation's own HTTP status and response body.
+//!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`].
 
@@ -583,6 +591,477 @@ async fn an_update_reads_a_grant_against_the_same_invoke_resource() {
                 json!("SERVICE_MANAGED"),
                 "case {case:?}: a refused update must leave the stored provider alone, got {}",
                 described.body
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The AUTHENTICATION REQUEST itself: an `API_GATEWAY` provider whose endpoint this
+// emulator's own API Gateway emulation serves
+// ---------------------------------------------------------------------------
+
+/// `StatusCode`'s modelled default (`@default(0)`): the value an answer carries when there is
+/// no HTTP status from a provider to report.
+const NO_RESPONSE_STATUS: i64 = 0;
+
+/// The media type the authentication answer is served in, which is the key of the mapping
+/// template a row's endpoint renders its body from.
+const APPLICATION_JSON: &str = "application/json";
+
+/// An API Gateway client over this emulator's own in-process callback — the very seam the
+/// transfer handler invokes a provider's endpoint over, so an API a row deploys through it is
+/// the one that handler reaches.
+fn api_gateway(emulator: &Emulator) -> aws_sdk_apigateway::Client {
+    let callback = emulator.callback();
+    let config = aws_sdk_apigateway::Config::builder()
+        .behavior_version(aws_sdk_apigateway::config::BehaviorVersion::latest())
+        .region(aws_sdk_apigateway::config::Region::new(REGION))
+        .endpoint_url(format!("https://apigateway.{REGION}.amazonaws.com"))
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        .retry_config(aws_sdk_apigateway::config::retry::RetryConfig::disabled())
+        .timeout_config(aws_sdk_apigateway::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(aws_sdk_apigateway::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            aws_sdk_apigateway::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    aws_sdk_apigateway::Client::from_conf(config)
+}
+
+/// One row of the invocation table: the REST API a row deploys, how its provider `Url`
+/// addresses the deployed stage, what that endpoint answers, and the request the row tests
+/// the provider with.
+struct Invoked {
+    case: &'static str,
+    /// The resource the deployed method serves, as the path parts under the api's root.
+    resource: &'static [&'static str],
+    /// The verb the deployed method is declared with.
+    verb: &'static str,
+    /// The stage the deployment is published into, which is the first path segment of the
+    /// invoke URL.
+    stage: &'static str,
+    /// Whether the provider's `Url` carries the api and the Region in the HOST (the invoke
+    /// URL AWS publishes) rather than in the PATH (the one this emulator publishes).
+    host_form: bool,
+    /// The status the endpoint answers the authentication request with, which its `MOCK`
+    /// integration's request template names.
+    status: u16,
+    /// The body the endpoint answers with, rendered from its integration response template.
+    body: &'static str,
+    /// The `TestIdentityProvider` members beyond `ServerId` and `UserName`.
+    extra: fn() -> Value,
+    /// The `UserName` authenticated, which is one segment of the resource the request reads.
+    user_name: &'static str,
+}
+
+/// Create the REST API a row describes and deploy it, answering the api id it was minted
+/// with.
+///
+/// The shape is the one a client builds for a custom identity provider: one resource serving
+/// the authentication path, a method authorized by IAM on it, a `MOCK` integration whose
+/// request template names the status the endpoint answers, and an integration response for
+/// that status whose `application/json` template is the body it serves.
+async fn deploy_authentication_api(gateway: &aws_sdk_apigateway::Client, row: &Invoked) -> String {
+    let created = gateway
+        .create_rest_api()
+        .name(row.case)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {:?}: CreateRestApi: {error:?}", row.case));
+    let api_id = created
+        .id()
+        .unwrap_or_else(|| panic!("case {:?}: CreateRestApi answered no id", row.case))
+        .to_string();
+
+    let resources = gateway
+        .get_resources()
+        .rest_api_id(&api_id)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {:?}: GetResources: {error:?}", row.case));
+    let mut parent = resources
+        .items()
+        .iter()
+        .find(|item| item.path() == Some("/"))
+        .and_then(|item| item.id())
+        .unwrap_or_else(|| panic!("case {:?}: the api has no root resource", row.case))
+        .to_string();
+    for part in row.resource {
+        let child = gateway
+            .create_resource()
+            .rest_api_id(&api_id)
+            .parent_id(&parent)
+            .path_part(*part)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {:?}: CreateResource({part}): {error:?}", row.case)
+            });
+        parent = child
+            .id()
+            .unwrap_or_else(|| panic!("case {:?}: CreateResource answered no id", row.case))
+            .to_string();
+    }
+
+    gateway
+        .put_method()
+        .rest_api_id(&api_id)
+        .resource_id(&parent)
+        .http_method(row.verb)
+        // The authorization a custom identity provider's method declares: the caller is the
+        // Transfer service, signing as the invocation role.
+        .authorization_type("AWS_IAM")
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {:?}: PutMethod: {error:?}", row.case));
+    gateway
+        .put_integration()
+        .rest_api_id(&api_id)
+        .resource_id(&parent)
+        .http_method(row.verb)
+        .r#type(aws_sdk_apigateway::types::IntegrationType::Mock)
+        .request_templates(
+            APPLICATION_JSON,
+            format!("{{\"statusCode\": {}}}", row.status),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {:?}: PutIntegration: {error:?}", row.case));
+    gateway
+        .put_integration_response()
+        .rest_api_id(&api_id)
+        .resource_id(&parent)
+        .http_method(row.verb)
+        .status_code(row.status.to_string())
+        .response_templates(APPLICATION_JSON, row.body)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {:?}: PutIntegrationResponse: {error:?}", row.case));
+    gateway
+        .create_deployment()
+        .rest_api_id(&api_id)
+        .stage_name(row.stage)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {:?}: CreateDeployment: {error:?}", row.case));
+    api_id
+}
+
+/// The `Url` a row's provider names for the stage it deployed: the invoke URL AWS publishes
+/// for a deployed stage, or the one this emulator publishes for a client that resolves that
+/// host nowhere — both of which name the same stage.
+fn provider_url(row: &Invoked, api_id: &str) -> String {
+    match row.host_form {
+        true => format!(
+            "https://{api_id}.execute-api.{REGION}.amazonaws.com/{}",
+            row.stage
+        ),
+        false => format!(
+            "https://127.0.0.1:9297/_aws/execute-api/{api_id}/{}",
+            row.stage
+        ),
+    }
+}
+
+/// The documented authentication resource of a custom identity provider: Transfer Family's
+/// `GET /servers/{serverId}/users/{username}/config`, as the path parts a client creates
+/// under the api's root. Source: the method request a custom identity provider serves, which
+/// this crate's invocation-role verification is also named after
+/// (`src/state/authorization.rs`).
+const DOCUMENTED_RESOURCE: &[&str] = &["servers", "{serverId}", "users", "{username}", "config"];
+
+/// A resource serving EVERY path of the stage — the greedy proxy a client deploys when one
+/// backend answers the whole API.
+const PROXY_RESOURCE: &[&str] = &["{proxy+}"];
+
+/// The rows: each deploys one API, and they differ along what the rule generalises over — the
+/// resource the endpoint serves the authentication at (the documented tree, a greedy proxy),
+/// the verb the method is declared with, the stage name, the addressing the provider's `Url`
+/// uses, the status the endpoint answers, the body it returns, the user authenticated and
+/// which optional request members are sent.
+const INVOKED_ROWS: &[Invoked] = &[
+    Invoked {
+        case: "the documented authentication resource, read with GET",
+        resource: DOCUMENTED_RESOURCE,
+        verb: "GET",
+        stage: "test",
+        host_form: false,
+        status: 200,
+        body: r#"{"Role":"arn:aws:iam::000000000000:role/idp-mock-role","HomeDirectory":"/one"}"#,
+        extra: || json!({}),
+        user_name: "sim2realuser",
+    },
+    Invoked {
+        case: "a greedy proxy resource serving every path, with ANY",
+        resource: PROXY_RESOURCE,
+        verb: "ANY",
+        stage: "prod",
+        host_form: false,
+        status: 200,
+        body: r#"{"Role":"arn:aws:iam::000000000000:role/idp-proxy-role","HomeDirectory":"/two"}"#,
+        extra: || json!({"UserPassword": "does-not-matter", "ServerProtocol": "SFTP"}),
+        user_name: "other_user",
+    },
+    Invoked {
+        case: "the same proxy, addressed on the invoke host AWS publishes",
+        resource: PROXY_RESOURCE,
+        verb: "ANY",
+        stage: "live",
+        host_form: true,
+        status: 200,
+        body: r#"{"Role":"arn:aws:iam::000000000000:role/idp-host-role","HomeDirectory":"/three"}"#,
+        extra: || json!({"SourceIp": "10.0.0.4", "ServerProtocol": "FTPS"}),
+        user_name: "partner.account",
+    },
+    Invoked {
+        case: "an endpoint that refuses the authentication",
+        resource: PROXY_RESOURCE,
+        verb: "ANY",
+        stage: "test",
+        host_form: false,
+        status: 403,
+        body: r#"{"message":"the provider declined this user"}"#,
+        extra: || json!({"UserPassword": "does-not-matter", "ServerProtocol": "FTP"}),
+        user_name: "declined.user",
+    },
+];
+
+/// RULE: for a server whose `IdentityProviderType` names a provider endpoint this emulator
+/// serves, `TestIdentityProvider` makes the documented authentication request against that
+/// endpoint and reports THAT invocation's outcome — `StatusCode` is the HTTP status the
+/// endpoint answered and `Response` is its response body verbatim — with `Url` the endpoint
+/// the server is configured with.
+#[tokio::test]
+async fn testing_an_api_gateway_provider_reports_what_its_endpoint_answered() {
+    for row in INVOKED_ROWS {
+        let case = row.case;
+        let emulator = Emulator::with_api_gateway();
+        let gateway = api_gateway(&emulator);
+        let api_id = deploy_authentication_api(&gateway, row).await;
+        let url = provider_url(row, &api_id);
+        // The role the provider is invoked as, allowed to invoke that whole API.
+        emulator.seed_role(
+            ROLE_ARN,
+            &allow_invoke(&execute_api(REGION, &format!("{api_id}/*"))),
+        );
+
+        let server_id = emulator
+            .create_server(json!({
+                "Protocols": ["SFTP"],
+                "Domain": "S3",
+                "EndpointType": "PUBLIC",
+                "IdentityProviderType": "API_GATEWAY",
+                "IdentityProviderDetails": {"Url": &url, "InvocationRole": ROLE_ARN},
+            }))
+            .await;
+
+        let mut request = json!({"ServerId": &server_id, "UserName": row.user_name});
+        for (member, value) in (row.extra)()
+            .as_object()
+            .expect("the row's extra members are an object")
+        {
+            request[member] = value.clone();
+        }
+        let answer = emulator.call("TestIdentityProvider", request).await;
+
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected TestIdentityProvider 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.get("StatusCode").as_i64(),
+            Some(i64::from(row.status)),
+            "case {case:?}: expected the status the provider's endpoint answered, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.get("Url").as_str(),
+            Some(url.as_str()),
+            "case {case:?}: expected the endpoint the server names, got {}",
+            answer.body
+        );
+        let response = answer
+            .get("Response")
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the endpoint's own response body, got {}",
+                    answer.body
+                )
+            })
+            .to_string();
+        let returned: Value = serde_json::from_str(&response).unwrap_or_else(|error| {
+            panic!("case {case:?}: expected the endpoint's JSON body, got {error} for {response:?}")
+        });
+        let expected: Value =
+            serde_json::from_str(row.body).expect("the row's own body is a JSON document");
+        assert_eq!(
+            returned, expected,
+            "case {case:?}: expected the body the endpoint serves, got {returned}"
+        );
+    }
+}
+
+/// RULE (the same rule, where no provider answered): an `API_GATEWAY` server whose `Url`
+/// names an endpoint this emulator serves nothing at is answered with the no-response
+/// answer — the modelled default status, no `Response` at all, and a message saying why —
+/// because no status and no body may be reported for a request nothing answered. An endpoint
+/// the API Gateway emulation DOES answer, even to refuse the call, keeps reporting that
+/// answer.
+#[tokio::test]
+async fn an_api_gateway_endpoint_nothing_serves_reports_no_response() {
+    let emulator = Emulator::with_api_gateway();
+    let gateway = api_gateway(&emulator);
+    // One API this emulator really holds, so the rows below differ from it only in WHICH
+    // endpoint they name — not in whether the API Gateway emulation is there at all.
+    let served = deploy_authentication_api(&gateway, &INVOKED_ROWS[0]).await;
+
+    // (case, the Url the provider names)
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "an api id this emulator holds no API for",
+            format!("https://127.0.0.1:9297/_aws/execute-api/{OTHER_API_ID}/test"),
+        ),
+        (
+            "an api id no API has, on the invoke host AWS publishes",
+            format!("https://{OTHER_API_ID}.execute-api.{REGION}.amazonaws.com/test"),
+        ),
+        (
+            "an endpoint outside this emulator altogether",
+            "https://idp.example.invalid/auth".to_string(),
+        ),
+    ];
+
+    for (case, url) in rows {
+        emulator.seed_role(ROLE_ARN, &allow_invoke("*"));
+        let server_id = emulator
+            .create_server(json!({
+                "IdentityProviderType": "API_GATEWAY",
+                "IdentityProviderDetails": {"Url": &url, "InvocationRole": ROLE_ARN},
+            }))
+            .await;
+        let answer = emulator
+            .call(
+                "TestIdentityProvider",
+                json!({"ServerId": &server_id, "UserName": "sim2realuser"}),
+            )
+            .await;
+        assert_eq!(
+            (answer.status, answer.get("StatusCode").as_i64()),
+            (200, Some(NO_RESPONSE_STATUS)),
+            "case {case:?}: expected the no-status answer, got {} with body {}",
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            answer.get("Url").as_str(),
+            Some(url.as_str()),
+            "case {case:?}: expected the endpoint the server names, got {}",
+            answer.body
+        );
+        assert!(
+            answer.get("Response").is_null(),
+            "case {case:?}: expected no Response for a request nothing answered, got {}",
+            answer.body
+        );
+        let message = member_of(&answer.body, "Message")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !message.is_empty() && !message.contains(&server_id) && !message.contains(&url),
+            "case {case:?}: expected a message fixed for the condition, got {message:?}"
+        );
+    }
+
+    // The OTHER side of the same rule: a stage of an API this emulator holds that carries no
+    // deployment is an endpoint the API Gateway emulation answers ITSELF — it refuses the
+    // invoke — so the test reports that refusal's own status and body rather than the
+    // no-response answer, which is reserved for a request nothing answered at all.
+    let case = "a stage of a held API that carries no deployment";
+    let url = format!("https://127.0.0.1:9297/_aws/execute-api/{served}/never-deployed");
+    emulator.seed_role(ROLE_ARN, &allow_invoke("*"));
+    let server_id = emulator
+        .create_server(json!({
+            "IdentityProviderType": "API_GATEWAY",
+            "IdentityProviderDetails": {"Url": &url, "InvocationRole": ROLE_ARN},
+        }))
+        .await;
+    let answer = emulator
+        .call(
+            "TestIdentityProvider",
+            json!({"ServerId": &server_id, "UserName": "sim2realuser"}),
+        )
+        .await;
+    let reported = answer.get("StatusCode").as_i64().unwrap_or_default();
+    assert!(
+        (400..500).contains(&reported),
+        "case {case:?}: expected the status the endpoint refused the invoke with, got {}",
+        answer.body
+    );
+    assert!(
+        answer.get("Response").is_string(),
+        "case {case:?}: expected the endpoint's own refusal body, got {}",
+        answer.body
+    );
+}
+
+/// RULE (the same rule at the request's own members): the authentication request reads the
+/// resource of the SERVER and the USER it is made for, so one endpoint answering every path
+/// is handed each row's own server and user — which is what the provider's body computes its
+/// answer from.
+#[tokio::test]
+async fn the_authentication_request_names_the_server_and_the_user_it_tests() {
+    let emulator = Emulator::with_api_gateway();
+    let gateway = api_gateway(&emulator);
+    // The DOCUMENTED resource tree, which serves `/servers/{serverId}/users/{username}/config`
+    // and nothing else: an endpoint deployed this way answers only a request that really
+    // addresses that path, so what it answers is evidence of the path the handler read.
+    let row = &INVOKED_ROWS[0];
+    let api_id = deploy_authentication_api(&gateway, row).await;
+    let url = provider_url(row, &api_id);
+    emulator.seed_role(
+        ROLE_ARN,
+        &allow_invoke(&execute_api(REGION, &format!("{api_id}/*"))),
+    );
+
+    // Two servers of the SAME provider, and two users on each: every one of the four
+    // authentications addresses its own resource of that one endpoint.
+    let mut servers = Vec::new();
+    for _ in 0..2 {
+        servers.push(
+            emulator
+                .create_server(json!({
+                    "IdentityProviderType": "API_GATEWAY",
+                    "IdentityProviderDetails": {"Url": &url, "InvocationRole": ROLE_ARN},
+                }))
+                .await,
+        );
+    }
+    for server_id in &servers {
+        for user_name in ["sim2realuser", "another.user"] {
+            let case = format!("{server_id} authenticating {user_name}");
+            let answer = emulator
+                .call(
+                    "TestIdentityProvider",
+                    json!({"ServerId": server_id, "UserName": user_name,
+                           "ServerProtocol": "SFTP"}),
+                )
+                .await;
+            assert_eq!(
+                (answer.status, answer.get("StatusCode").as_i64()),
+                (200, Some(i64::from(row.status))),
+                "case {case:?}: expected the status the endpoint answered, got {} with body {}",
+                answer.status,
+                answer.body
+            );
+            assert!(
+                answer.get("Response").is_string(),
+                "case {case:?}: expected the endpoint's own body, got {}",
+                answer.body
             );
         }
     }

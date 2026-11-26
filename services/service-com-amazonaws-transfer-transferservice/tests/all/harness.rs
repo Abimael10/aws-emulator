@@ -141,6 +141,10 @@ pub(crate) enum Peer {
     /// `IdentityProviderDetails.Function` names, and the `Target` of a workflow's
     /// `CUSTOM` step.
     Lambda,
+    /// Amazon API Gateway, which holds the REST APIs this service INVOKES over the
+    /// in-process callback: the identity provider an `API_GATEWAY` server's
+    /// `IdentityProviderDetails.Url` names is a deployed stage of one of them.
+    ApiGateway,
 }
 
 /// One HTTP answer, decoded.
@@ -234,6 +238,14 @@ impl Emulator {
         Self::mounting(&[Peer::Lambda])
     }
 
+    /// One emulator that also mounts Amazon API Gateway: a suite that drives an
+    /// `API_GATEWAY` identity provider needs the real API Gateway emulation beside this
+    /// service, because the endpoint the provider's `Url` names is a deployed stage that
+    /// service serves and the transfer handler invokes it there.
+    pub(crate) fn with_api_gateway() -> Self {
+        Self::mounting(&[Peer::ApiGateway])
+    }
+
     /// One emulator mounting the connector data plane's peers AND Lambda: the connector
     /// delivery reads its secret and moves its bytes through the first two, and the
     /// workflow a delivered file starts invokes its `CUSTOM` step's function through the
@@ -279,6 +291,13 @@ impl Emulator {
                 Peer::Lambda => {
                     router.register_service(
                         service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(
+                            Arc::clone(&engine),
+                        ),
+                    );
+                }
+                Peer::ApiGateway => {
+                    router.register_service(
+                        service_com_amazonaws_apigateway_backplanecontrolservice::EmulatedService::new(
                             Arc::clone(&engine),
                         ),
                     );

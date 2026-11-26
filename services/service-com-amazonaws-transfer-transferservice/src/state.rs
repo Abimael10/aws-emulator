@@ -832,10 +832,10 @@ pub fn not_configured_for_external_auth(server_id: &str) -> InvalidRequestExcept
 ///
 /// `StatusCode` is "the HTTP status code that is the response from your API Gateway or
 /// your Lambda function", and the model gives the member `@default(0)`: the value an
-/// answer carries when there is no such status to report. This emulator opens no
-/// outbound connection and runs no customer identity provider, so no authentication
-/// request is sent and no status comes back — the test reports that default, with
-/// [`identity_provider_test_message`] saying why, and no `Response`, which is what the
+/// answer carries when there is no such status to report. That is the answer for a
+/// provider endpoint this emulator serves nothing at, and for one it serves that never
+/// answered the authentication request — with [`identity_provider_test_message`] or
+/// [`IDENTITY_PROVIDER_NO_ANSWER`] saying which, and no `Response`, which is what the
 /// operation documents for a test that did not get one ("If you provide any incorrect
 /// values for any parameters, the `Response` field is empty").
 pub const IDENTITY_PROVIDER_NO_RESPONSE_STATUS: i32 = 0;
@@ -852,17 +852,18 @@ const IDENTITY_PROVIDER_NAMES_NO_ENDPOINT: &str = "The server's IdentityProvider
      for this test to authenticate against.";
 
 /// `Message` for a test of a server whose identity provider IS named, and is an endpoint
-/// OUTSIDE this emulator: an API Gateway REST endpoint or a directory, both customer-run.
-/// The test got as far as the authentication request itself, which is what this emulator
-/// does not make to an endpoint it does not serve.
+/// this emulator serves nothing at: a REST endpoint of an API no emulation here holds, or
+/// the directory an `AWS_DIRECTORY_SERVICE` server names, which this emulator does not run.
+/// The test got as far as the authentication request itself, which is what reached no
+/// provider.
 const IDENTITY_PROVIDER_NOT_INVOKED: &str = "The stored identity provider \
      configuration is complete, but the authentication request could not be made: this \
      emulator opens no outbound connection and runs no customer identity provider, so \
      the provider returned no response.";
 
 /// `Message` for a test whose authentication request WAS made against a provider this
-/// emulator serves and got no answer back: the function the server names could not be
-/// invoked, or never answered.
+/// emulator serves and got no answer back: the function or the endpoint the server names
+/// could not be invoked, or never answered.
 ///
 /// Fixed for that condition, like every other text here, and it claims no outcome: a
 /// request that was not answered has no status and no body, so the answer carries

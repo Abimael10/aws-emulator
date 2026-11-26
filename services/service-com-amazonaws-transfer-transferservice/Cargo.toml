@@ -112,6 +112,15 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # server's `IdentityProviderDetails.Function` names, and the `Target` of a workflow's
 # CUSTOM step. TEST-ONLY.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# The API Gateway service, mounted beside this one by the suite that drives an API_GATEWAY
+# identity provider: the endpoint such a server's `IdentityProviderDetails.Url` names is a
+# deployed stage that service serves, which is what the handler invokes. TEST-ONLY.
+service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+# Builds that REST API through API Gateway's own wire API — create_rest_api,
+# create_resource, put_method, put_integration, put_integration_response,
+# create_deployment — over the emulator's own in-process transport, so no network client
+# feature is enabled. TEST-ONLY.
+aws-sdk-apigateway = { version = "1", default-features = false }
 # Writes the .zip deployment package those suites create their function from — the form
 # `FunctionCode$ZipFile` carries. TEST-ONLY.
 zip = { version = "9", default-features = false, features = ["deflate"] }

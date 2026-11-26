@@ -9,18 +9,27 @@
 //! is "the response that is returned from your API Gateway or your Lambda function".
 //! So the answer can only be read off an invocation that really happened.
 //!
-//! One of the provider kinds the `IdentityProviderType` enum names IS served inside this
-//! emulator: an `AWS_LAMBDA` server's `IdentityProviderDetails.Function` names a Lambda
-//! function, and the Lambda emulation mounted beside this service holds it. So the
-//! request is made — over the in-process callback, with the documented authentication
-//! event — and the invocation's own HTTP status and response payload are what the
-//! answer carries. Nothing leaves the process: the function is this emulator's own.
+//! Two of the provider kinds the `IdentityProviderType` enum names ARE served inside this
+//! emulator, and for each of them the request is really made:
 //!
-//! The other two provider kinds point OUTSIDE: `API_GATEWAY` at a customer-run REST
-//! endpoint and `AWS_DIRECTORY_SERVICE` at a directory, neither of which this emulator
-//! runs. For those [`authenticate`] answers `None`, and the caller reports the
-//! no-response answer `crate::state::identity_provider_test_message` explains — no
-//! status and no body are invented for a request nothing sent.
+//! * an `AWS_LAMBDA` server's `IdentityProviderDetails.Function` names a Lambda function the
+//!   Lambda emulation mounted beside this service holds, invoked here with the documented
+//!   authentication event; and
+//! * an `API_GATEWAY` server's `IdentityProviderDetails.Url` names a REST endpoint, which is
+//!   a deployed stage of an API the API Gateway emulation beside this service holds whenever
+//!   the API is one the client created here — invoked at the authentication resource a custom
+//!   identity provider serves ([`rest_endpoint`]).
+//!
+//! Either way the invocation's own HTTP status and the body it returned are what the answer
+//! carries, and nothing leaves the process: both endpoints are this emulator's own.
+//!
+//! What is left OUTSIDE is an endpoint this emulator serves nothing at — a REST endpoint of
+//! an API no emulation here holds, and the directory an `AWS_DIRECTORY_SERVICE` server names,
+//! which this emulator does not run. For those [`authenticate`] answers `None`, and the
+//! caller reports the no-response answer `crate::state::identity_provider_test_message`
+//! explains — no status and no body are invented for a request nothing answered.
+
+mod rest_endpoint;
 
 use ::serde_json::{json, Value};
 
@@ -84,13 +93,14 @@ impl ProviderAnswer {
 /// Make the authentication request `request` against the provider `endpoint` names, when
 /// it is one this emulator serves, and answer what it answered.
 ///
-/// `None` for a provider this emulator does not run — every type other than `AWS_LAMBDA`,
-/// and an `AWS_LAMBDA` server whose details name no function at all — so the caller
-/// reports the no-response answer rather than an outcome nothing produced.
+/// `None` for a provider this emulator does not run — a server whose details name no
+/// endpoint at all, a type whose provider nothing here serves, and an endpoint of a kind
+/// this emulator serves that it holds no resource for — so the caller reports the
+/// no-response answer rather than an outcome nothing produced.
 ///
 /// Call it with this service's state lock RELEASED: nothing here reads or writes this
 /// service's state, and holding the lock across the invocation would make every other
-/// request of this service wait on the provider's function.
+/// request of this service wait on the provider's endpoint.
 pub async fn authenticate(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     request_region: &str,
@@ -98,9 +108,32 @@ pub async fn authenticate(
     endpoint: &str,
     request: &AuthenticationRequest<'_>,
 ) -> Option<ProviderAnswer> {
-    if identity_provider_type != st::IDENTITY_PROVIDER_AWS_LAMBDA || endpoint.is_empty() {
+    if endpoint.is_empty() {
         return None;
     }
+    match identity_provider_type {
+        st::IDENTITY_PROVIDER_AWS_LAMBDA => {
+            invoke_function(ctx, request_region, endpoint, request).await
+        }
+        st::IDENTITY_PROVIDER_API_GATEWAY => {
+            rest_endpoint::authenticate(ctx, request_region, endpoint, request).await
+        }
+        // Every other type names a provider this emulator does not run.
+        _ => None,
+    }
+}
+
+/// The authentication request against an `AWS_LAMBDA` provider: the function `endpoint`
+/// names, invoked with the documented authentication event over the in-process callback.
+///
+/// `None` when the invocation could not be made at all, so the caller reports the
+/// no-response answer.
+async fn invoke_function(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    request_region: &str,
+    endpoint: &str,
+    request: &AuthenticationRequest<'_>,
+) -> Option<ProviderAnswer> {
     // The function is addressed in the Region its own ARN names, so a provider in
     // another Region is reached through that Region's Lambda endpoint; an ARN carrying
     // no Region label falls back to the Region the request was signed for.
