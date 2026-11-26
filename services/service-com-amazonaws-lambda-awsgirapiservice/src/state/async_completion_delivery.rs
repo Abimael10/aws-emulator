@@ -804,6 +804,7 @@ mod tests {
             duration: Duration::from_millis(1),
             chunks: Vec::new(),
             stream_failure: None,
+            stopped: None,
         }
     }
 

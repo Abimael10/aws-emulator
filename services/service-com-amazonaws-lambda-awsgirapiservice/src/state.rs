@@ -2248,16 +2248,28 @@ impl DurableExecutionRecord {
     /// A durable execution is the handle on ONE invocation of a durable function, so the
     /// status it ends in is the one that invocation's run produced: a handler that returned
     /// makes the execution [`EXECUTION_STATUS_SUCCEEDED`] carrying the result it returned,
-    /// and a run that failed — a handler that raised, a run its timeout ended, a run this
-    /// emulator could not make at all — makes it [`EXECUTION_STATUS_FAILED`] carrying the
-    /// error that failure is. Nothing here reports a result or an error the run did not
-    /// produce.
+    /// and a run that failed — a handler that raised, a run this emulator could not make at
+    /// all — makes it [`EXECUTION_STATUS_FAILED`] carrying the error that failure is. Nothing
+    /// here reports a result or an error the run did not produce.
+    ///
+    /// A run a bound of TIME ended ([`DurableOutcome::OutOfTime`]) settles an execution that
+    /// still owes its OWN timeout on nothing: `ExecutionTimeout` is "the maximum time (in
+    /// seconds) that a durable execution can run before timing out. This timeout applies to
+    /// the entire durable execution, not individual function invocations", so the execution
+    /// is still RUNNING until that timeout falls due and then ends
+    /// [`EXECUTION_STATUS_TIMED_OUT`] ([`Self::materialize`]) — the status of an execution
+    /// the service itself ended, which is not the `FAILED` of a handler that raised. An
+    /// execution of a function whose configuration names no timeout is ended by that stop
+    /// like any other failure, because nothing else would ever end it.
     ///
     /// An execution already in a terminal status is NOT moved and nothing is appended: a
     /// caller's `StopDurableExecution` and the timeout the clock owed both end it for good,
     /// and the run of a stopped execution cannot re-open it.
     pub fn settle(&mut self, outcome: &DurableOutcome, now: SystemTime) {
         if self.status != EXECUTION_STATUS_RUNNING {
+            return;
+        }
+        if matches!(outcome, DurableOutcome::OutOfTime(_)) && self.timeout_due.is_some() {
             return;
         }
         // The instant the execution ended, at the resolution every report of it shares
@@ -2282,7 +2294,7 @@ impl DurableExecutionRecord {
                 });
                 self.history.push(event);
             }
-            DurableOutcome::Failed(error) => {
+            DurableOutcome::Failed(error) | DurableOutcome::OutOfTime(error) => {
                 self.status = EXECUTION_STATUS_FAILED.to_string();
                 self.error = Some(error.clone());
                 let mut event = self.next_event(EVENT_TYPE_EXECUTION_FAILED, now);
@@ -2443,6 +2455,16 @@ pub enum DurableOutcome {
     Succeeded(Option<String>),
     /// The run did not produce a result: the error it ended on.
     Failed(ErrorObject),
+    /// The run was ended by a bound of TIME rather than by the handler
+    /// ([`execution::Stop::out_of_time`]): the error that stop was reported as.
+    ///
+    /// It is held apart from [`DurableOutcome::Failed`] because the span one invocation of
+    /// the function was given is not the span its EXECUTION has: `ExecutionTimeout` "applies
+    /// to the entire durable execution, not individual function invocations", so an execution
+    /// that still owes that timeout is ended by it — as the `TIMED_OUT` the clock makes due
+    /// ([`DurableExecutionRecord::materialize`]) — and not by one run of its handler running
+    /// out of time.
+    OutOfTime(ErrorObject),
 }
 
 /// What became of a [`FunctionRecord::start_durable_execution`] call.

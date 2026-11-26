@@ -53,6 +53,19 @@ pub enum Stop {
 }
 
 impl Stop {
+    /// Whether this stop is one of TIME: the run was ended because it had taken the span it
+    /// was given ([`Self::Deadline`]) or the host time one run may take
+    /// ([`Self::HostCeiling`]), rather than because of anything the handler computed.
+    ///
+    /// The other bounds are the run's own doing — the traced events it executed, the memory
+    /// it held, the size of the answer it produced — so they say what the run DID. This is
+    /// the reading a caller that has to tell "the span ran out" from "the handler failed"
+    /// makes ([`super::super::durable_run::run_outcome`]).
+    #[must_use]
+    pub fn out_of_time(self) -> bool {
+        matches!(self, Self::Deadline | Self::HostCeiling)
+    }
+
     /// What the stop is reported as, as the reason of the run's failure.
     #[must_use]
     pub fn reason(self) -> &'static str {

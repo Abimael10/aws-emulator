@@ -597,6 +597,29 @@ impl DurableStepJournal {
         }
     }
 
+    /// What is LEFT of the `ExecutionTimeout` of the execution this journal writes to, at
+    /// `now` — and `None` for an execution whose function names no timeout, or that the store
+    /// no longer holds.
+    ///
+    /// `DurableConfig$ExecutionTimeout` is "the maximum time (in seconds) that a durable
+    /// execution can run before timing out. This timeout applies to the entire durable
+    /// execution, not individual function invocations", so this is the span the RUN of that
+    /// execution has ([`super::execution::run_invocation`]): the execution's own timeout
+    /// falls due at one instant ([`DurableExecutionRecord::timeout_due`]) however many spans
+    /// its handler spends inside it, and an execution whose timeout has already fallen due
+    /// has nothing left. Nothing here is written: the span is read off the stored execution.
+    #[must_use]
+    pub fn execution_timeout_left(&self, now: SystemTime) -> Option<Duration> {
+        let store = self.state.lock();
+        let due = store
+            .functions
+            .get(&self.function)?
+            .durable_executions
+            .get(&self.execution)?
+            .timeout_due?;
+        Some(due.duration_since(now).unwrap_or_default())
+    }
+
     /// Answer ONE call the run made about a CALLBACK of the execution it is the run of: the
     /// callback a `wait_for_callback` MINTS, and what that callback has come to while the
     /// handler waits on it ([`super::durable_callbacks`]).

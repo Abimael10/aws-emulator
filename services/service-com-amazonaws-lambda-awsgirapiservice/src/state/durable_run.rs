@@ -17,6 +17,12 @@
 //! ([`super::DurableExecutionRecord::materialize`]) and the stop a caller makes
 //! ([`super::DurableExecutionRecord::stop`]) — and neither of them is re-opened by a run
 //! settling afterwards.
+//!
+//! One outcome is NOT the execution's: a run the platform ended at a bound of TIME. The span
+//! a run is given is one invocation's, and `DurableConfig$ExecutionTimeout` "applies to the
+//! entire durable execution, not individual function invocations", so such a run leaves an
+//! execution that still owes its own timeout RUNNING, to be ended by that timeout as the
+//! `TIMED_OUT` it is.
 
 use super::*;
 
@@ -35,6 +41,12 @@ const ERROR_TYPE_MEMBER: &str = "errorType";
 /// carrying the error the run reported: the `errorType` and `errorMessage` of the error
 /// document the function's own runtime produced, or, for a run this emulator could not make
 /// at all, the reason it could not — with no error type, because no function raised.
+///
+/// A run the PLATFORM ended at a bound of TIME is reported as [`DurableOutcome::OutOfTime`]
+/// rather than as a failure of the handler's: the span a run is given is one invocation's,
+/// and `ExecutionTimeout` "applies to the entire durable execution, not individual function
+/// invocations", so what such a stop does to the execution is the execution's own timeout to
+/// decide ([`super::DurableExecutionRecord::settle`]).
 #[must_use]
 pub fn run_outcome(run: &Result<Invoked, Unrunnable>) -> DurableOutcome {
     let invoked = match run {
@@ -67,11 +79,18 @@ pub fn run_outcome(run: &Result<Invoked, Unrunnable>) -> DurableOutcome {
             .and_then(::serde_json::Value::as_str)
             .map(str::to_string)
     };
-    DurableOutcome::Failed(ErrorObject {
+    let error = ErrorObject {
         error_message: member(ERROR_MESSAGE_MEMBER),
         error_type: member(ERROR_TYPE_MEMBER),
         ..ErrorObject::default()
-    })
+    };
+    if invoked
+        .stopped
+        .is_some_and(super::execution::Stop::out_of_time)
+    {
+        return DurableOutcome::OutOfTime(error);
+    }
+    DurableOutcome::Failed(error)
 }
 
 /// Settle the durable execution `name` of `function` on `outcome`, if the store still holds
@@ -96,7 +115,8 @@ pub fn settle(
     };
     // Whatever the clock ALREADY owed is applied first, so a run that finishes after its
     // execution's `ExecutionTimeout` fell due does not overwrite the timeout that was owed
-    // at that earlier instant.
+    // at that earlier instant, and a run a bound of time ended just before that instant
+    // leaves the execution to the timeout it still owes ([`DurableOutcome::OutOfTime`]).
     execution.materialize(now);
     execution.settle(outcome, now);
 }

@@ -863,6 +863,16 @@ pub struct Invoked {
     /// Absent for every other run, where the payload IS the document; see
     /// [`Invoked::error_document`].
     pub stream_failure: Option<Vec<u8>>,
+    /// WHICH bound the PLATFORM ended this run at, for a run it ended, and `None` for one
+    /// the handler itself completed — one that returned, streamed or raised, whose outcome
+    /// is its own answer rather than a classification of the platform's.
+    ///
+    /// It is the same reading the answer's own `errorType` is rendered from
+    /// ([`stopped_class`]), kept beside the answer because a caller that has to tell a run
+    /// the platform STOPPED from a handler that failed cannot read it back out of the
+    /// document's text: the run of a durable execution is settled on the one or the other
+    /// ([`super::durable_run::run_outcome`]).
+    pub stopped: Option<Stop>,
 }
 
 impl Invoked {
@@ -1199,7 +1209,7 @@ pub async fn run_invocation(
     })?
     .map_err(|error| Unrunnable::Internal(format!("the run memory is gone: {error}")))?;
 
-    let budget = run_budget(
+    let mut budget = run_budget(
         invocation.timeout,
         invocation.memory_size,
         invocation.ephemeral_storage_mb,
@@ -1207,6 +1217,23 @@ pub async fn run_invocation(
         // ([`Invocation::streamed`]).
         invocation.streamed,
     );
+    // The run of a DURABLE EXECUTION is bounded by the EXECUTION's own timeout instead of by
+    // the function's: `DurableConfig$ExecutionTimeout` is "the maximum time (in seconds) that
+    // a durable execution can run before timing out. This timeout applies to the entire
+    // durable execution, not individual function invocations" — and this run IS that whole
+    // execution, because every wait, step and callback its handler takes is spent inside it
+    // ([`durable_sdk_guest`]). So what the run may spend is what is LEFT of that timeout, and
+    // the span one invocation of the function is allowed never ends an execution that still
+    // fits inside its own: an execution that outlives its `ExecutionTimeout` is ended by that
+    // timeout, as the `TIMED_OUT` it owes ([`super::DurableExecutionRecord::materialize`]).
+    // A durable function whose configuration names no timeout bounds its runs by the
+    // function's `Timeout` as every other invocation is bounded.
+    if let Some(left) = durable
+        .as_ref()
+        .and_then(|journal| journal.execution_timeout_left(SystemTime::now()))
+    {
+        budget.wall_clock = left;
+    }
     let heap_bytes = run_heap_bytes(invocation.memory_size);
     let started = SystemTime::now();
     let request_id = invocation.request_id.clone();
@@ -1574,6 +1601,11 @@ fn answered(
                 &failure.stack_trace,
                 engine,
             )),
+            _ => None,
+        },
+        // WHICH bound ended the run, for a run the platform ended at one of them.
+        stopped: match &finished.completion {
+            Completion::Stopped(stop) => Some(*stop),
             _ => None,
         },
     }
@@ -3340,6 +3372,7 @@ mod tests {
                 duration: Duration::ZERO,
                 chunks: Vec::new(),
                 stream_failure: None,
+                stopped: None,
             };
             let decoded = ::base64::Engine::decode(
                 &::base64::engine::general_purpose::STANDARD,
