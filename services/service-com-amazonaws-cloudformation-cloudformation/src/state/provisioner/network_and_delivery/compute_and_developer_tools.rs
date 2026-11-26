@@ -2002,6 +2002,15 @@ pub(crate) struct ApiGatewayV2Child {
     /// content type. Those keys travel EXACTLY as declared, while the values under them are
     /// re-cased like every other member ([`lower_camel_members`]).
     pub(crate) data_keys: &'static [&'static str],
+    /// The properties whose member takes the TEXT of a DOCUMENT a template may declare as
+    /// an object — a model's JSON Schema — rather than a structure of modelled members.
+    /// Such a value travels as its own serialization ([`attribute_text`]), and a value
+    /// declared as text travels exactly as written, because the keys inside the document are
+    /// the declared schema's own and not member names to re-case. This is the same reading
+    /// [`api_gateway_request`] takes of an api's resource policy and of an inline OpenAPI
+    /// definition, so neither API Gateway control plane here can disagree about what a
+    /// declared document is sent as.
+    pub(crate) documents: &'static [&'static str],
     /// Whether the create takes the tags CloudFormation gives the resource: true only where
     /// the type's own property set publishes `Tags`, because CloudFormation propagates no
     /// tags to a resource type that is not taggable.
@@ -2038,6 +2047,9 @@ pub(crate) const APIGATEWAYV2_INTEGRATION_CHILD: ApiGatewayV2Child = ApiGatewayV
     assigned_id: Some(("integrationId", "CreateIntegration")),
     named_by: None,
     data_keys: &["RequestParameters", "RequestTemplates", "ResponseParameters"],
+    // No member of an integration takes the text of a declared document: its templates are
+    // mapping templates, which a declaration states as the text they are.
+    documents: &[],
     taggable: false,
     reported: &[
         "ConnectionId",
@@ -2078,6 +2090,7 @@ pub(crate) const APIGATEWAYV2_ROUTE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child
     assigned_id: Some(("routeId", "CreateRoute")),
     named_by: None,
     data_keys: &["RequestModels", "RequestParameters"],
+    documents: &[],
     taggable: false,
     reported: &[
         "ApiKeyRequired",
@@ -2114,6 +2127,7 @@ pub(crate) const APIGATEWAYV2_STAGE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child
     assigned_id: None,
     named_by: Some("StageName"),
     data_keys: &["RouteSettings", "StageVariables"],
+    documents: &[],
     taggable: true,
     reported: &[
         "AccessLogSettings",
@@ -2147,6 +2161,7 @@ pub(crate) const APIGATEWAYV2_DEPLOYMENT_CHILD: ApiGatewayV2Child = ApiGatewayV2
     assigned_id: Some(("deploymentId", "CreateDeployment")),
     named_by: None,
     data_keys: &[],
+    documents: &[],
     taggable: false,
     // `GetDeployment` reports the deployment's own record — its description and the status
     // of the release — and not the stage a create released it to.
@@ -2170,6 +2185,7 @@ pub(crate) const APIGATEWAYV2_AUTHORIZER_CHILD: ApiGatewayV2Child = ApiGatewayV2
     assigned_id: Some(("authorizerId", "CreateAuthorizer")),
     named_by: None,
     data_keys: &[],
+    documents: &[],
     taggable: false,
     reported: &[
         "AuthorizerCredentialsArn",
@@ -2211,6 +2227,7 @@ pub(crate) const APIGATEWAYV2_INTEGRATION_RESPONSE_CHILD: ApiGatewayV2Child = Ap
     assigned_id: Some(("integrationResponseId", "CreateIntegrationResponse")),
     named_by: None,
     data_keys: &["ResponseParameters", "ResponseTemplates"],
+    documents: &[],
     taggable: false,
     reported: &[
         "ContentHandlingStrategy",
@@ -2241,6 +2258,7 @@ pub(crate) const APIGATEWAYV2_ROUTE_RESPONSE_CHILD: ApiGatewayV2Child = ApiGatew
     assigned_id: Some(("routeResponseId", "CreateRouteResponse")),
     named_by: None,
     data_keys: &["ResponseModels", "ResponseParameters"],
+    documents: &[],
     taggable: false,
     reported: &[
         "ModelSelectionExpression",
@@ -2267,8 +2285,19 @@ pub(crate) const APIGATEWAYV2_MODEL_CHILD: ApiGatewayV2Child = ApiGatewayV2Child
     assigned_id: Some(("modelId", "CreateModel")),
     named_by: None,
     data_keys: &[],
+    // `CreateModel$Schema` is a String carrying "the schema for the model. For
+    // application/json models, this should be JSON schema draft 4 model", while the type's
+    // `Schema` property is a JSON document a template normally writes INLINE as an object:
+    // the declared document travels as its own text, so its own keywords (`$schema`,
+    // `title`, `properties`, and whatever the schema names its own members) reach that
+    // service exactly as declared instead of being read as modelled member names.
+    documents: &["Schema"],
     taggable: false,
-    reported: &["ContentType", "Description", "Name", "Schema"],
+    // The SCHEMA is left out for the reason the Amazon API Gateway model records of the same
+    // property: a declaration states it as a JSON DOCUMENT while the read answers the text
+    // that document was stored as, so a property reported in a different shape would be
+    // evidence of a change nobody made.
+    reported: &["ContentType", "Description", "Name"],
     // `UpdateModel` takes every member of the create but the api that holds the model.
     create_only: &[],
     // API Gateway v2 publishes no call that clears a member of a model.
@@ -2359,9 +2388,10 @@ pub(crate) async fn create_apigatewayv2_child(
 ///
 /// The properties that address the collection are left out — they are the URI — and so is
 /// the name property where CloudFormation decides the name, which is sent as the physical id
-/// the naming rules computed instead. A property named in [`ApiGatewayV2Child::data_keys`]
-/// is a map of the caller's own keys and keeps them; everything else is re-cased all the way
-/// down.
+/// the naming rules computed instead. A property named in [`ApiGatewayV2Child::documents`] is
+/// a document the member takes the TEXT of and travels as that text; one named in
+/// [`ApiGatewayV2Child::data_keys`] is a map of the caller's own keys and keeps them;
+/// everything else is re-cased all the way down.
 pub(crate) fn apigatewayv2_child_request(
     resource: &StoredResource,
     propagated: &[(String, String)],
@@ -2381,7 +2411,9 @@ pub(crate) fn apigatewayv2_child_request(
                 continue;
             }
             let member = lower_initial(property);
-            if child.data_keys.contains(&property.as_str()) {
+            if child.documents.contains(&property.as_str()) {
+                request.insert(member, Value::String(attribute_text(value)));
+            } else if child.data_keys.contains(&property.as_str()) {
                 request.insert(member, apigatewayv2_data_keyed_map(value)?);
             } else {
                 request.insert(member, lower_camel_members(value, 0)?);
@@ -2465,7 +2497,9 @@ pub(crate) async fn update_apigatewayv2_child(
                 return Ok(None);
             }
             let member = lower_initial(property);
-            if child.data_keys.contains(&property.as_str()) {
+            if child.documents.contains(&property.as_str()) {
+                request.insert(member, Value::String(attribute_text(value)));
+            } else if child.data_keys.contains(&property.as_str()) {
                 request.insert(member, apigatewayv2_data_keyed_map(value)?);
             } else {
                 request.insert(member, lower_camel_members(value, 0)?);
