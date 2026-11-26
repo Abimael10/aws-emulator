@@ -398,7 +398,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if detach_from_capacity_reservation {
             record.db_capacity_reservation_identifier = None;
         }
-        let instance_arn = record.arn();
         let db_instance = record.to_wire(
             db_subnet_group.as_ref(),
             db_parameter_group.as_ref(),
@@ -409,13 +408,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bound, because the instance keeps it: a stopped instance refuses a login rather
         // than refusing the connection.
         store.sever_engine_sessions(&key);
-        // The stop happened, so the region's event log records it.
-        store.record_event(
-            &region,
-            crate::state::events::DB_INSTANCE_STOPPED,
-            &identifier,
-            instance_arn,
-        );
+        // The instance is NOT stopped yet — it reports `stopping`, and the clock owes it
+        // `stopped` — so the event that records "DB instance stopped" is written, and
+        // published onto the account's default bus, when that instant comes, by the one clock
+        // that waits it out ([`crate::state::drive_due_lifecycle_events`]), dated when the
+        // instance really stopped. The store is released first, for the reason that module
+        // gives: a target of a matching rule may call back into this service.
+        drop(store);
+        crate::state::drive_due_lifecycle_events(&self.engine, ctx.callback(), &region);
         Ok(StopDBInstanceOutput {
             db_instance: Some(db_instance),
         })

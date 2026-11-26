@@ -261,7 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance `available` above — so a parameter change that was waiting for a reboot
         // is still waiting while the instance is out, and is in force once it is back up
         // ([`crate::state::DbInstanceRecord::restart_engine`], called from the settle).
-        let instance_arn = record.arn();
         let db_instance = record.to_wire(
             db_subnet_group.as_ref(),
             db_parameter_group.as_ref(),
@@ -272,13 +271,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is rolled back with them. The endpoint stays bound — a reboot does not move the
         // address a client reconnects to.
         store.sever_engine_sessions(&key);
-        // The restart happened, so the region's event log records it.
-        store.record_event(
-            &region,
-            crate::state::events::DB_INSTANCE_RESTARTED,
-            &identifier,
-            instance_arn,
-        );
+        // The restart itself has NOT happened yet: the engine's run begins when the
+        // momentary outage is over, which is the instant the clock owes the instance
+        // `available`. So the event that records "DB instance restarted" is written — and
+        // published onto the account's default bus — when that instant comes, by the one
+        // clock that waits it out ([`crate::state::drive_due_lifecycle_events`]), dated when
+        // the restart happened; a consumer on the bus needs no further call of this service
+        // to receive it. The store is released first: the publication reaches EventBridge's
+        // own handler, and a target of a matching rule may call back into this service.
+        drop(store);
+        crate::state::drive_due_lifecycle_events(&self.engine, ctx.callback(), &region);
         Ok(RebootDBInstanceOutput {
             db_instance: Some(db_instance),
         })

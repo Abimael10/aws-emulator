@@ -347,19 +347,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(reservation) = capacity_reservation {
             record.db_capacity_reservation_identifier = Some(reservation);
         }
-        let instance_arn = record.arn();
         let db_instance = record.to_wire(
             db_subnet_group.as_ref(),
             db_parameter_group.as_ref(),
             db_cluster.as_ref(),
         );
-        // The start happened, so the region's event log records it.
-        store.record_event(
-            &region,
-            crate::state::events::DB_INSTANCE_STARTED,
-            &identifier,
-            instance_arn,
-        );
+        // The instance is NOT started yet — it reports `starting`, and the clock owes it
+        // `available` — so the event that records "DB instance started" is written, and
+        // published onto the account's default bus, when that instant comes, by the one clock
+        // that waits it out ([`crate::state::drive_due_lifecycle_events`]), dated when the
+        // instance was really back in service. The store is released first, for the reason
+        // that module gives: a target of a matching rule may call back into this service.
+        drop(store);
+        crate::state::drive_due_lifecycle_events(&self.engine, ctx.callback(), &region);
         Ok(StartDBInstanceOutput {
             db_instance: Some(db_instance),
         })

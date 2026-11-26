@@ -408,6 +408,46 @@ pub struct DbInstanceRecord {
 }
 
 impl DbInstanceRecord {
+    /// The lifecycle change this instance is in the MIDDLE of — the published event it is and
+    /// the instant the clock makes it happen — or `None` for an instance owing no such
+    /// change.
+    ///
+    /// Each row is a transient status the instance is on its way OUT of, and each of their
+    /// events names the state the instance REACHES: the engine is restarted when the reboot's
+    /// momentary outage is over, the instance is stopped when it reports `stopped`, and it is
+    /// started when it is back in service. So the change happens at the due instant — which
+    /// is after the call that ordered it was answered — and is recorded with that instant,
+    /// never with the instant the call was accepted.
+    ///
+    /// The transient statuses NOT here complete no such change: an instance reaching
+    /// `available` out of `creating` or `modifying` was already created or modified by the
+    /// call that stored it, which recorded that change itself.
+    pub(super) fn lifecycle_event_due_at(&self) -> Option<(events::LifecycleEvent, Instant)> {
+        let pending = self.pending_status.as_ref()?;
+        if !matches!(pending.change, PendingChange::Status(_)) {
+            return None;
+        }
+        let completing = match self.status.as_str() {
+            DB_INSTANCE_STATUS_REBOOTING => events::DB_INSTANCE_RESTARTED,
+            DB_INSTANCE_STATUS_STOPPING => events::DB_INSTANCE_STOPPED,
+            DB_INSTANCE_STATUS_STARTING => events::DB_INSTANCE_STARTED,
+            _ => return None,
+        };
+        Some((completing, pending.due_at))
+    }
+
+    /// The lifecycle change a settle at `now` COMPLETES, out of the one
+    /// [`Self::lifecycle_event_due_at`] names: `None` while that change is still to come.
+    ///
+    /// Read BEFORE [`Self::settle`], which is what performs it.
+    pub(super) fn completing_lifecycle_event(
+        &self,
+        now: Instant,
+    ) -> Option<(events::LifecycleEvent, Instant)> {
+        self.lifecycle_event_due_at()
+            .filter(|(_, due_at)| now >= *due_at)
+    }
+
     /// Apply a change whose due instant has passed. Returns whether the record is now
     /// gone — an accepted delete that has run its course — so the caller drops it from
     /// the store.

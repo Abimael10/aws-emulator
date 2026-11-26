@@ -379,6 +379,10 @@ pub use serverless_v1_capacity::*;
 // `MaxAllocatedStorage` the storage its engine is using makes due.
 pub mod storage_autoscaling;
 pub use storage_autoscaling::StorageAutoscalingClock;
+// The clock that materialises a lifecycle change this service answered BEFORE performing it,
+// and publishes the event that change records.
+pub mod lifecycle_event_clock;
+pub use lifecycle_event_clock::{drive_due_lifecycle_events, LifecycleEventClock};
 // The weekly maintenance window both resource kinds keep: the form it is STORED in, and
 // when its next occurrence begins.
 pub mod maintenance_window;
@@ -834,6 +838,14 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// bound it; [`Self::settle_storage_autoscaling`] drops the entries of the instances this
     /// store no longer holds.
     pub storage_autoscaling: BTreeMap<RegionalKey, StorageAutoscalingClock>,
+    /// The one in-process clock per Region that materialises the lifecycle changes this
+    /// service answered BEFORE performing them, and publishes the events they record
+    /// ([`lifecycle_event_clock`]).
+    ///
+    /// At most one entry per Region, so [`MAX_REGIONS`] bounds it; an entry is taken by the
+    /// clock it belongs to as soon as that Region owes no such change, and the task it holds
+    /// is aborted when a later clock replaces it.
+    pub lifecycle_event_clocks: BTreeMap<String, LifecycleEventClock>,
 }
 
 impl ComAmazonawsRdsAmazonrdsv19State {
@@ -874,6 +886,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         // A rename the clock made due in the maintenance window moves the record to a new
         // key, so those keys are collected here too and the records moved below.
         let mut renamed: Vec<(RegionalKey, RegionalKey)> = Vec::new();
+        // The lifecycle changes these settles COMPLETE — a restart, a stop, a start — each
+        // with the instance it happened to and the instant the clock made it due. Collected
+        // here because the region's event log is another field of this store, and recorded
+        // below once the range no longer borrows the map.
+        let mut completed: Vec<(String, String, LifecycleEvent, Instant)> = Vec::new();
         for (key, instance) in self
             .db_instances
             .range_mut((region.to_string(), String::new())..)
@@ -881,14 +898,28 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             if key.0 != region {
                 break;
             }
+            // Read BEFORE the settle, which is what performs the change: afterwards the
+            // instance reports the status it reached and owes nothing.
+            let completing = instance.completing_lifecycle_event(now);
             if instance.settle(now) {
                 gone.push(key.clone());
-            } else if instance.identifier != key.1 {
+                continue;
+            }
+            if let Some((event, due_at)) = completing {
+                completed.push((instance.identifier.clone(), instance.arn(), event, due_at));
+            }
+            if instance.identifier != key.1 {
                 renamed.push((
                     key.clone(),
                     (region.to_string(), instance.identifier.clone()),
                 ));
             }
+        }
+        // Each change a settle completed is a record of the region's event log — and so a
+        // publication onto the account's default bus — dated when the clock made it DUE
+        // rather than when this settle got round to it, because that is when it happened.
+        for (identifier, arn, event, due_at) in completed {
+            self.record_event_at(region, event, &identifier, arn, wire_timestamp_at(due_at, now));
         }
         for key in gone.drain(..) {
             self.db_instances.remove(&key);
@@ -1196,12 +1227,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// log entry `DescribeEvents` then reports for the change the caller just made.
     ///
     /// Called by the handler that PERFORMED the change, with the store already locked, so
-    /// a record exists only because the service did the thing it records. A region holding
-    /// no log yet opens one only while the store has room for another region, the same gate
-    /// every create passes ([`Self::has_room_for_region`]) — a log cannot outlive that
-    /// bound by being opened from here. That guard cannot drop a record in practice: the
-    /// change being recorded was made to a resource stored in this region, so the region
-    /// already holds records and is already counted.
+    /// a record exists only because the service did the thing it records. Dated NOW, which
+    /// is when that handler made the change; a change the CLOCK completes later is recorded
+    /// through [`Self::record_event_at`] with the instant it was made due instead.
     pub fn record_event(
         &mut self,
         region: &str,
@@ -1209,27 +1237,13 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         source_identifier: &str,
         source_arn: String,
     ) {
-        if !self.events.contains_key(region) && !self.has_room_for_region(region) {
-            return;
-        }
-        let record = self
-            .events
-            .entry(region.to_string())
-            .or_default()
-            .record(event, source_identifier, source_arn);
-        // The same change, queued for the account's default event bus: Amazon RDS publishes
-        // every lifecycle change it records, and the envelope is rendered from the record
-        // just written so the two cannot disagree (see [`bus_events`]).
-        self.pending_bus_events.push(BusEvent::of(region, record));
-        // Past the bound the oldest queued publication goes, exactly as the event log
-        // itself is a ring; a request drains the queue, so this is the pathological case.
-        let over = self
-            .pending_bus_events
-            .len()
-            .saturating_sub(MAX_PENDING_BUS_EVENTS);
-        if over > 0 {
-            self.pending_bus_events.drain(..over);
-        }
+        self.record_event_at(
+            region,
+            event,
+            source_identifier,
+            source_arn,
+            now_as_wire_timestamp(),
+        );
     }
 
     /// Take the publications queued by [`Self::record_event`], leaving the queue empty.

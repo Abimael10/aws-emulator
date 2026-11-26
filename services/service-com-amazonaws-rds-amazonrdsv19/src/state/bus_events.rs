@@ -18,8 +18,11 @@
 //! One envelope per RECORD: [`BusEvent`] is rendered from the [`super::EventRecord`] the
 //! change was written into, so the event a consumer receives and the row `DescribeEvents`
 //! reports are the same record down to its `Date`, and no change can be published that the
-//! log does not hold. A record exists only because a handler performed the change it
-//! records, so a refused call publishes nothing.
+//! log does not hold. A record exists only because this service performed the change it
+//! records — at the instant it performed it, which for a change it answers before performing
+//! (a reboot, a stop, a start) is when the clock makes that transition due rather than when
+//! the call was accepted ([`super::lifecycle_event_clock`]) — so a refused call publishes
+//! nothing.
 //!
 //! Publication is handed over by the ONE seam every request of this front door passes
 //! through (`crate::service::query_error_envelope`), AFTER the response has been rendered
@@ -27,8 +30,11 @@
 //! publication reaches EventBridge's own handler, which matches the event against the
 //! account's rules and delivers it to each of their targets, and a target may call back
 //! into this service; holding the store across it would deadlock the very call the event
-//! came from. EventBridge is reached the way every emulated service reaches another — the
-//! AWS SDK over the framework's in-process callback, through the ONE client construction
+//! came from. The SAME handover is made by the clock that materialises a change this service
+//! answered before performing it ([`super::lifecycle_event_clock`]), which is how the event
+//! of such a change reaches the bus without a further call of this service. EventBridge is
+//! reached the way every emulated service reaches another — the AWS SDK over the framework's
+//! in-process callback, through the ONE client construction
 //! [`service_common::eventbridge_client`] — so nothing here opens a socket, and the only
 //! thing the address is built from is the Region the changed resource lives in, so no part
 //! of a caller's request is a destination.
@@ -220,6 +226,10 @@ pub async fn publish_recorded_events<Eng: ::std::marker::Send + ::std::marker::S
     }
 }
 
+/// The module docs' note on the clock that materialises a change this service answered
+/// before performing it, and publishes what that change records, lives with that clock
+/// ([`super::lifecycle_event_clock`]); every publication still goes through the one drain
+/// above.
 #[cfg(test)]
 mod tests {
     use super::*;

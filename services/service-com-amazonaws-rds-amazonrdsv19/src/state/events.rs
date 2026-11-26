@@ -253,6 +253,49 @@ pub struct EventLog {
     next_sequence: u64,
 }
 
+impl super::ComAmazonawsRdsAmazonrdsv19State {
+    /// Record `event` for the resource `source_identifier` / `source_arn` in `region`,
+    /// timestamped `date` — the instant the change it reports HAPPENED.
+    ///
+    /// A region holding no log yet opens one only while the store has room for another
+    /// region, the same gate every create passes
+    /// ([`super::ComAmazonawsRdsAmazonrdsv19State::has_room_for_region`]) — a log cannot
+    /// outlive that bound by being opened from here. That guard cannot drop a record in
+    /// practice: the change being recorded was made to a resource stored in this region, so
+    /// the region already holds records and is already counted.
+    pub fn record_event_at(
+        &mut self,
+        region: &str,
+        event: LifecycleEvent,
+        source_identifier: &str,
+        source_arn: String,
+        date: ::aws_smithy_types::DateTime,
+    ) {
+        if !self.events.contains_key(region) && !self.has_room_for_region(region) {
+            return;
+        }
+        let record = self
+            .events
+            .entry(region.to_string())
+            .or_default()
+            .record_at(event, source_identifier, source_arn, date);
+        // The same change, queued for the account's default event bus: Amazon RDS publishes
+        // every lifecycle change it records, and the envelope is rendered from the record
+        // just written so the two cannot disagree (see [`super::bus_events`]).
+        self.pending_bus_events
+            .push(super::BusEvent::of(region, record));
+        // Past the bound the oldest queued publication goes, exactly as the event log
+        // itself is a ring; a request drains the queue, so this is the pathological case.
+        let over = self
+            .pending_bus_events
+            .len()
+            .saturating_sub(super::MAX_PENDING_BUS_EVENTS);
+        if over > 0 {
+            self.pending_bus_events.drain(..over);
+        }
+    }
+}
+
 impl EventLog {
     /// Record `event` for the resource `source_identifier` / `source_arn`, timestamped
     /// now, dropping the oldest record when the log is full, and hand back the record that
@@ -267,6 +310,23 @@ impl EventLog {
         source_identifier: &str,
         source_arn: String,
     ) -> EventRecord {
+        self.record_at(
+            event,
+            source_identifier,
+            source_arn,
+            super::now_as_wire_timestamp(),
+        )
+    }
+
+    /// The same record, timestamped `date` rather than now: what a change the CLOCK
+    /// completed is recorded with, the instant it was made due.
+    pub fn record_at(
+        &mut self,
+        event: LifecycleEvent,
+        source_identifier: &str,
+        source_arn: String,
+        date: ::aws_smithy_types::DateTime,
+    ) -> EventRecord {
         self.next_sequence += 1;
         let record = EventRecord {
             sequence: self.next_sequence,
@@ -276,7 +336,7 @@ impl EventLog {
             category: event.category,
             message: event.message.to_string(),
             source_arn,
-            date: super::now_as_wire_timestamp(),
+            date,
         };
         self.entries.push(record.clone());
         if self.entries.len() > MAX_EVENTS_PER_REGION {
