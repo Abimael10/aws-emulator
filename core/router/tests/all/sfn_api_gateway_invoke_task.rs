@@ -75,7 +75,11 @@ const IAM_ROLE: &str = "IAM_ROLE";
 const RESOURCE_POLICY: &str = "RESOURCE_POLICY";
 
 /// The four services this question spans, over ONE shared engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is one crate root, and
+/// `all/sfn_api_gateway_invoke_failure_cause.rs` asks a second question of the very same
+/// four services, so one wiring serves both suites.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the services, not SigV4: the signature a signed invoke carries is
@@ -110,7 +114,10 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One API Gateway control-plane call that has to be accepted with `expected`.
-async fn apigw(
+///
+/// `pub(crate)` for the reason [`emulator`] is: the sibling suite stands its own api up
+/// through the same control plane.
+pub(crate) async fn apigw(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -139,7 +146,9 @@ async fn apigw(
 }
 
 /// A required string member of a control-plane answer.
-fn member(case: &str, body: &Value, name: &str) -> String {
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("setup {case:?}: expected a {name} in {body}"))
@@ -148,11 +157,15 @@ fn member(case: &str, body: &Value, name: &str) -> String {
 
 /// The host the api's own invoke endpoint answers on, which is what a task's `ApiEndpoint`
 /// names (`{api-id}.execute-api.{region}.amazonaws.com`).
-fn invoke_host(api_id: &str) -> String {
+///
+/// `pub(crate)` for the reason [`emulator`] is: an api is addressed the one way, from one
+/// place.
+pub(crate) fn invoke_host(api_id: &str) -> String {
     format!("{api_id}.execute-api.{REGION}.amazonaws.com")
 }
 
-/// One `MOCK` method on its own resource under the api's root, answering `status`.
+/// One `MOCK` method on its own resource under the api's root, answering `status` with
+/// `answered`.
 ///
 /// A `MOCK` needs no backend — "for testing without actually invoking the backend"
 /// (`IntegrationType`) — and its request template IS what the integration answered, so the
@@ -160,13 +173,21 @@ fn invoke_host(api_id: &str) -> String {
 /// by: the patterned branch for a result in its class, and the unpatterned branch for every
 /// result no pattern covers. The success branch renders the request's OWN context, so an
 /// answer proves which verb and which stage served it.
-async fn mock_method(
+///
+/// `answered` is the document the branch for a non-2xx `status` renders, and `None` is a
+/// branch carrying no response template at all, which is a `MOCK` answering no body.
+///
+/// `pub(crate)` for the reason [`emulator`] is: `all/sfn_api_gateway_invoke_failure_cause.rs`
+/// stands its own methods up through this one call, so the two suites cannot drift in how a
+/// method that answers a given status is configured.
+pub(crate) async fn mock_method(
     router: &MultiServiceRouter,
     api: &str,
     root: &str,
     path_part: &str,
     verbs: &[&str],
     status: u16,
+    answered: Option<&str>,
 ) {
     let case = format!("the {path_part} resource");
     let created = apigw(
@@ -237,15 +258,18 @@ async fn mock_method(
                 201,
             )
             .await;
+            let mut mapping = json!({
+                "selectionPattern": format!(r"{}\d{{2}}", status / 100),
+            });
+            if let Some(document) = answered {
+                mapping["responseTemplates"] = json!({ "application/json": document });
+            }
             apigw(
                 router,
                 &case,
                 "PUT",
                 &format!("{method}/integration/responses/{status}"),
-                Some(json!({
-                    "selectionPattern": format!(r"{}\d{{2}}", status / 100),
-                    "responseTemplates": { "application/json": NOT_FOUND_BODY },
-                })),
+                Some(mapping),
                 201,
             )
             .await;
@@ -264,8 +288,17 @@ async fn deployed_api(router: &MultiServiceRouter, name: &str, policy: Option<&s
     let created = apigw(router, name, "POST", "/restapis", Some(request), 201).await;
     let api = member(name, &created, "id");
     let root = member(name, &created, "rootResourceId");
-    mock_method(router, &api, &root, SERVED_PATH, &["GET", "POST"], 200).await;
-    mock_method(router, &api, &root, NOT_FOUND_PATH, &["GET"], 404).await;
+    mock_method(router, &api, &root, SERVED_PATH, &["GET", "POST"], 200, None).await;
+    mock_method(
+        router,
+        &api,
+        &root,
+        NOT_FOUND_PATH,
+        &["GET"],
+        404,
+        Some(NOT_FOUND_BODY),
+    )
+    .await;
     for stage in [LIVE, BETA] {
         apigw(
             router,
