@@ -2052,6 +2052,13 @@ pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycle
 mod image_deregistration;
 pub use image_deregistration::*;
 
+// WHO MAY LAUNCH from one AMI of the account beside its owner: the launch permissions
+// `ModifyImageAttribute` grants and revokes, `DescribeImageAttribute` reports and
+// `DescribeImages` narrows its `ExecutableUsers` on, in a module of its own. Re-exported, so a
+// handler reaches them as `crate::state::<item>` like every other primitive of this module.
+mod image_launch_permissions;
+pub use image_launch_permissions::*;
+
 // The Recycle Bin an EBS snapshot waits in between its deletion and its permanent deletion,
 // and every rule that moves one in or out of it, in a module of its own.
 mod snapshot_recycle_bin;

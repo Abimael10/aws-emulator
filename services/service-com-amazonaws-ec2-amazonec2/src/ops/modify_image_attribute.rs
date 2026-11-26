@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyImageAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyImageAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyImageAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies ONE attribute of one AMI the account owns: its description, its IMDS support, or its
+//! launch permissions. "You can specify only one attribute at a time", so a call that describes
+//! none has asked for nothing and one that describes two has asked for a change this operation
+//! does not make in a single call ([`AttributeChange::read`]).
+//!
+//! Which attribute is meant comes from `Attribute` when the request names it — "valid values:
+//! description | imdsSupport | launchPermission" ([`MODIFIABLE_IMAGE_ATTRIBUTES`]) — and otherwise
+//! from the single value member the request carries, because "to specify the attribute, you can
+//! use the Attribute parameter, or one of the following parameters: Description, ImdsSupport, or
+//! LaunchPermission".
+//!
+//! The launch permissions are recorded against the image's id by
+//! [`crate::state::image_launch_permissions`], which is what `DescribeImageAttribute` reports and
+//! what `DescribeImages` narrows its `ExecutableUsers` on — so this is the writer and those the
+//! readers of one fact. The one permission that is not held there is the `all` group: "the value
+//! is `true` if this image has public launch permissions" (`Image$Public`) is its stored form, so
+//! granting that group is what makes the image public.
+//!
+//! Public sharing carries two rules of its own, each checked before anything is written: "images
+//! with an Amazon Web Services Marketplace product code cannot be made public", and a Region the
+//! account has blocked public access for AMIs in no longer admits new public sharing
+//! (`EnableImageBlockPublicAccess`).
+//!
+//! `ProductCodes` is "not supported", so a request that names the product codes of an AMI — by
+//! `Attribute` or by carrying the list — is refused as an attribute this action does not modify.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +112,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::scaffolded::Scaffolded;
+use crate::state::{
+    IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED, ImageLaunchPermissionGrantees,
+    LAUNCH_PERMISSION_GROUP_ALL, MAX_IMAGE_LAUNCH_PERMISSION_MODIFICATIONS, MAX_STORED_BYTES,
+    aws_account_id_is_well_formed, dry_run_operation, echoed_resource_id,
+    fields_for_multiple_attribute_types, invalid_user_id_malformed, missing_wire_parameter_message,
+    organization_arn_is_well_formed, organizational_unit_arn_is_well_formed, request_region,
+    require_own_modifiable_image, require_service_state, resource_limit_exceeded,
+    unrecognized_attribute,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +210,435 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyImageAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyImageAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyImageAttribute"))
+        // The one thing read off the request's metadata: "block public access for AMIs at the
+        // account level in the specified Amazon Web Services Region"
+        // (`EnableImageBlockPublicAccess`) is a per-Region setting, so the Region this request
+        // was signed for is the one whose setting decides whether it may share publicly.
+        let region = request_region(ctx.parts());
+
+        // The change the request asks for, read the one way out of either of the two forms EC2
+        // publishes it in, and held to the published bounds and the forms a grantee takes before
+        // any image is looked at — because those are facts of the REQUEST.
+        let change = AttributeChange::read(&input)?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The attributes are attributes OF AN AMI, and only the owner may change them, so the
+        // image is resolved first through the crate's one reading of that rule: a value that is no
+        // AMI id is malformed, a well-formed one the account can see no image for does not exist,
+        // and one it can see but does not own is not authorized.
+        let sells_through_marketplace = {
+            let image = require_own_modifiable_image(&store, &input.image_id)?;
+            // "Any product codes associated with the AMI" (`Image$ProductCodes`): read off the
+            // resolved image here, so the public-sharing rule below asks nothing further of the
+            // store and the borrow ends before the first write.
+            image.product_codes.iter().flatten().next().is_some()
+        };
+
+        // The two rules on PUBLIC sharing, each a fact of the image or of the account rather than
+        // of the request, so each is checked before anything is written and only when the call
+        // actually asks for public sharing.
+        if change.grants_group(LAUNCH_PERMISSION_GROUP_ALL) {
+            // "Enables block public access for AMIs at the account level in the specified Amazon
+            // Web Services Region. This prevents the public sharing of your AMIs"
+            // (`EnableImageBlockPublicAccess`) — in any blocking mode.
+            let blocking = store.image_block_public_access_state(&region);
+            if blocking != IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "Block public access for AMIs is set to {blocking}, so public sharing \
+                     cannot be requested for image {}",
+                    echoed_resource_id(&input.image_id)
+                )));
+            }
+            // "Images with an Amazon Web Services Marketplace product code cannot be made
+            // public", read off the codes the image itself carries.
+            if sells_through_marketplace {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Image {} has Amazon Web Services Marketplace product codes and cannot be \
+                     made public",
+                    echoed_resource_id(&input.image_id)
+                )));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`DryRun`): it sits after every
+        // parameter has been validated and the image resolved, and BEFORE the first write, so a
+        // request that would have been refused is refused with that reason instead and one that
+        // would have succeeded leaves the store untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        change.apply(&mut store, &input.image_id)?;
+
+        // "Modifies the specified attribute of the specified AMI": the modification is the whole
+        // answer, which the model gives no members for — a caller reads the attribute back through
+        // `DescribeImageAttribute`.
+        Ok(ModifyImageAttributeOutput)
     }
+}
+
+/// The attribute naming "a new description for the AMI" (`$Description`).
+const IMAGE_ATTRIBUTE_DESCRIPTION: &str = "description";
+
+/// The attribute naming whether "IMDSv2 is specified in the AMI" (`$ImdsSupport`).
+const IMAGE_ATTRIBUTE_IMDS_SUPPORT: &str = "imdsSupport";
+
+/// The attribute naming "a new launch permission for the AMI" (`$LaunchPermission`).
+const IMAGE_ATTRIBUTE_LAUNCH_PERMISSION: &str = "launchPermission";
+
+/// Every attribute this operation can modify: "the name of the attribute to modify. Valid values:
+/// description | imdsSupport | launchPermission" (`ModifyImageAttributeRequest$Attribute`).
+///
+/// `Attribute` is modelled as a PLAIN STRING here rather than as the `ImageAttributeName` enum the
+/// describe takes, so the request walk holds it to nothing and this list is the only place the
+/// published catalog exists for this operation. Every other member of `ImageAttributeName` — the
+/// kernel, the RAM disk, the product codes and the rest — is a fact of the AMI only a register or
+/// a copy of it can set, which is why a modify answers [`unrecognized_attribute`] for one.
+const MODIFIABLE_IMAGE_ATTRIBUTES: [&str; 3] = [
+    IMAGE_ATTRIBUTE_DESCRIPTION,
+    IMAGE_ATTRIBUTE_IMDS_SUPPORT,
+    IMAGE_ATTRIBUTE_LAUNCH_PERMISSION,
+];
+
+/// "The operation type" (`$OperationType`) that ADDS the permissions a request names: the
+/// `OperationType` enum's `add` member, the whole catalog being the generated
+/// [`OPERATION_TYPE_VALUES`].
+const OPERATION_TYPE_ADD: &str = "add";
+
+/// The `OperationType` member that REMOVES them.
+const OPERATION_TYPE_REMOVE: &str = "remove";
+
+/// The name the ec2Query wire gives `ModifyImageAttributeRequest$OperationType`, for the refusal
+/// that names the parameter a request has to contain: the member's own name, which is how the wire
+/// spells it for the original EC2 objects.
+const OPERATION_TYPE_PARAMETER: &str = "OperationType";
+
+/// The wire's name for `ModifyImageAttributeRequest$LaunchPermission`, named for the same refusal:
+/// the modification a launch-permission change that named no grantee left out.
+const LAUNCH_PERMISSION_PARAMETER: &str = "LaunchPermission";
+
+/// The ONE attribute change a call asks for.
+///
+/// "You can specify only one attribute at a time", so a request that describes none has asked for
+/// nothing and one that describes two has asked for a change this operation does not make in a
+/// single call.
+#[derive(Debug)]
+enum AttributeChange {
+    /// "A new description for the AMI" (`$Description`).
+    Description(String),
+    /// "Set to v2.0 to indicate that IMDSv2 is specified in the AMI" (`$ImdsSupport`).
+    ImdsSupport(String),
+    /// "A new launch permission for the AMI" (`$LaunchPermission`): the grantees to add and the
+    /// ones to remove, each already held to the form that kind of grantee takes.
+    LaunchPermission {
+        add: ImageLaunchPermissionGrantees,
+        remove: ImageLaunchPermissionGrantees,
+    },
+}
+
+impl AttributeChange {
+    /// The change `input` asks for, refused when the request does not describe exactly one.
+    fn read<E>(input: &ModifyImageAttributeInput) -> Result<Self, Scaffolded<E>> {
+        // "The name of the attribute to modify. Valid values: description | imdsSupport |
+        // launchPermission": a word outside that catalog names an attribute this action does not
+        // modify, which is refused before anything else is read.
+        if let Some(named) = input.attribute.as_deref() {
+            if !MODIFIABLE_IMAGE_ATTRIBUTES.contains(&named) {
+                return Err(unrecognized_attribute());
+            }
+        }
+        // "Not supported" (`$ProductCodes`): a request that carries the product codes of an AMI
+        // has named an attribute this action does not modify, the same as naming it by word.
+        if input.product_codes.iter().flatten().next().is_some() {
+            return Err(unrecognized_attribute());
+        }
+
+        // Every LIST the request carries is bounded by its COUNT before any per-grantee work is
+        // done, so the cost of serving one call is bounded whatever the caller sent: the model
+        // declares no `@length` on any of them, so the handler is the only place the published
+        // bound can exist ([`MAX_IMAGE_LAUNCH_PERMISSION_MODIFICATIONS`]).
+        let modifications = input
+            .launch_permission
+            .as_ref()
+            .map_or(0, |requested| {
+                requested.add.as_ref().map_or(0, Vec::len)
+                    + requested.remove.as_ref().map_or(0, Vec::len)
+            })
+            .saturating_add(input.user_ids.as_ref().map_or(0, Vec::len))
+            .saturating_add(input.user_groups.as_ref().map_or(0, Vec::len))
+            .saturating_add(input.organization_arns.as_ref().map_or(0, Vec::len))
+            .saturating_add(input.organizational_unit_arns.as_ref().map_or(0, Vec::len));
+        if modifications > MAX_IMAGE_LAUNCH_PERMISSION_MODIFICATIONS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "This request makes {modifications} modifications to the launch permissions of \
+                 the image, above the {MAX_IMAGE_LAUNCH_PERMISSION_MODIFICATIONS} a single \
+                 operation may make"
+            )));
+        }
+
+        // The two forms are read into ONE pair of directions, because they modify the same
+        // attribute of the same image: `LaunchPermission`'s `Add` and `Remove` lists name their
+        // direction per entry, while the flat `UserIds` / `UserGroups` / `OrganizationArns` /
+        // `OrganizationalUnitArns` lists take it from `OperationType`.
+        let requested = input.launch_permission.clone().unwrap_or_default();
+        let mut add = grantees(requested.add.as_deref())?;
+        let mut remove = grantees(requested.remove.as_deref())?;
+        let flat = ImageLaunchPermissionGrantees {
+            user_ids: named_values(input.user_ids.as_deref()),
+            organization_arns: named_values(input.organization_arns.as_deref()),
+            organizational_unit_arns: named_values(input.organizational_unit_arns.as_deref()),
+            groups: named_values(input.user_groups.as_deref()),
+        };
+        if !flat.is_empty() {
+            match input.operation_type.as_deref() {
+                Some(OPERATION_TYPE_ADD) => add.extend(flat),
+                Some(OPERATION_TYPE_REMOVE) => remove.extend(flat),
+                // The modelled enum constraint is refused by the request walk before this handler
+                // runs, so an operation type that is neither word is an ABSENT one here: the
+                // parameter the request has to contain for those lists to mean anything.
+                _ => {
+                    return Err(Scaffolded::missing_parameter(missing_wire_parameter_message(
+                        OPERATION_TYPE_PARAMETER,
+                    )));
+                }
+            }
+        }
+        for direction in [&add, &remove] {
+            check_grantee_forms(direction)?;
+        }
+
+        // Which attributes the request carries a VALUE for — the question "only one attribute at a
+        // time" is asked of, whether or not `Attribute` names one. `Value` is not one of these: it
+        // is "the value of the attribute being modified", which says nothing about WHICH attribute
+        // that is.
+        let carried: Vec<&'static str> = [
+            (input.description.is_some(), IMAGE_ATTRIBUTE_DESCRIPTION),
+            (input.imds_support.is_some(), IMAGE_ATTRIBUTE_IMDS_SUPPORT),
+            (
+                !add.is_empty() || !remove.is_empty(),
+                IMAGE_ATTRIBUTE_LAUNCH_PERMISSION,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(carried, attribute)| carried.then_some(attribute))
+        .collect();
+
+        // The attribute this call modifies: the one the request named, or the one it carried a
+        // value for. A request that describes two of them is refused naming the attributes IT
+        // named, in the order the request's own members are declared.
+        let attribute = match (input.attribute.as_deref(), carried.as_slice()) {
+            (Some(named), [carried]) if *carried != named => {
+                return Err(fields_for_multiple_attribute_types(&[named, carried]));
+            }
+            (Some(named), [_] | []) => named,
+            (None, [carried]) => *carried,
+            (_, []) => {
+                return Err(Scaffolded::missing_parameter(
+                    "The request must contain a value for the attribute it modifies",
+                ));
+            }
+            (_, carried) => return Err(fields_for_multiple_attribute_types(carried)),
+        };
+
+        match attribute {
+            // "A new description for the AMI", given either as the `Description` structure or as
+            // the attribute-agnostic `Value` beside `Attribute=description`. The EMPTY text is a
+            // value and not an absent one: it leaves the AMI with no description, which is what an
+            // AMI registered without one holds and the only way a caller can take one away.
+            IMAGE_ATTRIBUTE_DESCRIPTION => Ok(Self::Description(
+                attribute_text(input.description.as_ref(), input.value.as_deref()),
+            )),
+            IMAGE_ATTRIBUTE_IMDS_SUPPORT => {
+                let value = attribute_text(input.imds_support.as_ref(), input.value.as_deref());
+                // "Set to v2.0 to indicate that IMDSv2 is specified in the AMI" (`$ImdsSupport`):
+                // the modelled `ImdsSupportValues` catalog is the whole of what this member may
+                // carry, and the request walk holds it to nothing because the member arrives as an
+                // `AttributeValue` whose own value is a plain string.
+                if !IMDS_SUPPORT_VALUES_VALUES.contains(&value.as_str()) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Value ({}) for parameter imdsSupport is invalid. Valid values are {}",
+                        echoed_resource_id(&value),
+                        IMDS_SUPPORT_VALUES_VALUES.join(", ")
+                    )));
+                }
+                Ok(Self::ImdsSupport(value))
+            }
+            IMAGE_ATTRIBUTE_LAUNCH_PERMISSION => {
+                if add.is_empty() && remove.is_empty() {
+                    // The attribute is a LIST of grants, so there is no such thing as modifying it
+                    // to nothing — that is what `ResetImageAttribute` is for.
+                    return Err(Scaffolded::missing_parameter(missing_wire_parameter_message(
+                        LAUNCH_PERMISSION_PARAMETER,
+                    )));
+                }
+                Ok(Self::LaunchPermission { add, remove })
+            }
+            // Unreachable: the catalog check above admits only the three attributes named here.
+            _ => Err(unrecognized_attribute()),
+        }
+    }
+
+    /// Does this call grant `group` launch permissions — the question the rules on PUBLIC sharing
+    /// are asked about?
+    fn grants_group(&self, group: &str) -> bool {
+        match self {
+            Self::LaunchPermission { add, .. } => add.names_group(group),
+            Self::Description(_) | Self::ImdsSupport(_) => false,
+        }
+    }
+
+    /// Write this change onto the AMI `image_id` names.
+    ///
+    /// Every caller-chosen byte it would retain is charged against the store's shared budget
+    /// before the first write, so a call the budget has no room for is refused whole rather than
+    /// half-applied. Each write goes through the store's own writer for that fact, so the byte
+    /// accounting stays with the store.
+    fn apply<E>(
+        &self,
+        store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
+        image_id: &str,
+    ) -> Result<(), Scaffolded<E>> {
+        match self {
+            // A text attribute REPLACES the one the image carries, which is why the store's
+            // writer charges it as a net change.
+            Self::Description(text) => {
+                store
+                    .set_image_text_attribute(image_id, |image| &mut image.description, text)
+                    .map_err(|asked| no_room_for(store.stored_bytes(), asked))?;
+            }
+            Self::ImdsSupport(value) => {
+                store
+                    .set_image_text_attribute(image_id, |image| &mut image.imds_support, value)
+                    .map_err(|asked| no_room_for(store.stored_bytes(), asked))?;
+            }
+            // The removals are applied before the additions, so one call that names the same
+            // grantee both ways leaves it holding the permission: the request asked for it.
+            Self::LaunchPermission { add, remove } => {
+                let charge = store.image_launch_permission_charge(image_id, add);
+                if store.would_exceed_stored_bytes(charge) {
+                    return Err(no_room_for(store.stored_bytes(), charge));
+                }
+                store.revoke_image_launch_permissions(image_id, remove);
+                store.grant_image_launch_permissions(image_id, add);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Refuse a change the store's shared byte budget has no room for: HTTP 400
+/// `ResourceLimitExceeded`, the code this crate answers when a write would take the emulator past
+/// what it holds.
+fn no_room_for<E>(held: usize, asked: usize) -> Scaffolded<E> {
+    resource_limit_exceeded(format!(
+        "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of caller-supplied data, \
+         so it cannot store {asked} more"
+    ))
+}
+
+/// The grantees one `LaunchPermissionList` names.
+///
+/// Each entry names "the Amazon Web Services account ID" (`LaunchPermission$UserId`), "the Amazon
+/// Resource Name (ARN) of an organization" (`$OrganizationArn`), "the Amazon Resource Name (ARN)
+/// of an organizational unit (OU)" (`$OrganizationalUnitArn`) or "the name of the group"
+/// (`$Group`); one that names NONE of them describes no permission at all, which is a modification
+/// the service cannot make.
+fn grantees<E>(
+    requested: Option<&[LaunchPermission]>,
+) -> Result<ImageLaunchPermissionGrantees, Scaffolded<E>> {
+    let mut read = ImageLaunchPermissionGrantees::default();
+    for permission in requested.unwrap_or_default() {
+        // An EMPTY value names nothing: `UserId=` is a member the request carried without saying
+        // which account, so it is read as absent rather than as the account whose id is the empty
+        // string.
+        let named = |value: &Option<String>| -> Option<String> {
+            value.clone().filter(|value| !value.is_empty())
+        };
+        let before = read.len();
+        read.user_ids.extend(named(&permission.user_id));
+        read.organization_arns
+            .extend(named(&permission.organization_arn));
+        read.organizational_unit_arns
+            .extend(named(&permission.organizational_unit_arn));
+        read.groups.extend(named(&permission.group));
+        if read.len() == before {
+            return Err(Scaffolded::missing_parameter(
+                "Each launch permission must name a user ID, an organization ARN, an \
+                 organizational unit ARN or a group",
+            ));
+        }
+    }
+    Ok(read)
+}
+
+/// The values one of the FLAT grantee lists names, an empty entry dropped for the reason
+/// [`grantees`] gives.
+fn named_values(values: Option<&[String]>) -> Vec<String> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect()
+}
+
+/// Hold every grantee of one direction to the form that kind of grantee takes.
+///
+/// A value outside it names no grantee at all in any partition, so it is refused rather than
+/// recorded as a permission nobody could ever use: an account id through the crate's one reading of
+/// one, an ARN through the crate's one reading of an AWS Organizations ARN
+/// ([`organization_arn_is_well_formed`], [`organizational_unit_arn_is_well_formed`]), and a group
+/// against the modelled `PermissionGroup` catalog — which the flat `UserGroups` list is not held to
+/// by the model, its member type being a plain string.
+fn check_grantee_forms<E>(direction: &ImageLaunchPermissionGrantees) -> Result<(), Scaffolded<E>> {
+    for user_id in &direction.user_ids {
+        if !aws_account_id_is_well_formed(user_id) {
+            return Err(invalid_user_id_malformed(user_id));
+        }
+    }
+    for arn in &direction.organization_arns {
+        if !organization_arn_is_well_formed(arn) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value ({}) for parameter organizationArn is invalid. It must be the Amazon \
+                 Resource Name of an organization.",
+                echoed_resource_id(arn)
+            )));
+        }
+    }
+    for arn in &direction.organizational_unit_arns {
+        if !organizational_unit_arn_is_well_formed(arn) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value ({}) for parameter organizationalUnitArn is invalid. It must be the \
+                 Amazon Resource Name of an organizational unit.",
+                echoed_resource_id(arn)
+            )));
+        }
+    }
+    for group in &direction.groups {
+        if !PERMISSION_GROUP_VALUES.contains(&group.as_str()) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value ({}) for parameter group is invalid. Valid values are {}",
+                echoed_resource_id(group),
+                PERMISSION_GROUP_VALUES.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The text a TEXT attribute is being set to: the `AttributeValue` structure's own value when the
+/// request carried it, and otherwise "the value of the attribute being modified" (`$Value`).
+///
+/// Both forms mean the same thing — "to specify the attribute, you can use the Attribute
+/// parameter, or one of the following parameters: Description, ImdsSupport" — so they are read in
+/// one place, and a request that named the attribute without a value sets it to the empty text.
+fn attribute_text(carried: Option<&AttributeValue>, value: Option<&str>) -> String {
+    carried
+        .and_then(|carried| carried.value.clone())
+        .or_else(|| value.map(str::to_string))
+        .unwrap_or_default()
 }

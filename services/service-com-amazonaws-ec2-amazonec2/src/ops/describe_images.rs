@@ -120,11 +120,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    EXECUTABLE_BY_ALL, IMAGE_OWNER_ALIASES, IMAGE_PLATFORM_WINDOWS, IMAGE_STATE_DISABLED,
-    MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
-    OWNER_SELF, aws_account_id_is_well_formed, decode_page_token, dry_run_operation,
-    encode_page_token, filter_value_matches, image_id_is_well_formed, image_is_deprecated,
-    image_is_visible, invalid_ami_id_malformed, invalid_ami_id_not_found,
+    ComAmazonawsEc2Amazonec2State, EXECUTABLE_BY_ALL, IMAGE_OWNER_ALIASES, IMAGE_PLATFORM_WINDOWS,
+    IMAGE_STATE_DISABLED, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS, MAX_PAGE_SIZE,
+    MAX_RESOURCE_IDS, OWNER_SELF, aws_account_id_is_well_formed, decode_page_token,
+    dry_run_operation, encode_page_token, filter_value_matches, image_id_is_well_formed,
+    image_is_deprecated, image_is_visible, invalid_ami_id_malformed, invalid_ami_id_not_found,
     invalid_pagination_token_for, invalid_parameter_value, invalid_user_id_malformed,
     require_service_state,
 };
@@ -375,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 executable_users.is_empty()
                     || executable_users
                         .iter()
-                        .any(|user| executable_by_matches(image, user, account))
+                        .any(|user| executable_by_matches(&store, image, user, account))
             })
             .filter(|image| matches_every_filter(image, filters))
             .collect();
@@ -443,15 +443,21 @@ fn owner_matches(image: &Image, term: &str, account: &str) -> bool {
 /// May the user `term` names launch `image`?
 ///
 /// "all (public AMIs)" selects the images with public launch permissions. For an account —
-/// `self` being the calling one — the only launch permission this slice models is the
-/// owner's own: explicit permissions are granted through `ModifyImageAttribute`, which is
-/// still a scaffold, so no image carries one and none can be reported for one.
-fn executable_by_matches(image: &Image, term: &str, account: &str) -> bool {
+/// `self` being the calling one — it is the owner's own implicit permission or an explicit
+/// grant `ModifyImageAttribute` recorded for that account, read through the crate's one answer
+/// to that question (`ComAmazonawsEc2Amazonec2State::image_is_launchable_by`), so the
+/// narrowing and the launch permissions `DescribeImageAttribute` reports cannot disagree.
+fn executable_by_matches(
+    store: &ComAmazonawsEc2Amazonec2State,
+    image: &Image,
+    term: &str,
+    account: &str,
+) -> bool {
     if term == EXECUTABLE_BY_ALL {
         return image.public.unwrap_or(false);
     }
     let user = if term == OWNER_SELF { account } else { term };
-    image.owner_id.as_deref() == Some(user)
+    store.image_is_launchable_by(image, user)
 }
 
 /// The filter names this operation documents, from `DescribeImagesRequest$Filters`:

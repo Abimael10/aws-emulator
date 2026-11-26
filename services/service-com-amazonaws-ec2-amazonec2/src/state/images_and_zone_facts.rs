@@ -1298,6 +1298,57 @@ pub fn invalid_ami_id_malformed_expecting_ami<E>(image_id: &str) -> Scaffolded<E
     )
 }
 
+/// Resolve the AMI an operation that CHANGES an image names, refusing one this account may
+/// not change.
+///
+/// The OWNER rule every such operation follows, in the order EC2 answers its three causes: a
+/// value that is no AMI id at all is malformed ([`invalid_ami_id_malformed`]), a well-formed
+/// id the account can see no image for does not exist — the images it can see being the
+/// crate's one reading of that question ([`image_is_visible`]) — and an image the account can
+/// SEE but does not OWN, a public AMI of another account, is answered
+/// [`not_authorized_for_image`] rather than reported as missing, because it exists and the
+/// caller has simply no permission on it. The resolved image is handed back, so a caller that
+/// needs a fact of it reads it once rather than looking the same id up again.
+///
+/// `not_found` is the NOT-FOUND sentence the asking operation answers, because EC2's
+/// per-operation validators do not agree about how they word that code (see
+/// [`image_id_not_found_for_deprecation`] beside [`invalid_ami_id_not_found`]) — which is the
+/// only thing the operations sharing this rule differ in.
+pub fn require_own_image_by<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+    not_found: fn(&str) -> Scaffolded<E>,
+) -> Result<&'store Image, Scaffolded<E>> {
+    if !image_id_is_well_formed(image_id) {
+        return Err(invalid_ami_id_malformed(image_id));
+    }
+    let account = ::engine::emulator_account_id();
+    let image = store
+        .images
+        .get(image_id)
+        .filter(|image| image_is_visible(image, account))
+        .ok_or_else(|| not_found(image_id))?;
+    if image.owner_id.as_deref() != Some(account) {
+        return Err(not_authorized_for_image(image_id));
+    }
+    Ok(image)
+}
+
+/// Resolve the AMI whose attributes a request asks to CHANGE, refusing one this account may not
+/// change.
+///
+/// "Modifies the specified attribute of the specified AMI" (`ModifyImageAttribute`) is the
+/// owner's to do, so this is the crate's one owner rule ([`require_own_image_by`], where its
+/// three causes and their order are worded), answered with the NOT-FOUND sentence this crate's
+/// readers of ONE image id share ([`invalid_ami_id_not_found`]) — no recorded refusal of that
+/// operation words it otherwise.
+pub fn require_own_modifiable_image<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Result<&'store Image, Scaffolded<E>> {
+    require_own_image_by(store, image_id, invalid_ami_id_not_found)
+}
+
 /// Refuse an owner or executable-by term that names no account and no alias: HTTP 400
 /// `InvalidUserID.Malformed`.
 pub fn invalid_user_id_malformed<E>(user_id: &str) -> Scaffolded<E> {
@@ -1810,6 +1861,40 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         self.images.insert(image_id.clone(), image);
         image_id
+    }
+
+    /// Write `text` as the TEXT attribute of the AMI `image_id` names that `member` selects, and
+    /// answer the bytes it could NOT store.
+    ///
+    /// The one writer of a text member of a stored image after a register, so every such change
+    /// keeps the member in one place and is charged against the store's shared byte budget the
+    /// same way: as a NET change, the text that leaves refunded and the one that arrives charged,
+    /// so repeated changes cannot leak the budget — the same accounting
+    /// [`Self::set_image_deprecation_time`] does for the deprecation date.
+    ///
+    /// `Err(asked)` is a change the budget has no room for, which leaves the image exactly as it
+    /// was so the caller can refuse the request whole; the caller words that refusal, this being
+    /// the store rather than an operation. An id the store holds no image under is nothing to
+    /// write, and so is `Ok`.
+    pub fn set_image_text_attribute(
+        &mut self,
+        image_id: &str,
+        member: fn(&mut Image) -> &mut Option<String>,
+        text: &str,
+    ) -> Result<(), usize> {
+        let refund = match self.images.get_mut(image_id) {
+            Some(image) => member(image).as_deref().map_or(0, str::len),
+            None => return Ok(()),
+        };
+        if self.would_exceed_stored_bytes_after_refund(text.len(), refund) {
+            return Err(text.len());
+        }
+        if let Some(image) = self.images.get_mut(image_id) {
+            *member(image) = Some(text.to_string());
+        }
+        self.add_stored_bytes(text.len());
+        self.release_stored_bytes(refund);
+        Ok(())
     }
 
     /// The id of the AMI of the calling account that carries the name `name`, or `None` when

@@ -212,6 +212,9 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         self.release_stored_bytes(tag_list_bytes(image.tags.as_deref().unwrap_or_default()));
         self.image_uefi_data.remove(image_id);
+        // An AMI that is permanently gone can share nothing, so the launch permissions granted
+        // on it go with it — the same rule the UEFI variable store beside it leaves under.
+        self.forget_image_launch_permissions(image_id);
         true
     }
 }

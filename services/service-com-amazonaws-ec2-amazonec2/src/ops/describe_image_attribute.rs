@@ -125,7 +125,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    EXECUTABLE_BY_ALL, dry_run_operation, internal_error, require_resolvable_image,
+    ComAmazonawsEc2Amazonec2State, dry_run_operation, internal_error, require_resolvable_image,
     require_service_state, unknown_attribute_parameter_value,
 };
 
@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same id.
         let uefi_data = store.image_uefi_data.get(&input.image_id);
 
-        reported_attribute(attribute, image, uefi_data).ok_or_else(|| {
+        reported_attribute(attribute, &store, image, uefi_data).ok_or_else(|| {
             // Unreachable: the catalog check above admits only the attributes
             // `reported_attribute` answers, and the deprecated one is refused before it.
             internal_error(format!(
@@ -258,14 +258,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// is deprecated" (`DescribeImageAttributeRequest$Attribute`), one of the values
 /// [`IMAGE_ATTRIBUTE_NAME_VALUES`] carries.
 const IMAGE_ATTRIBUTE_BLOCK_DEVICE_MAPPING: &str = "blockDeviceMapping";
-
-/// "The name of the group" a PUBLIC image's launch permission names
-/// (`LaunchPermission$Group`): the `PermissionGroup` enum's only member (the generated
-/// catalog [`PERMISSION_GROUP_VALUES`]), which is the same term `DescribeImages` selects
-/// public AMIs with through its `ExecutableUsers` member. DEFINED as that one
-/// ([`crate::state::EXECUTABLE_BY_ALL`]), so the group a launch permission reports and the
-/// term that selects on it cannot drift apart.
-const LAUNCH_PERMISSION_GROUP_ALL: &str = EXECUTABLE_BY_ALL;
 
 /// The code EC2 answers for an AMI attribute it no longer serves: "The blockDeviceMapping
 /// attribute is deprecated. Using this attribute returns the Client.AuthFailure error"
@@ -305,26 +297,6 @@ fn image_attribute_deprecated<E>(attribute: &str) -> crate::scaffolded::Scaffold
     )
 }
 
-/// "The launch permissions" of `image` (`ImageAttribute$LaunchPermissions`), out of what the
-/// store holds about it.
-///
-/// "The value is `true` if this image has public launch permissions" (`Image$Public`) is the
-/// one launch permission this slice records, and a public image's permission is the one AWS
-/// reports as a GROUP — the `PermissionGroup` enum's single member
-/// ([`LAUNCH_PERMISSION_GROUP_ALL`]). An explicit per-account permission is
-/// granted through `ModifyImageAttribute`, which is still a scaffold, so no stored image
-/// carries one and none can be reported for one; that is the same reading `DescribeImages`'
-/// `ExecutableUsers` matcher gives the same store.
-fn launch_permissions(image: &Image) -> Vec<LaunchPermission> {
-    if !image.public.unwrap_or(false) {
-        return Vec::new();
-    }
-    vec![LaunchPermission {
-        group: Some(LAUNCH_PERMISSION_GROUP_ALL.to_string()),
-        ..LaunchPermission::default()
-    }]
-}
-
 /// `image` as the result of asking for its `attribute`: the ONE member that attribute names,
 /// read off the stored image, beside the image's own id. `None` for an attribute no member
 /// of the result corresponds to, which the handler's catalog check has already refused.
@@ -344,6 +316,7 @@ fn launch_permissions(image: &Image) -> Vec<LaunchPermission> {
 /// reports a volume's product codes.
 fn reported_attribute(
     attribute: &str,
+    store: &ComAmazonawsEc2Amazonec2State,
     image: &Image,
     uefi_data: Option<&String>,
 ) -> Option<DescribeImageAttributeOutput> {
@@ -374,7 +347,14 @@ fn reported_attribute(
         // it. An image registered without one is reported with no value at all rather than
         // with one this emulator invented.
         "uefiData" => reported.uefi_data = text(uefi_data),
-        "launchPermission" => reported.launch_permissions = Some(launch_permissions(image)),
+        // "The launch permissions" (`ImageAttribute$LaunchPermissions`): the group a PUBLIC
+        // image carries and every grantee `ModifyImageAttribute` has recorded for it, read
+        // through the crate's one derivation of an image's launch permissions, which is also
+        // what `DescribeImages`' `ExecutableUsers` narrowing asks — so the two cannot disagree
+        // about one grant.
+        "launchPermission" => {
+            reported.launch_permissions = Some(store.image_launch_permissions_of(image));
+        }
         "productCodes" => {
             reported.product_codes = Some(image.product_codes.clone().unwrap_or_default());
         }

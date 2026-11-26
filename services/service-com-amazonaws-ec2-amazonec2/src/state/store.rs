@@ -2387,6 +2387,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::images`] under the same id, written by the one writer of an image
     /// ([`Self::insert_image`]) and reported by `DescribeImageAttribute`'s `uefiData`.
     pub image_uefi_data: BTreeMap<String, String>,
+    /// The EXPLICIT launch permissions granted on each AMI of the account, by `ImageId`: "a new
+    /// launch permission for the AMI" (`ModifyImageAttributeRequest$LaunchPermission`), one entry
+    /// per image that has been shared with an account, an organization or an organizational unit
+    /// by name. The `all` group is NOT held here — it is the image's own `Public` member — and an
+    /// image nobody has shared by name holds no entry at all. Written through
+    /// [`Self::grant_image_launch_permissions`] / [`Self::revoke_image_launch_permissions`] and
+    /// read through [`Self::image_launch_permissions_of`] /
+    /// [`Self::image_is_launchable_by`], so the attribute report and the inventory's
+    /// `ExecutableUsers` narrowing cannot disagree about one grant (see the module docs of
+    /// `super::image_launch_permissions`).
+    pub image_launch_permissions: BTreeMap<String, ImageLaunchPermissions>,
     /// The ROOT DEVICE SNAPSHOT this store reports for an AMI the account cannot see, by the
     /// `ImageId` named: minted once, on the first write that has to name it, and kept, so
     /// every later answer about that AMI's root device names the same snapshot.
@@ -4168,6 +4179,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             image_uefi_data: BTreeMap::new(),
+            // A fresh account has shared no AMI of its own with anybody by name.
+            image_launch_permissions: BTreeMap::new(),
             // Nothing has had to name the root snapshot of an AMI this store holds no image
             // for yet.
             unseen_image_root_snapshots: BTreeMap::new(),

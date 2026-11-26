@@ -2038,10 +2038,12 @@ impl FastLaunchRecord {
 ///
 /// "The images available to you include public images, private images that you own, and
 /// private images owned by other Amazon Web Services accounts for which you have explicit
-/// launch permissions" (`DescribeImages`). Nothing in this slice grants an explicit launch
-/// permission — `ModifyImageAttribute` is still a scaffold — so the images available are
-/// the public ones and the account's own, and a private image of another account is
-/// invisible however a request asks for it.
+/// launch permissions" (`DescribeImages`). The explicit launch permissions this slice records
+/// are the ones the account GRANTS on its own images
+/// ([`ComAmazonawsEc2Amazonec2State::image_launch_permissions`]) — an account cannot grant one
+/// on an image it does not own — so the images available are still the public ones and the
+/// account's own, and a private image of another account is invisible however a request asks
+/// for it.
 pub fn image_is_visible(image: &Image, account: &str) -> bool {
     image.public.unwrap_or(false) || image.owner_id.as_deref() == Some(account)
 }

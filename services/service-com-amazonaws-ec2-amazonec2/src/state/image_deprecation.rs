@@ -24,8 +24,7 @@ use crate::ops::types::Image;
 use crate::scaffolded::Scaffolded;
 
 use super::{
-    ComAmazonawsEc2Amazonec2State, INVALID_AMI_ID_NOT_FOUND, echoed_resource_id,
-    image_id_is_well_formed, image_is_visible, invalid_ami_id_malformed, iso8601_utc,
+    ComAmazonawsEc2Amazonec2State, INVALID_AMI_ID_NOT_FOUND, echoed_resource_id, iso8601_utc,
     parse_iso8601_timestamp,
 };
 
@@ -179,31 +178,14 @@ pub fn not_authorized_for_image<E>(image_id: &str) -> Scaffolded<E> {
 /// Resolve the AMI a deprecation change names, refusing one this account may not change.
 ///
 /// "Only the AMI owner can enable or disable AMI deprecation" (Deprecate an Amazon EC2 AMI):
-/// an id that is no AMI id at all is malformed ([`super::invalid_ami_id_malformed`]), a
-/// well-formed one the account can see no image for does not exist
-/// ([`image_id_not_found_for_deprecation`]) — the images it can see being the crate's one
-/// reading of that question ([`super::image_is_visible`]) — and an image the account can SEE
-/// but does not OWN, a public AMI of another account, is answered
-/// [`not_authorized_for_image`] rather than reported as missing, because it exists and the
-/// caller has simply no permission on it. The resolved image is handed back, so a caller
-/// that needs a fact of it reads it once.
+/// the crate's one owner rule ([`super::require_own_image_by`], where its three causes and
+/// their order are worded), answered with the NOT-FOUND sentence the deprecation operations
+/// were recorded answering ([`image_id_not_found_for_deprecation`]).
 pub fn require_own_image<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     image_id: &str,
 ) -> Result<&'store Image, Scaffolded<E>> {
-    if !image_id_is_well_formed(image_id) {
-        return Err(invalid_ami_id_malformed(image_id));
-    }
-    let account = ::engine::emulator_account_id();
-    let image = store
-        .images
-        .get(image_id)
-        .filter(|image| image_is_visible(image, account))
-        .ok_or_else(|| image_id_not_found_for_deprecation(image_id))?;
-    if image.owner_id.as_deref() != Some(account) {
-        return Err(not_authorized_for_image(image_id));
-    }
-    Ok(image)
+    super::require_own_image_by(store, image_id, image_id_not_found_for_deprecation)
 }
 
 impl ComAmazonawsEc2Amazonec2State {

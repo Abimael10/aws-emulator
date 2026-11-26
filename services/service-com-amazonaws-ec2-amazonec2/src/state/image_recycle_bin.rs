@@ -127,9 +127,11 @@ impl ComAmazonawsEc2Amazonec2State {
         });
         // The UEFI variable store of a permanently deleted AMI goes with it: it is a fact of
         // that image, held beside it under the same id, and nothing can restore the image
-        // any more. Its bytes stay counted for the reason given above.
+        // any more. Its bytes stay counted for the reason given above. The launch permissions
+        // granted on it go the same way: an AMI that is permanently gone can share nothing.
         for image_id in purged {
             self.image_uefi_data.remove(&image_id);
+            self.forget_image_launch_permissions(&image_id);
         }
         self.release_stored_bytes(released);
     }
