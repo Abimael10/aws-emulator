@@ -20,7 +20,9 @@
 //! The rows differ along what the rule generalises over: WHICH construct the document left
 //! unterminated (an array, an object, a nested object, a string), how far into the document
 //! it opened, which line it opened and ended on, and the classes that stop on a character
-//! instead and so name no start marker at all.
+//! instead and so name no start marker at all. They differ along the IDENTITY the request
+//! presents as well — down to one a session really is vended for — because the ordering is a
+//! fact about the request's members and not about the identity happening to be defective.
 //!
 //! Every call goes over the wire as the `application/x-www-form-urlencoded` awsQuery POST a
 //! client makes, through the same router the emulator serves with — signed for `AssumeRole`
@@ -28,6 +30,10 @@
 //! makes anonymous.
 
 use super::malformed_session_policy::decode_xml_text;
+use super::saml_federation::{
+    audience_condition, create_saml_provider, create_saml_role, emulator_with_iam, saml_assertion,
+    IdentityProvider, Response,
+};
 use super::sts_sessions::{call, element, emulator, emulator_account, member, LONG_TERM_KEY};
 use super::web_identity_federation::unsigned_call;
 use smithy_server_runtime::MultiServiceRouter;
@@ -366,6 +372,117 @@ async fn the_presented_identity_is_evaluated_only_after_the_policy_parses() {
                 element(&body, "Code").as_deref(),
                 Some(INVALID_IDENTITY_TOKEN),
                 "case {case:?}: expected the presented identity's own refusal, got {body}"
+            );
+        }
+    }
+}
+
+/// A well-formed session policy: it narrows the session's permissions and nothing else, so a
+/// request carrying it is served whenever the same request without it is.
+const WELL_FORMED_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
+
+/// The ordering does not depend on the identity being BAD: the inline document is parsed
+/// ahead of the SAML provider lookup and ahead of the response reading, so a request whose
+/// authentication response the account's REGISTERED provider really signed — one the same
+/// request gets a session for once its document parses — is still refused the document's
+/// `MalformedPolicyDocument`.
+///
+/// The identity rows differ in how far the identity would get on its own: all the way (a
+/// freshly signed response of the registered provider), as far as the response reading (a
+/// value that is no response at all), and no further than the provider lookup (an ARN the
+/// account registered nothing for). The document's refusal is the answer to every one.
+#[tokio::test]
+async fn a_malformed_policy_is_refused_even_when_the_presented_identity_verifies() {
+    let (router, _engine) = emulator_with_iam();
+    let provider = IdentityProvider::mint("https://idp.example.test/saml");
+    let provider_arn = create_saml_provider(&router, "relayed-policy-idp", &provider).await;
+    let role_arn = create_saml_role(
+        &router,
+        "saml-relayed-policy",
+        &provider_arn,
+        audience_condition(),
+    )
+    .await;
+    let verifiable = saml_assertion(
+        &provider,
+        &Response::valid(&provider, &role_arn, &provider_arn),
+    );
+
+    // One identity row: the case, the provider ARN the request names and the response it
+    // presents.
+    let identities: Vec<(&str, String, String)> = vec![
+        (
+            "a response the registered provider signed",
+            provider_arn.clone(),
+            verifiable.clone(),
+        ),
+        (
+            "a value that is no authentication response",
+            provider_arn.clone(),
+            "not-base64".to_string(),
+        ),
+        (
+            "a provider the account never registered",
+            unregistered_provider_arn(),
+            verifiable.clone(),
+        ),
+    ];
+
+    let saml_mint = |principal_arn: &str, assertion: &str| Mint {
+        action: "AssumeRoleWithSAML",
+        base: vec![
+            ("RoleArn", role_arn.clone()),
+            ("PrincipalArn", principal_arn.to_string()),
+            ("SAMLAssertion", assertion.to_string()),
+        ],
+        signed: false,
+    };
+
+    // The verifying identity really is one a session is vended for, with a document that
+    // parses and with no document at all — which is what makes the refusals below the
+    // document's and not the identity's.
+    let verifying = saml_mint(&provider_arn, &verifiable);
+    for (row, policy) in [
+        ("a well-formed policy", Some(WELL_FORMED_POLICY)),
+        ("no policy at all", None),
+    ] {
+        let case = format!("AssumeRoleWithSAML: {row} with a verifying identity");
+        let (status, body) = mint_with_policy(&router, &verifying, policy).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the exchange to be served, got {status} {body}"
+        );
+        assert!(
+            element(&body, "AccessKeyId").is_some(),
+            "case {case:?}: expected a federated session's credential, got {body}"
+        );
+    }
+
+    for (identity, principal_arn, assertion) in &identities {
+        let mint = saml_mint(principal_arn, assertion);
+        for row in unparseable_documents() {
+            let case = format!("AssumeRoleWithSAML: {} with {identity}", row.case);
+            assert_positions_name_the_document(&row);
+            let (status, body) = mint_with_policy(&router, &mint, Some(row.policy)).await;
+
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} {body}"
+            );
+            assert_eq!(
+                element(&body, "Code").as_deref(),
+                Some("MalformedPolicyDocument"),
+                "case {case:?}: the document is read before the identity is, got {body}"
+            );
+            let message = decode_xml_text(&member(&case, &body, "Message"));
+            assert_eq!(
+                message,
+                expected_message(&row),
+                "case {case:?}: expected the relayed parser diagnostic, got {message:?}"
+            );
+            assert!(
+                element(&body, "AccessKeyId").is_none(),
+                "case {case:?}: a refused mint must vend no credential, got {body}"
             );
         }
     }
