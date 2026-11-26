@@ -262,10 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would do. The token is remembered with the cluster the first call changed, so the
         // same token naming another cluster is a conflict rather than a second update; a
         // request carrying no token is no retry at all (the SDK generates a fresh one per
-        // call), so it is answered on its own.
-        if let Some(remembered) = state
-            .remembered_create(Self::NAME, input.client_token.as_ref())
-            .cloned()
+        // call), so it is answered on its own. An entry whose cluster this service no
+        // longer holds has no first call's result left to answer with, so it is dropped
+        // rather than refusing later requests forever
+        // (`crate::state::remembered_action`).
+        if let Some(remembered) = state.remembered_action(Self::NAME, input.client_token.as_ref())
         {
             if remembered.resource_id != cluster_id {
                 return Err(UpdateClusterErrorModeled::ConflictException(

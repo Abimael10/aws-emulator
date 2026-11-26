@@ -430,6 +430,16 @@ impl ClusterRecord {
             .or_else(|| self.queues.values().find(|queue| queue.name == identifier))
     }
 
+    /// Whether this cluster still holds the child resource `resource_id` — a queue or a
+    /// compute node group — under the generated id it was minted with.
+    ///
+    /// Both children are addressed by ids minted from the one sequence
+    /// ([`ComAmazonawsPcsAwsparallelcomputingserviceState::mint_id`]), so an id names at
+    /// most one of them and asking both maps cannot confuse the two kinds.
+    pub fn holds_child(&self, resource_id: &str) -> bool {
+        self.queues.contains_key(resource_id) || self.compute_node_groups.contains_key(resource_id)
+    }
+
     /// The ids of this cluster's queues that STILL assign jobs to the compute node group
     /// `group_id`, in creation order.
     ///
@@ -849,8 +859,10 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
     /// replays it ([`Self::remembered_create_retry`]) and a request that merely reuses
     /// the token does not.
     ///
-    /// An existing entry is never overwritten — the token names the FIRST call's
-    /// resource for as long as it is remembered — and the index is kept at
+    /// An existing entry is never overwritten, so the token names the FIRST call's
+    /// resource for as long as that resource is there to be replayed; once it is gone the
+    /// entry is dropped as stale ([`Self::remembered_action`]) and the token is free to
+    /// name what a later call creates. The index is kept at
     /// [`MAX_REMEMBERED_CLIENT_TOKENS`] entries by evicting the oldest.
     pub fn remember_create(
         &mut self,
@@ -882,20 +894,73 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
     /// same cluster — replays that call's result, and anything else is a different
     /// request that happens to carry a used token, which conflicts rather than being
     /// answered with the first call's resource.
+    ///
+    /// Both answers need the record the first call minted, so an entry whose record this
+    /// service no longer holds is stale and is dropped ([`Self::remembered_action`]):
+    /// such a request is not a retry of anything that can be replayed, so it is a create
+    /// of its own. A [`RememberedCreateRetry::Replay`] therefore always names a record
+    /// the store still holds.
     pub fn remembered_create_retry(
-        &self,
+        &mut self,
         operation: &str,
         token: Option<&String>,
         cluster_id: Option<&str>,
         resource_name: &str,
     ) -> Option<RememberedCreateRetry> {
-        let remembered = self.remembered_create(operation, token)?;
+        let remembered = self.remembered_action(operation, token)?;
         if remembered.cluster_id.as_deref() == cluster_id
             && remembered.resource_name.as_deref() == Some(resource_name)
         {
-            return Some(RememberedCreateRetry::Replay(remembered.resource_id.clone()));
+            return Some(RememberedCreateRetry::Replay(remembered.resource_id));
         }
-        Some(RememberedCreateRetry::Conflict(remembered.clone()))
+        Some(RememberedCreateRetry::Conflict(remembered))
+    }
+
+    /// What a previous call of `operation` with this `@idempotencyToken` did, for an
+    /// operation whose replay is answered FROM the stored record — a create or an update —
+    /// dropping the entry first when that record is no longer held.
+    ///
+    /// A remembered create or update promises the caller the first call's result, and that
+    /// result is the stored record: once the record has been removed there is nothing left
+    /// to replay and nothing left for a reused token to conflict with, so the entry is
+    /// stale and the request is answered on its own merits rather than being refused for
+    /// as long as the entry survives. A remembered DELETE is the opposite case — it exists
+    /// precisely for the retry that arrives once the record is gone
+    /// ([`RememberedCreate::deleted`]) — so it is never dropped here.
+    pub fn remembered_action(
+        &mut self,
+        operation: &str,
+        token: Option<&String>,
+    ) -> Option<RememberedCreate> {
+        let remembered = self.remembered_create(operation, token)?.clone();
+        if !remembered.deleted && !self.holds_remembered(&remembered) {
+            self.forget(operation, token);
+            return None;
+        }
+        Some(remembered)
+    }
+
+    /// Whether the record a remembered create or update points at is still stored, so its
+    /// entry still has a first call's result to answer with.
+    fn holds_remembered(&self, remembered: &RememberedCreate) -> bool {
+        match remembered.cluster_id.as_deref() {
+            // No parent cluster: the entry points at a cluster itself.
+            None => self.clusters.contains_key(&remembered.resource_id),
+            Some(cluster_id) => self
+                .clusters
+                .get(cluster_id)
+                .is_some_and(|cluster| cluster.holds_child(&remembered.resource_id)),
+        }
+    }
+
+    /// Drop what `operation` with `token` is remembered to have done, keeping
+    /// [`Self::client_token_order`] holding exactly the index's keys.
+    fn forget(&mut self, operation: &str, token: Option<&String>) {
+        let Some(token) = token else { return };
+        let key = client_token_key(operation, token);
+        if self.client_tokens.remove(&key).is_some() {
+            self.client_token_order.retain(|remembered| remembered != &key);
+        }
     }
 
     /// Remember that `operation` with `token` DELETED the resource `resource_id`, known as

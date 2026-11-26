@@ -371,6 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under — so only a request asking for that same group is that retry: one naming
         // a different cluster, or a different group in the same cluster, conflicts
         // rather than being answered with the first call's group while creating nothing.
+        //
+        // Both answers are the STORED group, so a token whose group this service no
+        // longer holds is remembering nothing it can answer with: the entry is dropped
+        // and this request is a create of its own, which is why a `Replay` here always
+        // names a stored record (`crate::state::remembered_create_retry`).
         match state.remembered_create_retry(
             Self::NAME,
             input.client_token.as_ref(),
@@ -383,12 +388,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get(&cluster_id)
                     .and_then(|cluster| cluster.compute_node_groups.get(&resource_id))
                 else {
-                    return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
-                        crate::state::client_token_conflict(
-                            "create",
-                            crate::state::COMPUTE_NODE_GROUP,
-                            &resource_id,
-                        ),
+                    return Err(CreateComputeNodeGroupErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "the compute node group disappeared while it was being read"
+                                .to_string(),
+                        },
                     )
                     .into());
                 };

@@ -317,7 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request asking for that same cluster is that retry: one naming another cluster
         // conflicts rather than being answered with the first call's cluster while
         // creating nothing. The remembered entry is never overwritten, so the token names
-        // the FIRST call's cluster for as long as it is remembered.
+        // the FIRST call's cluster for as long as that cluster is there to be replayed;
+        // once it is gone the entry is remembering nothing it can answer with, so it is
+        // dropped and this request is a create of its own
+        // (`crate::state::remembered_create_retry`).
         match state.remembered_create_retry(
             Self::NAME,
             input.client_token.as_ref(),
@@ -325,11 +328,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.cluster_name,
         ) {
             Some(crate::state::RememberedCreateRetry::Replay(resource_id)) => {
-                if let Some(first) = state.clusters.get(&resource_id) {
-                    return Ok(CreateClusterOutput {
-                        cluster: Some(first.to_api()),
-                    });
-                }
+                let Some(first) = state.clusters.get(&resource_id) else {
+                    return Err(CreateClusterErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "the cluster disappeared while it was being read"
+                                .to_string(),
+                        },
+                    )
+                    .into());
+                };
+                return Ok(CreateClusterOutput {
+                    cluster: Some(first.to_api()),
+                });
             }
             Some(crate::state::RememberedCreateRetry::Conflict(remembered)) => {
                 return Err(CreateClusterErrorModeled::ConflictException(

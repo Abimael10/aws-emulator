@@ -267,10 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An `@idempotencyToken` retry returns the first call's result and has NO further
         // effect, so the stored record is answered without applying the change a second
         // time. The token is remembered with the queue the first call changed, so the same
-        // token naming another queue is a conflict rather than a second update.
-        if let Some(remembered) = state
-            .remembered_create(Self::NAME, input.client_token.as_ref())
-            .cloned()
+        // token naming another queue is a conflict rather than a second update; an entry
+        // whose queue this service no longer holds has no first call's result left to
+        // answer with, so it is dropped rather than refusing later requests forever
+        // (`crate::state::remembered_action`).
+        if let Some(remembered) = state.remembered_action(Self::NAME, input.client_token.as_ref())
         {
             if remembered.cluster_id.as_deref() != Some(cluster_id.as_str())
                 || remembered.resource_id != queue_id

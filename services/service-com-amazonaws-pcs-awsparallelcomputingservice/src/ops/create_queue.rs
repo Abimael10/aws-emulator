@@ -294,6 +294,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only a request asking for that same queue is that retry: one naming a
         // different cluster, or a different queue in the same cluster, conflicts rather
         // than being answered with the first call's queue while creating nothing.
+        //
+        // Both answers are the STORED queue, so a token whose queue this service no
+        // longer holds is remembering nothing it can answer with: the entry is dropped
+        // and this request is a create of its own, which is why a `Replay` here always
+        // names a stored record (`crate::state::remembered_create_retry`).
         match state.remembered_create_retry(
             Self::NAME,
             input.client_token.as_ref(),
@@ -306,12 +311,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get(&cluster_id)
                     .and_then(|cluster| cluster.queues.get(&resource_id))
                 else {
-                    return Err(CreateQueueErrorModeled::ConflictException(
-                        crate::state::client_token_conflict(
-                            "create",
-                            crate::state::QUEUE,
-                            &resource_id,
-                        ),
+                    return Err(CreateQueueErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "the queue disappeared while it was being read"
+                                .to_string(),
+                        },
                     )
                     .into());
                 };
