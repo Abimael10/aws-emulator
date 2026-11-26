@@ -224,7 +224,8 @@ async fn served_request(
 ///
 /// An event the namespace's handler filtered out is in [`Self::successful`] all the same:
 /// the publish of it succeeded, and what the handler decided is which subscribers it
-/// reaches.
+/// reaches. An event the handler answered with an `error` of its own is in [`Self::failed`]
+/// instead: the namespace refused that event, and said why.
 #[derive(Debug, Default, Clone)]
 pub struct PublishOutcome {
     /// The accepted events, each as the answer reports one.
@@ -352,11 +353,22 @@ pub async fn publish(
     // the events — one was minted per event above — so no request-derived index addresses
     // anything.
     let mut accepted: Vec<(usize, String, Json)> = Vec::new();
-    let mut failed: Vec<Json> = Vec::new();
+    // Each failure is kept beside the index of the event it is of, so the list a publish is
+    // answered with states them in the order the request carried the events, whichever of
+    // them this endpoint could not read and whichever of them the namespace refused.
+    let mut failed: Vec<(usize, Json)> = Vec::new();
     for (index, (event, identifier)) in events.iter().zip(identifiers).enumerate() {
         match read_event(event) {
             Some(payload) => accepted.push((index, identifier, payload)),
-            None => failed.push(failed_event(&identifier, index, EVENT_IS_A_JSON_STRING)),
+            None => failed.push((
+                index,
+                failed_event(
+                    &identifier,
+                    index,
+                    json!(EVENT_FAILURE_STATUS),
+                    EVENT_IS_A_JSON_STRING,
+                ),
+            )),
         }
     }
 
@@ -368,9 +380,11 @@ pub async fn publish(
         None => handlers::HandlerRun::NotDeclared,
     };
     let invocations = u32::from(!matches!(run, handlers::HandlerRun::NotDeclared));
-    let delivered = match &run {
+    // What the handler said about the events it was given: the ones to publish, and the ones
+    // it answered with an `error` of its own, which are the events of this batch it refused.
+    let (delivered, refused) = match &run {
         // A namespace with no `onPublish` handler publishes what it was given.
-        handlers::HandlerRun::NotDeclared => accepted.clone(),
+        handlers::HandlerRun::NotDeclared => (accepted.clone(), Vec::new()),
         handlers::HandlerRun::Returned(returned) => returned_events(returned, &accepted),
         handlers::HandlerRun::Failed(reason) => {
             ::tracing::info!(
@@ -379,17 +393,36 @@ pub async fn publish(
                 %reason,
                 "a channel namespace's onPublish handler did not return"
             );
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
+    // An event the handler answered with an `error` is one the namespace refused: it is
+    // reported under `failed`, carrying the handler's own sentence, and it is published to no
+    // subscriber.
+    for (index, identifier, message) in &refused {
+        failed.push((
+            *index,
+            failed_event(identifier, *index, json!(HANDLER_ERROR_CODE), message),
+        ));
+    }
     // A handler that did not return accepts nothing: every event it was given failed,
     // with what the handler failed with.
     if let handlers::HandlerRun::Failed(reason) = &run {
         for (index, identifier, _) in &accepted {
-            failed.push(failed_event(identifier, *index, reason));
+            failed.push((
+                *index,
+                failed_event(identifier, *index, json!(EVENT_FAILURE_STATUS), reason),
+            ));
         }
         accepted.clear();
     }
+    // What is left is what the namespace accepted — every event it did not refuse, including
+    // one its handler filtered out rather than errored on.
+    accepted.retain(|(index, _, _)| {
+        !refused
+            .iter()
+            .any(|(refused_index, _, _)| refused_index == index)
+    });
 
     let dropped = accepted.len().saturating_sub(delivered.len());
     deliver(context, &path, &delivered).await;
@@ -405,12 +438,13 @@ pub async fn publish(
             failed: counted(failed.len()),
         },
     );
+    failed.sort_by_key(|(index, _)| *index);
     Ok(PublishOutcome {
         successful: accepted
             .iter()
             .map(|(index, identifier, _)| json!({"identifier": identifier, "index": index}))
             .collect(),
-        failed,
+        failed: failed.into_iter().map(|(_, entry)| entry).collect(),
     })
 }
 
@@ -446,33 +480,56 @@ fn handler_context(path: &str, namespace: &str, accepted: &[(usize, String, Json
     })
 }
 
-/// The events a handler's answer says to publish, matched back onto the events it was
-/// given.
+/// One event the namespace's handler refused: which event it was, and the sentence the
+/// handler stated for it.
+type RefusedEvent = (usize, String, String);
+
+/// What a handler's answer says to do with the events it was given: the ones to publish and
+/// the ones it refused, each matched back onto the event it is of.
 ///
 /// A handler "must return the events that should be published", each carrying the `id` it
 /// was given, so the answer is read as a list of events: an entry whose `id` names one of
-/// the given events publishes that event with the entry's own `payload`, and a given event
-/// no entry names is one the handler filtered out. A handler that returned nothing
-/// published nothing, and an answer that is not a list of events publishes nothing either —
-/// there is no list of events in it to publish.
+/// the given events publishes that event with the entry's own `payload`, an entry carrying
+/// an `error` REFUSES that event rather than publishing it, and a given event no entry names
+/// is one the handler filtered out. A handler that returned nothing published nothing, and
+/// an answer that is not a list of events publishes nothing either — there is no list of
+/// events in it to publish.
 fn returned_events(
     returned: &Json,
     accepted: &[(usize, String, Json)],
-) -> Vec<(usize, String, Json)> {
+) -> (Vec<(usize, String, Json)>, Vec<RefusedEvent>) {
     let Some(entries) = returned.as_array() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let id = entry.get("id").and_then(Json::as_str)?;
-            let (index, identifier, given) = accepted
-                .iter()
-                .find(|(_, identifier, _)| identifier == id)?;
-            let payload = entry.get("payload").cloned().unwrap_or_else(|| given.clone());
-            Some((*index, identifier.clone(), payload))
-        })
-        .collect()
+    let mut published: Vec<(usize, String, Json)> = Vec::new();
+    let mut refused: Vec<RefusedEvent> = Vec::new();
+    for entry in entries {
+        let Some(id) = entry.get("id").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some((index, identifier, given)) =
+            accepted.iter().find(|(_, identifier, _)| identifier == id)
+        else {
+            continue;
+        };
+        if let Some(error) = entry.get("error").filter(|error| !error.is_null()) {
+            refused.push((*index, identifier.clone(), error_sentence(error)));
+            continue;
+        }
+        let payload = entry.get("payload").cloned().unwrap_or_else(|| given.clone());
+        published.push((*index, identifier.clone(), payload));
+    }
+    (published, refused)
+}
+
+/// The sentence an `error` a handler returned for one event states: the string it carries,
+/// or the value as the document it is, so an error the handler did not write as a string is
+/// still reported as the handler wrote it.
+fn error_sentence(error: &Json) -> String {
+    match error {
+        Json::String(sentence) => sentence.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Deliver each published event to every subscription whose channel covers `path`, as the
@@ -524,15 +581,30 @@ pub fn data_frame(subscription_id: &str, payload: &Json) -> String {
     .to_string()
 }
 
-/// One entry of a publish's `failed` list: which event it was and why it was not accepted.
-fn failed_event(identifier: &str, index: usize, reason: &str) -> Json {
+/// One entry of a publish's `failed` list: which event it was, and the code and the sentence
+/// saying why it was not published.
+///
+/// The code is the one the class of failure carries: [`HANDLER_ERROR_CODE`] for an error the
+/// namespace's own handler returned for that event, and [`EVENT_FAILURE_STATUS`] for a
+/// failure of this endpoint's own — an event it could not read as an event at all, or a
+/// handler run that did not return.
+fn failed_event(identifier: &str, index: usize, code: Json, reason: &str) -> Json {
     json!({
         "identifier": identifier,
         "index": index,
-        "errorCode": 400,
-        "errorMessage": reason,
+        "code": code,
+        "message": reason,
     })
 }
+
+/// The `code` a per-event failure carries when the namespace's handler answered that event
+/// with an `error` of its own: the fixed text an error a deployed handler supplied is
+/// reported under, as against one the endpoint itself states.
+pub const HANDLER_ERROR_CODE: &str = "CustomError";
+
+/// The `code` a per-event failure of this endpoint's own carries: the status such a request
+/// earns.
+const EVENT_FAILURE_STATUS: u16 = 400;
 
 /// The `errorType` a malformed request to this endpoint carries, as AppSync's own
 /// `BadRequestException` names it.

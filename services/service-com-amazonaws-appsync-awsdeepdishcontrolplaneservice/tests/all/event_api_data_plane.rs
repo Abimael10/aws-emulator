@@ -483,7 +483,10 @@ async fn post_with_fields(
 }
 
 /// Publish `events` to `channel` over the announced HTTP endpoint.
-async fn publish(
+///
+/// Shared with the suite that asserts how a publish PARTITIONS its batch
+/// ([`crate::event_api_publish_handler_errors`]), so a publisher is written once.
+pub(crate) async fn publish(
     case: &str,
     api: &EventApi,
     channel: &str,
@@ -504,7 +507,7 @@ async fn publish(
 
 /// The `payload` of the next `expected` `data` frames, in order, stopping at the first
 /// deadline that passes with nothing on the socket.
-async fn delivered(case: &str, socket: &mut ClientSocket, expected: usize) -> Vec<Value> {
+pub(crate) async fn delivered(case: &str, socket: &mut ClientSocket, expected: usize) -> Vec<Value> {
     let mut events = Vec::new();
     for _ in 0..expected {
         let Some(frame) = next_frame(case, socket).await else {

@@ -12,7 +12,7 @@
 //! * [`publish`] — the HTTP endpoint, which serves `POST /event`: it resolves the channel's
 //!   channel namespace, runs that namespace's `onPublish` handler over the events the
 //!   request carried ([`handlers`]), delivers what the handler returned to every matching
-//!   subscription, and answers which events it accepted;
+//!   subscription, and answers which events it accepted and which the handler refused;
 //! * [`realtime`] — the real-time endpoint, which serves the WebSocket at
 //!   `/event/realtime`: `connection_init`/`connection_ack`, `subscribe`/`unsubscribe`, the
 //!   `publish` a client makes over its own socket, and the `data` frames an event is

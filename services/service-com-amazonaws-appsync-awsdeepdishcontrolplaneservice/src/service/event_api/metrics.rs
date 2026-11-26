@@ -78,7 +78,8 @@ pub const SUCCESSFUL_EVENTS_METRIC: &str = "SuccessfulEvents";
 pub const DROPPED_EVENTS_METRIC: &str = "DroppedEvents";
 
 /// The events the namespace could not accept — one that is not an event document at all,
-/// or every event of a publish whose handler failed.
+/// one its handler answered with an error of its own, or every event of a publish whose
+/// handler failed.
 pub const FAILED_EVENTS_METRIC: &str = "FailedEvents";
 
 /// One realtime connection established on the API.
