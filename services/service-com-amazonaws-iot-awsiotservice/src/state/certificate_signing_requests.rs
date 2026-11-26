@@ -115,15 +115,13 @@ impl CertificateSigningRequestRefusal {
 
 /// The message a request refuses material it cannot read as a certification request with.
 ///
-/// AWS publishes the CLASS for this — `InvalidRequestException`, "The request is not
-/// valid" — and not the sentence it states it in, so the fixed text here is this
-/// emulator's rendering of that class, naming the member that carried the material and
-/// what about it could not be read, the same way the CA registration's own refusals do
-/// ([`super::ca_certificates::unreadable_ca_certificate_message`]).
+/// AWS IoT states this refusal in ONE fixed sentence: it names neither the member that
+/// carried the material, nor the bytes it held, nor what about them could not be read, so
+/// the sentence has no variable part and nothing of the request reaches it. The class it
+/// is stated under is the modelled `InvalidRequestException` (HTTP 400), "The request is
+/// not valid".
 pub fn unreadable_certificate_signing_request_message() -> String {
-    "Invalid certificate signing request: the certificateSigningRequest field is not a \
-     PEM-encoded PKCS#10 certification request"
-        .to_string()
+    "Invalid CSR format".to_string()
 }
 
 /// The message a request refuses a public key the operation does not admit with, worded

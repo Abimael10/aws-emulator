@@ -864,11 +864,10 @@ async fn reusing_one_signing_request_issues_a_distinct_certificate() {
     }
 }
 
-/// The message AWS IoT refuses material it cannot read as a certification request with.
+/// The message AWS IoT refuses material it cannot read as a certification request with:
+/// one fixed sentence with no part taken from the request.
 fn unreadable_message() -> String {
-    "Invalid certificate signing request: the certificateSigningRequest field is not a \
-     PEM-encoded PKCS#10 certification request"
-        .to_string()
+    "Invalid CSR format".to_string()
 }
 
 /// The message it refuses a readable request whose public key the operation does not admit
