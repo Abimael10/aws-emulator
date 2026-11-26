@@ -6,8 +6,10 @@
 //! ascending by `BlockIndex`, paging with a derived opaque `NextToken`.
 //!
 //! EMULATOR DEFAULT, not modelled behaviour: a request that names no `MaxResults` is
-//! paginated at [`DEFAULT_MAX_RESULTS`] (the model declares bounds for `MaxResults` but
-//! no default), so a caller that omits it can still receive a `NextToken`.
+//! paginated at [`crate::state::DEFAULT_MAX_RESULTS`] (the model declares bounds for
+//! `MaxResults` but no default), so a caller that omits it can still receive a
+//! `NextToken`. Both of this service's listings page by that one rule, so the page size
+//! and the `NextToken` check live in [`crate::state`] with the token codec.
 //!
 //! ## Shape of an operation
 //!
@@ -99,14 +101,7 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{decode_page_token, encode_page_token};
-
-/// The page size used when the request names no `MaxResults`.
-///
-/// The model bounds `MaxResults` at `range 100..10000` and documents no default, so the
-/// smallest page a caller may ask for is what an unasked-for page carries: it keeps the
-/// response bounded without inventing a larger limit than the model names anywhere.
-const DEFAULT_MAX_RESULTS: i32 = 100;
+use crate::state::{encode_page_token, page_resume_index, page_size};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,8 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due, which was owed whether or not anybody listed.
         store.apply_due_transitions(now);
 
-        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
-            .unwrap_or(0);
+        let page_size = page_size(input.max_results);
 
         let Some(snapshot) = store
             .snapshots
@@ -234,31 +228,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        // `NextToken` wins over `StartingBlockIndex`: "If you specify NextToken, then
-        // StartingBlockIndex is ignored."
-        //
-        // A `NextToken` this service issued always names a block the snapshot holds (it
-        // is minted from the first block the previous page did not report), so the token
-        // is checked against the stored blocks, not merely decoded: a value that names
-        // another snapshot, or an index this snapshot has no block at, is refused.
-        let starting_block_index = match input.next_token.as_deref() {
-            Some(token) => decode_page_token(token)
-                .filter(|(token_snapshot_id, next_index)| {
-                    *token_snapshot_id == input.snapshot_id
-                        && snapshot.blocks.contains_key(next_index)
-                })
-                .map(|(_, next_index)| next_index)
-                .ok_or_else(|| {
-                    validation(
-                        "INVALID_PAGE_TOKEN",
-                        format!(
-                            "NextToken is not a page token this service issued for snapshot {}",
-                            input.snapshot_id
-                        ),
-                    )
-                })?,
-            None => input.starting_block_index.unwrap_or(0),
-        };
+        // Where the page starts, by the rule both listings of this service share
+        // ([`crate::state::page_resume_index`]): a `NextToken` wins over
+        // `StartingBlockIndex` and is checked against what THIS listing reports, which
+        // here is the blocks the snapshot holds.
+        let starting_block_index = page_resume_index(
+            input.next_token.as_deref(),
+            input.starting_block_index,
+            &input.snapshot_id,
+            |next_index| snapshot.blocks.contains_key(&next_index),
+        )
+        .map_err(|refusal| validation(refusal.reason, refusal.message))?;
 
         // `blocks` is a `BTreeMap` keyed by `BlockIndex`, so `range` already yields the
         // ascending order the response promises and skips every lower index.

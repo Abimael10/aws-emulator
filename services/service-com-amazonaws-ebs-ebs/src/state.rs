@@ -1068,6 +1068,92 @@ pub fn decode_page_token(token: &str) -> Option<(String, i32)> {
     Some((snapshot_id.to_string(), index.parse().ok()?))
 }
 
+/// EMULATOR DEFAULT, not modelled behaviour: the page size a listing uses when the request
+/// names no `MaxResults`.
+///
+/// The model bounds `MaxResults` at `range 100..10000` and documents no default, so the
+/// smallest page a caller may ask for is what an unasked-for page carries: it keeps the
+/// response bounded without inventing a larger limit than the model names anywhere.
+///
+/// Stated here rather than in a handler because BOTH listings of this service page the
+/// same way — `ListSnapshotBlocks` over the blocks of one snapshot, `ListChangedBlocks`
+/// over the changed indexes of two — so the rule is one rule.
+pub const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// How many entries one page carries, for ANY operation of this service that pages: the
+/// `MaxResults` the request named, or [`DEFAULT_MAX_RESULTS`] when it named none.
+///
+/// A value below zero carries nothing rather than saturating into an unbounded page; the
+/// modelled `range` admits none, so this is the saturation branch of the conversion and
+/// not a case of its own.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    usize::try_from(max_results.unwrap_or(DEFAULT_MAX_RESULTS)).unwrap_or(0)
+}
+
+/// The `ValidationExceptionReason` a `NextToken` this service did not issue is refused
+/// under.
+pub const INVALID_PAGE_TOKEN_REASON: &str = "INVALID_PAGE_TOKEN";
+
+/// The message this service answers with when a `NextToken` is not one it issued for the
+/// listing the request asked to resume, for ANY operation that pages.
+///
+/// A request-derived template naming ONE value, the snapshot the listing is of: `NextToken
+/// is not a page token this service issued for snapshot <snapshotId>`. It names no index
+/// and no page size — a token is the only thing that names a page, so a token that resolves
+/// to nothing is the refusal whatever the listing holds.
+pub fn invalid_page_token_message(snapshot_id: &str) -> String {
+    fitted_message(&[
+        MessagePart::Fixed("NextToken is not a page token this service issued for snapshot "),
+        MessagePart::Echoed(snapshot_id),
+    ])
+}
+
+/// A page token this service did not issue, as the reason and the message the refusing
+/// operation's own modelled `ValidationException` carries ([`page_resume_index`]).
+///
+/// The two travel together so that neither listing can refuse the same condition under a
+/// different reason or in different words.
+#[derive(Debug, Clone)]
+pub struct PageTokenRefusal {
+    /// One of `ValidationExceptionReason`'s values: [`INVALID_PAGE_TOKEN_REASON`].
+    pub reason: &'static str,
+    /// The sentence [`invalid_page_token_message`] words for the listing that was asked to
+    /// resume.
+    pub message: String,
+}
+
+/// The block index a listing resumes at, for ANY operation of this service that pages:
+/// the index the `NextToken` names, or else `StartingBlockIndex`, which defaults to the
+/// first index.
+///
+/// `NextToken` wins over `StartingBlockIndex`: "If you specify NextToken, then
+/// StartingBlockIndex is ignored."
+///
+/// A `NextToken` this service issued always names an entry the listing reports (it is
+/// minted from the first entry the previous page did not report), so the token is CHECKED,
+/// not merely decoded: `reports_index` answers whether the listing being resumed reports
+/// the index the token names, and a token that names another snapshot, or an index this
+/// listing does not report, is refused as one this service never issued.
+pub fn page_resume_index(
+    next_token: Option<&str>,
+    starting_block_index: Option<i32>,
+    snapshot_id: &str,
+    reports_index: impl Fn(i32) -> bool,
+) -> Result<i32, PageTokenRefusal> {
+    let Some(token) = next_token else {
+        return Ok(starting_block_index.unwrap_or(0));
+    };
+    decode_page_token(token)
+        .filter(|(token_snapshot_id, next_index)| {
+            token_snapshot_id.as_str() == snapshot_id && reports_index(*next_index)
+        })
+        .map(|(_, next_index)| next_index)
+        .ok_or_else(|| PageTokenRefusal {
+            reason: INVALID_PAGE_TOKEN_REASON,
+            message: invalid_page_token_message(snapshot_id),
+        })
+}
+
 /// The text of a token this service mints for a caller to hand back in a URI QUERY: a
 /// `BlockToken` (`GetSnapshotBlock`'s `blockToken`) or a page token (`ListSnapshotBlocks`
 /// and `ListChangedBlocks`'s `pageToken`).

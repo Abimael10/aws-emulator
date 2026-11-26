@@ -104,17 +104,10 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::state::{
-    decode_page_token, empty_snapshot_message, encode_page_token, is_well_formed_snapshot_id,
-    malformed_snapshot_id_message, snapshot_not_found_message, unrelated_snapshots_message,
-    Snapshot, MISSING_FIRST_SNAPSHOT_MESSAGE,
+    empty_snapshot_message, encode_page_token, is_well_formed_snapshot_id,
+    malformed_snapshot_id_message, page_resume_index, page_size, snapshot_not_found_message,
+    unrelated_snapshots_message, Snapshot, MISSING_FIRST_SNAPSHOT_MESSAGE,
 };
-
-/// The page size used when the request names no `MaxResults`.
-///
-/// The model bounds `MaxResults` at `range 100..10000` and documents no default, so the
-/// smallest page a caller may ask for is what an unasked-for page carries: it keeps the
-/// response bounded without inventing a larger limit than the model names anywhere.
-const DEFAULT_MAX_RESULTS: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -209,8 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due, which was owed whether or not anybody listed.
         store.apply_due_transitions(now);
 
-        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
-            .unwrap_or(0);
+        let page_size = page_size(input.max_results);
 
         // The snapshot the URI names, resolved first because every other member is read
         // relative to it. The READ path sees only a snapshot whose content is final
@@ -280,34 +272,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // `NextToken` wins over `StartingBlockIndex`: "If you specify NextToken, then
-        // StartingBlockIndex is ignored."
-        //
-        // A `NextToken` this service issued always names a changed index of the snapshot
-        // the URI names (it is minted from the first changed index the previous page did
-        // not report), so the token is checked against the comparison just computed, not
-        // merely decoded: a value that names another snapshot, or an index this
-        // comparison does not report, is refused.
-        let starting_block_index = match input.next_token.as_deref() {
-            Some(token) => decode_page_token(token)
-                .filter(|(token_snapshot_id, next_index)| {
-                    *token_snapshot_id == input.second_snapshot_id
-                        && changed
-                            .iter()
-                            .any(|block| block.block_index == Some(*next_index))
-                })
-                .map(|(_, next_index)| next_index)
-                .ok_or_else(|| {
-                    validation(
-                        "INVALID_PAGE_TOKEN",
-                        format!(
-                            "NextToken is not a page token this service issued for snapshot {}",
-                            input.second_snapshot_id
-                        ),
-                    )
-                })?,
-            None => input.starting_block_index.unwrap_or(0),
-        };
+        // Where the page starts, by the rule both listings of this service share
+        // ([`crate::state::page_resume_index`]): a `NextToken` wins over
+        // `StartingBlockIndex` and is checked against what THIS listing reports, which
+        // here is the comparison just computed.
+        let starting_block_index = page_resume_index(
+            input.next_token.as_deref(),
+            input.starting_block_index,
+            &input.second_snapshot_id,
+            |next_index| {
+                changed
+                    .iter()
+                    .any(|block| block.block_index == Some(next_index))
+            },
+        )
+        .map_err(|refusal| validation(refusal.reason, refusal.message))?;
 
         // "The list in the response will start from this block index or the next valid
         // block index in the snapshots" (`StartingBlockIndex`), and the comparison is
