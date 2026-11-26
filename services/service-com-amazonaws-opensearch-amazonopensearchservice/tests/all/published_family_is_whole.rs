@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 use super::domain_lifecycle::{error_code, settled_domain, Emulator};
-use super::instance_type_catalog::{details, instance_types, list};
+use super::instance_type_catalog::{details, instance_types, list, list_type};
 use super::instance_type_limits::{describe_limits, limits_by_role};
 
 /// The roles a general-purpose, compute-optimized or memory-optimized family serves.
@@ -128,11 +128,6 @@ const OUTSIDE_THE_CATALOG: &str = "t9.nonexistent.search";
 /// whose values are `standard`, `gp2`, `io1`, `gp3`.
 const GENERAL_PURPOSE_SUB_TYPES: [&str; 2] = ["gp2", "gp3"];
 
-/// `ListInstanceTypeDetails`' `instanceType` filter, as the query one request sends.
-fn filter_query(instance_type: &str) -> String {
-    format!("instanceType={instance_type}")
-}
-
 /// One entry's `InstanceRole`, as the strings it reports.
 fn roles(entry: &Value, case: &str) -> Vec<String> {
     entry["InstanceRole"]
@@ -183,8 +178,12 @@ async fn the_listing_and_the_limit_catalog_publish_one_answer_per_family() {
              entries",
             current.len()
         );
+        // The narrowed read is made the way the service requires it
+        // ([`super::instance_type_catalog::list_type`]): naming an instance type asks for
+        // that type's Availability Zone information, which the retrieve-AZ flag has to
+        // enable.
         let filtered = details(
-            &list(&emulator, row.offered_on, &filter_query(row.instance_type)).await,
+            &list_type(&emulator, row.offered_on, row.instance_type).await,
             &case,
         );
         assert_eq!(

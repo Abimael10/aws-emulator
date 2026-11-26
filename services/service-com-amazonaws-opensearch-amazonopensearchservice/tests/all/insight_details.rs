@@ -13,10 +13,11 @@
 //! its stored name, type and value, in the order the insight holds them — rendering
 //! each value with the markup the field carries when the request asks for HTML content
 //! and as plain content otherwise; the insight is addressed by the ENTITY and the id
-//! together, and an ENTITY this read cannot resolve is refused as ONE missing resource
-//! naming neither half of the address, while an id that entity holds no insight under
-//! is answered with the ONE field the service states about an insight's details rather
-//! than refused; and nothing is written.
+//! together and BOTH halves have to resolve, so an address that resolves to no insight
+//! — an entity this account does not hold, or an id the entity holds no insight under —
+//! is refused as ONE missing resource naming neither half of it; an insight the service
+//! has raised no detail field for details with the one field the service states about an
+//! insight's details; and nothing is written.
 //!
 //! So the assertions span a SET of inputs rather than one call: a table of fields
 //! covering both values of `InsightFieldType`, a field with a marked-up rendering and
@@ -44,6 +45,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 use super::domain_lifecycle::{
     create_baseline, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
+use super::insight_address_resolution::RESOURCE_NOT_FOUND;
 use super::insights::refused;
 
 /// One row of the detail-field table: the field's name, its type, its plain value and
@@ -269,9 +271,9 @@ fn reported_value(reported: &[Value], name: &str, case: &str) -> String {
 
 /// The guidance view, asserted as the rule states it: the ONE field the service states
 /// about an insight's details, under the name and the modelled type it states it with
-/// and carrying the service's own sentence — whichever entity and id the read named,
-/// and in either rendering, because the guidance is content the service states rather
-/// than content it marks up.
+/// and carrying the service's own sentence — whichever insight a read details, and in
+/// either rendering, because the guidance is content the service states rather than
+/// content it marks up.
 fn guidance(answer: &Answer, case: &str) -> Vec<Value> {
     /// The sentence the service states about an insight's details, as the wire answer
     /// recorded for a detail read words it.
@@ -501,8 +503,8 @@ async fn an_insight_is_addressed_through_the_entity_that_holds_it() {
     // A sibling domain of the same account does not hold this insight, and no
     // `DomainName` entity holds the account's own one: an insight is reported by the
     // entity that holds it, so another entity of the same account resolves no insight
-    // under that id and is answered with the guidance view rather than with the
-    // insight — the id itself never widens the entity a read is scoped to.
+    // under that id and the read is refused as one missing resource — the id itself
+    // never widens the entity a read is scoped to.
     for (entity, insight_id) in [
         (domain_entity("insight-detail-other"), id.clone()),
         (
@@ -512,12 +514,17 @@ async fn an_insight_is_addressed_through_the_entity_that_holds_it() {
     ] {
         let case = format!("DescribeInsightDetails({entity:?}, {insight_id:?})");
         let answer = describe_insight(&emulator, entity.clone(), &insight_id, json!({})).await;
-        guidance(&answer, &case);
+        refused(
+            &answer,
+            &case,
+            RECORDED_NOT_FOUND_STATUS,
+            "ResourceNotFoundException",
+        );
     }
 }
 
 #[tokio::test]
-async fn an_id_the_entity_holds_no_insight_under_is_answered_with_the_guidance_view() {
+async fn an_id_the_entity_holds_no_insight_under_is_refused_as_a_missing_resource() {
     let emulator = Emulator::new();
     let id = seeded(&emulator, "insight-detail-missing").await;
     create_baseline(&emulator, "insight-detail-nothing").await;
@@ -550,9 +557,9 @@ async fn an_id_the_entity_holds_no_insight_under_is_answered_with_the_guidance_v
                 unheld, &id,
                 "case DescribeInsightDetails({unheld:?}): the row must name another id"
             );
-            // The three ways a request can answer `ShowHtmlContent`: the guidance is
-            // content the service states rather than content it marks up, so every one
-            // of them is answered with the same sentence.
+            // The three ways a request can answer `ShowHtmlContent`: what the request
+            // asks a field to be rendered as does not decide whether the insight it
+            // addresses exists, so every one of them is refused the same way.
             for extra in [
                 json!({}),
                 json!({"ShowHtmlContent": false}),
@@ -561,21 +568,29 @@ async fn an_id_the_entity_holds_no_insight_under_is_answered_with_the_guidance_v
                 let case = format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
                 let answer =
                     describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
-                let reported = guidance(&answer, &case);
-
-                // A report: a second identical read answers exactly the same.
-                let again =
-                    describe_insight(&emulator, entity.clone(), unheld, extra.clone()).await;
+                refused(
+                    &answer,
+                    &case,
+                    RECORDED_NOT_FOUND_STATUS,
+                    "ResourceNotFoundException",
+                );
+                // ONE refusal for both halves of the address: a caller cannot tell an
+                // entity this account does not hold from an insight it does not hold, so
+                // the sentence is fixed and names neither half.
+                let said = answer.body["message"].as_str().unwrap_or_default();
                 assert_eq!(
-                    fields(&again, &case),
-                    reported,
-                    "case {case}(twice): expected the same guidance view, got {:?}",
-                    again.body
+                    said, RESOURCE_NOT_FOUND,
+                    "case {case}: expected the fixed missing-resource sentence, got {said:?}"
+                );
+                assert!(
+                    answer.body["Fields"].is_null(),
+                    "case {case}: a refused read carries no detailed view, got {:?}",
+                    answer.body
                 );
             }
         }
-        // Reading ids this entity holds no insight under raised no insight: its
-        // listing is exactly what it was.
+        // The refused reads raised no insight: the entity's listing is exactly what it
+        // was.
         let after = list(&emulator, entity.clone()).await;
         assert_eq!(
             after.body, before.body,
@@ -649,7 +664,7 @@ async fn an_entity_this_account_does_not_hold_is_refused() {
 }
 
 #[tokio::test]
-async fn an_insight_the_service_raised_no_field_for_has_an_empty_detailed_view() {
+async fn an_insight_the_service_raised_no_field_for_details_with_the_services_guidance() {
     let emulator = Emulator::new();
     create_baseline(&emulator, "insight-detail-empty").await;
     let bare_id = guid("000000000003");
@@ -659,19 +674,36 @@ async fn an_insight_the_service_raised_no_field_for_has_an_empty_detailed_view()
         record(&bare_id, SystemTime::now(), Vec::new()),
     );
 
-    // `Fields` is required, so an insight with no detail field is reported with an empty
-    // list rather than refused or answered without the member.
-    let answer = describe_insight(
-        &emulator,
-        domain_entity("insight-detail-empty"),
-        &bare_id,
+    // `Fields` is required and the detailed view of an insight the service holds is never
+    // empty, so an insight it has raised no detail field for details with the one field it
+    // states about an insight's details — in either rendering, and the same on a second
+    // read.
+    for extra in [
         json!({}),
-    )
-    .await;
-    let reported = fields(&answer, "insight with no detail field");
-    assert!(
-        reported.is_empty(),
-        "case insight with no detail field: expected no fields, got {:?}",
-        answer.body["Fields"]
-    );
+        json!({"ShowHtmlContent": false}),
+        json!({"ShowHtmlContent": true}),
+    ] {
+        let case = format!("insight with no detail field {extra:?}");
+        let answer = describe_insight(
+            &emulator,
+            domain_entity("insight-detail-empty"),
+            &bare_id,
+            extra.clone(),
+        )
+        .await;
+        let reported = guidance(&answer, &case);
+        let again = describe_insight(
+            &emulator,
+            domain_entity("insight-detail-empty"),
+            &bare_id,
+            extra,
+        )
+        .await;
+        assert_eq!(
+            fields(&again, &case),
+            reported,
+            "case {case}(twice): expected the same view, got {:?}",
+            again.body
+        );
+    }
 }

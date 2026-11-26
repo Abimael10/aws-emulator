@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::domain_lifecycle::Emulator;
-use super::instance_type_catalog::{list, whole_listing};
+use super::instance_type_catalog::{list_type, whole_listing};
 
 /// The engine releases every table below spans: the oldest Elasticsearch release, each
 /// release one of the features arrived in, one either side of it, and OpenSearch
@@ -235,7 +235,10 @@ async fn an_entry_reports_the_instances_capabilities_on_a_release_without_the_en
             "i3.large.search",
         ] {
             let case = format!("{instance_type} on {release}");
-            let answer = list(&emulator, release, &format!("instanceType={instance_type}")).await;
+            // The narrowed read is made the way the service requires it
+            // ([`super::instance_type_catalog::list_type`]): naming the type asks for its
+            // Availability Zone information, which the retrieve-AZ flag has to enable.
+            let answer = list_type(&emulator, release, instance_type).await;
             assert_eq!(
                 answer.status, 200,
                 "case {case}: expected HTTP 200, got {} {:?}",

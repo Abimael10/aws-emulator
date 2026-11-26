@@ -118,7 +118,9 @@ async fn a_release_publishes_one_listing_whatever_the_account_holds() {
     );
     for query in [
         "retrieveAZs=true",
-        "instanceType=m5.large.search",
+        // Naming an instance type asks for that type's Availability Zone information, so
+        // the narrowed view enables the flag that reports it.
+        "instanceType=m5.large.search&retrieveAZs=true",
         // Naming a domain asks for that domain's zones, so the scoped view enables the
         // flag that reports them.
         &format!("domainName={TENANT}&retrieveAZs=true"),

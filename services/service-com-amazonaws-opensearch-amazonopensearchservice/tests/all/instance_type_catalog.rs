@@ -25,9 +25,12 @@
 //!   later one;
 //! * the `instanceType` filter reports exactly the entry it names, over a table of
 //!   types drawn from the listing, and answers an empty listing for a type the release
-//!   does not offer and for a value that names no published instance type at all — the
-//!   filter decides what is reported and is graded only where the read asks for the
-//!   type's Availability Zones ([`super::instance_type_az_resolution`]);
+//!   does not offer — naming an instance type asks for that type's Availability Zone
+//!   information, so such a read enables the retrieve-AZ flag
+//!   ([`super::instance_type_az_scope`] owns that precondition) and the value is then
+//!   resolved against those zones, so a value naming no published instance type at all is
+//!   refused rather than reported as an empty listing
+//!   ([`super::instance_type_az_resolution`]);
 //! * the release's catalog is reported COMPLETE in a single answer, with no `NextToken`
 //!   member at all, over a table of page sizes: `MaxResults` does not bound what is
 //!   reported and no token is ever handed out, while a `MaxResults` outside the modelled
@@ -139,6 +142,46 @@ pub(crate) async fn list(emulator: &Emulator, engine_version: &str, query: &str)
         format!("{PREFIX}/opensearch/instanceTypeDetails/{engine_version}?{query}")
     };
     emulator.call("GET", &uri, None).await
+}
+
+/// A read NARROWED to one instance type, as such a read has to be made.
+///
+/// Naming an instance type asks the service for that type's Availability Zone
+/// information, so a narrowed read enables the retrieve-AZ flag: without it the service
+/// refuses the read for the flag, which is [`super::instance_type_az_scope`]'s subject.
+/// Shared with the sibling suites that read one entry back.
+pub(crate) async fn list_type(
+    emulator: &Emulator,
+    engine_version: &str,
+    instance_type: &str,
+) -> Answer {
+    list(
+        emulator,
+        engine_version,
+        &format!("instanceType={instance_type}&retrieveAZs=true"),
+    )
+    .await
+}
+
+/// The entries of a narrowed read, each asserted to carry the Availability Zones the
+/// read had to ask for and reported WITHOUT them, so a case can state the rest of the
+/// entry without restating the Region's zones — which
+/// [`retrieve_azs_reports_the_zones_of_the_listing_region`] owns.
+pub(crate) fn narrowed(answer: &Answer, case: &str) -> Vec<Value> {
+    details(answer, case)
+        .iter()
+        .map(|entry| {
+            assert!(
+                entry["AvailabilityZones"].is_array(),
+                "case {case}: expected the zones the narrowed read asked for, got {entry:?}"
+            );
+            let mut without = entry.clone();
+            if let Some(members) = without.as_object_mut() {
+                members.remove("AvailabilityZones");
+            }
+            without
+        })
+        .collect()
 }
 
 /// The `InstanceTypeDetails` list of an answer, with the case named on failure.
@@ -926,8 +969,8 @@ async fn anchored_entries_are_reported_exactly() {
             .expect("every anchor names its instance type")
             .to_owned();
         let case = format!("{instance_type} on {version}");
-        let answer = list(&emulator, version, &format!("instanceType={instance_type}")).await;
-        let entry = details(&answer, &case);
+        let answer = list_type(&emulator, version, &instance_type).await;
+        let entry = narrowed(&answer, &case);
         assert_eq!(
             entry.len(),
             1,
@@ -972,13 +1015,8 @@ async fn instance_type_filter_reports_exactly_that_type() {
             .iter()
             .find(|entry| entry["InstanceType"].as_str() == Some(&instance_type))
             .unwrap_or_else(|| panic!("the listing reports {instance_type}"));
-        let answer = list(
-            &emulator,
-            version,
-            &format!("instanceType={instance_type}"),
-        )
-        .await;
-        let filtered = details(&answer, &instance_type);
+        let answer = list_type(&emulator, version, &instance_type).await;
+        let filtered = narrowed(&answer, &instance_type);
         assert_eq!(
             filtered.len(),
             1,
@@ -1007,13 +1045,8 @@ async fn instance_type_filter_reports_exactly_that_type() {
         ("ultrawarm1.medium.search", "Elasticsearch_6.7"),
         ("r6g.large.search", "Elasticsearch_7.8"),
     ] {
-        let answer = list(
-            &emulator,
-            version,
-            &format!("instanceType={not_offered}"),
-        )
-        .await;
-        let empty = details(&answer, not_offered);
+        let answer = list_type(&emulator, version, not_offered).await;
+        let empty = narrowed(&answer, not_offered);
         assert!(
             empty.is_empty(),
             "case {not_offered} on {version}: expected an empty listing, got {empty:?}"
@@ -1022,29 +1055,6 @@ async fn instance_type_filter_reports_exactly_that_type() {
             answer.body["NextToken"].is_null(),
             "case {not_offered} on {version}: an empty listing carries no NextToken, got \
              {:?}",
-            answer.body["NextToken"]
-        );
-    }
-
-    // A value of the member's own shape that names no published instance type selects no
-    // entry, so the listing it narrows is empty: the filter decides what is REPORTED and
-    // is graded only where the read asks the service to resolve it against an Availability
-    // Zone, which is [`super::instance_type_az_resolution`]'s subject.
-    for unknown in [
-        "nosuch.large.search",
-        "m5.nosuch.search",
-        "m7i.48xlarge.search",
-        "r6g.large.search.search",
-    ] {
-        let answer = list(&emulator, version, &format!("instanceType={unknown}")).await;
-        let empty = details(&answer, unknown);
-        assert!(
-            empty.is_empty(),
-            "case {unknown}: expected an empty listing, got {empty:?}"
-        );
-        assert!(
-            answer.body["NextToken"].is_null(),
-            "case {unknown}: an empty listing carries no NextToken, got {:?}",
             answer.body["NextToken"]
         );
     }
@@ -1059,7 +1069,7 @@ async fn instance_type_filter_reports_exactly_that_type() {
         let reported = whole_listing(
             &emulator,
             version,
-            &format!("instanceType={first}&nextToken={token}"),
+            &format!("instanceType={first}&retrieveAZs=true&nextToken={token}"),
         )
         .await;
         assert_eq!(
@@ -1348,6 +1358,7 @@ async fn reading_the_catalog_changes_nothing() {
 
     // Paged, filtered, zone-carrying and refused reads, all of which only report.
     list(&emulator, version, "maxResults=3").await;
+    list_type(&emulator, version, "m5.large.search").await;
     list(&emulator, version, "instanceType=m5.large.search").await;
     list(&emulator, version, "retrieveAZs=true").await;
     list(&emulator, version, "domainName=nosuch&retrieveAZs=true").await;

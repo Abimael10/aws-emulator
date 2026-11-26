@@ -18,12 +18,12 @@
 //!   is the missing resource, and against a domain the account holds, where the SAME
 //!   request earns the handler's own refusal, so resolving first does not suppress the
 //!   rules that follow;
-//! * a read of ONE insight refuses an ENTITY it cannot resolve as one missing resource,
+//! * a read of ONE insight refuses an address it cannot resolve as one missing resource,
 //!   naming neither the entity nor the id — over a table of entities this account holds
-//!   nothing for, each against several ids — while an entity whose type is outside the
-//!   published set stays the malformed request it is, the insight an entity DOES hold is
-//!   reported, and an id a resolved entity holds no insight under is answered with the
-//!   guidance the service states about an insight's details;
+//!   nothing for, each against several ids, and over ids a RESOLVED entity holds no
+//!   insight under, which are refused the very same way — while an entity whose type is
+//!   outside the published set stays the malformed request it is and the insight an
+//!   entity DOES hold is reported;
 //! * each of those refusals is answered the way every missing-resource refusal of this
 //!   service is answered ([`assert_missing_resource`]), which is not the status the error
 //!   shape's own `@httpError` declares.
@@ -39,6 +39,7 @@ use super::domain_lifecycle::{error_code, Answer, Emulator};
 use super::domain_maintenance::{start as start_maintenance, MAINTENANCE_TYPES};
 use super::index_registry::{create as create_index, stored_names};
 use super::index_schema_updates::update as update_index;
+use super::insight_address_resolution::RESOURCE_NOT_FOUND;
 use super::insight_details::{describe_insight, domain_entity, guid, raise_on_domain, record};
 use super::missing_resource_status::{absent_domains, assert_missing_resource};
 use super::saved_object_migrations::get_migration;
@@ -190,7 +191,7 @@ async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve
     let emulator = Emulator::new();
     let held = "insight-address";
     created_domain(&emulator, held).await;
-    let resource_not_found = "Resource not found";
+    let resource_not_found = RESOURCE_NOT_FOUND;
 
     // The ids differ in what the field that tells one `GUID` from another spells, so the
     // rule is asserted over the id as well as over the entity.
@@ -247,12 +248,9 @@ async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve
         );
     }
 
-    // Only the ENTITY half of the address decides whether the read resolves: the
-    // insight this entity DOES hold is reported, and an id it holds no insight under is
-    // ANSWERED — with the guidance the service states about an insight's details, which
-    // is what the recorded wire answer for such a read carries (the detail read of
-    // `opensearch-domain-insights-operations`), so the id is not resolved the way the
-    // entity is.
+    // Only ONE refusal answers both halves of the address: the insight this entity DOES
+    // hold is reported, and an id it holds no insight under is refused exactly as an
+    // entity this account does not hold is — a caller cannot tell the two apart.
     let held_id = guid("00000000000a");
     raise_on_domain(
         &emulator,
@@ -269,17 +267,17 @@ async fn a_read_of_one_insight_names_neither_half_of_an_entity_it_cannot_resolve
     for id in &ids {
         let answer = describe_insight(&emulator, domain_entity(held), id, json!({})).await;
         let case = format!("DescribeInsightDetails(DomainName {held:?}, {id})");
+        assert_missing_resource(&answer, &case);
+        let said = message(&answer);
         assert_eq!(
-            answer.status, 200,
-            "case {case}: an id a RESOLVED entity holds no insight under is answered, so \
-             expected 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.body["Fields"][0]["Name"].as_str(),
-            Some("Message"),
-            "case {case}: expected the guidance field the service states, got {:?}",
+            said, resource_not_found,
+            "case {case}: expected {resource_not_found:?}, got {:?}",
             answer.body
+        );
+        assert!(
+            !said.contains(held) && !said.contains(id.as_str()),
+            "case {case}: expected the refusal to name neither half of the address, got \
+             {said:?}"
         );
     }
 }

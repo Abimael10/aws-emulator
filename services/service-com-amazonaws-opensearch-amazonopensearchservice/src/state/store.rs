@@ -914,27 +914,39 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         }
     }
 
-    /// The one insight the entity a request names holds under `insight_id`, or
-    /// `None` where that entity holds none under it.
+    /// The one insight the entity a request names holds under `insight_id`.
     ///
-    /// An insight is addressed by its entity and its id together, so this resolves
-    /// the entity exactly as [`Self::insights_of_entity`] does — the same ONE
-    /// decision, and the only one that can refuse — and then looks the id up among
-    /// the insights THAT entity holds, so an insight another entity holds is never
-    /// reported here. An id the entity holds no insight under is not a refusal: it
-    /// names no insight of this entity, which the caller reports as it reports any
-    /// other id it resolves nothing for.
+    /// An insight is addressed by its entity and its id together, so BOTH halves of
+    /// that address have to resolve: the entity is resolved exactly as
+    /// [`Self::insights_of_entity`] resolves it, and the id is then looked up among
+    /// the insights THAT entity holds, so an insight another entity holds names
+    /// nothing here. An address that resolves to no insight — a `DomainName` this
+    /// account holds no domain under, or an id the entity holds no insight under — is
+    /// ONE missing resource naming neither half ([`insight_resource_not_found`]), the
+    /// same refusal the sibling submission that addresses an insight this way answers
+    /// with ([`Self::insight_for_feedback_mut`]), while an entity whose type is
+    /// outside `InsightEntityType` names no kind of resource at all and stays the
+    /// malformed request it is.
     ///
     /// Reads ONLY.
     pub fn insight_of_entity(
         &self,
         entity: &InsightEntity,
         insight_id: &str,
-    ) -> Result<Option<&InsightRecord>, InsightEntityRefusal> {
-        Ok(self
-            .insights_of_entity(entity)?
+    ) -> Result<&InsightRecord, InsightEntityRefusal> {
+        self.insights_of_entity(entity)
+            .map_err(|refusal| match refusal {
+                // Which HALF of the address resolved to nothing is not disclosed: an
+                // entity this account holds nothing for and an id the entity holds no
+                // insight under are the same missing resource to a caller.
+                InsightEntityRefusal::NotFound(_) => {
+                    InsightEntityRefusal::NotFound(insight_resource_not_found())
+                }
+                malformed => malformed,
+            })?
             .into_iter()
-            .find(|record| record.insight_id == insight_id))
+            .find(|record| record.insight_id == insight_id)
+            .ok_or_else(|| InsightEntityRefusal::NotFound(insight_resource_not_found()))
     }
 
     /// The one insight a feedback submission addresses, ready to be written.

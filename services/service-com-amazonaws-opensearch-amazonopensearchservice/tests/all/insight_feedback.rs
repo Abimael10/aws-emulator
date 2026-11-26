@@ -138,7 +138,11 @@ fn domain_entity(name: &str) -> Value {
 }
 
 /// `POST /2021-01-01/opensearch/insight-feedback` with `body`.
-async fn feedback(emulator: &Emulator, body: Value) -> Answer {
+///
+/// Reached by [`super::insight_address_resolution`] as
+/// `super::insight_feedback::feedback`, so the crate holds ONE wire call of this
+/// operation.
+pub(crate) async fn feedback(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -150,7 +154,15 @@ async fn feedback(emulator: &Emulator, body: Value) -> Answer {
 
 /// The request body of a submission: the members a caller sends, with `FeedbackText`
 /// present only where the submission carries text.
-fn submission(entity: Value, insight_id: &str, thumbs: &str, text: Option<&str>) -> Value {
+///
+/// Reached by [`super::insight_address_resolution`] as
+/// `super::insight_feedback::submission`, so the crate holds ONE builder of it.
+pub(crate) fn submission(
+    entity: Value,
+    insight_id: &str,
+    thumbs: &str,
+    text: Option<&str>,
+) -> Value {
     let mut body = json!({"Entity": entity, "InsightId": insight_id, "Thumbs": thumbs});
     if let Some(text) = text {
         body["FeedbackText"] = json!(text);

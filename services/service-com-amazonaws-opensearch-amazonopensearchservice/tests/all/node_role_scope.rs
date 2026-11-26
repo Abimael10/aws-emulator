@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use super::domain_lifecycle::{
     error_code, settled_domain, Answer, Emulator, RECORDED_NOT_FOUND_STATUS,
 };
-use super::instance_type_catalog::list;
+use super::instance_type_catalog::list_type;
 
 /// The engine release every row is created on: one that offers every family named below,
 /// so a refusal is the tier's and never the release's.
@@ -194,14 +194,13 @@ fn expected_message(instance_type: &str) -> String {
 /// The roles the published catalog reports for one instance type on [`ENGINE_VERSION`],
 /// read through `ListInstanceTypeDetails` — so each row's premise is the service's own
 /// published content rather than a second copy of its table.
+///
+/// The narrowed read is made the way the service requires it
+/// ([`super::instance_type_catalog::list_type`]): naming an instance type asks for that
+/// type's Availability Zone information, which the retrieve-AZ flag has to enable.
 async fn published_roles(emulator: &Emulator, instance_type: &str) -> Vec<String> {
     let case = format!("the published roles of {instance_type}");
-    let answer = list(
-        emulator,
-        ENGINE_VERSION,
-        &format!("instanceType={instance_type}"),
-    )
-    .await;
+    let answer = list_type(emulator, ENGINE_VERSION, instance_type).await;
     assert_eq!(
         answer.status, 200,
         "case {case}: expected the catalog entry, got {} {:?}",

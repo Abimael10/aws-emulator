@@ -20,17 +20,17 @@
 //! answers to is offered by no zone: the read is refused with the modelled
 //! `ValidationException` (HTTP 400) and the service's sentence for a zone that does not
 //! support the type, which echoes the value exactly as the request carried it. A read that
-//! does NOT ask for zone information resolves nothing against a zone, so there the same
-//! value is not graded at all: it only narrows what is reported, and the listing it names
-//! no entry of is empty.
+//! names a type and does NOT enable the retrieve-AZ flag never reaches that grading: it
+//! asks for Availability Zone information the answer would not carry, and is refused for
+//! the flag first ([`super::instance_type_az_scope`]).
 //!
 //! The assertions therefore span SETS of inputs: a table of values the catalog publishes no
 //! instance type for — a family it does not carry, a size a family is not published in, a
 //! size no family is published in, a value that is not an instance type at all, and a
 //! published type spelled in another case — each on releases of both engines, scoped to a
 //! domain and unscoped, and beside the other optional members; the same values with the
-//! flag absent and sent false, which are answered; and the published types, which are
-//! answered with their zones.
+//! flag absent and sent false, which are refused for the flag instead; and the published
+//! types, which are answered with their zones.
 
 use serde_json::json;
 
@@ -77,6 +77,12 @@ const BESIDE: [&str; 3] = ["", "maxResults=5", "nextToken=m5.large.search"];
 fn expected_message(instance_type: &str) -> String {
     format!("The AZ doesn't support instance type :{instance_type}")
 }
+
+/// The service's fixed sentence for the retrieve-AZ flag, restated here for the same
+/// reason: a read that names a type without enabling the flag is refused with THIS
+/// sentence rather than with the one above.
+const RETRIEVE_AZ_FLAG_REQUIRED: &str =
+    "Retrieve AZ flag need to be enabled to get Instance Type AZ information.";
 
 /// Assert that `answer` is the modelled zone refusal for `instance_type` and carries no
 /// listing.
@@ -173,12 +179,13 @@ async fn a_domain_scoped_read_is_refused_the_same_way() {
 }
 
 #[tokio::test]
-async fn the_same_value_is_not_graded_when_no_zone_information_is_asked_for() {
+async fn the_same_value_is_refused_for_the_flag_when_no_zone_information_is_asked_for() {
     let emulator = Emulator::new();
 
-    // The flag absent, and sent false: neither read resolves anything against a zone, so
-    // the value is not graded. It still decides what is REPORTED, and it names no entry of
-    // the listing, so the answer is an empty listing rather than a refusal.
+    // The flag absent, and sent false: naming an instance type asks for that type's
+    // Availability Zone information, which neither read enables, so both are refused for
+    // the flag BEFORE the value is weighed against a zone — the precondition is judged
+    // first, so the value's own refusal is never the answer here.
     for version in VERSIONS {
         for instance_type in NO_ZONE_OFFERS {
             for flag in ["", "retrieveAZs=false"] {
@@ -189,15 +196,21 @@ async fn the_same_value_is_not_graded_when_no_zone_information_is_asked_for() {
                     .join("&");
                 let case = format!("{version} ?{query}");
                 let answer = list(&emulator, version, &query).await;
-                let entries = listed(&case, &answer);
-                assert!(
-                    entries.is_empty(),
-                    "case {case}: expected an empty listing, got {entries:?}"
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case}: expected HTTP 400, got {} {:?}",
+                    answer.status, answer.body
+                );
+                let actual = answer.body["message"].as_str().unwrap_or_default();
+                assert_eq!(
+                    actual, RETRIEVE_AZ_FLAG_REQUIRED,
+                    "case {case}: expected the sentence naming the flag rather than the \
+                     zones' answer about the type, got {actual:?}"
                 );
                 assert!(
-                    answer.body["NextToken"].is_null(),
-                    "case {case}: an empty listing carries no NextToken, got {:?}",
-                    answer.body["NextToken"]
+                    answer.body["InstanceTypeDetails"].is_null(),
+                    "case {case}: a refused read carries no listing, got {:?}",
+                    answer.body["InstanceTypeDetails"]
                 );
             }
         }

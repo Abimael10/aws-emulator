@@ -9,7 +9,10 @@
 //! version is
 //! first RESOLVED against the catalog of releases the service publishes
 //! ([`crate::state::resolve_engine_version`], the set `ListVersions` advertises):
-//! there is no instance-type catalog for a release the service does not offer.
+//! there is no instance-type catalog for a release the service does not offer. A read
+//! that names the domain whose Region's zones would be reported, or the instance type
+//! those zones would be asked about, asks for instance-type Availability Zone
+//! information and is refused unless it enables the retrieve-AZ flag.
 //!
 //! An instance type is published BY the service, never created by a caller, so this
 //! is a pure read: it writes nothing, and the same request answers the same way on
@@ -204,23 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version = crate::state::resolve_engine_version("EngineVersion", &input.engine_version)
             .map_err(ListInstanceTypeDetailsErrorModeled::ValidationException)?;
 
-        // "An optional parameter that lists information for a given instance type" —
-        // the filter NARROWS the listing to that one instance type and decides nothing
-        // else: `InstanceTypeString`'s pattern admits any `<family>.<size>.search` value,
-        // and whether the catalog publishes an entry for the value or not, the listing it
-        // narrows is simply the entries it names. The value is graded only where the
-        // request asks the service to resolve it against an Availability Zone, below.
-
-        // "The name of the domain" — an optional scope whose ONLY effect on this read is
-        // which Region's Availability Zones are reported: the catalog itself is the named
-        // release's and is the same scoped or unscoped. Naming a domain is therefore
-        // asking for that domain's Availability Zone information, which this operation
-        // reports only when the retrieve-AZ flag asks for it — so a scoped read that does
-        // not enable the flag asks for AZ information the answer would not carry, and is
-        // refused rather than answered with an unscoped listing. Stated before the domain
-        // is resolved: what the request asked for is judged before an account resource is
-        // looked up.
-        if input.domain_name.is_some() && input.retrieve_a_zs != Some(true) {
+        // "An optional parameter that lists information for a given instance type" and
+        // "the name of the domain" are the two members whose information this read has
+        // to resolve against Availability Zones: the domain decides WHICH Region's
+        // zones an entry reports, and the instance type is the hardware those zones are
+        // asked about. Naming either is therefore asking for instance-type Availability
+        // Zone information, which the answer carries only when the retrieve-AZ flag
+        // asks for it — so a read that names one without enabling the flag asks for
+        // information the answer would not carry, and is refused rather than answered
+        // with a listing that resolved nothing against a zone. Stated before anything is
+        // resolved: what the request asked for is judged before an account resource is
+        // looked up and before the named type is weighed against the zones.
+        if (input.domain_name.is_some() || input.instance_type.is_some())
+            && input.retrieve_a_zs != Some(true)
+        {
             return Err(ListInstanceTypeDetailsErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(RETRIEVE_AZ_FLAG_REQUIRED.to_string()),
@@ -259,9 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // offer it. A value the catalog publishes no instance type for names hardware no
         // zone has, so there is no zone that offers it and the read is refused rather than
         // answered with a zone list for nothing. Stated once the zones the type would be
-        // resolved against are known, and only for a read that asked for them: a read
-        // carrying no retrieve-AZ flag resolves nothing against a zone, so there the same
-        // value is not graded and merely narrows the published listing.
+        // resolved against are known, and after the precondition above, so a read naming a
+        // type is weighed against the zones it did ask the service for.
         if let Some(refusal) = crate::state::az_unsupported_instance_type_refusal(
             availability_zones.as_deref(),
             input.instance_type.as_deref(),

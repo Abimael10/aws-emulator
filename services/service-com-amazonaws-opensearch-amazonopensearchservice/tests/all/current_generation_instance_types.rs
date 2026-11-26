@@ -36,6 +36,7 @@ use serde_json::Value;
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES;
 
 use super::domain_lifecycle::{Answer, Emulator, PREFIX};
+use super::instance_type_catalog::list_type;
 
 /// The roles a general-purpose, compute-optimized or memory-optimized family serves.
 const DATA_MASTER_COORDINATOR: &[&str] = &["data", "master", "coordinator"];
@@ -177,11 +178,11 @@ async fn the_catalog_publishes_the_current_generation_families_the_service_accep
         );
 
         // The `instanceType` filter reports exactly the entry the listing reports, and
-        // the entry carries the roles an instance of the family serves.
-        let filtered = details(
-            &list(&emulator, from, &format!("instanceType={instance_type}")).await,
-            &case,
-        );
+        // the entry carries the roles an instance of the family serves. The narrowed read
+        // is made the way the service requires it
+        // ([`super::instance_type_catalog::list_type`]): naming the type asks for its
+        // Availability Zone information, which the retrieve-AZ flag has to enable.
+        let filtered = details(&list_type(&emulator, from, instance_type).await, &case);
         assert_eq!(
             filtered.len(),
             1,
@@ -238,7 +239,7 @@ async fn the_published_catalog_and_the_accepted_value_set_agree() {
             "case the {family} family: expected the family's published sizes, got {sizes:?}"
         );
         let listing = details(
-            &list(&emulator, CURRENT_RELEASE, &format!("instanceType={instance_type}")).await,
+            &list_type(&emulator, CURRENT_RELEASE, instance_type).await,
             instance_type,
         );
         let reported = roles(&listing[0], instance_type);
@@ -261,12 +262,7 @@ async fn availability_zones_are_reported_for_the_current_generations_too() {
     // current generations carry them exactly as every other entry does.
     for (instance_type, from, _, _) in CURRENT_GENERATION {
         let case = format!("{instance_type} on {from} with retrieveAZs");
-        let answer = list(
-            &emulator,
-            from,
-            &format!("instanceType={instance_type}&retrieveAZs=true"),
-        )
-        .await;
+        let answer = list_type(&emulator, from, instance_type).await;
         let entry = details(&answer, &case);
         let zones: Vec<String> = entry[0]["AvailabilityZones"]
             .as_array()
@@ -282,16 +278,16 @@ async fn availability_zones_are_reported_for_the_current_generations_too() {
             "case {case}: expected the signing Region's zones, got {zones:?}"
         );
 
-        // Without the flag the member is not reported, so a client reads no zones it did
-        // not ask for.
-        let without = details(
-            &list(&emulator, from, &format!("instanceType={instance_type}")).await,
-            &case,
-        );
+        // A read that asks for no zone information carries the member for no entry, so a
+        // client reads no zones it did not ask for.
+        let whole = details(&list(&emulator, from, "").await, &case);
+        let entry = whole
+            .iter()
+            .find(|entry| entry["InstanceType"].as_str() == Some(instance_type))
+            .unwrap_or_else(|| panic!("case {case}: expected the release to publish the type"));
         assert!(
-            without[0]["AvailabilityZones"].is_null(),
-            "case {case}: expected no zones for a request that did not ask, got {:?}",
-            without[0]
+            entry["AvailabilityZones"].is_null(),
+            "case {case}: expected no zones for a request that did not ask, got {entry:?}"
         );
     }
 }

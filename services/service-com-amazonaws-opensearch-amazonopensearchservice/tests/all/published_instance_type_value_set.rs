@@ -30,6 +30,7 @@ use service_common::validation_message::hashed_enum_order;
 
 use super::constraint_refusal_messages::{clause, message, report, value_set};
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
+use super::instance_type_catalog::list_type;
 
 /// An engine version the service offers, so a row's refusal is about the instance type it
 /// carries rather than about the release it names.
@@ -221,11 +222,12 @@ async fn the_stated_set_is_the_catalog_the_listing_serves() {
 /// Whether `ListInstanceTypeDetails` publishes `instance_type` for the offered release —
 /// the catalog the refusal's value set has to agree with, read back through the operation
 /// that serves it.
+///
+/// The narrowed read is made the way the service requires it
+/// ([`super::instance_type_catalog::list_type`]): naming an instance type asks for that
+/// type's Availability Zone information, which the retrieve-AZ flag has to enable.
 async fn served_by_the_listing(emulator: &Emulator, instance_type: &str) -> bool {
-    let uri = format!(
-        "{PREFIX}/opensearch/instanceTypeDetails/{OFFERED_VERSION}?instanceType={instance_type}"
-    );
-    let answer = emulator.call("GET", &uri, None).await;
+    let answer = list_type(emulator, OFFERED_VERSION, instance_type).await;
     answer.body["InstanceTypeDetails"]
         .as_array()
         .is_some_and(|entries| {

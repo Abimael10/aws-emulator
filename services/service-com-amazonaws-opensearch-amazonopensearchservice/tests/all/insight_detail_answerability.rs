@@ -9,15 +9,15 @@
 //! listing from [`super::insights`] and the constraint report from
 //! [`super::constraint_refusal_messages`]; this suite adds no second copy of any of them.
 //!
-//! The rule under test: a detail read is an informational REPORT that is answerable for
-//! every entity this service resolves — an id that entity holds no insight under is
-//! answered 200 with the `@required` `Fields` list carrying at least one field, each with
-//! a `Name`, a modelled `Type` and a `Value`, rather than refused as a missing resource —
-//! and what it answers there carries no part of the request, so the view is the same
-//! whichever resolvable entity and whichever well-formed id a read names. Nothing else is
-//! relaxed by that: an entity whose type is outside `InsightEntityType`, an `Account`
-//! entity naming another account and a `DomainName` this account holds no domain under are
-//! still refused, and a read writes nothing.
+//! The rule under test: a detail read details the ONE insight its address resolves, and
+//! an address that resolves to no insight is refused as ONE missing resource naming
+//! neither half of it — so against a store that holds no insight at all EVERY detail read
+//! is refused, whichever entity this service resolves and whichever well-formed id the
+//! read names, and the refusal is the same fixed sentence either way. Nothing else is
+//! changed by that: an entity whose type is outside `InsightEntityType`, an `Account`
+//! entity naming another account and a `DomainName` this account holds no domain under
+//! are refused as the malformed requests and missing resources they are, and a read
+//! writes nothing — it does not raise the insight it failed to resolve.
 //!
 //! No insight is seeded anywhere, which is what tells this suite apart from
 //! [`super::insight_details`]: an insight is RAISED by the service observing a domain, so
@@ -32,14 +32,11 @@
 //! nothing for.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
-    INSIGHT_ENTITY_TYPE_VALUES, INSIGHT_FIELD_TYPE_VALUES,
-};
+use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::INSIGHT_ENTITY_TYPE_VALUES;
 
 use super::constraint_refusal_messages::{clause, message, report, value_set};
-use super::domain_lifecycle::{
-    create_baseline, Answer, Emulator, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
-};
+use super::domain_lifecycle::{create_baseline, settled_domain, Answer, Emulator};
+use super::insight_address_resolution::RESOURCE_NOT_FOUND;
 use super::insight_details::{describe_insight, domain_entity, guid};
 use super::insights::{list, refused};
 
@@ -47,8 +44,8 @@ use super::insights::{list, refused};
 /// precondition a client polls for before it reads insight detail.
 const READY_DOMAIN: &str = "insight-answerable-ready";
 
-/// A domain still inside its provisioning span, so readiness is not what makes a detail
-/// read answerable.
+/// A domain still inside its provisioning span, so readiness is not what decides how a
+/// detail read against it is answered.
 const PROVISIONING_DOMAIN: &str = "insight-answerable-new";
 
 /// The ids every case below reads.
@@ -74,42 +71,22 @@ fn is_ready(answer: &Answer) -> bool {
     status["Created"].as_bool() == Some(true) && status["Processing"].as_bool() == Some(false)
 }
 
-/// The `Fields` of an answered detail read, asserted to be the view the rule states: a
-/// non-empty list, every element carrying the three `@required` members of `InsightField`
-/// with a `Type` inside the catalog the model declares.
-fn answered_fields(answer: &Answer, case: &str) -> Vec<Value> {
+/// A refused detail read, asserted to be the missing-resource refusal the rule states:
+/// the modelled shape on the status this service answers it on
+/// ([`super::missing_resource_status::assert_missing_resource`], the crate's one statement
+/// of that pair), carrying the fixed sentence and no detailed view.
+fn assert_missing_resource(answer: &Answer, case: &str) {
+    super::missing_resource_status::assert_missing_resource(answer, case);
+    let said = answer.body["message"].as_str().unwrap_or_default();
     assert_eq!(
-        answer.status, 200,
-        "case {case}: expected 200, got {} with {:?}",
-        answer.status, answer.body
+        said, RESOURCE_NOT_FOUND,
+        "case {case}: expected the fixed missing-resource sentence, got {said:?}"
     );
-    let reported = answer.body["Fields"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case}: expected a Fields list, got {:?}", answer.body))
-        .clone();
     assert!(
-        !reported.is_empty(),
-        "case {case}: expected at least one informational field, got {:?}",
+        answer.body["Fields"].is_null(),
+        "case {case}: a refused read carries no detailed view, got {:?}",
         answer.body
     );
-    for field in &reported {
-        let name = field["Name"].as_str().unwrap_or_default();
-        assert!(
-            !name.is_empty(),
-            "case {case}: expected a non-empty Name on every field, got {field:?}"
-        );
-        assert!(
-            field["Value"].is_string(),
-            "case {case}: expected a string Value on every field, got {field:?}"
-        );
-        // The type catalog is the model's own enum, as generated into `ops::types`.
-        let field_type = field["Type"].as_str().unwrap_or_default();
-        assert!(
-            INSIGHT_FIELD_TYPE_VALUES.contains(&field_type),
-            "case {case}: expected a modelled field type, got {field:?}"
-        );
-    }
-    reported
 }
 
 /// Whether the store holds no insight at all: neither for the account nor on any domain.
@@ -147,20 +124,21 @@ async fn empty_listing(emulator: &Emulator, entity: &Value, case: &str) {
 }
 
 #[tokio::test]
-async fn a_detail_read_is_answerable_for_every_entity_this_service_resolves() {
+async fn a_detail_read_against_a_store_holding_no_insight_is_refused() {
     let emulator = Emulator::new();
     create_baseline(&emulator, READY_DOMAIN).await;
     // The precondition a client polls for: the domain has reached the status the clock
-    // owes it.
-    tokio::time::sleep(SETTLE_WAIT).await;
-    let ready = emulator.describe(READY_DOMAIN).await;
-    assert!(
-        is_ready(&ready),
-        "case {READY_DOMAIN}: expected Created && !Processing once the span has passed, got {:?}",
-        ready.body["DomainStatus"]
+    // owes it. Polled rather than waited out, so the case does not depend on how fast the
+    // host runs.
+    let settled = settled_domain(&emulator, READY_DOMAIN).await;
+    assert_eq!(
+        settled["Created"].as_bool(),
+        Some(true),
+        "case {READY_DOMAIN}: expected the settled domain to report itself created, got \
+         {settled:?}"
     );
-    // And one domain inside its provisioning span, so what makes the read answerable is
-    // that the entity resolves and not that it has settled.
+    // And one domain inside its provisioning span, so what decides the answer is whether
+    // the address resolves an insight and not whether the domain has settled.
     create_baseline(&emulator, PROVISIONING_DOMAIN).await;
     let provisioning = emulator.describe(PROVISIONING_DOMAIN).await;
     assert!(
@@ -179,7 +157,6 @@ async fn a_detail_read_is_answerable_for_every_entity_this_service_resolves() {
         domain_entity(PROVISIONING_DOMAIN),
     ];
 
-    let mut views: Vec<(String, Vec<Value>)> = Vec::new();
     for entity in &entities {
         assert!(
             INSIGHT_ENTITY_TYPE_VALUES.contains(&entity["Type"].as_str().unwrap_or_default()),
@@ -190,31 +167,30 @@ async fn a_detail_read_is_answerable_for_every_entity_this_service_resolves() {
         empty_listing(&emulator, entity, &format!("ListInsights({entity:?})")).await;
 
         for unheld in unheld_ids() {
-            // The three ways a request can answer `ShowHtmlContent`: a read with no
-            // stored field to render answers the same either way.
+            // The three ways a request can answer `ShowHtmlContent`: what a field would be
+            // rendered as does not decide whether the insight the read addresses exists.
             for extra in [
                 json!({}),
                 json!({"ShowHtmlContent": false}),
                 json!({"ShowHtmlContent": true}),
             ] {
-                let case =
-                    format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
+                let case = format!("DescribeInsightDetails({entity:?}, {unheld:?}, {extra:?})");
                 let answer =
                     describe_insight(&emulator, entity.clone(), &unheld, extra.clone()).await;
-                views.push((case.clone(), answered_fields(&answer, &case)));
+                assert_missing_resource(&answer, &case);
 
-                // A report: the same request answers the same thing again.
-                let again =
-                    describe_insight(&emulator, entity.clone(), &unheld, extra).await;
+                // A report: the same request is refused the same way again.
+                let again = describe_insight(&emulator, entity.clone(), &unheld, extra).await;
                 assert_eq!(
                     again.body, answer.body,
-                    "case {case}(twice): expected the same view, got {:?}",
+                    "case {case}(twice): expected the same refusal, got {:?}",
                     again.body
                 );
             }
         }
 
-        // Reading detail raised no insight for the entity, so its listing is what it was.
+        // The refused reads raised no insight for the entity, so its listing is what it
+        // was.
         empty_listing(
             &emulator,
             entity,
@@ -223,22 +199,8 @@ async fn a_detail_read_is_answerable_for_every_entity_this_service_resolves() {
         .await;
     }
 
-    // The view the service answers with where it holds no detail to report carries no part
-    // of the request: every entity and every id above is answered with the same fields, so
-    // nothing of the address leaks into it.
-    let (first_case, first) = views
-        .first()
-        .expect("the table drives at least one detail read")
-        .clone();
-    for (case, reported) in &views {
-        assert_eq!(
-            reported, &first,
-            "case {case}: expected the same informational view as {first_case}, got {reported:?}"
-        );
-    }
-
-    // And nothing was written: a detail read reports, it does not raise an insight to
-    // report on.
+    // And nothing was written: a detail read reports, it does not raise the insight it
+    // failed to resolve.
     assert!(
         holds_no_insight(&emulator),
         "case the whole table: expected a detail read to store no insight"
@@ -295,7 +257,7 @@ async fn an_entity_type_outside_the_modelled_set_is_refused_with_its_value_set()
 }
 
 #[tokio::test]
-async fn an_entity_this_account_holds_nothing_for_is_still_refused() {
+async fn an_entity_this_account_holds_nothing_for_is_refused_the_same_way() {
     let emulator = Emulator::new();
     create_baseline(&emulator, READY_DOMAIN).await;
     let unheld = unheld_ids();
@@ -305,17 +267,16 @@ async fn an_entity_this_account_holds_nothing_for_is_still_refused() {
         .to_owned();
 
     // A `DomainName` this account holds no domain under names no entity to report on, so
-    // the read is refused as one missing resource — the answerable path above is the ID's,
-    // not the entity's. Rows differ along the shape of the name: one never created, and one
-    // at each end of the modelled length.
+    // the read is refused as one missing resource — the SAME refusal an id the entity holds
+    // no insight under gets, because which half of the address resolved to nothing is not
+    // disclosed. Rows differ along the shape of the name: one never created, and one at
+    // each end of the modelled length.
     for name in ["never-created", "abc", "a-domain-name-at-its-upper-b"] {
         let answer =
             describe_insight(&emulator, domain_entity(name), &insight_id, json!({})).await;
-        refused(
+        assert_missing_resource(
             &answer,
             &format!("DescribeInsightDetails(DomainName {name:?})"),
-            RECORDED_NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
         );
     }
 

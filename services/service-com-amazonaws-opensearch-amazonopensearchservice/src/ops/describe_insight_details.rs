@@ -6,10 +6,11 @@
 //! request addresses ([`crate::state::InsightDetailField`]), in the order they are
 //! stored, each rendered with its markup or as plain content according to the
 //! request's `ShowHtmlContent`. The insight is addressed by the entity that holds it
-//! and its own id together: an ENTITY this service cannot resolve is reported as ONE
-//! missing resource naming neither half of the address, while an id that entity holds
-//! no insight under is not refused at all — it is answered with the guidance the
-//! service states about an insight's details ([`GUIDANCE`]). It
+//! and its own id together, and BOTH halves of that address have to resolve: an
+//! address that resolves to no insight — an entity this service cannot resolve, or an
+//! id that entity holds no insight under — is reported as ONE missing resource naming
+//! neither half of it. An insight the service has raised no detail field for details
+//! with the guidance the service states about an insight's details ([`GUIDANCE`]). It
 //! only REPORTS: an insight and its fields are raised by the service observing a
 //! domain, never by a read of them.
 //!
@@ -197,29 +198,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account does not hold and one outside `InsightEntityType` are told apart here
         // exactly as a listing tells them apart.
         //
-        // An ENTITY this service cannot resolve is reported as ONE missing resource,
-        // naming neither half of the address: which half failed to resolve is not
-        // disclosed, exactly as the feedback submission that addresses an insight the
-        // same way reports it ([`crate::state::insight_resource_not_found`]) — on the
-        // status this service answers that shape on
-        // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`).
-        //
-        // The ID is not resolved that way: a detail read of an id the entity holds no
-        // insight under is ANSWERED, which is what the recorded wire answer for such a
-        // read does, so it resolves to no insight of that entity rather than to a
-        // refusal.
-        let address_not_found = || -> DescribeInsightDetailsError {
-            DescribeInsightDetailsErrorModeled::ResourceNotFoundException(
-                crate::state::insight_resource_not_found(),
-            )
-            .into()
-        };
+        // BOTH halves of the address have to resolve, and an address that resolves to
+        // no insight is reported as ONE missing resource naming neither half: which
+        // half failed to resolve is not disclosed, exactly as the feedback submission
+        // that addresses an insight the same way reports it
+        // ([`crate::state::insight_resource_not_found`]) — on the status this service
+        // answers that shape on (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`). A
+        // read that resolved no insight has no detailed view to report, so it is
+        // refused rather than answered with a view of nothing.
         let insight = store
             .insight_of_entity(&input.entity, &input.insight_id)
-            .map_err(|refusal| match refusal {
-                InsightEntityRefusal::NotFound(_) => address_not_found(),
-                InsightEntityRefusal::Validation(payload) => {
-                    DescribeInsightDetailsErrorModeled::ValidationException(payload).into()
+            .map_err(|refusal| -> DescribeInsightDetailsError {
+                match refusal {
+                    InsightEntityRefusal::NotFound(payload) => {
+                        DescribeInsightDetailsErrorModeled::ResourceNotFoundException(payload)
+                            .into()
+                    }
+                    InsightEntityRefusal::Validation(payload) => {
+                        DescribeInsightDetailsErrorModeled::ValidationException(payload).into()
+                    }
                 }
             })?;
 
@@ -231,23 +228,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(SHOW_HTML_CONTENT_DEFAULT);
 
         // "The list of fields that contain detailed information about the insight", in
-        // the order they are held. An insight this entity holds details with its own
-        // stored fields — an EMPTY list where the service has raised none for it, an
-        // insight that exists and details nothing — and an id it holds no insight
-        // under details with the guidance the service states about an insight's
-        // details, which is the whole of what it answers where there is no stored
-        // detail to report.
-        let fields = match insight {
-            Some(insight) => insight
-                .details
-                .iter()
-                .map(|field| field.to_insight_field(show_html))
-                .collect(),
-            None => guidance_details()
-                .iter()
-                .map(|field| field.to_insight_field(show_html))
-                .collect(),
+        // the order they are held. An insight the service has raised detail fields for
+        // details with those fields; one it has raised none for details with the
+        // guidance the service states about an insight's details, which is the whole of
+        // what the recorded wire answer for a detail read carries — `Fields` is
+        // `@required` and a detailed view the service answers is never the empty set.
+        let guidance = guidance_details();
+        let detailed: &[crate::state::InsightDetailField] = if insight.details.is_empty() {
+            &guidance
+        } else {
+            &insight.details
         };
+        let fields = detailed
+            .iter()
+            .map(|field| field.to_insight_field(show_html))
+            .collect();
 
         Ok(DescribeInsightDetailsOutput { fields })
     }
@@ -265,11 +260,10 @@ const GUIDANCE: &str = "Please use the Amazon OpenSearch Console to view the Ins
 /// The detail fields a read of an insight the service holds no detail fields for is
 /// answered with: the ONE field above.
 ///
-/// A detail read is not keyed on an insight existing under the requested id — any id of
-/// the modelled `GUID` form is answered rather than refused — and `Fields` is
-/// `@required`, so the view carries this field where there is no stored detail to
-/// report. It carries no part of the request and no stored insight: the service states
-/// the same guidance whichever entity and id a read names.
+/// `Fields` is `@required` and the detailed view the service answers for an insight it
+/// holds is never empty, so the view carries this field where there is no stored detail
+/// to report. It carries no part of the request and nothing of the insight: the service
+/// states the same guidance whichever insight a read details.
 fn guidance_details() -> Vec<crate::state::InsightDetailField> {
     vec![crate::state::InsightDetailField {
         name: GUIDANCE_FIELD.to_string(),
