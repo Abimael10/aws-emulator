@@ -3029,11 +3029,12 @@ fn name_list(names: &'static [&'static str]) -> Option<(i32, Option<Vec<String>>
 ///
 /// A published policy belongs to AWS and no call in this account changes one, so the
 /// instant is FIXED rather than drawn from the clock: every read of a published catalog, in
-/// any process, reports the same one. It is this service's own API version date
-/// (`2020-05-31T00:00:00Z`), the earliest instant any policy of this API could have been
-/// published at.
+/// any process, reports the same one. Recorded behaviour says WHICH instant AWS publishes for
+/// a policy of its own — the start of the Unix epoch ([`MANAGED_POLICY_LAST_MODIFIED`]), the
+/// zero of the timestamp rather than any date a policy was authored on — so a client caching
+/// or comparing on it reads the same value this service serves.
 pub fn managed_policy_last_modified() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_POLICY_LAST_MODIFIED_UNIX_SECONDS)
+    SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_POLICY_LAST_MODIFIED)
 }
 
 /// The version token a read of a policy AWS published reports.
@@ -3053,8 +3054,9 @@ pub fn managed_policy_etag(id: &str) -> String {
     format!("E{body}")
 }
 
-/// `2020-05-31T00:00:00Z` in seconds since the Unix epoch.
-const MANAGED_POLICY_LAST_MODIFIED_UNIX_SECONDS: u64 = 1_590_883_200;
+/// `1970-01-01T00:00:00Z`, the instant AWS reports for a policy it published, in seconds
+/// since the Unix epoch.
+const MANAGED_POLICY_LAST_MODIFIED: u64 = 0;
 
 /// The AWS-managed cache policies, in the order Amazon PUBLISHES them rather than the
 /// order their ids sort in — the order every listing of this service serves them in, ahead
@@ -3807,8 +3809,15 @@ pub fn managed_security_headers_config() -> crate::ops::types::ResponseHeadersPo
         // belong to the application, so AWS leaves that header to a policy the account
         // writes.
         content_security_policy: None,
+        // `X-Content-Type-Options` is the one header of the published set CloudFront applies
+        // whatever the origin said: its `Override` "determines whether CloudFront overrides the
+        // X-Content-Type-Options HTTP response header received from the origin with the one
+        // specified in this response headers policy", and the published policy overrides it,
+        // so a response served under this policy carries `nosniff` even over an origin that set
+        // the header itself. Recorded behaviour, as the model states no values for a published
+        // policy.
         content_type_options: Some(crate::ops::types::ResponseHeadersPolicyContentTypeOptions {
-            r#override: false,
+            r#override: true,
         }),
         strict_transport_security: Some(
             crate::ops::types::ResponseHeadersPolicyStrictTransportSecurity {
@@ -4524,4 +4533,18 @@ pub use viewer_certificate::*;
 /// `crate::state::<name>`.
 mod pricing_plan_subscription;
 pub use pricing_plan_subscription::*;
+
+/// The published per-policy QUOTA on the response headers a response headers policy adds of
+/// its own, judged once for every payload that states such a configuration. A SUBMODULE for the
+/// same reason [`functions`] is one; `pub use` keeps every name reachable as
+/// `crate::state::<name>`.
+mod response_headers_policy_quota;
+pub use response_headers_policy_quota::*;
+
+/// The response HEADER LIST a response headers policy takes OFF a response: the headers
+/// CloudFront keeps whatever a policy says, judged once for every payload that states such a
+/// configuration. A SUBMODULE for the same reason [`functions`] is one; `pub use` keeps every
+/// name reachable as `crate::state::<name>`.
+mod response_headers_policy_header_lists;
+pub use response_headers_policy_header_lists::*;
 

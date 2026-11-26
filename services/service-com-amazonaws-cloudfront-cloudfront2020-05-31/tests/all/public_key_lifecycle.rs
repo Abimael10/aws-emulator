@@ -35,8 +35,8 @@
 //!   is refused with the error the operation models for a full account
 //!   (`TooManyPublicKeys`, 400) and mints nothing.
 //!
-//! The table rows differ along everything these rules generalise over: the form of the
-//! encoded key (single-line and multi-line PEM, long and short bodies), whether a comment
+//! The table rows differ along everything these rules generalise over: the key material each
+//! row carries (five distinct keys, each of the width CloudFront admits), whether a comment
 //! is carried at all and whether it is empty, ASCII or XML metacharacters, and the
 //! published comment bound, one inside it and one past it.
 //!
@@ -47,6 +47,7 @@ use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     INVALID_PUBLIC_KEY_MARKER_MESSAGE, MAX_ITEMS, MAX_PUBLIC_KEYS, MAX_PUBLIC_KEY_COMMENT,
+    PUBLIC_KEY_RSA_MODULUS_BITS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -230,24 +231,34 @@ impl Key {
     }
 }
 
-/// One PEM-enveloped RSA PUBLIC key, distinct for each `(lines, filler)` pair, whose
-/// modulus is as many octets wide as `lines` selects.
+/// One PEM-enveloped RSA PUBLIC key of the width CloudFront admits, distinct for each
+/// `(variant, filler)` pair.
 ///
-/// `PublicKeyConfig$EncodedKey` carries the RSA public key of a key pair — the service
-/// decodes the material and refuses anything that is not such a key — so a row of this table
-/// carries a key a PKCS#1 reader accepts rather than text in a PEM envelope. The VALUE itself
-/// is immaterial to the rules under test, which is why it is SYNTHESISED here rather than
-/// generated: the structure is what the service reads, and a generated pair would cost a key
-/// generation per row of every table in this suite.
+/// `PublicKeyConfig$EncodedKey` carries the RSA public key of a signer's key pair — the service
+/// decodes the material and refuses anything that is not such a key, of the one width such a
+/// pair has ([`PUBLIC_KEY_RSA_MODULUS_BITS`]) — so a row of this table carries a key a PKCS#1
+/// reader accepts, as wide as a signer's. The VALUE itself is immaterial to the rules under
+/// test, which is why it is SYNTHESISED here rather than generated: the structure is what the
+/// service reads, and a generated pair would cost a key generation per row of every table in
+/// this suite.
 ///
-/// The rows still vary the FORM, as the rules under test are about the form a configuration
-/// takes: `lines` widens the modulus, so the envelope's body runs over one line or over many.
-/// The document carries no trailing newline: the XML text of an element is read with its
-/// surrounding whitespace stripped at the request boundary, so a value is compared as the
-/// boundary hands it to a handler.
-pub(crate) fn pem(lines: usize, filler: char) -> String {
+/// `variant` and `filler` pick the key's own octets, so no two rows carry the same key while
+/// every row carries an admissible one. The width is varied only where the WIDTH is what is
+/// under test ([`pem_of_modulus_octets`]). The document carries no trailing newline: the XML
+/// text of an element is read with its surrounding whitespace stripped at the request boundary,
+/// so a value is compared as the boundary hands it to a handler.
+pub(crate) fn pem(variant: usize, filler: char) -> String {
+    pem_of_modulus_octets(PUBLIC_KEY_RSA_MODULUS_BITS / 8, variant, filler)
+}
+
+/// The same key material as [`pem`], of a modulus `octets` octets wide — for the rules that are
+/// about the WIDTH of the key a configuration carries.
+pub(crate) fn pem_of_modulus_octets(octets: usize, variant: usize, filler: char) -> String {
     ::pem::encode_config(
-        &::pem::Pem::new(PUBLIC_KEY_LABEL.to_string(), public_key_info(lines, filler)),
+        &::pem::Pem::new(
+            PUBLIC_KEY_LABEL.to_string(),
+            public_key_info(octets, variant, filler),
+        ),
         // The line ending a client's own PEM file carries, which is also the one the XML text
         // of the element is read back as.
         ::pem::EncodeConfig::new().set_line_ending(::pem::LineEnding::LF),
@@ -261,19 +272,20 @@ pub(crate) fn pem(lines: usize, filler: char) -> String {
 const PUBLIC_KEY_LABEL: &str = "PUBLIC KEY";
 
 /// The DER of a `SubjectPublicKeyInfo` holding one RSA public key: the algorithm
-/// `rsaEncryption` and, inside the bit string, the PKCS#1 `RSAPublicKey` of the modulus
-/// `lines` and `filler` select and the public exponent 65537.
-fn public_key_info(lines: usize, filler: char) -> Vec<u8> {
+/// `rsaEncryption` and, inside the bit string, the PKCS#1 `RSAPublicKey` of a modulus `octets`
+/// octets wide that `variant` and `filler` select, and the public exponent 65537.
+fn public_key_info(octets: usize, variant: usize, filler: char) -> Vec<u8> {
     use ::pkcs1::der::asn1::{Any, BitString, Null};
     use ::pkcs1::der::Encode as _;
     use ::x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 
-    // The width `lines` selects, in whole 64-octet steps, with the top bit of the modulus set
-    // (so its width really is that many octets) and the bottom bit set (a product of two odd
-    // primes is odd). Every octet in between is derived from the row's own `filler` and
-    // position, so no two rows carry the same key.
-    let mut modulus = vec![0u8; 64 * (1 + lines % 8)];
-    let seed = u8::try_from(u32::from(filler) % 251).unwrap_or_default();
+    // A modulus of exactly the width asked for, with its top bit set (so its width really is
+    // that many octets) and its bottom bit set (a product of two odd primes is odd). Every
+    // octet in between is derived from the row's own `variant` and `filler` and its position,
+    // so no two rows carry the same key.
+    let mut modulus = vec![0u8; octets.max(1)];
+    let seed = u8::try_from((u32::from(filler) + 17 * u32::try_from(variant).unwrap_or(0)) % 251)
+        .unwrap_or_default();
     for (index, octet) in modulus.iter_mut().enumerate() {
         *octet = seed.wrapping_add(u8::try_from(index % 251).unwrap_or_default());
     }
@@ -301,10 +313,9 @@ const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
 
 /// The configurations every case below is run over.
 ///
-/// The rows span the forms the configuration's members take: a single-line and a
-/// multi-line encoded key, a long and a short body, and the comment forms (absent, empty,
-/// plain ASCII, XML metacharacters, and the published 128-character bound) cycled across
-/// them.
+/// The rows span the forms the configuration's members take: five distinct encoded keys, each
+/// of the width CloudFront admits, and the comment forms (absent, empty, plain ASCII, XML
+/// metacharacters, and the published 128-character bound) cycled across them.
 fn table() -> Vec<Key> {
     let comments: [Option<String>; 5] = [
         None,
@@ -320,8 +331,6 @@ fn table() -> Vec<Key> {
         pem(2, 'B'),
         pem(4, 'C'),
         pem(8, 'D'),
-        // The narrowest modulus this helper writes, so one row's envelope body is a single
-        // line.
         pem(0, 'E'),
     ];
 
@@ -1144,7 +1153,7 @@ async fn a_create_past_the_account_bound_is_refused() {
             comment: None,
         },
         Key {
-            case: "a multi-line key past the bound".to_string(),
+            case: "another key past the bound".to_string(),
             caller_reference: "public-key-bound-past-multiline".to_string(),
             name: "public-key-bound-past-multiline".to_string(),
             encoded_key: pem(8, 'S'),

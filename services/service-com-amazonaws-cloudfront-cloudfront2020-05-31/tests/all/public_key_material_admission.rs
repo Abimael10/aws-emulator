@@ -9,7 +9,8 @@
 //! stored for it. The service decides it by DECODING the material, so what gets through is
 //! what a PKCS#1 reader accepted, not what merely looks like a key: the private half of a
 //! pair, a key of another algorithm, a body that is not DER and text in no envelope at all
-//! are each refused.
+//! are each refused, and so is a readable RSA key of any other width
+//! (`state::PUBLIC_KEY_RSA_MODULUS_BITS`, the width a signer's key pair has).
 //!
 //! Why it matters: a key the control plane stored is the key a signed URL is verified
 //! against, and material the control plane serves back out is read by whoever can read a
@@ -18,15 +19,18 @@
 //! The rows differ along what the rule generalises over: the KIND of material (public key,
 //! private key in each of its two envelopes, another algorithm's public key, a certificate's
 //! own structure, undecodable base64, no envelope, nothing at all) and, for the material that
-//! IS a public key, the width of its modulus. The harness is the public key lifecycle
-//! suite's, reused rather than copied.
+//! IS a readable RSA public key, the width of its modulus — the admitted width, each side of
+//! it, and the widths a client is most likely to submit instead. The harness is the public key
+//! lifecycle suite's, reused rather than copied.
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::INVALID_ENCODED_KEY_MESSAGE;
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
+    INVALID_ENCODED_KEY_MESSAGE, PUBLIC_KEY_RSA_MODULUS_BITS,
+};
 
 use crate::distribution_lifecycle::{call, emulator, API_VERSION};
-use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
+use crate::public_key_lifecycle::{create_key, get_key, pem, pem_of_modulus_octets, Key};
 
 /// `GET /2020-05-31/public-key/{Id}/config`, the reader that reports the stored material
 /// back.
@@ -134,17 +138,34 @@ fn other_algorithm_public_key() -> String {
 fn material_rows() -> Vec<(String, String, bool)> {
     let (public_key, pkcs8_private_key, pkcs1_private_key) = generated_pair();
     let valid = pem(4, 'M');
+    let admitted_octets = PUBLIC_KEY_RSA_MODULUS_BITS / 8;
     vec![
         ("a generated RSA public key".to_string(), public_key, true),
         (
-            "a synthesised RSA public key of a 1024-bit modulus".to_string(),
-            pem(1, 'N'),
+            "a synthesised RSA public key of the admitted modulus".to_string(),
+            valid.clone(),
             true,
         ),
         (
-            "a synthesised RSA public key of a wide modulus".to_string(),
-            pem(7, 'O'),
-            true,
+            "a synthesised RSA public key one octet narrower than the admitted modulus"
+                .to_string(),
+            pem_of_modulus_octets(admitted_octets - 1, 0, 'N'),
+            false,
+        ),
+        (
+            "a synthesised RSA public key one octet wider than the admitted modulus".to_string(),
+            pem_of_modulus_octets(admitted_octets + 1, 0, 'O'),
+            false,
+        ),
+        (
+            "a synthesised RSA public key of a 1024-bit modulus".to_string(),
+            pem_of_modulus_octets(128, 1, 'P'),
+            false,
+        ),
+        (
+            "a synthesised RSA public key of a 4096-bit modulus".to_string(),
+            pem_of_modulus_octets(512, 2, 'Q'),
+            false,
         ),
         (
             "the private half of the pair, in its PKCS#8 envelope".to_string(),

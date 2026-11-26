@@ -3556,6 +3556,83 @@ pub fn cache_policy_already_exists() -> CachePolicyAlreadyExists {
 /// literal, and a comment past it is refused with the one [`comment_too_long`] sentence.
 pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 
+/// The longest name a public key carries.
+///
+/// `PublicKeyConfig$Name` is "a name to help identify the public key" and carries no `@length`
+/// in the model, so the bound is not refused before a handler runs and the public key path
+/// checks it itself. What is RECORDED is that CloudFront refuses a longer name as the parameter
+/// it arrived in ([`public_key_name_too_long`]) and that every name a recorded upload is SERVED
+/// for is inside this bound — not the number itself, which no recorded refusal states (the
+/// sentence carries neither the submitted name nor the limit). So the value held to is the 128
+/// characters this configuration's other free-text member states
+/// ([`MAX_PUBLIC_KEY_COMMENT`]) — one bound for the configuration's text rather than a second
+/// literal, exactly as the key group surface holds its own name to its comment's bound
+/// ([`MAX_KEY_GROUP_NAME`]). A later reader should take the bound as THAT and not as a recorded
+/// number.
+pub const MAX_PUBLIC_KEY_NAME: usize = MAX_PUBLIC_KEY_COMMENT;
+
+/// The name the WIRE reports `PublicKeyConfig$Name` under, which is the name CloudFront's
+/// refusal of that member carries: the member named for the resource it identifies rather than
+/// the bare `Name` the payload spells it.
+pub const PUBLIC_KEY_NAME_PARAMETER: &str = "PublicKeyName";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a public key name longer than
+/// [`MAX_PUBLIC_KEY_NAME`].
+///
+/// Recorded behaviour: the whole sentence is fixed text naming the PARAMETER the name arrived
+/// in ([`parameter_too_big_message`]) — neither the submitted name nor the bound is echoed, so
+/// the refusal reads the same for every name past it.
+pub fn public_key_name_too_long() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(public_key_name_too_long_message()),
+    }
+}
+
+/// The message a public key write naming a name past [`MAX_PUBLIC_KEY_NAME`] is refused with.
+pub fn public_key_name_too_long_message() -> String {
+    parameter_too_big_message(PUBLIC_KEY_NAME_PARAMETER)
+}
+
+/// Whether `name` is a name a public key of this account can be identified by: a name built
+/// from the characters CloudFront admits in one.
+///
+/// `PublicKeyConfig$Name` is "a name to help identify the public key" and carries no `@pattern`
+/// in the model, so the alphabet is not enforced before a handler runs. Recorded behaviour on
+/// both sides of it: CloudFront refuses a name carrying a character outside the alphabet
+/// ([`public_key_name_illegal_characters`]), and every name a recorded upload is SERVED for is
+/// written from ASCII letters, digits, `-` and `_` — the SAME alphabet the sibling name of this
+/// surface is held to ([`is_key_group_name`]), read through that one reading rather than a
+/// second of its own.
+///
+/// The rule is about the CHARACTERS a name carries, so the empty name is not refused here, for
+/// the reason [`is_key_group_name`] does not refuse it either.
+pub fn is_public_key_name(name: &str) -> bool {
+    is_key_group_name(name)
+}
+
+/// The name the WIRE reports the offending member under when a public key name carries a
+/// character CloudFront does not admit: the member qualified by the resource whose
+/// configuration carries it, as the recorded refusal of that condition carries it — which is
+/// not how the recorded refusal of the same member's LENGTH names it
+/// ([`PUBLIC_KEY_NAME_PARAMETER`]), so the two are separate constants rather than one.
+pub const PUBLIC_KEY_NAME_MEMBER: &str = "PublicKey:Name";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a public key name carrying a character
+/// CloudFront does not admit in one ([`is_public_key_name`]).
+///
+/// Recorded behaviour: the whole sentence is fixed text naming the member the value arrived in
+/// and nothing of the value itself, so the refusal reads the same for every such name.
+pub fn public_key_name_illegal_characters() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(public_key_name_illegal_characters_message()),
+    }
+}
+
+/// The message a public key write naming a name outside [`is_public_key_name`] is refused with.
+pub fn public_key_name_illegal_characters_message() -> String {
+    format!("The parameter {PUBLIC_KEY_NAME_MEMBER} contains illegal characters.")
+}
+
 /// The modelled `NoSuchPublicKey` (HTTP 404) for a public key id the store does not hold.
 ///
 /// The sentence states a property of the store rather than of the request — the id names no

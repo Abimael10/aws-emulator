@@ -6,39 +6,44 @@
 //! stores the submitted configuration whole, and reports the record it stored, so a later
 //! read answers from that record rather than from the request being served.
 //!
-//! Three refusals are checked BEFORE anything is minted:
+//! Six refusals are checked BEFORE anything is minted:
 //!
 //! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
 //!   `InconsistentQuantities`, the same rule every CloudFront list wrapper obeys
 //!   ([`crate::state::response_headers_policy_quantity_mismatch`]);
-//! * a `Name` another policy already holds — "The name must be unique for response
-//!   headers policies in this Amazon Web Services account", so the second create under a
-//!   name is `ResponseHeadersPolicyAlreadyExists` rather than a second policy;
 //! * a `Content-Security-Policy` header value past CloudFront's published quota on its
 //!   length ([`crate::state::MAX_CSP_IN_RESPONSE_HEADERS_POLICY`]) —
 //!   `TooLongCSPInResponseHeadersPolicy`;
+//! * a `RemoveHeadersConfig` naming a header CloudFront keeps on a response, as CloudFront
+//!   documents them ([`crate::state::HEADERS_A_RESPONSE_HEADERS_POLICY_CANNOT_REMOVE`]) —
+//!   `InvalidArgument` naming the `RemoveHeaders` parameter and the header the request
+//!   submitted ([`crate::state::remove_header_not_allowed`]);
+//! * more response headers of the policy's own than CloudFront's published quota per policy
+//!   ([`crate::state::MAX_CUSTOM_HEADERS_IN_RESPONSE_HEADERS_POLICY`]) —
+//!   `TooManyCustomHeadersInResponseHeadersPolicy`;
+//! * a `Name` another policy already holds — "The name must be unique for response
+//!   headers policies in this Amazon Web Services account", so the second create under a
+//!   name is `ResponseHeadersPolicyAlreadyExists` rather than a second policy;
 //! * more policies than this emulator holds
 //!   ([`crate::state::MAX_RESPONSE_HEADERS_POLICIES`]) —
 //!   `TooManyResponseHeadersPolicies`.
 //!
-//! The model declares two more refusals whose maximum is an account quota CloudFront
-//! can raise and neither the model nor the shape documentation states a number for
-//! (`TooManyCustomHeadersInResponseHeadersPolicy`,
-//! `TooManyRemoveHeadersInResponseHeadersPolicy`). Nothing here refuses on them: a bound
-//! invented for them would refuse configurations the service accepts, which is a worse
-//! answer than accepting them.
+//! Each of them is decided before the insert, so a refused create leaves nothing behind —
+//! not even the `Name` it carried, which the next create is free to take.
 //!
-//! Two further modelled errors are deliberately unreachable from this handler, so a
-//! reader does not take them for omissions:
+//! The model declares one more refusal that nothing here raises:
+//! `TooManyRemoveHeadersInResponseHeadersPolicy`, the quota on how many headers one policy
+//! may take OFF a response. No recorded refusal states the sentence CloudFront answers that
+//! condition with, and a sentence invented for it would be this emulator's wording rather
+//! than the service's — which is why the quota that IS recorded (the custom header one above)
+//! is refused and this one is left to the recording that words it.
+//!
+//! One further modelled error is deliberately unreachable from this handler, so a
+//! reader does not take it for an omission:
 //!
 //! * `AccessDenied` — this emulator authorizes no caller. The request boundary verifies
 //!   the signature, and no operation in this service consults a principal, so there is
 //!   no permission for this one to refuse on.
-//! * `InvalidArgument` — the model constrains no member of `ResponseHeadersPolicyConfig`
-//!   (no `@length`, `@pattern` or `@range` outside `SamplingRate`, which the framework
-//!   refuses before this handler runs), and CloudFront publishes no syntax for a policy
-//!   name or for a custom header name. A rule invented here would, again, refuse what the
-//!   service accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -241,6 +246,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateResponseHeadersPolicyErrorModeled::TooLongCSPInResponseHeadersPolicy(
                     crate::state::too_long_csp_in_response_headers_policy(),
+                )
+                .into(),
+            );
+        }
+
+        // A policy may take headers OFF a response, but not the ones CloudFront keeps: a
+        // configuration naming one of those asks for a response the viewer could not read, so
+        // it is refused as the parameter the list arrived in, before anything is minted.
+        if let Some(header) = crate::state::response_headers_policy_unremovable_header(&config) {
+            return Err(CreateResponseHeadersPolicyErrorModeled::InvalidArgument(
+                crate::state::remove_header_not_allowed(&header),
+            )
+            .into());
+        }
+
+        // CloudFront's published quota on how many response headers of its own ONE policy may
+        // add: a configuration listing more describes no policy the service stores, so it is
+        // refused — with the error the model binds for exactly that condition — before
+        // anything is minted, which is also why the name this request carries is still free
+        // afterwards.
+        if crate::state::response_headers_policy_custom_headers_over_quota(&config) {
+            return Err(
+                CreateResponseHeadersPolicyErrorModeled::TooManyCustomHeadersInResponseHeadersPolicy(
+                    crate::state::too_many_custom_headers_in_response_headers_policy(),
                 )
                 .into(),
             );

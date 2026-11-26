@@ -10,6 +10,21 @@
 //! A mutating operation — "Uploads a public key to CloudFront" — and the only path by
 //! which a public key enters this service's store.
 //!
+//! The configuration is ADMITTED before anything is minted, each member against the domain
+//! CloudFront states for it, and each violation refused with the sentence CloudFront words for
+//! that member (the modelled `InvalidArgument`, HTTP 400):
+//!
+//! * `Comment` — "the comment cannot be longer than 128 characters"
+//!   ([`crate::state::MAX_PUBLIC_KEY_COMMENT`], [`crate::state::comment_too_long`]);
+//! * `Name` — bounded in length ([`crate::state::MAX_PUBLIC_KEY_NAME`],
+//!   [`crate::state::public_key_name_too_long`]) and built from the characters CloudFront
+//!   admits in a name ([`crate::state::is_public_key_name`],
+//!   [`crate::state::public_key_name_illegal_characters`]);
+//! * `EncodedKey` — the RSA public key of a signer's key pair, of the one width such a pair
+//!   has ([`crate::state::is_admitted_public_key_material`],
+//!   [`crate::state::invalid_encoded_key`]), decided by decoding the material rather than by
+//!   reading its text.
+//!
 //! A key is unique by its `Name` as well as by its `CallerReference`: a create under a name
 //! another key of this account already holds is `PublicKeyAlreadyExists` (HTTP 409) rather
 //! than a second key, and so is one under a reference another key holds — the sentence names
@@ -173,14 +188,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A name to help identify the public key": the name is bounded in length, as the
+        // other free-text member of this configuration is ([`crate::state::MAX_PUBLIC_KEY_NAME`]),
+        // and built from the characters CloudFront admits in a name
+        // ([`crate::state::is_public_key_name`]) — a longer one is refused as the parameter it
+        // arrived in and one carrying anything else as the member it arrived in, BEFORE
+        // anything is minted.
+        if config.name.chars().count() > crate::state::MAX_PUBLIC_KEY_NAME {
+            return Err(CreatePublicKeyErrorModeled::InvalidArgument(
+                crate::state::public_key_name_too_long(),
+            )
+            .into());
+        }
+        if !crate::state::is_public_key_name(&config.name) {
+            return Err(CreatePublicKeyErrorModeled::InvalidArgument(
+                crate::state::public_key_name_illegal_characters(),
+            )
+            .into());
+        }
+
         // "The public key that you can use with signed URLs and signed cookies, or with
-        // field-level encryption": the material is the RSA PUBLIC key of a key pair, so
-        // anything else — the PRIVATE half of that pair, a certificate, a key of another
-        // algorithm, or text that is no PEM at all — is not a public key CloudFront can
-        // verify a signature against, and no key is stored for it. Decided by the crates that
-        // own the formats ([`crate::state::is_rsa_public_key`]) rather than by reading the
-        // text, and refused BEFORE anything is minted.
-        if !crate::state::is_rsa_public_key(&config.encoded_key) {
+        // field-level encryption": the material is the RSA PUBLIC key of a signer's key pair,
+        // of the one width such a pair has, so anything else — the PRIVATE half of that pair,
+        // a certificate, a key of another algorithm, a key of another width, or text that is
+        // no PEM at all — is not a public key CloudFront can verify a signature against, and
+        // no key is stored for it. Decided by the crates that own the formats
+        // ([`crate::state::is_admitted_public_key_material`]) rather than by reading the text,
+        // and refused BEFORE anything is minted.
+        if !crate::state::is_admitted_public_key_material(&config.encoded_key) {
             return Err(CreatePublicKeyErrorModeled::InvalidArgument(
                 crate::state::invalid_encoded_key(),
             )

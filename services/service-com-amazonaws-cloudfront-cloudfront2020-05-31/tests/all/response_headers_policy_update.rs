@@ -58,7 +58,10 @@ const TOO_LONG_CSP_MESSAGE: &str =
 /// `PUT /2020-05-31/response-headers-policy/{Id}` with the `ResponseHeadersPolicyConfig`
 /// document `body` under the version token `if_match` — the route, the payload member and the
 /// header the model binds this operation to.
-async fn update_policy(
+///
+/// `pub(crate)` so a sibling suite that drives this operation calls it through the same one
+/// writer rather than growing a copy of it.
+pub(crate) async fn update_policy(
     router: &MultiServiceRouter,
     id: &str,
     body: &str,
