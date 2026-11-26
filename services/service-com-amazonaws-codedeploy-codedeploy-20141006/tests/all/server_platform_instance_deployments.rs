@@ -66,7 +66,11 @@ const POLL: Duration = Duration::from_millis(25);
 /// the AWS CodeDeploy User Guide's "Lifecycle event hook availability" lists them
 /// for a deployment with no load balancer. Spelled out here so a change to the
 /// sequence fails this suite.
-const LIFECYCLE_EVENTS: &[&str] = &[
+///
+/// Visible to the crate's other suites: `server_platform_ec2_tag_selector_resolution.rs`
+/// asserts the same sequence over the targets an EC2 tag selector resolved, so one place
+/// says what that order is.
+pub(crate) const LIFECYCLE_EVENTS: &[&str] = &[
     "ApplicationStop",
     "DownloadBundle",
     "BeforeInstall",
@@ -149,7 +153,14 @@ impl Fleet {
     }
 
     /// POST one `ec2Query` action that must succeed, answered with its XML body.
-    async fn ec2(&self, case: &str, action: &str, params: &[(String, String)]) -> String {
+    ///
+    /// Visible to the crate's other suites for the reason [`LIFECYCLE_EVENTS`] is.
+    pub(crate) async fn ec2(
+        &self,
+        case: &str,
+        action: &str,
+        params: &[(String, String)],
+    ) -> String {
         let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
         for (name, value) in params {
             body.push('&');
@@ -358,7 +369,9 @@ impl Fleet {
     }
 
     /// The ids of the targets `deployment_id` reports, in the order it lists them.
-    async fn target_ids(&self, case: &str, deployment_id: &str) -> Vec<String> {
+    ///
+    /// Visible to the crate's other suites for the reason [`LIFECYCLE_EVENTS`] is.
+    pub(crate) async fn target_ids(&self, case: &str, deployment_id: &str) -> Vec<String> {
         let listed = self
             .ok(
                 case,
@@ -408,7 +421,7 @@ impl Fleet {
 }
 
 /// One form field of an `ec2Query` body.
-fn param(name: &str, value: &str) -> (String, String) {
+pub(crate) fn param(name: &str, value: &str) -> (String, String) {
     (name.to_string(), value.to_string())
 }
 
