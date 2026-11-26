@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLinkRoutingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLinkRoutingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLinkRoutingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the configuration of one routing rule a stored link carries: the
+//! priority it is evaluated at and the conditions it matches on. Both are
+//! `@required`, so every call states the whole configuration the rule holds from
+//! here on, and the rule is addressed through its link exactly as the read
+//! addresses it. The link's non-deleted rules hold distinct priorities, so a call
+//! asking for a number ANOTHER of them holds is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +163,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLinkRoutingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLinkRoutingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLinkRoutingRule"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLinkRoutingRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // Which of the link's OTHER rules already holds the priority this call asks
+        // for, read before the record this call changes is taken for writing. A
+        // priority orders one link's rules against each other, so the number a rule
+        // already holds is its own and re-stating it conflicts with nothing.
+        let priority_held_by = store
+            .rule_holding_priority_other_than(&input.link_id, &input.rule_id, input.priority)
+            .map(|held| held.rule_id.clone());
+
+        // A rule is addressed through its own link, from either of that link's two
+        // ends: a gateway that is no end of the link, a link id nothing minted and a
+        // rule id this link does not carry are all not found — as is a rule whose
+        // deletion the clock has already completed.
+        let Some(rule) =
+            store.find_routing_rule_mut(&input.gateway_id, &input.link_id, &input.rule_id)
+        else {
+            return Err(UpdateLinkRoutingRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        if !rule.configurable() {
+            // The rule is on its way out, or stopped where nothing moves it from, so
+            // it has no configuration left to change.
+            return Err(UpdateLinkRoutingRuleErrorModeled::ConflictException(
+                ConflictException {
+                    message: rule.status_conflict_message("updated"),
+                },
+            )
+            .into());
+        }
+
+        // Every member of the modelled `RuleCondition` is optional, so a structure
+        // stating no condition at all passes the schema layer and has to be refused
+        // here: a rule that matches on nothing matches everything. Stated exactly as
+        // the create states it, since this call replaces the whole condition set.
+        if !crate::state::conditions_stated(&input.conditions) {
+            return Err(UpdateLinkRoutingRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::RULE_CONDITIONS_EMPTY_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        if let Some(held) = priority_held_by {
+            return Err(UpdateLinkRoutingRuleErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::priority_conflict_message(
+                        &held,
+                        &input.link_id,
+                        input.priority,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The change is accepted: the record carries it from here on, and the status
+        // reported below is where that leaves the rule — a rule that was routing
+        // reports the change as pending, and the clock owes it `ACTIVE` again.
+        rule.take_update(input.priority, input.conditions, now);
+
+        Ok(UpdateLinkRoutingRuleOutput {
+            rule_id: rule.rule_id.clone(),
+            status: rule.status.clone(),
+            updated_at: crate::state::timestamp(rule.updated_at),
+        })
     }
 }

@@ -51,7 +51,7 @@ pub use paging::{page_of, page_size, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub use routing_rules::{
     conditions_stated, priority_conflict_message, LinkRoutingRule, ROUTING_RULE_QUOTA,
     RULE_CONDITIONS_EMPTY_MESSAGE, RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,
-    RULE_STATUS_DELETED, RULE_STATUS_DELETION_IN_PROGRESS,
+    RULE_STATUS_DELETED, RULE_STATUS_DELETION_IN_PROGRESS, RULE_STATUS_UPDATE_IN_PROGRESS,
 };
 pub use tagging::{
     resource_tags, resource_tags_mut, tagged_resource, tagging_unresolved, TaggedResource,
