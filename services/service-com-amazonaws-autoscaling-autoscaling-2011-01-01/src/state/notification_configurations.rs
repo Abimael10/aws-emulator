@@ -219,14 +219,13 @@ pub fn invalid_topic_arn_message(topic_arn: &str) -> String {
 }
 
 /// The message a request naming an event type outside this service's own catalog is
-/// refused with, in the shape this service refuses every value outside one of its
-/// catalogs: the member as the model names it, the value from the request, and the catalog
-/// the caller has to choose from.
+/// refused with: Amazon EC2 Auto Scaling words the refusal as the rejected value in double
+/// quotes followed by the fixed sentence naming the member it was carried in, which is the
+/// wording a `ValidationError` for such a value is recorded carrying. The only variable part
+/// is the value copied from the request; the quotes, the wording and the closing full stop
+/// are fixed text, so nothing of one request's value belongs to the sentence itself.
 pub fn unknown_notification_type_message(notification_type: &str) -> String {
-    format!(
-        "The NotificationType value {notification_type} is not valid: it must be one of {}",
-        super::stated_value_set(super::AUTO_SCALING_NOTIFICATION_TYPES.iter().copied())
-    )
+    format!("\"{notification_type}\" is not a valid Notification Type.")
 }
 
 /// The message a request that would configure a topic past

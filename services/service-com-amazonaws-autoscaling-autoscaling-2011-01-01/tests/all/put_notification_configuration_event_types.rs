@@ -10,8 +10,8 @@
 //! `DescribeNotificationConfigurations` — for every type of the catalog
 //! `DescribeAutoScalingNotificationTypes` publishes and for no other value: a request
 //! naming a value outside that catalog is refused `ValidationError` (HTTP 400), naming the
-//! value it carried and the catalog the caller has to choose from, and writes nothing, so
-//! the group's stored configurations are exactly what they were.
+//! value it carried, and writes nothing, so the group's stored configurations are exactly
+//! what they were.
 //!
 //! The rows span what the rule generalises over: which published type a configuration names
 //! (every entry of the catalog in turn, one at a time), how many it names (one, two, the
@@ -103,19 +103,15 @@ pub(crate) async fn put_configuration_result(
 }
 
 /// The refusal a value outside the published catalog is answered with, spelled out here
-/// rather than taken from the service's own generator: the fixed text, the member as the
-/// model names it, the value the request carried, and the catalog the caller has to choose
-/// from, comma-separated inside brackets.
+/// rather than taken from the service's own generator: the value the request carried in
+/// double quotes, then the fixed sentence naming the member it was carried in.
 ///
-/// That is the one shape this service refuses every value outside one of its catalogs in —
-/// the same sentence its scaling-process, metric and adjustment-type refusals carry — so
-/// this suite states it for the notification member rather than inventing a second wording
-/// for the same class of request.
-fn unknown_type_message(offending: &str, catalog: &[String]) -> String {
-    format!(
-        "The NotificationType value {offending} is not valid: it must be one of [{}]",
-        catalog.join(", ")
-    )
+/// That is how Amazon EC2 Auto Scaling words a value its notification-type catalog does not
+/// hold — the wording a `ValidationError` for such a value is recorded carrying, with the
+/// rejected value as its only variable part — so this suite states that sentence rather than
+/// taking whatever the implementation renders.
+fn unknown_type_message(offending: &str) -> String {
+    format!("\"{offending}\" is not a valid Notification Type.")
 }
 
 /// The (topic, event type) pairs a configuration of `events` on `topic` amounts to: one per
@@ -341,7 +337,7 @@ async fn a_type_outside_the_published_catalog_is_refused_and_stores_nothing() {
                 code, "ValidationError",
                 "case {case:?}: expected the ValidationError code, got {code:?} {message:?}"
             );
-            let expected = unknown_type_message(&offending, &catalog);
+            let expected = unknown_type_message(&offending);
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected the message {expected:?}, got {message:?}"
@@ -350,12 +346,6 @@ async fn a_type_outside_the_published_catalog_is_refused_and_stores_nothing() {
                 message.contains(&offending),
                 "case {case:?}: the refusal names the value the request carried, got {message:?}"
             );
-            for published in &catalog {
-                assert!(
-                    message.contains(published.as_str()),
-                    "case {case:?}: the refusal names the choice {published}, got {message:?}"
-                );
-            }
             let after = configured(&router, &case, group).await;
             assert_eq!(
                 after, before,

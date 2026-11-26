@@ -40,6 +40,12 @@
 //! ([`auto_scaling_group_tags`]). A group that already exists has its tag set reconciled
 //! through the two calls that service publishes for one ([`retag_auto_scaling_group`]), since
 //! `UpdateAutoScalingGroup` has no member for it.
+//!
+//! Two of the group's properties are no member of either of its own calls, and reach that
+//! service through the pair IT publishes for that child of a group that exists: its lifecycle
+//! HOOKS ([`lifecycle_hook_changes`]) and the Amazon SNS NOTIFICATIONS it sends about its own
+//! events ([`notification_configuration_changes`]). Both walks build their calls before
+//! anything is sent and hand them to the one sender ([`make_group_calls`]).
 
 use super::*;
 
@@ -423,6 +429,11 @@ const AUTO_SCALING_GROUP_PROPERTIES_NOT_SENT: &[&str] = &[
     // the name of the Auto Scaling group"): the arm sets the member from that name, so the
     // walk must not also push the declared spelling of it.
     "AutoScalingGroupName",
+    // The notifications the group sends about its own events, which are no member of that
+    // create at all: each declared entry reaches that service through the one call it
+    // publishes for the notifications of a group that exists
+    // ([`notification_configuration_changes`]).
+    NOTIFICATION_CONFIGURATIONS,
     // The tag list carries the declared tags AND the ones CloudFormation propagates, with
     // the `PropagateAtLaunch` an Auto Scaling group's tag carries, so the arm builds it out
     // of both ([`auto_scaling_group_tags`]).
@@ -440,6 +451,11 @@ const AUTO_SCALING_GROUP_PROPERTIES_NOT_SENT: &[&str] = &[
 /// physical id and no identifier is taken over. The group's ARN is Auto Scaling's, carrying
 /// the resource id IT minted, so it is read back from that service rather than computed: the
 /// read is also what makes the create's success a resource that service really holds.
+///
+/// The group's declared NOTIFICATIONS are provisioned by a call per declared entry after the
+/// group itself is created ([`notification_configuration_changes`]), that property being no
+/// member of the create: so a configuration the owning service refuses fails THIS resource
+/// while leaving behind the group the create already made, with no configuration on it.
 pub(super) async fn create_auto_scaling_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -459,6 +475,13 @@ pub(super) async fn create_auto_scaling_group(
         parameters.push(("VPCZoneIdentifier".to_string(), subnets));
     }
     parameters.extend(auto_scaling_group_tags(&resource.properties, propagated));
+    // The notification calls this declaration owes, built BEFORE anything is sent, exactly as
+    // the create's own parameters are: an entry carrying a member that call does not take
+    // refuses the resource with nothing created at all
+    // ([`notification_configuration_changes`]). A group that was never deployed holds no
+    // configuration to remove, so these are writes alone.
+    let notifications =
+        notification_configuration_changes(&name, &Value::Null, &resource.properties)?;
     call_query(
         ctx,
         AUTOSCALING_SIGNING_NAME,
@@ -468,6 +491,7 @@ pub(super) async fn create_auto_scaling_group(
         &parameters,
     )
     .await?;
+    make_group_calls(ctx, region, notifications).await?;
     let reported = describe_auto_scaling_group(ctx, region, &name)
         .await?
         .ok_or_else(|| Refusal {
@@ -638,7 +662,7 @@ const UPDATE_AUTO_SCALING_GROUP_MEMBERS: &[(&str, QueryMember)] = &[
 /// change, by the re-tagging arm every other type's tags travel through
 /// ([`retag_auto_scaling_group`]). Nor are the group's lifecycle HOOKS: that property has its
 /// own pair of calls and this arm applies a changed declaration of it through them
-/// ([`reconcile_lifecycle_hooks`]).
+/// ([`lifecycle_hook_changes`]).
 const AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES: &[&str] = &[
     "InstanceId",
     "LoadBalancerNames",
@@ -649,7 +673,9 @@ const AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES: &[&str] = &[
 /// The `AWS::AutoScaling::AutoScalingGroup` properties an UPDATE does not write into the
 /// `UpdateAutoScalingGroup` request: the group's NAME and its `VPCZoneIdentifier`, which this
 /// arm pushes itself; the lifecycle hooks, which reach that service through their own two calls
-/// ([`reconcile_lifecycle_hooks`]); the tag set, which reaches that service through the two
+/// ([`lifecycle_hook_changes`]); the NOTIFICATIONS, which reach it through their own two
+/// calls ([`notification_configuration_changes`]); the tag set, which reaches that service
+/// through the two
 /// calls it publishes for the tags of a group that exists ([`retag_auto_scaling_group`]); and
 /// the attachments and the source instance, which no member of that call carries at all. A
 /// declaration that CHANGES one of the last two is refused before anything is sent
@@ -661,6 +687,7 @@ const AUTO_SCALING_GROUP_PROPERTIES_NOT_UPDATED: &[&str] = &[
     "InstanceId",
     "LifecycleHookSpecificationList",
     "LoadBalancerNames",
+    NOTIFICATION_CONFIGURATIONS,
     "Tags",
     "TargetGroupARNs",
     "TrafficSources",
@@ -672,9 +699,11 @@ const AUTO_SCALING_GROUP_PROPERTIES_NOT_UPDATED: &[&str] = &[
 /// Auto Scaling group".
 ///
 /// A changed `LifecycleHookSpecificationList` is applied too, through the calls that write
-/// and remove ONE hook of a group that exists ([`reconcile_lifecycle_hooks`]): the group's
+/// and remove ONE hook of a group that exists ([`lifecycle_hook_changes`]): the group's
 /// hooks are a property of it that the owning service changes after the group was created,
-/// not part of what `UpdateAutoScalingGroup` carries.
+/// not part of what `UpdateAutoScalingGroup` carries. A changed `NotificationConfigurations`
+/// travels the same way, through the two calls that configure and un-configure ONE topic of a
+/// group that exists ([`notification_configuration_changes`]).
 ///
 /// A changed `Tags` property is applied too, but not from here: a tag set is carried by no
 /// member of this call ([`UPDATE_AUTO_SCALING_GROUP_MEMBERS`]), so it travels through the
@@ -716,6 +745,9 @@ pub(super) async fn update_auto_scaling_group(
     // update with the group untouched rather than half-way through it
     // ([`lifecycle_hook_changes`]).
     let hooks = lifecycle_hook_changes(&name, &resource.properties, declared)?;
+    // The notification calls, built before anything is sent for the same reason the hook
+    // calls are ([`notification_configuration_changes`]).
+    let notifications = notification_configuration_changes(&name, &resource.properties, declared)?;
     parameters.push(("AutoScalingGroupName".to_string(), name.clone()));
     if let Some(subnets) = comma_separated_subnets(declared) {
         parameters.push(("VPCZoneIdentifier".to_string(), subnets));
@@ -729,7 +761,8 @@ pub(super) async fn update_auto_scaling_group(
         &parameters,
     )
     .await?;
-    reconcile_lifecycle_hooks(ctx, region, hooks).await?;
+    make_group_calls(ctx, region, hooks).await?;
+    make_group_calls(ctx, region, notifications).await?;
     Ok(Some(Created::attributes(BTreeMap::new())))
 }
 
@@ -759,34 +792,56 @@ const PUT_LIFECYCLE_HOOK_MEMBERS: &[&str] = &[
     "RoleARN",
 ];
 
-/// The hook specifications a declaration states, in declaration order.
+/// The entries a declaration states under the list property `property`, in declaration order.
 ///
-/// A declaration that spells ONE specification without the sequence syntax is the one-entry
-/// list of itself, exactly as it is for every other list property ([`push_list`]), and a
-/// declaration that states the property as an EMPTY list asks for a group with no hook at all.
-fn declared_lifecycle_hooks(properties: &Value) -> Vec<Value> {
-    match properties.get(LIFECYCLE_HOOK_SPECIFICATION_LIST) {
+/// A declaration that spells ONE entry without the sequence syntax is the one-entry list of
+/// itself, exactly as it is for every other list property ([`push_list`]), and a declaration
+/// that states the property as an EMPTY list asks for a group with none of that child at all.
+///
+/// THE ONE reading of such a property for the children of the group that travel beside its own
+/// calls — its lifecycle hooks and its notification configurations — so the two walks cannot
+/// drift apart about what a declaration states.
+fn declared_group_children(properties: &Value, property: &str) -> Vec<Value> {
+    match properties.get(property) {
         Some(Value::Array(entries)) => entries.clone(),
         None | Some(Value::Null) => Vec::new(),
         Some(single) => vec![single.clone()],
     }
 }
 
-/// The name one specification gives its hook, or `None` where it states none: a specification
-/// that names no hook is sent exactly as it was declared, so the owning service's own
-/// validation of that required member is what answers for it rather than a reading invented
-/// here.
-fn lifecycle_hook_name(specification: &Value) -> Option<String> {
-    specification
-        .get(LIFECYCLE_HOOK_NAME)
+/// The text one entry states for `member`, or `None` where it states none.
+///
+/// An entry that names neither the hook nor the topic it is about is sent exactly as it was
+/// declared, so the owning service's own validation of that required member is what answers for
+/// it rather than a reading invented here. THE ONE such reading, for the reason
+/// [`declared_group_children`] is the one reading of the list.
+fn declared_child_member(entry: &Value, member: &str) -> Option<String> {
+    entry
+        .get(member)
         .map(attribute_text)
-        .filter(|name| !name.is_empty())
+        .filter(|text| !text.is_empty())
 }
 
-/// The hook calls one revision of a group's `LifecycleHookSpecificationList` owes Amazon EC2
-/// Auto Scaling: the awsQuery parameters of each `DeleteLifecycleHook` and then of each
-/// `PutLifecycleHook`, in the order they are to be made.
-type LifecycleHookCalls = Vec<(&'static str, Vec<(String, String)>)>;
+/// The hook specifications a declaration states, in declaration order.
+fn declared_lifecycle_hooks(properties: &Value) -> Vec<Value> {
+    declared_group_children(properties, LIFECYCLE_HOOK_SPECIFICATION_LIST)
+}
+
+/// The name one specification gives its hook, or `None` where it states none.
+fn lifecycle_hook_name(specification: &Value) -> Option<String> {
+    declared_child_member(specification, LIFECYCLE_HOOK_NAME)
+}
+
+/// The calls one revision of a property the owning service provisions through calls of its
+/// OWN owes Amazon EC2 Auto Scaling: the awsQuery parameters of each call, paired with the
+/// action it is made under, in the order they are to be made.
+///
+/// Built by the walk of that property — the group's lifecycle hooks
+/// ([`lifecycle_hook_changes`]) or its notification configurations
+/// ([`notification_configuration_changes`]) — and made by the one sender
+/// ([`make_group_calls`]). Each walk puts its REMOVALS first, so a revision that renames or
+/// moves a child cannot run into that service's per-group ceiling on the way through.
+type GroupCalls = Vec<(&'static str, Vec<(String, String)>)>;
 
 /// The most hooks of one group this walk writes or removes, and so the most calls one stack
 /// update fans out into per direction: "if you exceed your maximum limit of lifecycle hooks,
@@ -827,7 +882,7 @@ fn lifecycle_hook_changes(
     name: &str,
     deployed: &Value,
     declared: &Value,
-) -> Result<LifecycleHookCalls, Refusal> {
+) -> Result<GroupCalls, Refusal> {
     let group = || ("AutoScalingGroupName".to_string(), name.to_string());
     let wanted = declared_lifecycle_hooks(declared);
     // One specification per hook NAME, so the comparison below is a lookup rather than a scan.
@@ -840,7 +895,7 @@ fn lifecycle_hook_changes(
             lifecycle_hook_name(specification).map(|hook| (hook, specification))
         })
         .collect();
-    let mut calls: LifecycleHookCalls = Vec::new();
+    let mut calls: GroupCalls = Vec::new();
     for held in declared_lifecycle_hooks(deployed)
         .iter()
         .take(MAX_DECLARED_LIFECYCLE_HOOKS)
@@ -891,17 +946,23 @@ fn drops_a_member(held: &Value, wanted: &Value) -> bool {
         .any(|(member, _)| wanted.get(member).is_none())
 }
 
-/// Make the hook calls [`lifecycle_hook_changes`] built, through the two calls Amazon EC2 Auto
-/// Scaling publishes for ONE hook of a group that exists: `PutLifecycleHook` "creates or
-/// updates a lifecycle hook for the specified Auto Scaling group" and `DeleteLifecycleHook`
-/// "deletes the specified lifecycle hook".
+/// Make the calls a walk of one property of the group built, in the order it built them:
+/// each of the per-child calls Amazon EC2 Auto Scaling publishes for a group that EXISTS —
+/// the two that write and remove one lifecycle hook ([`lifecycle_hook_changes`]), and the two
+/// that configure and un-configure one notification topic
+/// ([`notification_configuration_changes`]).
 ///
-/// Idempotent, like every other in-place arm: a revision that restates the hooks it already
-/// declared re-writes exactly those hooks, which is what that upsert is for.
-async fn reconcile_lifecycle_hooks(
+/// THE ONE copy of "make this sequence of calls to the owning service", so a property that
+/// travels beside the group's own create or update cannot be sent over a second path of its
+/// own, and a call refused mid-sequence fails the resource the same way whichever walk built
+/// it.
+///
+/// Idempotent, like every other in-place arm: a revision that restates what it already
+/// declared re-writes exactly that, which is what those upserts are for.
+async fn make_group_calls(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    calls: LifecycleHookCalls,
+    calls: GroupCalls,
 ) -> Result<(), Refusal> {
     for (action, parameters) in &calls {
         call_query(
@@ -915,6 +976,133 @@ async fn reconcile_lifecycle_hooks(
         .await?;
     }
     Ok(())
+}
+
+/// The property an `AWS::AutoScaling::AutoScalingGroup` declares the Amazon SNS notifications
+/// of its own events in, and the two members of ONE entry of it: the topic that entry
+/// notifies and the events it is told about.
+///
+/// Source: AWS's CloudFormation resource reference for the type read against
+/// `smithy_query(query="operation",operation="PutNotificationConfiguration",
+/// model_path="services/service-com-amazonaws-autoscaling-autoscaling-2011-01-01/\
+/// smithy-model/com-amazonaws-autoscaling-autoscaling-2011-01-01.json")` — the type publishes
+/// `NotificationConfigurations`, a list whose entry carries a `TopicARN` and the
+/// `NotificationTypes` that topic is to be sent, and that call takes each of them under its
+/// own name beside the group's.
+const NOTIFICATION_CONFIGURATIONS: &str = "NotificationConfigurations";
+const NOTIFICATION_TOPIC_ARN: &str = "TopicARN";
+const NOTIFICATION_TYPES: &str = "NotificationTypes";
+
+/// The most notification configurations of one group this walk writes or removes, and so the
+/// most calls one deployment fans out into per direction: "if you exceed your maximum limit of
+/// SNS topics, which is 10 per Auto Scaling group, the call fails"
+/// (`PutNotificationConfiguration`).
+///
+/// A declaration stating MORE than that asks for a group no account can have, and the owning
+/// service refuses the first topic past its own ceiling — so the walk stops one entry past the
+/// bound rather than fanning out the rest, exactly as the hook walk does
+/// ([`MAX_DECLARED_LIFECYCLE_HOOKS`]). The group cannot hold more than this many
+/// configurations either, so no more removals than this can be owed.
+const MAX_DECLARED_NOTIFICATION_CONFIGURATIONS: usize = 10;
+
+/// The notification entries a declaration states, in declaration order.
+fn declared_notification_configurations(properties: &Value) -> Vec<Value> {
+    declared_group_children(properties, NOTIFICATION_CONFIGURATIONS)
+}
+
+/// The topic one entry names, or `None` where it names none.
+fn notification_topic_arn(entry: &Value) -> Option<String> {
+    declared_child_member(entry, NOTIFICATION_TOPIC_ARN)
+}
+
+/// The calls that take the group's notifications from the ones the PREVIOUS revision declared
+/// to the ones THIS one does, or the refusal an entry this arm cannot carry earns.
+///
+/// This property is no member of either of the group's own calls: Amazon EC2 Auto Scaling
+/// configures the notifications of a group that EXISTS, through `PutNotificationConfiguration`
+/// — "configures an Auto Scaling group to send notifications when specified events take place
+/// […] this configuration overwrites any existing configuration" — and
+/// `DeleteNotificationConfiguration`, which "deletes the specified notification". So a CREATE
+/// provisions each declared entry by a call of its own after the group is there, and an UPDATE
+/// reconciles the two revisions through the same pair.
+///
+/// Built before anything is sent, as every other refusal of a declaration here is
+/// ([`query_members`]): an entry carrying a member neither call takes refuses the deployment
+/// with nothing sent. What the owning service itself refuses mid-sequence — an event type it
+/// does not notify about, a value that names no Amazon SNS topic, its per-group ceiling on
+/// topics — fails the resource with that service's own message, the group left as the call
+/// that created it made it.
+///
+/// A topic the previous revision declared that this one no longer does is UN-CONFIGURED, and
+/// every declared entry is then written through the upsert that call is: the write REPLACES
+/// that topic's event types, so no entry has to be deleted first for a revision that only
+/// narrows the events it asks for — and a declaration naming one topic in two entries
+/// configures ONE topic, with the event types of the entry written last. A topic no revision of
+/// this declaration states is left alone: it is not this resource's to take away. The removals
+/// come first, and each topic is removed ONCE however many entries of the previous revision
+/// named it, since what is there to take away is the one configuration those entries left; the
+/// order keeps a revision that moves a configuration from one topic to another from running
+/// into that service's per-group ceiling on the way through.
+///
+/// Both lists are bounded by [`MAX_DECLARED_NOTIFICATION_CONFIGURATIONS`], so the work and the
+/// calls this builds are bounded for any template.
+fn notification_configuration_changes(
+    name: &str,
+    deployed: &Value,
+    declared: &Value,
+) -> Result<GroupCalls, Refusal> {
+    let group = || ("AutoScalingGroupName".to_string(), name.to_string());
+    let wanted = declared_notification_configurations(declared);
+    let wanted_topics: Vec<String> = wanted
+        .iter()
+        .take(MAX_DECLARED_NOTIFICATION_CONFIGURATIONS + 1)
+        .filter_map(notification_topic_arn)
+        .collect();
+    let mut calls: GroupCalls = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    for held in declared_notification_configurations(deployed)
+        .iter()
+        .take(MAX_DECLARED_NOTIFICATION_CONFIGURATIONS)
+    {
+        let Some(topic_arn) = notification_topic_arn(held) else {
+            continue;
+        };
+        if !wanted_topics.contains(&topic_arn) && !removed.contains(&topic_arn) {
+            removed.push(topic_arn);
+        }
+    }
+    for topic_arn in removed {
+        calls.push((
+            "DeleteNotificationConfiguration",
+            vec![group(), (NOTIFICATION_TOPIC_ARN.to_string(), topic_arn)],
+        ));
+    }
+    for entry in wanted
+        .iter()
+        .take(MAX_DECLARED_NOTIFICATION_CONFIGURATIONS + 1)
+    {
+        let mut parameters = vec![group()];
+        for (member, value) in entry.as_object().into_iter().flatten() {
+            match member.as_str() {
+                // The topic is one value and the event types a LIST, written as every other
+                // awsQuery list member of this crate is ([`push_list`]): indexed from 1 under
+                // the element name its list shape carries, which is the Smithy default here.
+                NOTIFICATION_TOPIC_ARN => {
+                    parameters.push((member.clone(), attribute_text(value)));
+                }
+                NOTIFICATION_TYPES => {
+                    push_list(&mut parameters, NOTIFICATION_TYPES, "member", value, 0)?;
+                }
+                // A member that call does not take is REFUSED rather than dropped, exactly as
+                // a property outside the create's catalogue is ([`query_members`]): a group
+                // configured without what its declaration asked for notifies differently from
+                // what the template declared.
+                _ => return Err(property_not_sent(AUTOSCALING_GROUP, member)),
+            }
+        }
+        calls.push(("PutNotificationConfiguration", parameters));
+    }
+    Ok(calls)
 }
 
 /// The `ResourceType` one tag of a tagging call names the group by: "the only supported value
