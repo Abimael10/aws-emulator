@@ -44,5 +44,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Generates the topic strings the retained-message read's topic-identity cases run over,
+# instead of enumerating them by hand. In-process only: the forking and timeout features
+# are off, and the suite writes no failure-persistence file.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
 [lints]
 workspace = true

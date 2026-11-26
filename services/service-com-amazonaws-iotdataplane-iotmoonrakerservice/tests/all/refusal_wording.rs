@@ -35,6 +35,12 @@
 //! from the crate (`state::MAX_PUBLISH_PAYLOAD_BYTES`, `state::MAX_TOPIC_PARTS`,
 //! `state::MAX_TOPIC_BYTES`) so no row can drift from the rule the handler enforces,
 //! while the SENTENCES are written out here, independently of the renderers under test.
+//!
+//! The topic-identity rule is also asserted as a PROPERTY over GENERATED topic strings,
+//! because it is an invariant with two sides that no enumeration can close: a read refuses
+//! a string if and only if it carries a wildcard, whatever its depth, its length or its
+//! alphabet. The generator (`topic_strategy`) draws from a fixed seed, so the cases are the
+//! same on every machine, and the run asserts that the generated set reached each class.
 
 use serde_json::{json, Value};
 
@@ -1039,6 +1045,338 @@ async fn a_publish_whose_response_topic_names_one_topic_is_accepted_and_retained
             payload,
             "case {case:?}: expected the published payload back, got {:?}",
             String::from_utf8_lossy(&stored)
+        );
+    }
+}
+
+/// The characters one generated topic level is drawn from: ordinary name characters, the
+/// characters that NEIGHBOUR the two MQTT wildcards in the ASCII table (`*`, `,`, `"`),
+/// and a two- and a three-byte character so a name's BYTES and its characters differ. The
+/// wildcards themselves are NOT in here: whether a generated string carries one is its own
+/// dimension ([`topic_strategy`]), so the two classes are drawn in comparable numbers
+/// rather than one of them by chance. `$` is left out on purpose: a leading `$` is the
+/// reserved system namespace, which is its own rule with its own suite
+/// (`super::reserved_topic_namespace`). The shape puts no constraint of its own on a
+/// topic (`smithy_query(query="shape",shape="Topic")` reports no length and no pattern),
+/// so the service's own rules are the whole of what a generated string is weighed
+/// against.
+const TOPIC_CHARACTERS: &[char] = &['a', 'b', 'z', '0', '9', '-', '_', '*', ',', '"', 'é', '温'];
+
+/// The two MQTT subscription wildcards — the single-level `+` and the multi-level `#` —
+/// one of which a generated string may carry anywhere in it.
+const MQTT_WILDCARDS: &[char] = &['+', '#'];
+
+/// The seed the generated cases below are drawn with — the 32 bytes the generator's
+/// ChaCha algorithm takes. FIXED, so the suite runs the same cases on every machine, and
+/// named in every assertion so a failure says which draw produced it.
+const TOPIC_SEED: &str = "iotdata-retained-topic-identity!";
+
+/// How many generated topics the property runs over. Bounded: each case is a handful of
+/// in-process requests, so the suite stays fast.
+const TOPIC_CASES: usize = 48;
+
+/// Topics drawn from [`TOPIC_CHARACTERS`]: one to ten `/`-separated levels of one to six
+/// characters each, zero to two long filler levels, and — on half the cases — one MQTT
+/// wildcard inserted at a generated position. A generated string therefore varies along
+/// everything the two rules divide on: whether it carries a wildcard, which wildcard it is
+/// and where it sits (alone in a level, inside one, between levels, at either end), how
+/// many levels the name has, and how many BYTES it is (the filler is what carries a name
+/// past the byte ceiling).
+fn topic_strategy() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::strategy::Strategy;
+
+    let level = proptest::collection::vec(proptest::sample::select(TOPIC_CHARACTERS), 1..=6)
+        .prop_map(|characters| characters.into_iter().collect::<String>());
+    let name = (proptest::collection::vec(level, 1..=10), 0..=2usize).prop_map(
+        |(levels, fillers)| {
+            let mut parts = levels;
+            for filler in 0..fillers {
+                parts.push(format!("{}{filler}", "w".repeat(120)));
+            }
+            parts.join("/")
+        },
+    );
+    let wildcard = proptest::option::of((proptest::sample::select(MQTT_WILDCARDS), 0..=255usize));
+    (name, wildcard).prop_map(|(name, wildcard)| match wildcard {
+        None => name,
+        Some((character, position)) => {
+            let mut characters: Vec<char> = name.chars().collect();
+            let at = position % (characters.len() + 1);
+            characters.insert(at, character);
+            characters.into_iter().collect()
+        }
+    })
+}
+
+/// [`TOPIC_CASES`] topics from [`topic_strategy`], drawn with [`TOPIC_SEED`]. Nothing is
+/// written to disk: failure persistence is off, and the generated cases are values.
+fn generated_topics() -> Vec<String> {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+
+    assert_eq!(
+        TOPIC_SEED.len(),
+        32,
+        "the generator's seed is 32 bytes, got {}",
+        TOPIC_SEED.len()
+    );
+    let mut runner = TestRunner::new_with_rng(
+        Config {
+            cases: TOPIC_CASES as u32,
+            failure_persistence: None,
+            ..Config::default()
+        },
+        TestRng::from_seed(RngAlgorithm::ChaCha, TOPIC_SEED.as_bytes()),
+    );
+    let strategy = topic_strategy();
+    (0..TOPIC_CASES)
+        .map(|case| {
+            strategy
+                .new_tree(&mut runner)
+                .unwrap_or_else(|error| {
+                    panic!("seed {TOPIC_SEED:?}: case {case} could not be generated: {error}")
+                })
+                .current()
+        })
+        .collect()
+}
+
+/// Why the BROKER would not take `topic` as the destination of a message, or `None` when
+/// it would: a string carrying an MQTT wildcard is a filter and no name at all, and a name
+/// is bounded in levels and, independently, in bytes. The sentences are written out here
+/// rather than taken from the renderer under test; the limits come from the crate so no
+/// case can drift from the rule.
+fn publish_refusal(topic: &str) -> Option<String> {
+    if topic.contains('+') || topic.contains('#') {
+        return Some("Invalid topic filter".to_string());
+    }
+    if topic.split('/').count() > MAX_TOPIC_PARTS {
+        return Some(format!("Topic can't contain more than {MAX_TOPIC_PARTS} parts"));
+    }
+    if topic.len() > MAX_TOPIC_BYTES {
+        return Some(format!("Topic can't contain more than {MAX_TOPIC_BYTES} bytes"));
+    }
+    None
+}
+
+/// The topic the control retained message is held under, so every case can observe that a
+/// refused call changed nothing. No generated topic can collide with it: `c`, `o`, `n`,
+/// `t`, `r`, `l` and `f` are not in [`TOPIC_CHARACTERS`].
+const CONTROL_TOPIC: &str = "control/leaf";
+
+#[tokio::test]
+async fn a_retained_message_read_refuses_exactly_the_generated_topics_that_are_filters() {
+    // What each class of generated string was answered as, so a generated set that drifted
+    // into one class alone cannot pass this as a property.
+    let mut filters = 0_usize;
+    let mut past_a_ceiling = 0_usize;
+    let mut retained = 0_usize;
+
+    for (case, topic) in generated_topics().into_iter().enumerate() {
+        // A fresh store per case, so each generated name starts out retaining nothing
+        // whatever an earlier case published.
+        let harness = Harness::new();
+        let control = harness
+            .publish(
+                &encode_component(CONTROL_TOPIC),
+                1,
+                true,
+                None,
+                b"control".to_vec(),
+            )
+            .await;
+        assert_eq!(
+            control.status,
+            200,
+            "seed {TOPIC_SEED:?} case {case} ({topic:?}): the control publish must be accepted, \
+             got {} with body {}",
+            control.status,
+            String::from_utf8_lossy(&control.body)
+        );
+
+        let encoded = encode_component(&topic);
+        let refusal = publish_refusal(&topic);
+        let is_filter = topic.contains('+') || topic.contains('#');
+
+        // The read of a name nothing is retained under: a filter is no name to resolve and
+        // is refused, and every other string — however deep or long — is a key the store
+        // holds nothing under, which is absence.
+        let (expected_status, expected_code, expected_message): (u16, &str, &str) = if is_filter {
+            (400, "InvalidRequestException", "Invalid topic filter")
+        } else {
+            (404, "ResourceNotFoundException", RETAINED_MESSAGE_NOT_FOUND)
+        };
+        let before = harness.get_retained_message(&encoded).await;
+        assert_eq!(
+            before.status,
+            expected_status,
+            "seed {TOPIC_SEED:?} case {case} ({topic:?}, {} levels, {} bytes): expected the read \
+             of an unretained name to be {expected_status}, got {} with body {}",
+            topic.split('/').count(),
+            topic.len(),
+            before.status,
+            String::from_utf8_lossy(&before.body)
+        );
+        assert_eq!(
+            before.error_code(),
+            expected_code,
+            "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected {expected_code}, got {}",
+            String::from_utf8_lossy(&before.body)
+        );
+        assert_eq!(
+            message(&before),
+            expected_message,
+            "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected {expected_message:?}, got {:?}",
+            message(&before)
+        );
+
+        // The write path's verdict on the SAME string: it borrows the identity rule and
+        // adds its own ceilings, each with its own sentence.
+        let published = harness
+            .publish(&encoded, 1, true, None, b"attempt".to_vec())
+            .await;
+        match refusal.as_deref() {
+            Some(sentence) => {
+                assert_eq!(
+                    published.status,
+                    400,
+                    "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the publish to be \
+                     refused 400, got {} with body {}",
+                    published.status,
+                    String::from_utf8_lossy(&published.body)
+                );
+                assert_eq!(
+                    message(&published),
+                    sentence,
+                    "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the publish refusal \
+                     {sentence:?}, got {:?}",
+                    message(&published)
+                );
+            }
+            None => assert_eq!(
+                published.status,
+                200,
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the broker to take the \
+                 name, got {} with body {}",
+                published.status,
+                String::from_utf8_lossy(&published.body)
+            ),
+        }
+
+        // …and the read once more. For a filter the two paths answer IDENTICALLY, which is
+        // the whole of the identity rule; for a name past a ceiling the read still reports
+        // absence; for a name the broker took the read answers from the store.
+        let after = harness.get_retained_message(&encoded).await;
+        if is_filter {
+            filters += 1;
+            assert_eq!(
+                after.status,
+                published.status,
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the read of a filter to \
+                 answer the publish path's status {}, got {} with body {}",
+                published.status,
+                after.status,
+                String::from_utf8_lossy(&after.body)
+            );
+            assert_eq!(
+                after.error_code(),
+                published.error_code(),
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the read of a filter to \
+                 answer the publish path's code {}, got {}",
+                published.error_code(),
+                String::from_utf8_lossy(&after.body)
+            );
+            assert_eq!(
+                message(&after),
+                message(&published),
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the read of a filter to \
+                 answer the publish path's sentence {:?}, got {:?}",
+                message(&published),
+                message(&after)
+            );
+        } else if refusal.is_some() {
+            past_a_ceiling += 1;
+            assert_eq!(
+                after.status,
+                404,
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected a name past a ceiling to \
+                 read as absent, got {} with body {}",
+                after.status,
+                String::from_utf8_lossy(&after.body)
+            );
+            assert_eq!(
+                message(&after),
+                RETAINED_MESSAGE_NOT_FOUND,
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the absent-message \
+                 sentence, got {:?}",
+                message(&after)
+            );
+        } else {
+            retained += 1;
+            assert_eq!(
+                after.status,
+                200,
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the retained message to \
+                 read back, got {} with body {}",
+                after.status,
+                String::from_utf8_lossy(&after.body)
+            );
+            assert_eq!(
+                after.json().get("topic").and_then(Value::as_str),
+                Some(topic.as_str()),
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the stored topic back, \
+                 got {}",
+                String::from_utf8_lossy(&after.body)
+            );
+            let payload = after
+                .json()
+                .get("payload")
+                .and_then(Value::as_str)
+                .map(|encoded| aws_smithy_types::base64::decode(encoded).expect("base64"))
+                .unwrap_or_default();
+            assert_eq!(
+                payload,
+                b"attempt".to_vec(),
+                "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the published payload \
+                 back, got {:?}",
+                String::from_utf8_lossy(&payload)
+            );
+        }
+
+        // The store from the other side: it holds the generated name only when the broker
+        // took it — a filter is never a key — and the control message throughout, so no
+        // refused call and no read fanned out or cleared anything.
+        let listed = retained_topics(&harness).await;
+        assert_eq!(
+            listed.contains(&topic),
+            refusal.is_none(),
+            "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the listing to hold the name \
+             only when the publish was taken, got {listed:?}"
+        );
+        let control_read = harness
+            .get_retained_message(&encode_component(CONTROL_TOPIC))
+            .await;
+        assert_eq!(
+            control_read.status,
+            200,
+            "seed {TOPIC_SEED:?} case {case} ({topic:?}): expected the control message to still \
+             be readable, got {} with body {}",
+            control_read.status,
+            String::from_utf8_lossy(&control_read.body)
+        );
+    }
+
+    // The generated set spans the three classes the two rules produce, so none of the
+    // branches above was asserted on an empty set.
+    for (class, observed) in [
+        ("topic filters refused on both paths", filters),
+        ("names past one of the broker's ceilings", past_a_ceiling),
+        ("names the broker took and retained", retained),
+    ] {
+        assert!(
+            observed >= 2,
+            "seed {TOPIC_SEED:?}: expected the {TOPIC_CASES} generated topics to span the \
+             class {class:?} at least twice, got {observed}"
         );
     }
 }
