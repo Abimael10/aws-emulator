@@ -36,6 +36,14 @@
 //! * The GROUP NAMES are the catalog's own: these are the groups MediaLive
 //!   publishes, one per media workflow it ships monitoring for, and a client
 //!   resolves a published group by exactly these names.
+//! * A published TEMPLATE's NAME is the name the catalog publishes that alarm
+//!   under, which is DERIVED rather than stored: the `AWS-` prefix, the metric
+//!   the alarm watches followed by the direction a breach of it lies in, then
+//!   the workflow family of the group publishing it
+//!   (`AWS-<Metric><High|Low>-<Workflow>Workflows`, see
+//!   [`PublishedTemplate::name`]). A client resolves a published template by
+//!   that name as readily as by its id (`Identifier`: "Can be either be its id
+//!   or current name"), so the form matters as much as the id's does.
 //! * A template's `MetricName` is a metric the service named by its
 //!   `TargetResourceType` publishes to CloudWatch, which is what
 //!   `MetricName` requires ("Must be compatible with targetResourceType").
@@ -198,21 +206,55 @@ pub struct PublishedGroup {
     pub id: &'static str,
     /// The group's `Name`, as the service publishes it.
     pub name: &'static str,
-    /// The component of a template's name that says which group published it,
-    /// which is what keeps every published template's `Name` unique in the
-    /// region (`Name`: "Names must be unique within the scope of a resource type
-    /// in a specific region").
-    pub tag: &'static str,
     pub templates: &'static [PublishedTemplate],
 }
 
+/// The prefix every published monitor template resource's `Name` carries, the
+/// one the published group names themselves are published under.
+const PUBLISHED_NAME_PREFIX: &str = "AWS-";
+
+/// The workflow family a published group covers, as a published name spells it:
+/// the group's own `Name` without the prefix every published name carries
+/// (`AWS-MediaLiveUdpAndRtmpWorkflows` -> `MediaLiveUdpAndRtmpWorkflows`).
+fn workflow_family(group_name: &str) -> &str {
+    group_name
+        .strip_prefix(PUBLISHED_NAME_PREFIX)
+        .unwrap_or(group_name)
+}
+
+/// Which side of the threshold a breach of an alarm built from this template
+/// lies on, as a published template's name spells it: a comparison that trips
+/// when the statistic rises above the threshold alarms on a HIGH metric, and one
+/// that trips when it falls under the threshold on a LOW one.
+fn breach_direction(comparison_operator: &str) -> &'static str {
+    match comparison_operator {
+        comparison_operator::LESS_THAN | comparison_operator::LESS_THAN_OR_EQUAL_TO => "Low",
+        // `GreaterThanThreshold`, `GreaterThanOrEqualToThreshold`, and anything
+        // a later model adds.
+        _ => "High",
+    }
+}
+
 impl PublishedTemplate {
-    /// The name the published template carries: the workflow its group is for,
-    /// then the metric it alarms on, under the `AWS-` prefix every published
-    /// monitor resource's name is published under. Derived, so no two rows of
-    /// this table can collide on a name.
-    fn name(&self, tag: &str) -> String {
-        format!("AWS-{tag}-{}", self.metric_name)
+    /// The name the published template carries: the metric the alarm watches and
+    /// the direction a breach of it lies in, then the workflow family of the
+    /// group that publishes it, under the prefix every published monitor
+    /// resource's name carries.
+    ///
+    /// DERIVED from the row and its group, so no two rows of this table can
+    /// collide on a name and a published name cannot drift from the alarm it
+    /// names. Both components are the catalog's own vocabulary: the metric is
+    /// the one the alarm is evaluated on and the family is the publishing
+    /// group's `Name`, which is what keeps every published template's `Name`
+    /// unique in the region (`Name`: "Names must be unique within the scope of a
+    /// resource type in a specific region").
+    fn name(&self, group_name: &str) -> String {
+        format!(
+            "{PUBLISHED_NAME_PREFIX}{metric}{direction}-{family}",
+            metric = self.metric_name,
+            direction = breach_direction(self.comparison_operator),
+            family = workflow_family(group_name),
+        )
     }
 
     /// The sentence this template's `Description` carries: what the alarm trips
@@ -301,7 +343,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-1160891",
         name: "AWS-CloudFrontGeneralWorkflows",
-        tag: "CloudFrontGeneral",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::CLOUDFRONT_DISTRIBUTION,
@@ -330,7 +371,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-4336130",
         name: "AWS-MediaConnectArqProtocolWorkflows",
-        tag: "MediaConnectArqProtocol",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIACONNECT_FLOW,
@@ -370,7 +410,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-2587288",
         name: "AWS-MediaConnectCdiJpegxsWorkflows",
-        tag: "MediaConnectCdiJpegxs",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIACONNECT_FLOW,
@@ -410,7 +449,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-5128237",
         name: "AWS-MediaConnectInputFailoverWorkflows",
-        tag: "MediaConnectInputFailover",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIACONNECT_FLOW,
@@ -439,7 +477,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-3414886",
         name: "AWS-MediaConnectRtpWorkflows",
-        tag: "MediaConnectRtp",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIACONNECT_FLOW,
@@ -490,7 +527,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-4237617",
         name: "AWS-MediaLiveMultiplexWorkflows",
-        tag: "MediaLiveMultiplex",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIALIVE_MULTIPLEX,
@@ -519,7 +555,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-5775786",
         name: "AWS-MediaLiveToMediaPackageWorkflows",
-        tag: "MediaLiveToMediaPackage",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
@@ -581,7 +616,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-1484347",
         name: "AWS-MediaLiveUdpAndRtmpWorkflows",
-        tag: "MediaLiveUdpAndRtmp",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIALIVE_CHANNEL,
@@ -689,7 +723,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-2520023",
         name: "AWS-MediaPackageGeneralWorkflows",
-        tag: "MediaPackageGeneral",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIAPACKAGE_CHANNEL,
@@ -729,7 +762,6 @@ pub const CATALOG: &[PublishedGroup] = &[
     PublishedGroup {
         id: "aws-3840949",
         name: "AWS-MediaTailorAdInsertionWorkflows",
-        tag: "MediaTailorAdInsertion",
         templates: &[
             PublishedTemplate {
                 target_resource_type: target_resource_type::MEDIATAILOR_PLAYBACK_CONFIGURATION,
@@ -816,7 +848,7 @@ pub fn published_templates(region: &str) -> Vec<CloudWatchAlarmTemplateRecord> {
                 id,
                 region: region.to_string(),
                 group_id: group.id.to_string(),
-                name: template.name(group.tag),
+                name: template.name(group.name),
                 description: Some(template.description()),
                 comparison_operator: template.comparison_operator.to_string(),
                 datapoints_to_alarm: Some(template.datapoints_to_alarm),

@@ -313,13 +313,25 @@ async fn a_describe_is_a_report_and_an_id_names_one_configuration() {
                 continue;
             }
             if member == "offeringDescription" {
-                // The description names the configuration AND the region it
-                // reserves it in, so it is compared without that region.
-                let description = away[member].as_str().unwrap_or_default();
-                assert!(
-                    description.contains(region),
-                    "case {case:?}: expected the description to name the region, got \
-                     {description:?}"
+                // The description names the configuration AND the Region it
+                // reserves it in, by that Region's published display name
+                // ("… in US West (Oregon)"), so the two reads are compared on
+                // the configuration they share: everything up to the trailing
+                // " in <Region>".
+                let configuration = |reported: &Value| {
+                    let description = reported.as_str().unwrap_or_default();
+                    description.rsplit_once(" in ").map_or_else(
+                        || description.to_string(),
+                        |(configuration, _)| configuration.to_string(),
+                    )
+                };
+                assert_eq!(
+                    configuration(&away[member]),
+                    configuration(&home[member]),
+                    "case {case:?}: expected one configuration however the Region it is read \
+                     in is named, got {:?} against {:?}",
+                    away[member],
+                    home[member]
                 );
                 continue;
             }

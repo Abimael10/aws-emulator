@@ -70,6 +70,11 @@ const DURATION_UNITS: &str = "MONTHS";
 /// NO_UPFRONT offering").
 const OFFERING_TYPE: &str = "NO_UPFRONT";
 
+/// The display name AWS publishes [`DEFAULT_REGION`] under, which is how an
+/// offering's description names the Region it reserves capacity in — the very
+/// name `OfferingDescription`'s own example ends in ("… in US West (Oregon)").
+const DEFAULT_REGION_DISPLAY_NAME: &str = "US West (Oregon)";
+
 /// `ListOfferings` with `query` appended verbatim (every input member is
 /// `@httpQuery`), signed for `region`.
 async fn list(
@@ -384,14 +389,22 @@ async fn every_offering_reports_the_configuration_it_reserves() {
             offering["usagePrice"]
         );
 
-        // The description names the configuration it reserves, so a caller
-        // reading it sees the same configuration the structured member carries.
+        // The description reads the reserved resource out in PROSE, the way
+        // `OfferingDescription`'s own example reads one out ("HD AVC output at
+        // 10-20 Mbps, 30 fps, and standard VQ in US West (Oregon)"): it says
+        // what is reserved and where, in words, rather than repeating the enum
+        // constants the structured specification beside it carries.
         let description = offering["offeringDescription"]
             .as_str()
             .unwrap_or_default()
             .to_string();
         let specification = specification_of(offering);
-        for name in SPECIFICATION_MEMBERS {
+        assert!(
+            description.starts_with("Reserved "),
+            "case {case:?}: expected the description to say the resource is reserved, \
+             got {description:?}"
+        );
+        for name in ["resolution", "codec"] {
             if let Some(value) = member(&specification, name) {
                 assert!(
                     description.contains(&value),
@@ -400,9 +413,22 @@ async fn every_offering_reports_the_configuration_it_reserves() {
                 );
             }
         }
+        if let Some(resource_type) = member(&specification, "resourceType") {
+            assert!(
+                description.contains(&resource_type.to_lowercase()),
+                "case {case:?}: expected the description to name the reserved \
+                 {resource_type:?} in words, got {description:?}"
+            );
+        }
         assert!(
-            description.contains(DEFAULT_REGION),
-            "case {case:?}: expected the description to name the region, got {description:?}"
+            !description.contains('_'),
+            "case {case:?}: expected prose rather than the enum constants the \
+             specification carries, got {description:?}"
+        );
+        assert!(
+            description.ends_with(&format!(" in {DEFAULT_REGION_DISPLAY_NAME}")),
+            "case {case:?}: expected the description to end in the Region's published \
+             display name, got {description:?}"
         );
     }
 

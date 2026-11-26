@@ -39,12 +39,14 @@
 //! entry by [`OfferingSpec::usage_price`]. Nothing is built out of the request in
 //! flight beyond the region the caller addressed.
 //!
-//! The two members AWS does not give a machine-readable rule for — the recurring
-//! price and the description's prose — are this EMULATOR's, not the real service's
-//! data: each is a pure function of the catalog entry (see
-//! [`OfferingSpec::usage_price`] and [`OfferingSpec::description`]), so a read of
-//! one offering is stable and comparable with another's, but neither is AWS's
-//! published price list or console wording and nothing should treat them as such.
+//! The one member AWS does not give a machine-readable rule for — the recurring
+//! price — is this EMULATOR's, not the real service's data: it is a pure function
+//! of the catalog entry (see [`OfferingSpec::usage_price`]), so a read of one
+//! offering is stable and comparable with another's, but it is not AWS's
+//! published price list and nothing should treat it as such. The description's
+//! PROSE, by contrast, follows the form `OfferingDescription` documents (see
+//! [`OfferingSpec::description`]), so what a client shows a human reads the way
+//! the service's own wording does.
 
 use std::sync::OnceLock;
 
@@ -355,33 +357,52 @@ impl OfferingSpec {
         (price * 100.0).round() / 100.0
     }
 
-    /// The sentence `OfferingDescription` carries: the configuration this
-    /// offering reserves and the region it reserves it in, the way the member's
-    /// own example reads one out ("HD AVC output at 10-20 Mbps, 30 fps, and
-    /// standard VQ in US West (Oregon)") — resolution, codec and what is being
-    /// reserved, then the rest of the configuration, then the region.
+    /// The sentence `OfferingDescription` carries: the reserved resource this
+    /// offering is for, read out in PROSE the way the member's own example reads
+    /// one out ("HD AVC output at 10-20 Mbps, 30 fps, and standard VQ in US West
+    /// (Oregon)") — what is reserved, with its channel class, resolution, codec
+    /// and bitrate band, then the qualifiers its resource type carries, then the
+    /// Region by its published display name.
     ///
-    /// Built from the entry and the region, never from a request, and it names
-    /// the configuration in the model's own vocabulary rather than in the
-    /// console's prose, which no document gives a rule for.
+    /// PROSE, not the enum constants: `OfferingDescription` is the member a
+    /// client shows a human ("Reserved Single Pipeline UHD AVC input at <10mbps
+    /// in US West (Oregon)"), so every component is the WORD for the value it
+    /// reports — [`channel_class_phrase`], [`resource_phrase`],
+    /// [`bitrate_phrase`], [`framerate_phrase`], [`video_quality_phrase`],
+    /// [`special_feature_phrase`] and [`region_display_name`] — and none of them
+    /// is an enum token. The structured `ResourceSpecification` beside it is
+    /// where a program reads the configuration from.
+    ///
+    /// Built from the entry and the region, never from a request.
     pub fn description(&self, region: &str) -> String {
         let mut description = format!(
-            "{} {} {} at {}",
-            self.resolution, self.codec, self.resource_type, self.maximum_bitrate
+            "Reserved {class} {resolution} {codec} {resource} at {bitrate}",
+            class = channel_class_phrase(self.channel_class),
+            resolution = self.resolution,
+            codec = self.codec,
+            resource = resource_phrase(self.resource_type),
+            bitrate = bitrate_phrase(self.maximum_bitrate),
         );
-        if let Some(maximum_framerate) = self.maximum_framerate {
-            description.push_str(&format!(", {maximum_framerate}"));
+        // The qualifiers the reserved resource's own type carries, in the order
+        // the member's example lists them, joined as that example joins them: a
+        // comma before each, and `and` before the last of several.
+        let qualifiers: Vec<String> = [
+            self.maximum_framerate.map(framerate_phrase),
+            self.video_quality.map(video_quality_phrase),
+            self.special_feature.map(special_feature_phrase),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let last = qualifiers.len().saturating_sub(1);
+        for (position, qualifier) in qualifiers.iter().enumerate() {
+            description.push_str(", ");
+            if position == last && last > 0 {
+                description.push_str("and ");
+            }
+            description.push_str(qualifier);
         }
-        if let Some(video_quality) = self.video_quality {
-            description.push_str(&format!(", {video_quality} video quality"));
-        }
-        if let Some(special_feature) = self.special_feature {
-            description.push_str(&format!(", {special_feature}"));
-        }
-        description.push_str(&format!(
-            ", {} channel class in {region}",
-            self.channel_class
-        ));
+        description.push_str(&format!(" in {}", region_display_name(region)));
         description
     }
 
@@ -426,6 +447,148 @@ impl OfferingSpec {
             )
             && member_matches(configuration.resolution.as_deref(), Some(self.resolution))
     }
+}
+
+/// How a `ChannelClass` reads in an offering's description: a reserved resource
+/// is for the standard or the single-pipeline form of the channel ("A standard
+/// channel has two encoding pipelines and a single pipeline channel only has
+/// one").
+fn channel_class_phrase(channel_class: &str) -> String {
+    title_case_words(channel_class)
+}
+
+/// How a `ReservationResourceType` reads in an offering's description: the
+/// resource the offering reserves, named as the member's own example names it
+/// ("HD AVC output at …").
+fn resource_phrase(resource_type: &str) -> String {
+    resource_type.to_lowercase()
+}
+
+/// How a `ReservationMaximumBitrate` reads in an offering's description: the
+/// band of bitrates the reserved resource may run at ("<10mbps").
+///
+/// The band is derived from the model's own value order ("Maximum bitrate in
+/// megabits per second"): a value's band runs from the ceiling of the value
+/// below it up to its own, and the lowest value has no band below it, so it
+/// reads as everything up to its ceiling. A value the model does not declare
+/// reads the same way.
+fn bitrate_phrase(maximum_bitrate: &str) -> String {
+    let megabits = |value: &str| {
+        value
+            .trim_start_matches("MAX_")
+            .trim_end_matches("_MBPS")
+            .to_lowercase()
+    };
+    match RESERVATION_MAXIMUM_BITRATE_VALUES
+        .iter()
+        .position(|value| *value == maximum_bitrate)
+    {
+        Some(0) | None => format!("<{}mbps", megabits(maximum_bitrate)),
+        Some(position) => {
+            let below = RESERVATION_MAXIMUM_BITRATE_VALUES
+                .get(position - 1)
+                .copied()
+                .unwrap_or(maximum_bitrate);
+            format!("{}-{}mbps", megabits(below), megabits(maximum_bitrate))
+        }
+    }
+}
+
+/// How a `ReservationMaximumFramerate` reads in an offering's description, as
+/// the member's example reads it ("30 fps"): the frames per second the value
+/// names ("Maximum framerate in frames per second (Outputs only)").
+fn framerate_phrase(maximum_framerate: &str) -> String {
+    format!(
+        "{} fps",
+        maximum_framerate
+            .trim_start_matches("MAX_")
+            .trim_end_matches("_FPS")
+            .to_lowercase()
+    )
+}
+
+/// How a `ReservationVideoQuality` reads in an offering's description, as the
+/// member's example reads it ("standard VQ").
+fn video_quality_phrase(video_quality: &str) -> String {
+    format!("{} VQ", video_quality.to_lowercase())
+}
+
+/// How a `ReservationSpecialFeature` reads in an offering's description: the
+/// feature's own words ("ADVANCED_AUDIO" -> "advanced audio").
+fn special_feature_phrase(special_feature: &str) -> String {
+    special_feature.to_lowercase().replace('_', " ")
+}
+
+/// `value` with its underscores as spaces and each word capitalised
+/// (`SINGLE_PIPELINE` -> `Single Pipeline`), so a modelled value reads as the
+/// words it is made of whatever value a later model adds.
+fn title_case_words(value: &str) -> String {
+    value
+        .split('_')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                None => String::new(),
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &characters.as_str().to_lowercase()
+                }
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// The published display name of each AWS Region, which is how an offering's
+/// description names the Region it reserves capacity in ("… in US West
+/// (Oregon)").
+///
+/// WRITTEN OUT, because a Region's display name is nowhere in this service's
+/// model: each pair is a Region code and the name AWS publishes that Region
+/// under, the one for `us-west-2` being the name the `OfferingDescription`
+/// example itself uses. A Region this table does not name is named by its own
+/// code ([`region_display_name`]), so a Region added later reads as itself
+/// rather than as some other Region's name.
+const REGION_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("af-south-1", "Africa (Cape Town)"),
+    ("ap-east-1", "Asia Pacific (Hong Kong)"),
+    ("ap-northeast-1", "Asia Pacific (Tokyo)"),
+    ("ap-northeast-2", "Asia Pacific (Seoul)"),
+    ("ap-northeast-3", "Asia Pacific (Osaka)"),
+    ("ap-south-1", "Asia Pacific (Mumbai)"),
+    ("ap-south-2", "Asia Pacific (Hyderabad)"),
+    ("ap-southeast-1", "Asia Pacific (Singapore)"),
+    ("ap-southeast-2", "Asia Pacific (Sydney)"),
+    ("ap-southeast-3", "Asia Pacific (Jakarta)"),
+    ("ca-central-1", "Canada (Central)"),
+    ("cn-north-1", "China (Beijing)"),
+    ("cn-northwest-1", "China (Ningxia)"),
+    ("eu-central-1", "Europe (Frankfurt)"),
+    ("eu-central-2", "Europe (Zurich)"),
+    ("eu-north-1", "Europe (Stockholm)"),
+    ("eu-south-1", "Europe (Milan)"),
+    ("eu-south-2", "Europe (Spain)"),
+    ("eu-west-1", "Europe (Ireland)"),
+    ("eu-west-2", "Europe (London)"),
+    ("eu-west-3", "Europe (Paris)"),
+    ("il-central-1", "Israel (Tel Aviv)"),
+    ("me-central-1", "Middle East (UAE)"),
+    ("me-south-1", "Middle East (Bahrain)"),
+    ("sa-east-1", "South America (Sao Paulo)"),
+    ("us-east-1", "US East (N. Virginia)"),
+    ("us-east-2", "US East (Ohio)"),
+    ("us-gov-east-1", "AWS GovCloud (US-East)"),
+    ("us-gov-west-1", "AWS GovCloud (US-West)"),
+    ("us-west-1", "US West (N. California)"),
+    ("us-west-2", "US West (Oregon)"),
+];
+
+/// The display name `region` is published under, or `region` itself when
+/// [`REGION_DISPLAY_NAMES`] does not name it.
+fn region_display_name(region: &str) -> &str {
+    REGION_DISPLAY_NAMES
+        .iter()
+        .find(|(code, _)| *code == region)
+        .map_or(region, |(_, display_name)| *display_name)
 }
 
 /// Whether a filter on one specification member admits an offering that carries
