@@ -90,7 +90,7 @@ impl<Eng: Send + Sync + 'static> RequestPipeline<Eng> {
         // A resource ARN names a resource of one Region, so it is built in the Region the
         // request is signed for — the same key every handler reads.
         let region = crate::state::request_region(ctx);
-        let denied = super::authorization::judged_resource(key, protocol, req, &region)
+        let denied = super::authorization::judged_resource(&*self.engine, key, protocol, req, &region)
             .and_then(|resource| {
                 super::authorization::authorize(&*self.engine, ctx, key, &resource).err()
             })

@@ -51,21 +51,30 @@
 //! caller supplied for a tagging call or a service-deployment call, and
 //! [`EVERY_RESOURCE`] for an action IAM publishes no resource type for. Taking the
 //! identifiers from the REQUEST rather than from a stored record is also what keeps a
-//! refused call from telling an unauthorized caller whether what it named exists.
+//! refused call from telling an unauthorized caller whether what it named exists — with the
+//! ONE exception AWS documents, a `taskDefinition` reference that names no revision, where
+//! the revision is resolved from this account's registrations first and the decision is
+//! taken on it ([`judged_task_definition`]).
 //!
 //! ## Which operations this decides, and why only those
 //!
 //! The operations that MUTATE this account's Amazon ECS resources, and whose addressed
-//! resource the request itself determines. An operation addressed to a LIST of resources
-//! (the container-instance state update, the task-protection update, the task-definition
-//! delete), or to a task-definition reference that need not name a revision (the two
-//! launches and the deregistration, where "family" alone means whichever revision is latest
-//! at the time), is NOT decided here ([`judged_resource`] answers `None`): the request does
-//! not determine the ONE ARN IAM would judge such a call against, and withholding a grant
-//! from it would refuse calls AWS permits — a policy scoped to that resource grants the
-//! action on it. Those are left to a later change that can name every resource they address,
-//! and are served exactly as before, as are this service's reporting operations and the
-//! agent-plane state submissions.
+//! resource is determined — by the request itself, or, for a call addressed to a revision of
+//! a task-definition family, by RESOLVING the reference the request carries before the
+//! decision is taken ([`judged_task_definition`]): "a change was made to resolve the task
+//! definition revision before authorization. When a task definition revision is not
+//! specified, authorization will occur using the latest revision of a task definition"
+//! (`RunTask`'s own doc), so a `family` reference is judged on the revision such a call would
+//! put to work rather than on a family-wide ARN no policy statement about one revision
+//! matches.
+//!
+//! An operation addressed to a LIST of resources (the container-instance state update, the
+//! task-protection update, the task-definition delete) is NOT decided here
+//! ([`judged_resource`] answers `None`): the request does not determine the ONE ARN IAM would
+//! judge such a call against, and withholding a grant from it would refuse calls AWS permits
+//! — a policy scoped to that resource grants the action on it. Those are left to a later
+//! change that can name every resource they address, and are served exactly as before, as are
+//! this service's reporting operations and the agent-plane state submissions.
 //!
 //! ## The callers this gate does not bound
 //!
@@ -123,7 +132,12 @@ const EVERY_REVISION: &str = "*";
 /// schema the dispatch sequence will hand the handler ([`read_input`]), so this gate cannot
 /// judge a different value from the one the operation acts on; a body that cannot be read at
 /// all is no decision here, and the framework's own walk refuses it.
-pub fn judged_resource(
+///
+/// `engine` is the shared store, consulted for the ONE identifier a request does not spell
+/// in full: the revision a `taskDefinition` reference naming only a family resolves to
+/// ([`judged_task_definition`]).
+pub fn judged_resource<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     operation: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
@@ -334,10 +348,55 @@ pub fn judged_resource(
             req,
         )
         .map(|input| input.service_deployment_arn),
+        // The task-definition REVISION a call addressed to one puts to work or retires,
+        // resolved out of the reference the request carries before the decision is taken.
+        "RunTask" => read_input::<RunTaskInput>(protocol, RUN_TASK_INPUT_SCHEMA, req)
+            .and_then(|input| judged_task_definition(engine, region, &input.task_definition)),
+        "StartTask" => read_input::<StartTaskInput>(protocol, START_TASK_INPUT_SCHEMA, req)
+            .and_then(|input| judged_task_definition(engine, region, &input.task_definition)),
+        "DeregisterTaskDefinition" => read_input::<DeregisterTaskDefinitionInput>(
+            protocol,
+            DEREGISTER_TASK_DEFINITION_INPUT_SCHEMA,
+            req,
+        )
+        .and_then(|input| judged_task_definition(engine, region, &input.task_definition)),
         // Everything else is reported, agent-plane, or addressed to a resource the request
         // does not determine the ARN of (see the module docs).
         _ => None,
     }
+}
+
+/// The ARN of the task-definition revision a `taskDefinition` reference addresses, which is
+/// what IAM judges a call addressed to one against — or `None` when the reference resolves to
+/// no revision of this account's at all.
+///
+/// The three forms the member documents ("The family and revision (family:revision) or full
+/// ARN of the task definition ... If a revision isn't specified, the latest ACTIVE revision
+/// is used") are read by this crate's one reader of the value
+/// ([`crate::state::parse_task_definition_reference`]). A reference that SPELLS its revision
+/// is judged on that revision, taken from the request alone; one that names only a family is
+/// judged on the revision the call would act on, which is "the latest ACTIVE revision in that
+/// family" — the resolution AWS performs ahead of the decision, so a statement scoped to one
+/// revision decides a call that names its family.
+///
+/// `None` where that resolution finds nothing: the reference is unreadable, or the family
+/// holds no `ACTIVE` revision, so there is no revision for the call to act on and the
+/// operation's own not-found refusal — the answer AWS gives such a call, whose resolution
+/// fails before authorization is reached — is what the caller gets.
+fn judged_task_definition<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    reference: &str,
+) -> Option<String> {
+    let (family, revision) = crate::state::parse_task_definition_reference(reference)?;
+    let revision = match revision {
+        Some(revision) => revision,
+        None => crate::state::service_state(engine)?
+            .lock()
+            .latest_active_revision(region, &family)?
+            .revision,
+    };
+    Some(crate::state::task_definition_arn(region, &family, revision))
 }
 
 /// Whether IAM lets this request perform `operation`'s action on `resource`.

@@ -36,10 +36,10 @@ use crate::ecs_wire::{iam, list, ok, xml_element, ACCOUNT, SIGNED_REGION};
 
 /// The error code an authorization refusal carries (`AccessDeniedException`, `@httpError
 /// 403`).
-const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// The status that error is answered with.
-const FORBIDDEN: u16 = 403;
+pub(crate) const FORBIDDEN: u16 = 403;
 
 /// The access key id of the account's own published credential — the key every other suite
 /// of this crate signs with, which neither STS nor IAM holds a record for: the position AWS
@@ -53,7 +53,7 @@ const STS_API_VERSION: &str = "2011-06-15";
 /// from — IAM, which holds the policies in force on a principal, and STS, which holds the
 /// session a credential speaks for — over ONE shared engine, mounted the way the production
 /// router mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -75,7 +75,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// One `awsJson1_1` call to this service signed with `access_key_id` in its SigV4 credential
 /// scope — which is where this emulator reads which principal a request speaks for.
-async fn ecs_as(
+pub(crate) async fn ecs_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -156,15 +156,15 @@ async fn sts(
 
 /// One role session a row calls as: the access key id its requests are signed with, and the
 /// session ARN a refusal names it by.
-struct Session {
-    access_key_id: String,
-    session_arn: String,
+pub(crate) struct Session {
+    pub(crate) access_key_id: String,
+    pub(crate) session_arn: String,
 }
 
 /// Create the IAM role `role_name` carrying `document` as its inline policy (when one is
 /// given), assume it, and answer the session the assume minted — each step through that
 /// service's OWN API.
-async fn assumed_role(
+pub(crate) async fn assumed_role(
     router: &MultiServiceRouter,
     role_name: &str,
     document: Option<&str>,
@@ -244,7 +244,11 @@ fn family_arn(family: &str) -> String {
 /// The refusal IAM words for a principal an explicit `Deny` refuses `action` on `resource`
 /// for. `resource` is `None` for an action IAM publishes no resource type for, which the
 /// sentence names no resource clause for.
-fn explicit_deny_message(principal: &str, action: &str, resource: Option<&str>) -> String {
+pub(crate) fn explicit_deny_message(
+    principal: &str,
+    action: &str,
+    resource: Option<&str>,
+) -> String {
     let clause = resource.map_or(String::new(), |resource| format!(" on resource: {resource}"));
     format!(
         "User: {principal} is not authorized to perform: ecs:{action}{clause} with an explicit \
@@ -253,7 +257,7 @@ fn explicit_deny_message(principal: &str, action: &str, resource: Option<&str>) 
 }
 
 /// The refusal IAM words for a principal nothing granted `action` to.
-fn default_deny_message(principal: &str, action: &str, resource: &str) -> String {
+pub(crate) fn default_deny_message(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: ecs:{action} on resource: {resource} \
          because no identity-based policy allows the ecs:{action} action"
@@ -261,7 +265,7 @@ fn default_deny_message(principal: &str, action: &str, resource: &str) -> String
 }
 
 /// A document allowing everything beside an explicit `Deny` of `denied`.
-fn allow_all_but(denied: &[&str]) -> String {
+pub(crate) fn allow_all_but(denied: &[&str]) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [
@@ -273,7 +277,7 @@ fn allow_all_but(denied: &[&str]) -> String {
 }
 
 /// The error code a refusal reports, as the short shape name its `__type` carries.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
