@@ -933,7 +933,18 @@ fn start_action(
     if category == CATEGORY_APPROVAL {
         // An approval action does no work: it holds the stage until
         // `PutApprovalResult` answers the token it publishes here.
-        action.token = Some(random_uuid_v4());
+        //
+        // `ActionExecution$token` is "the system-generated token used to identify a
+        // unique approval request", and the approval request this action is waiting at IS
+        // this action execution: the provider of a manual approval is the service's own
+        // approval record. So the handle the request is identified by is the id of the
+        // execution that answering it settles — one identifier, not two — which is what
+        // lets a client that holds the token find the run its decision produced
+        // (`GetPipelineState`'s `latestExecution.actionExecutionId`,
+        // `ListActionExecutions`' `actionExecutionId` and, once answered, the provider's
+        // `externalExecutionId`). A later attempt of the action is a new action execution
+        // with a new id, so the token a displaced attempt published is no longer in force.
+        action.token = Some(action.action_execution_id.clone());
         action.summary = config.get("CustomData").cloned();
         return None;
     }

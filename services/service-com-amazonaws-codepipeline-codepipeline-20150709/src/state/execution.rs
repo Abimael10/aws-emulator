@@ -359,7 +359,11 @@ pub struct ActionRun {
     pub due: Option<SystemTime>,
     /// Set while a call is performing this action's work (see [`CLAIM_TIMEOUT`]).
     pub claimed: Option<SystemTime>,
-    /// The approval token an `Approval` action waits on.
+    /// The approval token an `Approval` action waits on, which is this action
+    /// execution's own id ([`Self::action_execution_id`]): the approval request the
+    /// token identifies is this action execution, so the handle a client holds for the
+    /// request is the id of the run answering it settles
+    /// ([`super::driver`] publishes it, `PutApprovalResult` consumes it).
     pub token: Option<String>,
     /// A human-readable summary of what the action did.
     pub summary: Option<String>,
