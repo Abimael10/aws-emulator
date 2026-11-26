@@ -1,31 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a destination asking to buffer for LONGER than this emulator holds data for gets:
-//! the hint is improved on, not waited out.
+//! What a destination asking for an interval at the CEILING of the published range gets: the
+//! wait it asked for, not a shorter one.
 //!
-//! The rule under test: `BufferingHints` is documented as hints rather than as a contract —
-//! "These options are treated as hints, and therefore Firehose might choose to use different
-//! values when it is optimal" — so `IntervalInSeconds` states the LONGEST a producer asks for
-//! its records to be held and not a wait the service owes. A buffer is therefore held for the
-//! interval its destination asks for only while that interval is inside the span this
-//! emulator holds data for, and a destination asking for more than that span has its records
-//! delivered at the end of that span instead. Nothing is held forever: whatever a destination
-//! configures, a record a put accepted becomes one object at that destination, so a producer
-//! that writes through Firehose and verifies by reading the destination back finds its data
-//! there. How a configuration is SPELLED makes no difference to that — the documented default
-//! interval stated explicitly is the same configuration as the member left out — and neither
-//! does a tag mutation on the stream, because `TagDeliveryStream` / `UntagDeliveryStream`
-//! carry no delivery semantics.
+//! The rule under test: `BufferingHints$IntervalInSeconds` is how long a destination's records
+//! are held before they are written — "buffer incoming data for the specified period of time,
+//! in seconds, before delivering it to the destination" — so the interval a destination
+//! configures is the wait its records get, whatever its length, and only the OTHER buffering
+//! condition can flush a buffer earlier ("Firehose buffers data up to 5 MB or for 5 minutes,
+//! whichever condition is satisfied first" — `CreateDeliveryStream`). A destination asking for
+//! minutes therefore still holds a handful of small records minutes later, while one asking
+//! for a window of seconds has them written at the end of that window: nothing is delivered
+//! before the destination's own hints are met. How a configuration is SPELLED makes no
+//! difference to that — the documented default interval stated explicitly is the same
+//! configuration as the member left out — and neither does a tag mutation on the stream,
+//! because `TagDeliveryStream` / `UntagDeliveryStream` carry no delivery semantics.
 //!
-//! The parent suite [`crate::buffering_hints`] pins the other half of the same rule: an
-//! interval INSIDE that span is honoured to the second, so a buffer configured with one holds
-//! nothing until it has elapsed.
+//! The parent suite [`crate::buffering_hints`] pins the same rule on the windows a case can
+//! wait out — the published minimum, a short non-zero one, and the size condition firing
+//! inside a long interval. What this child adds is the TOP of the published range: a
+//! destination whose interval is minutes away holds its records all through a window that the
+//! rows beside it show is far longer than any span this emulator would flush them at, so a
+//! window of minutes is not quietly shortened to one of seconds.
 //!
-//! No case here sleeps a window out or reads the wall clock. Every row's destination is
-//! polled until it holds the object its records owe, and the rows whose interval is longer
-//! than the span are required to hold NOTHING at the reading taken when the control row —
-//! configured with the shortest interval its member admits — has already been delivered, which
-//! is what says their records were held rather than written by the put itself.
+//! No case here sleeps a window out or reads the wall clock. The control row, configured with
+//! the shortest interval its member admits, is polled until its object is there; the row whose
+//! interval is tens of seconds is polled until its own object is there, which is what says the
+//! wait passed; and the rows whose interval is minutes away are required to hold NOTHING at
+//! every reading taken while both of those are waited for.
 
 use std::time::{Duration, Instant};
 
@@ -39,12 +41,19 @@ use crate::parquet_serializer_parameters::await_active;
 /// listing is per case.
 const BUCKET: &str = "hint-ceiling-bucket";
 
-/// How long the delivery of a row whose interval is longer than the span this emulator holds
-/// data for is waited for before the case fails.
+/// The interval of the row whose window a case waits out, in seconds.
 ///
-/// Generous beside that span, so a loaded machine does not fail a case the clock would have
-/// served; it bounds nothing the case measures.
-const CEILING_DELIVERY_DEADLINE: Duration = Duration::from_secs(240);
+/// Inside the published range of `IntervalInSeconds` (0..900), and tens of seconds: longer
+/// than the span any delivery this emulator makes without being asked would take, so the
+/// readings taken while it is waited for are what the rows asking for MINUTES must hold
+/// nothing at.
+const TENS_OF_SECONDS: i64 = 25;
+
+/// How long the row whose interval is [`TENS_OF_SECONDS`] is waited for before the case fails.
+///
+/// Generous beside that interval, so a loaded machine does not fail a case the clock would
+/// have served; it bounds nothing the case measures.
+const WAITED_OUT_DELIVERY_DEADLINE: Duration = Duration::from_secs(180);
 
 /// How long the control row's delivery — the one asking for the shortest interval its member
 /// admits — is waited for before the case fails.
@@ -53,15 +62,16 @@ const PROMPT_DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
 /// How often a destination is polled while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Whether a row's records are expected at its destination promptly or only once the span
-/// this emulator holds data for is spent.
+/// When a row's records may first appear at its destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
-    /// Not held at all: the row asks for the shortest interval `IntervalInSeconds` admits.
-    No,
-    /// Held: the row asks for an interval longer than the span, so its records arrive at the
-    /// end of that span rather than at the end of the interval it asked for.
-    PastTheSpan,
+enum Due {
+    /// At once: the row asks for the shortest interval `IntervalInSeconds` admits.
+    AtOnce,
+    /// Once the window it asked for has passed, which this suite waits out.
+    AfterItsInterval,
+    /// Not while this case runs: its interval is minutes away and its records are far below
+    /// its size.
+    NotYet,
 }
 
 /// What the stream's tags are made to do between the create and the put.
@@ -85,20 +95,21 @@ struct Row {
     /// How many records are put, one `PutRecord` each.
     records: usize,
     tagging: Tagging,
-    held: Held,
+    due: Due,
 }
 
 /// The cases.
 ///
 /// The rows differ along what the rule generalises over: the configured `IntervalInSeconds`
-/// (the documented default 300 stated explicitly, the member left out so that default stands
-/// unstated, the published maximum 900, and the published minimum 0 as the control), the
-/// configured `SizeInMBs` beside it (the documented default 5, the published minimum 1 and the
-/// published maximum 128 — none of which a handful of small records comes near), how many
-/// records one buffer holds, and whether the stream's tags are changed and removed between the
-/// create and the put. The published ranges are `SizeInMBs` 1..128 and `IntervalInSeconds`
-/// 0..900 (`smithy_query(query="shape", shape="SizeInMBs,IntervalInSeconds")`), and the
-/// defaults are `BufferingHints`' own ("The default value is 5", "The default value is 300").
+/// (the published minimum 0 as the control, a window of tens of seconds, the documented
+/// default 300 stated explicitly, the member left out so that default stands unstated, and
+/// the published maximum 900), the configured `SizeInMBs` beside it (the documented default 5,
+/// the published minimum 1 and the published maximum 128 — none of which a handful of small
+/// records comes near), how many records one buffer holds, and whether the stream's tags are
+/// changed and removed between the create and the put. The published ranges are `SizeInMBs`
+/// 1..128 and `IntervalInSeconds` 0..900 (`smithy_query(query="shape",
+/// shape="SizeInMBs,IntervalInSeconds")`), and the defaults are `BufferingHints`' own ("The
+/// default value is 5", "The default value is 300").
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -107,14 +118,14 @@ fn rows() -> Vec<Row> {
             hints: Some((5, 300)),
             records: 1,
             tagging: Tagging::ChangedAndRemoved,
-            held: Held::PastTheSpan,
+            due: Due::NotYet,
         },
         Row {
             case: "the same defaults stated explicitly, with the stream never tagged",
             hints: Some((5, 300)),
             records: 1,
             tagging: Tagging::Untouched,
-            held: Held::PastTheSpan,
+            due: Due::NotYet,
         },
         Row {
             case: "no BufferingHints member at all, so the documented default interval \
@@ -122,21 +133,28 @@ fn rows() -> Vec<Row> {
             hints: None,
             records: 2,
             tagging: Tagging::Untouched,
-            held: Held::PastTheSpan,
+            due: Due::NotYet,
         },
         Row {
             case: "the longest interval the member admits, under the largest size it admits",
             hints: Some((128, 900)),
             records: 3,
             tagging: Tagging::ChangedAndRemoved,
-            held: Held::PastTheSpan,
+            due: Due::NotYet,
+        },
+        Row {
+            case: "an interval of tens of seconds, which this case waits out",
+            hints: Some((1, TENS_OF_SECONDS)),
+            records: 2,
+            tagging: Tagging::Untouched,
+            due: Due::AfterItsInterval,
         },
         Row {
             case: "the shortest interval the member admits, as the control",
             hints: Some((1, 0)),
             records: 1,
             tagging: Tagging::ChangedAndRemoved,
-            held: Held::No,
+            due: Due::AtOnce,
         },
     ]
 }
@@ -150,11 +168,11 @@ struct Leg {
     /// The records put, in arrival order.
     records: Vec<Vec<u8>>,
     tagging: Tagging,
-    held: Held,
+    due: Due,
 }
 
 #[tokio::test]
-async fn an_interval_longer_than_the_span_this_emulator_holds_data_for_is_improved_on() {
+async fn an_interval_of_minutes_is_waited_out_and_not_shortened() {
     let emulator = Emulator::new();
     emulator.create_bucket(BUCKET).await;
 
@@ -183,7 +201,7 @@ async fn an_interval_longer_than_the_span_this_emulator_holds_data_for_is_improv
                 .map(|index| format!("row-{ordinal}-record-{index}").into_bytes())
                 .collect(),
             tagging: row.tagging,
-            held: row.held,
+            due: row.due,
         });
     }
     for leg in &legs {
@@ -192,7 +210,10 @@ async fn an_interval_longer_than_the_span_this_emulator_holds_data_for_is_improv
 
     // The tag mutations, before anything is put: a stream whose tags were changed and then
     // removed is the same stream as far as its destination is concerned.
-    for leg in legs.iter().filter(|leg| leg.tagging == Tagging::ChangedAndRemoved) {
+    for leg in legs
+        .iter()
+        .filter(|leg| leg.tagging == Tagging::ChangedAndRemoved)
+    {
         change_and_remove_tags(&emulator, leg.case, &leg.stream).await;
     }
 
@@ -210,26 +231,20 @@ async fn an_interval_longer_than_the_span_this_emulator_holds_data_for_is_improv
     }
 
     // The control row is delivered with no window to wait out; at the reading that says so,
-    // every row asking for more than the span this emulator holds data for still holds
-    // nothing, so its records are being HELD rather than written by the put.
-    for leg in legs.iter().filter(|leg| leg.held == Held::No) {
-        await_object(&emulator, leg, PROMPT_DELIVERY_DEADLINE).await;
+    // every row with a window still running holds nothing, so its records are being HELD
+    // rather than written by the put.
+    for leg in legs.iter().filter(|leg| leg.due == Due::AtOnce) {
+        await_object(&emulator, leg, PROMPT_DELIVERY_DEADLINE, &legs).await;
     }
-    for leg in legs.iter().filter(|leg| leg.held == Held::PastTheSpan) {
-        let keys = emulator.keys_under(BUCKET, &leg.prefix).await;
-        assert!(
-            keys.is_empty(),
-            "case {:?}: a buffer whose interval is still running holds its records, \
-             got {keys:?}",
-            leg.case
-        );
-    }
+    assert_nothing_delivered(&emulator, &legs).await;
 
-    // And none of them is held forever: each is delivered once the span is spent, as one
-    // object carrying every record of its buffer in arrival order.
-    for leg in legs.iter().filter(|leg| leg.held == Held::PastTheSpan) {
-        await_object(&emulator, leg, CEILING_DELIVERY_DEADLINE).await;
+    // The row whose window is tens of seconds is delivered once that window has passed — and
+    // all through the wait for it, every row whose interval is MINUTES away still holds
+    // nothing: a window of minutes is not shortened to one of seconds.
+    for leg in legs.iter().filter(|leg| leg.due == Due::AfterItsInterval) {
+        await_object(&emulator, leg, WAITED_OUT_DELIVERY_DEADLINE, &legs).await;
     }
+    assert_nothing_delivered(&emulator, &legs).await;
 }
 
 /// The `ExtendedS3DestinationConfiguration` a row is created with: a location in `bucket`
@@ -283,15 +298,31 @@ async fn change_and_remove_tags(emulator: &Emulator, case: &str, stream: &str) {
     );
 }
 
+/// Require every leg whose interval is minutes away to hold nothing: its buffer's own
+/// conditions are not met, so its records are still held.
+async fn assert_nothing_delivered(emulator: &Emulator, legs: &[Leg]) {
+    for leg in legs.iter().filter(|leg| leg.due == Due::NotYet) {
+        let keys = emulator.keys_under(BUCKET, &leg.prefix).await;
+        assert!(
+            keys.is_empty(),
+            "case {:?}: a buffer whose interval is still running holds its records, \
+             got {keys:?}",
+            leg.case
+        );
+    }
+}
+
 /// Wait until `leg`'s destination holds exactly one object carrying every record of its buffer
-/// in arrival order, or fail naming the case once `deadline` has passed.
-async fn await_object(emulator: &Emulator, leg: &Leg, deadline: Duration) {
+/// in arrival order, or fail naming the case once `deadline` has passed. Every leg whose
+/// interval is minutes away is read at each turn of the wait and must hold nothing.
+async fn await_object(emulator: &Emulator, leg: &Leg, deadline: Duration, legs: &[Leg]) {
     let expire = Instant::now() + deadline;
     let keys = loop {
         let keys = emulator.keys_under(BUCKET, &leg.prefix).await;
         if !keys.is_empty() {
             break keys;
         }
+        assert_nothing_delivered(emulator, legs).await;
         assert!(
             Instant::now() < expire,
             "case {:?}: expected the records put to be delivered under {:?}, it holds nothing",

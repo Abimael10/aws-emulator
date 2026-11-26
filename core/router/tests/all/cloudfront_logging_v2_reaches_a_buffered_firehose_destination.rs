@@ -4,14 +4,11 @@
 //! request leaves in an Amazon S3 delivery destination, and in a Firehose delivery destination
 //! whose stream was configured to hold its records for minutes.
 //!
-//! RULE: a destination's `BufferingHints` are documented as hints rather than as a contract —
-//! "These options are treated as hints, and therefore Firehose might choose to use different
-//! values when it is optimal" — so `IntervalInSeconds` ("buffer incoming data for the specified
-//! period of time, in seconds, before delivering it to the destination") is the LONGEST a
-//! producer asks for its records to be held and never a wait the service owes: a window inside
-//! the span this emulator holds data for is honoured, and every longer one is improved on, so
-//! every record a producer put reaches the destination inside a span a client that reads the
-//! destination back can wait out. A vended-log pipeline is such a producer — `CreateDelivery`
+//! RULE: `BufferingHints$IntervalInSeconds` is how long a destination's records are held
+//! before they are written — "buffer incoming data for the specified period of time, in
+//! seconds, before delivering it to the destination" — so the window a destination asks for is
+//! the wait its records get, and they are at the destination once that window has passed and
+//! not before. A vended-log pipeline is such a producer — `CreateDelivery`
 //! pairs "exactly one delivery source and one delivery destination", and "a delivery
 //! destination can represent a log group in CloudWatch Logs, an Amazon S3 bucket, a delivery
 //! stream in Firehose, or X-Ray" — so each request a CloudFront distribution's edge serves
@@ -30,17 +27,16 @@
 //! pipeline reaches a destination whose stream asked to hold it for minutes.
 //!
 //! The rows span what the rule generalises over: the `IntervalInSeconds` the destination stream
-//! asks for — the published minimum, the documented default stated explicitly, the member left
-//! out so that default stands unstated, and the published maximum — beside the `SizeInMBs` next
-//! to it, none of which two small records come near (the published ranges are `SizeInMBs` 1..128
-//! and `IntervalInSeconds` 0..900, `smithy_query(query="shape",
+//! asks for — the published minimum and three non-zero windows a case can wait out — beside the
+//! `SizeInMBs` next to it, none of which two small records come near (the published ranges are
+//! `SizeInMBs` 1..128 and `IntervalInSeconds` 0..900, `smithy_query(query="shape",
 //! shape="SizeInMBs,IntervalInSeconds")`), and the ANSWER each viewer request got (the origin's
 //! object, then the same read again, which the managed caching policy answers from the edge
 //! cache — two result classifications).
 //!
 //! No case sleeps a window out or reads the wall clock: every destination is polled until it
-//! holds the records its pipeline owes, under one deadline — a span a client that reads the
-//! destination back can wait out, which is the limit the rule is about.
+//! holds the records its pipeline owes, under one deadline generous beside every window a row
+//! asks for, so a loaded host never fails a delivery the clock would have made.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -107,12 +103,9 @@ const ACTIVE: &str = "ACTIVE";
 /// How long a destination that IS owed its records is polled before a case fails, and how often
 /// it is looked at again.
 ///
-/// This is the limit the rule is about, so it is the one bound any case here puts on the wall
-/// clock: a span a client that puts its records and then reads the destination back can WAIT
-/// OUT — one short poll loop — rather than a span only a reader that comes back minutes later
-/// would see through. It is several times the span this emulator holds a buffer for, so a
-/// loaded host never fails a delivery the clock would have made; what it refuses is a window a
-/// destination asked for being waited out in full.
+/// Many times the longest window any row here asks its stream to hold its records for, so a
+/// loaded host never fails a delivery the clock would have made; it bounds nothing a case
+/// measures.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
 
@@ -132,16 +125,16 @@ fn rows() -> Vec<Row> {
             hints: Some((1, 0)),
         },
         Row {
-            case: "the documented default interval stated explicitly",
-            hints: Some((5, 300)),
+            case: "a short window beside the documented default size",
+            hints: Some((5, 3)),
         },
         Row {
-            case: "no BufferingHints member at all, so the documented default stands unstated",
-            hints: None,
+            case: "a longer window under a size two small records never come near",
+            hints: Some((64, 6)),
         },
         Row {
-            case: "the longest interval the member admits, under the largest size it admits",
-            hints: Some((128, 900)),
+            case: "the longest window a case can wait out, under the largest size it admits",
+            hints: Some((128, 9)),
         },
     ]
 }
