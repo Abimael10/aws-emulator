@@ -453,10 +453,10 @@ async fn the_library_publishes_exactly_the_permissions_aws_publishes_for_the_typ
     // publishes no permission under is neither. Source: the managed permissions the RAM
     // permission library publishes for `acm-pca:CertificateAuthority` — the type's default
     // permission, the two blank end-entity issuance permissions, the client- and
-    // server-auth end-entity issuance permissions, one subordinate-CA issuance permission
-    // per published certificate template (the path lengths zero through three), and the
-    // revocation permission — which is what a `ListPermissions` scoped to that type
-    // enumerates in any account.
+    // server-auth end-entity issuance permissions, the subordinate-CA issuance permission
+    // published for the path-length-zero certificate template, and the revocation
+    // permission — which is what a `ListPermissions` scoped to that type enumerates in any
+    // account.
     let mut published: Vec<String> = [
         "AWSRAMBlankEndEntityCertificateAPICSRPassthroughIssuanceCertificateAuthority",
         "AWSRAMBlankEndEntityCertificateAPIPassthroughIssuanceCertificateAuthority",
@@ -465,9 +465,6 @@ async fn the_library_publishes_exactly_the_permissions_aws_publishes_for_the_typ
         "AWSRAMEndEntityServerAuthCertificateIssuanceCertificateAuthority",
         "AWSRAMRevokeCertificateCertificateAuthority",
         "AWSRAMSubordinateCACertificatePathLen0IssuanceCertificateAuthority",
-        "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",
-        "AWSRAMSubordinateCACertificatePathLen2IssuanceCertificateAuthority",
-        "AWSRAMSubordinateCACertificatePathLen3IssuanceCertificateAuthority",
     ]
     .into_iter()
     .map(aws_managed_permission_arn)
@@ -497,6 +494,7 @@ async fn the_library_publishes_exactly_the_permissions_aws_publishes_for_the_typ
     // nowhere and resolves to nothing, so a client cannot attach an ARN that does not
     // exist.
     for name in [
+        "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",
         "AWSRAMSubordinateCACertificatePathLen9IssuanceCertificateAuthority",
         "AWSRAMRootCACertificateIssuanceCertificateAuthority",
         "awsramdefaultpermissioncertificateauthority",

@@ -320,9 +320,14 @@ async fn every_default_the_catalog_publishes_attaches_to_a_share_of_its_resource
             }),
         )
         .await;
+        // The permission a share that names none is governed by is the default the
+        // library publishes for the type — the first of them where the library publishes
+        // more than one default for one type.
+        let attached = default_aws_managed_permission(entry.resource_type)
+            .unwrap_or_else(|| panic!("case {case:?}: the type has a published default"));
         assert_eq!(
             listed_arns(&router, case, &share_arn).await,
-            vec![aws_managed_permission_arn(entry.name)],
+            vec![aws_managed_permission_arn(attached.name)],
             "case {case:?}: a share of {resource_arn:?} carries that resource type's default \
              permission and nothing else"
         );

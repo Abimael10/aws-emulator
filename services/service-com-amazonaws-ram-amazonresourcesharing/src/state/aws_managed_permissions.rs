@@ -30,13 +30,20 @@
 //! publishes — a resource type whose owning service maintains a family of certificate
 //! templates gets one entry per published permission of that family, the revocation
 //! permission beside the issuance ones — and a name no permission is published under
-//! resolves nowhere, so an ARN a caller discovers here can be attached.
+//! carries no entry, so it resolves nowhere and an ARN a caller discovers here can be
+//! attached. A plausible name is not a published one: a permission the library publishes
+//! for one certificate template, or under one spelling of a type's name, is no reason to
+//! record a sibling for every other template or spelling.
 //!
-//! So is each entry's published VERSION ([`AwsManagedPermission::version`]). The library
-//! revises a managed permission in place and publishes the revision as the permission's
-//! version, so an entry carries the version the library publishes it at rather than one
-//! number for the whole catalog: that is the version every read of it reports and the
-//! default version a share attaches.
+//! So is each entry's published VERSION ([`AwsManagedPermission::version`]), the
+//! `resourceType` its owning service publishes
+//! ([`AwsManagedPermission::resource_type`]) and the is-resource-type-default flag
+//! ([`AwsManagedPermission::is_resource_type_default`]). The library revises a managed
+//! permission in place and publishes the revision as the permission's version, so an
+//! entry carries the version the library publishes it at rather than one number for the
+//! whole catalog: that is the version every read of it reports and the default version a
+//! share attaches. Each of those three is read off the entry on every read and defaulted
+//! nowhere.
 
 use std::collections::BTreeMap;
 
@@ -65,12 +72,27 @@ pub struct AwsManagedPermission {
     pub name: &'static str,
     /// The resource type it applies to, `<service-code>:<resource-code>`; one of
     /// [`super::RESOURCE_TYPES`].
+    ///
+    /// The spelling is the one the OWNING service publishes for the type — the resource
+    /// code of a resource's own ARN, which is what the shareable-resource-type catalog
+    /// carries — rather than one derived from this permission's name: a permission named
+    /// for a capability can govern a type of another service entirely, and a type the
+    /// owning service publishes in the plural, or as a second version of an earlier type,
+    /// is spelled that way here. A client filters a read by this string, so it is the
+    /// published one or the read misses the permission.
     pub resource_type: &'static str,
     /// The actions its policy allows, which is what the `permission` document reports.
     pub actions: &'static [&'static str],
     /// Whether this is "the default managed permission for all resources of this
     /// resource type" (`ResourceSharePermissionDetail$isResourceTypeDefault`) — the
     /// one RAM attaches when a share names no permission for the type.
+    ///
+    /// A published property of the permission, not a position in the family: the default
+    /// of a resource type the library publishes several permissions for is whichever one
+    /// the library marks, which is not necessarily the first of them or the most
+    /// permissive. Where the library marks more than one permission of a type, every one
+    /// of them reports the flag, and the one this service attaches to a share that names
+    /// none is [`default_aws_managed_permission`]'s.
     pub is_resource_type_default: bool,
     /// Whether Amazon Web Services publishes this permission for service-linked
     /// resource shares only — a share a service created on the account's behalf — so a
@@ -83,12 +105,13 @@ pub struct AwsManagedPermission {
     /// (`ResourceSharePermissionSummary$version`). Counting from
     /// [`FIRST_PERMISSION_VERSION`], the version every permission starts at.
     ///
-    /// An entry states a revision ([`entry_at_version`]) only where the number the library
-    /// publishes it at is known; every other entry carries
-    /// [`FIRST_PERMISSION_VERSION`], which is where a permission is published until the
-    /// library revises it. So a plain [`entry`] records "not known to have been revised"
-    /// rather than "confirmed at the first version", and the number to correct, when the
-    /// revision of one becomes known, is that entry's alone.
+    /// Per ENTRY, never per catalog: the library revises one permission without touching
+    /// the next, so the permissions published for one resource type sit at different
+    /// numbers and an entry carries the one the library publishes IT at — written with
+    /// [`entry_at_version`] for a revision and with [`entry`] for a permission the library
+    /// publishes at the first version. Reporting the first version for an entry whose
+    /// published number is a revision points a caller at a policy that does not exist, so
+    /// the number is the entry's own published one rather than a fallback.
     pub version: i32,
 }
 
@@ -360,24 +383,6 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         false,
     ),
     entry(
-        "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",
-        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
-        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
-        false,
-    ),
-    entry(
-        "AWSRAMSubordinateCACertificatePathLen2IssuanceCertificateAuthority",
-        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
-        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
-        false,
-    ),
-    entry(
-        "AWSRAMSubordinateCACertificatePathLen3IssuanceCertificateAuthority",
-        CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
-        CERTIFICATE_AUTHORITY_ISSUANCE_ACTIONS,
-        false,
-    ),
-    entry(
         "AWSRAMRevokeCertificateCertificateAuthority",
         CERTIFICATE_AUTHORITY_RESOURCE_TYPE,
         CERTIFICATE_AUTHORITY_REVOCATION_ACTIONS,
@@ -433,14 +438,6 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         "ec2:DedicatedHost",
         &["ec2:DescribeHosts", "ec2:RunInstances"],
         true,
-    ),
-    // The library publishes two managed permissions for an IPAM pool, and the one it
-    // publishes as the pool's default is `AWSRAMDefaultPermissionsIpamPool` below.
-    entry(
-        "AWSRAMDefaultPermissionIpamPool",
-        "ec2:IpamPool",
-        IPAM_POOL_ACTIONS,
-        false,
     ),
     entry(
         "AWSRAMDefaultPermissionPrefixList",
@@ -554,41 +551,6 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
-    // The library publishes two managed permissions for a firewall policy, and the one
-    // it publishes as the policy's default is `AWSRAMDefaultPermissionNetworkFirewallPolicy`
-    // below.
-    entry(
-        "AWSRAMDefaultPermissionNetworkFirewallFirewallPolicy",
-        "network-firewall:FirewallPolicy",
-        FIREWALL_POLICY_ACTIONS,
-        false,
-    ),
-    // The library publishes the stateful rule group's default under the
-    // `AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroup` name above.
-    entry(
-        "AWSRAMDefaultPermissionStatefulRuleGroup",
-        "network-firewall:StatefulRulegroup",
-        &[
-            "network-firewall:DescribeRuleGroup",
-            "network-firewall:ListRuleGroups",
-        ],
-        false,
-    ),
-    // The library publishes the Outpost's and the site's defaults under the
-    // `AWSRAMDefaultPermissionOutpostsOutpost` and `AWSRAMDefaultPermissionOutpostsSite`
-    // names below.
-    entry(
-        "AWSRAMDefaultPermissionOutpost",
-        "outposts:Outpost",
-        OUTPOST_ACTIONS,
-        false,
-    ),
-    entry(
-        "AWSRAMDefaultPermissionSite",
-        "outposts:Site",
-        OUTPOSTS_SITE_ACTIONS,
-        false,
-    ),
     entry(
         "AWSRAMDefaultPermissionResourceGroup",
         "resource-groups:Group",
@@ -609,18 +571,6 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "route53resolver:ListResolverRuleAssociations",
         ],
         true,
-    ),
-    // The library publishes the service network's default under the
-    // `AWSRAMPermissionVpcLatticeServiceNetworkReadWrite` name below.
-    entry(
-        "AWSRAMDefaultPermissionVpcLatticeServiceNetwork",
-        "vpc-lattice:ServiceNetwork",
-        &[
-            "vpc-lattice:CreateServiceNetworkVpcAssociation",
-            "vpc-lattice:GetServiceNetwork",
-            "vpc-lattice:ListServiceNetworks",
-        ],
-        false,
     ),
     // The rest of the private-CA issuance family: one published permission per
     // certificate template the shared certificate authority may issue under.
@@ -659,12 +609,11 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         false,
         2,
     ),
-    entry_at_version(
+    entry(
         "AWSRAMPermissionAgentRegistryForConsumer",
         "agent-registry:Registry",
         AGENT_REGISTRY_READ_ACTIONS,
         false,
-        2,
     ),
     entry_at_version(
         "AWSRAMPermissionAgentRegistryForPublisher",
@@ -731,7 +680,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         false,
     ),
     // An AWS Backup vault.
-    entry(
+    entry_at_version(
         "AWSRAMPermissionBackupVaultReadOnly",
         "backup:BackupVault",
         &[
@@ -740,6 +689,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "backup:ListRecoveryPointsByBackupVault",
         ],
         true,
+        3,
     ),
     // An Amazon Bedrock custom model.
     entry(
@@ -772,13 +722,14 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
     ),
     // An Amazon DataZone domain: the domain's own default, the portal-access variants,
     // and the permissions another service's principal uses against a shared domain.
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionAmazonDataZoneDomain",
         "datazone:Domain",
         DATAZONE_DOMAIN_READ_ACTIONS,
         true,
+        10,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionAmazonDataZoneDomainFullAccessWithPortalAccess",
         "datazone:Domain",
         &[
@@ -788,14 +739,16 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "datazone:ListProjects",
         ],
         false,
+        7,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionsAmazonDatazoneDomainExtendedServiceAccess",
         "datazone:Domain",
         DATAZONE_DOMAIN_SERVICE_ACTIONS,
         false,
+        10,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionsAmazonDatazoneDomainExtendedServiceWithPortalAccess",
         "datazone:Domain",
         &[
@@ -805,12 +758,14 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "datazone:ListEnvironments",
         ],
         false,
+        8,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMSageMakerServicePrincipalPermissionAmazonDataZoneDomain",
         "datazone:Domain",
         DATAZONE_DOMAIN_SERVICE_ACTIONS,
         false,
+        3,
     ),
     entry(
         "AWSRAMPermissionSageMakerDataZoneProjectMembershipAccess",
@@ -824,13 +779,13 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
     ),
     entry(
         "AWSRAMPermissionSageMakerCatalogResourceSearch",
-        "datazone:Domain",
+        "sagemaker:SagemakerCatalog",
         &[
-            "datazone:GetDomain",
-            "datazone:Search",
-            "datazone:SearchListings",
+            "sagemaker:DescribeFeatureGroup",
+            "sagemaker:ListFeatureGroups",
+            "sagemaker:Search",
         ],
-        false,
+        true,
     ),
     // Amazon EC2 and Amazon VPC resources the library publishes a permission for beside
     // the ones above.
@@ -866,11 +821,12 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionsIpamPool",
         "ec2:IpamPool",
         IPAM_POOL_ACTIONS,
         true,
+        4,
     ),
     entry(
         "AWSRAMPermissionIpamPoolByoipCidrImport",
@@ -878,7 +834,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         &["ec2:DescribeIpamPools", "ec2:ProvisionPublicIpv4PoolCidr"],
         false,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionIpamResourceDiscovery",
         "ec2:IpamResourceDiscovery",
         &[
@@ -887,6 +843,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "ec2:GetIpamDiscoveredResourceCidrs",
         ],
         true,
+        3,
     ),
     entry(
         "AWSRAMDefaultPermissionsPlacementGroup",
@@ -894,7 +851,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         &["ec2:DescribePlacementGroups", "ec2:RunInstances"],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionsSecurityGroup",
         "ec2:SecurityGroup",
         &[
@@ -902,6 +859,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "ec2:DescribeSecurityGroups",
         ],
         true,
+        2,
     ),
     entry(
         "AWSRAMDefaultPermissionTrafficMirror",
@@ -951,7 +909,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
     // publishes for it.
     entry(
         "AWSRAMEventBridgeEventBusV2FullAccess",
-        "events:EventBus",
+        "events:EventBusv2",
         &[
             "events:DeleteRule",
             "events:DescribeEventBus",
@@ -960,30 +918,30 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "events:PutRule",
             "events:PutTargets",
         ],
-        true,
+        false,
     ),
     entry(
         "AWSRAMEventBridgeEventBusV2EventSourceAccess",
-        "events:EventBus",
+        "events:EventBusv2",
         &["events:DescribeEventBus", "events:PutEvents"],
         false,
     ),
     entry(
         "AWSRAMEventBridgeEventBusV2PublishOnly",
-        "events:EventBus",
+        "events:EventBusv2",
         &["events:DescribeEventBus", "events:PutEvents"],
         false,
     ),
     entry(
         "AWSRAMEventBridgeEventBusV2SubscribeOnly",
-        "events:EventBus",
+        "events:EventBusv2",
         &[
             "events:DescribeEventBus",
             "events:ListRules",
             "events:PutRule",
             "events:PutTargets",
         ],
-        false,
+        true,
     ),
     // An Amazon FSx volume.
     entry(
@@ -1001,23 +959,26 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         GLUE_CATALOG_READ_ACTIONS,
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueAllTablesReadWriteForCatalog",
         "glue:Catalog",
         GLUE_CATALOG_TABLE_ACTIONS,
         false,
+        3,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueDatabaseReadWriteForCatalog",
         "glue:Catalog",
         GLUE_CATALOG_DATABASE_ACTIONS,
         false,
+        3,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueTableReadWriteForCatalog",
         "glue:Catalog",
         GLUE_CATALOG_TABLE_ACTIONS,
         false,
+        3,
     ),
     entry(
         "AWSRAMPermissionLFTagGlueDatabaseReadWriteForCatalog",
@@ -1031,17 +992,19 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         GLUE_CATALOG_TABLE_ACTIONS,
         false,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueAllTablesReadWriteForDatabase",
         "glue:Database",
         GLUE_DATABASE_TABLE_ACTIONS,
         false,
+        3,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueTableReadWriteForDatabase",
         "glue:Database",
         GLUE_DATABASE_TABLE_ACTIONS,
         false,
+        3,
     ),
     entry(
         "AWSRAMLFEnabledGlueAllTablesReadWriteForDatabase",
@@ -1067,17 +1030,19 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         GLUE_DATABASE_TABLE_ACTIONS,
         false,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueTableReadWrite",
         "glue:Table",
         GLUE_TABLE_PARTITION_ACTIONS,
         false,
+        2,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionGlueDatabaseReadWriteForTable",
         "glue:Table",
         GLUE_TABLE_PARTITION_ACTIONS,
         false,
+        2,
     ),
     entry(
         "AWSRAMLFEnabledGlueDatabaseReadWriteForTable",
@@ -1112,11 +1077,12 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         FIREWALL_POLICY_ACTIONS,
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroup",
         "network-firewall:StatefulRulegroup",
         RULE_GROUP_ACTIONS,
         true,
+        2,
     ),
     entry(
         "AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroupWithDescribe",
@@ -1277,15 +1243,16 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         true,
     ),
     // An Amazon S3 Access Grants instance.
-    entry(
+    entry_at_version(
         "AWSRAMPermissionAccessGrantsReadAccess",
-        "s3:AccessGrantsInstance",
+        "s3:AccessGrants",
         ACCESS_GRANTS_READ_ACTIONS,
-        true,
+        false,
+        2,
     ),
     entry(
         "AWSRAMPermissionAccessGrantsControl",
-        "s3:AccessGrantsInstance",
+        "s3:AccessGrants",
         &[
             "s3:CreateAccessGrant",
             "s3:DeleteAccessGrant",
@@ -1294,39 +1261,43 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         false,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionAccessGrantsData",
-        "s3:AccessGrantsInstance",
+        "s3:AccessGrants",
         &["s3:GetAccessGrantsInstance", "s3:GetDataAccess"],
-        false,
+        true,
+        2,
     ),
     // Amazon SageMaker AI resources, one default per shareable type and the variants the
     // library publishes beside each.
-    entry(
+    entry_at_version(
         "AWSRAMPermissionSageMakerFeatureGroupReadOnly",
         "sagemaker:FeatureGroup",
         FEATURE_GROUP_READ_ACTIONS,
         true,
+        2,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionSageMakerFeatureGroupReadWrite",
         "sagemaker:FeatureGroup",
         FEATURE_GROUP_WRITE_ACTIONS,
         false,
+        2,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionSageMakerFeatureGroupAdmin",
         "sagemaker:FeatureGroup",
         FEATURE_GROUP_WRITE_ACTIONS,
         false,
+        2,
     ),
     entry(
         "AWSRAMPermissionSagemakerHubReadOnly",
         "sagemaker:Hub",
         HUB_READ_ACTIONS,
-        true,
+        false,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionSagemakerHubReadAndUse",
         "sagemaker:Hub",
         &[
@@ -1335,9 +1306,10 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "sagemaker:ImportHubContent",
             "sagemaker:ListHubContents",
         ],
-        false,
+        true,
+        2,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionSagemakerHubFullAccess",
         "sagemaker:Hub",
         &[
@@ -1348,6 +1320,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "sagemaker:ListHubContents",
         ],
         false,
+        2,
     ),
     entry(
         "AWSRAMDefaultPermissionsSageMakerLineageGroup",
@@ -1361,10 +1334,11 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
     ),
     entry(
         "AWSRAMPermissionMlflowDefaultPolicy",
-        "sagemaker:MlflowTrackingServer",
+        "sagemaker:MlflowApp",
         &[
-            "sagemaker:DescribeMlflowTrackingServer",
-            "sagemaker:ListMlflowTrackingServers",
+            "sagemaker:CreatePresignedMlflowAppUrl",
+            "sagemaker:DescribeMlflowApp",
+            "sagemaker:ListMlflowApps",
         ],
         true,
     ),
@@ -1447,42 +1421,42 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
     // AWS Service Catalog AppRegistry applications and attribute groups.
     entry(
         "AWSRAMPermissionServiceCatalogAppRegistryApplicationAllowAssociation",
-        "servicecatalog:Application",
+        "servicecatalog:Applications",
         &[
             "servicecatalog:AssociateResource",
             "servicecatalog:DisassociateResource",
             "servicecatalog:GetApplication",
             "servicecatalog:ListAssociatedResources",
         ],
-        true,
+        false,
     ),
     entry(
         "AWSRAMPermissionServiceCatalogAppRegistryApplicationReadOnly",
-        "servicecatalog:Application",
+        "servicecatalog:Applications",
         &[
             "servicecatalog:GetApplication",
             "servicecatalog:ListAssociatedResources",
         ],
-        false,
+        true,
     ),
     entry(
         "AWSRAMPermissionServiceCatalogAppRegistryAttributeGroupAllowAssociation",
-        "servicecatalog:AttributeGroup",
+        "servicecatalog:AttributeGroups",
         &[
             "servicecatalog:AssociateAttributeGroup",
             "servicecatalog:DisassociateAttributeGroup",
             "servicecatalog:GetAttributeGroup",
         ],
-        true,
+        false,
     ),
     entry(
         "AWSRAMPermissionServiceCatalogAppRegistryAttributeGroupReadOnly",
-        "servicecatalog:AttributeGroup",
+        "servicecatalog:AttributeGroups",
         &[
             "servicecatalog:GetAttributeGroup",
             "servicecatalog:ListAttributeGroups",
         ],
-        false,
+        true,
     ),
     // An AWS Cloud Map namespace.
     entry(
@@ -1491,7 +1465,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         SERVICE_DISCOVERY_READ_ACTIONS,
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionCloudMapECSFullPermission",
         "servicediscovery:Namespace",
         &[
@@ -1504,6 +1478,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "servicediscovery:RegisterInstance",
         ],
         false,
+        2,
     ),
     // AWS End User Messaging resources: one published permission per shareable type.
     entry(
@@ -1545,7 +1520,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         true,
     ),
     // AWS Systems Manager resources.
-    entry(
+    entry_at_version(
         "AWSRAMPermissionSsmDocument",
         "ssm:Document",
         &[
@@ -1556,6 +1531,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "ssm:StartAutomationExecution",
         ],
         true,
+        2,
     ),
     entry(
         "AWSRAMDefaultPermissionSSMParameterReadOnly",
@@ -1575,7 +1551,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
     ),
     entry(
         "AWSRAMDefaultPermissionServerManageability",
-        "ssm:ManagedInstance",
+        "ec2:DedicatedHost",
         &[
             "ssm:DescribeInstanceInformation",
             "ssm:SendCommand",
@@ -1605,7 +1581,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         2,
     ),
     // Amazon VPC Lattice resources beside the service network default above.
-    entry(
+    entry_at_version(
         "AWSRAMPermissionVpcLatticeServiceNetworkReadWrite",
         "vpc-lattice:ServiceNetwork",
         &[
@@ -1615,6 +1591,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "vpc-lattice:ListServiceNetworks",
         ],
         true,
+        2,
     ),
     entry(
         "AWSRAMPermissionVpcLatticeServiceReadWrite",
@@ -1626,7 +1603,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
         ],
         true,
     ),
-    entry(
+    entry_at_version(
         "AWSRAMPermissionVpcLatticeResourceConfiguration",
         "vpc-lattice:ResourceConfiguration",
         &[
@@ -1635,6 +1612,7 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
             "vpc-lattice:ListResourceConfigurations",
         ],
         true,
+        2,
     ),
 ];
 
@@ -1646,10 +1624,9 @@ pub const AWS_MANAGED_PERMISSIONS: &[AwsManagedPermission] = &[
 /// ([`super::PermissionRecord::restrict_to_service_linked_shares`]), reported from there
 /// on every summary, and no permission the library publishes today carries it.
 ///
-/// An entry written this way records that the library is not known to have revised the
-/// permission ([`AwsManagedPermission::version`]), not that it was checked and found at
-/// the first version; one whose published revision IS known is written with
-/// [`entry_at_version`].
+/// An entry written this way is one the library publishes at its FIRST version — it has
+/// not been revised since publication — while one published at a revision is written with
+/// [`entry_at_version`] and carries that number.
 const fn entry(
     name: &'static str,
     resource_type: &'static str,
@@ -1775,7 +1752,9 @@ pub fn catalog_records(now: i64) -> BTreeMap<String, PermissionRecord> {
 ///
 /// The type is matched the way [`super::resource_type_matches`] matches one, so the
 /// spelling read off a shared resource's ARN finds the entry the catalog publishes
-/// under the display spelling of the same type.
+/// under the display spelling of the same type. Where the library publishes more than one
+/// permission of a type as that type's default, the first of them in catalog order is the
+/// one a share that names no permission is governed by.
 pub fn default_aws_managed_permission(
     resource_type: &str,
 ) -> Option<&'static AwsManagedPermission> {

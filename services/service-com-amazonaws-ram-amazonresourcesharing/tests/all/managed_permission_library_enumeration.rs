@@ -265,8 +265,8 @@ async fn the_library_publishes_the_families_the_permission_library_records() {
         ("AWSRAMPermissionSMSVoicePhoneNumber", "sms-voice:PhoneNumber"),
         ("AWSRAMPermissionSMSVoicePool", "sms-voice:Pool"),
         ("AWSRAMPermissionSMSVoiceSenderId", "sms-voice:SenderId"),
-        ("AWSRAMEventBridgeEventBusV2FullAccess", "events:EventBus"),
-        ("AWSRAMEventBridgeEventBusV2PublishOnly", "events:EventBus"),
+        ("AWSRAMEventBridgeEventBusV2FullAccess", "events:EventBusv2"),
+        ("AWSRAMEventBridgeEventBusV2PublishOnly", "events:EventBusv2"),
         ("AWSRAMPermissionSagemakerHubReadOnly", "sagemaker:Hub"),
         ("AWSRAMPermissionSagemakerHubFullAccess", "sagemaker:Hub"),
         ("AWSRAMLFEnabledGlueDatabaseReadWrite", "glue:Database"),
@@ -377,9 +377,10 @@ async fn the_library_publishes_these_revisions_and_resource_type_defaults() {
     // literals rather than read off the catalog, so a renumbered entry or a default moved
     // onto the wrong permission fails a case. Source: the version the RAM permission
     // library publishes each of these permissions at, and which of the permissions it
-    // publishes for one resource type is that type's default. The rows are every entry the
-    // library publishes at a revision beyond the first, and both permissions of each
-    // resource type the library publishes two of.
+    // publishes for one resource type is that type's default. The rows span every shape the
+    // rule has: an entry at its first version, entries at a revision, both permissions of a
+    // resource type the library publishes two of, and the entries the library publishes for
+    // one resource type where the default is NOT the first-listed or the most permissive one.
     let published: &[(&str, &str, &str, bool)] = &[
         ("AWSRAMDefaultPermissionAppMesh", "appmesh:Mesh", "3", true),
         (
@@ -393,6 +394,12 @@ async fn the_library_publishes_these_revisions_and_resource_type_defaults() {
             "agent-registry:Registry",
             "2",
             true,
+        ),
+        (
+            "AWSRAMPermissionAgentRegistryForConsumer",
+            "agent-registry:Registry",
+            "1",
+            false,
         ),
         (
             "AWSRAMDefaultPermissionCapacityReservation",
@@ -431,15 +438,52 @@ async fn the_library_publishes_these_revisions_and_resource_type_defaults() {
             "2",
             true,
         ),
+        // An Amazon DataZone domain: the library has revised the domain's own default and
+        // each of the permissions published beside it a different number of times.
+        (
+            "AWSRAMDefaultPermissionAmazonDataZoneDomain",
+            "datazone:Domain",
+            "10",
+            true,
+        ),
+        (
+            "AWSRAMPermissionAmazonDataZoneDomainFullAccessWithPortalAccess",
+            "datazone:Domain",
+            "7",
+            false,
+        ),
+        (
+            "AWSRAMPermissionsAmazonDatazoneDomainExtendedServiceAccess",
+            "datazone:Domain",
+            "10",
+            false,
+        ),
+        (
+            "AWSRAMPermissionsAmazonDatazoneDomainExtendedServiceWithPortalAccess",
+            "datazone:Domain",
+            "8",
+            false,
+        ),
+        (
+            "AWSRAMSageMakerServicePrincipalPermissionAmazonDataZoneDomain",
+            "datazone:Domain",
+            "3",
+            false,
+        ),
         // A resource type the library publishes two permissions for: exactly one of the
         // pair is the type's default, and the other reports false.
         (
             "AWSRAMDefaultPermissionsIpamPool",
             "ec2:IpamPool",
-            "1",
+            "4",
             true,
         ),
-        ("AWSRAMDefaultPermissionIpamPool", "ec2:IpamPool", "1", false),
+        (
+            "AWSRAMPermissionIpamPoolByoipCidrImport",
+            "ec2:IpamPool",
+            "1",
+            false,
+        ),
         (
             "AWSRAMDefaultPermissionNetworkFirewallPolicy",
             "network-firewall:FirewallPolicy",
@@ -447,19 +491,13 @@ async fn the_library_publishes_these_revisions_and_resource_type_defaults() {
             true,
         ),
         (
-            "AWSRAMDefaultPermissionNetworkFirewallFirewallPolicy",
-            "network-firewall:FirewallPolicy",
-            "1",
-            false,
-        ),
-        (
             "AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroup",
             "network-firewall:StatefulRulegroup",
-            "1",
+            "2",
             true,
         ),
         (
-            "AWSRAMDefaultPermissionStatefulRuleGroup",
+            "AWSRAMDefaultPermissionNetworkFirewallStatefulRuleGroupWithDescribe",
             "network-firewall:StatefulRulegroup",
             "1",
             false,
@@ -470,25 +508,80 @@ async fn the_library_publishes_these_revisions_and_resource_type_defaults() {
             "1",
             true,
         ),
-        ("AWSRAMDefaultPermissionOutpost", "outposts:Outpost", "1", false),
         (
             "AWSRAMDefaultPermissionOutpostsSite",
             "outposts:Site",
             "1",
             true,
         ),
-        ("AWSRAMDefaultPermissionSite", "outposts:Site", "1", false),
         (
             "AWSRAMPermissionVpcLatticeServiceNetworkReadWrite",
             "vpc-lattice:ServiceNetwork",
+            "2",
+            true,
+        ),
+        // An Amazon EventBridge event bus: the subscribe-only permission is the type's
+        // default, not the full-access one, and the type is spelled the way the owning
+        // service publishes it.
+        (
+            "AWSRAMEventBridgeEventBusV2SubscribeOnly",
+            "events:EventBusv2",
             "1",
             true,
         ),
         (
-            "AWSRAMDefaultPermissionVpcLatticeServiceNetwork",
-            "vpc-lattice:ServiceNetwork",
+            "AWSRAMEventBridgeEventBusV2FullAccess",
+            "events:EventBusv2",
             "1",
             false,
+        ),
+        // Amazon S3 Access Grants and the SageMaker AI hubs: again the default is not the
+        // read-only or the most permissive entry of the family.
+        (
+            "AWSRAMPermissionAccessGrantsData",
+            "s3:AccessGrants",
+            "2",
+            true,
+        ),
+        (
+            "AWSRAMPermissionAccessGrantsReadAccess",
+            "s3:AccessGrants",
+            "2",
+            false,
+        ),
+        (
+            "AWSRAMPermissionSagemakerHubReadAndUse",
+            "sagemaker:Hub",
+            "2",
+            true,
+        ),
+        (
+            "AWSRAMPermissionSagemakerHubReadOnly",
+            "sagemaker:Hub",
+            "1",
+            false,
+        ),
+        // AWS Service Catalog AppRegistry: the plural type spelling the owning service
+        // publishes, with the read-only permission as the default.
+        (
+            "AWSRAMPermissionServiceCatalogAppRegistryApplicationReadOnly",
+            "servicecatalog:Applications",
+            "1",
+            true,
+        ),
+        (
+            "AWSRAMPermissionServiceCatalogAppRegistryAttributeGroupReadOnly",
+            "servicecatalog:AttributeGroups",
+            "1",
+            true,
+        ),
+        // A permission whose name names one service and whose resource type is another's:
+        // the server-manageability permission governs a Dedicated Host.
+        (
+            "AWSRAMDefaultPermissionServerManageability",
+            "ec2:DedicatedHost",
+            "1",
+            true,
         ),
     ];
 
@@ -545,9 +638,6 @@ async fn a_scoped_read_reports_the_permissions_the_library_publishes_for_two_nam
                 "AWSRAMEndEntityServerAuthCertificateIssuanceCertificateAuthority",
                 "AWSRAMRevokeCertificateCertificateAuthority",
                 "AWSRAMSubordinateCACertificatePathLen0IssuanceCertificateAuthority",
-                "AWSRAMSubordinateCACertificatePathLen1IssuanceCertificateAuthority",
-                "AWSRAMSubordinateCACertificatePathLen2IssuanceCertificateAuthority",
-                "AWSRAMSubordinateCACertificatePathLen3IssuanceCertificateAuthority",
             ],
         ),
         ("odb:OdbNetwork", &["AWSRAMDefaultPermissionODBNetwork"]),
@@ -591,8 +681,9 @@ async fn a_scoped_read_reports_the_permissions_the_library_publishes_for_two_nam
 async fn the_library_publishes_one_default_per_resource_type_it_governs() {
     let router = emulator();
     // Over every resource type the library publishes for, not only the types the recording
-    // touched: exactly one of that type's published permissions is its default, and a
-    // scoped read reports it.
+    // touched: at least one of that type's published permissions is its default, and a
+    // scoped read reports it. The flag is a per-entry published fact rather than a count
+    // this service derives, so a type the library publishes two defaults for reports two.
     let governed: BTreeSet<&str> = AWS_MANAGED_PERMISSIONS
         .iter()
         .map(|entry| entry.resource_type)
@@ -618,15 +709,26 @@ async fn the_library_publishes_one_default_per_resource_type_it_governs() {
             "case {case:?}: expected HTTP 200, got {status} with {reported:?}"
         );
         let permissions = permissions_of(&case, &reported);
-        let defaults: Vec<String> = permissions
+        let mut defaults: Vec<String> = permissions
             .iter()
             .filter(|permission| flag(&case, permission, "isResourceTypeDefault"))
             .map(|permission| field(&case, permission, "name"))
             .collect();
+        defaults.sort();
+        let mut published_defaults: Vec<String> = AWS_MANAGED_PERMISSIONS
+            .iter()
+            .filter(|entry| entry.resource_type == resource_type && entry.is_resource_type_default)
+            .map(|entry| entry.name.to_string())
+            .collect();
+        published_defaults.sort();
+        assert!(
+            !defaults.is_empty(),
+            "case {case:?}: a governed resource type has a default permission, got \
+             {defaults:?}"
+        );
         assert_eq!(
-            defaults.len(),
-            1,
-            "case {case:?}: exactly one published permission is the type's default, got \
+            defaults, published_defaults,
+            "case {case:?}: expected the defaults the library publishes for the type, got \
              {defaults:?}"
         );
     }

@@ -428,7 +428,11 @@ pub struct ResourceTypeEntry {
 /// publish a type nothing can be shared as — no resource ARN classifies to it
 /// ([`is_shareable_resource_arn`]) and no managed permission is published for it
 /// ([`default_aws_managed_permission`]). EC2 Image Builder's resources, for one, are
-/// `imagebuilder:*`, the code its ARNs and its managed permissions carry.
+/// `imagebuilder:*`, the code its ARNs and its managed permissions carry. Where the
+/// owning service publishes a DIFFERENT resource code for a related resource — a later
+/// version of an earlier type, or a resource whose own ARN carries a plural code — that
+/// is a type of its own and takes its own entry, because the managed permissions
+/// published for it carry that spelling.
 ///
 /// A custom billing view is one of the types: the Billing service declares no
 /// operation that attaches a resource-based policy to a view, and the document its
@@ -476,6 +480,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
     resource_type_entry("ec2:Volume", false),
     resource_type_entry("elasticloadbalancing:TrustStore", true),
     resource_type_entry("events:EventBus", true),
+    resource_type_entry("events:EventBusv2", true),
     resource_type_entry("fsx:Volume", true),
     resource_type_entry("glue:Catalog", true),
     resource_type_entry("glue:Database", true),
@@ -506,6 +511,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
     resource_type_entry("route53resolver:FirewallRuleGroup", true),
     resource_type_entry("route53resolver:ResolverQueryLogConfig", true),
     resource_type_entry("route53resolver:ResolverRule", true),
+    resource_type_entry("s3:AccessGrants", true),
     resource_type_entry("s3:AccessGrantsInstance", true),
     resource_type_entry("s3-outposts:AccessPoint", true),
     resource_type_entry("s3-outposts:Bucket", true),
@@ -514,13 +520,17 @@ pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
     resource_type_entry("sagemaker:FeatureGroup", true),
     resource_type_entry("sagemaker:Hub", true),
     resource_type_entry("sagemaker:LineageGroup", true),
+    resource_type_entry("sagemaker:MlflowApp", true),
     resource_type_entry("sagemaker:MlflowTrackingServer", true),
     resource_type_entry("sagemaker:ModelCard", true),
     resource_type_entry("sagemaker:ModelPackageGroup", true),
     resource_type_entry("sagemaker:PartnerApp", true),
     resource_type_entry("sagemaker:Pipeline", true),
+    resource_type_entry("sagemaker:SagemakerCatalog", true),
     resource_type_entry("servicecatalog:Application", true),
+    resource_type_entry("servicecatalog:Applications", true),
     resource_type_entry("servicecatalog:AttributeGroup", true),
+    resource_type_entry("servicecatalog:AttributeGroups", true),
     resource_type_entry("servicediscovery:Namespace", true),
     resource_type_entry("sms-voice:OptOutList", true),
     resource_type_entry("sms-voice:PhoneNumber", true),
