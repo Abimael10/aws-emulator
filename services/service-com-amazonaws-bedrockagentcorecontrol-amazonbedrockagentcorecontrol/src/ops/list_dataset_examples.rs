@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasetExamples
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasetExamples`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasetExamples::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the examples the version this request resolved to holds,
+//! read off the dataset's record in [`crate::state`]: the DRAFT working copy, or one
+//! version published from it. Each example is reported as the content document it was
+//! stored with, carrying the `ExampleId` it is addressed by, so a caller can name it to
+//! an update or a delete.
+//!
+//! The page walks the examples in the order they ENTERED the dataset, and the opaque
+//! `nextToken` carries the resolved version beside the example the page ended on — "the
+//! server embeds the resolved version in the pagination token. Once pagination begins,
+//! all subsequent pages are pinned to that version regardless of concurrent mutations" —
+//! so a later page reports that version whatever the request's own `datasetVersion` says.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +172,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasetExamples` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetExamplesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasetExamples"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDatasetExamplesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A dataset, or a version of one, whose deletion the clock has already
+        // made due is gone before this read looks for it: the removal was owed
+        // at this instant whether or not anybody called.
+        store.expire_deleted_datasets(now);
+
+        // An example is addressed only THROUGH the dataset that holds it, so an
+        // id naming no stored dataset is the modelled 404 rather than an empty
+        // page.
+        let record = store.datasets.get(&input.dataset_id).ok_or_else(|| {
+            ListDatasetExamplesErrorModeled::ResourceNotFoundException(
+                crate::state::dataset_not_found(),
+            )
+        })?;
+
+        // The token is opaque on the wire: it carries the version the pagination
+        // resolved to and the example the previous page ended on, and the next
+        // page starts strictly after that example.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListDatasetExamplesErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "must be a nextToken returned by a previous \
+                                  ListDatasetExamples call"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // "Version to paginate: DRAFT or a version number. Defaults to DRAFT if
+        // absent. Only used on the first request; for subsequent pages, the
+        // version is extracted from the pagination token" — which is why the
+        // resolved version is part of the key the token carries.
+        let resolved = match resume_after.as_deref() {
+            Some(key) => key
+                .split(VERSION_KEY_SEPARATOR)
+                .next()
+                .unwrap_or(crate::state::DATASET_VERSION_DRAFT)
+                .to_string(),
+            None => input
+                .dataset_version
+                .as_deref()
+                .unwrap_or(crate::state::DATASET_VERSION_DRAFT)
+                .to_string(),
+        };
+
+        // Every spelling `DatasetVersion` admits beside `DRAFT` is a PUBLISHED
+        // version number, so a number no published version of this dataset
+        // carries is the modelled 404 — the same resolution `GetDataset`
+        // performs. A version a delete has since removed resolves to nothing
+        // either, so a pinned pagination ends in that 404 rather than reporting
+        // another version's examples.
+        let examples = if resolved == crate::state::DATASET_VERSION_DRAFT {
+            record.draft_examples()
+        } else {
+            // The member's pattern admits only `DRAFT` or digits, and so does
+            // the key this service's own token carries.
+            let published = resolved
+                .parse::<u32>()
+                .ok()
+                .and_then(|version| record.version(version))
+                .ok_or_else(|| {
+                    ListDatasetExamplesErrorModeled::ResourceNotFoundException(
+                        crate::state::resource_not_found(crate::state::RESOURCE_DATASET_VERSION),
+                    )
+                })?;
+            published.examples.as_slice()
+        };
+
+        // The examples of one version are paged in the order they entered the
+        // dataset — the ascending-key rule every listing of this service pages
+        // by — with the resolved version in the key, so the token a page hands
+        // back pins the next one to that version.
+        let page: ::std::collections::BTreeMap<String, ::aws_smithy_types::Document> = examples
+            .iter()
+            .map(|example| {
+                (
+                    format!("{resolved}{VERSION_KEY_SEPARATOR}{}", example.page_key()),
+                    example.listed(),
+                )
+            })
+            .collect();
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        let (examples, next_token) =
+            crate::state::page_over(&page, resume_after.as_deref(), page_size, |example| {
+                Some(example.clone())
+            });
+
+        Ok(ListDatasetExamplesOutput {
+            dataset_arn: record.dataset_arn.clone(),
+            dataset_id: record.dataset_id.clone(),
+            dataset_version: resolved,
+            examples,
+            next_token,
+        })
     }
 }
+
+/// The modeled upper bound of `maxResults` (range 1..1000), used as the page size
+/// when the caller names none.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// What separates the resolved version from the example's own key inside the
+/// opaque `nextToken`. Not a character `DatasetVersion` (`^(DRAFT|[0-9]+)$`) can
+/// carry, so the version a token was issued for is recovered exactly.
+const VERSION_KEY_SEPARATOR: char = '#';
+
+// The opaque `nextToken` codec is `crate::state`'s
+// (`encode_page_token`/`decode_page_token`): every `@paginated` listing in this
+// service issues and reads the same token form.

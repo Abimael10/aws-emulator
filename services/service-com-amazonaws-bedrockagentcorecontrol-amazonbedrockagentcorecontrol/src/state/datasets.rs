@@ -50,8 +50,8 @@ use ::serde_json::Value;
 use crate::ops::types::{
     AddDatasetExamplesOutput, ConflictException, CreateDatasetInput, CreateDatasetOutput,
     CreateDatasetVersionOutput, DataSourceType, DatasetSummary, DatasetVersionSummary,
-    DeleteDatasetOutput, GetDatasetOutput, ResourceNotFoundException, UpdateDatasetOutput,
-    ValidationException,
+    DeleteDatasetExamplesOutput, DeleteDatasetOutput, GetDatasetOutput, ResourceNotFoundException,
+    UpdateDatasetOutput, ValidationException,
 };
 
 use super::{sorted_map, timestamp, VALIDATION_REASON_FIELD_VALIDATION_FAILED};
@@ -85,6 +85,24 @@ pub fn dataset_not_found() -> ResourceNotFoundException {
             "The specified dataset does not exist. Please verify the datasetId and try again."
                 .to_string(),
         ),
+    }
+}
+
+/// The modelled not-found error for an `ExampleId` the dataset's DRAFT working
+/// copy holds no example under ("The specified example does not exist in DRAFT:
+/// <exampleId>. Please verify the exampleIds and try again.").
+///
+/// Worded in the dataset family's own sentence, like [`dataset_not_found`]: what
+/// is missing and the request member the caller has to check. The one variable
+/// part is the offending id, taken from the request — unlike the dataset's own
+/// refusal this one names it, because a batch addressing many examples is
+/// rejected WHOLE and the caller cannot otherwise tell which id was wrong.
+pub fn dataset_example_not_found(example_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "The specified example does not exist in {DATASET_VERSION_DRAFT}: {example_id}. \
+             Please verify the exampleIds and try again."
+        )),
     }
 }
 
@@ -616,6 +634,49 @@ pub struct DatasetExampleRecord {
     /// The example itself: "a free-form JSON document whose structure is
     /// defined by the dataset's schema type".
     pub content: Document,
+    /// Which example of this dataset it is: the sequence it entered under,
+    /// ascending in entry order and never re-used. A listing pages over the
+    /// examples by this number rather than by their position in the working
+    /// copy, which a delete of an earlier example changes, so a cursor handed
+    /// out by one page still resumes in the right place after one.
+    seq: u64,
+}
+
+/// The member a listing carries an example's own id under: "each element is a
+/// JSON object containing at least an `exampleId` field plus the
+/// schema-specific content fields" (`smithy_query shape=ListDatasetExamplesResponse
+/// member=examples`).
+const LISTED_EXAMPLE_ID_FIELD: &str = "exampleId";
+
+impl DatasetExampleRecord {
+    /// This example as a listing reports it: the content document the source
+    /// carried, carrying the id the example is addressed by.
+    ///
+    /// The id is MERGED into the content rather than reported beside it because
+    /// the list's member is the example document itself
+    /// (`DatasetExampleList`), and the model says each element carries at least
+    /// that field. An example that is not a JSON object carries no field at all
+    /// — which the schema check refuses before anything is stored
+    /// ([`validate_examples`]) — so such content is reported exactly as it is
+    /// rather than wrapped in a shape the model does not declare.
+    pub fn listed(&self) -> Document {
+        let Document::Object(members) = &self.content else {
+            return self.content.clone();
+        };
+        let mut listed = members.clone();
+        listed.insert(
+            LISTED_EXAMPLE_ID_FIELD.to_string(),
+            Document::String(self.example_id.clone()),
+        );
+        Document::Object(listed)
+    }
+
+    /// The key a listing pages this example by: its entry sequence, zero-padded
+    /// so the ascending-key order every listing of this service pages by IS the
+    /// order the examples entered the dataset.
+    pub fn page_key(&self) -> String {
+        format!("{:020}", self.seq)
+    }
 }
 
 /// One published version of a dataset: the numbered snapshot
@@ -820,6 +881,15 @@ impl DatasetRecord {
     /// published.
     pub fn versions(&self) -> &[DatasetVersionRecord] {
         &self.versions
+    }
+
+    /// The DRAFT working copy's examples, in the order they entered it.
+    ///
+    /// Read-only, like [`Self::versions`]: an example enters the working copy
+    /// only through [`Self::add_examples`], which is what keeps it inside
+    /// [`MAX_DATASET_EXAMPLES`].
+    pub fn draft_examples(&self) -> &[DatasetExampleRecord] {
+        &self.draft_examples
     }
 
     /// The version a `datasetVersion` names, or `None` when this dataset holds
@@ -1035,6 +1105,80 @@ impl DatasetRecord {
         }
     }
 
+    /// The first id of `example_ids` the DRAFT working copy holds no example
+    /// under, or `None` when it holds one for every id in the batch.
+    ///
+    /// The whole batch is checked BEFORE anything is removed — "all example IDs
+    /// are validated before any deletes occur. If any ID does not exist in
+    /// DRAFT, the entire batch is rejected (all-or-nothing semantics)"
+    /// (`smithy_query doc shape=DeleteDatasetExamples`) — so a caller naming one
+    /// id the draft does not hold is refused with the draft exactly as it was,
+    /// rather than part-way through the batch.
+    pub fn first_example_not_held(&self, example_ids: &[String]) -> Option<String> {
+        let held: HashSet<&str> = self
+            .draft_examples
+            .iter()
+            .map(|example| example.example_id.as_str())
+            .collect();
+        example_ids
+            .iter()
+            .find(|example_id| !held.contains(example_id.as_str()))
+            .cloned()
+    }
+
+    /// Remove every example `example_ids` names from the DRAFT working copy,
+    /// answering the ids that were really removed in the order the working copy
+    /// held them.
+    ///
+    /// "Deletes specific examples by ID from DRAFT": only the working copy is
+    /// touched, so every published version keeps the examples it snapshotted and
+    /// the draft now holds changes no version reflects. An id repeated in one
+    /// batch addresses the one example it names, which goes once, so the count
+    /// this answers is the number of examples that left the draft.
+    ///
+    /// The mutation is ASYNCHRONOUS like every other example mutation, so the
+    /// dataset reports `UPDATING` — in which "an async example mutation … is in
+    /// progress" and "all writes are blocked" — until the clock owes it
+    /// `ACTIVE`.
+    pub fn delete_examples(&mut self, example_ids: &[String], now: SystemTime) -> Vec<String> {
+        let requested: HashSet<&str> = example_ids.iter().map(String::as_str).collect();
+        let mut deleted = Vec::new();
+        self.draft_examples.retain(|example| {
+            if requested.contains(example.example_id.as_str()) {
+                deleted.push(example.example_id.clone());
+                return false;
+            }
+            true
+        });
+        self.draft_modified = true;
+        self.updated_at = now;
+        self.transient_status = DATASET_STATUS_UPDATING.to_string();
+        self.settled_status = DATASET_STATUS_ACTIVE.to_string();
+        self.settles_at = now + DATASET_SETTLE_DELAY;
+        // The mutation succeeded, so nothing of an earlier failure is owed.
+        self.failure_reason = None;
+        deleted
+    }
+
+    /// What a delete of examples from this dataset reports: the five members
+    /// `DeleteDatasetExamplesResponse` declares, every one of them off the
+    /// record just written, so the status it answers is the one a read of the
+    /// dataset reports and `deletedCount` is the number of examples that left
+    /// the working copy.
+    pub fn delete_examples_output(
+        &self,
+        deleted_count: usize,
+        now: SystemTime,
+    ) -> DeleteDatasetExamplesOutput {
+        DeleteDatasetExamplesOutput {
+            dataset_arn: self.dataset_arn.clone(),
+            dataset_id: self.dataset_id.clone(),
+            status: self.status_at(now).to_string(),
+            deleted_count: i64::try_from(deleted_count).unwrap_or(i64::MAX),
+            updated_at: timestamp(self.updated_at),
+        }
+    }
+
     /// Put `examples` into the working copy under freshly minted ids, answering
     /// those ids in the order the examples were appended — or `None` when the
     /// batch would take the working copy past [`MAX_DATASET_EXAMPLES`], in which
@@ -1057,8 +1201,11 @@ impl DatasetRecord {
         for content in examples {
             let example_id = self.next_example_id(&mut held, now);
             minted.push(example_id.clone());
-            self.draft_examples
-                .push(DatasetExampleRecord { example_id, content });
+            self.draft_examples.push(DatasetExampleRecord {
+                example_id,
+                content,
+                seq: self.next_example_seq,
+            });
         }
         Some(minted)
     }

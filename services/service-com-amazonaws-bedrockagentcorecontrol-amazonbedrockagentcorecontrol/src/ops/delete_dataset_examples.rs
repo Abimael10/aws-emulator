@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDatasetExamples
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDatasetExamples`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDatasetExamples::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the examples the request names, by the `ExampleId` each one was
+//! assigned as it entered, from the dataset's DRAFT working copy in
+//! [`crate::state`], and answers how many examples really left it. The examples
+//! live on the dataset's record, so the count every later read of the dataset
+//! reports is the number the working copy still holds.
+//!
+//! Every id in the batch is resolved against the DRAFT before anything is
+//! removed, so one id the working copy holds no example under refuses the whole
+//! call and leaves the draft exactly as it was.
+//!
+//! The mutation is ASYNCHRONOUS: it reports `UPDATING`, in which "all writes are
+//! blocked", so a second write arriving before the clock settles the dataset
+//! meets the modelled conflict; the clock owes the dataset `ACTIVE`.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +172,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDatasetExamples` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDatasetExamplesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDatasetExamples"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDatasetExamplesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A dataset whose deletion the clock has already made due is gone before
+        // this write looks for it, so a request naming it is the modelled 404
+        // rather than a delete of examples out of a record on its way out.
+        store.expire_deleted_datasets(now);
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // examples that token first removed from THIS dataset, rather than
+        // refusing the ids its own first request already took out of the DRAFT:
+        // "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error."
+        if let Some(example_ids) = store.replayed_dataset_examples(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &input.dataset_id,
+        ) {
+            // `replayed_dataset_examples` answers only for a dataset the store
+            // still holds, so this lookup cannot miss.
+            if let Some(record) = store.datasets.get(&input.dataset_id) {
+                return Ok(record.delete_examples_output(example_ids.len(), now));
+            }
+        }
+
+        let record = store.datasets.get_mut(&input.dataset_id).ok_or_else(|| {
+            DeleteDatasetExamplesErrorModeled::ResourceNotFoundException(
+                crate::state::dataset_not_found(),
+            )
+        })?;
+
+        // A dataset whose own ingestion or last mutation is still in flight
+        // blocks every write — "all writes are blocked" while it is `CREATING`
+        // or `UPDATING`, and a dataset on its way out in `DELETING` serves reads
+        // only — so the request conflicts with the operation already running on
+        // it rather than racing it.
+        let status = record.status_at(now).to_string();
+        if crate::state::dataset_blocks_writes(&status) {
+            return Err(DeleteDatasetExamplesErrorModeled::ConflictException(
+                crate::state::dataset_status_conflict(&status),
+            )
+            .into());
+        }
+
+        // "All example IDs are validated before any deletes occur. If any ID
+        // does not exist in DRAFT, the entire batch is rejected (all-or-nothing
+        // semantics)": the batch is one commit, so an id the working copy holds
+        // no example under refuses the whole call and nothing of the batch is
+        // removed.
+        if let Some(missing) = record.first_example_not_held(&input.example_ids) {
+            return Err(DeleteDatasetExamplesErrorModeled::ResourceNotFoundException(
+                crate::state::dataset_example_not_found(&missing),
+            )
+            .into());
+        }
+
+        let deleted = record.delete_examples(&input.example_ids, now);
+        let output = record.delete_examples_output(deleted.len(), now);
+        store.remember_dataset_examples_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.dataset_id,
+            &deleted,
+        );
+
+        Ok(output)
     }
 }
