@@ -422,6 +422,14 @@ pub struct ResourceTypeEntry {
 /// Amazon API Gateway and Amazon Web Services Private CA resources there are shared
 /// only through the permissions Amazon Web Services manages for them.
 ///
+/// ONE ENTRY PER TYPE. `Resource$type` is `<service-code>:<resource-code>` where the
+/// service code is the one the owning service's own ARNs carry, so a type is published
+/// once, under that code: a second spelling under a service code no ARN names would
+/// publish a type nothing can be shared as — no resource ARN classifies to it
+/// ([`is_shareable_resource_arn`]) and no managed permission is published for it
+/// ([`default_aws_managed_permission`]). EC2 Image Builder's resources, for one, are
+/// `imagebuilder:*`, the code its ARNs and its managed permissions carry.
+///
 /// A custom billing view is one of the types: the Billing service declares no
 /// operation that attaches a resource-based policy to a view, and the document its
 /// `GetResourcePolicy` reports is the one a share of the view instantiates on it
@@ -466,10 +474,6 @@ pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
     resource_type_entry("ec2:VerifiedAccessGroup", false),
     resource_type_entry("ec2:VerifiedAccessInstance", false),
     resource_type_entry("ec2:Volume", false),
-    resource_type_entry("ec2-image-builder:Component", true),
-    resource_type_entry("ec2-image-builder:ContainerRecipe", true),
-    resource_type_entry("ec2-image-builder:Image", true),
-    resource_type_entry("ec2-image-builder:ImageRecipe", true),
     resource_type_entry("elasticloadbalancing:TrustStore", true),
     resource_type_entry("events:EventBus", true),
     resource_type_entry("fsx:Volume", true),

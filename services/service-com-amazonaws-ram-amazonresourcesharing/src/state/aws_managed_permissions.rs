@@ -1785,3 +1785,31 @@ pub fn default_aws_managed_permission(
     })
 }
 
+/// Whether resources of `resource_type` can be shared only through a SERVICE-LINKED
+/// resource share — a share an Amazon Web Services service created on the account's
+/// behalf — rather than through a share a caller creates.
+///
+/// Every resource share is governed by a managed permission for the type of each
+/// resource it shares, so a resource type whose published permissions may all govern
+/// service-linked shares alone
+/// ([`AwsManagedPermission::restrict_to_service_linked_shares`]) can only be shared that
+/// way, and one with a published permission that is not so restricted can be shared by
+/// any caller. The answer is therefore read off the permissions this service publishes
+/// for the type rather than written beside the type a second time, so the two can never
+/// disagree; a type the library publishes no permission for restricts nothing.
+///
+/// The type is matched the way [`super::resource_type_matches`] matches one, so either
+/// spelling of a type finds the permissions published for it.
+pub fn resource_type_restricted_to_service_linked_shares(resource_type: &str) -> bool {
+    let mut published = AWS_MANAGED_PERMISSIONS
+        .iter()
+        .filter(|entry| super::resource_type_matches(entry.resource_type, resource_type));
+    match published.next() {
+        None => false,
+        Some(first) => {
+            first.restrict_to_service_linked_shares
+                && published.all(|entry| entry.restrict_to_service_linked_shares)
+        }
+    }
+}
+

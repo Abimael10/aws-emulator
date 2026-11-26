@@ -46,6 +46,7 @@ pub mod promote_permission_created_from_policy_types;
 pub mod promote_resource_share_created_from_policy_types;
 pub mod reject_resource_share_invitation_types;
 pub mod replace_permission_associations_types;
+pub mod resource_type_wire;
 pub mod set_default_permission_version_types;
 pub mod shared_types;
 pub mod tag_resource_types;
@@ -117,6 +118,8 @@ pub use promote_resource_share_created_from_policy_types::*;
 pub use reject_resource_share_invitation_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use replace_permission_associations_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use resource_type_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use set_default_permission_version_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
