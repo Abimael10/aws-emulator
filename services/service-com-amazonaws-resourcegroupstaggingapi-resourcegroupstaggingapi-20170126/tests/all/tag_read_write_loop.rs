@@ -2158,3 +2158,120 @@ async fn each_framing_on_its_own_is_still_served() {
         );
     }
 }
+
+/// One row of the table below: the case, the operation the CBOR path names, the
+/// input the request carries, and the status that operation answers for that
+/// input when the request names ONE framing.
+///
+/// That last field is the answer the framing refusal takes precedence over: the
+/// rows differ along WHICH answer that is — a served read, the modelled refusal
+/// of an input the operation itself rejects, and the scaffold signal of an
+/// operation this slice has not implemented.
+type PrecedenceCase = (&'static str, &'static str, serde_json::Value, u16);
+
+/// RULE (the half the table above does not reach): the refusal is settled by the
+/// request's framing markers alone, so it precedes NAMING the operation — the
+/// answer the named operation would itself have given, whatever class it is, is
+/// never reached, and nothing of this service's state is read or written for such
+/// a request.
+#[tokio::test]
+async fn the_framing_refusal_precedes_the_answer_the_named_operation_would_give() {
+    let router = emulator();
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
+    tag(&router, &[alpha], &[("Env", "prod")]).await;
+
+    let rows: Vec<PrecedenceCase> = vec![
+        // A read this endpoint serves.
+        (
+            "an operation that answers the query",
+            "GetResources",
+            serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] }),
+            200,
+        ),
+        // An input GetResources itself refuses: the documented combination of
+        // `ResourceARNList` with `TagFilters`, which is `InvalidParameterException`
+        // (`smithy_query(query="operation", operation="GetResources")` -> errors
+        // InvalidParameterException 400).
+        (
+            "an input the operation itself refuses",
+            "GetResources",
+            serde_json::json!({
+                "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:alpha"],
+                "TagFilters": [{ "Key": "Env" }]
+            }),
+            400,
+        ),
+        // An operation this slice has not implemented, which answers the scaffold
+        // signal on its own.
+        (
+            "an operation that answers the scaffold signal",
+            "GetComplianceSummary",
+            serde_json::json!({}),
+            501,
+        ),
+    ];
+
+    for (case, operation, input, own_status) in rows {
+        let body = || cbor_bytes(&input, Lengths::Declared);
+
+        // Naming ONE framing, the request reaches the operation and earns that
+        // operation's own answer.
+        let served = asked_with(
+            &router,
+            &cbor_path(operation),
+            &cbor_framing_headers(),
+            body(),
+        )
+        .await;
+        assert_eq!(
+            served.status, own_status,
+            "case {case:?}: expected the operation's own answer ({own_status}), got {} with {:?}",
+            served.status, served.text
+        );
+        assert!(
+            !served.text.contains(MALFORMED_HTTP_REQUEST),
+            "case {case:?}: a request naming one framing is not a malformed request, got {:?}",
+            served.text
+        );
+
+        // The same call carrying the header that framing prohibits never reaches
+        // it: the answer is the front door's, not the operation's.
+        let mut headers = cbor_framing_headers();
+        headers.push(("x-amz-target", format!("{SERVICE_LABEL}.{operation}")));
+        let refused = asked_with(&router, &cbor_path(operation), &headers, body()).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 for a self-contradictory framing, got {} with \
+             {:?}",
+            refused.status, refused.text
+        );
+        assert_eq!(
+            refused.body,
+            serde_json::json!({ MALFORMED_HTTP_REQUEST: "" }),
+            "case {case:?}: expected the body to name {MALFORMED_HTTP_REQUEST} and nothing else, \
+             got {:?}",
+            refused.text
+        );
+    }
+
+    // None of those refusals read or wrote anything: the store still answers
+    // exactly what was tagged before them.
+    let (status, read) = call(&router, "GetResources", serde_json::json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case the read afterwards: expected HTTP 200, got {status} with {read}"
+    );
+    assert_eq!(
+        page_arns(&read),
+        vec![alpha.to_string()],
+        "case the read afterwards: the refused requests must have changed nothing, got {read}"
+    );
+    assert_eq!(
+        page_tags(&read, alpha),
+        [("Env".to_string(), "prod".to_string())]
+            .into_iter()
+            .collect::<BTreeMap<String, String>>(),
+        "case the read afterwards: the tags of the one stored resource changed, got {read}"
+    );
+}
+

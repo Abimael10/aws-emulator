@@ -22,7 +22,10 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. Return `Some(op)` to route one yourself. EDITED HERE: a
+//!   request whose own framing contradicts itself is refused rather than served
+//!   ([`contradictory_framing`]), and every other request is served by the operation the
+//!   generated table names for it, wrapped as [`submitted_collections`] says.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
