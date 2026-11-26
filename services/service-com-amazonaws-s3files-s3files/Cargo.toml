@@ -42,13 +42,23 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # mount target's network interface, and whether an address a request named lies inside it.
 ipnet = "2"
 # `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL, which
-# is what the endpoint the EC2 call above is made at is built from.
+# is what the endpoint the EC2 call above is made at is built from. Beside it,
+# `posix_shell_volume` (the tree a mounted file system holds) and `web_media_type` (the media
+# type a file's own name states), which the native data plane in `src/state/file_data.rs` is
+# built on.
 service-common = { path = "../common" }
+# The object store a file system is a view of: a file written through a mount IS an object of
+# the backing bucket, so the write-through records it in that service's own store on the
+# shared engine (`src/state/file_data.rs`) rather than in a second copy of it here.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One module per `tests/all/<name>.rs`, so a new suite is a new file: this crate's tests are
+# the single `all` target rooted at `tests/all/main.rs`.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The EC2 service, mounted beside this one in the mount-target test harness: that a mount

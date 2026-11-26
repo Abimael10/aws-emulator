@@ -20729,6 +20729,7 @@ dependencies = [
 name = "service-com-amazonaws-s3files-s3files"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -20747,6 +20748,7 @@ dependencies = [
  "ipnet",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
+ "service-com-amazonaws-s3-amazons3",
  "service-common",
  "sha2 0.10.9",
  "tokio",
@@ -21999,6 +22001,7 @@ dependencies = [
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-route53-awsdnsv20130401",
  "service-com-amazonaws-route53resolver-route53resolver",
+ "service-com-amazonaws-s3files-s3files",
  "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",

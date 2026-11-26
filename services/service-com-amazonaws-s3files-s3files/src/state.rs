@@ -17,13 +17,22 @@
 //! projection every response reporting a mount target is built from — lives in
 //! [`mount_targets`], and the network a mount target is placed in is resolved against the
 //! service that OWNS it in [`ec2_network`]. Both are re-exported here too.
+//!
+//! What a file system HOLDS — the POSIX tree a client that mounted it reads and writes, and
+//! the write-through that makes every file in it an object of the backing bucket — lives in
+//! [`file_data`], and the mount itself (the client programs a machine inside the VPC mounts
+//! the file system with) in [`nfs_data_plane`].
 
 mod ec2_network;
+mod file_data;
 mod mount_targets;
+mod nfs_data_plane;
 mod projection;
 
 pub use ec2_network::*;
+pub use file_data::*;
 pub use mount_targets::*;
+pub use nfs_data_plane::*;
 pub use projection::*;
 
 use std::collections::{HashMap, VecDeque};
@@ -304,6 +313,10 @@ pub struct ComAmazonawsS3filesS3filesState {
     /// [`MountTarget::file_system_id`] binds one to the file system it is an endpoint
     /// for.
     pub mount_targets: HashMap<String, MountTarget>,
+    /// The FILES each file system holds, keyed by its `fs-` id — the tree a client that
+    /// mounted it reads and writes ([`file_data`]). Minted on the first mount of a file
+    /// system and dropped with it.
+    file_system_data: HashMap<String, MountedFileSystem>,
     /// Monotonic creation counter. It orders list pages and backs the opaque
     /// `nextToken`, so a cursor keeps resuming correctly across deletes.
     next_sequence: u64,

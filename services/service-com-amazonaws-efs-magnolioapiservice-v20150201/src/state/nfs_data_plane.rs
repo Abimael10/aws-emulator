@@ -51,9 +51,10 @@
 
 use std::time::SystemTime;
 
-use ::service_common::posix_shell_session::{
-    program_option_value, EnvironmentPrograms, ProgramFiles, ProgramOutcome,
+use ::service_common::posix_shell_mounts::{
+    is_mount_program, is_unmount_program, MountInvocation, MOUNT_FAILURE, SUCCESS,
 };
+use ::service_common::posix_shell_session::{EnvironmentPrograms, ProgramFiles, ProgramOutcome};
 use ::service_common::posix_shell_volume::MountFacts;
 
 use super::{service_state, MountedFileSystem, LIFE_CYCLE_AVAILABLE};
@@ -76,55 +77,10 @@ const NFS_FILE_SYSTEM_TYPE: &str = "nfs";
 /// same string as the mount type above.
 pub const NFS_STATFS_TYPE: &str = "nfs";
 
-/// The program that mounts a filesystem, and the one that takes it away again.
-const MOUNT_PROGRAM: &str = "mount";
-const UNMOUNT_PROGRAM: &str = "umount";
-
-/// The mount HELPERS the kernel's mount calls for these filesystem types
-/// (`/sbin/mount.<type>`), which a client may also invoke directly.
-const MOUNT_HELPERS: &[&str] = &["mount.nfs", "mount.nfs4"];
-
-/// See [`MOUNT_HELPERS`].
-const UNMOUNT_HELPERS: &[&str] = &["umount.nfs", "umount.nfs4"];
-
-/// The status a program exits with when it did what it was asked.
-const SUCCESS: i32 = 0;
-
-/// The status `mount` and `umount` exit with when the mount itself failed: "32 mount failure"
-/// (`mount(8)` and `umount(8)`, EXIT STATUS).
-const MOUNT_FAILURE: i32 = 32;
-
-/// The options a mount reports when the command named none: a filesystem is mounted
-/// read-write unless something says otherwise, which is the default `mount` applies.
-const DEFAULT_MOUNT_OPTIONS: &str = "rw";
-
-/// The export path a source names when it carries none at all, which is the file system's own
-/// root — the path `<address>:/` names.
-const EXPORT_ROOT: &str = "/";
-
-/// The separator between the ADDRESS of an NFS server and the path it exports, which is what
-/// makes a mount source an NFS one: `<address>:/<path>`.
-const SOURCE_SEPARATOR: char = ':';
-
-/// The option words `mount` and `umount` take whose meaning this program performs in full,
-/// because they change nothing about WHICH filesystem is mounted where: how much the command
-/// says about what it did, whether it records the mount in a table this machine does not keep,
-/// and the read-write mode a mount has by default anyway.
-const PERFORMED_FLAGS: &[&str] = &[
-    "-v",
-    "--verbose",
-    "-n",
-    "--no-mtab",
-    "-w",
-    "--rw",
-    "--read-write",
-    "-s",
-    "--sloppy",
-];
-
-/// The option words `umount` takes beyond those: a detach this emulator performs at once
-/// either way, and a forced one, which is the same detach when nothing is in flight.
-const PERFORMED_UNMOUNT_FLAGS: &[&str] = &["-f", "--force", "-l", "--lazy", "-d", "--detach-loop"];
+/// The filesystem types a `-t` may name for THIS data plane's mount, which is also what
+/// decides which mount HELPERS (`/sbin/mount.<type>`) are this program's
+/// ([`::service_common::posix_shell_mounts::is_mount_program`]).
+const SERVED_MOUNT_TYPES: &[&str] = &[NFS4_FILE_SYSTEM_TYPE, NFS_FILE_SYSTEM_TYPE];
 
 /// ONE export this emulator's NFS server offers: the address it answers at, the file system
 /// behind it and the files that file system holds.
@@ -216,13 +172,13 @@ impl EnvironmentPrograms for NfsClient {
         arguments: &[String],
         files: &mut dyn ProgramFiles,
     ) -> Option<ProgramOutcome> {
-        // A program named by its absolute path is the same program, as a shell resolving a
-        // name on `PATH` finds: `/usr/bin/mount` and `mount` are one.
-        let name = name.rsplit('/').next().unwrap_or(name);
-        if name == MOUNT_PROGRAM || MOUNT_HELPERS.contains(&name) {
+        // Which program the command names, and whether its helper is one of this data plane's,
+        // is the shared reading's
+        // ([`::service_common::posix_shell_mounts::is_mount_program`]).
+        if is_mount_program(name, SERVED_MOUNT_TYPES) {
             return self.mounted(arguments, files);
         }
-        if name == UNMOUNT_PROGRAM || UNMOUNT_HELPERS.contains(&name) {
+        if is_unmount_program(name, SERVED_MOUNT_TYPES) {
             return unmounted(arguments, files);
         }
         None
@@ -263,10 +219,7 @@ impl NfsClient {
             file_system_type: NFS4_FILE_SYSTEM_TYPE.to_string(),
             statfs_type: NFS_STATFS_TYPE.to_string(),
             source: invocation.source.clone(),
-            options: invocation
-                .options
-                .clone()
-                .unwrap_or_else(|| DEFAULT_MOUNT_OPTIONS.to_string()),
+            options: invocation.mount_options(),
         };
         let Some(tree) = export.files.mounted_tree(&export_path, facts) else {
             return failed;
@@ -315,117 +268,28 @@ fn unmounted(arguments: &[String], files: &mut dyn ProgramFiles) -> Option<Progr
     })
 }
 
-/// One invocation of `mount` this program performs: what to mount, where, and the options it
-/// was asked for.
-#[derive(Debug)]
-struct MountInvocation {
-    /// The first operand: WHAT is mounted.
-    source: String,
-    /// The second operand: the directory it is mounted at.
-    target: String,
-    /// `-o`, as the command wrote it.
-    options: Option<String>,
-}
-
-/// The invocation `arguments` describes, or `None` for one this program performs nothing of:
-///
-/// * a `-t` naming a filesystem type other than this service's own — another filesystem's
-///   mount is not this program's to make;
-/// * an option this program does not read, which is answered as a command that could not be
-///   run rather than as a mount made under options nothing applied;
-/// * anything but the two-operand form, since the forms with fewer operands mount what a
-///   table of this machine says and this machine keeps none.
+/// One invocation of `mount` this program performs, as the ONE reading of a `mount(8)`
+/// command line this workspace has answers it
+/// ([`::service_common::posix_shell_mounts::mount_invocation`], which states which invocations
+/// are performed at all), narrowed to the filesystem types this data plane serves
+/// ([`SERVED_MOUNT_TYPES`]) — another filesystem's mount is not this program's to make.
 fn mount_invocation(arguments: &[String]) -> Option<MountInvocation> {
-    let mut file_system_type: Option<String> = None;
-    let mut options: Option<String> = None;
-    let mut operands: Vec<String> = Vec::new();
-    let mut words = arguments.iter();
-    while let Some(word) = words.next() {
-        if word == "--" {
-            operands.extend(words.map(String::clone));
-            break;
-        }
-        if let Some(named) = program_option_value(word, &mut words, &["-t", "--types"]) {
-            file_system_type = Some(named?);
-            continue;
-        }
-        if let Some(named) = program_option_value(word, &mut words, &["-o", "--options"]) {
-            options = Some(named?);
-            continue;
-        }
-        if word.starts_with('-') {
-            if !PERFORMED_FLAGS.contains(&word.as_str()) {
-                return None;
-            }
-            continue;
-        }
-        operands.push(word.clone());
-    }
-    if let Some(named) = file_system_type.as_deref() {
-        if named != NFS4_FILE_SYSTEM_TYPE && named != NFS_FILE_SYSTEM_TYPE {
-            return None;
-        }
-    }
-    let [source, target] = operands.as_slice() else {
-        return None;
-    };
-    Some(MountInvocation {
-        source: source.clone(),
-        target: target.clone(),
-        options,
-    })
+    ::service_common::posix_shell_mounts::mount_invocation(arguments, SERVED_MOUNT_TYPES)
 }
 
-/// The one operand `umount` was given, or `None` for an invocation this program performs
-/// nothing of — an option it does not read, or anything but the single-operand form.
+/// The one operand `umount` was given, out of that same reading
+/// ([`::service_common::posix_shell_mounts::unmount_invocation`]) — `None` for an invocation
+/// this program performs nothing of.
 fn unmount_target(arguments: &[String]) -> Option<String> {
-    let mut operands: Vec<String> = Vec::new();
-    let mut words = arguments.iter();
-    while let Some(word) = words.next() {
-        if word == "--" {
-            operands.extend(words.map(String::clone));
-            break;
-        }
-        if let Some(named) = program_option_value(word, &mut words, &["-t", "--types"]) {
-            let named = named?;
-            if named != NFS4_FILE_SYSTEM_TYPE && named != NFS_FILE_SYSTEM_TYPE {
-                return None;
-            }
-            continue;
-        }
-        if word.starts_with('-') {
-            if !PERFORMED_FLAGS.contains(&word.as_str())
-                && !PERFORMED_UNMOUNT_FLAGS.contains(&word.as_str())
-            {
-                return None;
-            }
-            continue;
-        }
-        operands.push(word.clone());
-    }
-    let [target] = operands.as_slice() else {
-        return None;
-    };
-    Some(target.clone())
+    ::service_common::posix_shell_mounts::unmount_invocation(arguments, SERVED_MOUNT_TYPES)
+        .map(|invocation| invocation.target)
 }
 
-/// The ADDRESS and the exported PATH a mount source names, or `None` for a source that is not
-/// an NFS one at all — one carrying no `<address>:<path>` separator, which is a local device
-/// rather than a server.
-///
-/// An address written in brackets is an IPv6 one, as a source carrying one spells it; a source
-/// naming no path at all exports the file system's root, which is what `<address>:` means.
+/// The ADDRESS and the exported PATH a mount source names, out of the ONE reading of a mount
+/// source this workspace has ([`::service_common::posix_shell_mounts::mount_source`]) — `None`
+/// for a source that is not an NFS one at all, which is a local device rather than a server.
 fn nfs_source(source: &str) -> Option<(String, String)> {
-    let (address, path) = source.rsplit_once(SOURCE_SEPARATOR)?;
-    let address = address
-        .strip_prefix('[')
-        .and_then(|inside| inside.strip_suffix(']'))
-        .unwrap_or(address);
-    if address.is_empty() {
-        return None;
-    }
-    let path = if path.is_empty() { EXPORT_ROOT } else { path };
-    Some((address.to_string(), path.to_string()))
+    ::service_common::posix_shell_mounts::mount_source(source)
 }
 
 #[cfg(test)]

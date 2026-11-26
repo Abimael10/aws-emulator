@@ -77,7 +77,9 @@ pub struct GuestAgent {
 /// the packages the agents' documented installation procedure installs first: `ruby`, the
 /// runtime the CodeDeploy agent is written for, and `wget`, the downloader that fetches its
 /// installer ("install ruby and wget", the CodeDeploy user guide's Amazon Linux instructions).
-/// A name that is not one of these is a package this guest has nothing for.
+/// Beside those, the FILE-SYSTEM utilities ([`FILE_SYSTEM_UTILITIES`]), which the documented
+/// procedure for mounting a managed file system installs before it mounts one. A name that is
+/// not one of these is a package this guest has nothing for.
 pub const GUEST_AGENT_PACKAGES: &[GuestAgent] = &[
     GuestAgent {
         name: "codedeploy-agent",
@@ -109,7 +111,23 @@ pub const GUEST_AGENT_PACKAGES: &[GuestAgent] = &[
         shipped: &[],
         directories: &[],
     },
+    GuestAgent {
+        name: FILE_SYSTEM_UTILITIES,
+        unit: false,
+        shipped: &[],
+        directories: &[],
+    },
 ];
+
+/// The package that ships the MOUNT HELPERS for the managed file systems of this account —
+/// the `/sbin/mount.<type>` programs the kernel's `mount` calls for them — which the
+/// documented procedure for mounting one installs first (`dnf install -y amazon-efs-utils`).
+///
+/// It ships no unit and no file this emulator holds the contents of: what a mount of such a
+/// file system DOES is performed by the client programs the service that owns the file system
+/// supplies to this guest, so what installing the package leaves on the machine is the record
+/// that it is installed.
+pub const FILE_SYSTEM_UTILITIES: &str = "amazon-efs-utils";
 
 /// The agent of the CodeDeploy family, whose unit the gate in front of every EC2 deployment
 /// asks about.

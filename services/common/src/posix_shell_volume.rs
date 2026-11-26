@@ -70,6 +70,16 @@
 //! keeping a file at that path, and the sink decides what, if anything, receives it. A tree
 //! given none keeps the write as what it is to this tree: a path like any other.
 //!
+//! # What a write to the tree is REPORTED to
+//!
+//! A filesystem whose whole premise is that a file written into it becomes something else —
+//! an object of a bucket behind it — has to learn about the write as it happens. A tree given
+//! a sink for its writes ([`ShellVolume::with_file_write_sink`]) reports every write and every
+//! removal of one of its OWN files to it ([`FileWrites`]), after the tree has taken it, so the
+//! component that holds the filesystem records what the program wrote without a second notion
+//! of what the tree holds. A tree given none reports nothing, which is every tree that is only
+//! storage.
+//!
 //! # Bounds
 //!
 //! Every write is bounded by [`VolumeLimits`], held here rather than in the program's
@@ -150,6 +160,52 @@ pub trait DatagramSink: ::std::fmt::Debug + Send + Sync {
     /// A send to a port nothing listens on still happened: the datagram was handed to the
     /// stack, which is why delivery is not what this answers.
     fn send(&self, host: &str, port: u16, payload: &str) -> bool;
+}
+
+/// ONE write a program made to a tree, as the component that HOLDS that tree is told about
+/// it ([`FileWrites`]).
+///
+/// Everything a filesystem records about a file it just took: the path inside itself, the
+/// bytes that path holds NOW (an append reports the whole file, not the part appended), who
+/// the entry belongs to and the permissions it carries for an entry a caller stated them for
+/// ([`ShellVolume::set_owner`], [`ShellVolume::set_mode`]), and the instant the write
+/// happened — which is the instant the tree recorded for the entry, not one computed
+/// afterwards.
+#[derive(Debug, Clone, Copy)]
+pub struct FileWritten<'a> {
+    /// The path inside the tree that was written, resolved.
+    pub path: &'a str,
+    /// What that path holds now.
+    pub contents: &'a [u8],
+    /// Who the entry belongs to, as `(uid, gid)`, for an entry a caller stated an owner for.
+    pub owner: Option<(i64, i64)>,
+    /// The permission bits the entry carries, for an entry a caller stated them for.
+    pub mode: Option<u32>,
+    /// When the write happened.
+    pub written_at: SystemTime,
+}
+
+/// Where a write that lands in a tree is REPORTED: the component that holds the filesystem,
+/// for a filesystem whose premise is that a write into it is also something else.
+///
+/// A tree is given one ([`ShellVolume::with_file_write_sink`]) so that the component holding
+/// it learns of a write as the program makes it, rather than by re-reading the tree later and
+/// guessing what changed. The implementation records the write wherever that component's own
+/// state belongs; nothing here opens a socket, starts a process or reaches a host path, and
+/// what it answers is nothing at all — the tree has already taken the write, and a sink that
+/// could refuse one would make the file's contents and what was recorded for it disagree.
+///
+/// It is told about the WRITES and REMOVALS of the tree's OWN files, and about nothing else: a
+/// path that lies in a filesystem MOUNTED into this tree is that filesystem's, and is reported
+/// to ITS sink; a later change of an entry's owner or permissions alone
+/// ([`ShellVolume::set_owner`], [`ShellVolume::set_mode`]) is not a write of the file and is
+/// not reported.
+pub trait FileWrites: ::std::fmt::Debug + Send + Sync {
+    /// Take the write `written`, which the tree has already made.
+    fn wrote(&self, written: &FileWritten<'_>);
+
+    /// Take the removal of the file at `path`, which the tree has already made.
+    fn removed(&self, path: &str);
 }
 
 /// What one DEVICE of the tree does with the lines written to it.
@@ -362,6 +418,9 @@ pub struct ShellVolume {
     /// Where a write to one of the machine's datagram addresses goes, for a tree whose owner
     /// gave it one ([`ShellVolume::with_datagram_sink`]).
     datagrams: Option<Arc<dyn DatagramSink>>,
+    /// Where a write to one of this tree's OWN files is reported, for a tree whose owner gave
+    /// it one ([`ShellVolume::with_file_write_sink`]).
+    writes: Option<Arc<dyn FileWrites>>,
     limits: VolumeLimits,
 }
 
@@ -432,8 +491,18 @@ impl ShellVolume {
             held_bytes: 0,
             mounts: Vec::new(),
             datagrams: None,
+            writes: None,
             limits,
         }
+    }
+
+    /// The same tree, with `sink` as where a write to one of its own files is reported
+    /// ([`FileWrites`]) — so the component holding the filesystem records what a program
+    /// wrote as it writes it.
+    #[must_use]
+    pub fn with_file_write_sink(mut self, sink: Arc<dyn FileWrites>) -> Self {
+        self.writes = Some(sink);
+        self
     }
 
     /// The same tree, with `sink` as where a write to one of the machine's datagram addresses
@@ -913,7 +982,39 @@ impl ShellVolume {
         if Self::parent_of(&resolved).is_some_and(|parent| !self.directories.contains(&parent)) {
             return false;
         }
-        self.write_resolved(&resolved, contents, append)
+        if !self.write_resolved(&resolved, contents, append) {
+            return false;
+        }
+        // The write the tree has just taken, reported to whoever holds this filesystem — a
+        // PROGRAM's write, which is what such a component learns about: the files the service
+        // itself seeds into the tree ([`Self::put_file`], [`Self::seal_file`]) are its own
+        // already.
+        self.report_written(&resolved);
+        true
+    }
+
+    /// Report the write of `resolved` to the tree's sink, for a tree whose owner gave it one.
+    ///
+    /// The bytes reported are the ones the path holds NOW, so an append reports the whole
+    /// file; the owner, the mode and the instant are the ones the tree recorded for the entry.
+    fn report_written(&self, resolved: &str) {
+        let Some(sink) = self.writes.as_ref() else {
+            return;
+        };
+        let Some(contents) = self.files.get(resolved) else {
+            return;
+        };
+        sink.wrote(&FileWritten {
+            path: resolved,
+            contents,
+            owner: self.owners.get(resolved).copied(),
+            mode: self.modes.get(resolved).copied(),
+            written_at: self
+                .modified
+                .get(resolved)
+                .copied()
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        });
     }
 
     /// [`Self::write`] once the path is resolved and known to name a file.
@@ -1015,6 +1116,11 @@ impl ShellVolume {
                 self.owners.remove(&resolved);
                 self.modes.remove(&resolved);
                 self.record_parent_written(&resolved);
+                // The removal the tree has just made, reported to whoever holds this
+                // filesystem, exactly as a write is ([`Self::report_written`]).
+                if let Some(sink) = self.writes.as_ref() {
+                    sink.removed(&resolved);
+                }
                 true
             }
             None => false,

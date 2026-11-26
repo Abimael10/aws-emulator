@@ -112,6 +112,10 @@ service-com-amazonaws-route53resolver-route53resolver = { workspace = true }
 # that file system holds are read through that service's own data-plane accessor rather than
 # from a second copy of them here (`state::guest_execution`).
 service-com-amazonaws-efs-magnolioapiservice-v20150201 = { workspace = true }
+# The native data plane of S3 Files, installed in that same guest and read the same way: a
+# script that mounts one of ITS file systems writes files that are objects of the bucket the
+# file system is a view of (`state::guest_execution`).
+service-com-amazonaws-s3files-s3files = { workspace = true }
 # The AWS SDK for EventBridge, driven over the in-process callback
 # (`OperationContext::callback`): a write to Parameter Store — a create, an update, a delete —
 # is published onto the account's default event bus (`state::parameter_events`). Only the

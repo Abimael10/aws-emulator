@@ -717,6 +717,10 @@ pub mod posix_shell_files;
 /// program of a MACHINE the emulator holds — its files, its sealed values and its devices,
 /// all bounded, with no host path behind any of them.
 pub mod posix_shell_volume;
+/// The ONE reading of a `mount(8)` / `umount(8)` command line, for every service whose file
+/// system a machine of this emulator mounts — so two data planes cannot read the same
+/// invocation two ways or exit differently for it.
+pub mod posix_shell_mounts;
 pub mod lex;
 pub mod management_events;
 /// The ONE construction of the in-process EventBridge client a service publishing an event

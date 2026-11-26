@@ -437,10 +437,21 @@ pub fn delivery_in_guest<Eng: Send + Sync + 'static>(
     // of Amazon EFS: which address serves NFS, which file system is behind it and the files
     // that file system holds are facts of that service, read through its own data-plane
     // accessor before the store that owns the guest is taken.
+    let node_vpc_id = node_vpc_id(engine, instance_id);
     let nfs = ::service_com_amazonaws_efs_magnolioapiservice_v20150201::state::nfs_client_programs(
         engine,
         now,
-        node_vpc_id(engine, instance_id).as_deref(),
+        node_vpc_id.as_deref(),
+    );
+    // ... and the file-system client of S3 Files, read the same way and for the same reason: a
+    // script that mounts one of ITS file systems names the file system itself or the address
+    // its mount target reports, and both are that service's facts. It is asked BEFORE the NFS
+    // client above, because a mount either data plane performs nothing of falls through to the
+    // other, so each answers for its own file systems only.
+    let s3_files = ::service_com_amazonaws_s3files_s3files::state::mount_client_programs(
+        engine,
+        now,
+        node_vpc_id.as_deref(),
     );
     // ... and the PYTHON INTERPRETER the inline programs of such a script are written in
     // ([`super::guest_python`]): the one contained engine this workspace embeds for running
@@ -469,7 +480,7 @@ pub fn delivery_in_guest<Eng: Send + Sync + 'static>(
         )
     });
     GuestDelivery {
-        supplied: [resolver, packages, nfs, interpreter, command_line]
+        supplied: [resolver, packages, s3_files, nfs, interpreter, command_line]
             .into_iter()
             .flatten()
             .reduce(::service_common::posix_shell_session::layered),
