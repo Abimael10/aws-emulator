@@ -37,6 +37,7 @@ pub mod mfa_devices;
 pub mod open_id_connect_provider_urls;
 pub mod outbound_web_identity_federation;
 pub mod outbound_web_identity_keys;
+pub mod password_history;
 pub mod permissions_boundary;
 pub mod policy_arn_identity;
 pub mod policy_document_reports;
@@ -78,6 +79,7 @@ pub use mfa_devices::*;
 pub use open_id_connect_provider_urls::*;
 pub use outbound_web_identity_federation::*;
 pub use outbound_web_identity_keys::*;
+pub use password_history::*;
 pub use permissions_boundary::*;
 pub use policy_arn_identity::*;
 pub use policy_document_reports::*;
@@ -1590,6 +1592,12 @@ pub struct LoginProfileRecord {
     /// The verifier of the password in force: the one the create set, or the one a
     /// later `UpdateLoginProfile` or `ChangePassword` replaced it with.
     pub password: PasswordVerifier,
+    /// The verifiers of the passwords this user NO LONGER has, most recently superseded
+    /// first: what the account's `PasswordReusePrevention` window is decided against
+    /// (`crate::state::password_history`), bounded by the most any policy can ask about.
+    /// Every entry is held exactly as the password in force is, so a superseded password is
+    /// no more readable than the current one.
+    pub superseded_passwords: Vec<PasswordVerifier>,
 }
 
 /// The account's password policy, as `UpdateAccountPasswordPolicy` wrote it.
@@ -1686,11 +1694,11 @@ impl AccountPasswordPolicy {
     /// Only the rules about the SUPPLIED PASSWORD's content are decided here, because they
     /// are the only ones a password-setting call can break: the length and the four
     /// character classes. `MaxPasswordAge` and `HardExpiry` govern a password already in
-    /// force rather than one being set, `AllowUsersToChangePassword` grants a permission,
-    /// and `PasswordReusePrevention` is a rule about passwords the account no longer holds
-    /// — this store keeps the verifier of the password IN FORCE and of no superseded one
-    /// ([`LoginProfileRecord::password`]), so there is nothing to compare a new password
-    /// against.
+    /// force rather than one being set, and `AllowUsersToChangePassword` grants a permission.
+    /// `PasswordReusePrevention` is a rule about the passwords ONE user had before this one,
+    /// not about the password's content, so it is decided where that user's superseded
+    /// passwords are ([`ComAmazonawsIamAwsidentitymanagementv20100508State::password_reuse_violation`])
+    /// rather than here, which is handed a password and no user.
     ///
     /// The rules are taken in the order `PasswordPolicy` declares them, so a password
     /// breaking several is refused by the first of them and one call cannot answer two

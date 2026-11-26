@@ -328,7 +328,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         if let Some(password) = held_password {
-            held.password = password;
+            // The password this update replaces is REMEMBERED, not dropped: the account's
+            // `PasswordReusePrevention` window is a rule about the passwords a user had
+            // before the one in force, so every write that replaces one records it
+            // (`crate::state::LoginProfileRecord::supersede`). The window itself bars what
+            // the USER may choose for itself (`ChangePassword`); an administrative reset is
+            // not the user choosing again, so this write is not refused for it.
+            held.supersede(password);
         }
         if let Some(reset_required) = input.password_reset_required {
             held.password_reset_required = reset_required;

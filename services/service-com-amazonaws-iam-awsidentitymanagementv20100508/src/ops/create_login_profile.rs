@@ -345,6 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // request that omits it creates a profile that does not demand one.
                 password_reset_required: input.password_reset_required,
                 password: held_password,
+                // The first password of a profile supersedes none: the account remembers a
+                // password only once a later write replaces it
+                // (`crate::state::LoginProfileRecord::supersede`).
+                superseded_passwords: Vec::new(),
             },
         );
 

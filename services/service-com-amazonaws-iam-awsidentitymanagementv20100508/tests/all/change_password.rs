@@ -47,6 +47,12 @@ const REFUSED_CODE: &str = "AccessDenied";
 /// credential has no console password of its own.
 const WRONG_USER_TYPE_CODE: &str = "InvalidUserType";
 
+/// The WHOLE message that refusal carries, spelled out here rather than imported from the
+/// handler, so a change of the wording fails this suite instead of following it. Every
+/// character is fixed: it names the only kind of caller the operation serves and nothing of
+/// the request.
+const WRONG_USER_TYPE_MESSAGE: &str = "Only IAM Users can change their own password.";
+
 /// The code a caller with no console password at all is refused with: a login profile
 /// "is created when you create a password for the user" (`GetLoginProfile`), so there is
 /// no password to change.
@@ -500,6 +506,12 @@ async fn a_caller_without_an_iam_identity_or_a_password_is_refused() {
             WRONG_USER_TYPE_CODE,
             "case {label:?}: expected {WRONG_USER_TYPE_CODE}, got {:?}",
             error_code(&refused)
+        );
+        assert_eq!(
+            element(&refused, "Message"),
+            WRONG_USER_TYPE_MESSAGE,
+            "case {label:?}: expected the fixed sentence {WRONG_USER_TYPE_MESSAGE:?}, got {:?}",
+            element(&refused, "Message")
         );
         // The user that does hold a password still holds the same one.
         let (status, read) = profile(&router, "identified").await;

@@ -226,12 +226,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ChangePasswordErrorModeled::InvalidUserTypeException(
                 InvalidUserTypeException {
                     message: Some(
-                        // The sentence the model states for this error, as its fixed
-                        // text: "the request was rejected because the type of user for
-                        // the transaction was incorrect".
-                        "The request was rejected because the type of user for the \
-                         transaction was incorrect."
-                            .to_string(),
+                        // The sentence AWS words this refusal with, fixed throughout: it
+                        // names the only kind of caller the operation serves — the IAM user
+                        // whose own password it changes — and nothing of the request, so a
+                        // credential that belongs to no IAM user learns nothing from it.
+                        // The modelled shape's own doc states the CLASS of the error ("the
+                        // type of user for the transaction was incorrect"), which is what
+                        // this operation says concretely.
+                        "Only IAM Users can change their own password.".to_string(),
                     ),
                 },
             )
@@ -384,6 +386,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PASSWORD_CHANGE_REFUSED,
             ));
         }
+
+        // The other rule the account's policy states about a password a USER chooses for
+        // itself: "the number of previous passwords that IAM users are prevented from
+        // reusing" (`PasswordPolicy$PasswordReusePrevention`). A new password inside that
+        // window — the password in force, or one of the superseded passwords the window
+        // still covers — is refused and the password in force stays as it was, decided
+        // from the passwords the account remembers for this user
+        // (`crate::state::password_reuse_violation`).
+        //
+        // THIS refusal is the modelled `PasswordPolicyViolationException` (HTTP 400,
+        // awsQuery code `PasswordPolicyViolation`) carrying the sentence AWS words it with,
+        // rather than the sentence above that covers a stale `OldPassword` too: a caller
+        // refused here has already presented the password in force, and what it is told is
+        // that a password it chose and knows it used before cannot come back — which
+        // discloses nothing it did not supply. The content rules stay behind the one
+        // sentence precisely because a caller must not read a right guess out of them.
+        if let Some(violation) = store.password_reuse_violation(&user_key, &input.new_password) {
+            ::tracing::info!(
+                audit = true,
+                operation = "ChangePassword",
+                outcome = "refused_password_reuse_prevention",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no password was changed"
+            );
+            return Err(
+                ChangePasswordErrorModeled::PasswordPolicyViolationException(
+                    PasswordPolicyViolationException {
+                        message: Some(violation),
+                    },
+                )
+                .into(),
+            );
+        }
         let held_password = store.hold_password(&input.new_password);
         let Some(held) = store.login_profiles.get_mut(&user_key) else {
             return Err(ChangePasswordErrorModeled::ServiceFailureException(
@@ -393,7 +429,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        held.password = held_password;
+        // The replaced password is remembered, so a later change cannot return to it while
+        // the account's reuse window still covers it
+        // (`crate::state::LoginProfileRecord::supersede`).
+        held.supersede(held_password);
         // The caller has just chosen a password of its own, so the demand that the
         // user "set a new password on next sign-in"
         // (`CreateLoginProfile$PasswordResetRequired`) has been met and no longer
