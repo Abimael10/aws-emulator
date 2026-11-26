@@ -1322,6 +1322,18 @@ pub struct NetworkInterfaceSpec {
     pub primary_ipv6: bool,
     /// The tags the create asked for.
     pub tags: Vec<Tag>,
+    /// Whether this interface is being BROUGHT UP by the call that stores it, which is what a
+    /// `CreateNetworkInterface` does.
+    ///
+    /// EC2 answers a create with the interface in the non-terminal
+    /// [`NETWORK_INTERFACE_STATUS_PENDING`] status and brings it up asynchronously, so an
+    /// interface a create minted sits there until the clock makes it
+    /// [`NETWORK_INTERFACE_STATUS_AVAILABLE`]
+    /// ([`ComAmazonawsEc2Amazonec2State::network_interface_available_at`]). An interface that
+    /// is already up when it reaches the store — one another service's resource is served by,
+    /// one a launch attaches, one a fixture seeds — is not coming up, and reports the status
+    /// that holds it instead.
+    pub coming_up: bool,
 }
 
 /// The MAC address of the network interface whose store counter value is `counter`.
@@ -1475,23 +1487,26 @@ impl ComAmazonawsEc2Amazonec2State {
         let retained_bytes =
             network_interface_spec_bytes(&spec).saturating_add(STORED_RECORD_OVERHEAD_BYTES);
         // "The status of the network interface" (`NetworkInterface$Status`): an interface
-        // something holds is `in-use` and one nothing holds is `available`. Derived here
+        // something holds is `in-use`; one this call is BRINGING UP is `pending` until the
+        // clock makes it `available` ([`NetworkInterfaceSpec::coming_up`]); and one that is
+        // already up and held by nothing is `available`. Derived here
         // rather than taken from the writer, so a stored interface cannot claim to be
         // `available` while something holds it — and derived on the same terms a later read
         // asks ([`ComAmazonawsEc2Amazonec2State::network_interface_is_held`]): an attachment
         // that has not been taken away holds it, and so does the SERVICE that created it to
         // serve a resource of the account, for as long as that resource exists. A create the
-        // CALLER made for itself attaches nothing and names no such service, so it always
-        // gets `available`.
+        // CALLER made for itself attaches nothing and names no such service, so it is
+        // reported `pending` and the clock owes it `available` a span later
+        // ([`ComAmazonawsEc2Amazonec2State::network_interface_available_at`]).
         let held = spec
             .attachment
             .as_ref()
             .is_some_and(|attachment| !attachment_is_detached(attachment))
             || spec.requester.is_some();
-        let status = if held {
-            NETWORK_INTERFACE_STATUS_IN_USE
-        } else {
-            NETWORK_INTERFACE_STATUS_AVAILABLE
+        let status = match (held, spec.coming_up) {
+            (true, _) => NETWORK_INTERFACE_STATUS_IN_USE,
+            (false, true) => NETWORK_INTERFACE_STATUS_PENDING,
+            (false, false) => NETWORK_INTERFACE_STATUS_AVAILABLE,
         };
         let interface = NetworkInterface {
             // No Elastic IP address is associated until something associates one.
@@ -1626,6 +1641,14 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         self.network_interfaces
             .insert(network_interface_id.clone(), interface);
+        // The move the clock owes an interface that came up `pending`: `available` one span
+        // later, whether or not anybody calls again
+        // ([`Self::materialize_due_transitions`]). An interface minted in the status that
+        // holds it has nothing owed on it.
+        if status == NETWORK_INTERFACE_STATUS_PENDING {
+            self.network_interface_available_at
+                .insert(network_interface_id.clone(), Instant::now() + TRANSITION_DELAY);
+        }
         Some(network_interface_id)
     }
 }

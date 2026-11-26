@@ -844,10 +844,11 @@ async fn an_existing_interface_the_launch_names_is_attached_where_it_is() {
     .await;
     let network_interface_id = element(&created, "networkInterfaceId").unwrap_or_default();
     let before = described_interface(case, &network.router, &network_interface_id).await;
-    assert_eq!(
-        before.status.as_deref(),
-        Some("available"),
-        "case {case:?}: a created interface holds nothing yet, got {before:?}"
+    // Coming up, or up: either way nothing holds the interface yet, which is what the launch
+    // below needs (`network_interface_create_comes_up_pending` owns the move between the two).
+    assert!(
+        matches!(before.status.as_deref(), Some("pending" | "available")),
+        "case {case:?}: a created interface must hold nothing yet, got {before:?}"
     );
 
     let body = network

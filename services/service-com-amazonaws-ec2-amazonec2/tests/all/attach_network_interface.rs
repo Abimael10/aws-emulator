@@ -309,10 +309,14 @@ async fn an_attach_writes_one_attachment_every_reader_reports_the_same_way() {
     {
         let network_interface_id = create_interface(case, &router, &subnet_id).await;
         let before = describe_interface(case, &router, &network_interface_id).await;
-        assert_eq!(
-            interface_status(case, &before, &network_interface_id).as_deref(),
-            Some("available"),
-            "case {case:?}: a created interface holds nothing, got {before}"
+        // A created interface holds NOTHING: it is coming up, or the clock has made it
+        // available — which of the two is the transition
+        // `network_interface_create_comes_up_pending` owns, and either way nothing holds it,
+        // which is what this row needs before it attaches.
+        let unheld = interface_status(case, &before, &network_interface_id);
+        assert!(
+            matches!(unheld.as_deref(), Some("pending" | "available")),
+            "case {case:?}: a created interface must hold nothing, got {unheld:?} in {before}"
         );
 
         let (status, body) = attach(

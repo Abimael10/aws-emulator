@@ -576,6 +576,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// service's private DNS name out of `pendingVerification`
     /// ([`Self::materialize_due_private_dns_name_verifications`]).
     ///
+    /// So is a `pending` network interface a create minted reaching `available`, the clock
+    /// bringing it up whether or not anybody called again.
+    ///
     /// So is the public IPv4 address Amazon maps to a RUNNING instance: the address is
     /// released at the instant a stop completes and a fresh one assigned at the instant a
     /// start does ([`crate::state::instance_mapped_public_ipv4`]).
@@ -767,6 +770,25 @@ impl ComAmazonawsEc2Amazonec2State {
                     }
                 }
                 // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
+        // A network interface a create answered as `pending` is `available` once its own due
+        // instant has passed, whether or not anybody called — EC2 brings the interface up
+        // asynchronously, the same contract as the `pending` gateway above. An interface
+        // something took hold of while it was coming up is reported in the status that holds
+        // it, so the move is applied only to one still sitting in `pending`.
+        let network_interfaces = &mut self.network_interfaces;
+        self.network_interface_available_at
+            .retain(|network_interface_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(interface) = network_interfaces.get_mut(network_interface_id) {
+                    if interface.status.as_deref() == Some(NETWORK_INTERFACE_STATUS_PENDING) {
+                        interface.status = Some(NETWORK_INTERFACE_STATUS_AVAILABLE.to_string());
+                    }
+                }
+                // The transition is applied once; nothing is owed on this interface any more.
                 false
             });
         // A managed prefix list `CreateManagedPrefixList` answered as `create-in-progress`

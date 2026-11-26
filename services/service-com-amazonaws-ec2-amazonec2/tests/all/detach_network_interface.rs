@@ -862,10 +862,12 @@ async fn an_attach_makes_the_attachment_a_detach_takes_down() {
     {
         let network_interface_id = create_interface(case, &router, &subnet_id).await;
         let before = reported(case, &router, &network_interface_id).await;
-        assert_eq!(
-            before.status.as_deref(),
-            Some("available"),
-            "case {case:?}: a created interface holds nothing, got {before:?}"
+        // Coming up, or up: either way nothing holds the interface, which is what this row
+        // needs before it attaches (`network_interface_create_comes_up_pending` owns the move
+        // between the two).
+        assert!(
+            matches!(before.status.as_deref(), Some("pending" | "available")),
+            "case {case:?}: a created interface must hold nothing, got {before:?}"
         );
 
         let (status, body) = attach(

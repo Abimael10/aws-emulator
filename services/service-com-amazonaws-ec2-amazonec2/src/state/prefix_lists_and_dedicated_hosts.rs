@@ -837,16 +837,42 @@ pub fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixList> {
         .collect()
 }
 
+/// The ids AWS publishes for the prefix lists it manages, by the list's own name.
+///
+/// A published prefix list's id is a fact of the list, not something a caller or a run
+/// produces: AWS keeps one id per published list for the life of the list and names it in the
+/// gateway endpoint documentation of each Region, which is what lets a route table or a
+/// security group rule be written against `pl-…` directly. So the ids AWS publishes are held
+/// here, one row per list, keyed by the name [`aws_managed_prefix_list_name`] builds — the
+/// gateway service lists of the Regions whose published ids are recorded so far.
+///
+/// A list no row names keeps the DERIVED id below, which gives the same two properties a
+/// published id has — stable across reads, distinct per list — without claiming a value AWS
+/// publishes.
+static PUBLISHED_PREFIX_LIST_IDS: &[(&str, &str)] = &[
+    ("com.amazonaws.us-east-1.dynamodb", "pl-02cd2c6b"),
+    ("com.amazonaws.us-east-1.s3", "pl-63a5400a"),
+    ("com.amazonaws.us-west-2.dynamodb", "pl-00a54069"),
+    ("com.amazonaws.us-west-2.s3", "pl-68a54001"),
+];
+
 /// The id of the service prefix list named `prefix_list_name`.
 ///
-/// AWS mints an opaque id of the form `pl-` followed by hexadecimal digits for every prefix
-/// list and keeps it for the life of the list, so the id here is DERIVED from the list's name
+/// The id AWS publishes for the list where [`PUBLISHED_PREFIX_LIST_IDS`] holds its row. For
+/// every other list, AWS mints an opaque id of the form `pl-` followed by hexadecimal digits
+/// and keeps it for the life of the list, so the id here is DERIVED from the list's name
 /// — a pure function of it through [`stable_derived_id_hash`] — which gives the same two
 /// properties without storing anything: every read of one Region's prefix list reports the
-/// same id, and two lists with different names get different ids. It carries 8 digits where
-/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints 17, so a derived id can never collide with
+/// same id, and two lists with different names get different ids. Either form carries 8 digits
+/// where [`ComAmazonawsEc2Amazonec2State::next_id`] mints 17, so neither can collide with
 /// the id of a managed prefix list a caller created.
 pub(super) fn service_prefix_list_id(prefix_list_name: &str) -> String {
+    if let Some((_, published)) = PUBLISHED_PREFIX_LIST_IDS
+        .iter()
+        .find(|(name, _)| *name == prefix_list_name)
+    {
+        return (*published).to_string();
+    }
     format!(
         "{PREFIX_LIST_ID_PREFIX}-{:08x}",
         stable_derived_id_hash(prefix_list_name) & 0xffff_ffff
@@ -1306,8 +1332,30 @@ pub const INVALID_HOST_ID_MALFORMED: &str = "InvalidHostID.Malformed";
 /// (`ReleaseHosts`), and a host that still runs them is reported in `Unsuccessful` under this
 /// code — the recorded code for that one cause, which is NOT the general
 /// [`INCORRECT_STATE`] the rest of this service answers a state that does not admit a request
-/// with.
+/// with. The `Client.` prefix is the one [`client_faulted_item_code`] writes on every other
+/// per-item code of these batches.
 pub const HOST_OCCUPIED: &str = "Client.InvalidHost.Occupied";
+
+/// The prefix EC2 writes on a FAULTED error code — the class of the fault, the caller's here —
+/// as `Client.InvalidHostID.Malformed` and [`HOST_OCCUPIED`] carry it.
+const CLIENT_FAULT_PREFIX: &str = "Client.";
+
+/// `code` as a batch operation's per-item error reports it: the client-faulted form of the
+/// code, the caller's request being what the item failed on.
+///
+/// An EC2 batch operation answers 200 and reports what it could not act on per item
+/// (`UnsuccessfulItemError$Code`), and that embedded code carries the class of the fault —
+/// `Client.` for a cause the caller's request carried — while the same cause reported as the
+/// CALL's own refusal carries the bare code in `Errors/Error/Code`. So the one code this
+/// service answers a cause with ([`INVALID_HOST_ID_MALFORMED`] and the rest) is read through
+/// this wherever it is written into an item, and a code that already states its fault class
+/// (the recorded [`HOST_OCCUPIED`]) is left as it is rather than prefixed twice.
+pub fn client_faulted_item_code(code: &str) -> String {
+    if code.starts_with(CLIENT_FAULT_PREFIX) {
+        return code.to_string();
+    }
+    format!("{CLIENT_FAULT_PREFIX}{code}")
+}
 
 /// `InvalidHostReservationOfferingId.Malformed` (HTTP 400): the request named something that
 /// is not a Dedicated Host reservation OFFERING id at all, so there is nothing to look up —

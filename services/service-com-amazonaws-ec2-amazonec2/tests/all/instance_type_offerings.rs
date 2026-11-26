@@ -288,19 +288,32 @@ async fn each_location_type_reports_the_locations_of_its_own_kind() {
 }
 
 /// Every instance type the modelled `InstanceType` catalog declares is offered in the
-/// current Region, and nothing outside the catalog is.
+/// current Region EXCEPT the ones AWS publishes no Region for, and nothing outside the
+/// catalog is offered at all.
 ///
 /// The catalog is read from the value list the model generated, so the assertion is over
-/// the whole class rather than over a sample: a type the model declares but the emulator
-/// withheld, or a type it offered that the model does not declare, both fail here.
+/// the whole class rather than over a sample: a type the model declares and the Region is
+/// offered but the emulator withheld, or a type it offered that the model does not declare,
+/// both fail here. The whole-host sizes of the block storage optimized Graviton family are
+/// taken out by NAME, those being the types no Region's published offering set names — the
+/// rule `region_restricted_instance_type_offerings` covers.
 /// `u-6tb1.metal` and `x2gd.medium` are checked by name as entries the issue did not
 /// cite. The catalog is larger than one page, so the offerings are collected over a
 /// `NextToken` walk.
 #[tokio::test]
 async fn every_catalogued_instance_type_is_offered_in_the_region() {
     let (router, _engine) = super::ec2_query::emulator();
+    const REGION: &str = "eu-west-1";
+    /// The types AWS publishes no Region for, so no Region offers them in any location.
+    const UNOFFERED_ANYWHERE: [&str; 4] = [
+        "c8gb.metal-24xl",
+        "c8gb.metal-48xl",
+        "c8gn.metal-24xl",
+        "c8gn.metal-48xl",
+    ];
     let catalog: BTreeSet<String> = ec2::ops::types::INSTANCE_TYPE_VALUES
         .iter()
+        .filter(|value| !UNOFFERED_ANYWHERE.contains(value))
         .map(|value| (*value).to_string())
         .collect();
     assert!(
@@ -309,7 +322,7 @@ async fn every_catalogued_instance_type_is_offered_in_the_region() {
         catalog.len()
     );
 
-    let (walked, _pages) = walk(&router, "eu-west-1", "region", &[], None).await;
+    let (walked, _pages) = walk(&router, REGION, "region", &[], None).await;
     let reported: BTreeSet<String> = walked
         .iter()
         .map(|offering| offering.instance_type.clone())

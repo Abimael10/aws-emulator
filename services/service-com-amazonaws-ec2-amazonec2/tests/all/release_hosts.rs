@@ -22,8 +22,7 @@ use std::sync::Arc;
 use ec2::ops::types::ALLOCATION_STATE_VALUES;
 use ec2::state::{
     DEDICATED_HOST_TAGGABLE_RESOURCE, HOST_OCCUPIED, HOST_STATE_AVAILABLE, HOST_STATE_RELEASED,
-    HOST_STATE_RELEASED_PERMANENT_FAILURE, INVALID_HOST_ID_MALFORMED,
-    availability_zones_in_region,
+    HOST_STATE_RELEASED_PERMANENT_FAILURE, availability_zones_in_region,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -35,9 +34,11 @@ use super::ec2_query::{as_timestamp, element, elements, indexed, unescaped};
 const REGION: &str = "us-east-1";
 
 /// The code an `Unsuccessful` item carries for a Dedicated Host id this operation could not
-/// resolve: the one code this service answers an unresolvable host id with
-/// (`ec2::state::INVALID_HOST_ID_MALFORMED`, what `DescribeHosts` refuses the same id with).
-const UNRESOLVABLE_HOST_ID_CODE: &str = INVALID_HOST_ID_MALFORMED;
+/// resolve: the client-faulted form of the one code this service answers an unresolvable host
+/// id with (`ec2::state::INVALID_HOST_ID_MALFORMED`, what `DescribeHosts` refuses the same id
+/// with) — an item's embedded code states the class of the fault, which is the caller's here,
+/// where the same cause reported as the CALL's refusal carries the bare code.
+const UNRESOLVABLE_HOST_ID_CODE: &str = "Client.InvalidHostID.Malformed";
 
 /// One `(key, value)` request parameter.
 fn param(key: &str, value: impl Into<String>) -> (String, String) {

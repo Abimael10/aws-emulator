@@ -469,6 +469,16 @@ async fn each_created_interface_round_trips_through_the_describe() {
             "case {:?}: expected an eni- id, got {network_interface_id:?} from {created}",
             case.name
         );
+        // The create's OWN answer carries the status it created the interface in; the clock
+        // then makes it `available` a span later, which
+        // `network_interface_create_comes_up_pending` is the suite for — so the describe below
+        // reads every other member rather than racing that move.
+        assert_eq!(
+            element(&created, "status").as_deref(),
+            Some("pending"),
+            "case {:?}: expected the create to answer the interface coming up, got {created}",
+            case.name
+        );
 
         // Read it back through the describe: the two must report the same interface.
         let body = describe_one(&router, case.name, &network_interface_id).await;
@@ -479,7 +489,6 @@ async fn each_created_interface_round_trips_through_the_describe() {
             ("availabilityZone", zones[0].zone_name.clone()),
             ("availabilityZoneId", zones[0].zone_id.clone()),
             ("ownerId", engine::emulator_account_id().to_string()),
-            ("status", "available".to_string()),
             ("interfaceType", case.interface_type.to_string()),
             ("sourceDestCheck", "true".to_string()),
             ("requesterManaged", "false".to_string()),

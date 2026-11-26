@@ -2526,6 +2526,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// An attachment with nothing owed on it has no entry, so it stays exactly as it was
     /// stored.
     pub network_interface_attachment_move_at: BTreeMap<String, PendingStateMove>,
+    /// When each network interface's `pending` -> `available` transition falls due, by
+    /// `NetworkInterfaceId`, for the interfaces that have one.
+    ///
+    /// The interface counterpart of [`Self::carrier_gateway_available_at`], for the same
+    /// reason and on the same clock: a create answers an interface in the non-terminal
+    /// [`NETWORK_INTERFACE_STATUS_PENDING`] state, so the clock owes it
+    /// [`NETWORK_INTERFACE_STATUS_AVAILABLE`] [`TRANSITION_DELAY`] later whether or not
+    /// anybody calls again, and [`Self::materialize_due_transitions`] applies it. An
+    /// interface something already holds is minted in the status that holds it and has no
+    /// entry here.
+    pub network_interface_available_at: BTreeMap<String, Instant>,
     /// Every permission the account has granted over one of its network interfaces, by
     /// `NetworkInterfacePermissionId`, as the modelled [`NetworkInterfacePermission`] shape
     /// itself — the one `DescribeNetworkInterfacePermissions` reports — so a member a writer
@@ -4185,6 +4196,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // Nothing is owed on an account that holds no interface, let alone on an
             // attachment of one.
             network_interface_attachment_move_at: BTreeMap::new(),
+            network_interface_available_at: BTreeMap::new(),
             // A fresh account has granted nothing over an interface it does not have yet.
             network_interface_permissions: BTreeMap::new(),
             // A fresh account runs no instance as an IAM instance profile.

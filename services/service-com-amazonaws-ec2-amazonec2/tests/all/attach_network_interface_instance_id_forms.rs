@@ -167,10 +167,11 @@ async fn an_instance_id_the_service_never_issued_is_refused_as_malformed() {
             &indexed("NetworkInterfaceId", &[interface.as_str()]),
         )
         .await;
-        assert_eq!(
-            element(&body, "status").as_deref(),
-            Some("available"),
-            "case {case:?}: a refused attach must leave the interface free, got {body}"
+        let free = element(&body, "status");
+        assert!(
+            matches!(free.as_deref(), Some("pending" | "available")),
+            "case {case:?}: a refused attach must leave the interface holding nothing — coming \
+             up, or up — got {free:?} in {body}"
         );
     }
 }

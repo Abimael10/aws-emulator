@@ -186,6 +186,10 @@ struct TypeCase {
     clock_ghz: &'static str,
     /// `EbsInfo$MaximumEbsAttachments`.
     ebs_attachments: i64,
+    /// Whether the published "Network performance" column of the type is a FIGURE in Gigabit:
+    /// the share of its host a type is given is published that way, while a previous
+    /// generation family's column carries words ("Moderate") instead.
+    gigabit_network: bool,
 }
 
 /// Every member of `InstanceTypeInfo` whose value follows from the instance type's name is
@@ -211,6 +215,7 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             // 28 attachments shared, less the primary network interface and the one
             // instance store device.
             ebs_attachments: 26,
+            gigabit_network: true,
         },
         TypeCase {
             case: "its bare metal size, which has no hypervisor",
@@ -221,6 +226,7 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             ena_srd: false,
             clock_ghz: "2.5",
             ebs_attachments: 25,
+            gigabit_network: true,
         },
         TypeCase {
             case: "a seventh-generation Graviton type",
@@ -231,6 +237,7 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             ena_srd: true,
             clock_ghz: "2.6",
             ebs_attachments: 27,
+            gigabit_network: true,
         },
         TypeCase {
             case: "a fifth-generation Intel type",
@@ -241,6 +248,7 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             ena_srd: false,
             clock_ghz: "3.1",
             ebs_attachments: 27,
+            gigabit_network: true,
         },
         TypeCase {
             case: "a sixth-generation AMD type",
@@ -254,19 +262,22 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             ena_srd: true,
             clock_ghz: "3.6",
             ebs_attachments: 27,
+            gigabit_network: true,
         },
         TypeCase {
             case: "a type that runs on the Xen hypervisor",
-            // A pre-Nitro family the catalog holds no per-type row for, so every member below
-            // is the derivation's: the burstable Xen family's own row publishes a processor
-            // frequency, an attachment total and a reboot-migration answer of its own.
+            // A pre-Nitro family: the features the Nitro hypervisor provides are the
+            // derivation's `unsupported` for it, while its own published row carries the
+            // processor frequency and the attachment total its hardware has.
             instance_type: "c3.large",
             cards: 1,
             nitro_clock: "unsupported",
             hypervisor_feature: "unsupported",
             ena_srd: false,
-            clock_ghz: "2.4",
-            ebs_attachments: 27,
+            clock_ghz: "2.8",
+            ebs_attachments: 39,
+            // Its published column carries the words "Moderate" rather than a figure.
+            gigabit_network: false,
         },
         TypeCase {
             case: "a published four-card type",
@@ -281,6 +292,7 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             // Its instance store is seven devices, each of which takes an attachment out of
             // the pool its EBS volumes share.
             ebs_attachments: 20,
+            gigabit_network: true,
         },
         TypeCase {
             case: "a two-card type with no published row",
@@ -294,6 +306,7 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
             ena_srd: true,
             clock_ghz: "3.5",
             ebs_attachments: 27,
+            gigabit_network: true,
         },
     ];
 
@@ -374,19 +387,43 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
                 Some(index.to_string()),
                 "case {case:?}: card {index} must report its own index, got {item}"
             );
-            let performance = child_text(*card, "networkPerformance").unwrap_or_default();
-            assert!(
-                performance.ends_with(" Gigabit"),
-                "case {case:?}: card {index} must report a Gigabit figure, got \
-                 {performance:?}"
-            );
         }
         let performance = element(&network, "networkPerformance").unwrap_or_default();
-        assert!(
-            performance.ends_with(" Gigabit"),
-            "case {case:?}: {} must report a Gigabit figure, got {performance:?}",
-            row.instance_type
-        );
+        // A type with ONE card reports the whole instance's network on it, so the two
+        // readings of that one figure cannot differ; a card of a multi-card type carries its
+        // SHARE of the host, which is a figure of its own in the published form.
+        for (index, card) in reported_cards.iter().enumerate() {
+            let card_performance = child_text(*card, "networkPerformance").unwrap_or_default();
+            if row.cards == 1 {
+                assert_eq!(
+                    card_performance, performance,
+                    "case {case:?}: the one card must report the type's own performance \
+                     {performance:?}, got {card_performance:?}"
+                );
+            } else {
+                assert!(
+                    card_performance.ends_with(" Gigabit"),
+                    "case {case:?}: card {index} must report its share as a Gigabit figure, \
+                     got {card_performance:?}"
+                );
+            }
+        }
+        if row.gigabit_network {
+            assert!(
+                performance.ends_with(" Gigabit"),
+                "case {case:?}: {} must report a Gigabit figure, got {performance:?}",
+                row.instance_type
+            );
+        } else {
+            // A previous generation family publishes the WORDS of its column rather than a
+            // figure, so the reported performance is those words.
+            assert!(
+                !performance.is_empty() && !performance.ends_with(" Gigabit"),
+                "case {case:?}: {} must report the published words of its column, got \
+                 {performance:?}",
+                row.instance_type
+            );
+        }
     }
 }
 

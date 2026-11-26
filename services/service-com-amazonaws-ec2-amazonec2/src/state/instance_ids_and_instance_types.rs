@@ -1430,10 +1430,11 @@ pub fn locations_of_type(region: &str, location_type: &str) -> Vec<String> {
 ///
 /// The catalog is the modelled `InstanceType` enum's generated value list
 /// (`crate::ops::types::INSTANCE_TYPE_VALUES`, from
-/// `smithy_query(query="shape",shape="InstanceType")`), so an instance type is offered
-/// exactly when the model declares it. AWS offers a Region-specific subset of them,
-/// and neither the model nor a request carries WHICH subset a Region has, so the set
-/// is the same in every Region rather than a per-Region subset invented here.
+/// `smithy_query(query="shape",shape="InstanceType")`), so the catalog holds an instance
+/// type exactly when the model declares it. WHICH of them a Region offers is published per
+/// Region and read through [`region_offers_instance_type`]: a type AWS has not installed in a
+/// Region is offered in none of its locations, and every other type is offered wherever its
+/// locations are.
 ///
 /// WITHIN a Region the zones differ, which is a fact the describe of offerings reports per
 /// zone: see [`location_offers_instance_type`] for which of these a given Availability Zone
@@ -1491,6 +1492,41 @@ pub const LOCATION_TYPE_AVAILABILITY_ZONE: &str = "availability-zone";
 /// The `LocationType` value naming them by AZ ID.
 pub const LOCATION_TYPE_AVAILABILITY_ZONE_ID: &str = "availability-zone-id";
 
+/// The instance types AWS does not offer in every Region, each with the Regions that offer
+/// it.
+///
+/// Which types a Region offers is published per Region (the EC2 User Guide's instance-type
+/// availability tables, and `DescribeInstanceTypeOfferings` itself in each Region): a family's
+/// newest hardware reaches the Regions AWS has installed it in and no others, so a Region that
+/// has not been given a type offers it in none of its locations even though the modelled
+/// `InstanceType` enum names it. A type with an entry here is offered in the Regions the entry
+/// lists and nowhere else; one with no entry is offered wherever its locations are, which is
+/// what the published tables say for the rest of the catalog. The entries recorded so far are
+/// the whole-host sizes of the block storage optimized and the network optimized AWS Graviton
+/// compute families, for which no Region's published offering set names them — while the
+/// VIRTUALIZED sizes of those same families are offered, so the restriction is per TYPE rather
+/// than per family. Each of those rows therefore names NO Region; the second column is what a
+/// type AWS offers in SOME Regions is recorded with when one is — no row recorded so far
+/// carries a Region, so that half of [`region_offers_instance_type`] has no case of its own to
+/// read yet.
+static REGION_RESTRICTED_INSTANCE_TYPES: &[(&str, &[&str])] = &[
+    ("c8gb.metal-24xl", &[]),
+    ("c8gb.metal-48xl", &[]),
+    ("c8gn.metal-24xl", &[]),
+    ("c8gn.metal-48xl", &[]),
+];
+
+/// Whether Region `region` offers `instance_type` at all.
+///
+/// The ONE place the published per-Region restriction above is read, so every location of a
+/// Region that is not offered a type reports no offering of it — a zone, an AZ id and the
+/// Region itself alike — and a launch asked of such a zone is refused on the same fact.
+pub fn region_offers_instance_type(region: &str, instance_type: &str) -> bool {
+    !REGION_RESTRICTED_INSTANCE_TYPES
+        .iter()
+        .any(|(restricted, regions)| *restricted == instance_type && !regions.contains(&region))
+}
+
 /// Whether `location` of `region`, named as `location_type`, offers `instance_type`.
 ///
 /// "The results can be filtered by location" and
@@ -1500,7 +1536,11 @@ pub const LOCATION_TYPE_AVAILABILITY_ZONE_ID: &str = "availability-zone-id";
 /// that lacks the requested type is refused `Unsupported` and a capacity-aware client
 /// enumerates offerings to choose a zone.
 ///
-/// WHICH zone lacks which type is per-account, per-Region data neither the model nor a
+/// A type the REGION is not offered at all ([`region_offers_instance_type`]) is offered in
+/// none of its locations, whichever kind the request named.
+///
+/// WHICH zone of an offered Region lacks which type is per-account, per-Region data neither
+/// the model nor a
 /// request carries, so where the boundary falls is CHOSEN and derived, not invented per
 /// call: a Region's LAST Availability Zone in zone order does not offer the
 /// CURRENT-generation instance types ([`InstanceTypeName::current_generation`], which reads
@@ -1509,8 +1549,9 @@ pub const LOCATION_TYPE_AVAILABILITY_ZONE_ID: &str = "availability-zone-id";
 /// between its zones, the newest families being the ones a zone can lack, and the previous
 /// generations — the ones every zone has had since it was built — are offered everywhere.
 ///
-/// A whole REGION offers a type whenever any of its zones does, which every type satisfies,
-/// so a `region` location offers the whole catalog; a location kind that names no zone
+/// A whole REGION offers a type whenever any of its zones does, which every type it is
+/// offered satisfies, so a `region` location offers the whole catalog it is offered; a
+/// location kind that names no zone
 /// (`outpost`) has no offerings to narrow in the first place.
 pub fn location_offers_instance_type(
     region: &str,
@@ -1518,6 +1559,9 @@ pub fn location_offers_instance_type(
     location_type: &str,
     instance_type: &str,
 ) -> bool {
+    if !region_offers_instance_type(region, instance_type) {
+        return false;
+    }
     if unoffering_location(region, location_type).as_deref() != Some(location) {
         return true;
     }
@@ -1929,11 +1973,12 @@ pub(super) const CONNECTION_TRACKING_TIMEOUTS: (i32, i32, i32) = (432_000, 30, 1
 pub(super) const FREE_TIER_INSTANCE_TYPES: [&str; 2] = ["t2.micro", "t3.micro"];
 
 /// The instance types that run 32-bit AMIs, each of which also runs 64-bit ones: the
-/// sizes the EC2 User Guide lists for `i386` — the four previous generation ones and the
+/// sizes the EC2 User Guide lists for `i386` — the five previous generation ones and the
 /// four smallest sizes of the long-lived burstable family, which is current generation and
 /// still offered them.
-pub(super) const I386_INSTANCE_TYPES: [&str; 8] = [
+pub(super) const I386_INSTANCE_TYPES: [&str; 9] = [
     "c1.medium",
+    "c3.large",
     "m1.medium",
     "m1.small",
     "t1.micro",

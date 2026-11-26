@@ -158,10 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF, ALLOWS_MULTIPLE_INSTANCE_TYPES_ON,
             INVALID_HOST_ID_MALFORMED, INVALID_PARAMETER_VALUE, MAX_RESOURCE_IDS,
-            host_instance_family, host_is_released, instance_family_is_modelled,
-            instance_type_is_modelled, invalid_request, missing_parameter, require_service_state,
-            unresolvable_host_ids_message, unsupported_host_instance_family,
-            unsupported_host_instance_type,
+            client_faulted_item_code, host_instance_family, host_is_released,
+            instance_family_is_modelled, instance_type_is_modelled, invalid_request,
+            missing_parameter, require_service_state, unresolvable_host_ids_message,
+            unsupported_host_instance_family, unsupported_host_instance_type,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it — the host
@@ -300,10 +300,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             };
             match refusal {
+                // The embedded code carries the CLASS of the fault, which is the caller's for
+                // both causes above ([`crate::state::client_faulted_item_code`]), while the
+                // same code carried by the call's own refusal is the bare one.
                 Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
                     resource_id: Some(host_id.clone()),
                     error: Some(UnsuccessfulItemError {
-                        code: Some(code.to_string()),
+                        code: Some(client_faulted_item_code(code)),
                         message: Some(message),
                     }),
                 }),

@@ -23,8 +23,8 @@ use std::sync::Arc;
 use ec2::ops::types::{AUTO_PLACEMENT_VALUES, HOST_MAINTENANCE_VALUES, HOST_RECOVERY_VALUES};
 use ec2::state::{
     ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF, ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, INVALID_HOST_CONFIGURATION,
-    INVALID_HOST_ID_MALFORMED, INVALID_PARAMETER_VALUE, INVALID_REQUEST, MAX_RESOURCE_IDS,
-    MISSING_PARAMETER, availability_zones_in_region, unresolvable_host_ids_message,
+    INVALID_PARAMETER_VALUE, INVALID_REQUEST, MAX_RESOURCE_IDS, MISSING_PARAMETER,
+    availability_zones_in_region, unresolvable_host_ids_message,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -34,6 +34,15 @@ use super::ec2_query::{element, elements, error_code, error_message, indexed, un
 /// The Region every call here is signed for; the zones the hosts are allocated into are
 /// derived from it.
 const REGION: &str = "us-east-1";
+
+/// The code an `Unsuccessful` item carries for a host id this operation could not resolve: the
+/// client-faulted form of `ec2::state::INVALID_HOST_ID_MALFORMED`, an item's embedded code
+/// stating the class of the fault where the call's own refusal carries the bare code.
+const INVALID_HOST_ID_MALFORMED_ITEM_CODE: &str = "Client.InvalidHostID.Malformed";
+
+/// The same form of `ec2::state::INVALID_PARAMETER_VALUE`, the other cause this operation
+/// reports per item.
+const INVALID_PARAMETER_VALUE_ITEM_CODE: &str = "Client.InvalidParameterValue";
 
 /// One `(key, value)` request parameter.
 fn param(key: &str, value: impl Into<String>) -> (String, String) {
@@ -590,7 +599,7 @@ async fn an_id_naming_no_host_is_reported_unsuccessful() {
             unsuccessful(&body),
             vec![(
                 unresolvable.to_string(),
-                INVALID_HOST_ID_MALFORMED.to_string(),
+                INVALID_HOST_ID_MALFORMED_ITEM_CODE.to_string(),
                 unresolvable_host_ids_message([unresolvable]),
             )],
             "case {unresolvable:?}: expected the unresolvable id reported, got {body}"
@@ -652,7 +661,7 @@ async fn a_released_host_is_reported_unsuccessful() {
         unsuccessful(&body),
         vec![(
             released.clone(),
-            INVALID_HOST_ID_MALFORMED.to_string(),
+            INVALID_HOST_ID_MALFORMED_ITEM_CODE.to_string(),
             unresolvable_host_ids_message([released.as_str()]),
         )],
         "case {case:?}: expected the released host reported unsuccessful, got {body}"
@@ -749,8 +758,8 @@ async fn an_instance_family_the_host_is_not_configured_for_is_reported_unsuccess
             "case {case:?}: expected the item to name the host, got {resource:?}"
         );
         assert_eq!(
-            code, INVALID_PARAMETER_VALUE,
-            "case {case:?}: expected the code {INVALID_PARAMETER_VALUE}, got {code:?}"
+            code, INVALID_PARAMETER_VALUE_ITEM_CODE,
+            "case {case:?}: expected the code {INVALID_PARAMETER_VALUE_ITEM_CODE}, got {code:?}"
         );
         for expected in [value, member, family] {
             assert!(

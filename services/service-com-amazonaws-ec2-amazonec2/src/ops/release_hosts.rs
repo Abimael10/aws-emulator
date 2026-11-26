@@ -137,8 +137,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             HOST_OCCUPIED, HOST_STATE_RELEASED, INVALID_HOST_ID_MALFORMED, MAX_RESOURCE_IDS,
-            host_is_released, require_service_state, system_time_to_date_time,
-            unresolvable_host_ids_message,
+            client_faulted_item_code, host_is_released, require_service_state,
+            system_time_to_date_time, unresolvable_host_ids_message,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it — the host
@@ -225,10 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(_) => None,
             };
             match refusal {
+                // The embedded code carries the CLASS of the fault, which is the caller's
+                // for every cause above ([`crate::state::client_faulted_item_code`]) — the
+                // same code the call's own refusal of that cause carries bare.
                 Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
                     resource_id: Some(host_id.clone()),
                     error: Some(UnsuccessfulItemError {
-                        code: Some(code.to_string()),
+                        code: Some(client_faulted_item_code(code)),
                         message: Some(message),
                     }),
                 }),
