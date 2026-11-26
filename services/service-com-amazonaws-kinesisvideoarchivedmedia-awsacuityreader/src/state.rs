@@ -536,73 +536,119 @@ impl ResolvedStream<'_> {
         range_holds_media(self.fragments, origin, start_millis, end_millis)
     }
 
-    /// The manifest/playlist snapshot a streaming session over this stream
-    /// serves at `now`: the fragment numbers `window` selects, at most
-    /// `max_fragments` of them.
+    /// The manifest/playlist a streaming session over this stream serves from
+    /// the archive AS IT STANDS: the fragment numbers `window` selects, at most
+    /// `max_fragments` of them, and where the first of them sits in that
+    /// selection.
     ///
-    /// EMPTY when the session would serve nothing, which both streaming-session
-    /// operations report as `ResourceNotFoundException` with
-    /// [`NO_FRAGMENTS_MESSAGE`]. The one selection rule both of them use, so an
-    /// HLS and an MPEG-DASH session over the same archive and the same
-    /// parameters carry the same fragments.
+    /// Read at every fetch of a session whose playlist grows
+    /// ([`StreamingSession::grows`]), so a fragment ingested after the session
+    /// was minted is in the answer the next fetch is served, and read once for
+    /// one whose window is a closed stretch of the past.
     ///
-    /// In EVERY playback mode the fragments that share one start timestamp are
-    /// collapsed to the newest of them before the cap is applied
-    /// ([`collapse_shared_start_timestamps`]).
+    /// The one selection rule both streaming-session operations use, so an HLS
+    /// and an MPEG-DASH session over the same archive and the same parameters
+    /// carry the same fragments. In EVERY playback mode the fragments that
+    /// share one start timestamp are collapsed to the newest of them before the
+    /// cap is applied ([`collapse_shared_start_timestamps`]).
+    ///
+    /// SELECTION alone: whether a session over this window exists at all is
+    /// [`Self::minted_session_fragment_numbers`]'s question, because the
+    /// freshness a LIVE session is minted against is a condition on the request
+    /// rather than on each later fetch.
     #[must_use]
-    pub fn session_fragment_numbers(
+    pub fn session_playlist(
         &self,
         window: SessionWindow,
         origin: TimestampOrigin,
         max_fragments: usize,
-        now: SystemTime,
-    ) -> Vec<String> {
+    ) -> SessionPlaylist {
         match window {
             SessionWindow::Live => {
-                // LIVE serves the most recently INGESTED fragments and only
-                // exists while the stream head is fresh. The ordering is by
-                // server timestamp whatever `FragmentSelectorType` the request
-                // names, because that is what the selector's own documentation
-                // says of LIVE: "the most recently ingested fragments based on
-                // server timestamps are included" — "this means that even if
-                // fragments ingested in the past have producer timestamps with
-                // values now, they are not included".
-                // Collapsed FIRST, so the existence check and the snapshot are
-                // decided on the same set of fragments, and the fragment that
-                // is kept is placed by its OWN server timestamp — it is the one
-                // the snapshot carries, and LIVE serves the most recently
-                // ingested of what it carries.
+                // LIVE serves the most recently INGESTED fragments. The
+                // ordering is by server timestamp whatever
+                // `FragmentSelectorType` the request names, because that is
+                // what the selector's own documentation says of LIVE: "the most
+                // recently ingested fragments based on server timestamps are
+                // included" — "this means that even if fragments ingested in the
+                // past have producer timestamps with values now, they are not
+                // included".
+                // Collapsed FIRST, so the fragment that is kept is placed by
+                // its OWN server timestamp: it is the one the playlist carries,
+                // and LIVE serves the most recently ingested of what it
+                // carries.
                 let mut newest =
                     collapse_shared_start_timestamps(self.fragments.iter().collect(), origin);
-                let window_start = epoch_millis(now - LIVE_FRAGMENT_WINDOW);
-                let fresh = newest
-                    .iter()
-                    .any(|fragment| epoch_millis(fragment.server_timestamp) >= window_start);
-                if !fresh {
-                    return Vec::new();
-                }
                 newest.sort_by_key(|fragment| epoch_millis(fragment.server_timestamp));
                 let skip = newest.len().saturating_sub(max_fragments);
-                newest
-                    .into_iter()
-                    .skip(skip)
-                    .map(|fragment| fragment.fragment_number.clone())
-                    .collect()
+                SessionPlaylist {
+                    fragment_numbers: newest
+                        .into_iter()
+                        .skip(skip)
+                        .map(|fragment| fragment.fragment_number.clone())
+                        .collect(),
+                    first_sequence: u64::try_from(skip).unwrap_or(u64::MAX),
+                }
             }
             // ON_DEMAND and LIVE_REPLAY serve the OLDEST fragments in the
             // requested range, up to the maximum.
             SessionWindow::Range {
                 start_millis,
                 end_millis,
-            } => collapse_shared_start_timestamps(
-                self.fragments_in_range(origin, start_millis, end_millis),
-                origin,
-            )
-            .into_iter()
-            .take(max_fragments)
-            .map(|fragment| fragment.fragment_number.clone())
-            .collect(),
+            } => SessionPlaylist {
+                fragment_numbers: collapse_shared_start_timestamps(
+                    self.fragments_in_range(origin, start_millis, end_millis),
+                    origin,
+                )
+                .into_iter()
+                .take(max_fragments)
+                .map(|fragment| fragment.fragment_number.clone())
+                .collect(),
+                // The oldest fragment of the range is the first segment of the
+                // playlist, so nothing has slid out in front of it.
+                first_sequence: 0,
+            },
         }
+    }
+
+    /// Whether this stream's head is fresh enough at `now` for a LIVE session
+    /// over it to exist: whether the archive holds a fragment ingested within
+    /// [`LIVE_FRAGMENT_WINDOW`].
+    ///
+    /// The condition `ResourceNotFoundException`'s own documentation puts on
+    /// MINTING such a session — "if a session with a PlaybackMode of LIVE is
+    /// requested for a stream that has no fragments within the last 30 seconds"
+    /// — read on the same collapsed set the playlist is selected from, so both
+    /// answers are about the fragments a session would carry.
+    #[must_use]
+    pub fn holds_live_fragments(&self, origin: TimestampOrigin, now: SystemTime) -> bool {
+        let window_start = epoch_millis(now - LIVE_FRAGMENT_WINDOW);
+        collapse_shared_start_timestamps(self.fragments.iter().collect(), origin)
+            .iter()
+            .any(|fragment| epoch_millis(fragment.server_timestamp) >= window_start)
+    }
+
+    /// The fragments a streaming session minted at `now` serves, or EMPTY when
+    /// such a session would serve nothing — which both streaming-session
+    /// operations report as `ResourceNotFoundException` with
+    /// [`NO_FRAGMENTS_MESSAGE`].
+    ///
+    /// The one existence rule both of them use: no fragment in the requested
+    /// range for a session over a range, and no fragment in the last 30 seconds
+    /// for a LIVE one.
+    #[must_use]
+    pub fn minted_session_fragment_numbers(
+        &self,
+        window: SessionWindow,
+        origin: TimestampOrigin,
+        max_fragments: usize,
+        now: SystemTime,
+    ) -> Vec<String> {
+        if matches!(window, SessionWindow::Live) && !self.holds_live_fragments(origin, now) {
+            return Vec::new();
+        }
+        self.session_playlist(window, origin, max_fragments)
+            .fragment_numbers
     }
 }
 
@@ -750,6 +796,24 @@ pub enum SessionWindow {
         /// The inclusive end of the requested range, in epoch milliseconds.
         end_millis: i64,
     },
+}
+
+/// What a streaming session's playlist or manifest lists at one instant.
+///
+/// A session whose playlist GROWS ([`StreamingSession::grows`]) is answered from
+/// a fresh one of these on every fetch, so the list a player re-reads is the
+/// archive as it stands then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPlaylist {
+    /// The fragment numbers the playlist lists, in playback order.
+    pub fragment_numbers: Vec<String>,
+    /// The media sequence number of the first of them: "the Media Sequence
+    /// Number of the first Media Segment that appears in a Playlist file"
+    /// (RFC 8216 §4.3.3.2). It rises as fragments slide out of the front of a
+    /// growing playlist, because "the Media Sequence Number MUST be incremented
+    /// by 1 for each Media Segment that is removed" (§6.2.2), so a player that
+    /// re-reads such a playlist is never handed one number for two fragments.
+    pub first_sequence: u64,
 }
 
 /// `PlaybackMode` LIVE: the mode that plays the stream head, the only one that
@@ -986,9 +1050,18 @@ pub struct StreamingSession {
     /// carries: `None` for an HLS session, whose input models no such
     /// parameter.
     pub display_fragment_number: Option<String>,
-    /// The playlist snapshot: the fragment numbers the session serves, capped
-    /// by the request's max-results.
+    /// The playlist snapshot taken when the session was minted: the fragment
+    /// numbers it selected then, capped by the request's max-results. What a
+    /// session whose playlist does NOT grow serves for its whole life
+    /// ([`Self::grows`]).
     pub fragment_numbers: Vec<String>,
+    /// Which fragments of the archive this session's request asked for, which
+    /// is the window a growing session re-selects over on every fetch.
+    pub window: SessionWindow,
+    /// How many fragments its playlist or manifest carries at most: the
+    /// request's `MaxMediaPlaylistFragmentResults` /
+    /// `MaxManifestFragmentResults`, or the mode's documented default.
+    pub max_fragments: usize,
     /// When the session was created.
     pub created_at: SystemTime,
     /// How long after `created_at` the session URL stays valid.
@@ -996,6 +1069,49 @@ pub struct StreamingSession {
 }
 
 impl StreamingSession {
+    /// Whether this session's playlist GROWS: whether the fragments it serves
+    /// are re-selected from the archive on every fetch, so fragments ingested
+    /// after it was minted appear in it.
+    ///
+    /// True for the two LIVE modes, whose playlist the model defines as a
+    /// growing one: of `LIVE`, "the HLS media playlist is continually updated
+    /// with the latest fragments as they become available. We recommend that
+    /// the media player retrieve a new playlist on a one-second interval"; and
+    /// of a `LIVE_REPLAY` range, "if the EndTimestamp is not set for
+    /// LIVE_REPLAY mode then the session will continue to include newly
+    /// ingested fragments until the session expires" — a range that carries an
+    /// end still grows, up to that end, which is what its own window bounds.
+    /// False for `ON_DEMAND`, which plays a closed stretch of the past: "the
+    /// HLS media playlist is typically static for sessions with a PlaybackType
+    /// of ON_DEMAND".
+    ///
+    /// The ONE predicate for that difference, so what a playlist or manifest
+    /// ADVERTISES — an `EXT-X-ENDLIST`-closed VOD playlist, a `static`
+    /// presentation — cannot drift from whether re-reading it can show anything
+    /// new.
+    #[must_use]
+    pub fn grows(&self) -> bool {
+        self.playback_mode != ON_DEMAND_PLAYBACK_MODE
+    }
+
+    /// What this session's playlist or manifest lists over `stream` right now.
+    ///
+    /// A growing session re-selects from the archive by its own recorded
+    /// selection — its window, its timestamp origin and its maximum fragment
+    /// count — so a fragment ingested since the mint is listed and one that
+    /// slid out of a LIVE window is not. A session that does not grow lists the
+    /// snapshot it was minted with.
+    #[must_use]
+    pub fn playlist(&self, stream: &ResolvedStream<'_>) -> SessionPlaylist {
+        if self.grows() {
+            return stream.session_playlist(self.window, self.origin, self.max_fragments);
+        }
+        SessionPlaylist {
+            fragment_numbers: self.fragment_numbers.clone(),
+            first_sequence: 0,
+        }
+    }
+
     /// When this session's URL stops being valid.
     #[must_use]
     pub fn expires_at(&self) -> SystemTime {

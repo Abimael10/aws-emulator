@@ -23,12 +23,15 @@
 //! * `DASHFragmentSelector` is required for ON_DEMAND and LIVE_REPLAY and must
 //!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
 //!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
-//! * The session is RECORDED in state with the manifest snapshot it serves — by
-//!   the same selection rule `GetHLSStreamingSessionURL` uses — so two calls
+//! * The session is RECORDED in state with the selection it plays and the
+//!   manifest it starts from — by the same selection rule
+//!   `GetHLSStreamingSessionURL` uses — so two calls
 //!   mint two distinct sessions, and the URL reported for it is served by this
 //!   emulator: the manifest, the initialization and the media fragments a player
 //!   fetches from it are answered by [`crate::service::playback_session`] from
-//!   that record. A session with no fragments to serve — none in
+//!   that record. A `LIVE` or `LIVE_REPLAY` session's manifest is re-selected
+//!   from the archive at every fetch, which is why it is typed `dynamic`. A
+//!   session with no fragments to serve — none in
 //!   the requested range for ON_DEMAND / LIVE_REPLAY, none in the last 30
 //!   seconds for LIVE — is `ResourceNotFoundException`, exactly as the error's
 //!   own documentation states.
@@ -392,8 +395,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // Resolve the stream and take the manifest snapshot while the borrow of
-        // the archive is still immutable, then record the session.
+        // Resolve the stream and select the manifest the session starts from
+        // while the borrow of the archive is still immutable, then record the
+        // session.
         let (stream_name, fragment_numbers) = {
             let stream = match state.resolve_stream(
                 &*self.engine,
@@ -418,11 +422,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
 
-            // The manifest snapshot, by the one selection rule both
-            // streaming-session operations share. A session with nothing to
-            // serve does not exist.
-            let selected =
-                stream.session_fragment_numbers(window, origin, max_fragments, SystemTime::now());
+            // The manifest the session starts from, by the one selection rule
+            // both streaming-session operations share. A session with nothing
+            // to serve does not exist.
+            let selected = stream.minted_session_fragment_numbers(
+                window,
+                origin,
+                max_fragments,
+                SystemTime::now(),
+            );
             if selected.is_empty() {
                 return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
             }
@@ -433,8 +441,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The session is a resource this call MINTS — the operation's own
         // documentation says "Kinesis Video Streams creates an MPEG-DASH
         // streaming session to be used for accessing content in a stream" — so
-        // it is recorded, with the manifest snapshot it serves, and a second
-        // call mints a distinct one.
+        // it is recorded, with the selection it plays and the manifest it
+        // starts from, and a second call mints a distinct one.
         let created_at = SystemTime::now();
         let token = state.mint_session_token(created_at);
         state.record_session(StreamingSession {
@@ -448,6 +456,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             display_fragment_timestamp,
             display_fragment_number: Some(display_fragment_number),
             fragment_numbers,
+            window,
+            max_fragments,
             created_at,
             expires_in_secs,
         });

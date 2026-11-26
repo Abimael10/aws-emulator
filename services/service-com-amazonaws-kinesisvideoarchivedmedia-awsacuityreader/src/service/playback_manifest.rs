@@ -4,8 +4,8 @@
 //! reads the session's media out of.
 //!
 //! Three documents, one per root a player can start from, all rendered from the
-//! session the minting call recorded and the fragments the archive still holds
-//! ([`crate::service::playback_session::PlaybackView`]):
+//! session the minting call recorded and the fragments that session lists right
+//! now ([`crate::service::playback_session::PlaybackView`]):
 //!
 //! * the HLS MASTER playlist, which "contains a URL for the GetHLSMediaPlaylist
 //!   action for each track, and additional metadata for the media player,
@@ -42,12 +42,6 @@ pub(crate) const DASH_MANIFEST_MEDIA_TYPE: &str = "application/dash+xml";
 /// FRAGMENTED_MP4 container format packages the media into MP4 fragments (fMP4 or
 /// CMAF)".
 pub(crate) const FRAGMENTED_MP4: &str = "FRAGMENTED_MP4";
-
-/// The `PlaybackMode` whose playlist is complete, so it is the only one closed with
-/// an end tag: "The HLS media playlist is typically static for sessions with a
-/// PlaybackType of ON_DEMAND. The HLS media playlist is continually updated with
-/// new fragments for sessions with a PlaybackType of LIVE."
-const ON_DEMAND: &str = "ON_DEMAND";
 
 /// The value of a session parameter that asks for something on every fragment.
 const ALWAYS: &str = "ALWAYS";
@@ -116,14 +110,17 @@ pub(crate) fn media_playlist(view: &PlaybackView<'_>) -> String {
         "#EXTM3U\n\
          #EXT-X-VERSION:{}\n\
          #EXT-X-TARGETDURATION:{}\n\
-         #EXT-X-MEDIA-SEQUENCE:0\n",
+         #EXT-X-MEDIA-SEQUENCE:{}\n",
         hls_version(view),
         target_duration_seconds(&view.fragments),
+        view.media_sequence,
     );
     // "The HLS media playlist is typically static for sessions with a PlaybackType
     // of ON_DEMAND": a complete playlist is the one a player may treat as a
-    // recording, and the only one closed with `EXT-X-ENDLIST` below.
-    if session.playback_mode == ON_DEMAND {
+    // recording, and the only one closed with `EXT-X-ENDLIST` below. The playlist
+    // of a session whose fragments are re-selected at every fetch is left open,
+    // because re-reading it can show fragments ingested since.
+    if !session.grows() {
         playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     }
     // The MP4 pair carries its initialization in a resource of its own, which is
@@ -156,7 +153,7 @@ pub(crate) fn media_playlist(view: &PlaybackView<'_>) -> String {
         ));
         previous = Some(fragment);
     }
-    if session.playback_mode == ON_DEMAND {
+    if !session.grows() {
         playlist.push_str("#EXT-X-ENDLIST\n");
     }
     playlist
@@ -225,10 +222,11 @@ pub(crate) fn dash_manifest(view: &PlaybackView<'_>) -> String {
          \x20 </Period>\n\
          </MPD>\n",
         // A complete presentation is static; one a player re-reads for new
-        // fragments is dynamic, which is what the two live modes serve.
-        presentation = match session.playback_mode == ON_DEMAND {
-            true => "static",
-            false => "dynamic",
+        // fragments is dynamic, which is what a session whose manifest grows
+        // serves.
+        presentation = match session.grows() {
+            true => "dynamic",
+            false => "static",
         },
         duration = iso_duration(total),
         codecs = avc_codec(view),

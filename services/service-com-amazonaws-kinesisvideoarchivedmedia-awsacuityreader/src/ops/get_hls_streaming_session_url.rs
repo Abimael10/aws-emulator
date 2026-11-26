@@ -23,11 +23,15 @@
 //! * `HLSFragmentSelector` is required for ON_DEMAND and LIVE_REPLAY and must
 //!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
 //!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
-//! * The session is RECORDED in state with the playlist snapshot it serves, so
-//!   two calls mint two distinct sessions, and the URL reported for it is served
-//!   by this emulator: the master playlist, the media playlist, the
+//! * The session is RECORDED in state with the selection it plays — its window,
+//!   its timestamp origin and its fragment cap — and the playlist it starts
+//!   from, so two calls mint two distinct sessions, and the URL reported for it
+//!   is served by this emulator: the master playlist, the media playlist, the
 //!   initialization and the media fragments a player fetches from it are answered
-//!   by [`crate::service::playback_session`] from that record. A session with no
+//!   by [`crate::service::playback_session`] from that record. A `LIVE` or
+//!   `LIVE_REPLAY` session's playlist is re-selected from the archive at every
+//!   fetch, because such a playlist "is continually updated with the latest
+//!   fragments as they become available". A session with no
 //!   fragments to serve
 //!   — none in the requested range for ON_DEMAND / LIVE_REPLAY, none in the
 //!   last 30 seconds for LIVE — is `ResourceNotFoundException`, exactly as the
@@ -408,8 +412,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // Resolve the stream and take the playlist snapshot while the borrow of
-        // the archive is still immutable, then record the session.
+        // Resolve the stream and select the playlist the session starts from
+        // while the borrow of the archive is still immutable, then record the
+        // session.
         let (stream_name, fragment_numbers) = {
             let stream = match state.resolve_stream(
                 &*self.engine,
@@ -432,11 +437,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            // The playlist snapshot, by the one selection rule both
-            // streaming-session operations share. A session with nothing to
-            // serve does not exist.
-            let selected =
-                stream.session_fragment_numbers(window, origin, max_fragments, SystemTime::now());
+            // The playlist the session starts from, by the one selection rule
+            // both streaming-session operations share. A session with nothing
+            // to serve does not exist.
+            let selected = stream.minted_session_fragment_numbers(
+                window,
+                origin,
+                max_fragments,
+                SystemTime::now(),
+            );
             if selected.is_empty() {
                 return Err(not_found(NO_FRAGMENTS_MESSAGE.to_string()));
             }
@@ -462,6 +471,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             display_fragment_timestamp,
             display_fragment_number: None,
             fragment_numbers,
+            window,
+            max_fragments,
             created_at,
             expires_in_secs,
         });

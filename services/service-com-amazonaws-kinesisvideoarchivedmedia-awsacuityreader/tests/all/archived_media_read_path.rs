@@ -1682,7 +1682,7 @@ type HlsDefaultsRow = (&'static str, &'static str, Option<u64>, &'static str, Ve
 #[tokio::test]
 async fn minting_a_session_bounds_the_session_store() {
     use archived_media::state::{
-        MAX_STREAMING_SESSIONS, SessionProtocol, StreamingSession,
+        SessionProtocol, SessionWindow, StreamingSession, MAX_STREAMING_SESSIONS,
     };
 
     let harness = seeded();
@@ -1709,6 +1709,11 @@ async fn minting_a_session_bounds_the_session_store() {
         display_fragment_timestamp: "NEVER".to_string(),
         display_fragment_number: None,
         fragment_numbers: Vec::new(),
+        window: SessionWindow::Range {
+            start_millis: T0_SECS * 1000,
+            end_millis: (T0_SECS + 1000) * 1000,
+        },
+        max_fragments: 1000,
         created_at,
         expires_in_secs,
     };
@@ -3138,6 +3143,306 @@ async fn a_dash_session_manifest_states_the_parameters_it_was_minted_with() {
     }
 }
 
+/// One row of the growing-playlist table: a session to mint, the stream a
+/// fragment is ingested into after it was minted, and whether that fragment
+/// belongs in the next document the session serves.
+struct GrowthRow {
+    case: &'static str,
+    /// The operation that mints the session, and the output member its URL is
+    /// reported in.
+    path: &'static str,
+    member: &'static str,
+    /// The minting request.
+    body: serde_json::Value,
+    /// The stream the session plays, which is also the one appended to.
+    stream: &'static str,
+    /// Whether this session's playlist GROWS: whether the fragment ingested
+    /// after the mint must appear in it, and whether the document must leave
+    /// itself open instead of declaring itself complete.
+    grows: bool,
+}
+
+/// The document that LISTS a session's fragments: the MEDIA playlist the HLS
+/// master playlist names, or the MPEG-DASH manifest, which is itself the root.
+async fn listing_document(harness: &Harness, case: &str, url: &str) -> String {
+    let root = harness.fetch(url).await;
+    assert_eq!(
+        root.status().as_u16(),
+        200,
+        "case {case}: the session's root resource must be served, got {} {:?}",
+        root.status(),
+        text_body(&root)
+    );
+    let document = text_body(&root);
+    if !url.contains("/hls/") {
+        return document;
+    }
+    let variant = referenced_resources(&document)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case}: the master playlist must name a media playlist"));
+    let media = harness.fetch(&sibling_url(url, &variant)).await;
+    assert_eq!(
+        media.status().as_u16(),
+        200,
+        "case {case}: the media playlist must be served, got {} {:?}",
+        media.status(),
+        text_body(&media)
+    );
+    text_body(&media)
+}
+
+/// The fragment numbers a playlist or a manifest lists, in the order it lists
+/// them: every resource it names for media addresses its fragment by number.
+fn listed_fragment_numbers(document: &str) -> Vec<String> {
+    referenced_resources(document)
+        .iter()
+        .filter_map(|resource| {
+            let field = format!("{}=", archived_media::state::FRAGMENT_NUMBER_FIELD);
+            resource
+                .split_once(&field)
+                .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_string())
+        })
+        .collect()
+}
+
+/// The `EXT-X-MEDIA-SEQUENCE` an HLS media playlist declares, or `None` for a
+/// document that is no HLS playlist.
+fn media_sequence(document: &str) -> Option<u64> {
+    document
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .find_map(|value| value.parse().ok())
+}
+
+/// Ingest ONE more fragment into `stream`'s archive, the way the ingest plane
+/// appends to it, and answer its fragment number.
+///
+/// A fragment of the live stream is stamped now, as one just ingested is; a
+/// fragment of the seeded archive continues that archive's own timestamps, so it
+/// falls inside the range the seeded sessions ask for.
+fn ingest_another_fragment(harness: &Harness, stream: &str) -> String {
+    let index = match stream == LIVE_STREAM {
+        true => LIVE_FRAGMENTS,
+        false => SEEDED_FRAGMENTS,
+    };
+    let (producer, server) = match stream == LIVE_STREAM {
+        true => {
+            let now = SystemTime::now();
+            (now, now)
+        }
+        false => (
+            from_epoch_millis(producer_secs(index) * 1000),
+            from_epoch_millis(server_secs(index) * 1000),
+        ),
+    };
+    let state = service_state(&*harness.engine).expect("the service store");
+    let mut state = state.lock();
+    assert!(
+        state.append_fragment(
+            stream,
+            StoredFragment::new(
+                fragment_number(index),
+                producer,
+                server,
+                1000,
+                media(index),
+            ),
+        ),
+        "case ingest into {stream}: the stream must exist"
+    );
+    fragment_number(index)
+}
+
+/// RULE: a streaming session whose playback mode defines a GROWING playlist —
+/// the two live modes, whose playlist "is continually updated with the latest
+/// fragments as they become available" and which "will continue to include newly
+/// ingested fragments until the session expires" — re-applies its own selection
+/// (window, timestamp source and fragment cap) to the archive at every fetch, so
+/// a fragment ingested after the session was minted is listed; a session whose
+/// mode plays a closed stretch of the past keeps listing what it was minted
+/// with, and is the only one that declares itself complete.
+///
+/// The rows differ along what the rule generalises over: each playback mode, a
+/// range with and without an `EndTimestamp`, and both playback protocols — the
+/// HLS media playlist and the MPEG-DASH manifest.
+#[tokio::test]
+async fn a_growing_session_playlist_lists_fragments_ingested_after_the_mint() {
+    let rows: Vec<GrowthRow> = vec![
+        GrowthRow {
+            case: "LIVE over HLS",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: serde_json::json!({ "StreamName": LIVE_STREAM, "PlaybackMode": "LIVE" }),
+            stream: LIVE_STREAM,
+            grows: true,
+        },
+        GrowthRow {
+            case: "LIVE over MPEG-DASH",
+            path: "/getDASHStreamingSessionURL",
+            member: "DASHStreamingSessionURL",
+            body: serde_json::json!({ "StreamName": LIVE_STREAM, "PlaybackMode": "LIVE" }),
+            stream: LIVE_STREAM,
+            grows: true,
+        },
+        GrowthRow {
+            case: "LIVE_REPLAY with no EndTimestamp over HLS",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "MaxMediaPlaylistFragmentResults": 10,
+                "HLSFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS },
+                },
+            }),
+            stream: STREAM,
+            grows: true,
+        },
+        GrowthRow {
+            case: "LIVE_REPLAY with no EndTimestamp over MPEG-DASH",
+            path: "/getDASHStreamingSessionURL",
+            member: "DASHStreamingSessionURL",
+            body: serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "MaxManifestFragmentResults": 10,
+                "DASHFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": { "StartTimestamp": T0_SECS },
+                },
+            }),
+            stream: STREAM,
+            grows: true,
+        },
+        GrowthRow {
+            case: "LIVE_REPLAY with an EndTimestamp the ingest falls inside, over HLS",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: serde_json::json!({
+                "StreamName": STREAM,
+                "PlaybackMode": "LIVE_REPLAY",
+                "MaxMediaPlaylistFragmentResults": 10,
+                "HLSFragmentSelector": {
+                    "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                    "TimestampRange": {
+                        "StartTimestamp": T0_SECS,
+                        "EndTimestamp": T0_SECS + 1000,
+                    },
+                },
+            }),
+            stream: STREAM,
+            grows: true,
+        },
+        GrowthRow {
+            case: "ON_DEMAND over HLS",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: on_demand_body(
+                &serde_json::json!({ "MaxMediaPlaylistFragmentResults": 10 }),
+                "HLSFragmentSelector",
+            ),
+            stream: STREAM,
+            grows: false,
+        },
+        GrowthRow {
+            case: "ON_DEMAND over MPEG-DASH",
+            path: "/getDASHStreamingSessionURL",
+            member: "DASHStreamingSessionURL",
+            body: on_demand_body(
+                &serde_json::json!({ "MaxManifestFragmentResults": 10 }),
+                "DASHFragmentSelector",
+            ),
+            stream: STREAM,
+            grows: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        // Each row ingests into its own emulator, so one row's appended
+        // fragment cannot be what the next row observes.
+        let harness = seeded();
+        let url = minted_session_url(&harness, case, row.path, row.member, &row.body).await;
+
+        let before = listing_document(&harness, case, &url).await;
+        let listed_before = listed_fragment_numbers(&before);
+        assert!(
+            !listed_before.is_empty(),
+            "case {case}: the minted session must list the fragments it serves, got {before:?}"
+        );
+
+        // A document that tells a player to come back for more must not also
+        // declare itself finished, and the complete one must.
+        let declares_complete = before.contains("#EXT-X-ENDLIST")
+            || before.contains("#EXT-X-PLAYLIST-TYPE:VOD")
+            || before.contains("type=\"static\"");
+        assert_eq!(
+            declares_complete, !row.grows,
+            "case {case}: a document declares itself complete exactly when re-reading it \
+             cannot show a new fragment, got {before:?}"
+        );
+
+        let ingested = ingest_another_fragment(&harness, row.stream);
+        let after = listing_document(&harness, case, &url).await;
+        let listed_after = listed_fragment_numbers(&after);
+        assert_eq!(
+            listed_after.contains(&ingested), row.grows,
+            "case {case}: expected the fragment {ingested} ingested after the mint to be \
+             listed: {}, got {listed_after:?}",
+            row.grows
+        );
+        if !row.grows {
+            assert_eq!(
+                listed_after, listed_before,
+                "case {case}: a session over a closed range keeps the playlist it was minted \
+                 with, got {listed_after:?}"
+            );
+            continue;
+        }
+
+        // The media of the newly listed fragment is served too, so what grew is
+        // the session rather than the text of its playlist.
+        let segment = referenced_resources(&after)
+            .into_iter()
+            .find(|resource| resource.contains(&ingested))
+            .unwrap_or_else(|| panic!("case {case}: the document must name the new fragment"));
+        let served = harness.fetch(&sibling_url(&url, &segment)).await;
+        assert_eq!(
+            served.status().as_u16(),
+            200,
+            "case {case}: the media of the newly listed fragment must be served, got {} {:?}",
+            served.status(),
+            text_body(&served)
+        );
+        assert!(
+            !served.body().is_empty(),
+            "case {case}: the media of the newly listed fragment must carry bytes"
+        );
+
+        // And a playlist that slides forward renumbers: the media sequence of
+        // its first segment rises by however many fragments left the front, so
+        // no number names two fragments.
+        if let (Some(sequence_before), Some(sequence_after)) =
+            (media_sequence(&before), media_sequence(&after))
+        {
+            let slid = listed_before
+                .iter()
+                .filter(|number| !listed_after.contains(number))
+                .count();
+            assert_eq!(
+                sequence_after.saturating_sub(sequence_before),
+                slid as u64,
+                "case {case}: {slid} fragments left the front of {listed_before:?} -> \
+                 {listed_after:?}, but the media sequence went {sequence_before} -> \
+                 {sequence_after}"
+            );
+        }
+    }
+}
+
 /// RULE: a session's media fragment carries the frames the archive holds for that
 /// fragment and nothing else, in the container the session's `ContainerFormat`
 /// asks for; its initialization carries the track's own declaration and no media.
@@ -3356,7 +3661,9 @@ async fn a_playback_address_serves_nothing_it_cannot_resolve() {
         .map(|(_, token)| token.to_string())
         .expect("the session URL carries a token");
     {
-        use archived_media::state::{SessionProtocol, StreamingSession, TimestampOrigin};
+        use archived_media::state::{
+            SessionProtocol, SessionWindow, StreamingSession, TimestampOrigin,
+        };
 
         let state = service_state(&*harness.engine).expect("the service store");
         let mut state = state.lock();
@@ -3372,6 +3679,11 @@ async fn a_playback_address_serves_nothing_it_cannot_resolve() {
             display_fragment_timestamp: "NEVER".to_string(),
             display_fragment_number: None,
             fragment_numbers: vec![fragment_number(0)],
+            window: SessionWindow::Range {
+                start_millis: T0_SECS * 1000,
+                end_millis: (T0_SECS + 1000) * 1000,
+            },
+            max_fragments: 1000,
             created_at,
             expires_in_secs: 300,
         });

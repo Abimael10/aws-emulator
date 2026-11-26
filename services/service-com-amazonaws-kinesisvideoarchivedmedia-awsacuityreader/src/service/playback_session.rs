@@ -20,8 +20,8 @@
 //! # What it serves is the session that was minted
 //!
 //! Every answer is computed from the [`crate::state::StreamingSession`] the
-//! minting call recorded and from the archive the stream still holds, so each
-//! parameter of the request that minted it is observable on the wire:
+//! minting call recorded and from the archive the stream holds at that instant,
+//! so each parameter of the request that minted it is observable on the wire:
 //!
 //! * `ContainerFormat` decides whether the media playlist names the MP4 pair or
 //!   the TS fragment ("If the ContainerFormat is MPEG_TS, this API is used instead
@@ -30,11 +30,19 @@
 //!   markers, `DisplayFragmentTimestamp` whether it carries each fragment's start
 //!   timestamp, and for MPEG-DASH those two decide the `kvs:ts` and `kvs:fn`
 //!   attributes of a manifest's `S` elements;
-//! * the playlist snapshot — `MaxMediaPlaylistFragmentResults` /
-//!   `MaxManifestFragmentResults` fragments of the mode's own window — is the set
-//!   of segments the playlist lists and the only media the session serves, because
-//!   "the media that is made available through the playlist consists only of the
-//!   requested stream, time range, and format".
+//! * the session's selection — its window, its timestamp origin and its
+//!   `MaxMediaPlaylistFragmentResults` / `MaxManifestFragmentResults` cap — is
+//!   what decides the segments the playlist lists and the only media the session
+//!   serves, because "the media that is made available through the playlist
+//!   consists only of the requested stream, time range, and format".
+//!
+//! A session whose playlist GROWS ([`crate::state::StreamingSession::grows`]) has
+//! that selection applied to the archive AGAIN on every fetch, so a player that
+//! re-reads the playlist of a LIVE or LIVE_REPLAY session is served the fragments
+//! ingested since — which is what such a playlist, left open and typed
+//! `dynamic` here, tells it to poll for. A session over a closed stretch of the
+//! past serves the playlist it was minted with, less whatever retention has
+//! dropped from the archive since.
 //!
 //! # Who may reach it
 //!
@@ -58,7 +66,7 @@
 //! # What one request costs
 //!
 //! Bounded by the session and the archive, not by the request: a playlist lists
-//! the fragments the session recorded (at most the `MaxMediaPlaylistFragmentResults`
+//! the fragments the session selects (at most the `MaxMediaPlaylistFragmentResults`
 //! / `MaxManifestFragmentResults` the model caps at 5,000, and at most the
 //! [`crate::state::MAX_ARCHIVED_FRAGMENTS_PER_STREAM`] the archive holds), and a
 //! media answer reads ONE archived fragment — whose bytes the archive's own
@@ -176,14 +184,17 @@ pub(crate) struct PlayedFragment {
 }
 
 /// What one session serves, as the playlists and the manifest report it: the
-/// session as it was minted, the fragments of its snapshot the archive still
-/// holds, and the video track those fragments declare.
+/// session as it was minted, the fragments it lists right now, and the video
+/// track those fragments declare.
 #[derive(Debug)]
 pub(crate) struct PlaybackView<'a> {
     /// The session the URL's token names.
     pub(crate) session: &'a StreamingSession,
-    /// Its playlist, in the order the session recorded it.
+    /// Its playlist, in the order the session's own selection puts it in.
     pub(crate) fragments: Vec<PlayedFragment>,
+    /// The media sequence number of the first of them, which rises as fragments
+    /// slide out of the front of a growing playlist.
+    pub(crate) media_sequence: u64,
     /// The video track the session's media declares.
     pub(crate) track: VideoTrack,
     /// That track's `TrackNumber`, which a playlist addresses a per-track
@@ -198,8 +209,10 @@ pub(crate) struct PlaybackView<'a> {
 struct Resolved {
     /// The session the URL's token names, as it was minted.
     session: StreamingSession,
-    /// Its playlist, as the archive still holds it.
+    /// Its playlist, as the archive stands now.
     fragments: Vec<PlayedFragment>,
+    /// The media sequence number of its first fragment.
+    media_sequence: u64,
     /// The archived container the session's video track is read from: the first
     /// fragment of its playlist.
     first_media: Vec<u8>,
@@ -213,9 +226,10 @@ struct Resolved {
 ///
 /// Everything this reads is stored state: the session record, the stream the
 /// control plane holds for it right now, and the fragments of the session's
-/// recorded playlist the archive still holds — a fragment retention has since
-/// dropped is no longer served, which is what a real archive's own retention
-/// produces mid-session. Nothing is written.
+/// playlist the archive holds at this instant — which, for a session whose
+/// playlist grows, is re-selected here rather than read from the mint
+/// ([`StreamingSession::playlist`]), so a fragment ingested since is served and
+/// one retention has dropped is not. Nothing is written.
 fn resolved_session<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &crate::state::ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState,
@@ -242,7 +256,8 @@ fn resolved_session<Eng: Send + Sync + 'static>(
         .resolve_stream(engine, None, Some(&session.stream_name), None)
         .ok()?;
 
-    let played: Vec<(&crate::state::StoredFragment, PlayedFragment)> = session
+    let playlist = session.playlist(&stream);
+    let played: Vec<(&crate::state::StoredFragment, PlayedFragment)> = playlist
         .fragment_numbers
         .iter()
         .filter_map(|number| stream.fragment(number))
@@ -262,6 +277,7 @@ fn resolved_session<Eng: Send + Sync + 'static>(
 
     Some(Resolved {
         session: session.clone(),
+        media_sequence: playlist.first_sequence,
         first_media: first.media.clone(),
         asked: played
             .iter()
@@ -347,6 +363,7 @@ pub fn serve_playback_path<Eng: Send + Sync + 'static>(
     let view = PlaybackView {
         session: &resolved.session,
         fragments: resolved.fragments,
+        media_sequence: resolved.media_sequence,
         track: track.track,
         track_number: track.number,
     };
