@@ -199,12 +199,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first, which is where the boundary would have judged them — before any state is
         // read, so a request the boundary would have refused still reaches no snapshot.
         //
-        // `ChecksumAlgorithm` is checked HERE rather than at the boundary (the member
-        // carries `skip_validation` on `CompleteSnapshotInput`): the service answers an
-        // algorithm it does not support with its own modelled `ValidationException`,
-        // which carries the `Reason` a client branches on and a message naming the
-        // rejected algorithm and the supported set. The boundary's refusal would carry
-        // neither.
+        // Their FORM first: `ChangedBlocksCount`, `Checksum`, `ChecksumAggregationMethod`
+        // and `ChecksumAlgorithm` all carry `skip_validation`, so the constraints are the
+        // MODEL's and so is the report — the same walk and the same sentence the boundary
+        // would have produced — but it travels in the modelled error, which carries the
+        // `Reason` a client branches on.
+        if let Some(message) = header_constraint_refusal(&input) {
+            return Err(validation("INVALID_PARAMETER_VALUE", message));
+        }
+        // `ChecksumAlgorithm` is then judged on what the value MEANS, which is this
+        // service's own question rather than the boundary's: the service answers an
+        // algorithm it does not support with its own modelled `ValidationException`, which
+        // carries the `Reason` a client branches on and a message naming the rejected
+        // algorithm and the supported set. The boundary's refusal would carry neither.
         if let Some(algorithm) = input.checksum_algorithm.as_deref() {
             if algorithm != CHECKSUM_ALGORITHM_SHA256 {
                 return Err(validation(
@@ -212,15 +219,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     unsupported_checksum_algorithm_message(algorithm),
                 ));
             }
-        }
-        // The operation's other HEADER-bound members, for the same reason and in the same
-        // place: `ChangedBlocksCount`, `Checksum` and `ChecksumAggregationMethod` all
-        // carry `skip_validation`, so the constraints are the MODEL's and so is the
-        // report — the same walk and the same sentence the boundary would have produced —
-        // but it travels in the modelled error, which carries the `Reason` a client
-        // branches on.
-        if let Some(message) = header_constraint_refusal(&input) {
-            return Err(validation("INVALID_PARAMETER_VALUE", message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
@@ -312,7 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `smithy_query(query="shape",shape="com.amazonaws.ebs#CompleteSnapshotRequest")`
 /// reports them: `Checksum`'s `@length` 0..64 and `@pattern`,
 /// `ChecksumAggregationMethod`'s `@length` 0..32, `@pattern` and the value set its enum
-/// declares, and `ChangedBlocksCount`'s `@range` min 0.
+/// declares, and `ChangedBlocksCount`'s `@range` min 0. The fourth such member,
+/// `ChecksumAlgorithm`, is declared once for both operations that carry it
+/// ([`crate::state::checksum_algorithm`]).
 ///
 /// Restated here because `skip_validation` takes them off the generated member schemas,
 /// so there is none left at the boundary to read them from.
@@ -403,6 +403,12 @@ fn header_constraint_refusal(input: &CompleteSnapshotInput) -> Option<String> {
     let _ = validator.write_integer(&CHANGED_BLOCKS_COUNT_SCHEMA, input.changed_blocks_count);
     if let Some(checksum) = input.checksum.as_deref() {
         let _ = validator.write_string(&CHECKSUM_SCHEMA, checksum);
+    }
+    if let Some(algorithm) = input.checksum_algorithm.as_deref() {
+        let _ = validator.write_string(
+            &crate::state::checksum_algorithm::CHECKSUM_ALGORITHM_SCHEMA,
+            algorithm,
+        );
     }
     if let Some(method) = input.checksum_aggregation_method.as_deref() {
         let _ = validator.write_string(&CHECKSUM_AGGREGATION_METHOD_SCHEMA, method);

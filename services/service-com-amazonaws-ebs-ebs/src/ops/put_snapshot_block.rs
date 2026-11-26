@@ -222,19 +222,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reaches here: the guard in `crate::service` refuses it, for the reason stated
         // there.
         //
-        // `ChecksumAlgorithm`: an algorithm the service does not support is named,
-        // alongside the set it does support.
+        // The FORM of every one of them first, `ChecksumAlgorithm` included: the
+        // constraints are the MODEL's, and so is the report — the same walk and the same
+        // sentence the boundary would have produced — but it travels in the modelled error
+        // rather than in the synthetic envelope. A value outside the form its own member
+        // declares is refused for that, before the service judges what the value MEANS,
+        // which is the order the boundary would have judged them in.
+        if let Some(message) = header_constraint_refusal(&input) {
+            return Err(validation("INVALID_PARAMETER_VALUE", message));
+        }
+        // `ChecksumAlgorithm`, once it carries a value its member admits at all: an
+        // algorithm the service does not support is named, alongside the set it does
+        // support.
         if input.checksum_algorithm != CHECKSUM_ALGORITHM_SHA256 {
             return Err(validation(
                 "INVALID_PARAMETER_VALUE",
                 unsupported_checksum_algorithm_message(&input.checksum_algorithm),
             ));
-        }
-        // `Checksum` and `Progress`: the constraints are the MODEL's, and so is the
-        // report — the same walk and the same sentence the boundary would have produced —
-        // but it travels in the modelled error rather than in the synthetic envelope.
-        if let Some(message) = header_constraint_refusal(&input.checksum, input.progress) {
-            return Err(validation("INVALID_PARAMETER_VALUE", message));
         }
 
         // The payload's INTEGRITY binding, judged before anything else about the payload:
@@ -400,7 +404,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The modelled constraint traits of the header members this operation judges itself:
 /// `Checksum`'s `@length` 0..64 and `@pattern` and `Progress`'s `@range` 0..100, as
 /// `smithy_query(query="shape",shape="com.amazonaws.ebs#PutSnapshotBlockRequest")`
-/// reports them.
+/// reports them. The third such member, `ChecksumAlgorithm`, is declared once for both
+/// operations that carry it ([`crate::state::checksum_algorithm`]).
 ///
 /// Restated here because `skip_validation` takes them off the generated member schemas,
 /// so there is none left at the boundary to read them from.
@@ -455,15 +460,20 @@ static PROGRESS_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 /// The sentence is the framework's `ValidationException` report — `N validation error(s)
 /// detected: Value '<v>' at '<member>' failed to satisfy constraint: <requirement>` — so
 /// a member the service judges is worded exactly as one the boundary judges; only the
-/// envelope it travels in differs. Both members are judged on the values the request
-/// carried, so an absent `Progress` (optional) contributes nothing.
-fn header_constraint_refusal(checksum: &str, progress: Option<i32>) -> Option<String> {
+/// envelope it travels in differs. Every member is judged on the value the request
+/// carried, so an absent `Progress` (optional) contributes nothing, and a request breaking
+/// more than one constraint is reported in the ONE envelope the boundary would have used.
+fn header_constraint_refusal(input: &PutSnapshotBlockInput) -> Option<String> {
     let mut validator = ValidatingSerializer::new();
     // Infallible: the validator accumulates violations instead of failing.
-    let _ = validator.write_string(&CHECKSUM_SCHEMA, checksum);
-    if let Some(progress) = progress {
+    let _ = validator.write_string(&CHECKSUM_SCHEMA, &input.checksum);
+    if let Some(progress) = input.progress {
         let _ = validator.write_integer(&PROGRESS_SCHEMA, progress);
     }
+    let _ = validator.write_string(
+        &crate::state::checksum_algorithm::CHECKSUM_ALGORITHM_SCHEMA,
+        &input.checksum_algorithm,
+    );
     ::aws_smithy_schema_server::envelope(&validator.into_violations())
 }
 

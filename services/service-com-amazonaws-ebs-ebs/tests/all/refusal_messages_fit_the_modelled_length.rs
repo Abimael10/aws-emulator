@@ -7,11 +7,10 @@
 //! targets `ErrorMessage`, which the model constrains to `@length` 0..256
 //! (`smithy_query(query="shape",shape="com.amazonaws.ebs#ErrorMessage")`). So a refusal
 //! that interpolates a request value — a `BlockToken` whose own `@length` maximum is
-//! itself 256, a header-bound `ChecksumAlgorithm` whose constraints the operation takes
-//! off the request boundary and so has no enforced length at all when the refusal names it
-//! — has to be rendered so the sentence stays inside that maximum: the fixed text whole,
-//! the echo elided when it would not fit, with the value's full length reported so the
-//! caller still learns what was refused.
+//! itself 256, a header-bound `ChecksumAlgorithm` whose value the service names back
+//! alongside the set it supports — has to be rendered so the sentence stays inside that
+//! maximum: the fixed text whole, the echo elided when it would not fit, with the value's
+//! full length reported so the caller still learns what was refused.
 //!
 //! Rows differ along what the rule generalises over: which operation words the refusal,
 //! which member the echoed value arrived in and where it travelled (a query parameter, a
@@ -162,21 +161,21 @@ async fn the_invalid_block_token_refusal_fits_the_modelled_message_length() {
 }
 
 /// RULE, on the other member and the other two operations: the refusal naming an
-/// unsupported `ChecksumAlgorithm` fits `ErrorMessage`'s `@length` maximum too. This value
-/// travels in a HEADER whose modelled constraints the operation takes off the request
-/// boundary, so nothing bounds its length before the refusal words it — the fit is the
-/// message's own, not a side effect of the member's constraints.
+/// unsupported `ChecksumAlgorithm` fits `ErrorMessage`'s `@length` maximum too.
+///
+/// This sentence is reached only by a value the member's own modelled `@length` 0..32 and
+/// `@pattern` admit — a value outside them is refused by those constraints instead, in the
+/// framework's constraint report (pinned by
+/// `crate::judged_header_members_keep_their_modelled_form`) — so the rows run from the
+/// shortest name up to that maximum, and the fit is asserted on each.
 #[tokio::test]
 async fn the_unsupported_algorithm_refusal_fits_the_modelled_message_length() {
     let router = router();
 
-    let budget = ERROR_MESSAGE_MAX_LENGTH
-        - ALGORITHM_PREFIX.chars().count()
-        - ALGORITHM_SUFFIX.chars().count();
-    // Rows bracket the budget the same way, and go well past it: the member's own modelled
-    // `@length` maximum is 32, but it is not enforced before this refusal, so a header of
-    // any length reaches it.
-    let lengths = [3_usize, 32, budget, budget + 1, 1_024];
+    // The member's modelled `@length` maximum
+    // (`smithy_query(query="shape",shape="com.amazonaws.ebs#ChecksumAlgorithm")`: 0..32),
+    // which the rows bracket from below and reach exactly.
+    let lengths = [1_usize, 3, 31, 32];
 
     for length in lengths {
         // Inside the member's modelled `@pattern` `^[A-Za-z0-9]+$` and never `SHA256`, so
@@ -242,5 +241,48 @@ async fn the_unsupported_algorithm_refusal_fits_the_modelled_message_length() {
             accepted.status,
             String::from_utf8_lossy(&accepted.body)
         );
+    }
+}
+
+/// RULE, asserted on the rendering itself rather than through one member's wire path: the
+/// sentence is held to `ErrorMessage`'s `@length` maximum for a value of ANY length — the
+/// fixed text whole, the echo elided with the value's full length named.
+///
+/// Pinned directly because the member whose refusal words this sentence now has its
+/// modelled `@length` 0..32 judged before the sentence is reached, so no request can carry
+/// a value past the budget TO it; the rendering is shared by every refusal this service
+/// words around a request value, and a value past the budget is exactly what it exists to
+/// hold. Rows bracket the budget the echo has: one inside, exactly at it, one past it, and
+/// far past it.
+#[test]
+fn the_shared_refusal_rendering_holds_an_over_long_value_to_the_modelled_message_length() {
+    let budget = ERROR_MESSAGE_MAX_LENGTH
+        - ALGORITHM_PREFIX.chars().count()
+        - ALGORITHM_SUFFIX.chars().count();
+
+    for length in [budget - 1, budget, budget + 1, 1_024] {
+        let value = "M".repeat(length);
+        let message =
+            service_com_amazonaws_ebs_ebs::state::unsupported_checksum_algorithm_message(&value);
+        let case = format!("a value of {length} characters");
+        assert!(
+            message.chars().count() <= ERROR_MESSAGE_MAX_LENGTH,
+            "case {case:?}: expected a message of at most {ERROR_MESSAGE_MAX_LENGTH} \
+             characters, got {} characters: {message:?}",
+            message.chars().count()
+        );
+        assert_eq!(
+            message,
+            expected_message(ALGORITHM_PREFIX, &value, ALGORITHM_SUFFIX),
+            "case {case:?}: expected the fixed text whole around the echo the budget leaves, \
+             got {message:?}"
+        );
+        if length > budget {
+            assert!(
+                message.contains(&format!("... [{length} bytes]")),
+                "case {case:?}: an elided echo must name the value's full length, got \
+                 {message:?}"
+            );
+        }
     }
 }

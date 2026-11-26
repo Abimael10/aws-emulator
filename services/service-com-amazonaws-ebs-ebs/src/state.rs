@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+pub mod checksum_algorithm;
 pub mod kms_reference;
 
 /// The block size, in bytes, of every snapshot this service creates.
@@ -901,9 +902,12 @@ pub fn checksum_mismatch_message(computed: &str, supplied: &str) -> String {
 /// is [`CHECKSUM_ALGORITHM_SHA256`] — the only value the modelled `ChecksumAlgorithm`
 /// enum declares.
 ///
-/// The algorithm is echoed through [`fitted_message`]: the member is header-bound and its
-/// modelled constraints are taken off the request boundary, so the value named here has no
-/// enforced length of its own at the point this refusal words it.
+/// The algorithm is echoed through [`fitted_message`]: the sentence is worded around a
+/// value the request carried, and this service renders every such sentence through the one
+/// fit, whichever member the value arrived in. The member's own modelled `@length` is
+/// judged before this sentence words it
+/// ([`checksum_algorithm::CHECKSUM_ALGORITHM_SCHEMA`]), so a value that reaches here is
+/// one the model admits and the fit has nothing to elide.
 pub fn unsupported_checksum_algorithm_message(algorithm: &str) -> String {
     let tail = format!("', supported algorithms are {CHECKSUM_ALGORITHM_SHA256}");
     fitted_message(&[

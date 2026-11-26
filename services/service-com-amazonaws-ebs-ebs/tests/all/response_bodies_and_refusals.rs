@@ -48,11 +48,14 @@ const BLOCK_TOKEN_PATTERN: &str = "^[A-Za-z0-9+/=_-]+$";
 /// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ValidationExceptionReason")`).
 /// Distinct from `INVALID_BLOCK_TOKEN`, which answers a WELL-FORMED token that names no
 /// block.
-const CONSTRAINT_REFUSAL_REASON: &str = "INVALID_PARAMETER_VALUE";
+///
+/// `pub(crate)` with the clause and envelope helpers below: every suite asserting a
+/// constraint report of this service states it the same way or asserts nothing.
+pub(crate) const CONSTRAINT_REFUSAL_REASON: &str = "INVALID_PARAMETER_VALUE";
 
 /// The only checksum algorithm the modelled `ChecksumAlgorithm` enum declares
 /// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ChecksumAlgorithm")`).
-const SUPPORTED_ALGORITHM: &str = "SHA256";
+pub(crate) const SUPPORTED_ALGORITHM: &str = "SHA256";
 
 /// The widths of the hex suffix of a snapshot id the service accepts, mirroring
 /// `crate::state::SNAPSHOT_ID_HEX_WIDTHS`.
@@ -972,7 +975,7 @@ async fn a_snapshot_id_of_the_wrong_shape_is_a_malformed_parameter() {
 /// `PutSnapshotBlock` both bind to `x-amz-Checksum`
 /// (`smithy_query(query="shape",shape="com.amazonaws.ebs#Checksum")`: `@length` 0..64 and
 /// this `@pattern`).
-const CHECKSUM_PATTERN: &str = "^[A-Za-z0-9+/=]+$";
+pub(crate) const CHECKSUM_PATTERN: &str = "^[A-Za-z0-9+/=]+$";
 const CHECKSUM_MAX_LENGTH: usize = 64;
 
 /// The modelled form of `com.amazonaws.ebs#ChecksumAggregationMethod`
@@ -984,18 +987,18 @@ const AGGREGATION_METHODS: &[&str] = &["LINEAR"];
 /// The modelled minimum of `com.amazonaws.ebs#ChangedBlocksCount`
 /// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ChangedBlocksCount")`: `@range`
 /// min 0, with no maximum).
-const CHANGED_BLOCKS_COUNT_MIN: i64 = 0;
+pub(crate) const CHANGED_BLOCKS_COUNT_MIN: i64 = 0;
 
 /// One clause of a constraint report: the value echoed, the member as the report names it
 /// (its Smithy name lower-camelled) and the requirement the value failed.
-fn clause(value: &str, member_path: &str, requirement: &str) -> String {
+pub(crate) fn clause(value: &str, member_path: &str, requirement: &str) -> String {
     format!("Value '{value}' at '{member_path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The envelope the constraint report travels in, which is the one the request boundary
 /// renders for the members it judges itself: one clause per rejected value, in the order
 /// the input shape declares its members.
-fn constraint_report(clauses: &[String]) -> String {
+pub(crate) fn constraint_report(clauses: &[String]) -> String {
     match clauses.len() {
         1 => format!("1 validation error detected: {}", clauses[0]),
         n => format!(
@@ -1006,12 +1009,12 @@ fn constraint_report(clauses: &[String]) -> String {
 }
 
 /// The requirement a value outside a member's `@pattern` failed.
-fn pattern_requirement(pattern: &str) -> String {
+pub(crate) fn pattern_requirement(pattern: &str) -> String {
     format!("Member must satisfy regular expression pattern: {pattern}")
 }
 
 /// The requirement a value longer than a member's `@length` maximum failed.
-fn max_length_requirement(max: usize) -> String {
+pub(crate) fn max_length_requirement(max: usize) -> String {
     format!("Member must have length less than or equal to {max}")
 }
 
@@ -1021,7 +1024,7 @@ fn enum_requirement(values: &[&str]) -> String {
 }
 
 /// The requirement a number below a member's `@range` minimum failed.
-fn min_value_requirement(min: i64) -> String {
+pub(crate) fn min_value_requirement(min: i64) -> String {
     format!("Member must have value greater than or equal to {min}")
 }
 
@@ -1033,10 +1036,10 @@ fn max_value_requirement(max: i64) -> String {
 /// The ceiling a constraint report puts on the rejected value it echoes: a caller controls
 /// that value's length, so a long one arrives as a 256-character prefix followed by its
 /// byte count. Asserted here because a row below rejects a value past the ceiling.
-const MAX_ECHOED_VALUE: usize = 256;
+pub(crate) const MAX_ECHOED_VALUE: usize = 256;
 
 /// The rejected value as a clause echoes it.
-fn echoed(value: &str) -> String {
+pub(crate) fn echoed(value: &str) -> String {
     if value.len() <= MAX_ECHOED_VALUE {
         return value.to_string();
     }
