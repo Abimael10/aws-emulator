@@ -67,7 +67,7 @@ fn services() -> Vec<Service> {
         },
         Service {
             code: "mgn",
-            name: "AWS Application Migration Service",
+            name: "Application Migration",
             withdrawn: &["SourceServersPerAccount"],
             published: &[],
         },

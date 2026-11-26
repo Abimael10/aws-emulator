@@ -3612,8 +3612,11 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         ),
         service("imagebuilder", "EC2 Image Builder", imagebuilder_quotas()),
         service(
+            // The `iot` code's own name, as [`SEED_SERVICE_CATALOG`] registers it (so
+            // this string is only the fallback for a code that table does not carry);
+            // the Core plane's name belongs to the `iotcore` code.
             "iot",
-            "AWS IoT Core",
+            "AWS IoT",
             vec![quota("Rules per account", 1000.0)],
         ),
         service(
@@ -4348,26 +4351,41 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("greengrass", "AWS IoT Greengrass"),
     ("groundstation", "AWS Ground Station"),
     ("guardduty", "Amazon GuardDuty"),
+    // The health plane of the Amazon Connect family, registered under the product
+    // family's name rather than under anything the code spells out.
+    ("health-agent", "Amazon Connect Health"),
     ("healthlake", "AWS HealthLake"),
     ("iam", "AWS Identity and Access Management (IAM)"),
     ("imagebuilder", "EC2 Image Builder"),
     ("inspector", "Amazon Inspector Classic"),
     ("inspector2", "Amazon Inspector"),
-    ("internetmonitor", "Amazon CloudWatch Internet Monitor"),
-    ("iot", "AWS IoT Core"),
+    ("interconnect", "AWS Interconnect"),
+    // The inventory registers the Internet Monitor plane WITHOUT the `Amazon` prefix
+    // the rest of the CloudWatch family carries.
+    ("internetmonitor", "CloudWatch Internet Monitor"),
+    // Two codes of the IoT family, each under its OWN name: the product's own name on
+    // `iot`, and the Core plane's name on the `iotcore` code — the first is not the
+    // second's name.
+    ("iot", "AWS IoT"),
     ("iotanalytics", "AWS IoT Analytics"),
+    ("iotcore", "AWS IoT Core"),
     ("iotdeviceadvisor", "AWS IoT Core Device Advisor"),
     ("iotevents", "AWS IoT Events"),
     ("iotsitewise", "AWS IoT SiteWise"),
     ("iotthingsgraph", "AWS IoT Things Graph"),
     ("iottwinmaker", "AWS IoT TwinMaker"),
+    ("iotwireless", "AWS IoT Wireless"),
     ("ivs", "Amazon Interactive Video Service"),
-    ("ivschat", "Amazon IVS Chat"),
+    // The chat plane's name spells the product out exactly as its sibling `ivs` does,
+    // rather than abbreviating it.
+    ("ivschat", "Amazon Interactive Video Service Chat"),
     // The label the service's OWN published catalog carries on every row it serves
     // for this code, which is the one name this emulator reports for it — here and in
     // every quota row ([`seed_services`] is the single source both read).
     ("kafka", "Amazon Managed Streaming for Kafka (MSK)"),
-    ("kafkaconnect", "Amazon MSK Connect"),
+    // The connect plane is registered with the product spelled out and no prefix at
+    // all, which is not how its sibling `kafka` is registered.
+    ("kafkaconnect", "Managed Streaming for Kafka Connect"),
     ("kendra", "Amazon Kendra"),
     ("kendra-ranking", "Amazon Kendra Intelligent Ranking"),
     ("kinesis", "Amazon Kinesis Data Streams"),
@@ -4402,10 +4420,13 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("mediapackagev2", "AWS Elemental MediaPackage v2"),
     ("mediastore", "AWS Elemental MediaStore"),
     ("mediatailor", "AWS Elemental MediaTailor"),
-    ("medical-imaging", "AWS HealthImaging"),
+    // Registered with the product's two words spaced apart.
+    ("medical-imaging", "AWS Health Imaging"),
     ("memorydb", "Amazon MemoryDB"),
-    ("mgn", "AWS Application Migration Service"),
-    ("migrationhuborchestrator", "AWS Migration Hub Orchestrator"),
+    // Two migration planes the inventory registers under the bare product name: no
+    // `AWS` prefix, and on `mgn` no `Service` suffix either.
+    ("mgn", "Application Migration"),
+    ("migrationhuborchestrator", "Migration Hub Orchestrator"),
     (
         "migrationhubstrategy",
         "AWS Migration Hub Strategy Recommendations",
@@ -4579,8 +4600,6 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     // code is reported as the name rather than inventing one: `ServiceCode` — the
     // member every other operation keys on, and the one the model constrains — stays
     // exactly AWS's, and nothing downstream reads `ServiceName`.
-    ("health-agent", "health-agent"),
-    ("interconnect", "interconnect"),
     ("networkinsights", "networkinsights"),
     ("s3files", "s3files"),
     ("securityagent", "securityagent"),

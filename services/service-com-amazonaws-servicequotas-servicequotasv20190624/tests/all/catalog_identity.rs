@@ -1298,8 +1298,6 @@ const CITED_SERVICE_QUOTA_CODES: &[(&str, &str)] =
 /// name it can cite, and which therefore report their code (see the tail of
 /// `src/state.rs::SEED_SERVICE_CATALOG`). Every OTHER code reports a display name.
 const CODES_WITHOUT_A_CITED_DISPLAY_NAME: &[&str] = &[
-    "health-agent",
-    "interconnect",
     "networkinsights",
     "s3files",
     "securityagent",

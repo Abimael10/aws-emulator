@@ -9,7 +9,7 @@ Issue-Shape-Id: com.amazonaws.servicequotas#ServiceQuotasV20190624
 Issue-Key: service-quotas|ListServices|2xx->2xx|$.Services[*]
 Issue-Commit: c5e269aa69c070928f6722aebd119bfd6f867924
 
-# ListServices catalog diverges from the AWS service list: wrong membership and placeholder ServiceName
+# ListServices catalog diverges from the AWS service list: wrong membership and placeholder ServiceName (PARTIAL CLOSE: every registered `(ServiceCode, ServiceName)` pair this report QUOTES is now served — the inventory registers the two codes it names that the catalog lacked, and the nine names it quotes are corrected; the positions that still diverge are inventory entries no report in this checkout quotes a recorded value for)
 
 > _Note: this issue was identified against the code base at commit `c5e269aa69c070928f6722aebd119bfd6f867924`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
@@ -17,6 +17,19 @@ Issue-Commit: c5e269aa69c070928f6722aebd119bfd6f867924
 ListServices
 
 ## Description
+PARTIAL CLOSE (added by the fixer). The rule is now applied to every entry this report
+states a registered pair for: `iotcore` / 'AWS IoT Core' and `iotwireless` / 'AWS IoT
+Wireless' are registered as codes of their own, and `health-agent`, `interconnect`,
+`internetmonitor`, `iot`, `ivschat`, `kafkaconnect`, `medical-imaging`, `mgn` and
+`migrationhuborchestrator` carry the display names the report quotes, in place of a
+code echoed as a stand-in or a "tidied" product name. Replay confirms those entries:
+the positions this report names for them no longer diverge. What still diverges are
+entries whose registered `ServiceName` neither this report, nor the checkout's other
+service-quotas reports, nor the Smithy model states — the model enumerates no catalog,
+so the registered string is the only authority and it is withheld here. Read the
+`Issue-Key` above as the key of the ORIGINAL sweep, not as a key that now matches in
+full.
+
 1 net-new cause. ListServices answers 200 but the service catalog it serves is not the AWS one: from position 40 onward roughly 90 of the ~308 entries hold a different ServiceInfo than AWS returns, because the emulator's catalog both OMITS service codes AWS publishes and CONTAINS codes AWS does not list in this page, and because the ServiceName of some entries is not the name AWS publishes for that ServiceCode. Since Services is an ordered list, every omission/insertion shifts all later positions, so the divergence surfaces as a long run of positional mismatches rather than ~90 independent faults — it is one catalog-contents defect.
 
 Cause 1 of 1 — the ListServices catalog (fixture service-quotas-catalog-list-services, step task#1).
