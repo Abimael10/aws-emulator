@@ -26,9 +26,9 @@
 //!   endpoint held.
 //!
 //! The TEXT FORM the emulator mints that identifier in is pinned by
-//! `tests/all/minted_uuid_identifier_form.rs`, which covers every identifier this service
-//! mints as a UUID; the cases here are about the identity those forms carry, so they hold
-//! whatever form a future mint takes.
+//! `tests/all/multi_region_endpoint_identifier_form.rs` — the pair of dot-separated
+//! alphanumeric labels SES hands the id back as; the cases here are about the identity
+//! those forms carry, so they hold whatever form a future mint takes.
 //!
 //! The table below spans what the rule generalises over: the endpoint name's length and
 //! character set, the secondary region the route details name, how many tags the create

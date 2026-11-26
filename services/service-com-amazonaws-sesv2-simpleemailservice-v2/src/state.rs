@@ -2063,21 +2063,26 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
 
     /// Mint the id of a new multi-region endpoint.
     ///
-    /// `EndpointId` is documented only as "the ID of the multi-region endpoint" and
-    /// carries no modelled pattern and no modelled length, so the surface promises an
-    /// IDENTITY rather than a format, and that identity is what this mint owes a client:
-    /// the id is minted ONCE, here, for the endpoint being created, it is unique across
-    /// endpoints, and it is stable for as long as the endpoint holds it (every read
-    /// reports it off the record). The monotonic sequence number is part of what the
-    /// bytes are derived from, so two endpoints created in the same instant still differ,
-    /// and a name whose endpoint was deleted is minted a NEW id when it is created again
-    /// rather than the id the deleted endpoint held. With no modelled form to take, the
-    /// text form is the one this store writes its other opaque identifiers in — a UUID
-    /// ([`minted_uuid`]), so a client that round-trips the id through a UUID type is
-    /// served — and no caller may depend on anything narrower than the identity above.
+    /// `EndpointId` is documented only as "the ID of the multi-region endpoint
+    /// (global-endpoint)" and carries no modelled pattern and no modelled length, so the
+    /// FORM is recorded behaviour: SES hands the id back as a PAIR OF DOT-SEPARATED
+    /// ALPHANUMERIC LABELS — `<label>.<label>`, lowercase, one dot — which is the form a
+    /// client reads when it validates the id or places it where the endpoint it names is
+    /// addressed. It is NOT a dashed hexadecimal UUID, a bare run of hexadecimal
+    /// characters or a prefixed token, so the id is rendered in that form
+    /// ([`minted_label_pair`]) rather than in the UUID form this store writes the two job
+    /// ids in.
+    ///
+    /// Beside the form, the identity the surface owes a client: the id is minted ONCE,
+    /// here, for the endpoint being created, it is unique across endpoints, and it is
+    /// stable for as long as the endpoint holds it (every read reports it off the record).
+    /// The monotonic sequence number is part of what the bytes are derived from, so two
+    /// endpoints created in the same instant still differ, and a name whose endpoint was
+    /// deleted is minted a NEW id when it is created again rather than the id the deleted
+    /// endpoint held.
     pub fn next_endpoint_id(&mut self, name: &str, region: &str, now: SystemTime) -> String {
         self.endpoint_sequence += 1;
-        minted_uuid(b"Endpoint", self.endpoint_sequence, now, &[name, region])
+        minted_label_pair(b"Endpoint", self.endpoint_sequence, now, &[name, region])
     }
 
     /// Mint the next `TenantId`.

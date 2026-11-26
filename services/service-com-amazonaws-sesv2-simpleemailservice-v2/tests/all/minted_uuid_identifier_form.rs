@@ -14,14 +14,16 @@
 //! bits say it is no UUID, and these ids travel on into the ARNs and the paths that
 //! address the resource.
 //!
-//! Three identifiers of this API are minted that way, and none of them carries a modelled
-//! pattern to take the form from
-//! (`smithy_query(query="shape",shape="EndpointId,JobId")` reports a bare string and a
-//! `length: min 1` string): a multi-region endpoint's `EndpointId`, an export job's
-//! `JobId` and an import job's `JobId` — the three `CreateMultiRegionEndpoint`,
+//! Two identifiers of this API are minted that way, and neither carries a modelled
+//! pattern to take the form from (`smithy_query(query="shape",shape="JobId")` reports a
+//! `length: min 1` string): an export job's `JobId` and an import job's `JobId` — the two
 //! `CreateExportJob` and `CreateImportJob` answer with. Each is checked by the same
 //! crate that renders one (`service_common::uuid_from_random_bytes`), so what counts as
 //! well formed is that crate's rule rather than a spelling re-derived here.
+//!
+//! A multi-region endpoint's `EndpointId` is NOT one of them: SES hands that id back as a
+//! pair of dot-separated alphanumeric labels, and
+//! `tests/all/multi_region_endpoint_identifier_form.rs` pins that form.
 //!
 //! Beside the form, the two guarantees a client depends on: the id is UNIQUE across the
 //! resources of its kind — rows mint several in one breath, which is where ids built from
@@ -36,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use uuid::{Uuid, Variant, Version};
 
 /// The Region the cases execute in: the one their `Authorization` credential scope
-/// names, which is also the primary region of an endpoint created in it.
+/// names.
 const HOME: &str = "us-east-1";
 
 /// How many resources each row mints, back to back: enough that two ids minted inside
@@ -155,21 +157,9 @@ struct MintedIdCase {
 }
 
 /// The identifiers of this API that are minted as UUIDs — one row each for the
-/// multi-region endpoint plane, the export-job plane and the import-job plane, so the
-/// rule is asserted at every minter rather than at the one the endpoint plane owns.
+/// export-job plane and the import-job plane, so the rule is asserted at every minter
+/// rather than at the one plane.
 const MINTED_ID_CASES: &[MintedIdCase] = &[
-    MintedIdCase {
-        case: "CreateMultiRegionEndpoint answers an EndpointId",
-        create_path: "/v2/email/multi-region-endpoints",
-        body: |index| {
-            json!({
-                "EndpointName": format!("minted_endpoint_{index}"),
-                "Details": {"RoutesDetails": [{"Region": "us-west-2"}]},
-            })
-        },
-        member: "EndpointId",
-        read_path: |index, _id| format!("/v2/email/multi-region-endpoints/minted_endpoint_{index}"),
-    },
     MintedIdCase {
         case: "CreateExportJob answers a JobId",
         create_path: "/v2/email/export-jobs",
