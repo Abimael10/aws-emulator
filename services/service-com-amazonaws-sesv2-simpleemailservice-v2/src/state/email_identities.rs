@@ -175,6 +175,13 @@ impl DkimState {
     }
 }
 
+/// The key length SES reports as the next Easy-DKIM key pair's for an identity it
+/// holds no Easy-DKIM key configuration for: an address identity, or a domain whose
+/// key pair the caller owns. SES has generated no pair for such an identity and no
+/// request has named a length for the next one, so the member reports the shortest
+/// length `DkimSigningKeyLength` publishes rather than a length nothing chose.
+pub const DKIM_BASE_SIGNING_KEY_LENGTH: &str = "RSA_1024_BIT";
+
 /// The `BehaviorOnMxFailure` a custom MAIL FROM configuration takes when the
 /// request that set it named none: SES then sends the mail using its own domain
 /// rather than refusing it.
@@ -223,10 +230,26 @@ impl MailFromState {
     /// The modelled `MailFromAttributes` view of this record.
     pub fn view(&self) -> crate::ops::types::MailFromAttributes {
         crate::ops::types::MailFromAttributes {
-            mail_from_domain: self.domain.clone(),
-            mail_from_domain_status: self.status.as_str().to_string(),
+            mail_from_domain: Some(self.domain.clone()),
+            mail_from_domain_status: Some(self.status.as_str().to_string()),
             behavior_on_mx_failure: self.behavior_on_mx_failure.clone(),
         }
+    }
+}
+
+/// The modelled `MailFromAttributes` of an identity with NO custom MAIL FROM domain.
+///
+/// SES reports the object for every identity, because `BehaviorOnMxFailure` states what
+/// sending does when the required MX record cannot be found whether or not a custom
+/// domain was ever configured: with none configured the documented default applies
+/// ([`BEHAVIOR_ON_MX_FAILURE_DEFAULT`], under which "the mail is sent using
+/// amazonses.com as the MAIL FROM domain"). There is no domain and no MX search to
+/// report for such an identity, so those two members carry no value.
+pub fn unconfigured_mail_from_view() -> crate::ops::types::MailFromAttributes {
+    crate::ops::types::MailFromAttributes {
+        mail_from_domain: None,
+        mail_from_domain_status: None,
+        behavior_on_mx_failure: BEHAVIOR_ON_MX_FAILURE_DEFAULT.to_string(),
     }
 }
 
@@ -632,10 +655,18 @@ impl EmailIdentityRecord {
             // records it publishes itself; nothing here configures one.
             signing_hosted_zone: None,
             signing_attributes_origin: Some(self.dkim.origin.as_str().to_string()),
-            // `NextSigningKeyLength` describes a rotation that has been requested
-            // and not yet taken effect; `PutEmailIdentityDkimSigningAttributes`
-            // owns that, and nothing here requests one.
-            next_signing_key_length: None,
+            // "[Easy DKIM] The key length of the future DKIM key pair to be
+            // generated": the length SES would generate this identity's next pair
+            // at, which is the length its Easy-DKIM key is configured at until a
+            // request names another. SES reports the member for every identity, so
+            // one it holds no Easy-DKIM key configuration for reports the service's
+            // base length ([`DKIM_BASE_SIGNING_KEY_LENGTH`]).
+            next_signing_key_length: Some(
+                self.dkim
+                    .signing_key_length
+                    .clone()
+                    .unwrap_or_else(|| DKIM_BASE_SIGNING_KEY_LENGTH.to_string()),
+            ),
             current_signing_key_length: self.dkim.signing_key_length.clone(),
             // SES generated the Easy DKIM key pair when it configured DKIM for the
             // identity, which is exactly when it published a token set of its own;

@@ -201,15 +201,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // under a domain identity is that domain's.
             dkim_attributes: Some(store.dkim_attributes_of(record)),
             // The custom MAIL FROM configuration
-            // `PutEmailIdentityMailFromAttributes` persisted, when one is enabled
-            // for this identity.
-            mail_from_attributes: record.mail_from.as_ref().map(crate::state::MailFromState::view),
+            // `PutEmailIdentityMailFromAttributes` persisted, or — for an identity
+            // with none — the behaviour that applies to it anyway, with no domain
+            // and no MX search to report
+            // ([`crate::state::unconfigured_mail_from_view`]).
+            mail_from_attributes: Some(
+                record
+                    .mail_from
+                    .as_ref()
+                    .map_or_else(crate::state::unconfigured_mail_from_view, crate::state::MailFromState::view),
+            ),
             policies: Some(record.policies.clone().into_iter().collect()),
             tags: Some(record.tag_list()),
             configuration_set_name: record.configuration_set_name.clone(),
             verification_status: Some(record.verification_status.as_str().to_string()),
             // What the search of that same DNS zone found, and when it last ran.
-            verification_info: store.verification_info_of(record),
+            // Reported for every identity the account holds: an identity no search
+            // has run for reports the object with its members unset.
+            verification_info: Some(store.verification_info_of(record)),
         })
     }
 }

@@ -16,6 +16,11 @@
 //!   `GetAccount` reports). While it is off there is no such data to read at all, so
 //!   the call is refused as a resource that does not exist, naming the feature to
 //!   enable (`crate::state::enable_vdm_to_use_this_feature`).
+//! * A query's `Id` is what the result it produced is keyed back to it by, so the
+//!   batch must identify each of its queries: one carrying the same `Id` twice is
+//!   refused as invalid input before any record is read. So is a query whose window
+//!   is longer than the interval SES serves one query over
+//!   (`MAX_QUERY_INTERVAL_DAYS`), which the refusal tells the caller to partition.
 //! * A dimension states which of the recorded activity the metric is wanted for, so
 //!   it filters the records rather than looking the resource it names up: a query
 //!   whose dimension names a configuration set, an identity, a tenant or a provider
@@ -181,13 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every query's own members are checked before anything is resolved against
-        // the account's records: a value outside a modelled set, or a window that
-        // runs backwards, is the caller's mistake whatever the account holds.
+        // the account's records: a value outside a modelled set, a window that runs
+        // backwards, or one longer than the interval SES serves a query over is the
+        // caller's mistake whatever the account holds.
         let queries = input
             .queries
             .into_iter()
             .map(MetricQuery::checked)
             .collect::<Result<Vec<MetricQuery>, BatchGetMetricDataError>>()?;
+        // `BatchGetMetricDataQuery$Id` is "the query identifier", and each result the
+        // batch answers with carries the `Id` of the query it answers — so a batch
+        // that spends one identifier on two queries describes no answer the caller
+        // can read, whatever the records hold. That is the caller's mistake, refused
+        // before anything is resolved against the account.
+        if !identifiers_are_unique(&queries) {
+            return Err(bad_request(QUERIES_MUST_BE_UNIQUELY_IDENTIFIED.to_string()));
+        }
 
         // Reporting only: no metric falls due with the clock, so this read leaves the
         // store exactly as a later caller finds it.
@@ -274,6 +288,14 @@ impl MetricQuery {
         if end < start {
             return Err(bad_request(crate::state::window_runs_backwards()));
         }
+        // A query asks for one metric's series over its window, and SES serves a
+        // window no longer than [`MAX_QUERY_INTERVAL_DAYS`] days: a longer one is
+        // refused as invalid input, with the service's one sentence for it, which
+        // tells the caller to split the interval it asked for rather than reporting a
+        // partial series for it.
+        if end - start > max_query_interval_seconds() {
+            return Err(bad_request(interval_too_long()));
+        }
 
         Ok(Self {
             id: query.id,
@@ -296,6 +318,38 @@ impl MetricQuery {
     ) -> Vec<(i64, i64)> {
         crate::state::metric_day_counts(store, &self.metric, &self.dimensions, self.start, self.end)
     }
+}
+
+/// The longest window one query may ask a metric's series over, in days, as SES's own
+/// refusal of a longer one states the limit.
+pub const MAX_QUERY_INTERVAL_DAYS: i64 = 60;
+
+/// [`MAX_QUERY_INTERVAL_DAYS`] in seconds, the units a query's bounds are read in.
+fn max_query_interval_seconds() -> f64 {
+    (MAX_QUERY_INTERVAL_DAYS * 24 * 60 * 60) as f64
+}
+
+/// AWS's sentence for a window longer than SES serves: fixed text but for the limit
+/// itself, which is taken from [`MAX_QUERY_INTERVAL_DAYS`] so the sentence and the
+/// check cannot state different limits.
+fn interval_too_long() -> String {
+    format!(
+        "Invalid interval, can request at most {MAX_QUERY_INTERVAL_DAYS} days. Please partition your requested interval."
+    )
+}
+
+/// AWS's sentence for a batch that does not identify each of its queries: entirely
+/// fixed text, naming neither the repeated identifier nor the positions it was
+/// repeated at.
+const QUERIES_MUST_BE_UNIQUELY_IDENTIFIED: &str = "All queries must have a unique identifier.";
+
+/// Whether every query of the batch carries its own `Id`.
+///
+/// An identifier is an opaque string the caller chose, so two of them are the same
+/// identifier only when they are the same string.
+fn identifiers_are_unique(queries: &[MetricQuery]) -> bool {
+    let mut seen = ::std::collections::BTreeSet::new();
+    queries.iter().all(|query| seen.insert(query.id.as_str()))
 }
 
 /// `value` when it is one of `allowed`, and this operation's input error otherwise.

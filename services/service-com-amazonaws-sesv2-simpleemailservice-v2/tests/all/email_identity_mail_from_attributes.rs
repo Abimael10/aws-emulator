@@ -14,7 +14,9 @@
 //! quoting the domain asked for and the identity's own, which stores nothing; an accepted request carries the whole configuration, so the
 //! identity ends up with exactly the domain and behaviour it names, in the `PENDING`
 //! state the MX search starts in, and a request that names no domain disables the
-//! configuration. The tables below span what the rule generalises over: both
+//! configuration — after which the read reports the object with the default behaviour
+//! alone, because `BehaviorOnMxFailure` applies to an identity whether or not a custom
+//! domain was ever configured. The tables below span what the rule generalises over: both
 //! identity kinds and their spellings, subdomains several labels deep, the identity's
 //! own domain, the domains that merely resemble one, the values not spelled as a
 //! domain name at all and each published DNS length bound, each modelled behaviour
@@ -64,8 +66,9 @@ impl Reply {
             .to_string()
     }
 
-    /// `MailFromAttributes` as the read reported it, absent when the identity has no
-    /// custom MAIL FROM configuration.
+    /// `MailFromAttributes` as the read reported it. The object itself is reported for
+    /// every identity; what an identity with no custom MAIL FROM configuration carries
+    /// is [`unconfigured_attributes`].
     fn mail_from(&self) -> Option<&Value> {
         self.body.get("MailFromAttributes")
     }
@@ -78,6 +81,14 @@ impl Reply {
             .unwrap_or_default()
             .to_string()
     }
+}
+
+/// What a read reports for an identity with NO custom MAIL FROM domain: the behaviour
+/// that applies anyway — `USE_DEFAULT_VALUE`, under which "the mail is sent using
+/// amazonses.com as the MAIL FROM domain" — and no domain and no MX-search state, since
+/// there is none to report.
+fn unconfigured_attributes() -> Value {
+    json!({"BehaviorOnMxFailure": "USE_DEFAULT_VALUE"})
 }
 
 /// The emulated service behind its router, plus the shared engine so a case can
@@ -461,8 +472,8 @@ async fn a_domain_outside_the_identity_is_refused() {
             let read = ses.get(identity).await;
             assert_eq!(
                 read.mail_from(),
-                None,
-                "case ({identity:?}, {domain:?}, {behavior:?}): expected no MailFromAttributes to be reported, got {:?}",
+                Some(&unconfigured_attributes()),
+                "case ({identity:?}, {domain:?}, {behavior:?}): expected the unconfigured MailFromAttributes to be reported, got {:?}",
                 read.mail_from()
             );
         }
@@ -537,8 +548,8 @@ async fn a_request_that_names_no_domain_disables_the_configuration() {
             let read = ses.get(identity).await;
             assert_eq!(
                 read.mail_from(),
-                None,
-                "case ({identity:?}, {domain:?}, {body}): expected no MailFromAttributes to be reported, got {:?}",
+                Some(&unconfigured_attributes()),
+                "case ({identity:?}, {domain:?}, {body}): expected the unconfigured MailFromAttributes to be reported, got {:?}",
                 read.mail_from()
             );
 

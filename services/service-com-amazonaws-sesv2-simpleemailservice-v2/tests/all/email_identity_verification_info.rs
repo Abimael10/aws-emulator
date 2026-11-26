@@ -14,7 +14,9 @@
 //! `HOST_NOT_FOUND` ("the queried hostname does not exist") for a name no DNS zone can
 //! cover, `TYPE_NOT_FOUND` ("the queried hostname exists but does not have the
 //! requested type of DNS record") for a name under a zone that may exist. A name no
-//! zone can cover never finishes verifying, however long the caller waits.
+//! zone can cover never finishes verifying, however long the caller waits. Every
+//! identity has a verification state to report, so the object itself is always there;
+//! an identity no zone was searched for carries it with every member unset.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -383,16 +385,18 @@ async fn two_reads_report_one_search_until_the_next_is_due() {
 #[tokio::test]
 async fn an_address_identity_reports_the_search_of_the_domain_that_covers_it() {
     // An email-address identity is verified by the recipient following the link in
-    // the verification message, so there is no DNS search to report — unless a domain
-    // identity covers it, in which case the search of THAT domain's zone is the one
-    // its DKIM records are published in.
+    // the verification message, so there is no DNS search to report — the object is
+    // still there, with every member unset, because the identity has a verification
+    // state whether or not a zone was searched for it. Where a domain identity covers
+    // the address, the search of THAT domain's zone — the one its DKIM records are
+    // published in — is what the read reports.
     let ses = Ses::new();
     ses.create("solo@uncovered.example.com").await;
     let solo = ses.get("solo@uncovered.example.com").await;
     assert_eq!(
         solo.info(),
-        Value::Null,
-        "case uncovered: expected no VerificationInfo for an address no domain identity covers, got {:?}",
+        json!({}),
+        "case uncovered: expected a VerificationInfo with no member set for an address no domain identity covers, got {:?}",
         solo.info()
     );
 

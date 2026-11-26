@@ -32,12 +32,152 @@ pub struct GetEmailIdentityOutput {
     pub verification_info: Option<VerificationInfo>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sesv2#MailFromAttributes")]
+/// `MailFromAttributes`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the shapes beside it: SES
+/// reports this object for EVERY identity — `BehaviorOnMxFailure` states what sending
+/// does when the MX record cannot be found, and its documented `USE_DEFAULT_VALUE`
+/// ("the mail is sent using amazonses.com as the MAIL FROM domain") is what applies
+/// while no custom MAIL FROM domain is configured — and such an identity has no domain
+/// and no MX search to report, so `MailFromDomain` and `MailFromDomainStatus` carry no
+/// value at all. The model marks all three members `@required`
+/// (`smithy_query(query="shape",shape="MailFromAttributes",
+/// model_path="services/service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/com-amazonaws-sesv2-simpleemailservice-v2.json")`),
+/// which the derive reads as "always on the wire": it refuses an `Option<T>` field for
+/// such a member ("Field 'mail_from_domain' is @required or @default in Smithy, so it
+/// must not be Option<T>."), leaving a derived response able to report only the empty
+/// string — which is no domain SES could have detected an MX record for, and no value of
+/// `MailFromDomainStatus`'s own enum at all.
+///
+/// The three member schemas below are the model's, member for member: same shape ids,
+/// same wire names, same order, same shape types (`MailFromDomainStatus` and
+/// `BehaviorOnMxFailure` are enums, which the derive also emits as
+/// `ShapeType::String`).
+///
+/// Deliberately NOT reproduced, each because nothing reads it here:
+/// * the constraint traits the derive captures — the framework's validating walk runs
+///   against `Operation::INPUT_SCHEMA` only, so they are inert on an output;
+/// * the derive's `DeserializableStruct` impl — this shape is reached only as part of an
+///   operation OUTPUT, which the server only ever serializes.
+///
+/// This is a PER-SHAPE workaround and has to be kept in step with the model by hand. The
+/// generator gap it works around is filed as
+/// `issues/things-that-do-not-work/20261029T040000Z-smithy-macros-cannot-omit-a-required-output-member.md`
+/// — the real fix is in `vendor/smithy-macros`, which is read-only from a service crate.
+/// REMOVE this block and put the derive back once the generator can express an omittable
+/// member; `tests/all/email_identity_read_members.rs` pins the wire form.
 #[derive(Debug, Clone, Default)]
 pub struct MailFromAttributes {
-    pub mail_from_domain: String,
-    pub mail_from_domain_status: String,
+    pub mail_from_domain: Option<String>,
+    pub mail_from_domain_status: Option<String>,
     pub behavior_on_mx_failure: String,
+}
+
+#[allow(non_upper_case_globals)]
+impl MailFromAttributes {
+    const M_MAIL_FROM_DOMAIN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.sesv2#MailFromAttributes$MailFromDomain",
+            "com.amazonaws.sesv2",
+            "MailFromDomain",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "MailFromDomain",
+        0,
+    );
+
+    const M_MAIL_FROM_DOMAIN_STATUS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.sesv2#MailFromAttributes$MailFromDomainStatus",
+                "com.amazonaws.sesv2",
+                "MailFromDomainStatus",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "MailFromDomainStatus",
+            1,
+        );
+
+    const M_BEHAVIOR_ON_MX_FAILURE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.sesv2#MailFromAttributes$BehaviorOnMxFailure",
+                "com.amazonaws.sesv2",
+                "BehaviorOnMxFailure",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "BehaviorOnMxFailure",
+            2,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.sesv2#MailFromAttributes",
+            "com.amazonaws.sesv2",
+            "MailFromAttributes",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_MAIL_FROM_DOMAIN,
+            &Self::M_MAIL_FROM_DOMAIN_STATUS,
+            &Self::M_BEHAVIOR_ON_MX_FAILURE,
+        ],
+    );
+}
+
+pub static MAIL_FROM_ATTRIBUTES_SCHEMA: &::aws_smithy_schema::Schema = &MailFromAttributes::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MailFromAttributes {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The domain and the state of the search for its MX record are written only
+        // for an identity that HAS a custom MAIL FROM domain; one with none reports
+        // neither, rather than a domain nobody configured.
+        if let Some(domain) = self.mail_from_domain.as_ref() {
+            serializer.write_string(&Self::M_MAIL_FROM_DOMAIN, domain.as_str())?;
+        }
+        if let Some(status) = self.mail_from_domain_status.as_ref() {
+            serializer.write_string(&Self::M_MAIL_FROM_DOMAIN_STATUS, status.as_str())?;
+        }
+        serializer.write_string(
+            &Self::M_BEHAVIOR_ON_MX_FAILURE,
+            self.behavior_on_mx_failure.as_str(),
+        )?;
+        Ok(())
+    }
+}
+
+/// Reading the shape back, as the derive would: the server never deserializes this
+/// shape itself (it is reached only as part of an operation OUTPUT), but the enclosing
+/// response's own derived read path names every nested structure's, so the impl has to
+/// be here for the enclosing one to compile. An absent member reads as absent, which is
+/// the same wire form the write path above produces.
+impl ::aws_smithy_schema_server::DeserializableStruct for MailFromAttributes {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut domain: Option<String> = None;
+        let mut status: Option<String> = None;
+        let mut behavior: Option<String> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => domain = Some(d.read_string(&Self::M_MAIL_FROM_DOMAIN)?),
+                Some(1) => status = Some(d.read_string(&Self::M_MAIL_FROM_DOMAIN_STATUS)?),
+                Some(2) => behavior = Some(d.read_string(&Self::M_BEHAVIOR_ON_MX_FAILURE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            mail_from_domain: domain,
+            mail_from_domain_status: status,
+            behavior_on_mx_failure: behavior.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("BehaviorOnMxFailure")
+            })?,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.sesv2#VerificationInfo")]

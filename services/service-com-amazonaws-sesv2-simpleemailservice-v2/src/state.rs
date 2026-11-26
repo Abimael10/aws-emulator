@@ -1971,15 +1971,22 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
     /// The modelled `VerificationInfo` of `record`: the search of the DNS zone that
     /// publishes its DKIM records ([`Self::dkim_authority`]).
     ///
-    /// `None` when there is no such zone to search — an email-address identity that no
-    /// domain identity covers is verified by the recipient following the link in the
-    /// verification message, so no DNS search reports on it.
+    /// Every identity the account holds has a verification state to report, so the
+    /// object itself is always there — what varies is how much of it is known. Where
+    /// there is no DNS zone to search — an email-address identity that no domain
+    /// identity covers is verified by the recipient following the link in the
+    /// verification message — nothing has looked for a record, nothing has succeeded
+    /// and nothing has failed, so every member of the object is unset rather than the
+    /// object being left out.
     pub fn verification_info_of(
         &self,
         record: &EmailIdentityRecord,
-    ) -> Option<crate::ops::types::VerificationInfo> {
+    ) -> crate::ops::types::VerificationInfo {
         let authority = self.dkim_authority(record);
-        (authority.identity_kind == IdentityKind::Domain).then(|| authority.verification_info())
+        if authority.identity_kind == IdentityKind::Domain {
+            return authority.verification_info();
+        }
+        crate::ops::types::VerificationInfo::default()
     }
 
     /// Recipients charged against the sending quota within the trailing
