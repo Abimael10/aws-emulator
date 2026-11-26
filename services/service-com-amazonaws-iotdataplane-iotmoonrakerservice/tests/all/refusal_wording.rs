@@ -18,6 +18,12 @@
 //!   service's fixed not-found sentence, exactly as a well-formed absent name is. The
 //!   400-vs-404 distinction is the whole signal: a 404 tells a caller its probe found
 //!   nothing, while a 400 tells it the string it asked about is no topic to probe.
+//! * A `responseTopic` is the topic a responder is told to publish its reply to, so it
+//!   has to be one topic too: a reply topic carrying an MQTT subscription wildcard names
+//!   none, and the publish is refused `InvalidRequestException` (HTTP 400) with the
+//!   service's own fixed sentence for that condition — which is NOT the publish-topic
+//!   one — before anything is retained, while a reply topic that names one topic is
+//!   carried and the publish retained.
 //! * A shadow name in this service's reserved `$` namespace is not a name a client may
 //!   address — on the write path or on either read path — and is refused
 //!   `InvalidRequestException` (HTTP 400) naming the shadow the request asked for. Only
@@ -702,7 +708,7 @@ async fn an_ordinary_shadow_name_round_trips_whatever_its_form() {
 /// (alone, leading, between levels, trailing, inside a level), how many the string
 /// carries, and what the rest of the string looks like. The recorded case, a multi-level
 /// wildcard on the leaf of a base topic, is one row among them.
-const TOPIC_FILTERS: &[(&str, &str)] = &[
+pub(crate) const TOPIC_FILTERS: &[(&str, &str)] = &[
     // The recorded case.
     ("a multi-level wildcard on the leaf of a base topic", "fleet-telemetry/#"),
     ("a bare multi-level wildcard", "#"),
@@ -722,7 +728,7 @@ const TOPIC_FILTERS: &[(&str, &str)] = &[
 /// characters that NEIGHBOUR `+` (0x2B) and `#` (0x23) in the ASCII table — `*`, `,`, `"`,
 /// `$` — so no row can pass by refusing a whole character class, and the rest vary the
 /// depth, the width and the alphabet of the name.
-const TOPIC_NAMES: &[(&str, &str)] = &[
+pub(crate) const TOPIC_NAMES: &[(&str, &str)] = &[
     ("an asterisk, the character below `+`", "sensors/*/temperature"),
     ("a comma, the character above `+`", "sensors/,/temperature"),
     ("a quote, the character below `#`", "sensors/\"/temperature"),
@@ -876,6 +882,163 @@ async fn a_retained_message_read_resolves_every_topic_name_against_the_store() {
             case.as_bytes(),
             "case {case:?}: expected the published payload back, got {:?}",
             String::from_utf8_lossy(&payload)
+        );
+    }
+}
+
+/// The sentence the service refuses a response topic carrying an MQTT wildcard with,
+/// written out here rather than taken from the renderer under test. It is FIXED text for
+/// this condition: nothing of the request is interpolated into it, and it is not the
+/// publish-topic sentence.
+pub(crate) const INVALID_RESPONSE_TOPIC: &str =
+    "This response topic isn't valid. Response topics must not contain MQTT wildcard \
+     characters (+ or #)";
+
+/// A `Publish` that names a `responseTopic`, which the operation binds to the query
+/// parameter of the same name (`smithy_query(query="operation", operation="Publish")`).
+/// `retain=true`, so a publish that reached the broker is one the store would hold.
+async fn publish_with_response_topic(
+    harness: &Harness,
+    topic: &str,
+    response_topic: Option<&str>,
+    payload: Vec<u8>,
+) -> Answer {
+    let mut uri = format!("/topics/{}?qos=1&retain=true", encode_component(topic));
+    if let Some(response_topic) = response_topic {
+        uri.push_str("&responseTopic=");
+        uri.push_str(&encode_component(response_topic));
+    }
+    harness.send("POST", &uri, &[], payload).await
+}
+
+#[tokio::test]
+async fn a_publish_whose_response_topic_carries_a_wildcard_is_refused_and_retains_nothing() {
+    let harness = Harness::new();
+
+    for (index, (case, response_topic)) in TOPIC_FILTERS.iter().enumerate() {
+        // A distinct publish topic per row, so each row's own topic is what the
+        // retained-message read below reports on.
+        let topic = format!("response-flow/refused-{index}");
+        let refused = publish_with_response_topic(
+            &harness,
+            &topic,
+            Some(response_topic),
+            b"reply-wanted".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?}: expected the reply topic {response_topic:?} to be refused 400, \
+             got {} with body {}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequestException",
+            "case {case:?}: expected InvalidRequestException for {response_topic:?}, got {}",
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(
+            message(&refused),
+            INVALID_RESPONSE_TOPIC,
+            "case {case:?}: expected the response-topic sentence, got {:?}",
+            message(&refused)
+        );
+        // The condition is its own: a bad reply topic is not reported as a bad publish
+        // topic, which is what a client branching on the wording reads.
+        assert_ne!(
+            message(&refused),
+            "Invalid topic filter",
+            "case {case:?}: expected the response-topic sentence rather than the \
+             publish-topic one, got {:?}",
+            message(&refused)
+        );
+
+        // The refusal came before any state change: the publish asked for `retain=true`
+        // and its own topic holds nothing.
+        let read = harness.get_retained_message(&encode_component(&topic)).await;
+        assert_eq!(
+            read.status,
+            404,
+            "case {case:?}: expected the refused publish to retain nothing under {topic:?}, \
+             got {} with body {}",
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            read.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException for {topic:?}, got {}",
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            message(&read),
+            RETAINED_MESSAGE_NOT_FOUND,
+            "case {case:?}: expected the fixed not-found sentence, got {:?}",
+            message(&read)
+        );
+    }
+
+    // The same store from the other side: no refused row left a retained message behind.
+    let retained = retained_topics(&harness).await;
+    assert!(
+        retained.is_empty(),
+        "expected the refused publishes to retain nothing, got {retained:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_publish_whose_response_topic_names_one_topic_is_accepted_and_retained() {
+    let harness = Harness::new();
+
+    // A request that names NO response topic asks for no reply topic at all, and every
+    // topic-name row is a name a reply could be published to — including the ones
+    // carrying the characters that neighbour `+` and `#`.
+    let mut rows: Vec<(&str, Option<&str>)> = vec![("no response topic at all", None)];
+    rows.extend(
+        TOPIC_NAMES
+            .iter()
+            .map(|(case, topic)| (*case, Some(*topic))),
+    );
+
+    for (index, (case, response_topic)) in rows.into_iter().enumerate() {
+        let topic = format!("response-flow/accepted-{index}");
+        let payload = format!("payload for {case}").into_bytes();
+        let accepted =
+            publish_with_response_topic(&harness, &topic, response_topic, payload.clone()).await;
+        assert_eq!(
+            accepted.status,
+            200,
+            "case {case:?}: expected the reply topic {response_topic:?} to be taken, got {} \
+             with body {}",
+            accepted.status,
+            String::from_utf8_lossy(&accepted.body)
+        );
+
+        // …and the publish it carried is the topic's retained message, so the accepted
+        // leg is backed by the store rather than by the acknowledgement alone.
+        let read = harness.get_retained_message(&encode_component(&topic)).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected the accepted publish to be retained under {topic:?}, \
+             got {} with body {}",
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        let stored = read
+            .json()
+            .get("payload")
+            .and_then(Value::as_str)
+            .map(|encoded| aws_smithy_types::base64::decode(encoded).expect("base64"))
+            .unwrap_or_default();
+        assert_eq!(
+            stored,
+            payload,
+            "case {case:?}: expected the published payload back, got {:?}",
+            String::from_utf8_lossy(&stored)
         );
     }
 }

@@ -20,8 +20,11 @@
 //! * `SendDirectMessage` delivers into the session: a message to an offline client is
 //!   queued on its persistent session, a message to a connected client is handed to the
 //!   connection and queues nothing, a payload past the broker's quota is 413, a topic
-//!   outside the broker's topic-name rules is 400, and a request asking for delivery
-//!   confirmation — which no client in this emulator can send — is the modelled 504.
+//!   outside the broker's topic-name rules is 400, a `responseTopic` carrying an MQTT
+//!   wildcard — which names no topic a reply could be published to — is 400 with the
+//!   service's own sentence for that condition and delivers nothing, and a request asking
+//!   for delivery confirmation — which no client in this emulator can send — is the
+//!   modelled 504.
 //! * `DeleteConnection` closes the connection and records that the SERVICE closed it,
 //!   discarding the session state only when the caller asks for it (or when the client
 //!   connected with a clean session, for which there is no persistent state to keep).
@@ -43,6 +46,7 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::publish_topic_and_payload_limits::encode_component;
+use crate::refusal_wording::{INVALID_RESPONSE_TOPIC, TOPIC_FILTERS, TOPIC_NAMES};
 use service_com_amazonaws_iotdataplane_iotmoonrakerservice::state::{
     now_millis, payload_too_large, too_many_topic_bytes, too_many_topic_parts, DirectMessage,
     MqttSession, CLIENT_NOT_FOUND, DEFAULT_SUBSCRIPTION_PAGE_SIZE,
@@ -204,6 +208,31 @@ impl Harness {
                 "/connections/{}/messages?topic={}&confirmation={confirmation}&timeout=5",
                 encode_component(client_id),
                 encode_component(topic)
+            ),
+            payload,
+        )
+        .await
+    }
+
+    /// A `SendDirectMessage` that names a `responseTopic`, which the operation binds to
+    /// the query parameter of the same name (`smithy_query(query="operation",
+    /// operation="SendDirectMessage")`). Delivery confirmation is asked for, so the
+    /// delivery is made at QoS 1 — the QoS an offline session keeps — and what the
+    /// session holds afterwards is what the request carried.
+    async fn send_direct_message_with_response_topic(
+        &self,
+        client_id: &str,
+        topic: &str,
+        response_topic: &str,
+        payload: Vec<u8>,
+    ) -> Answer {
+        self.send(
+            "POST",
+            &format!(
+                "/connections/{}/messages?topic={}&responseTopic={}&confirmation=true&timeout=5",
+                encode_component(client_id),
+                encode_component(topic),
+                encode_component(response_topic)
             ),
             payload,
         )
@@ -910,6 +939,103 @@ async fn a_send_asking_for_delivery_confirmation_is_not_claimed_to_be_confirmed(
         "expected a confirmed delivery to use QoS 1, got {}",
         queue[0].qos
     );
+}
+
+#[tokio::test]
+async fn a_direct_message_whose_response_topic_carries_a_wildcard_is_refused_and_delivers_nothing()
+{
+    let harness = Harness::new();
+    harness.connect(offline_session("response-flow-client", 1_000));
+
+    let queued = |harness: &Harness| {
+        harness
+            .stored_session("response-flow-client")
+            .expect("the session is still held")
+            .queued_messages
+    };
+
+    for (case, response_topic) in TOPIC_FILTERS {
+        let before = queued(&harness).len();
+        let answer = harness
+            .send_direct_message_with_response_topic(
+                "response-flow-client",
+                "orders/request",
+                response_topic,
+                b"reply-wanted".to_vec(),
+            )
+            .await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {case:?}: expected the reply topic {response_topic:?} to be refused 400, \
+             got {} with body {}",
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidRequestException",
+            "case {case:?}: expected InvalidRequestException for {response_topic:?}, got {}",
+            answer.text()
+        );
+        assert_eq!(
+            answer.message(),
+            INVALID_RESPONSE_TOPIC,
+            "case {case:?}: expected the response-topic sentence, got {:?}",
+            answer.message()
+        );
+        assert_ne!(
+            answer.message(),
+            INVALID_TOPIC_FILTER,
+            "case {case:?}: expected the response-topic sentence rather than the \
+             outbound-topic one, got {:?}",
+            answer.message()
+        );
+        assert_eq!(
+            queued(&harness).len(),
+            before,
+            "case {case:?}: a refused send must deliver nothing"
+        );
+    }
+
+    // The control: a reply topic that names ONE topic is carried into the session, so the
+    // message the client will be handed holds the topic it is to reply on. An offline
+    // client has no connection to acknowledge the delivery over, which is the modelled
+    // 504 (see the confirmation case above), while the persistent session keeps the
+    // message.
+    for (case, response_topic) in TOPIC_NAMES {
+        let before = queued(&harness).len();
+        let answer = harness
+            .send_direct_message_with_response_topic(
+                "response-flow-client",
+                "orders/request",
+                response_topic,
+                b"reply-wanted".to_vec(),
+            )
+            .await;
+        assert_eq!(
+            answer.status,
+            504,
+            "case {case:?}: expected the reply topic {response_topic:?} to be carried, got \
+             {} with body {}",
+            answer.status,
+            answer.text()
+        );
+        let queue = queued(&harness);
+        assert_eq!(
+            queue.len(),
+            before + 1,
+            "case {case:?}: expected the accepted message to be delivered, got {} entries",
+            queue.len()
+        );
+        let delivered = queue.back().expect("the message just delivered");
+        assert_eq!(
+            delivered.response_topic.as_deref(),
+            Some(*response_topic),
+            "case {case:?}: expected the reply topic the request carried, got {:?}",
+            delivered.response_topic
+        );
+    }
 }
 
 #[tokio::test]

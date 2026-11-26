@@ -28,7 +28,11 @@
 //!
 //! A publish is refused before any of that when the topic is not one a client may
 //! publish to: a topic in the reserved `$` namespace (the service's own system
-//! topics) or one carrying MQTT subscription wildcards.
+//! topics) or one carrying MQTT subscription wildcards. The same holds for the
+//! `responseTopic` the request-response flow would have a responder reply on — a reply
+//! topic carrying a wildcard names no topic a reply could be published to — and that
+//! refusal comes before the retained-message write, so a refused publish retains
+//! nothing.
 //!
 //! An accepted publish answers in the data plane's `{message, traceId}` envelope — the
 //! acknowledgement that tells a caller the broker took the message — and so does every
@@ -332,6 +336,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // limit — see `crate::state::topic_name_refusal`, which is the one place that
         // rule lives.
         if let Some(refusal) = crate::state::topic_name_refusal(&input.topic) {
+            return Err(PublishErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
+
+        // The `responseTopic` names the topic a responder is told to publish its reply
+        // to, so it is a topic NAME too: one carrying an MQTT subscription wildcard names
+        // no topic a reply could reach, and the publish is refused here — before the
+        // retained-message write and before rule dispatch — so nothing of it is kept. The
+        // refusal has its own fixed wording; see `crate::state::response_topic_refusal`.
+        if let Some(refusal) = crate::state::response_topic_refusal(input.response_topic.as_deref())
+        {
             return Err(PublishErrorModeled::InvalidRequestException(
                 InvalidRequestException::new(refusal),
             )

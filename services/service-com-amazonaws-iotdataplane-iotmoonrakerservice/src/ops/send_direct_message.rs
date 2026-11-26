@@ -240,6 +240,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `responseTopic` the receiver is told to reply on is a topic NAME too, so a
+        // string carrying an MQTT subscription wildcard names no topic the reply could
+        // reach and the message is refused before it is handed to any session. The
+        // refusal has its own fixed wording; see `crate::state::response_topic_refusal`.
+        if let Some(refusal) = crate::state::response_topic_refusal(input.response_topic.as_deref())
+        {
+            return Err(SendDirectMessageErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
+
         let payload = input.payload.unwrap_or_default();
         if payload.len() > crate::state::MAX_PUBLISH_PAYLOAD_BYTES {
             return Err(SendDirectMessageErrorModeled::RequestEntityTooLargeException(

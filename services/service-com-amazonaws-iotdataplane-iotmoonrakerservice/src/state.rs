@@ -199,10 +199,43 @@ pub fn too_many_topic_bytes(max_bytes: usize) -> String {
 /// broker's publish-time ceilings below bound what it will CARRY, so a name past them is
 /// a name nothing could be stored under rather than no name at all.
 pub fn topic_filter_refusal(topic: &str) -> Option<String> {
-    if topic.contains('+') || topic.contains('#') {
+    if carries_mqtt_wildcard(topic) {
         return Some(INVALID_TOPIC_FILTER.to_string());
     }
     None
+}
+
+/// Whether `topic` carries either MQTT subscription wildcard — the single-level `+` or
+/// the multi-level `#`. MQTT keeps both for topic FILTERS, so a string carrying one
+/// anywhere in it names a SET of topics rather than one topic, whatever the request
+/// meant it as. This is the one place that predicate lives; each caller answers it with
+/// the message its own condition carries.
+#[must_use]
+pub fn carries_mqtt_wildcard(topic: &str) -> bool {
+    topic.contains('+') || topic.contains('#')
+}
+
+/// The service's fixed rejection of a response topic carrying an MQTT wildcard. It
+/// interpolates nothing from the request: the condition is the whole of what the caller
+/// is told, and the response topic it sent is the one thing it has to change.
+pub const INVALID_RESPONSE_TOPIC: &str = "This response topic isn't valid. Response topics must \
+                                          not contain MQTT wildcard characters (+ or #)";
+
+/// Why this service will not carry `response_topic` as the reply topic of the
+/// request-response flow, or `None` when it will — including for a request that named
+/// none, which asks for no reply topic at all.
+///
+/// A response topic is the topic NAME a responder is told to publish its reply to ("the
+/// topic which the receiver should publish to as part of the request-response flow. The
+/// topic must not contain wildcard characters" — `PublishRequest$responseTopic`,
+/// `SendDirectMessageRequest$responseTopic`), so a string carrying an MQTT subscription
+/// wildcard ([`carries_mqtt_wildcard`]) names no topic a reply could ever be published
+/// to and the request is refused before anything is delivered or retained. The rule
+/// holds wherever a request carries a response topic; the refusal is its own fixed text,
+/// not the publish-topic one ([`INVALID_TOPIC_FILTER`]).
+pub fn response_topic_refusal(response_topic: Option<&str>) -> Option<String> {
+    let topic = response_topic?;
+    carries_mqtt_wildcard(topic).then(|| INVALID_RESPONSE_TOPIC.to_string())
 }
 
 /// Why the broker will not publish to `topic`, or `None` when the name is one it will.
