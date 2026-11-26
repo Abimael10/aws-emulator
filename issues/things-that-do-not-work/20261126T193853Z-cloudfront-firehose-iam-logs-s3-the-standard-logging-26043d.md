@@ -1,0 +1,58 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudfront__firehose__iam__logs__s3.standard-logging-v2-joins-s3-and-firehose-deliveries-on-edge-request-id
+Issue-Key: cloudfront__firehose__iam__logs__s3.standard-logging-v2-joins-s3-and-firehose-deliveries-on-edge-request-id|_poll_until#64|Timeout|last = probe()
+Issue-Commit: 14ec769a5321afdf37a20bd54803749025ed3b5a
+
+# cloudfront__firehose__iam__logs__s3: the standard-logging-v2 S3+Firehose access-log join still reaches no verdict — the whole per-check budget is consumed with no answer
+
+> _Note: this issue was identified against the code base at commit `14ec769a5321afdf37a20bd54803749025ed3b5a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateDelivery
+
+## Description
+One root cause, grounded in one failing behavioral check. This run's replay reports this check owned by no open issue and blocked by no unimplemented scaffold stub, so it is filed here. It is the ONLY failure in this whole replay (307 failing checks) that is neither OWNED nor ALREADY FILED.
+
+Cause 1 of 1: the CloudFront standard-logging-v2 end-to-end scenario makes no gradable progress. The check is killed by the per-check harness cap before any of its graded assertions is reached, so none of the following is observable: the distribution settling to Status=Deployed, the three viewer requests at the edge, the CloudWatch Logs delivery wiring (one ACCESS_LOGS delivery source fanned out to an S3 delivery destination and a Firehose delivery destination), or the per-request access-log records landing in both destinations and joining on x-edge-request-id. Failing check: cloudfront__firehose__iam__logs__s3.standard-logging-v2-joins-s3-and-firehose-deliveries-on-edge-request-id.
+
+AWS: Smithy (cloudfront 2020-05-31) models Distribution.Status as "The distribution's status. When the status is Deployed, the distribution's information is fully propagated to all CloudFront edge locations" and Distribution.DomainName as "The distribution's CloudFront domain name. For example: d111111abcdef8.cloudfront.net" — i.e. an address at which viewer traffic for that distribution is actually served. Smithy (logs 2014-03-28) models PutDeliverySource (name, resourceArn, logType required), PutDeliveryDestination (name required, deliveryDestinationConfiguration, outputFormat) and CreateDelivery (deliverySourceName, deliveryDestinationArn required, recordFields up to 128); each answers with the created resource or one of its modeled client errors (ValidationException / ResourceNotFoundException / ConflictException / AccessDeniedException / ServiceQuotaExceededException / ThrottlingException, all HTTP 400) or ServiceUnavailableException (500). For the rest of the chain this is recorded behavior only: on AWS the scenario completes — the distribution reaches Deployed; an S3-bucket ARN destination reads back deliveryDestinationType "S3" and a Firehose-stream ARN destination reads back "FH"; the three viewer GETs through the distribution's DomainName are answered 200/x-edge-result-type Miss, 200/Hit and 403/Error (the OAC bucket policy grants only s3:GetObject, so an absent key is refused 403 rather than disclosed as 404), each minting a distinct X-Amz-Cf-Id; and each destination then holds exactly one record per request carrying exactly the configured recordFields [x-edge-request-id, cs-uri-stem, sc-status, x-edge-result-type], with the S3 record and the Firehose record for one request byte-identical. The bucket, stream and distribution names, the generated ids and the request ids are per-run values and are NOT requirements; the requirements are the Deployed transition, the S3/FH destination typing, the three edge outcomes, the exact field set and the one-record-per-request-per-destination join on x-edge-request-id.
+
+Emulator: the check produces no answer at all. The entire replay detail is `Error: Check timed out after 60.0s` — a harness kill with no stack frame, no assertion message, no HTTP status and no error code. Nothing in the chain settled inside the budget, so nothing was graded. Hypothesis (the bare timeout does not name the stalling call): the body's bounded waits are, in order, firehose CreateDeliveryStream retried past IAM propagation, DescribeDeliveryStream polled to DeliveryStreamStatus=ACTIVE, GetDistribution polled to Status=Deployed, then the three edge GETs, then two 900 s polls for the delivered records; the same replay shows sibling cloudfront headings whose Deployed distributions serve nothing at their announced edge address, so the edge leg and/or the status transition are the likeliest consumers of the budget.
+
+Why: a client cannot configure or observe CloudFront standard logging v2 at all. The delivery source/destination/delivery lifecycle, the per-request access-log records, their field projection and their joinability across an S3 destination and a Firehose destination are unreachable rather than merely wrong — a caller polling either destination for the record for a request it just made waits indefinitely and is given no diagnosis to act on.
+
+Fix: whichever component on this path never settles — the CloudFront distribution status machine and the edge data plane that must serve viewer traffic for the distribution's announced DomainName (CreateDistribution/GetDistribution and the edge listener that routes that address), together with the CloudWatch Logs standard-logging-v2 delivery components (PutDeliverySource / PutDeliveryDestination / CreateDelivery handlers and their state) and the ACCESS_LOGS record producer that must write one projected record per edge request into both the S3 bucket destination and the Firehose delivery stream. Instrumenting which call fails to answer is the first step, since the current failure carries no frame.
+
+Related open issues that do NOT cover this check (the replay reports it unowned, so none of them carries this run's replay key): 20261125T050522Z-cloudfront-firehose-iam-logs-s3-the-standard-logging.md and 20261125T165138Z-cloudfront-firehose-iam-logs-s3-createdistribution-publishes-domainname.md both name this same check and subject — the first is keyed on a `_poll_until#56|Timeout` frame, the second on a fast `PublishedUrlRejected` refusal of the published `<id>.cloudfront.net` DomainName — while this run is a frameless harness kill. This filing re-grounds the cause in this run's evidence and should be closed together with them. The resolved issue 20261117T115022Z-cloudfront-firehose-iam-logs-s3-cloudfront-standard-logging-v2-to-s3-and-firehose.md claimed this check earlier; nothing here is refused with an HTTP status or an error code, so this is NOT described as a refusal regression.
+
+Traces: cloudfront__firehose__iam__logs__s3.standard-logging-v2-joins-s3-and-firehose-deliveries-on-edge-request-id.
+
+## Evidence
+Replay of simparity-behavioral-aws-v1 against the emulator built from this checkout: 2356/2681 passed (87.9%), 252 mismatched, 73 errored, 0 skipped, 0 unloadable, bootstrap_signal false. get_bootstrap_status reports an empty `pending` list, so no service in this heading is awaiting bootstrap. Per-service rate for this heading: cloudfront__firehose__iam__logs__s3 1/2 (50%), 1 failed. Of the 307 failures listed, 305 are reported OWNED by open issues and 2 are ALREADY FILED against unimplemented stubs (gamelift ListScripts, connect UpdateInstanceStorageConfig); this is the only unowned, unblocked failure in the run.
+
+Failing check `cloudfront__firehose__iam__logs__s3.standard-logging-v2-joins-s3-and-firehose-deliveries-on-edge-request-id`, verdict mismatch. The complete detail is:
+  Error: Check timed out after 60.0s
+No frame, no assertion message, no HTTP status and no error code were produced — the check was cut off by the harness cap, so the emulator was never observed answering or refusing any of the scenario's graded steps.
+
+Expected (AWS):
+- GetDistribution eventually reports Status='Deployed' for the created distribution.
+- firehose DescribeDeliveryStream reports DeliveryStreamStatus='ACTIVE' for the DirectPut ExtendedS3Destination stream.
+- logs PutDeliverySource answers a deliverySource with service='cloudfront' and resourceArns=[the distribution ARN] for logType='ACCESS_LOGS'.
+- logs PutDeliveryDestination answers deliveryDestinationType='S3' for an S3 bucket ARN and 'FH' for a Firehose delivery-stream ARN.
+- logs CreateDelivery answers one delivery per destination, the pair covering {'S3','FH'}.
+- Three viewer GETs through the distribution's DomainName are answered 200 with x-edge-result-type 'Miss', 200 with 'Hit', and 403 with 'Error' (absent key under an OAC policy granting only s3:GetObject), each minting a distinct X-Amz-Cf-Id.
+- Both destinations then hold one record per request whose key set is exactly {x-edge-request-id, cs-uri-stem, sc-status, x-edge-result-type}, with cs-uri-stem/sc-status/x-edge-result-type matching that request, and the S3 record equal to the Firehose record for the same x-edge-request-id.
+
+Actual (emulator): nothing was observed. The scenario reached no verdict inside the per-check budget; every assertion above is unreached.
+
+## Steps to Reproduce
+1. Create an S3 origin bucket in the run region, put a text object in it, and create a CloudFront origin access control (CreateOriginAccessControl, type s3, SigningBehavior always, SigningProtocol sigv4).
+2. CreateDistribution with that bucket as an S3 origin carrying the OriginAccessControlId and the managed CachingOptimized cache policy 658327ea-f89d-4fab-a63d-7e88639e58f6, Enabled=true. Grant cloudfront.amazonaws.com s3:GetObject on the origin bucket, conditioned on AWS:SourceArn = the distribution ARN (no s3:ListBucket).
+3. In us-east-1, create an S3 log-destination bucket with the AWSLogDeliveryWrite policy for delivery.logs.amazonaws.com, and a second bucket plus an IAM role for a Firehose DirectPut delivery stream with an ExtendedS3DestinationConfiguration. Poll firehose DescribeDeliveryStream and record how long DeliveryStreamStatus takes to reach ACTIVE, or that it never does.
+4. In us-east-1, call logs PutDeliverySource(name, resourceArn=<distribution ARN>, logType='ACCESS_LOGS'); confirm the answer reports service='cloudfront' and resourceArns=[the distribution ARN]. Call logs PutDeliveryDestination for the S3 bucket ARN (expect deliveryDestinationType='S3') and for the delivery-stream ARN (expect 'FH'). Call logs CreateDelivery for each destination with recordFields=['x-edge-request-id','cs-uri-stem','sc-status','x-edge-result-type']; confirm each answers and that the two deliveries cover {'S3','FH'}.
+5. Poll GetDistribution and record how long Status takes to reach 'Deployed', or that it never does.
+6. Through the distribution's published DomainName, issue: a GET for the object key (expect 200, x-edge-result-type Miss), the same GET again (expect 200, Hit), and a GET for a key that does not exist (expect 403, Error). Confirm each response carries a distinct X-Amz-Cf-Id and that the edge answers at all.
+7. Poll both destination buckets for the delivered JSON records and confirm each holds one record per request whose keys are exactly the four configured recordFields, whose cs-uri-stem / sc-status / x-edge-result-type match that request, and whose S3 and Firehose copies are identical for the same x-edge-request-id.
+8. Re-replay cloudfront__firehose__iam__logs__s3.standard-logging-v2-joins-s3-and-firehose-deliveries-on-edge-request-id and confirm it completes with a verdict inside the per-check budget.
