@@ -203,6 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The tags a create carries are judged by the same content rules every tag write
+        // of this service is judged by, before anything is stored.
+        if let Some(message) =
+            crate::state::tag_list_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(PutStoredQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // A query this account already holds is updated in place; only a NEW one has to

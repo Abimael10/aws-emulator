@@ -20,7 +20,10 @@
 //!    resource — each with its own modelled error, from every tagging operation;
 //! 5. a resource carries at most the published number of tags, and a request that
 //!    would take it past that is refused and persists nothing;
-//! 6. deleting a resource deletes its tags with it.
+//! 6. deleting a resource deletes its tags with it;
+//! 7. a submitted tag list whose content Config will not store is refused with
+//!    `ValidationException` before anything is written: a key in the namespace AWS
+//!    reserves for its own tags, and a key the one list names twice.
 //!
 //! The harness (`Emulator`, `managed_rule`, `with_recorder_and_channel`) is the one
 //! `config_setup_and_rule_loop` already builds.
@@ -28,8 +31,11 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_configservice_starlingdoveservice::state::SERVICE_LINKED_PRINCIPALS;
 
-use crate::config_setup_and_rule_loop::{managed_rule, with_recorder_and_channel, Emulator};
+use crate::config_setup_and_rule_loop::{
+    managed_rule, recorder_request, with_recorder_and_channel, Emulator, ROLE_ARN,
+};
 
 /// The most tags one Config resource can carry: the tags-per-resource limit, which the
 /// model corroborates with the `TagList` length maximum of 50 on `TagResource$Tags`
@@ -899,5 +905,323 @@ async fn deleting_a_resource_deletes_its_tags() {
         recreated_tags.is_empty(),
         "case \"recreated rule\": expected a rule created again to carry no tags, got \
          {recreated_tags:?}"
+    );
+}
+
+/// How Config words the refusal of a tag key in the namespace AWS reserves for its own
+/// tags: a fixed sentence, echoing nothing of the request.
+const RESERVED_NAMESPACE_MESSAGE: &str = "One or more parameter value is invalid";
+
+/// How Config words the refusal of a tag list that names one key twice: fixed as well,
+/// naming the list rather than the key that was repeated.
+const DUPLICATE_KEYS_MESSAGE: &str = "Duplicate tags exists in tags list";
+
+/// The error code both refusals carry, which every operation they are answered from
+/// models (`smithy_query(query="operation", operation="TagResource")` lists
+/// `ValidationException`, client, httpError 400).
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The tag every target carries BEFORE a refused request reaches it, so the refusal can
+/// be shown to leave the resource's tag set exactly as it was.
+const BASELINE: (&str, &str) = ("owner", "platform");
+
+/// Call `operation` and return its status, its error code and its message.
+async fn refusal(emulator: &Emulator, operation: &str, body: &Value) -> (u16, String, String) {
+    let (status, parsed) = emulator.call(operation, body).await;
+    let code = parsed
+        .get("__type")
+        .and_then(Value::as_str)
+        .map(|wire| wire.rsplit('#').next().unwrap_or(wire).to_string())
+        .unwrap_or_else(|| format!("<no __type in {parsed}>"));
+    let message = parsed
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (status, code, message)
+}
+
+/// Require that `operation` with `body` was refused with the 400 `ValidationException`
+/// `expected_message` states.
+async fn assert_refused(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    body: &Value,
+    expected_message: &str,
+) {
+    let (status, code, message) = refusal(emulator, operation, body).await;
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (400, VALIDATION_EXCEPTION, expected_message),
+        "case {case:?}: expected {operation} to answer HTTP 400 {VALIDATION_EXCEPTION} \
+         {expected_message:?}, got {status} {code} {message:?}"
+    );
+}
+
+/// One row of the refused-content table: the case, the list the request carries, and
+/// the message Config refuses it with.
+type RefusedListCase = (&'static str, Tags, &'static str);
+
+/// Every tag list Config will not store, with the sentence it refuses each with: the
+/// case, the list the request carries, and the expected message.
+///
+/// The rows differ along what the rule generalises over — how the reserved prefix is
+/// spelled (lower, upper and mixed case, and the prefix with nothing after it), where in
+/// the list the offending entry sits, how a repeat is spaced out (adjacent, separated by
+/// another key), what values the repeated entries carry (two values, the same value
+/// twice), and the length of the repeated key, up to the published maximum. The last row
+/// carries BOTH faults and is refused for the one the list breaks first.
+fn refused_tag_lists() -> Vec<RefusedListCase> {
+    let longest = "k".repeat(TAG_KEY_MAXIMUM_LENGTH);
+    vec![
+        (
+            "a reserved key alone",
+            vec![pair("aws:cloudformation:stack-name", "a-stack")],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+        (
+            "a reserved key spelled in upper case",
+            vec![pair("AWS:Name", "a-name")],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+        (
+            "a reserved key spelled in mixed case",
+            vec![pair("Aws:region", "eu-west-1")],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+        (
+            "the reserved prefix with nothing after it",
+            vec![pair("aws:", "nothing")],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+        (
+            "a reserved key after an acceptable one",
+            vec![pair("team", "sre"), pair("aws:createdBy", "someone")],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+        (
+            "a reserved key at the longest spelling a key may have",
+            vec![pair(
+                &format!("aws:{}", "x".repeat(TAG_KEY_MAXIMUM_LENGTH - "aws:".len())),
+                "v",
+            )],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+        (
+            "a key repeated with two values",
+            vec![pair("dupe", "first"), pair("dupe", "second")],
+            DUPLICATE_KEYS_MESSAGE,
+        ),
+        (
+            "a key repeated with the same value",
+            vec![pair("dupe", "same"), pair("dupe", "same")],
+            DUPLICATE_KEYS_MESSAGE,
+        ),
+        (
+            "a key repeated either side of another key",
+            vec![
+                pair("dupe", "first"),
+                pair("other", "value"),
+                pair("dupe", "second"),
+            ],
+            DUPLICATE_KEYS_MESSAGE,
+        ),
+        (
+            "the key the resource already carries, repeated",
+            vec![pair(BASELINE.0, "first"), pair(BASELINE.0, "second")],
+            DUPLICATE_KEYS_MESSAGE,
+        ),
+        (
+            "a key at the published maximum length repeated",
+            vec![
+                (longest.clone(), "first".to_string()),
+                (longest, "second".to_string()),
+            ],
+            DUPLICATE_KEYS_MESSAGE,
+        ),
+        (
+            "a reserved key that is also repeated",
+            vec![pair("aws:both", "first"), pair("aws:both", "second")],
+            RESERVED_NAMESPACE_MESSAGE,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn tag_resource_refuses_a_reserved_or_repeated_key_and_changes_nothing() {
+    let (emulator, resources) = taggable_resources().await;
+    let carried = vec![pair(BASELINE.0, BASELINE.1)];
+    for target in &resources {
+        tag(&emulator, &target.arn, &carried).await;
+    }
+
+    for (row, list, expected_message) in refused_tag_lists() {
+        for target in &resources {
+            let case = format!("{row} on a {}", target.kind);
+            let body = json!({ "ResourceArn": target.arn, "Tags": tag_list(&list) });
+            assert_refused(&emulator, &case, "TagResource", &body, expected_message).await;
+            // The refusal is ATOMIC: no key of the refused list is present afterwards,
+            // and the tag the resource already carried is untouched.
+            let listed = all_tags(&emulator, &case, &target.arn).await;
+            assert_eq!(
+                listed,
+                expected_map(&carried),
+                "case {case:?}: expected the refused request to change nothing, got \
+                 {listed:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tag_resource_stores_keys_that_only_resemble_a_reserved_or_repeated_key() {
+    // The other half of the rule, so the checks refuse requests rather than tags. Rows
+    // differ along HOW a key comes close without breaking either rule: the reserved
+    // letters without the separator, the prefix somewhere other than the start, and two
+    // keys that differ only in case or in padding — a tag key is matched verbatim and is
+    // case-sensitive, so each pair is two tags rather than one key repeated.
+    let cases: [(&str, Vec<(String, String)>); 6] = [
+        (
+            "the reserved letters with no separator",
+            vec![pair("aws", "v")],
+        ),
+        (
+            "keys opening with the reserved letters",
+            vec![pair("awsome", "v"), pair("awsaccount", "w")],
+        ),
+        (
+            "the reserved prefix somewhere other than the start",
+            vec![pair("my:aws:thing", "v")],
+        ),
+        (
+            "two keys differing only in case",
+            vec![pair("dupe", "lower"), pair("Dupe", "upper")],
+        ),
+        (
+            "two keys differing only in padding",
+            vec![pair("padded", "bare"), pair(" padded", "leading")],
+        ),
+        (
+            "many distinct keys in one list",
+            vec![pair("a", "1"), pair("b", "2"), pair("c", "3")],
+        ),
+    ];
+
+    for (row, list) in cases {
+        let (emulator, resources) = taggable_resources().await;
+        for target in &resources {
+            let case = format!("{row} on a {}", target.kind);
+            emulator
+                .ok(
+                    "TagResource",
+                    &json!({ "ResourceArn": target.arn, "Tags": tag_list(&list) }),
+                )
+                .await;
+            let listed = all_tags(&emulator, &case, &target.arn).await;
+            assert_eq!(
+                listed,
+                expected_map(&list),
+                "case {case:?}: expected the written tags to read back, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// A `PutStoredQuery` body whose query is a Config query, so only the tags it carries
+/// can refuse it.
+fn stored_query_request(name: &str) -> Value {
+    json!({
+        "StoredQuery": {
+            "QueryName": name,
+            "Expression": "SELECT resourceId WHERE resourceType = 'AWS::S3::Bucket'",
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_create_carrying_a_reserved_or_repeated_key_is_refused_and_creates_nothing() {
+    // The same content rules on the OTHER operations that write a caller-supplied tag
+    // list and model this refusal: the list is judged before the resource is minted, so
+    // a refused create leaves nothing behind.
+    for (row, list, expected_message) in refused_tag_lists() {
+        let emulator = Emulator::new();
+
+        let mut query = stored_query_request("tag-content-query");
+        query["Tags"] = tag_list(&list);
+        let case = format!("{row} on PutStoredQuery");
+        assert_refused(&emulator, &case, "PutStoredQuery", &query, expected_message).await;
+        let queries = emulator.ok("ListStoredQueries", &json!({})).await;
+        let saved = queries["StoredQueryMetadata"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a metadata list, got {queries}"));
+        assert!(
+            saved.is_empty(),
+            "case {case:?}: expected the refused create to store no query, got {saved:?}"
+        );
+
+        let mut recorder = recorder_request(json!({ "roleARN": ROLE_ARN }));
+        recorder["Tags"] = tag_list(&list);
+        let case = format!("{row} on PutConfigurationRecorder");
+        assert_refused(
+            &emulator,
+            &case,
+            "PutConfigurationRecorder",
+            &recorder,
+            expected_message,
+        )
+        .await;
+
+        let mut linked = json!({ "ServicePrincipal": SERVICE_LINKED_PRINCIPALS[0] });
+        linked["Tags"] = tag_list(&list);
+        let case = format!("{row} on PutServiceLinkedConfigurationRecorder");
+        assert_refused(
+            &emulator,
+            &case,
+            "PutServiceLinkedConfigurationRecorder",
+            &linked,
+            expected_message,
+        )
+        .await;
+
+        let described = emulator
+            .ok("DescribeConfigurationRecorders", &json!({}))
+            .await;
+        let recorders = described["ConfigurationRecorders"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a recorder list, got {described}"));
+        assert!(
+            recorders.is_empty(),
+            "case {case:?}: expected the refused creates to store no recorder, got \
+             {recorders:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_create_carrying_an_acceptable_tag_list_stores_it() {
+    // The accepting half on the create path: a list that breaks neither rule is stored
+    // at creation and read back through the tag read path.
+    let emulator = Emulator::new();
+    let written = vec![
+        pair("awsome", "v"),
+        pair("dupe", "lower"),
+        pair("Dupe", "upper"),
+    ];
+    let mut query = stored_query_request("tag-content-query");
+    query["Tags"] = tag_list(&written);
+    let saved = emulator.ok("PutStoredQuery", &query).await;
+    let arn = saved["QueryArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PutStoredQuery must answer a QueryArn, got {saved}"))
+        .to_string();
+
+    let case = "a create carrying acceptable tags";
+    let listed = all_tags(&emulator, case, &arn).await;
+    assert_eq!(
+        listed,
+        expected_map(&written),
+        "case {case:?}: expected the created query to carry the tags its create named, \
+         got {listed:?}"
     );
 }

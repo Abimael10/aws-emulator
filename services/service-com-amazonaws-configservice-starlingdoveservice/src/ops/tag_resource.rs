@@ -201,6 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The content rules the submitted list has to satisfy whatever resource it is
+        // written to: no key in the namespace AWS reserves for its own tags, and no key
+        // the one list names twice. Both are judged before the list is collapsed into a
+        // tag set (which keeps one value per key, so a repeat would be invisible after
+        // it) and before the store is reached at all, so a refused request changes
+        // nothing about the resource's tags.
+        if let Some(message) = crate::state::tag_list_refusal(&input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message.to_string()),
+            })
+            .into());
+        }
+
         let requested = crate::state::tag_set(&input.tags);
 
         let mut store = state.lock();

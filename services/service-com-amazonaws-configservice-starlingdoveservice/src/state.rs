@@ -4954,7 +4954,8 @@ mod discovered_resource;
 // How the ids above are DRAWN, in one place, so no mint derives one from a counter.
 mod identifier;
 // How a tagging request's `ResourceArn` is resolved to the tag set of the resource it
-// names, for every taggable resource type this store holds.
+// names, for every taggable resource type this store holds, and the content rules a
+// submitted tag list has to satisfy before any of it is stored.
 mod tagging;
 // How Config words the refusal of a call made on a resource an AWS SERVICE owns rather
 // than this account: a service-linked configuration recorder, and a Config rule a
@@ -4967,3 +4968,4 @@ pub use delivery_channel::*;
 pub use discovered_resource::*;
 pub use identifier::*;
 pub use protected_resource::*;
+pub use tagging::*;

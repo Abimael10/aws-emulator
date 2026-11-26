@@ -308,6 +308,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested.recording_scope.clone(),
         ));
 
+        // The tags a create carries are judged by the same content rules every tag write
+        // of this service is judged by, before anything is stored.
+        if let Some(message) =
+            crate::state::tag_list_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(PutConfigurationRecorderErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
