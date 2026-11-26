@@ -686,6 +686,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request — "after the call completes successfully, the stack creation starts", and
         // the processing is part of that creation.
         let processing = crate::state::include::process(ctx, &region, &template_body).await;
+        // ...and then the REGISTERED macros its `Transform` section names are performed over
+        // that document, in the order the template declares them: a macro is a function a
+        // client registered, and performing it means INVOKING that function with the fragment
+        // and deploying the fragment it answers — so the resource a macro INJECTS is created
+        // with the stack, exactly as one the body declares itself is
+        // ([`crate::state::private_macro::expand_declared`]). A macro that fails is this
+        // stage's failure, so the stack reports the transform's own sentence and deploys
+        // nothing.
+        let processing = crate::state::private_macro::expand_declared(
+            ctx,
+            &*self.engine,
+            &region,
+            &template_body,
+            &parameter_values,
+            processing,
+        )
+        .await;
         // The capabilities are weighed again over the PROCESSED template: a resource a
         // snippet CONTRIBUTES is as much the stack's as one the body declares itself, so
         // the acknowledgement this request carries is held to the template that really
@@ -1174,6 +1191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack_id: Some(stack_id.clone()),
             operation_id: Some(operation_id),
         };
+        // Whether the deployment's own failure (if it had one) is a diagnostic CLOUDFORMATION
+        // reached before asking any owning service for anything, read before the walk's
+        // result is taken apart: such a failure is reported on the stack's own event, exactly
+        // as a failure of the stages that process and validate the template is
+        // ([`crate::state::provisioning::Materialised::diagnosed`]).
+        let diagnosed_deployment = materialised.diagnosed;
         // What the failure (if any) owes the stack beyond the CREATE_FAILED it records:
         // the resources to remove again, and the status that removal settles the stack
         // into.
@@ -1242,7 +1265,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // for the same reason — the document the stack would have deployed could
                     // not be produced, so the transform's own sentence is on the stack's
                     // event ([`crate::state::StoredStack::fail_transition_on_template`]) —
-                    // and carries no detailed status, being no validation's verdict.
+                    // and carries no detailed status, being no validation's verdict. So is a
+                    // DYNAMIC REFERENCE the deployment could not resolve: CloudFormation
+                    // refuses that deployment before asking any owning service for anything,
+                    // so the resolver's diagnostic is on the stack's own events too — as the
+                    // PROGRESS event of the operation that was reading those values when it
+                    // could not read one
+                    // ([`crate::state::StoredStack::report_deployment_diagnostic`]), and then
+                    // on the failed status that diagnostic owes.
+                    if diagnosed_deployment {
+                        stack.report_deployment_diagnostic(failed_at, failure.clone());
+                    }
                     if stack.disable_rollback {
                         if refused_by_validation {
                             stack.fail_transition_on_validation(
@@ -1260,6 +1293,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         stack.keep_failed_resources(&materialised.transitions, failed_at);
                         None
                     } else {
+                        // Whether the failure is CLOUDFORMATION's OWN, reached before
+                        // anything was asked of any owning service: the stage that processes
+                        // the template and the one that resolves the dynamic references of
+                        // what it declares (`crate::state::dynamic_references`) each refuse
+                        // the deployment on their own, so no resource of this stack has an
+                        // event that could carry the diagnostic and the stack's own events
+                        // are the one report of it.
+                        let diagnosed = refused_by_processing || diagnosed_deployment;
                         if refused_by_validation {
                             stack.fail_transition_on_validation(
                                 failed_at,
@@ -1267,7 +1308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 failure.clone(),
                                 false,
                             );
-                        } else if refused_by_processing {
+                        } else if diagnosed {
                             stack.fail_transition_on_template(
                                 failed_at,
                                 status::CREATE_FAILED,

@@ -182,6 +182,34 @@ impl StoredStack {
         self.record_failure(now, failed_status, reason, FailureReport::Diagnosed);
     }
 
+    /// Report, ON THE OPERATION IN FLIGHT, a diagnostic CLOUDFORMATION reached about the
+    /// template it is deploying — a value it could not read from the store the template
+    /// sources it from ([`super::ssm_parameters`], [`super::dynamic_references`]).
+    ///
+    /// The operation is in its `*_IN_PROGRESS` status when CloudFormation reads those values,
+    /// so what it reports is a PROGRESS event of that operation: the stack's own event in the
+    /// status it is in, carrying the diagnostic, which is where a client polling the stack's
+    /// events reads WHICH value could not be read. The failure the diagnostic then owes is
+    /// recorded by the caller ([`Self::fail_transition_on_template`]), so the event stream
+    /// carries the diagnostic and then the failed status, in that order.
+    ///
+    /// The event belongs to the operation in flight, so it carries that operation's id and
+    /// the token every event of it carries.
+    pub fn report_deployment_diagnostic(&mut self, now: SystemTime, reason: String) {
+        let in_progress = self.status.clone();
+        let operation_id = self
+            .last_operation()
+            .map(|operation| operation.operation_id.clone());
+        let client_request_token = self.client_request_token.clone();
+        self.record_event(
+            now,
+            &in_progress,
+            Some(reason),
+            operation_id,
+            client_request_token,
+        );
+    }
+
     /// The one writer of a failed transition, for every one of the reports above.
     pub(super) fn record_failure(
         &mut self,

@@ -127,7 +127,7 @@ fn trust_policy() -> Value {
 /// The template that REGISTERS a macro: the function that performs it, the role that function
 /// runs as, and the `AWS::CloudFormation::Macro` resource that names the macro and its
 /// function.
-fn registration(macro_name: &str, handler: &str) -> String {
+pub(crate) fn registration(macro_name: &str, handler: &str) -> String {
     json!({
         "Resources": {
             "Role": {
@@ -159,7 +159,11 @@ fn registration(macro_name: &str, handler: &str) -> String {
 
 /// Deploy the registration stack and wait until the function it declares is one Lambda reports
 /// `Active`, so the macro's invocation reaches a function that can run.
-async fn register_macro(
+///
+/// Shared with the suite that deploys a stack whose `Transform` names a registered macro
+/// (`macro_transform_deployment.rs`): registering a macro is the same work whichever operation
+/// then performs it, so it is spelled once.
+pub(crate) async fn register_macro(
     router: &MultiServiceRouter,
     stack: &str,
     macro_name: &str,
@@ -238,7 +242,7 @@ async fn create_change_set(
 
 /// A macro handler that answers the macro protocol: the `requestId` it was given, the status
 /// `success` and the fragment `body` computes from the one it was handed.
-fn handler(body: &str) -> String {
+pub(crate) fn handler(body: &str) -> String {
     format!(
         r#"
 def handler(event, context):

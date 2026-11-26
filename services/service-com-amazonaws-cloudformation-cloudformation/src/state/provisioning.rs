@@ -1136,6 +1136,19 @@ pub struct Materialised {
     /// resource was asked of anybody, so there is no resource whose failure it could be
     /// summarising.
     pub failure: Option<String>,
+    /// Whether that failure is one CLOUDFORMATION itself reached in the stage that resolves
+    /// the declarations' dynamic references, before anything was asked of any owning service
+    /// ([`super::dynamic_references::resolve_declared`]).
+    ///
+    /// It decides how the failure is REPORTED, which is why it travels beside the reason
+    /// rather than being re-derived from its text: no resource of this deployment has an
+    /// event that could carry a diagnostic about the template, so the stack's own failed
+    /// event is the one report of it
+    /// ([`super::StoredStack::fail_transition_on_template`]) — the same report the stages
+    /// that process the template and validate it before provisioning already get. `false`
+    /// for a failure the resources are what reached, whose own refusals are on those
+    /// resources' events.
+    pub diagnosed: bool,
     /// Every resource transition this deployment made, oldest first — the stack's
     /// per-resource event records.
     pub transitions: Vec<ResourceTransition>,
@@ -2484,7 +2497,11 @@ pub async fn reconcile(
         {
             Ok(resolutions) => resolutions,
             Err(reason) => {
+                // CLOUDFORMATION's own refusal, reached before any owning service was asked
+                // anything: the stack's own failed event is what reports it, since no
+                // resource of this deployment has one.
                 outcome.failure = Some(reason);
+                outcome.diagnosed = true;
                 BTreeMap::new()
             }
         }

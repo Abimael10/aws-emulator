@@ -1033,6 +1033,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // its own failure ([`crate::state::exports::ExportPublication`] records
                     // why that is the stage).
                     let failure = materialised.failure;
+                    // Whether CloudFormation itself reached that failure before asking any
+                    // owning service for anything — a dynamic reference the deployment could
+                    // not resolve — which is the report whose diagnostic no resource's event
+                    // could carry
+                    // ([`crate::state::provisioning::Materialised::diagnosed`]).
+                    let diagnosed = materialised.diagnosed;
                     match failure {
                         None => {
                             // The execution got through its calls to the owning services and
@@ -1061,6 +1067,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // deployment before asking anybody.
                             if creating {
                                 let failed_at = ::std::time::SystemTime::now();
+                                // A value the deployment could not READ is reported on the
+                                // operation in flight first, exactly as `CreateStack` reports
+                                // one: the stack was CREATE_IN_PROGRESS when CloudFormation
+                                // read the values the template deploys with
+                                // ([`crate::state::StoredStack::report_deployment_diagnostic`]).
+                                if diagnosed {
+                                    stack.report_deployment_diagnostic(
+                                        failed_at,
+                                        failure.clone(),
+                                    );
+                                }
                                 // The stack rests in the failed status only where nothing
                                 // follows it: a rollback (or the removal `DELETE` asks for)
                                 // begins at this very instant and its own event is what
@@ -1068,6 +1085,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 // ([`crate::state::StoredStack::fail_transition_superseded`]).
                                 if stack.disable_rollback {
                                     stack.fail_transition(
+                                        failed_at,
+                                        status::CREATE_FAILED,
+                                        failure.clone(),
+                                    );
+                                } else if diagnosed {
+                                    // ...bar CloudFormation's own diagnostic, which no
+                                    // resource of this stack has an event for: the stack's
+                                    // own failed event carries it
+                                    // ([`crate::state::StoredStack::fail_transition_on_template`]).
+                                    stack.fail_transition_on_template(
                                         failed_at,
                                         status::CREATE_FAILED,
                                         failure.clone(),
@@ -1140,6 +1167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     status::UPDATE_FAILED,
                                     failure,
                                     false,
+                                    diagnosed,
                                     &materialised.transitions,
                                 );
                                 None

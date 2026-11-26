@@ -894,6 +894,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this update is compared with below.
         let processing =
             crate::state::include::process(ctx, &request_region, &template_body).await;
+        // ...and then the REGISTERED macros its `Transform` section names are performed over
+        // that document, exactly as a create's are: an update deploys the document the macros
+        // produced, so a macro's output is what this update is compared with and what its
+        // resources are created from ([`crate::state::private_macro::expand_declared`]).
+        let processing = crate::state::private_macro::expand_declared(
+            ctx,
+            &*self.engine,
+            &request_region,
+            &template_body,
+            &parameter_values,
+            processing,
+        )
+        .await;
         // The acknowledgement is held to the PROCESSED template, exactly as a create's is:
         // a resource an included snippet contributes is one this update would deploy.
         if let crate::state::include::Processed::Expanded(processed) = &processing {
@@ -1581,6 +1594,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // down anything it supersedes — so they arrive here as its own failure
             // ([`crate::state::exports::ExportPublication`] records why that is the stage).
             let failure = materialised.failure;
+            // Whether CloudFormation itself reached that failure before asking any owning
+            // service for anything — a dynamic reference the deployment could not resolve —
+            // which decides which report carries it
+            // ([`crate::state::provisioning::Materialised::diagnosed`]).
+            let diagnosed = materialised.diagnosed;
             if let Some(failure) = failure {
                 // The deployment could not be carried out: the update does not reach
                 // UPDATE_COMPLETE, and the stack reports what failed
@@ -1604,6 +1622,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status::UPDATE_FAILED,
                     failure,
                     refused_by_validation,
+                    diagnosed,
                     &materialised.transitions,
                 );
             }

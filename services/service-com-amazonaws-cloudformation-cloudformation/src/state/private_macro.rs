@@ -411,16 +411,14 @@ fn still_owed(
 /// section, which is what a template-level macro processes; the fragment each macro answers is
 /// what the next one is handed.
 ///
-/// The chain STOPS as soon as the change set no longer owes the expansion ([`still_owed`]) — so
-/// a creation its own deadline has settled is not followed by invocations nothing will read,
-/// and no further macro runs for it.
-async fn processed_fragment(
+/// `still_owed` is asked before each invocation: a chain whose answer nothing will read any
+/// more stops rather than invoking further macros for it.
+async fn invoked_chain<Owed: Fn() -> bool>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     pending: &PendingMacros,
     body: &str,
-    state: &::engine::ServiceState<ComAmazonawsCloudformationCloudformationState>,
-    change_set_id: &str,
+    still_owed: Owed,
 ) -> Result<String, String> {
     let Some(Value::Object(mut document)) = template::document(body) else {
         return Err(transform_failure(
@@ -437,7 +435,7 @@ async fn processed_fragment(
     document.remove(TRANSFORM_SECTION);
     let mut fragment = Value::Object(document);
     for invoked in &pending.macros {
-        if !still_owed(state, change_set_id) {
+        if !still_owed() {
             return Err(pending.unanswered_reason());
         }
         fragment = invoke(ctx, region, invoked, &fragment, &pending.parameters).await?;
@@ -452,6 +450,97 @@ async fn processed_fragment(
             &error.to_string(),
         )
     })
+}
+
+/// Perform the REGISTERED macros a template a stack OPERATION submitted invokes, over the
+/// document that operation would otherwise deploy, and answer the stage that leaves.
+///
+/// This is the other half of the rule this module implements: a macro is performed before the
+/// template is PLANNED from (which is [`start`], for a change set) and equally before it is
+/// DEPLOYED from — "CloudFormation processes the template fragments" a transform names before
+/// it does anything with the template's resources. So an operation that deploys a template
+/// directly performs the macros here, in the stage that processes the template, and what
+/// deploys below is the document the macros produced: the resource a macro INJECTED is as much
+/// the stack's as one the body declares itself, and a macro that fails is the stack's own
+/// template-processing failure rather than a resource's.
+///
+/// `included` is what the stage has reached so far — the `AWS::Include` snippets the template
+/// names, spliced in ([`super::include::process`]) — and is what the macros are handed: the
+/// stage is one pipeline, so a macro processes the document the splices made. A body whose
+/// includes could not be read is answered as it stands: that failure is the stage's, and
+/// nothing is invoked for a template nothing will deploy.
+///
+/// The invocation runs INLINE, on the operation's own call, because the operation's deployment
+/// does too: the document the resources are created from has to exist before any owning
+/// service is asked for one. It is bounded exactly as the change-set expansion is — at most
+/// [`MAX_MACROS_PER_TEMPLATE`] macros, the whole chain cut off at [`MACRO_ANSWER_DEADLINE`] —
+/// and a template that names no registered macro invokes nothing at all.
+pub async fn expand_declared<Eng: Send + Sync + 'static>(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
+    region: &str,
+    submitted: &str,
+    parameters: &BTreeMap<String, String>,
+    included: super::include::Processed,
+) -> super::include::Processed {
+    use super::include::Processed;
+
+    let body = match &included {
+        Processed::Failed(_) => return included,
+        Processed::Expanded(spliced) => spliced.clone(),
+        Processed::Unchanged => submitted.to_string(),
+    };
+    let Some(state) = super::service_state(engine) else {
+        return included;
+    };
+    let pending = {
+        let mut held = state.lock();
+        held.settle(SystemTime::now());
+        PendingMacros::declared(&held, region, &body, parameters.clone())
+    };
+    // A template invoking no macro a client registered is left exactly as the stage above
+    // produced it: nothing here guesses at a transform this emulator does not perform.
+    let Some(pending) = pending else {
+        return included;
+    };
+    if let Some(over_the_bound) = pending.over_the_bound() {
+        return Processed::Failed(over_the_bound);
+    }
+    // Every macro of the chain is asked for, in turn, and the WHOLE chain — the turn it waits
+    // for among the expansions this service performs at once included — is cut off at the span
+    // one operation's macros are given, so the call that submitted the template cannot be held
+    // past it however many other templates are being expanded.
+    let chain = async {
+        let Ok(_in_flight) = EXPANSIONS_IN_FLIGHT.acquire().await else {
+            return Err(pending.unanswered_reason());
+        };
+        invoked_chain(ctx, region, &pending, &body, || true).await
+    };
+    match ::tokio::time::timeout(MACRO_ANSWER_DEADLINE, chain).await {
+        Ok(Ok(produced)) => Processed::Expanded(produced),
+        Ok(Err(reason)) => Processed::Failed(reason),
+        Err(_elapsed) => Processed::Failed(pending.unanswered_reason()),
+    }
+}
+
+/// Invoke each macro a CHANGE SET's creation owes in turn and answer the document the last of
+/// them produced ([`invoked_chain`]).
+///
+/// The chain STOPS as soon as the change set no longer owes the expansion ([`still_owed`]) — so
+/// a creation its own deadline has settled is not followed by invocations nothing will read,
+/// and no further macro runs for it.
+async fn processed_fragment(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    pending: &PendingMacros,
+    body: &str,
+    state: &::engine::ServiceState<ComAmazonawsCloudformationCloudformationState>,
+    change_set_id: &str,
+) -> Result<String, String> {
+    invoked_chain(ctx, region, pending, body, || {
+        still_owed(state, change_set_id)
+    })
+    .await
 }
 
 /// Invoke ONE macro's function with the request AWS documents, and answer the fragment it

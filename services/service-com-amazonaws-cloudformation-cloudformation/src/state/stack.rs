@@ -3031,6 +3031,12 @@ pub struct HeldFailure {
     /// Whether a PRE-DEPLOYMENT VALIDATION is what reached it, which decides which report
     /// carries it ([`StoredStack::fail_transition_on_validation`]).
     pub on_validation: bool,
+    /// Whether CLOUDFORMATION ITSELF reached it before anything was asked of any owning
+    /// service — a dynamic reference the deployment could not resolve
+    /// ([`provisioning::Materialised::diagnosed`]) — which is the other report whose
+    /// diagnostic no resource's event could carry, so the stack's own event is the one report
+    /// of it ([`StoredStack::fail_transition_on_template`]).
+    pub diagnosed: bool,
     /// What the deployment did to each resource it acted on, which those resources' records
     /// take when the failure is reported
     /// ([`StoredStack::record_failed_resource_statuses`]).
@@ -3058,6 +3064,7 @@ impl StoredStack {
         failed_status: &str,
         reason: String,
         on_validation: bool,
+        diagnosed: bool,
         transitions: &[provisioning::ResourceTransition],
     ) {
         self.wait_conditions.clear();
@@ -3069,6 +3076,7 @@ impl StoredStack {
             failed_status: failed_status.to_string(),
             reason,
             on_validation,
+            diagnosed,
             transitions: transitions.to_vec(),
         });
         if self.pending.is_none() {
@@ -3099,6 +3107,13 @@ impl StoredStack {
         // rollback begins at this instant never rests in it and the rollback's own event is
         // what carries the failure ([`Self::fail_transition_superseded`]).
         let rests = self.disable_rollback || !updating;
+        // A value the deployment could not READ is reported on the operation in flight
+        // first, exactly as a create reports one: the stack was in its `*_IN_PROGRESS`
+        // status when CloudFormation read the values the template deploys with
+        // ([`Self::report_deployment_diagnostic`]).
+        if held.diagnosed {
+            self.report_deployment_diagnostic(at, held.reason.clone());
+        }
         if held.on_validation {
             self.fail_transition_on_validation(
                 at,
@@ -3106,6 +3121,13 @@ impl StoredStack {
                 held.reason.clone(),
                 rests,
             );
+        } else if held.diagnosed && !rests {
+            // CloudFormation's own diagnostic, reached before any owning service was asked
+            // anything: no resource of this stack has an event that could carry it, so the
+            // stack's own failed event does — even though its rollback begins at this same
+            // instant. A stack that RESTS in the failed status gets that event from
+            // [`Self::fail_transition`] below either way.
+            self.fail_transition_on_template(at, &held.failed_status, held.reason.clone());
         } else if rests {
             self.fail_transition(at, &held.failed_status, held.reason.clone());
         } else {

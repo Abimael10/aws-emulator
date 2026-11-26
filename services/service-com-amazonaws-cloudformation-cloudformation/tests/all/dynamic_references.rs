@@ -360,7 +360,10 @@ async fn a_dynamic_reference_is_honoured_only_as_its_form_allows() {
             carrier: Carrier::DatabasePassword,
             expected: Deployed::RolledBack,
             deployed_value: None,
-            reason: &["ParameterNotFound", "{name}"],
+            // The one condition CloudFormation states a sentence of its own for, naming the
+            // reference as the template wrote it — version selector and all. The sentence is
+            // pinned in full in `unresolvable_reference_stack_event.rs`.
+            reason: &["Parameters: [ssm-secure:{name}", "] cannot be found."],
         },
         Row {
             case: "ssm-secure in a property of the same type AWS does not publish for it",
@@ -436,7 +439,7 @@ async fn a_dynamic_reference_is_honoured_only_as_its_form_allows() {
             carrier: Carrier::ParameterValue,
             expected: Deployed::RolledBack,
             deployed_value: None,
-            reason: &["ParameterNotFound", "{name}"],
+            reason: &["Parameters: [ssm:{name}] cannot be found."],
         },
         Row {
             case: "a reference INSIDE a longer property value resolves in place",

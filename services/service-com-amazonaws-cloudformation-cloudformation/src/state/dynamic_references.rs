@@ -24,9 +24,17 @@
 //! reference stands in an unsupported property — is a MISUSE of the reference rather than a
 //! value, and the misuse is CLOUDFORMATION's own refusal: no resource provider is asked
 //! about any of the deployment's resources, and the diagnostic saying WHICH reference could
-//! not be honoured and why is what the stack itself reports as its status reason, so a
-//! create rolls back carrying the resolver's words rather than a summary of resources that
-//! tried and failed ([`super::provisioning::reconcile`] is what records that).
+//! not be honoured and why is what the stack itself reports as its status reason AND on its
+//! own failed event — no resource has an event that could carry it — so a create rolls back
+//! carrying the resolver's words rather than a summary of resources that tried and failed
+//! ([`super::provisioning::reconcile`] is what records that).
+//!
+//! One of those conditions has a sentence of CloudFormation's own: a reference naming a
+//! parameter the store holds NOTHING under is reported as `Parameters: [` … `] cannot be
+//! found.`, the brackets holding every such reference as the template wrote it
+//! ([`Unresolvable::NotFound`]). Every other misuse is reported in the resolver's own words,
+//! and a deployment is refused once for the whole set rather than at the first reference, so
+//! the one diagnostic names every reference a client has to fix.
 //!
 //! A `secretsmanager` reference is resolved LATER: as the resource whose property carries it
 //! is created or updated ([`resolve_as_deployed`]), because the secret it names may be one
@@ -124,6 +132,11 @@ const SECRET_STRING: &str = "SecretString";
 const NO_VALUE_FOR_THE_JSON_KEY: &str =
     "Could not find a value associated with JSONKey in SecretString";
 
+/// The error code Parameter Store answers for a parameter it does not hold
+/// (`ParameterNotFound`: "the parameter couldn't be found"), which is what says a reference
+/// names NO parameter rather than one it may not resolve ([`Unresolvable::NotFound`]).
+const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
+
 /// The head every ARN is written with, which is what says a reference's secret id is an ARN
 /// rather than a secret NAME ([`Named::split_secret_id`]).
 const ARN: &str = "arn:";
@@ -171,6 +184,65 @@ const MAX_REFERENCES: usize = 256;
 /// resources resolves to it. Only the SPELLING of the type head lives here, beside the
 /// `{{resolve:ssm:…}}` forms it sits next to.
 pub const SSM_PARAMETER_TYPE: &str = "AWS::SSM::Parameter::Value<";
+
+/// The sentence CloudFormation reports a value it had to read from Parameter Store BEFORE it
+/// deployed anything, and could not find, with: `Parameters: [` … `] cannot be found.`
+///
+/// FIXED text, with the references it could not find between the brackets, each named as the
+/// template wrote it — the store prefix it names and the reference key, `<store>:<key>`.
+fn cannot_be_found(named: &[String]) -> String {
+    format!("Parameters: [{}] cannot be found.", named.join(", "))
+}
+
+/// Why a dynamic reference could not be honoured, and so what the failure carrying it says.
+///
+/// The two conditions are reported DIFFERENTLY, which is the whole reason they are kept
+/// apart: a reference naming a parameter the store does not hold at all is the one condition
+/// CloudFormation states in a sentence of its own ([`Self::NotFound`]), and every other
+/// misuse of a reference is reported in the resolver's own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unresolvable {
+    /// The store holds no parameter of that name. Each entry names one such reference the way
+    /// the template wrote it — the store prefix and the reference key, `<store>:<key>` — and
+    /// the sentence holds the whole set, because CloudFormation states this condition as a
+    /// LIST of the references it could not find.
+    NotFound(Vec<String>),
+    /// Any other reference this deployment cannot honour, already worded as the reason the
+    /// failure is reported with.
+    Diagnosed(String),
+}
+
+impl Unresolvable {
+    /// The `StackStatusReason` / `ResourceStatusReason` this failure is reported with.
+    fn reason(&self) -> String {
+        match self {
+            // The FIXED text, with the references the template wrote between the brackets.
+            Self::NotFound(named) => cannot_be_found(named),
+            Self::Diagnosed(reason) => reason.clone(),
+        }
+    }
+
+    /// Two failures of the same deployment as ONE report.
+    ///
+    /// A reference the store does not hold stands ahead of any other misuse and names every
+    /// such reference, since the sentence for that condition is a list; of two failures of any
+    /// other kind, the first one reached is the one reported.
+    fn merged(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::NotFound(mut named), Self::NotFound(also)) => {
+                for reference in also {
+                    if !named.contains(&reference) {
+                        named.push(reference);
+                    }
+                }
+                Self::NotFound(named)
+            }
+            (Self::NotFound(named), Self::Diagnosed(_))
+            | (Self::Diagnosed(_), Self::NotFound(named)) => Self::NotFound(named),
+            (first @ Self::Diagnosed(_), Self::Diagnosed(_)) => first,
+        }
+    }
+}
 
 /// One resolved reference: the value the store answered, and whether that value is one the
 /// stack must keep out of its own records (see the module docs).
@@ -221,20 +293,39 @@ pub(super) async fn resolve_declared(
     declared: &[super::StoredResource],
 ) -> Result<BTreeMap<String, Resolution>, String> {
     let mut resolutions = BTreeMap::new();
+    // Every declaration is resolved before the deployment is refused, so the diagnostic names
+    // every reference the deployment could not honour rather than the first one reached: the
+    // sentence CloudFormation states for a reference nothing holds is a LIST, and a client
+    // fixing a template reads the whole set from one failed deployment.
+    let mut unresolvable: Option<Unresolvable> = None;
     for resource in declared {
-        resolutions.insert(
-            resource.logical_id.clone(),
-            resolve(
-                ctx,
-                region,
-                &resource.resource_type,
-                &resource.properties,
-                Pass::BeforeTheDeployment,
-            )
-            .await?,
-        );
+        match resolve(
+            ctx,
+            region,
+            &resource.resource_type,
+            &resource.properties,
+            Pass::BeforeTheDeployment,
+        )
+        .await
+        {
+            Ok(resolution) => {
+                resolutions.insert(resource.logical_id.clone(), resolution);
+            }
+            Err(failure) => unresolvable = Some(folded(unresolvable, failure)),
+        }
     }
-    Ok(resolutions)
+    match unresolvable {
+        Some(unresolvable) => Err(unresolvable.reason()),
+        None => Ok(resolutions),
+    }
+}
+
+/// One more failure folded into what a pass has reached so far ([`Unresolvable::merged`]).
+fn folded(held: Option<Unresolvable>, failure: Unresolvable) -> Unresolvable {
+    match held {
+        Some(held) => held.merged(failure),
+        None => failure,
+    }
 }
 
 /// Resolve the dynamic references ONE resource's properties carry that are resolved as that
@@ -267,7 +358,8 @@ pub(super) async fn resolve_as_deployed(
         properties,
         Pass::AsTheResourceIsDeployed,
     )
-    .await?;
+    .await
+    .map_err(|failure| failure.reason())?;
     *properties = resolution.deployed;
     Ok(())
 }
@@ -289,7 +381,7 @@ async fn resolve(
     resource_type: &str,
     properties: &Value,
     pass: Pass,
-) -> Result<Resolution, String> {
+) -> Result<Resolution, Unresolvable> {
     let mut occurrences = Vec::new();
     collect(properties, "", 0, pass, &mut occurrences);
     if occurrences.is_empty() {
@@ -297,10 +389,10 @@ async fn resolve(
         return Ok(Resolution::verbatim(properties));
     }
     if occurrences.len() > MAX_REFERENCES {
-        return Err(format!(
+        return Err(Unresolvable::Diagnosed(format!(
             "Unable to resolve the dynamic references of this resource: its properties carry \
              more than the {MAX_REFERENCES} this emulator resolves for one resource"
-        ));
+        )));
     }
     // WHERE each reference stands is judged before anything is read: a secure reference
     // outside the properties that support it is refused whatever the store holds.
@@ -311,24 +403,32 @@ async fn resolve(
         if form.restricted_to_published_properties()
             && !secure_reference_supported(resource_type, path)
         {
-            return Err(format!(
+            return Err(Unresolvable::Diagnosed(format!(
                 "SSM Secure reference is not supported in: \
                  [{resource_type}/Properties/{path}]"
-            ));
+            )));
         }
     }
     // Each DISTINCT reference is read once, however many properties name it.
     let references: BTreeSet<&String> =
         occurrences.iter().map(|(_, reference)| reference).collect();
     let mut resolutions: BTreeMap<String, Resolved> = BTreeMap::new();
+    // As above: every reference is read before the document is refused, so one failure does
+    // not hide another the same diagnostic would have named.
+    let mut unresolvable: Option<Unresolvable> = None;
     for reference in references {
         let Some((form, key)) = parsed(reference) else {
             continue;
         };
-        resolutions.insert(
-            reference.clone(),
-            held_value(ctx, region, reference, form, key).await?,
-        );
+        match held_value(ctx, region, reference, form, key).await {
+            Ok(resolved) => {
+                resolutions.insert(reference.clone(), resolved);
+            }
+            Err(failure) => unresolvable = Some(folded(unresolvable, failure)),
+        }
+    }
+    if let Some(unresolvable) = unresolvable {
+        return Err(unresolvable);
     }
     Ok(Resolution {
         deployed: substituted(properties, &resolutions, true, 0),
@@ -409,10 +509,12 @@ async fn held_value(
     reference: &str,
     form: Form,
     key: &str,
-) -> Result<Resolved, String> {
+) -> Result<Resolved, Unresolvable> {
     match form {
         Form::Ssm | Form::SsmSecure => parameter(ctx, region, reference, form, key).await,
-        Form::SecretsManager => secret(ctx, region, reference, key).await,
+        Form::SecretsManager => secret(ctx, region, reference, key)
+            .await
+            .map_err(Unresolvable::Diagnosed),
     }
 }
 
@@ -421,19 +523,22 @@ async fn held_value(
 ///
 /// The read is `GetParameter` on the store's own wire, so a parameter it does not hold
 /// answers with its own `ParameterNotFound` and a version it does not hold with its own
-/// `ParameterVersionNotFound` — the refusal the failure then carries is that service's,
-/// exactly as a refused resource create carries its owning service's.
+/// `ParameterVersionNotFound`. The two are different conditions: a name the store holds NO
+/// parameter under is the one CloudFormation states its own sentence for
+/// ([`Unresolvable::NotFound`]), naming the reference as the template wrote it, and every
+/// other refusal the failure carries is that service's, exactly as a refused resource create
+/// carries its owning service's.
 async fn parameter(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     reference: &str,
     form: Form,
     key: &str,
-) -> Result<Resolved, String> {
+) -> Result<Resolved, Unresolvable> {
     if key.is_empty() {
-        return Err(format!(
+        return Err(Unresolvable::Diagnosed(format!(
             "Unable to resolve the dynamic reference '{reference}': it names no parameter"
-        ));
+        )));
     }
     // The reference key is the name the store is asked for, verbatim: Parameter Store
     // itself reads a `name:version` suffix as the version selector and a full ARN as the
@@ -443,18 +548,23 @@ async fn parameter(
     let answer = call_ssm(ctx, region, GET_PARAMETER, &request)
         .await
         .map_err(|refusal| {
-            format!("Unable to resolve the dynamic reference '{reference}': {refusal}")
+            if refusal.code == PARAMETER_NOT_FOUND {
+                return Unresolvable::NotFound(vec![format!("{}:{key}", form.prefix())]);
+            }
+            Unresolvable::Diagnosed(format!(
+                "Unable to resolve the dynamic reference '{reference}': {refusal}"
+            ))
         })?;
     let held = answer.pointer("/Parameter/Type").and_then(Value::as_str);
     let value = answer.pointer("/Parameter/Value").and_then(Value::as_str);
     let (Some(held), Some(value)) = (held, value) else {
-        return Err(format!(
+        return Err(Unresolvable::Diagnosed(format!(
             "Unable to resolve the dynamic reference '{reference}': the parameter store \
              reported no type and value for {key}"
-        ));
+        )));
     };
     if !form.resolves().contains(&held) {
-        return Err(form.misuse(key));
+        return Err(Unresolvable::Diagnosed(form.misuse(key)));
     }
     Ok(Resolved {
         value: value.to_string(),
@@ -679,6 +789,17 @@ impl Form {
     /// creates, and the two Parameter Store forms cannot.
     fn resolved_as_the_resource_is_deployed(self) -> bool {
         matches!(self, Self::SecretsManager)
+    }
+
+    /// The store PREFIX a reference of this form is written with, which is also how such a
+    /// reference is NAMED in the sentence CloudFormation states for one the store holds
+    /// nothing for ([`Unresolvable::NotFound`]).
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Ssm => SSM,
+            Self::SsmSecure => SSM_SECURE,
+            Self::SecretsManager => SECRETSMANAGER,
+        }
     }
 
     /// The `ResourceStatusReason` a reference of this form pointed at a parameter of a type
