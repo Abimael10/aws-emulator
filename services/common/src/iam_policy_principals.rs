@@ -150,6 +150,39 @@ pub fn account_root_principal(value: &str) -> Option<String> {
     super::arn::is_account_id(value).then(|| account_root_arn(value))
 }
 
+/// The account id an account's ROOT ARN names, or `None` for a value that is no root ARN:
+/// `arn:<partition>:iam::<account id>:root` names the account `<account id>`.
+///
+/// The reading [`account_root_arn`] writes, in any partition, so the pair is one rule.
+#[must_use]
+pub fn root_arn_account(value: &str) -> Option<&str> {
+    let arn = super::arn::parse(value)?;
+    let names_the_root = arn.vendor == "iam"
+        && arn.region.is_empty()
+        && arn.resource == ACCOUNT_ROOT_RESOURCE
+        && super::arn::is_account_id(arn.account);
+    names_the_root.then_some(arn.account)
+}
+
+/// The resource field of an account's root ARN: the root user of an account carries no name
+/// of its own, so the field is this word alone.
+const ACCOUNT_ROOT_RESOURCE: &str = "root";
+
+/// The OTHER spelling of an account principal a policy store may report one in: a whole
+/// account named by its root ARN is written as that account's bare ID
+/// ([`root_arn_account`]), and every other value of the `AWS` principal type — the wildcard,
+/// an identity's ARN, a bare account id already — is the caller's own and is left exactly as
+/// it was submitted.
+///
+/// The `written_as` of an [`super::iam_policy_rendering::ElementValues`] over the `AWS`
+/// type, for a service whose reads report an account principal as the account itself —
+/// [`account_root_principal`] is the same rule for a store that reports the root ARN. It is
+/// a FIXED POINT — an account id is no root ARN, so a value it wrote is one it leaves alone.
+#[must_use]
+pub fn account_principal_id(value: &str) -> Option<String> {
+    root_arn_account(value).map(::std::borrow::ToOwned::to_owned)
+}
+
 /// Whether `value` is a DNS name: at least two labels, each non-empty and written with
 /// ASCII letters, digits and `-`. The form a service principal and a web-identity provider
 /// are published under.
@@ -667,5 +700,101 @@ mod tests {
             None,
             "case \"a text that is no policy\": expected no member, got a quote"
         );
+    }
+
+    /// RULE: the two spellings of an account principal are each other's reading — a bare
+    /// account id is written as that account's root ARN and a root ARN as that account's bare
+    /// id — and every other value of the `AWS` type is left exactly as it was submitted.
+    ///
+    /// The rows differ along what the rule generalises over: which spelling the value is in,
+    /// the partition the ARN is written in, what else an `iam` ARN can name (a user, a role),
+    /// a value that is no ARN at all, and the ways a value can look like a root ARN without
+    /// being one (a Region in it, an account field that is no account id, a longer resource).
+    #[test]
+    fn the_two_account_principal_spellings_read_each_other() {
+        // (case, value, the account it names, what each spelling writes it as)
+        let rows: [(&str, &str, Option<&str>, Option<&str>); 11] = [
+            (
+                "a bare account id",
+                "123456789012",
+                None,
+                Some("arn:aws:iam::123456789012:root"),
+            ),
+            (
+                "an account's root ARN",
+                "arn:aws:iam::123456789012:root",
+                Some("123456789012"),
+                None,
+            ),
+            (
+                "a root ARN of another partition",
+                "arn:aws-cn:iam::123456789012:root",
+                Some("123456789012"),
+                None,
+            ),
+            ("an IAM user", "arn:aws:iam::123456789012:user/alice", None, None),
+            ("an IAM role", "arn:aws:iam::123456789012:role/search", None, None),
+            ("the wildcard", "*", None, None),
+            ("a value that is no ARN", "nobody", None, None),
+            (
+                "a root ARN carrying a Region, which IAM writes none of",
+                "arn:aws:iam:us-east-1:123456789012:root",
+                None,
+                None,
+            ),
+            (
+                "an ARN whose account field is no account id",
+                "arn:aws:iam::12345:root",
+                None,
+                None,
+            ),
+            (
+                "a resource that merely starts with the root's",
+                "arn:aws:iam::123456789012:rootkit",
+                None,
+                None,
+            ),
+            (
+                "the root of an account under another vendor",
+                "arn:aws:sts::123456789012:root",
+                None,
+                None,
+            ),
+        ];
+
+        for (case, value, account, as_root) in rows {
+            let read = root_arn_account(value);
+            assert_eq!(
+                read, account,
+                "case {case:?}: expected the account {account:?}, got {read:?}"
+            );
+            let collapsed = account_principal_id(value);
+            assert_eq!(
+                collapsed.as_deref(),
+                account,
+                "case {case:?}: expected the account spelling {account:?}, got {collapsed:?}"
+            );
+            let expanded = account_root_principal(value);
+            assert_eq!(
+                expanded.as_deref(),
+                as_root,
+                "case {case:?}: expected the root-ARN spelling {as_root:?}, got {expanded:?}"
+            );
+            // Each spelling is a FIXED POINT: what it wrote, it leaves alone.
+            if let Some(written) = collapsed {
+                assert_eq!(
+                    account_principal_id(&written),
+                    None,
+                    "case {case:?}: the account spelling must leave its own output alone"
+                );
+            }
+            if let Some(written) = expanded {
+                assert_eq!(
+                    account_root_principal(&written),
+                    None,
+                    "case {case:?}: the root-ARN spelling must leave its own output alone"
+                );
+            }
+        }
     }
 }

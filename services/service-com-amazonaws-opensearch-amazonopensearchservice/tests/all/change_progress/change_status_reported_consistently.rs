@@ -275,14 +275,16 @@ async fn every_path_reports_one_change_in_one_status() {
 }
 
 /// One access policy document a create can carry: what a failure calls it, the document as the
-/// request supplies it, and the text its PRINCIPAL is written as, which must survive verbatim.
+/// request supplies it, the text its PRINCIPAL is written as in the CONFIGURATION, which must
+/// survive verbatim, and the text a PROPERTY of the change applying it writes that principal
+/// as, which is the account itself where the principal names a whole account.
 ///
 /// The rows differ along the FORM the principal is written in — the bare account id, the
 /// account's root user ARN, a wildcard and a role ARN in a one-element list — and along the
 /// layout the document arrives in, because what the service holds is the document it was
 /// handed rather than a re-rendering of a parse of it. The principal text is stated per row
 /// rather than derived, so the assertion on it holds whatever the service's rendering does.
-fn submitted_policies() -> Vec<(&'static str, String, String)> {
+fn submitted_policies() -> Vec<(&'static str, String, String, String)> {
     let account = ::engine::emulator_account_id();
     vec![
         (
@@ -293,6 +295,7 @@ fn submitted_policies() -> Vec<(&'static str, String, String)> {
                  \"Resource\":\"*\"}}]}}"
             ),
             format!("\"AWS\":\"{account}\""),
+            format!("\"AWS\":\"{account}\""),
         ),
         (
             "a principal written as the account's root user",
@@ -302,12 +305,14 @@ fn submitted_policies() -> Vec<(&'static str, String, String)> {
                  \"Action\":\"es:*\",\"Resource\":\"*\"}}]}}"
             ),
             format!("\"AWS\":\"arn:aws:iam::{account}:root\""),
+            format!("\"AWS\":\"{account}\""),
         ),
         (
             "a wildcard principal",
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
              \"Principal\":\"*\",\"Action\":[\"es:ESHttpGet\"],\"Resource\":\"*\"}]}"
                 .to_string(),
+            "\"Principal\":\"*\"".to_string(),
             "\"Principal\":\"*\"".to_string(),
         ),
         (
@@ -319,22 +324,29 @@ fn submitted_policies() -> Vec<(&'static str, String, String)> {
                  \"es:*\",\n    \"Resource\" : \"*\"\n  }} ]\n}}"
             ),
             format!("\"arn:aws:iam::{account}:role/search\""),
+            format!("\"arn:aws:iam::{account}:role/search\""),
         ),
     ]
 }
 
 /// RULE: the access policy document a create submits is reported back as it was written, on
-/// every path that reports it and as the value the change in flight is setting it to.
+/// every path that reports the CONFIGURATION, and as the value the change in flight is
+/// setting it to with an account principal written as the account itself.
 ///
 /// The expectation is the service's own rendering of a document it was handed — the shared
 /// minifier every service that holds one goes through ([`::service_common::json_document`]),
 /// which drops the insignificant whitespace BETWEEN the document's JSON tokens and changes
-/// nothing else — so what this asserts is that no value inside the document moved.
+/// nothing else — so what this asserts is that no value inside the document moved, bar the
+/// account spelling a change's own property carries
+/// ([`super::super::change_property_account_principal`] holds that one rule over a wider
+/// table).
 #[tokio::test]
 async fn a_submitted_access_policy_is_echoed_as_it_was_written() {
     let emulator = Emulator::new();
 
-    for (index, (case, submitted, principal)) in submitted_policies().into_iter().enumerate() {
+    for (index, (case, submitted, principal, changed_principal)) in
+        submitted_policies().into_iter().enumerate()
+    {
         let domain = format!("policy-echo-{index}");
         let mut body = single_node_create(&domain);
         body["AccessPolicies"] = Value::from(submitted.clone());
@@ -389,8 +401,12 @@ async fn a_submitted_access_policy_is_echoed_as_it_was_written() {
             );
         }
 
-        // And so does the entry the change in flight reports for it: the value the policy is
-        // being set to is the document the caller wrote, JSON content whoever typed it.
+        // And the entry the change in flight reports for it carries the same document, JSON
+        // content whoever typed it — with the one value a change writes in a spelling of its
+        // own: a principal that names a whole ACCOUNT is reported as that account, since the
+        // account's root ARN and the bare account id name the same account and the change
+        // applies one value, not the two spellings of it. Every other value, the principal of
+        // a row that names no account included, is the caller's.
         let modifying = created.body["DomainStatus"]["ModifyingProperties"]
             .as_array()
             .unwrap_or_else(|| {
@@ -406,11 +422,12 @@ async fn a_submitted_access_policy_is_echoed_as_it_was_written() {
             .unwrap_or_else(|| {
                 panic!("case {case}: expected an AccessPolicies entry among {modifying:?}")
             });
+        let moving_to = expected.replace(&principal, &changed_principal);
         assert_eq!(
             (entry["PendingValue"].as_str(), entry["ValueType"].as_str()),
-            (Some(expected.as_str()), Some("STRINGIFIED_JSON")),
+            (Some(moving_to.as_str()), Some("STRINGIFIED_JSON")),
             "case {case}: expected the submitted document as the value the policy is moving \
-             to, got {entry:?}"
+             to, with an account principal written as the account, got {entry:?}"
         );
     }
 }

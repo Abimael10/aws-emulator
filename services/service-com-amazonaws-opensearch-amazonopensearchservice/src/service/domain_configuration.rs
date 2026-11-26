@@ -935,6 +935,37 @@ fn object(members: Vec<(&str, Option<Value>)>) -> Value {
     )
 }
 
+/// The access policy document as a PROPERTY of a configuration change carries it: the
+/// document the domain holds, with every principal that names a whole ACCOUNT written as
+/// that account's id.
+///
+/// A property of a change is the value the service is applying, read out of the change the
+/// service is deploying rather than out of the configuration a caller submitted: an account
+/// principal is one value however it was spelled — the account's root ARN and the bare
+/// account id name the same account — and a change reports it as the account itself. The
+/// configuration's own `AccessPolicies` member is the caller's document and keeps the
+/// spelling the request used ([`stored_access_policies`]), so the two differ exactly where
+/// the submitted document named an account by its root ARN.
+///
+/// Written through the fleet's one policy-document walk
+/// ([`::service_common::iam_policy_rendering::rewritten_values`] over the account spelling
+/// [`::service_common::iam_policy_principals::account_principal_id`]), so no value in the
+/// document beyond that one moves: the member order, the list form of every element, the
+/// spelling of every other value and every byte inside a string literal are the caller's.
+fn changed_policy_document(document: &str) -> String {
+    ::service_common::iam_policy_rendering::rewritten_values(
+        document,
+        &::service_common::iam_policy_rendering::ElementValues {
+            element: PRINCIPAL_ACCOUNT_ELEMENT,
+            written_as: &::service_common::iam_policy_principals::account_principal_id,
+        },
+    )
+}
+
+/// The principal element whose values name an AWS account: the type a
+/// `Principal`/`NotPrincipal` map keys an account or an IAM identity by.
+const PRINCIPAL_ACCOUNT_ELEMENT: &str = "AWS";
+
 /// The value `domain` holds for the option `option` names, as the JSON document a
 /// change reports it as — or `None` when the domain holds no value for it.
 ///
@@ -942,7 +973,9 @@ fn object(members: Vec<(&str, Option<Value>)>) -> Value {
 /// member the configuration does.
 fn option_value(domain: &Domain, option: &str) -> Option<Value> {
     let value = match option {
-        OPT_ACCESS_POLICIES => Value::from(domain.access_policies.clone()?),
+        OPT_ACCESS_POLICIES => {
+            Value::from(changed_policy_document(domain.access_policies.as_deref()?))
+        }
         OPT_ADVANCED_OPTIONS => object(
             domain
                 .advanced_options
