@@ -62,6 +62,16 @@ use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
 // which it may not.
 use crate::brand_profile_attributes::{GIF, PNG};
 
+/// The identifier-format gate read over the WHOLE surface that accepts the identifier
+/// member — every implemented operation taking a `BrandProfileIdOrArn`, wherever the
+/// member sits in the request — beside the envelope this suite reads for the
+/// brand-profile operations. A child module of this suite, in
+/// `tests/all/brand_profile_refusal_bodies/`: this crate's one test target declares each
+/// suite DIRECTLY under `tests/all/`, so a child module of an already-declared suite is
+/// declared by its parent, here, with a `#[path]` relative to this file's own directory.
+#[path = "brand_profile_refusal_bodies/identifier_format_gate.rs"]
+mod identifier_format_gate;
+
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
 
