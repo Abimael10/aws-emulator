@@ -61,7 +61,12 @@ const INVALID_ACTION: &str = "InvalidAction";
 ///
 /// Read from the model file rather than listed here, because a list beside the model is a
 /// second statement of the action set and this suite exists to pin that there is only one.
-fn declared_actions() -> Vec<String> {
+///
+/// `pub(crate)`: the whole-surface suite beside this one
+/// (`crate::modelled_answer_per_operation`) drives every declared action against provisioned
+/// state, and reads the set from here rather than restating it, so neither suite can drift
+/// from the model.
+pub(crate) fn declared_actions() -> Vec<String> {
     let model: Value = serde_json::from_str(MODEL).expect("the model is JSON");
     let shapes = model
         .get("shapes")
