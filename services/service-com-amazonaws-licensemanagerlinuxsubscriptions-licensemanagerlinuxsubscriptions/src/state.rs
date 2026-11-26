@@ -52,11 +52,32 @@ pub const PROVIDER_STATUS_PENDING: &str = "PENDING";
 /// [`SubscriptionProviderRecord::status_message`] the service has about the token, which is
 /// the only way a client can tell a refused token from one still being checked.
 ///
-/// Nothing in the registration path reaches it: a registration is refused at the request
-/// boundary or it is taken, and a taken one becomes usable
-/// ([`SubscriptionProviderRecord::settle`]). It stays named here because it is a value of
-/// the modelled enum a client may branch on.
+/// This is where the token validation running behind a registration call lands for a token
+/// that validation does not honour ([`TokenVerdict::Rejected`]): the registration exists,
+/// it is not usable, and the message it carries says so.
 pub const PROVIDER_STATUS_INVALID: &str = "INVALID";
+
+/// What the token validation that runs BEHIND a registration call finds about the access
+/// token the registration holds — the verdict [`SubscriptionProviderRecord::settle`]
+/// materializes once that validation falls due.
+///
+/// A registration's `SubscriptionProviderStatus` reports on the token License Manager
+/// holds for it, so its terminal status is whatever that validation found: a token the
+/// provider honours makes the registration usable ([`PROVIDER_STATUS_ACTIVE`]), and one it
+/// does not leaves the registration reporting [`PROVIDER_STATUS_INVALID`] with the message
+/// the service has about the token.
+///
+/// The verdict is reached by the call that registered the token — the only code that holds
+/// the credential — and carried here as the verdict alone, so this store holds no part of
+/// the credential itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenVerdict {
+    /// The validation honours the token: the registration becomes usable.
+    Honoured,
+    /// It does not, and the registration reports the carried message as its
+    /// `SubscriptionProviderStatusMessage`.
+    Rejected(String),
+}
 
 /// How long a fresh registration stays [`PROVIDER_STATUS_PENDING`] before the clock owes
 /// it its terminal `SubscriptionProviderStatus`.
@@ -137,17 +158,22 @@ pub struct SubscriptionProviderRecord {
     /// while the token validation behind the registration call has not landed yet; `None`
     /// once the status is terminal, so nothing moves twice.
     pub settles_at: Option<SystemTime>,
+    /// What that validation finds about the registered access token, which is the terminal
+    /// status it lands on ([`settle`](Self::settle)).
+    pub token_verdict: TokenVerdict,
 }
 
 impl SubscriptionProviderRecord {
     /// A registration of `source` against `secret_arn`, as the registration call leaves
     /// it: `PENDING`, with the terminal status the clock owes it due at
-    /// `now + `[`TOKEN_VALIDATION_DELAY`].
+    /// `now + `[`TOKEN_VALIDATION_DELAY`] and `verdict` the token validation behind the
+    /// call reaches about the registered token by then.
     pub fn registered(
         arn: String,
         source: String,
         secret_arn: String,
         tags: HashMap<String, String>,
+        verdict: TokenVerdict,
         now: SystemTime,
     ) -> Self {
         Self {
@@ -160,6 +186,7 @@ impl SubscriptionProviderRecord {
             last_successful_data_retrieval_time: None,
             tags,
             settles_at: Some(now + TOKEN_VALIDATION_DELAY),
+            token_verdict: verdict,
         }
     }
 
@@ -188,24 +215,29 @@ impl SubscriptionProviderRecord {
             last_successful_data_retrieval_time: active.then(|| iso8601(now)),
             tags,
             settles_at: None,
+            // Terminal already: no validation is owed this record, so the verdict is never
+            // read.
+            token_verdict: TokenVerdict::Honoured,
         }
     }
 
     /// Materialize the status transition the clock owes this registration by `now`.
     ///
-    /// A registration the account asked for and the service took becomes USABLE: the
-    /// validation running behind the registration call finishes and the registration
-    /// reports [`PROVIDER_STATUS_ACTIVE`], with nothing to report about the token (so no
-    /// `SubscriptionProviderStatusMessage`) and the subscription data retrieval that status
-    /// reports on recorded in
-    /// [`last_successful_data_retrieval_time`](Self::last_successful_data_retrieval_time).
-    /// A failure status belongs to a registration the service rejected, which is a
-    /// condition the request boundary answers before a record exists at all.
+    /// The transition is the validation behind the registration call LANDING, so what it
+    /// writes is that validation's verdict about the registered token
+    /// ([`token_verdict`](Self::token_verdict)): a token the provider honours makes the
+    /// registration USABLE — [`PROVIDER_STATUS_ACTIVE`], nothing to report about the token
+    /// (so no `SubscriptionProviderStatusMessage`) and the subscription data retrieval that
+    /// status reports on recorded in
+    /// [`last_successful_data_retrieval_time`](Self::last_successful_data_retrieval_time) —
+    /// and a token it does not honour leaves the registration in
+    /// [`PROVIDER_STATUS_INVALID`] reporting the message the service has about that token,
+    /// with no retrieval recorded for a retrieval that cannot have happened.
     ///
     /// The transition was owed at `settles_at` whether or not anybody called, which is what
     /// lets a report materialize it: no caller's read decides it, and the values it writes
-    /// are derived from the DUE instant rather than from the reader's clock, so every later
-    /// read of the same registration answers the same thing.
+    /// are derived from the DUE instant and the stored verdict rather than from the
+    /// reader's clock, so every later read of the same registration answers the same thing.
     fn settle(&mut self, now: SystemTime) {
         let Some(due) = self.settles_at else {
             return;
@@ -214,9 +246,20 @@ impl SubscriptionProviderRecord {
             return;
         }
         self.settles_at = None;
-        self.status = PROVIDER_STATUS_ACTIVE.to_string();
-        self.status_message = None;
-        self.last_successful_data_retrieval_time = Some(iso8601(due));
+        match &self.token_verdict {
+            TokenVerdict::Honoured => {
+                self.status = PROVIDER_STATUS_ACTIVE.to_string();
+                self.status_message = None;
+                self.last_successful_data_retrieval_time = Some(iso8601(due));
+            }
+            TokenVerdict::Rejected(status_message) => {
+                self.status = PROVIDER_STATUS_INVALID.to_string();
+                self.status_message = Some(status_message.clone());
+                // `LastSuccessfulDataRetrievalTime` is left exactly as it stands: a
+                // retrieval this token could not make adds none, and one an earlier token
+                // of the same registration made does not un-happen.
+            }
+        }
     }
 
     /// Point this registration at `secret_arn` and start the token validation that change
@@ -232,13 +275,14 @@ impl SubscriptionProviderRecord {
     /// Manager last retrieved subscription details from the provider, which is a retrieval
     /// that happened and does not un-happen because the secret the next one will use
     /// changed.
-    fn point_at_secret(&mut self, secret_arn: &str, now: SystemTime) {
+    fn point_at_secret(&mut self, secret_arn: &str, verdict: TokenVerdict, now: SystemTime) {
         if self.secret_arn == secret_arn {
             return;
         }
         self.secret_arn = secret_arn.to_string();
         self.status = PROVIDER_STATUS_PENDING.to_string();
         self.status_message = None;
+        self.token_verdict = verdict;
         self.settles_at = Some(now + TOKEN_VALIDATION_DELAY);
     }
 }
@@ -472,6 +516,13 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     /// Any tags the call carries are merged into the registration's tag set, exactly as
     /// `TagResource` merges them.
     ///
+    /// `verdict` is what the token validation running behind this registration finds about
+    /// the access token the named secret holds, so it is carried onto the registration
+    /// whose validation this call starts — a fresh one, or one pointed at another secret —
+    /// and decides the terminal status that validation lands on
+    /// ([`SubscriptionProviderRecord::settle`]). The `@idempotent` repeat starts no
+    /// validation, so it carries none.
+    ///
     /// `Err` is a registration this account may not take: a resultant tag set past
     /// [`MAX_TAGS_PER_RESOURCE`]. Nothing is written in that case.
     pub fn register_provider(
@@ -480,6 +531,7 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         source: &str,
         secret_arn: &str,
         tags: HashMap<String, String>,
+        verdict: TokenVerdict,
         now: SystemTime,
     ) -> Result<SubscriptionProviderRecord, TagLimitExceeded> {
         self.settle_providers(now);
@@ -495,7 +547,7 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
             // the bound; a refused call leaves the registration exactly as it was — which
             // is why the merge is decided BEFORE the secret is written.
             merge_tags(&mut record.tags, tags)?;
-            record.point_at_secret(secret_arn, now);
+            record.point_at_secret(secret_arn, verdict, now);
             return Ok(record.clone());
         }
 
@@ -510,6 +562,7 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
             source.to_string(),
             secret_arn.to_string(),
             fresh_tags,
+            verdict,
             now,
         );
         self.providers.insert(arn, record.clone());

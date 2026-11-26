@@ -11,19 +11,21 @@
 //! The resource is created only for a registration whose CREDENTIAL this service can
 //! actually use: the secret the `SecretArn` names is read from Secrets Manager and its
 //! value has to be an access token of the form the named `SubscriptionProviderSource`
-//! issues, or the call is refused with the modelled `ValidationException` (HTTP 400)
-//! before anything is written — so a caller that registers to check a BYOL credential
-//! learns here that it is unusable, and a refused registration leaves the provider store
-//! exactly as it was however many such calls arrive at once.
+//! issues whose own expiry has not already passed, or the call is refused with the modelled
+//! `ValidationException` (HTTP 400) before anything is written — so a caller that registers
+//! to check a BYOL credential learns here that it is unusable, and a refused registration
+//! leaves the provider store exactly as it was however many such calls arrive at once.
 //!
-//! Whether a token OF THAT FORM is one the provider still honours is the only part of the
+//! Whether the provider honours that token WHEN THIS SERVICE PRESENTS IT is the part of the
 //! verdict that happens BEHIND this call: the registration answers
 //! `SubscriptionProviderStatus: PENDING` and the verdict lands on the resource afterwards
 //! (which is why `GetRegisteredSubscriptionProvider`, and not this operation, reports a
-//! `SubscriptionProviderStatusMessage`). A registration this call took then becomes
-//! usable: once `crate::state::TOKEN_VALIDATION_DELAY` has passed it reports `ACTIVE` with
-//! the subscription data retrieval that status reports on, which is the status a client
-//! polls for before it expects third-party subscription data.
+//! `SubscriptionProviderStatusMessage`). Once `crate::state::TOKEN_VALIDATION_DELAY` has
+//! passed, a registration whose token covers that instant with its own validity window
+//! reports `ACTIVE` with the subscription data retrieval that status reports on — the
+//! status a client polls for before it expects third-party subscription data — and one
+//! whose token does not (it expires in between, or it is not valid yet) reports `INVALID`
+//! with the one sentence this service has about a provider token it cannot use.
 //!
 //! A registration's identity is the `SubscriptionProviderSource` it is for: the account
 //! holds ONE registration per supported source, so a call naming a source it already
@@ -197,6 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tag APIs and the read side address is the one this Region's caller created.
         let region = crate::state::request_region(&ctx.parts().headers);
 
+        // ONE instant for the whole call: the credential is judged against the same clock
+        // the registration's own validation is scheduled on, so the token question this
+        // call asks and the due instant the store records cannot be about two different
+        // moments.
+        let now = ::std::time::SystemTime::now();
+
         // `SubscriptionProviderSource` and `SecretArn` are both `@required` and the
         // boundary already held the request to the modelled enum, the `SecretArn` pattern
         // and the `Tags` size — but neither says anything about what the SECRET holds, and
@@ -208,16 +216,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.subscription_provider_source,
             &input.secret_arn,
+            now,
         )
         .await;
-        if matches!(credential, CredentialLookup::Unusable) {
-            return Err(RegisterSubscriptionProviderErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(PROVIDER_TOKEN_REFUSAL_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
+        let verdict = match credential {
+            CredentialLookup::Usable(verdict) => verdict,
+            CredentialLookup::Unusable => {
+                return Err(RegisterSubscriptionProviderErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(PROVIDER_TOKEN_REFUSAL_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            // Nothing was established about the credential, so the validation behind the
+            // registration has nothing to withhold it on either.
+            CredentialLookup::Indeterminate => crate::state::TokenVerdict::Honoured,
+        };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RegisterSubscriptionProviderErrorModeled::InternalServerException(
@@ -233,7 +248,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.subscription_provider_source,
                 &input.secret_arn,
                 input.tags.clone().unwrap_or_default(),
-                ::std::time::SystemTime::now(),
+                verdict,
+                now,
             )
             // A resultant tag set past the limit is the tagging surface's own
             // `BadRequestException` — the same refusal the request boundary states for an
@@ -280,8 +296,10 @@ const OPERATION_NAME: &str = "RegisterSubscriptionProvider";
 #[derive(Debug, PartialEq, Eq)]
 enum CredentialLookup {
     /// The secret was read and its value is an access token of the form the registered
-    /// `SubscriptionProviderSource` issues, so the registration can be taken.
-    Usable,
+    /// `SubscriptionProviderSource` issues, so the registration can be taken — carrying
+    /// what the token validation running behind it finds about that token when it falls
+    /// due.
+    Usable(crate::state::TokenVerdict),
     /// A definite negative about the credential: the secret cannot be read at all, or its
     /// value is not an access token of that form. Every such verdict is the one refusal
     /// [`PROVIDER_TOKEN_REFUSAL_MESSAGE`] states, so the variant carries no text of its
@@ -350,7 +368,7 @@ fn secret_region(secret_arn: &str, request_region: &str) -> String {
 }
 
 /// Read the secret `secret_arn` names and say whether it holds an access token `source`
-/// could be registered with.
+/// could be registered with, as of `now`.
 ///
 /// `GetSecretValue` is the read the registration needs: the provider's access token is
 /// what this service will present to the provider, so the registration is only worth
@@ -360,6 +378,7 @@ async fn resolve_credential(
     request_region: &str,
     source: &str,
     secret_arn: &str,
+    now: ::std::time::SystemTime,
 ) -> CredentialLookup {
     let region = secret_region(secret_arn, request_region);
     let value = match secrets_manager_client(ctx, &region)
@@ -377,9 +396,10 @@ async fn resolve_credential(
     let Some(credential) = value.secret_string() else {
         return unusable_credential(source, "it holds no string value");
     };
-    match credential_defect(source, credential) {
-        Some(defect) => unusable_credential(source, &defect),
-        None => CredentialLookup::Usable,
+    match credential_check(source, credential, now) {
+        CredentialCheck::Honoured => CredentialLookup::Usable(crate::state::TokenVerdict::Honoured),
+        CredentialCheck::NotHonoured(defect) => withheld_credential(source, &defect),
+        CredentialCheck::Unusable(defect) => unusable_credential(source, &defect),
     }
 }
 
@@ -399,6 +419,31 @@ fn unusable_credential(source: &str, defect: &str) -> CredentialLookup {
          provider issues"
     );
     CredentialLookup::Unusable
+}
+
+/// The credential is one this service holds but the validation behind the registration
+/// does not honour, with `defect` — what that validation finds about the token — recorded
+/// for an OPERATOR, exactly as [`unusable_credential`] records a refusal's: what the CLIENT
+/// is told is the one sentence this service has about a provider token it cannot use, which
+/// the registration then reports as its `SubscriptionProviderStatusMessage`.
+///
+/// The registration is still TAKEN: the resource exists, and the verdict lands on its
+/// `SubscriptionProviderStatus` when the validation falls due
+/// ([`crate::state::SubscriptionProviderRecord::settle`]), which is the distinction the
+/// modelled status message exists for — a client can tell a token the service rejected from
+/// one still being checked.
+fn withheld_credential(source: &str, defect: &str) -> CredentialLookup {
+    ::tracing::info!(
+        operation = OPERATION_NAME,
+        subscription_provider_source = %source,
+        defect = %defect,
+        outcome = "not honoured",
+        "the access token a registration named is not one this subscription provider \
+         honours when the validation behind the registration falls due"
+    );
+    CredentialLookup::Usable(crate::state::TokenVerdict::Rejected(
+        PROVIDER_TOKEN_REFUSAL_MESSAGE.to_string(),
+    ))
 }
 
 /// Classify a failed `GetSecretValue`.
@@ -458,8 +503,8 @@ const SECRET_NEGATIVE_ERROR_CODES: &[&str] = &[
 ];
 
 /// The refusal this operation answers for EVERY credential it cannot use: the secret that
-/// cannot be read, the secret holding no text value, and the value that is not an access
-/// token the named provider issues.
+/// cannot be read, the secret holding no text value, the value that is not an access token
+/// the named provider issues, and the token whose own expiry has passed.
 ///
 /// Recorded behaviour, not modelled text (the model states this operation's
 /// `ValidationException` and its 400 and nothing about the credential check): the service
@@ -468,6 +513,11 @@ const SECRET_NEGATIVE_ERROR_CODES: &[&str] = &[
 /// from it — so the credential verdict is one refusal class a client can read off the
 /// message, distinct from the request-shape refusals the boundary words for the
 /// `SubscriptionProviderSource` enum domain and the `SecretArn` pattern.
+///
+/// It is the service's one sentence about a provider token it cannot use, so it is also
+/// what a registration whose token the validation behind it rejected reports as its
+/// `SubscriptionProviderStatusMessage` ([`withheld_credential`]): the same verdict class,
+/// stated the same way wherever a client reads it.
 pub(crate) const PROVIDER_TOKEN_REFUSAL_MESSAGE: &str =
     "The subscription provider token is invalid or expired";
 
@@ -477,19 +527,34 @@ pub(crate) const PROVIDER_TOKEN_REFUSAL_MESSAGE: &str =
 /// secret contains your Red Hat Offline token").
 const SOURCE_RED_HAT: &str = "RedHat";
 
-/// Why `credential` is not an access token the provider `source` issues, or `None` when it
-/// has that token's form. The reason is for an operator's trace only — what the CALLER is
-/// answered is [`PROVIDER_TOKEN_REFUSAL_MESSAGE`], whichever reason it is.
+/// What this call establishes about the credential a registration named. Every reason it
+/// carries is for an operator's trace only — what a CALLER is told is
+/// [`PROVIDER_TOKEN_REFUSAL_MESSAGE`], whichever reason it is.
+enum CredentialCheck {
+    /// An access token of the form the provider issues, which the validation running
+    /// behind the registration honours when it falls due.
+    Honoured,
+    /// An access token of that form which that validation does NOT honour then, with why.
+    NotHonoured(String),
+    /// Not a credential this service can use at all, with why.
+    Unusable(String),
+}
+
+/// What the credential `credential` is for the provider `source`, as of `now`.
 ///
 /// One arm per modelled `SubscriptionProviderSource`: the credential a registration needs
 /// is whatever the named provider issues, so the check belongs to the source rather than
 /// to the operation. A source outside the modelled enum never reaches here — the request
 /// boundary holds `SubscriptionProviderSource` to the enum — and is left unchecked rather
 /// than refused on a form nothing has stated.
-fn credential_defect(source: &str, credential: &str) -> Option<String> {
+fn credential_check(
+    source: &str,
+    credential: &str,
+    now: ::std::time::SystemTime,
+) -> CredentialCheck {
     match source {
-        SOURCE_RED_HAT => offline_token_defect(credential),
-        _ => None,
+        SOURCE_RED_HAT => offline_token_check(credential, now),
+        _ => CredentialCheck::Honoured,
     }
 }
 
@@ -501,8 +566,8 @@ const TOKEN_TYPE_CLAIM: &str = "typ";
 /// data without the account holder present.
 const OFFLINE_TOKEN_TYPE: &str = "Offline";
 
-/// Why `credential` is not a Red Hat offline token, or `None` when it has that token's
-/// form. The reason is traced, never answered: see [`PROVIDER_TOKEN_REFUSAL_MESSAGE`].
+/// What `credential` is as a Red Hat offline token, as of `now`. Every reason is traced,
+/// never answered: see [`PROVIDER_TOKEN_REFUSAL_MESSAGE`].
 ///
 /// An RHSM offline token is the offline refresh token Red Hat's single sign-on issues, so
 /// it is a JSON Web Token whose claim set declares the OFFLINE token type. The token's form
@@ -510,23 +575,46 @@ const OFFLINE_TOKEN_TYPE: &str = "Offline";
 /// (`service_common::jwt`), which also bounds the work a caller-supplied value can ask
 /// for; what belongs to THIS registration is the claim that makes the token an offline one.
 ///
-/// Whether a token OF that form is still one the provider honours is a question only the
-/// provider can answer — that is the validation that runs behind an admitted registration
-/// and lands on the resource's `SubscriptionProviderStatus`. What is decided here is
-/// whether the stored credential is an offline token at all.
-fn offline_token_defect(credential: &str) -> Option<String> {
+/// A token of that form is then judged against ITS OWN validity window, which the same
+/// reader answers (RFC 7519 §4.1.4/§4.1.5) and leaves to the consumer to act on, at the two
+/// instants the credential has to work at:
+///
+/// * `now` — the instant the credential is PRESENTED. A token already at or past its own
+///   expiry is one no later instant can make usable, so the registration is not worth
+///   taking at all and the call is refused like any other unusable credential.
+/// * the instant the validation running behind an admitted registration falls due
+///   (`now + `[`crate::state::TOKEN_VALIDATION_DELAY`]) — the instant this service would
+///   first present the token to the provider. A token whose window does not cover that
+///   instant (it expires in between, or its `nbf` has not been reached) is not one the
+///   provider honours then, so the registration is taken and that validation lands on the
+///   status which says the token was rejected, with the message the service has about it.
+///
+/// A token naming NO expiry stays acceptable — the reader reports that case rather than
+/// deciding it, and an offline refresh token is issued to be held without one.
+fn offline_token_check(credential: &str, now: ::std::time::SystemTime) -> CredentialCheck {
+    use ::service_common::jwt::WindowDefect;
+
     let token = match ::service_common::jwt::read(credential) {
         Ok(token) => token,
-        Err(form) => return Some(form.to_string()),
+        Err(form) => return CredentialCheck::Unusable(form.to_string()),
     };
     match token.claim_str(TOKEN_TYPE_CLAIM) {
-        Some(token_type) if token_type.eq_ignore_ascii_case(OFFLINE_TOKEN_TYPE) => None,
+        Some(token_type) if token_type.eq_ignore_ascii_case(OFFLINE_TOKEN_TYPE) => {}
         // The reason names the claim that is wrong, never the VALUE read out of the
         // secret: it is traced where an operator reads it, and no part of the stored
         // credential may travel even there.
-        _ => Some(format!(
-            "its payload does not declare the {OFFLINE_TOKEN_TYPE:?} token type"
-        )),
+        _ => {
+            return CredentialCheck::Unusable(format!(
+                "its payload does not declare the {OFFLINE_TOKEN_TYPE:?} token type"
+            ));
+        }
+    }
+    if matches!(token.outside_window(now), Some(WindowDefect::Expired)) {
+        return CredentialCheck::Unusable(WindowDefect::Expired.to_string());
+    }
+    match token.outside_window(now + crate::state::TOKEN_VALIDATION_DELAY) {
+        None | Some(WindowDefect::NoExpiry) => CredentialCheck::Honoured,
+        Some(defect) => CredentialCheck::NotHonoured(defect.to_string()),
     }
 }
 
