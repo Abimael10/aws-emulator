@@ -80,10 +80,35 @@ impl CertificateAssociation {
         self.updated_at = due;
     }
 
-    /// Whether the certificate is serving, or on its way to serving: the two statuses
-    /// a repeat of the association asks for rather than starting afresh.
+    /// Whether the association this record holds is the one a caller asking to
+    /// associate the certificate asks for: it is accepted and settling in, or it is
+    /// in place. A repeat of the association answers such a record as it stands, and
+    /// a removal of it is the removal of an association that is there to remove.
+    ///
+    /// A record whose removal has been accepted is NOT one of these: the certificate
+    /// is still serving, but the association the store holds is on its way out, which
+    /// is what [`disassociation_pending`](Self::disassociation_pending) answers for.
     pub fn association_in_force(&self) -> bool {
         self.status == CERTIFICATE_STATUS_PENDING_ASSOCIATION
             || self.status == CERTIFICATE_STATUS_ASSOCIATED
+    }
+
+    /// Whether this association's removal is already outstanding: the service has
+    /// accepted it and the clock has not completed it yet, so the record still holds
+    /// the (gateway, certificate) pair's identity and no call may write a new
+    /// association over it.
+    pub fn disassociation_pending(&self) -> bool {
+        self.status == CERTIFICATE_STATUS_PENDING_DISASSOCIATION
+    }
+
+    /// The words a refusal carries when this association's current status does not
+    /// admit the transition a call asks for: the pair the call addressed and the
+    /// status that refuses it, both from the record. Worded exactly as the gateway
+    /// and link records word the same refusal.
+    pub fn status_conflict_message(&self, transition: &str) -> String {
+        format!(
+            "certificate {} on responder gateway {} is {} and cannot be {}",
+            self.acm_certificate_arn, self.gateway_id, self.status, transition
+        )
     }
 }

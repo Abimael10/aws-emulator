@@ -5,7 +5,10 @@
 //! Associates an ACM certificate with a responder gateway. Only an `EXTERNAL`
 //! responder gateway terminates TLS for callers outside the fabric, so only one of
 //! those takes a certificate; the association is stored against the (gateway,
-//! certificate) pair and read back by `GetCertificateAssociation`.
+//! certificate) pair and read back by `GetCertificateAssociation`. A pair whose
+//! association is already in force is answered as it stands, and one whose removal
+//! is accepted but not yet complete -> `ConflictException` (409): that record still
+//! holds the pair until the clock settles the removal.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +217,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     acm_certificate_arn: existing.acm_certificate_arn.clone(),
                     status: existing.status.clone(),
                 });
+            }
+            if existing.disassociation_pending() {
+                // The removal of this very association is accepted and still
+                // outstanding, so the record holds the pair's identity until the
+                // clock completes it: this call asks for a transition that status
+                // does not admit, and is refused rather than written over the
+                // removal the caller was already told was pending. A fresh
+                // association is taken once the removal has settled.
+                return Err(AssociateCertificateErrorModeled::ConflictException(
+                    ConflictException {
+                        message: existing.status_conflict_message("associated"),
+                    },
+                )
+                .into());
             }
         } else if store
             .certificate_associations

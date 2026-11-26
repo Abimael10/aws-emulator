@@ -14,6 +14,11 @@
 //!   the read reports exactly what the write left, a repeat of the association
 //!   answers that one record rather than making a second, the clock settles each
 //!   pending status to its terminal one, and the record dies with its gateway;
+//! * a record whose removal this service has already accepted still holds the
+//!   (gateway, certificate) pair until the clock completes that removal, so a call
+//!   asking to associate the certificate again is refused with the modelled
+//!   `ConflictException` (409) and changes nothing, and the accepted removal still
+//!   completes;
 //! * every refusal for a gateway or a certificate this store does not hold is the
 //!   service's one not-found: HTTP 404 with fixed text naming nothing from the
 //!   request.
@@ -48,6 +53,16 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long the poll loop pauses between two reads of the same record.
 const POLL_PAUSE: Duration = Duration::from_millis(20);
+
+/// How many times the removal-then-association pair is driven on a fresh record
+/// before the test gives up.
+///
+/// The two in-process calls land inside the span the clock owes the accepted removal,
+/// so the refusal is what an attempt observes; an attempt whose removal had already
+/// settled by the time the second call ran saw no outstanding removal at all, which
+/// proves nothing either way, so it is made again on a fresh record rather than
+/// asserted on.
+const PENDING_REMOVAL_ATTEMPTS: usize = 8;
 
 /// ACM certificate ARNs spanning every partition the modelled `AcmCertificateArn`
 /// pattern admits (`^arn:(aws|aws-cn|aws-us-gov):acm:…`), each inside the member's
@@ -541,4 +556,195 @@ async fn an_association_dies_with_the_gateway_it_is_on() {
         "case {case:?}: expected the listing to report no responder gateway, got {:?}",
         listed.body["gatewayIds"]
     );
+}
+
+#[tokio::test]
+async fn associating_again_is_refused_while_an_accepted_removal_is_outstanding() {
+    // The rule is about the record's status, not about one certificate, so it is
+    // driven for a certificate of every partition the ARN pattern admits.
+    for (case, arn) in CERTIFICATE_ARNS {
+        let mut observed = false;
+        for _ in 0..PENDING_REMOVAL_ATTEMPTS {
+            let fabric = Fabric::new();
+            let gateway_id = fabric
+                .responder_gateway(case, "token-responder", Some("EXTERNAL"))
+                .await;
+            let associated = fabric.associate(&gateway_id, arn, "token-associate").await;
+            assert_eq!(
+                associated.status, 200,
+                "case {case:?}: expected AssociateCertificate to answer 200, got {} {:?}",
+                associated.status, associated.body
+            );
+            let before = fabric.get_association(&gateway_id, arn).await;
+
+            let removing = fabric.disassociate(&gateway_id, arn).await;
+            assert_eq!(
+                removing.status, 200,
+                "case {case:?}: expected DisassociateCertificate to answer 200, got {} {:?}",
+                removing.status, removing.body
+            );
+            assert_eq!(
+                text(&removing.body, "status"),
+                CERTIFICATE_STATUS_PENDING_DISASSOCIATION,
+                "case {case:?}: expected the removal to be accepted as pending, got {:?}",
+                removing.body["status"]
+            );
+
+            // The removal is accepted and the clock has not completed it, so this
+            // call asks for a transition the record's status does not admit.
+            let answered = fabric
+                .associate(&gateway_id, arn, "token-associate-again")
+                .await;
+            if answered.status == 200 {
+                // The removal settled before this call reached the handler, so
+                // there was no outstanding removal for it to conflict with: this
+                // attempt observed nothing about the rule.
+                continue;
+            }
+            observed = true;
+            assert_eq!(
+                answered.status, 409,
+                "case {case:?}: expected HTTP 409, got {} {:?}",
+                answered.status, answered.body
+            );
+            assert_eq!(
+                answered.code, "ConflictException",
+                "case {case:?}: expected ConflictException, got {:?}",
+                answered.code
+            );
+            let expected_message = format!(
+                "certificate {arn} on responder gateway {gateway_id} is \
+                 {CERTIFICATE_STATUS_PENDING_DISASSOCIATION} and cannot be associated"
+            );
+            assert_eq!(
+                answered.message(),
+                expected_message,
+                "case {case:?}: expected {expected_message:?}, got {:?}",
+                answered.message()
+            );
+
+            // The refused call wrote nothing: the record still carries the removal
+            // this service accepted — or the terminal status the clock has since
+            // made due — and the instant the association was asked for has not
+            // moved.
+            let during = fabric.get_association(&gateway_id, arn).await;
+            let status = text(&during.body, "status");
+            assert!(
+                status == CERTIFICATE_STATUS_PENDING_DISASSOCIATION
+                    || status == CERTIFICATE_STATUS_DISASSOCIATED,
+                "case {case:?}: expected the accepted removal to stand, got {status:?}"
+            );
+            assert_eq!(
+                during.body["associatedAt"], before.body["associatedAt"],
+                "case {case:?}: expected the refused call to leave the record alone, got {:?}",
+                during.body["associatedAt"]
+            );
+
+            // And the removal the caller was told was pending still completes.
+            fabric
+                .settled(case, &gateway_id, arn, CERTIFICATE_STATUS_DISASSOCIATED)
+                .await;
+            // Once it has, the pair takes a fresh association: the refusal belongs
+            // to the outstanding removal, not to the certificate.
+            let again = fabric
+                .associate(&gateway_id, arn, "token-associate-third")
+                .await;
+            assert_eq!(
+                again.status, 200,
+                "case {case:?}: expected a settled removal to admit a fresh association, got {} {:?}",
+                again.status, again.body
+            );
+            assert_eq!(
+                text(&again.body, "status"),
+                CERTIFICATE_STATUS_PENDING_ASSOCIATION,
+                "case {case:?}: expected the fresh association to be pending, got {:?}",
+                again.body["status"]
+            );
+            break;
+        }
+        assert!(
+            observed,
+            "case {case:?}: expected AssociateCertificate to be refused while the accepted \
+             removal was outstanding, but all {PENDING_REMOVAL_ATTEMPTS} attempts answered 200"
+        );
+    }
+}
+
+#[tokio::test]
+async fn what_a_repeated_association_does_follows_the_record_status() {
+    // (case, wait for the association to be in place first, remove it and let the
+    //  removal settle first) — the statuses of the stored record that DO admit the
+    //  repeat, and what each one answers it with.
+    for (case, settle_first, remove_first) in [
+        ("the association is still settling in", false, false),
+        ("the association is in place", true, false),
+        ("the association was removed and the removal settled", true, true),
+    ] {
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .responder_gateway(case, "token-responder", Some("EXTERNAL"))
+            .await;
+        let (_, arn) = CERTIFICATE_ARNS[2];
+        let associated = fabric.associate(&gateway_id, arn, "token-associate").await;
+        assert_eq!(
+            associated.status, 200,
+            "case {case:?}: expected AssociateCertificate to answer 200, got {} {:?}",
+            associated.status, associated.body
+        );
+        if settle_first {
+            fabric
+                .settled(case, &gateway_id, arn, CERTIFICATE_STATUS_ASSOCIATED)
+                .await;
+        }
+        if remove_first {
+            fabric.disassociate(&gateway_id, arn).await;
+            fabric
+                .settled(case, &gateway_id, arn, CERTIFICATE_STATUS_DISASSOCIATED)
+                .await;
+        }
+        let before = fabric.get_association(&gateway_id, arn).await;
+
+        // A fresh client token and all: the (gateway, certificate) pair IS the
+        // record's identity.
+        let repeat = fabric
+            .associate(&gateway_id, arn, "token-associate-again")
+            .await;
+        assert_eq!(
+            repeat.status, 200,
+            "case {case:?}: expected a repeated AssociateCertificate to answer 200, got {} {:?}",
+            repeat.status, repeat.body
+        );
+        let after = fabric.get_association(&gateway_id, arn).await;
+
+        if remove_first {
+            // Nothing is outstanding on a record that has reached the terminal
+            // status, so this is an association of its own.
+            assert_eq!(
+                text(&repeat.body, "status"),
+                CERTIFICATE_STATUS_PENDING_ASSOCIATION,
+                "case {case:?}: expected a removed certificate to associate afresh, got {:?}",
+                repeat.body["status"]
+            );
+            assert_ne!(
+                after.body["associatedAt"], before.body["associatedAt"],
+                "case {case:?}: expected the fresh association to date from this call, got {:?}",
+                after.body["associatedAt"]
+            );
+            continue;
+        }
+
+        // The association the caller asks for is the one already in force, so the
+        // record is answered as it stands and is left exactly as it was.
+        let status = text(&repeat.body, "status");
+        assert!(
+            status == CERTIFICATE_STATUS_PENDING_ASSOCIATION
+                || status == CERTIFICATE_STATUS_ASSOCIATED,
+            "case {case:?}: expected the repeat to answer the association in force, got {status:?}"
+        );
+        assert_eq!(
+            after.body["associatedAt"], before.body["associatedAt"],
+            "case {case:?}: expected the repeat to leave the record alone, got {:?}",
+            after.body["associatedAt"]
+        );
+    }
 }
