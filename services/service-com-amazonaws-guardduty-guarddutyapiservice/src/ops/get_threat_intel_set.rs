@@ -191,10 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: set.name.clone(),
             format: set.format.clone(),
             // "The URI of the file that contains the ThreatIntelSet": the URI the create
-            // or the update stored, reported as it was given — the one projection every
-            // uploaded-list read-back shares
-            // ([`crate::state::stored_list_location`]).
-            location: crate::state::stored_list_location(&set.location),
+            // or the update stored, announced at an address this emulator answers on — the
+            // one projection every uploaded-list read-back shares
+            // ([`crate::state::announced_list_location`]).
+            location: crate::state::announced_list_location(ctx, &set.location),
             status: set.status.clone(),
             // Projected through the ONE tag-map rule every read of this service
             // shares ([`crate::state::reported_tags`]): the member is always

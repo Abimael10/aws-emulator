@@ -234,6 +234,7 @@ impl InvestigationRecord {
         let covered = evidence_for_prompt(&self.trigger_prompt, &covered);
         self.analysis = Some(InvestigationAnalysis::of_evidence(
             &covered,
+            &self.trigger_prompt,
             &self.triggered_by,
             &self.region,
         ));

@@ -21,10 +21,10 @@
 //!    nothing. The rule is the uploaded-list FAMILY's, so the rows span all four
 //!    families — the IPSet, the threat list and the two entity sets — on the create
 //!    that stores a location.
-//! 2. A read-back reports that location as the URI it was stored as: a `Location` is the
-//!    caller's own value, kept as a record of what it configured, so a read answers the
-//!    same URI whichever endpoint it arrives at and whichever S3 URL spelling the write
-//!    used.
+//! 2. A read-back reports that location as the object it was stored as: whichever address
+//!    a read announces the list at, the bucket and the key it names are the ones the write
+//!    submitted. WHICH address a read announces — the stored URI, or the same object at the
+//!    endpoint the read arrived at — is the `uploaded_list_announced_host` suite's rule.
 //! 3. A change to a list whose own delete has already been accepted collides with
 //!    work in flight rather than naming an absent resource, so `UpdateIPSet` and
 //!    `UpdateThreatIntelSet` refuse it under the `InternalServerErrorException` class
@@ -112,11 +112,13 @@ fn families() -> Vec<Family> {
     ]
 }
 
-/// One `Location` case: the location a create carries and whether the service may store
-/// it. Every row is sent to each of [`endpoints`].
+/// One `Location` case: the location a create carries, the `bucket/key` object it names
+/// (empty for a value that names none) and whether the service may store it. Every row is
+/// sent to each of [`endpoints`].
 struct LocationCase {
     why: &'static str,
     location: String,
+    object: &'static str,
     accepted: bool,
 }
 
@@ -137,61 +139,73 @@ fn location_cases() -> Vec<LocationCase> {
         LocationCase {
             why: "an s3:// URL",
             location: "s3://my-bucket/lists/trusted.txt".to_string(),
+            object: "my-bucket/lists/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "a path-style public S3 endpoint",
             location: "https://s3.eu-west-1.amazonaws.com/my-bucket/lists/trusted.txt".to_string(),
+            object: "my-bucket/lists/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "a virtual-hosted-style public S3 endpoint",
             location: "https://my-bucket.s3.us-west-2.amazonaws.com/lists/trusted.txt".to_string(),
+            object: "lists/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL on a loopback endpoint with a port",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket/lists/trusted.txt"),
+            object: "my-bucket/lists/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL on a named endpoint with a port",
             location: format!("https://{NAMED_ENDPOINT}/my-bucket/trusted.txt"),
+            object: "my-bucket/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL on that endpoint with a deep key",
             location: format!("https://{NAMED_ENDPOINT}/my-bucket/lists/2026/03/trusted.txt"),
+            object: "my-bucket/lists/2026/03/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL on an endpoint naming no port",
             location: "https://gd-endpoint.internal/my-bucket/trusted.txt".to_string(),
+            object: "my-bucket/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL over http rather than https",
             location: format!("http://{LOOPBACK_ENDPOINT}/my-bucket/trusted.txt"),
+            object: "my-bucket/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL on an unrelated host",
             location: "https://files.example-corp.com/my-bucket/trusted.txt".to_string(),
+            object: "my-bucket/trusted.txt",
             accepted: true,
         },
         LocationCase {
             why: "an object URL naming only a bucket",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket"),
+            object: "",
             accepted: false,
         },
         LocationCase {
             why: "an object URL with an empty key",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket/"),
+            object: "",
             accepted: false,
         },
         LocationCase {
             why: "a value that is no URL at all",
             location: "this is not a valid s3 uri or arn".to_string(),
+            object: "",
             accepted: false,
         },
     ]
@@ -300,18 +314,20 @@ async fn a_location_is_accepted_exactly_when_it_addresses_an_object_at_any_s3_en
                         .as_str()
                         .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {body:?}"))
                         .to_string();
-                    // The SAME URI the create submitted, read back at every endpoint a
-                    // read can arrive at: the value is the caller's own record of where
-                    // the file sits, so nothing about the read re-spells it.
+                    // The same OBJECT the create submitted, read back at every endpoint a
+                    // read can arrive at: whichever address a read-back announces the list
+                    // at, the bucket and the key it names are the ones the caller stored.
+                    // WHICH address that is belongs to the `uploaded_list_announced_host`
+                    // suite's own table.
                     for read_endpoint in endpoints() {
                         let stored =
                             read_at(&router, read_endpoint, &detector_id, &family, &id).await;
                         let reported = stored["location"].as_str().unwrap_or_default();
-                        assert_eq!(
-                            reported, row.location,
-                            "case {case:?}: a read at {read_endpoint} must report the \
-                             submitted URI, expected {:?}, got {reported:?}",
-                            row.location
+                        assert!(
+                            reported.ends_with(row.object),
+                            "case {case:?}: a read at {read_endpoint} must report the object \
+                             {:?} the create stored, got {reported:?}",
+                            row.object
                         );
                     }
                 } else {

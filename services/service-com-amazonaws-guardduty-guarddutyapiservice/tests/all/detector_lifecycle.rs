@@ -117,12 +117,15 @@ async fn call_signed(
 /// names another ([`call_at`]).
 const DEFAULT_HOST: &str = "guardduty.us-east-1.amazonaws.com";
 
-/// The `Location` an uploaded-list read-back reports for a list created at `stored`.
+/// The `Location` an uploaded-list read-back reports for a list created at `stored`, for a
+/// read that arrives at this harness's default endpoint.
 ///
-/// A `Location` is the URI of the file the list was uploaded as, submitted by the account
-/// and kept as a record of what it configured: a read reports that very URI, in the
-/// spelling the writer chose, and nothing about the request reading it takes part in the
-/// answer. The `uploaded_list_announced_host` suite is where that rule is asserted over a
+/// A `Location` is the URI of the file the list was uploaded as, submitted by the account,
+/// and a read announces that object at an address this emulator answers on when the stored
+/// URI names a host it does not. This harness's default endpoint is the service's own
+/// published AWS host and binds no socket, so a read there resolves no address of this
+/// emulator to announce and reports the stored URI. The
+/// `uploaded_list_announced_host` suite is where the announcing rule is asserted over a
 /// table of spellings, families and endpoints; this is how every other suite spells the
 /// value it expects back.
 pub(crate) fn reported_list_location(stored: &str) -> String {

@@ -18,9 +18,10 @@
 //! ([`FindingEvidence`]), the risk level is the band the highest severity among them
 //! sits in, the confidence follows how many of them corroborate that band, and the
 //! summary and the risk sentence name the resources, the finding types and the
-//! severities actually found. Nothing is drawn from the request beyond the prompt's
-//! own selection of which findings to look at, and an account with no findings is
-//! assessed as exactly that rather than given an invented narrative.
+//! severities actually found. Nothing is drawn from the request beyond the prompt — which
+//! selects which findings to look at and is the request the summary reports on — and an
+//! account with no findings is assessed as exactly that rather than given an invented
+//! narrative.
 //!
 //! The assessment is computed ONCE, when the clock ends the pass
 //! ([`super::InvestigationRecord::settle`]), and stored on the investigation, so
@@ -250,13 +251,19 @@ const RISK_MAX: usize = 1024;
 const TITLE_MAX: usize = 1024;
 
 impl InvestigationAnalysis {
-    /// Run the pass: assess `evidence` — the findings this investigation covered —
-    /// for the account and Region it was initiated for.
+    /// Run the pass: assess `evidence` — the findings this investigation covered — as
+    /// the answer to the request `prompt` asked, for the account and Region the
+    /// investigation was initiated for.
     ///
     /// The evidence is taken in SEVERITY order, highest first, with the finding id
     /// breaking ties, so the assessment is a function of the findings alone and not
     /// of the order a map happened to yield them in.
-    pub fn of_evidence(evidence: &[FindingEvidence], account: &str, region: &str) -> Self {
+    pub fn of_evidence(
+        evidence: &[FindingEvidence],
+        prompt: &str,
+        account: &str,
+        region: &str,
+    ) -> Self {
         let mut ordered: Vec<&FindingEvidence> = evidence.iter().collect();
         ordered.sort_by(|a, b| {
             b.severity
@@ -285,7 +292,7 @@ impl InvestigationAnalysis {
             risk_level: risk_level.to_string(),
             risk: clamped(risk_sentence(&ordered, risk_level), RISK_MAX),
             confidence: confidence.to_string(),
-            summary: summary_text(&ordered, risk_level, account, region),
+            summary: summary_text(&ordered, prompt, risk_level, account, region),
             title: clamped(title_text(&ordered, risk_level), TITLE_MAX),
         }
     }
@@ -364,22 +371,29 @@ fn risk_sentence(evidence: &[&FindingEvidence], risk_level: &str) -> String {
 /// including affected resources, threat assessment, and recommended remediation steps"
 /// (`smithy_query(shape="Investigation")`).
 ///
-/// A report with a HEADED SECTION per part the documentation names — the account and
-/// Region the pass covered, the resources the analysed findings affect, the assessment
-/// and the remediation steps the assessed level calls for — so a reader can show it as
-/// it stands and a consumer can find a section by its heading. Every number, resource
-/// type and finding type in it is read off the findings the pass analysed.
+/// The report the pass produced, with a HEADED SECTION per part the documentation names —
+/// the REQUEST it answers and the environment and evidence the pass covered, the resources
+/// the analysed findings affect, the assessment, and the remediation steps the assessed
+/// level calls for — so a reader can show it as it stands and a consumer can find a part
+/// by its heading.
+///
+/// It opens with the `TriggerPrompt` this investigation was initiated with, which is what
+/// makes the report THIS investigation's rather than any other's: two investigations of
+/// different requests over the same account do not read alike. Every count, resource type,
+/// severity and finding type in it is read off the findings the pass analysed, and nothing
+/// in it is narrated beyond them.
 fn summary_text(
     evidence: &[&FindingEvidence],
+    prompt: &str,
     risk_level: &str,
     account: &str,
     region: &str,
 ) -> String {
     let mut report = format!(
-        "## Investigation summary\nGuardDuty analysed {findings} in account {account} \
-         ({region}) and assessed the activity as {risk_level} risk.\n\n## Affected \
-         resources\n{resources}\n\n## Threat assessment\n{assessment}\n\n## Recommended \
-         remediation\n",
+        "## Investigation summary\nGuardDuty investigated the request \"{prompt}\" and analysed \
+         {findings} in account {account} ({region}), assessing the activity as {risk_level} \
+         risk.\n\n## Affected resources\n{resources}\n\n## Threat assessment\n{assessment}\n\n## \
+         Recommended remediation\n",
         findings = counted(evidence.len(), "finding", "findings"),
         resources = affected_resources(evidence),
         assessment = threat_assessment(evidence, risk_level),
@@ -413,7 +427,8 @@ fn affected_resources(evidence: &[&FindingEvidence]) -> String {
 
 /// The summary's threat-assessment section: the severity the assessed level comes from
 /// and the finding types it came from, highest severity first, with a count of the types
-/// past [`SUMMARIZED_FINDING_TYPES`].
+/// past [`SUMMARIZED_FINDING_TYPES`] so one account's assessment cannot grow without
+/// bound as its findings do.
 fn threat_assessment(evidence: &[&FindingEvidence], risk_level: &str) -> String {
     let Some(highest) = evidence.first() else {
         return format!(
@@ -422,17 +437,17 @@ fn threat_assessment(evidence: &[&FindingEvidence], risk_level: &str) -> String 
         );
     };
     // Counted in ONE pass, then listed in the order the evidence is already in (highest
-    // severity first), so the section is linear in the findings the pass read however
+    // severity first), so the assessment is linear in the findings the pass read however
     // many types they carry.
     let counts = counts_of(evidence.iter().map(|finding| finding.r#type.as_str()));
     let mut listed: BTreeSet<&str> = BTreeSet::new();
-    let mut lines: Vec<String> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     for finding in evidence {
-        if !listed.insert(finding.r#type.as_str()) || lines.len() >= SUMMARIZED_FINDING_TYPES {
+        if !listed.insert(finding.r#type.as_str()) || named.len() >= SUMMARIZED_FINDING_TYPES {
             continue;
         }
-        lines.push(format!(
-            "- {} (severity {}, {})",
+        named.push(format!(
+            "{} (severity {}, {})",
             finding.r#type,
             format_number(finding.severity),
             counted(
@@ -442,10 +457,10 @@ fn threat_assessment(evidence: &[&FindingEvidence], risk_level: &str) -> String 
             )
         ));
     }
-    let rest = counts.len().saturating_sub(lines.len());
+    let rest = counts.len().saturating_sub(named.len());
     if rest > 0 {
-        lines.push(format!(
-            "- and {}",
+        named.push(format!(
+            "and {}",
             counted(rest, "further finding type", "further finding types")
         ));
     }
@@ -456,7 +471,11 @@ fn threat_assessment(evidence: &[&FindingEvidence], risk_level: &str) -> String 
         top = highest.r#type,
         findings = counted(evidence.len(), "finding", "findings"),
         types = counted(counts.len(), "finding type", "finding types"),
-        lines = lines.join("\n"),
+        lines = named
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<String>>()
+            .join("\n"),
     )
 }
 
