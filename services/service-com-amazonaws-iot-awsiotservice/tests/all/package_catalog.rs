@@ -34,6 +34,13 @@ use service_com_amazonaws_iot_awsiotservice::state::MAX_PACKAGES;
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// `ListPackages`: the page of summaries the catalog's packages are reported as. It is
+/// driven through the same harness, so what a listing says and what this suite's create
+/// and reader say are compared against one emulator. The `#[path]` is what keeps it a
+/// child of THIS suite rather than a second suite beside it.
+#[path = "package_catalog/listing.rs"]
+mod listing;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

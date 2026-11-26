@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the software packages this account's package catalog holds
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::packages`]), ordered by
+//! `packageName` — the name that identifies a package — so every entry is built from the
+//! record `CreatePackage` persisted and `UpdatePackage` maintains: what this reports and
+//! what `GetPackage` reads are one value, and a package `DeletePackage` removed is listed
+//! by neither.
+//!
+//! The listing is account-wide and takes no filter, so an account holding no package is
+//! answered an EMPTY page rather than a refusal: nothing to list is an answer.
+//!
+//! `maxResults` bounds the page and `nextToken` resumes it: the token is opaque, names
+//! the package the previous page ended at, and a token this listing never issued is
+//! refused with the modelled `ValidationException` rather than silently resuming from
+//! somewhere else.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +149,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackages"))
+        // Every member this listing reports was recorded when its package was created or
+        // last updated, so the listing needs no request metadata of its own.
+        let _ = ctx;
+
+        // WHERE the page starts is resolved BEFORE any store is reached: a `nextToken`
+        // this listing never issued is refused whatever the catalog holds.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token)?),
+            None => None,
+        };
+
+        // `maxResults` is "The maximum number of results returned at one time", modelled
+        // `range 1..100` and refused outside it before this handler runs, so a request
+        // that names it asks for at least one package and one that does not asks for
+        // every package the catalog holds. The clamp is defensive rather than
+        // load-bearing.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPackagesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // A pure read of the package catalog: nothing here writes, so a later caller sees
+        // exactly what this one did.
+        let store = state.lock();
+        let mut page: Vec<PackageSummary> = store
+            .packages
+            .values()
+            // The catalog is keyed by `packageName`, so iteration is already name order
+            // and "the packages whose name sorts after the last one emitted" is a
+            // well-defined resume point even if that package has since been deleted.
+            .filter(|package| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| package.package_name.as_str() > cursor)
+            })
+            // One package beyond the page: its presence is what says the listing is
+            // truncated, and nothing more than that is read.
+            .take(page_size.saturating_add(1))
+            .map(package_summary)
+            .collect();
+        drop(store);
+
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token for the next set of results", so it is issued only
+        // while there is a next set.
+        let next_token = if truncated {
+            page.last()
+                .and_then(|last| last.package_name.as_deref())
+                .map(encode_next_token)
+        } else {
+            None
+        };
+
+        Ok(ListPackagesOutput {
+            // `PackageSummaryList` carries no length constraint, so an account holding no
+            // package answers with an EMPTY list rather than an absent member: "nothing
+            // to list" is an answer, not a missing one.
+            package_summaries: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The largest page `PackageCatalogMaxResults` admits (`range 1..100`,
+/// `smithy_query(query="operation",operation="ListPackages")`).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// One stored package as the modelled `PackageSummary` a listing carries.
+///
+/// `PackageSummary` is "A summary of information about a software package" of four
+/// members — the name that identifies it, the version currently promoted as its default,
+/// and the dates it was created and last updated
+/// (`smithy_query(query="shape",shape="PackageSummary")`) — each read off the record the
+/// create persisted and the updates maintain, so a summary and the package `GetPackage`
+/// reports can never disagree.
+fn package_summary(package: &crate::state::RegisteredPackage) -> PackageSummary {
+    PackageSummary {
+        package_name: Some(package.package_name.clone()),
+        default_version_name: package.default_version_name.clone(),
+        creation_date: Some(::aws_smithy_types::DateTime::from(package.creation_date)),
+        last_modified_date: Some(::aws_smithy_types::DateTime::from(
+            package.last_modified_date,
+        )),
+    }
+}
+
+/// The character that separates a token's listing marker from the package name it
+/// resumes after. A control character, so it occurs in no `PackageName`
+/// (`^[a-zA-Z0-9-_.]+$`) and the split is unambiguous.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The marker every token of THIS listing carries. The listing takes no filter, so one
+/// account has exactly one listing to page through and the marker is constant — it is
+/// what keeps a token of another listing from being read as a resume point here.
+const TOKEN_MARKER: &str = "packages";
+
+/// The opaque `nextToken` that resumes the listing after the package named `last_name`.
+///
+/// Hex-encoded so the token is opaque to the caller whatever the names contain. The
+/// encoding carries no integrity protection and claims none: a caller that reverses it
+/// can name any resume point of the listing it is already reading, which selects a page
+/// of that same listing and nothing else.
+fn encode_next_token(last_name: &str) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{TOKEN_SEPARATOR}{last_name}"))
+}
+
+/// The package name a `nextToken` resumes after, or the modelled `ValidationException`
+/// (HTTP 400, "The request is not valid") when the token is not one
+/// [`encode_next_token`] issued for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler.
+fn decode_next_token(token: &str) -> Result<String, ListPackagesError> {
+    let invalid = || -> ListPackagesError {
+        ListPackagesErrorModeled::ValidationException(ValidationException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (marker, resume_after) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    // A resume point outside `PackageName` could name no package in the catalog, so a
+    // token carrying one was not issued by this listing.
+    if marker != TOKEN_MARKER || !is_modeled_package_name(resume_after) {
+        return Err(invalid());
+    }
+    Ok(resume_after.to_string())
+}
+
+/// Whether `name` satisfies the model's `PackageName`: 1..128 characters matching
+/// `^[a-zA-Z0-9-_.]+$` (`smithy_query(query="shape",shape="PackageName")`). Smithy
+/// `length` counts CHARACTERS, so this does too.
+fn is_modeled_package_name(name: &str) -> bool {
+    let length = name.chars().count();
+    (1..=128).contains(&length)
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
 }
