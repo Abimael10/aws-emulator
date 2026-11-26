@@ -239,7 +239,7 @@ use std::collections::BTreeMap;
 
 use super::posix_shell_arithmetic::{self, ArithmeticVariables};
 use super::posix_shell_files::{
-    self, AppliedRedirect, FileRefusal, Redirections, ShellFiles,
+    self, AppliedRedirect, FileRefusal, HereInput, Redirections, ShellFiles,
 };
 use super::posix_shell_text_filters::{Filter, STANDARD_INPUT_LABEL, TEXT_FILTER_COMMANDS};
 use super::posix_shell_volume::{
@@ -2337,13 +2337,25 @@ impl ShellSession {
         redirections: &mut Redirections,
     ) -> bool {
         let machine = self.volume.is_some();
-        if let Some(text) = self.here_document(redirect) {
+        if let Some(here) = HereInput::of(redirect) {
             // A here-document reaches the descriptor a `<` does, so it is a form a session
             // that works over a tree performs.
             if !machine {
                 return false;
             }
-            redirections.input_text = Some(text);
+            // WHICH forms carry text, and what the shell does to each, is the shared reading
+            // ([`HereInput`]); what is this session's own is the EXPANSION, and whether the
+            // text is expanded at all is the delimiter's own question, which that reading
+            // answers.
+            let text = if here.requires_expansion {
+                match self.expand_word(here.written) {
+                    Some(expanded) => expanded,
+                    None => return false,
+                }
+            } else {
+                here.written.to_string()
+            };
+            here.record(&text, redirections);
             return true;
         }
         let ::brush_parser::ast::IoRedirect::File(descriptor, kind, target) = redirect else {
@@ -2372,37 +2384,6 @@ impl ShellSession {
         }
         applied.record(redirections);
         true
-    }
-
-    /// The TEXT one here-document or here-string carries, or `None` for a redirection that is
-    /// neither.
-    ///
-    /// `<<WORD` is the document written under the command, `<<-WORD` is the same with the
-    /// leading tabs stripped off each of its lines, and `<<<WORD` is the one word itself with
-    /// a line ending, which is what the shell gives the command on its standard input.
-    /// Whether the text is EXPANDED is the delimiter's own question: a quoted delimiter takes
-    /// the document literally, and the parser reports which it was.
-    fn here_document(&mut self, redirect: &::brush_parser::ast::IoRedirect) -> Option<String> {
-        match redirect {
-            ::brush_parser::ast::IoRedirect::HereDocument(_fd, document) => {
-                let text = if document.requires_expansion {
-                    self.expand_word(&document.doc.value)?
-                } else {
-                    document.doc.value.clone()
-                };
-                Some(if document.remove_tabs {
-                    text.lines()
-                        .map(|line| format!("{}\n", line.trim_start_matches('\t')))
-                        .collect()
-                } else {
-                    text
-                })
-            }
-            ::brush_parser::ast::IoRedirect::HereString(_fd, word) => {
-                Some(format!("{}\n", self.expand_word(&word.value)?))
-            }
-            _ => None,
-        }
     }
 
     /// `path` as the tree this session works over keys it: a path a program named WITHOUT a

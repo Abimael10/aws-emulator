@@ -22,7 +22,8 @@
 //! * the `test` questions that are about a FILE ([`file_test_answer`]), beside the ones about
 //!   values alone ([`crate::posix_shell_session::value_test_answer`]);
 //! * the REDIRECTIONS of the three standard streams ([`Redirections`],
-//!   [`AppliedRedirect::of`]), read off the grammar's own redirection node.
+//!   [`AppliedRedirect::of`]), read off the grammar's own redirection node, together with the
+//!   ones whose text is written INSIDE the command ([`HereInput`]).
 //!
 //! So each session plumbs its own streams and spends its own budget, and the answer to "what
 //! does `ls -l` write", "what does `rm` say about a directory" and "which descriptor does
@@ -970,15 +971,101 @@ impl AppliedRedirect {
 
     /// Record this redirection among the ones the command being performed carries. A later
     /// redirection of the same descriptor replaces an earlier one, as the shell's last open of
-    /// a descriptor is the one that stands.
+    /// a descriptor is the one that stands — so an input redirection from a FILE replaces the
+    /// text a here-document or here-string had put on the same descriptor
+    /// ([`Redirections::input_text`]).
     pub fn record(self, redirections: &mut Redirections) {
         match self {
             Self::Out(path, append) => redirections.out = Some((path, append)),
             Self::Error(path, append) => redirections.error = Some((path, append)),
-            Self::Input(path) => redirections.input = Some(path),
+            Self::Input(path) => {
+                redirections.input = Some(path);
+                redirections.input_text = None;
+            }
             Self::ErrorToOut => redirections.error_to_out = true,
             Self::OutToError => redirections.out_to_error = true,
         }
+    }
+}
+
+/// ONE redirection whose text is written INSIDE the command rather than named as a file: a
+/// here-document (`<<WORD`, and `<<-WORD` which "shall strip leading <tab> characters" off
+/// each of its lines) or a here-string (`<<<WORD`). The text is "the command's standard
+/// input", so nothing of the files is opened or read for it.
+///
+/// Read here, off the grammar's own redirection node, for the reason the rest of this module
+/// is shared: a session that reads its own here-documents hands a program a different document
+/// from the session beside it. What stays the SESSION's is the EXPANSION — only a session knows
+/// what a word expands to — so this reading answers the text as the program WROTE it together
+/// with what the shell does to it, and the session hands the expanded text back to
+/// [`Self::handed_over`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HereInput<'a> {
+    /// The text as the program wrote it: the document's own lines, or the one word of a
+    /// here-string.
+    pub written: &'a str,
+    /// Whether the text is EXPANDED before it is handed over. It is the DELIMITER's own
+    /// question — "if no characters in word are quoted, ... the here-document lines shall be
+    /// expanded", while a quoted delimiter takes the document literally — and the grammar
+    /// reports which it was.
+    pub requires_expansion: bool,
+    /// Whether the leading tabs are stripped off each of the text's lines, which is what the
+    /// `<<-` spelling asks for.
+    pub remove_tabs: bool,
+    /// Whether a line ending is ADDED to the text: a here-string is one word and the shell
+    /// gives the command that word followed by a newline, while a document already carries the
+    /// line endings the program wrote.
+    pub ends_the_line: bool,
+}
+
+impl<'a> HereInput<'a> {
+    /// The here-document or here-string the grammar's node describes, and `None` for a
+    /// redirection that is neither.
+    #[must_use]
+    pub fn of(redirect: &'a ::brush_parser::ast::IoRedirect) -> Option<Self> {
+        match redirect {
+            ::brush_parser::ast::IoRedirect::HereDocument(_descriptor, document) => Some(Self {
+                written: document.doc.value.as_str(),
+                requires_expansion: document.requires_expansion,
+                remove_tabs: document.remove_tabs,
+                ends_the_line: false,
+            }),
+            ::brush_parser::ast::IoRedirect::HereString(_descriptor, word) => Some(Self {
+                written: word.value.as_str(),
+                requires_expansion: true,
+                remove_tabs: false,
+                ends_the_line: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The text the command really reads on its standard input, given `expanded` — the
+    /// session's expansion of [`Self::written`], or that text itself where the delimiter asked
+    /// for none.
+    #[must_use]
+    pub fn handed_over(&self, expanded: &str) -> String {
+        if self.remove_tabs {
+            return expanded
+                .lines()
+                .map(|line| format!("{}\n", line.trim_start_matches('\t')))
+                .collect();
+        }
+        if self.ends_the_line {
+            return format!("{expanded}\n");
+        }
+        expanded.to_string()
+    }
+
+    /// Record the text this redirection carries among the ones the command being performed
+    /// carries, given `expanded` as [`Self::handed_over`] takes it.
+    ///
+    /// It stands on the same descriptor a `< path` does, so it REPLACES a file an earlier input
+    /// redirection of the same command named — the shell's last open of a descriptor is the one
+    /// that stands, which is what [`AppliedRedirect::record`] applies the other way round.
+    pub fn record(&self, expanded: &str, redirections: &mut Redirections) {
+        redirections.input = None;
+        redirections.input_text = Some(self.handed_over(expanded));
     }
 }
 

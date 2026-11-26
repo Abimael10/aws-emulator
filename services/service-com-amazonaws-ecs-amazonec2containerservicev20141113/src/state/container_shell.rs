@@ -81,8 +81,9 @@
 //! rather than restated:
 //!
 //! * the FILES and the utilities over them — the seam a session reaches its files through,
-//!   `cat`, `ls`, `mkdir`, `touch`, `rm`, `sync`, the `test` questions about a file, and the
-//!   reading of a redirection node ([`::service_common::posix_shell_files`]);
+//!   `cat`, `ls`, `mkdir`, `touch`, `rm`, `sync`, the `test` questions about a file, the
+//!   reading of a redirection node and the reading of the text a here-document or here-string
+//!   carries ([`::service_common::posix_shell_files`]);
 //! * the TEXT FILTERS ([`::service_common::posix_shell_text_filters`]);
 //! * the `test` questions about values alone
 //!   ([`::service_common::posix_shell_session::value_test_answer`]);
@@ -129,6 +130,11 @@
 //!   `< path`, and the duplications `2>&1` and `1>&2` — each OPENED where the shell opens it,
 //!   before the command runs, so a file the filesystem refuses (a read-only mount, a missing
 //!   directory) is reported in the shell's own wording and the command does not run at all;
+//! * the forms whose text is written INSIDE the command — a HERE-DOCUMENT (`<<WORD`, and
+//!   `<<-WORD` which strips the leading tabs off each of its lines) and a HERE-STRING
+//!   (`<<<WORD`) — which ARE the command's standard input, expanded where the delimiter
+//!   asked for it and taken literally where it was quoted, so a program that composes a
+//!   document and hands it to a command needs no file to put it in;
 //! * a PIPELINE connects its stages: "the standard output of the first command shall be
 //!   connected to the standard input of the second command", so what one stage wrote is what
 //!   the next one reads;
@@ -216,7 +222,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ::service_common::posix_shell_files::{
-    AppliedRedirect, FileRefusal, Redirections, ShellFiles, FILE_COMMANDS,
+    AppliedRedirect, FileRefusal, HereInput, Redirections, ShellFiles, FILE_COMMANDS,
 };
 
 use super::*;
@@ -2100,10 +2106,9 @@ impl ContainerShell {
                         assignments.push(pair);
                     }
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
-                        let Some(applied) = self.apply_redirect(redirect).await else {
+                        if !self.apply_redirect(redirect, &mut redirections).await {
                             return self.word_failure().await;
-                        };
-                        applied.record(&mut redirections);
+                        }
                     }
                     _ => return self.declined(),
                 }
@@ -2179,30 +2184,58 @@ impl ContainerShell {
         })
     }
 
-    /// One redirection of a simple command as this session records it — `None` for a form
-    /// this container does not perform.
+    /// RECORD one redirection of a simple command among the ones that command carries —
+    /// answering `false` for a form this container does not perform, which makes the command
+    /// one that did not run.
     ///
     /// WHICH forms are read is the shared reading of a redirection node
-    /// ([`AppliedRedirect::of`]), over the target word this session expanded: the
-    /// redirections of the three standard descriptors and the duplication of one standard
-    /// stream onto the other, which is how a program asks for its diagnostics on the one
-    /// stream its caller reads.
+    /// ([`AppliedRedirect::of`], and [`HereInput::of`] for the ones whose text is written
+    /// inside the command), over the target word this session expanded: the redirections of
+    /// the three standard descriptors, the duplication of one standard stream onto the other
+    /// — which is how a program asks for its diagnostics on the one stream its caller reads —
+    /// and the HERE-DOCUMENT (`<<WORD`, `<<-WORD`) and HERE-STRING (`<<<WORD`) that ARE the
+    /// command's standard input, which is how a program hands a document it composed to a
+    /// command without a file to put it in.
     fn apply_redirect<'a>(
         &'a mut self,
         redirect: &'a ::brush_parser::ast::IoRedirect,
-    ) -> ShellFuture<'a, Option<AppliedRedirect>> {
+        redirections: &'a mut Redirections,
+    ) -> ShellFuture<'a, bool> {
         Box::pin(async move {
+            // The text written INSIDE the command is read first: it names no file, so nothing
+            // of the filesystem is opened for it.
+            if let Some(here) = HereInput::of(redirect) {
+                let text = if here.requires_expansion {
+                    match self.expand_word(here.written).await {
+                        Some(expanded) => expanded,
+                        None => return false,
+                    }
+                } else {
+                    here.written.to_string()
+                };
+                here.record(&text, redirections);
+                return true;
+            }
             let ::brush_parser::ast::IoRedirect::File(descriptor, kind, target) = redirect else {
-                return None;
+                return false;
             };
             let expanded = match target {
                 ::brush_parser::ast::IoFileRedirectTarget::Duplicate(word)
                 | ::brush_parser::ast::IoFileRedirectTarget::Filename(word) => {
-                    self.expand_word(&word.value).await?
+                    match self.expand_word(&word.value).await {
+                        Some(expanded) => expanded,
+                        None => return false,
+                    }
                 }
-                _ => return None,
+                _ => return false,
             };
-            AppliedRedirect::of(*descriptor, kind, &expanded)
+            match AppliedRedirect::of(*descriptor, kind, &expanded) {
+                Some(applied) => {
+                    applied.record(redirections);
+                    true
+                }
+                None => false,
+            }
         })
     }
 
@@ -2941,12 +2974,16 @@ impl ContainerShell {
     /// What the command being performed reads from STANDARD INPUT, and `None` when there is
     /// none to read.
     ///
-    /// The file an input redirection names, when the command carries one, and otherwise what
-    /// the stage before it in a pipeline wrote. It is TAKEN: a stream is consumed by whoever
-    /// reads it, so the command after it in the same pipeline reads nothing rather than the
-    /// same bytes twice. There is no terminal behind this: a command with neither reads
-    /// nothing at all.
+    /// The TEXT written inside the command, when it carries a here-document or a here-string;
+    /// otherwise the file an input redirection names, and otherwise what the stage before it
+    /// in a pipeline wrote. It is TAKEN: a stream is consumed by whoever reads it, so the
+    /// command after it in the same pipeline reads nothing rather than the same bytes twice.
+    /// There is no terminal behind this: a command with none of the three reads nothing at
+    /// all.
     fn standard_input(&mut self, redirections: &Redirections) -> Option<String> {
+        if let Some(text) = redirections.input_text.clone() {
+            return Some(text);
+        }
         if let Some(path) = redirections.input.clone() {
             return self.filesystem.read(&path).ok();
         }
