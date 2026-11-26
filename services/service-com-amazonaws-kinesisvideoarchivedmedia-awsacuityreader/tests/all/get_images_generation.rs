@@ -355,9 +355,20 @@ const LONG_FRAGMENT_STREAM: &str = "get-images-long-fragment-stream";
 /// single instant it is stamped at and nowhere else.
 const INSTANT_FRAGMENT_STREAM: &str = "get-images-instant-fragment-stream";
 
-/// [`harness`] with two more streams, each holding ONE fragment stamped at the same
+/// How long the one fragment of [`SHORT_FRAGMENT_STREAM`] plays, in seconds: a short
+/// burst of media, so the instant its playback ends falls a couple of sampled instants
+/// into a window rather than a minute into one.
+const SHORT_FRAGMENT_SECS: i64 = 2;
+
+/// That same duration in the milliseconds a stored fragment records it in.
+const SHORT_FRAGMENT_MILLIS: u64 = 2_000;
+
+/// A stream holding exactly one fragment that plays for [`SHORT_FRAGMENT_SECS`].
+const SHORT_FRAGMENT_STREAM: &str = "get-images-short-fragment-stream";
+
+/// [`harness`] with three more streams, each holding ONE fragment stamped at the same
 /// producer and server timestamps as the first seeded fragment but playing for a
-/// different length of time: a whole minute, and no time at all.
+/// different length of time: a whole minute, a couple of seconds, and no time at all.
 fn harness_with_one_fragment_each() -> Harness {
     let harness = harness();
     {
@@ -366,6 +377,7 @@ fn harness_with_one_fragment_each() -> Harness {
         let created_at = from_epoch_millis(T0_SECS * 1000);
         for (name, duration_millis) in [
             (LONG_FRAGMENT_STREAM, LONG_FRAGMENT_MILLIS),
+            (SHORT_FRAGMENT_STREAM, SHORT_FRAGMENT_MILLIS),
             (INSTANT_FRAGMENT_STREAM, 0),
         ] {
             let archived = ArchivedStream::new(name, REGION, created_at, 24);
@@ -418,9 +430,9 @@ struct CoverageCase {
 ///
 /// The rows differ along what the rule generalises over: where the window sits relative
 /// to the one fragment's playback (strictly inside it, straddling its start, straddling
-/// its end, entirely past it), how long that fragment plays (a whole minute, no time at
-/// all), which timestamp field is selected, and whether the request samples the window
-/// at all.
+/// its end, opening exactly where it ends, a minute past it, an hour past it), how long
+/// that fragment plays (a whole minute, a couple of seconds, no time at all), which
+/// timestamp field is selected, and whether the request samples the window at all.
 #[tokio::test]
 async fn a_window_the_archive_plays_over_is_served_wherever_its_fragment_started() {
     let harness = harness_with_one_fragment_each();
@@ -495,6 +507,56 @@ async fn a_window_the_archive_plays_over_is_served_wherever_its_fragment_started
             covered: None,
         },
         CoverageCase {
+            case: "a window opening one second before a fragment that plays for two: \
+                   only the instants its playback reaches carry an image",
+            stream: SHORT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from - 1,
+            end_secs: from + 9,
+            interval_millis: Some(1_000),
+            covered: Some(vec![
+                false, true, true, false, false, false, false, false, false, false, false,
+            ]),
+        },
+        CoverageCase {
+            case: "a window opening one second into that fragment's playback",
+            stream: SHORT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 1,
+            end_secs: from + 11,
+            interval_millis: Some(1_000),
+            covered: Some(vec![
+                true, false, false, false, false, false, false, false, false, false, false,
+            ]),
+        },
+        CoverageCase {
+            case: "a window opening ON the instant that fragment stops playing",
+            stream: SHORT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + SHORT_FRAGMENT_SECS,
+            end_secs: from + 12,
+            interval_millis: Some(1_000),
+            covered: None,
+        },
+        CoverageCase {
+            case: "a window a minute past that fragment",
+            stream: SHORT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 60,
+            end_secs: from + 70,
+            interval_millis: Some(1_000),
+            covered: None,
+        },
+        CoverageCase {
+            case: "a window an hour past that fragment",
+            stream: SHORT_FRAGMENT_STREAM,
+            selector: "PRODUCER_TIMESTAMP",
+            start_secs: from + 3_600,
+            end_secs: from + 3_610,
+            interval_millis: Some(1_000),
+            covered: None,
+        },
+        CoverageCase {
             case: "a window opening on a fragment of no duration: its one instant is \
                    covered and nothing after it is",
             stream: INSTANT_FRAGMENT_STREAM,
@@ -539,6 +601,8 @@ async fn a_window_the_archive_plays_over_is_served_wherever_its_fragment_started
                 String::from_utf8_lossy(response.body())
             );
             let (code, message) = reported(&response);
+            // One fixed sentence: it names neither the stream the request addressed nor
+            // either end of the window, so nothing of the request is in the refusal.
             assert_eq!(
                 (code.as_str(), message.as_str()),
                 ("ResourceNotFoundException", NO_FRAGMENTS),
@@ -561,6 +625,29 @@ async fn a_window_the_archive_plays_over_is_served_wherever_its_fragment_started
             page.len()
         );
         for (index, (image, has_media)) in page.iter().zip(covered).enumerate() {
+            // Each image is stamped at the instant it was generated FOR, covered or not:
+            // the window's start, then one per sampling interval while the window lasts.
+            // A request naming no interval samples that start alone, which is the one
+            // image `SamplingInterval` documents for it.
+            let at_millis = match interval_millis {
+                Some(step) => {
+                    start_secs * 1000 + i64::try_from(index).expect("a small index") * step
+                }
+                None => {
+                    assert_eq!(
+                        index, 0,
+                        "case {case:?}: a window sampled at no interval carries its start \
+                         alone, got image {index} as well"
+                    );
+                    start_secs * 1000
+                }
+            };
+            assert_eq!(
+                image_millis(image),
+                at_millis,
+                "case {case:?}: image {index} must be stamped at the instant it was sampled \
+                 for ({at_millis} ms from the epoch), got {image:?}"
+            );
             if has_media {
                 assert_eq!(
                     image["Error"],
@@ -576,6 +663,11 @@ async fn a_window_the_archive_plays_over_is_served_wherever_its_fragment_started
                     image["Error"].as_str(),
                     Some("NO_MEDIA"),
                     "case {case:?}: instant {index} expected NO_MEDIA, got {image:?}"
+                );
+                assert_eq!(
+                    image["ImageContent"],
+                    serde_json::Value::Null,
+                    "case {case:?}: instant {index} expected no image content, got {image:?}"
                 );
             }
         }
