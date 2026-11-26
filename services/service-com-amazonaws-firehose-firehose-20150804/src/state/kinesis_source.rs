@@ -73,7 +73,7 @@ use crate::state::{
     StreamStatus,
 };
 
-/// Whether the role a stream's source names may be read under at all, and what a read it may
+/// Whether the role a stream's source names may make the read at all, and what a read it may
 /// not make reports.
 pub mod source_read_authorization;
 

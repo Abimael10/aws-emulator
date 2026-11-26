@@ -593,7 +593,10 @@ async fn a_create_is_served_whatever_the_source_role_may_do_with_the_source() {
         engine::emulator_account_id()
     );
 
-    for (row, source_case) in source_cases().iter().enumerate() {
+    // Every row's create, each under a role whose policy says something different about the
+    // source read.
+    let cases = source_cases();
+    for (row, source_case) in cases.iter().enumerate() {
         let case = source_case.case;
         let mut statements = Vec::new();
         if !source_case.granted.is_empty() {

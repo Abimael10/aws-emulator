@@ -36,16 +36,16 @@
 //! missing permission in place restores the refused stream's delivery.
 //!
 //! Every row's stream is CREATED under a role that may make the whole read, and the row's own
-//! grant is then stated in place: `CreateDeliveryStream` resolves the source role's
-//! permissions before it writes the stream, so a configuration whose role may not read is
-//! refused outright and never becomes a stream (the sibling suite
-//! `firehose_create_resolves_its_configuration` pins that refusal). What this suite is about
-//! is therefore what every later attempt reads — the permissions in force AT THAT ATTEMPT.
-//! The narrowing is ordered against the stream's own readings and not against the clock: it
-//! is stated while the stream is still `CREATING`, before any poll of its source (a source is
-//! polled only for an `ACTIVE` stream), and a row whose refusal is reported then waits for
+//! grant is then stated in place — not because the create would answer for that grant (it
+//! resolves no identity policy at all: the sibling suite
+//! `firehose_create_resolves_its_configuration` pins that every grant shape is written), but so
+//! the grant under test is ordered against the stream's own readings and not against the clock:
+//! it is stated while the stream is still `CREATING`, before any poll of its source (a source
+//! is polled only for an `ACTIVE` stream), and a row whose refusal is reported then waits for
 //! that FIRST report before writing to the source — so the records it puts meet a retrieval
-//! the narrowed policy decided, whatever order the host happened to run things in.
+//! the narrowed policy decided, whatever order the host happened to run things in. What this
+//! suite is about is therefore what every attempt reads — the permissions in force AT THAT
+//! ATTEMPT.
 //!
 //! Nothing here is asserted about how fast the host ran: every wait polls for the CONDITION
 //! under a generous deadline, and what must stay empty is re-read at every one of those

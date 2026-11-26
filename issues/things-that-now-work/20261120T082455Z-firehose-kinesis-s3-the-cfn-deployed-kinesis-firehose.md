@@ -45,3 +45,21 @@ The marker strings, bucket/stream/role names and log-stream names are per-run va
 4. List the bucket under `good/`: on AWS the permissioned stream's record lands there. Observe that no object appears.
 5. GetLogEvents on the under-permissioned stream's log stream: on AWS a delivery-error record with errorCode `Kinesis.AccessDenied` appears. Observe that no delivery-error record is written.
 6. Re-replay the check in trace_ids to confirm a fix.
+
+## Resolution
+
+Each beat above is served now. `CreateDeliveryStream` no longer refuses a
+`KinesisStreamSourceConfiguration` whose `RoleARN` is short of a Kinesis Data Streams call the
+retrieval is made of — those permissions are read at each retrieval, not by the create — so the
+stack reaches `CREATE_COMPLETE`, the permissioned stream delivers under its prefix, the
+under-permissioned one delivers nothing and reports `Kinesis.AccessDenied` through its
+`CloudWatchLoggingOptions`, and a grant stated afterwards on the same role delivers the records
+it never took. Pinned by `core/router/tests/all/cfn_deployed_firehose_under_permissioned_source_stack.rs`,
+`core/router/tests/all/firehose_cfn_deployed_source_grant_decides_the_retrieval.rs`,
+`core/router/tests/all/firehose_source_grant_is_every_policy_the_role_carries.rs` and
+`core/router/tests/all/cfn_deployed_firehose_source_permission_repair.rs`.
+
+The recorded check itself still reports no verdict, and this record is NOT a green replay: it is
+cut off by the replay harness's 60 s wall-clock cap inside its own late poll loop, which sleeps
+10 s before each look, while the emulator serves the whole scenario end to end in about 8 s (the
+runtime of the suites above). What remains at that point is budget, not behaviour.
