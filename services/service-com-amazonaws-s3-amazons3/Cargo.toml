@@ -37,8 +37,8 @@ md-5 = "0.10"
 # Renders that digest as the lowercase hex an ETag carries.
 hex = { workspace = true }
 # An object version id is the SHA-256 of the bucket, the key and the store's mint
-# sequence, hex encoded (`state::mint_version_id`), and SHA-512 is one of the checksum
-# algorithms an object may be stored with (`state::checksum_digest`).
+# sequence, rendered as a URL-safe Base64 token (`state::mint_version_id`), and SHA-512 is
+# one of the checksum algorithms an object may be stored with (`state::checksum_digest`).
 sha2 = { workspace = true }
 # The five checksum algorithms S3 publishes for an object (`CRC32`, `CRC32C`, `CRC64NVME`,
 # `SHA1`, `SHA256`), computed by the AWS SDK's own implementation of them rather than by

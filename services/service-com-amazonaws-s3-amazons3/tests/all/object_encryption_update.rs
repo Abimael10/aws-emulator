@@ -298,7 +298,9 @@ async fn an_update_naming_an_address_this_emulator_does_not_hold_is_refused_with
     // The payload is well formed in all of them, so the answer is about the ADDRESS — and
     // `NoSuchKey` is the one not-found error this operation publishes, so a version id that
     // names nothing is answered with it too.
-    let absent_version = "a".repeat(version_id.chars().count());
+    // The width of a minted id, in a character of the alphabet an issued id is drawn from
+    // that no hexadecimal digest carries.
+    let absent_version = "z".repeat(version_id.chars().count());
     let rows: &[(&str, &str, String, &str)] = &[
         ("a key never written", "absent.bin", String::new(), "NoSuchKey"),
         ("a prefix of the held key", "present", String::new(), "NoSuchKey"),

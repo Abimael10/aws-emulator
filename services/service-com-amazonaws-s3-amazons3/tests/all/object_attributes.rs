@@ -301,7 +301,9 @@ async fn an_address_this_emulator_does_not_hold_is_refused_with_the_code_for_wha
     let version_id = stored
         .header("x-amz-version-id")
         .expect("a versioning-enabled bucket mints a version id");
-    let absent_version = "b".repeat(version_id.chars().count());
+    // The width of a minted id, in a character of the alphabet an issued id is drawn from
+    // that no hexadecimal digest carries: an entity tag's digest form names no version.
+    let absent_version = "z".repeat(version_id.chars().count());
     assert_ne!(
         absent_version, version_id,
         "the absent-version row must name an id the store did not mint"

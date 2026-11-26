@@ -637,12 +637,15 @@ async fn a_version_id_the_bucket_holds_no_version_for_is_not_found() {
     // covers it.
     let mut almost = minted.clone();
     let last = almost.pop().expect("a minted version id is not empty");
-    // Another hexadecimal digit, so the id stays shaped like one the store could have minted.
-    almost.push(if last == '0' { '1' } else { '0' });
+    // Another character of the alphabet a minted id is drawn from, so the id stays shaped
+    // like one the store could have minted.
+    almost.push(if last == 'Z' { 'y' } else { 'Z' });
     let rows: [(&str, String); 3] = [
         (
             "an id of the minted shape that was never minted",
-            "0123456789abcdef0123456789abcdef".to_string(),
+            // Amazon S3's own published example of a version id: the issued form, which is
+            // not the hexadecimal digest an entity tag is written in.
+            "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY".to_string(),
         ),
         ("an id differing in one character", almost),
         ("the null version of a key that has none", "null".to_string()),

@@ -186,6 +186,26 @@ impl CustomerKeyRejection {
             Self::CombinedWithManaged => COMBINED_WITH_MANAGED_MESSAGE,
         }
     }
+
+    /// The request field S3's `InvalidArgument` document names this refusal against, or `None`
+    /// for one whose document names no argument.
+    ///
+    /// Each sentence above is the same for every request in its class and states the RULE
+    /// rather than which header broke it, so the `<ArgumentName>` is the whole of what says
+    /// what the caller has to change: the `x-amz-server-side-encryption` header the
+    /// server-side-encryption parameters of a request belong to
+    /// ([`super::SERVER_SIDE_ENCRYPTION_HEADER`]) — the family, not one of the three members,
+    /// because what the class is about is the encryption the request asks for and not the
+    /// spelling of one header. No `<ArgumentValue>` travels beside it: those members carry a
+    /// secret key and the digest of one, and nothing of them is answered back.
+    ///
+    /// The pair belongs to the `InvalidArgument` document (Amazon S3 API Reference, *Error
+    /// responses*), so the one rejection answered under another code ([`Self::code`] — the
+    /// digest of the key not matching the key, which is an `InvalidDigest`) names no argument.
+    pub fn argument(self) -> Option<&'static str> {
+        (self.code() == super::INVALID_ARGUMENT_CODE)
+            .then_some(super::SERVER_SIDE_ENCRYPTION_HEADER)
+    }
 }
 
 /// The customer key the three SSE-C members carry, `None` for a request that carries none of

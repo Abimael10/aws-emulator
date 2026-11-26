@@ -23,7 +23,11 @@
 
 /// The `x-amz-server-side-encryption` header a WRITE names the encryption to apply in, which a
 /// read does not bind.
-const SERVER_SIDE_ENCRYPTION_HEADER: &str = "x-amz-server-side-encryption";
+///
+/// The header the SERVER-SIDE ENCRYPTION parameters of a request belong to, so it is also how
+/// S3's `InvalidArgument` document names the argument of a refusal about those parameters
+/// ([`super::CustomerKeyRejection::argument`]).
+pub const SERVER_SIDE_ENCRYPTION_HEADER: &str = "x-amz-server-side-encryption";
 
 /// Every header a write binds the S3-MANAGED encryption of the object it stores from, in the
 /// order S3's own documentation lists them: the algorithm, the KMS key it names, the encryption

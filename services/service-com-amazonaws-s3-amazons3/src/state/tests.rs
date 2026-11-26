@@ -1070,3 +1070,108 @@ fn a_versioned_write_keeps_what_it_supersedes_and_counts_it_against_the_budgets(
         bucket.object_versions("key").len()
     );
 }
+
+/// Every id the store MINTS is a token the one `versionId` rule accepts, and none of them is
+/// written in the form an object's ENTITY TAG is: the two kinds of token this service publishes
+/// stay apart, so a request carrying a tag where a version id belongs names no version.
+///
+/// Over a bounded set of (bucket, key, sequence) triples rather than one: what the mint
+/// generalises over is the bucket, the key and the store's sequence.
+#[test]
+fn every_minted_version_id_is_a_token_the_shared_rule_accepts() {
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+    for bucket in ["one", "two", "a-much-longer-bucket-name"] {
+        for key in ["key", "ledger/entry.bin", ""] {
+            for sequence in [0u64, 1, 7, 4096, u64::MAX] {
+                let id = mint_version_id(bucket, key, sequence);
+                let case = format!("{bucket:?}/{key:?}#{sequence}");
+                assert_eq!(
+                    id.chars().count(),
+                    VERSION_ID_CHARS,
+                    "case {case}: a minted id carries the published width, got {id:?}"
+                );
+                assert!(
+                    version_id_is_well_formed(&id),
+                    "case {case}: a minted id must be one the shared rule accepts, got {id:?}"
+                );
+                assert!(
+                    !is_entity_tag_shaped(&id),
+                    "case {case}: a minted id must not be written in an entity tag's form, got \
+                     {id:?}"
+                );
+                assert!(
+                    minted.insert(id.clone()),
+                    "case {case}: every minted id is unique, got {id:?} twice"
+                );
+                assert_eq!(
+                    mint_version_id(bucket, key, sequence),
+                    id,
+                    "case {case}: a minted id is derived, so it does not change, got {id:?}"
+                );
+            }
+        }
+    }
+}
+
+/// An object's entity tag is read as one WHEREVER it is written: the digest of a single write's
+/// object, the composite of a multipart one with its part count, and with or without the quotes
+/// the tag is reported inside — while a token of the version id's own form is not one.
+#[test]
+fn an_entity_tag_is_recognised_by_its_published_form() {
+    let single = object_etag(b"an object of some bytes");
+    let multipart = multipart_object_etag(&[b"part one", b"part two"]);
+    // (case, the value, whether it is written in an entity tag's form)
+    let rows: Vec<(&str, String, bool)> = vec![
+        ("the tag of a single write", single.clone(), true),
+        (
+            "that tag without its quotes",
+            etag_value(&single).to_string(),
+            true,
+        ),
+        ("the tag of a multipart object", multipart.clone(), true),
+        (
+            "that tag without its quotes",
+            etag_value(&multipart).to_string(),
+            true,
+        ),
+        (
+            "a digest of the tag's width in one digit",
+            "0".repeat(ENTITY_TAG_DIGEST_CHARS),
+            true,
+        ),
+        (
+            "a digest one digit short of that width",
+            "0".repeat(ENTITY_TAG_DIGEST_CHARS - 1),
+            false,
+        ),
+        (
+            "a token of the version id's own form",
+            mint_version_id("one", "key", 1),
+            false,
+        ),
+        (
+            // Amazon S3's own published example of a version id.
+            "the published example of a version id",
+            "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY".to_string(),
+            false,
+        ),
+        (
+            "a digest of the tag's width with a part count that is no number",
+            format!("{}-many", "a".repeat(ENTITY_TAG_DIGEST_CHARS)),
+            false,
+        ),
+        (
+            "an uppercase rendering of a digest",
+            "A".repeat(ENTITY_TAG_DIGEST_CHARS),
+            false,
+        ),
+    ];
+    for (case, value, expected) in rows {
+        assert_eq!(
+            is_entity_tag_shaped(&value),
+            expected,
+            "case {case:?}: expected {expected} for {value:?}, got {}",
+            is_entity_tag_shaped(&value)
+        );
+    }
+}

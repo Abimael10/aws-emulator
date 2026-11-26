@@ -1889,12 +1889,18 @@ impl<E> Scaffolded<E> {
 
     /// The refusal every call that may supply a CUSTOMER-PROVIDED encryption key answers one
     /// of the three SSE-C members it cannot use with: the code, the status and the sentence
-    /// that rejection publishes ([`crate::state::CustomerKeyRejection`]).
+    /// that rejection publishes ([`crate::state::CustomerKeyRejection`]), and — where the
+    /// document is the `InvalidArgument` one — the `<ArgumentName>` naming the request field
+    /// it is about ([`crate::state::CustomerKeyRejection::argument`]).
     ///
     /// One place, so a write and a read refuse the same unusable key alike, and nothing about
-    /// the key the request carried travels in the answer.
+    /// the key the request carried travels in the answer: the pair carries the field's name
+    /// and no value.
     pub fn customer_key(rejection: crate::state::CustomerKeyRejection) -> Self {
-        Self::unmodeled(rejection.code(), rejection.status(), rejection.message())
+        match rejection.argument() {
+            Some(argument) => Self::invalid_argument(argument, None, rejection.message()),
+            None => Self::unmodeled(rejection.code(), rejection.status(), rejection.message()),
+        }
     }
 
     /// The refusal a READ of an object stored under a customer-provided key answers a request

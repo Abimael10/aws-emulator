@@ -12,8 +12,9 @@
 //!   the capitalised spelling, and a client that reads a configuration back and puts it again
 //!   is sending that one, which S3 accepts. A `Name` that is no `FilterRuleName` in any case
 //!   is refused as the ARGUMENT it is: HTTP 400 `InvalidArgument` with the fixed sentence for
-//!   that class and the `<ArgumentName>` / `<ArgumentValue>` pair naming the `FilterRule` and
-//!   echoing the value as sent — not as a document that does not validate.
+//!   that class and the `<ArgumentName>` / `<ArgumentValue>` pair naming the member at fault by
+//!   its dotted path, `FilterRule.Name`, and echoing the value as sent — not as a document that
+//!   does not validate.
 //! * An `Events` entry outside the published `Event` set is refused the same way, naming the
 //!   `Event` and echoing the value as sent.
 //! * A destination reference is judged against the ARN form its member requires: a value no
@@ -57,8 +58,10 @@ const UNPARSEABLE_DESTINATION: &str = "The ARN could not be parsed";
 const OVERLAPPING_EVENTS: &str = "Configurations overlap. Configurations on the same bucket \
                                   cannot share a common event type.";
 
-/// The `<ArgumentName>` each class names: the field the caller has to change.
-const FILTER_RULE_ARGUMENT: &str = "FilterRule";
+/// The `<ArgumentName>` each class names: the field the caller has to change — for a refusal
+/// about one filter rule's `Name`, that MEMBER by its dotted path rather than the
+/// `FilterRule` element carrying it.
+const FILTER_RULE_NAME_ARGUMENT: &str = "FilterRule.Name";
 const EVENT_ARGUMENT: &str = "Event";
 
 /// A destination of each kind, in this emulator's account. Validation of the destinations
@@ -323,7 +326,7 @@ async fn a_filter_rule_name_outside_the_published_set_is_refused_as_an_argument(
             &case,
             &answer,
             INVALID_FILTER_RULE_NAME,
-            FILTER_RULE_ARGUMENT,
+            FILTER_RULE_NAME_ARGUMENT,
             sent.trim(),
         );
 

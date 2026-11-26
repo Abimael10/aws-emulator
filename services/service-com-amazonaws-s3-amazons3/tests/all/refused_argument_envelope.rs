@@ -353,7 +353,7 @@ async fn an_object_scoped_not_found_names_the_key_and_the_version_it_addressed()
     // The rows differ along whether the key is there and whether the request named a
     // version: a key the bucket holds nothing at is `NoSuchKey`, and a version it holds no
     // entry for is `NoSuchVersion`.
-    let absent_version = "0".repeat(VERSION_ID_CHARS);
+    let absent_version = "z".repeat(VERSION_ID_CHARS);
     let rows: Vec<(&str, &str, &str, Option<&str>, &str)> = vec![
         (
             "a key the bucket holds nothing at",

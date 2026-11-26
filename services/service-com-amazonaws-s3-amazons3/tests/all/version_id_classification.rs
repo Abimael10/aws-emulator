@@ -5,14 +5,15 @@
 //! name exists.
 //!
 //! The rule under test: a `versionId` that is not shaped like a version id S3 issues — or
-//! that carries the one VALUE no issuer mints, the zero token — cannot name a version of any
-//! object in any bucket, so it is a bad ARGUMENT: HTTP 400 `InvalidArgument` with `Invalid
+//! that carries the one VALUE no issuer mints, the zero token, or a token of ANOTHER form this
+//! service publishes, an object's entity tag — cannot name a version of any object in any
+//! bucket, so it is a bad ARGUMENT: HTTP 400 `InvalidArgument` with `Invalid
 //! version id specified`, naming the `versionId` parameter and echoing the token it
 //! rejected. One that IS shaped like one and names no stored version is HTTP 404
 //! `NoSuchVersion` with `The specified version does not exist.` The shape is the published
 //! one: the literal `null`, or a token between `state::VERSION_ID_CHARS` and
 //! `state::MAX_VERSION_ID_CHARS` characters, each an ASCII alphanumeric or one of `-`, `_`,
-//! `.`.
+//! `.`, that is not the hexadecimal digest an entity tag is written in.
 //!
 //! The same classification is asserted on the single-object READS (`GetObject`,
 //! `HeadObject`), which is where both halves of it are visible. `DeleteObject` is held to
@@ -123,8 +124,11 @@ fn entry_deleted(answer: &Answer) -> Option<(String, String)> {
 /// (one character, one short of the minimum, one past the maximum), the ALPHABET at a width
 /// inside the range (the alphanumerics and the `-`, `_`, `.` the shape holds, against the
 /// characters it does not — standard Base64's `+` and `/`, and an ASCII punctuation mark),
-/// the CASE of the characters, which the shape does not restrict, and the one token whose
-/// VALUE no issuer mints: the zero one, written as nothing but the alphabet's zero digit.
+/// the CASE of the characters, which the shape does not restrict, the one token whose
+/// VALUE no issuer mints — the zero one, written as nothing but the alphabet's zero digit —
+/// and the token of another FORM this service publishes: an object's entity tag, which is a
+/// hexadecimal digest of `state::ENTITY_TAG_DIGEST_CHARS` digits, alone or with the
+/// `-<parts>` of a multipart tag.
 fn rows() -> Vec<(String, String, Expected)> {
     let min = VERSION_ID_CHARS;
     let max = MAX_VERSION_ID_CHARS;
@@ -133,11 +137,11 @@ fn rows() -> Vec<(String, String, Expected)> {
 
     // Shaped like a version id, and naming nothing: every one of these is a 404.
     for (case, id) in [
-        ("at the minimum width", "a".repeat(min)),
-        ("between the published widths", "b".repeat(between)),
-        ("at the maximum width", "c".repeat(max)),
+        ("at the minimum width", "z".repeat(min)),
+        ("between the published widths", "y".repeat(between)),
+        ("at the maximum width", "x".repeat(max)),
         ("upper case", format!("B{}", "A".repeat(min - 1))),
-        ("every character a digit", "0".repeat(min)),
+        ("every character a digit", "0".repeat(between)),
         (
             "mixed case and digits",
             (0..min)
@@ -149,7 +153,7 @@ fn rows() -> Vec<(String, String, Expected)> {
         ),
         (
             "carrying each character the shape holds beside the alphanumerics",
-            format!("{}-_.", "d".repeat(min - 3)),
+            format!("{}-_.", "z".repeat(min - 3)),
         ),
         (
             // The published example of a version id, which is what a client that stored one
@@ -167,9 +171,9 @@ fn rows() -> Vec<(String, String, Expected)> {
         rows.push((format!("well formed, {case}"), id, ABSENT));
     }
 
-    // Not shaped like a version id, or carrying the one value no issuer mints: every one of
-    // these is a 400.
-    let padded = "a".repeat(min);
+    // Not shaped like a version id, carrying the one value no issuer mints, or written in the
+    // form of a token of another kind: every one of these is a 400.
+    let padded = "z".repeat(min);
     for (case, id) in [
         ("a single character", "x".to_string()),
         ("one character short of the minimum", padded[..min - 1].to_string()),
@@ -189,6 +193,22 @@ fn rows() -> Vec<(String, String, Expected)> {
         ),
         ("the zero token, at the minimum width", "A".repeat(min)),
         ("the zero token, wider", "A".repeat(between)),
+        (
+            // The entity tag of an object one write stored: the hexadecimal digest form,
+            // which identifies the object's DATA and names no version of it.
+            "an entity tag's digest",
+            "0123456789abcdef0123456789abcdef".to_string(),
+        ),
+        (
+            "an entity tag's digest in one character",
+            "a".repeat(min),
+        ),
+        (
+            // The tag of an object a multipart upload assembled: the same digest with the
+            // part count S3 appends to it.
+            "a multipart entity tag",
+            "0123456789abcdef0123456789abcdef-3".to_string(),
+        ),
     ] {
         rows.push((format!("malformed, {case}"), id, MALFORMED));
     }

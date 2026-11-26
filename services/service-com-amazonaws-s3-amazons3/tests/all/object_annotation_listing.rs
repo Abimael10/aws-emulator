@@ -66,8 +66,10 @@ const INVALID_PREFIX_MESSAGE: &str = "The annotation prefix you have provided is
 const DEFAULT_MAX_ANNOTATION_RESULTS: i64 = 1_000;
 
 /// A version id of the SHAPE S3 issues that this store never minted, so it names no stored
-/// version of any object (32 characters drawn from the alphanumerics, the published width).
-const UNISSUED_VERSION_ID: &str = "0123456789abcdef0123456789abcdef";
+/// version of any object: Amazon S3's own published example of a version id, 32 characters of
+/// the alphabet an issued id is drawn from (and not the hexadecimal digest form of an entity
+/// tag, which names no version at all).
+const UNISSUED_VERSION_ID: &str = "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY";
 
 /// `GET /<bucket>/<key>?annotation&x-id=ListObjectAnnotations` — `ListObjectAnnotations`,
 /// with whatever extra query parameters and bound headers the case under test carries.

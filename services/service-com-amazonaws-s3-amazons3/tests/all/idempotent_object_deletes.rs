@@ -45,8 +45,10 @@ use super::object_versioning::{
 };
 
 /// A `versionId` of the published shape that this store never minted: thirty-two characters
-/// of the alphabet a minted id is drawn from.
-const NEVER_MINTED: &str = "0123456789abcdef0123456789abcdef";
+/// of the alphabet a minted id is drawn from — Amazon S3's own published example of a version
+/// id (Amazon S3 User Guide, *Working with object versioning*), which is a token of the issued
+/// form and not the hexadecimal digest an entity tag is written in.
+const NEVER_MINTED: &str = "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY";
 
 /// The versioning state a case's bucket carries, as `BucketVersioningStatus` publishes them
 /// (`PutBucketVersioning`: `Enabled`, `Suspended`), plus the bucket that carries none.

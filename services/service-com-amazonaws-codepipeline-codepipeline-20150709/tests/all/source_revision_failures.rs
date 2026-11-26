@@ -390,7 +390,9 @@ async fn a_failure_relays_the_answering_services_error_and_none_of_the_client_ob
             "an object version the bucket does not hold",
             true,
             true,
-            Some("00000000000000000000000000000001"),
+            // A token of the form S3 issues version ids in (Amazon S3's own published
+            // example) that no write minted, so the read is answered about the VERSION.
+            Some("3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY"),
             "NoSuchVersion",
         ),
     ];

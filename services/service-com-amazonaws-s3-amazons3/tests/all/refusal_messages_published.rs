@@ -1048,7 +1048,7 @@ async fn an_object_encryption_update_reports_an_unresolvable_address_as_its_own_
     // Each row is an address this bucket does not hold, differing in HOW: a version it
     // minted and then permanently deleted, a well-formed id it never minted, a key never
     // written, and a key never written under a version id as well.
-    let never_minted = "0123456789abcdef0123456789abcdef";
+    let never_minted = "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY";
     let rows: &[(&str, &str, String)] = &[
         (
             "a version this bucket minted and then permanently deleted",

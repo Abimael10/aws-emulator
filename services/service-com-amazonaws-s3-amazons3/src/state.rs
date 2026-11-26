@@ -2819,10 +2819,13 @@ impl NotificationConfigurationRejection {
     ///   two values the pair overlaps in;
     /// * an `Events` entry outside the published set names the `Event` and echoes the value as
     ///   sent;
-    /// * a document the key-name filter rules leave ambiguous, and a rule whose `Name` is no
-    ///   `FilterRuleName`, name the `FilterRule` — the rules being what the caller has to
-    ///   change — the second echoing the name as sent, the first naming no value, there being
-    ///   no single rule the ambiguity is in;
+    /// * a document the key-name filter rules leave ambiguous names the `FilterRule` — the
+    ///   rules being what the caller has to change — and no value, there being no single rule
+    ///   the ambiguity is in;
+    /// * a rule whose `Name` is no `FilterRuleName`, and a filter carrying two rules of one
+    ///   kind, name that MEMBER by its dotted path, `FilterRule.Name` — the member at fault
+    ///   rather than its container — the first echoing the name as sent, the second naming no
+    ///   value, there being no one name the pair is wrong in;
     /// * a destination reference that is no ARN of its service names the MEMBER it arrived on
     ///   (`Topic`, `Queue`, `CloudFunction`) and echoes the value as sent.
     ///
@@ -2837,14 +2840,14 @@ impl NotificationConfigurationRejection {
             Self::UnsupportedEvent { event, .. } => Some((EVENT_ARGUMENT, Some(event.as_str()))),
             Self::AmbiguousConfiguration => Some((FILTER_RULE_ARGUMENT, None)),
             Self::InvalidFilterRuleName { name } => {
-                Some((FILTER_RULE_ARGUMENT, Some(name.as_str())))
+                Some((FILTER_RULE_NAME_ARGUMENT, Some(name.as_str())))
             }
             Self::InvalidDestinationArn { member, arn, .. } => Some((member, Some(arn.as_str()))),
             Self::DestinationArnPattern { member, arn, .. } => {
                 Some((member, Some(arn.as_str())))
             }
             Self::FifoDestination { member, arn, .. } => Some((member, Some(arn.as_str()))),
-            Self::DuplicateFilterRuleKind { .. } => Some((FILTER_RULE_ARGUMENT, None)),
+            Self::DuplicateFilterRuleKind { .. } => Some((FILTER_RULE_NAME_ARGUMENT, None)),
             Self::DuplicateConfigurationId { id } => {
                 Some((CONFIGURATION_ID_ARGUMENT, Some(id.as_str())))
             }
@@ -2862,9 +2865,20 @@ const EVENT_ARGUMENT: &str = "Event";
 /// (`smithy_query(query="shape",shape="S3KeyFilter")` reports `FilterRules` as a list of
 /// `FilterRule`).
 ///
-/// The three refusals about those rules name it: a document the rules leave ambiguous, a rule
-/// whose `Name` is no `FilterRuleName`, and a filter carrying two rules of one kind.
+/// Named by the one refusal about those rules that is about no single member of one: a document
+/// the rules leave AMBIGUOUS, where the fault is the set of rules standing beside each other.
 const FILTER_RULE_ARGUMENT: &str = "FilterRule";
+
+/// The request field a refusal about one filter rule's `Name` is reported about: that MEMBER,
+/// written as the dotted path from the element that carries it
+/// (`smithy_query(query="shape",shape="FilterRule")` reports `Name` targeting `FilterRuleName`).
+///
+/// S3's document names the member actually at FAULT rather than its container, so a client that
+/// points the caller at the offending element names the field to change and a tool keyed on the
+/// exact argument name matches. The two refusals about a rule's name are both reported here: a
+/// `Name` that is no `FilterRuleName` value, and a second rule carrying a `Name` of a kind the
+/// filter already has.
+const FILTER_RULE_NAME_ARGUMENT: &str = "FilterRule.Name";
 
 /// The request field a refusal about a configuration's `Id` is reported about, as
 /// `NotificationId`'s own member is published.

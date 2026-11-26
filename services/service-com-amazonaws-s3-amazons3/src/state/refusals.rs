@@ -88,20 +88,31 @@ pub(super) const VERSION_ID_ZERO_DIGIT: char = 'A';
 /// rather than one number because the token is opaque: this store mints ids of its own
 /// width, and an id another S3 issued is just as much a version id.
 ///
-/// An opaque token's text IS the identity it names, and one identity is not nameable: the
-/// ZERO value, which a token writes as nothing but [`VERSION_ID_ZERO_DIGIT`]. No issuer
-/// mints it — an issued id carries the moment and the sequence the version was recorded at
-/// — so a caller that sends it has invented a token rather than named a version, which is
-/// what S3 reports by refusing the ARGUMENT instead of the version.
+/// An opaque token's text IS the identity it names, and two values name no version for that
+/// reason. The ZERO value is one: a token writes it as nothing but [`VERSION_ID_ZERO_DIGIT`],
+/// and no issuer mints it — an issued id carries the moment and the sequence the version was
+/// recorded at — so a caller that sends it has invented a token rather than named a version.
+/// The other is a value written in a DIFFERENT published form: an object's ENTITY TAG, which S3
+/// renders as a hexadecimal digest ([`is_entity_tag_shaped`] reads that form) and a version
+/// id is never written in. A tag identifies the object's DATA, so a request carrying one
+/// where a version id belongs has named no version of any object — which is what S3 reports
+/// by refusing the ARGUMENT instead of the version.
 ///
-/// Anything outside that is not a version id of any object in any bucket either, so both are
-/// a malformed ARGUMENT rather than an absent version: S3 answers the former
+/// Anything outside that is not a version id of any object in any bucket either, so all of
+/// them are a malformed ARGUMENT rather than an absent version: S3 answers the former
 /// [`INVALID_ARGUMENT_CODE`] with HTTP 400 and reserves [`NO_SUCH_VERSION_CODE`] with HTTP
 /// 404 for a well-formed id that names no stored version — which is why an id of the
 /// published shape that this store never minted is a 404 and not a 400. Checked by every
 /// operation that takes one `versionId` as an argument, so one id is well-formed or
 /// malformed everywhere; the batch delete reports per identifier what it could not do with
 /// that pair instead (`ops/delete_objects.rs`).
+///
+/// Each excluded FORM is a trade: a token another S3 issued that happens to be written in one
+/// of them — a digest of exactly [`super::ENTITY_TAG_DIGEST_CHARS`] hexadecimal digits, say —
+/// is answered the 400 rather than the 404 it would get there. That is the right way round for
+/// this service, because every id it issues is outside those forms by construction
+/// ([`super::mint_version_id`]) while a caller that sends one has sent a token of another kind;
+/// a form added here has to be weighed the same way.
 pub fn version_id_is_well_formed(version_id: &str) -> bool {
     if version_id == NULL_VERSION_ID {
         return true;
@@ -114,6 +125,7 @@ pub fn version_id_is_well_formed(version_id: &str) -> bool {
         && version_id
             .chars()
             .any(|character| character != VERSION_ID_ZERO_DIGIT)
+        && !super::is_entity_tag_shaped(version_id)
 }
 
 /// The request field a malformed `versionId` is reported against — the `versionId` query

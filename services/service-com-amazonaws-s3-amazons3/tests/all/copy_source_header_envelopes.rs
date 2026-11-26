@@ -518,7 +518,7 @@ async fn a_copy_source_version_that_is_not_a_version_id_is_refused_as_a_bad_requ
 
     // A WELL-FORMED id the bucket holds no version for is the other condition, and keeps
     // its own code: the two are told apart by the token's SHAPE.
-    let absent = "0".repeat(VERSION_ID_CHARS);
+    let absent = "z".repeat(VERSION_ID_CHARS);
     let refused = copy_object(
         &router,
         destination,

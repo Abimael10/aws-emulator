@@ -193,18 +193,40 @@ impl UploadedPart {
 /// in. Two uploads — of one key or anywhere in the store — therefore never collide, and
 /// the id stays what it was once recorded, because nothing re-derives it.
 pub fn mint_upload_id(bucket: &str, key: &str, sequence: u64) -> String {
+    url_safe_token(&minted_digest(UPLOAD_ID_LABEL, bucket, key, sequence))
+}
+
+/// The bytes a minted id is derived from: the SHA-256 of what KIND of id is being minted, the
+/// bucket, the key and the store's monotonic mint sequence.
+///
+/// Separated fields, so ("a", "bc") and ("ab", "c") cannot hash the same bytes, and `label`
+/// first, so the id of one kind is never derived from the same bytes as the id of another.
+fn minted_digest(label: &[u8], bucket: &str, key: &str, sequence: u64) -> Vec<u8> {
     use ::sha2::Digest;
     let mut digest = ::sha2::Sha256::new();
+    digest.update(label);
+    digest.update([0u8]);
     digest.update(bucket.as_bytes());
-    // A separator, so ("a", "bc") and ("ab", "c") cannot hash the same bytes.
     digest.update([0u8]);
     digest.update(key.as_bytes());
     digest.update([0u8]);
     digest.update(sequence.to_be_bytes());
-    ::aws_smithy_types::base64::encode(digest.finalize().as_slice())
-        .replace('+', "-")
-        .replace('/', "_")
-        .replace('=', "")
+    digest.finalize().to_vec()
+}
+
+/// Which kind of id a derivation is for ([`minted_digest`]).
+const UPLOAD_ID_LABEL: &[u8] = b"upload-id";
+const VERSION_ID_LABEL: &[u8] = b"version-id";
+
+/// `bytes` rendered as the URL-SAFE Base64 token S3's opaque ids are written in: the alphabet
+/// its own published ids are drawn from, and the one that survives the round trip through the
+/// query parameter a client sends such an id back in, where `+` would arrive decoded as a space
+/// and `/` would end the path segment.
+///
+/// One rendering, so every opaque id this store hands out is written the same way.
+fn url_safe_token(bytes: &[u8]) -> String {
+    use ::base64::Engine as _;
+    ::base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// The entity tag S3 reports for an object written by a single `PutObject`.
@@ -354,6 +376,45 @@ pub fn stored_object_etag(plaintext: &str, encryption: &ObjectEncryption) -> Str
 /// client may send back with or without the quotes, work on this value instead.
 pub fn etag_value(etag: &str) -> &str {
     etag.trim_matches('"')
+}
+
+/// How many hexadecimal digits the entity tag that IS the MD5 digest of an object's data
+/// carries.
+///
+/// The model states the form itself: "the entity tag may or may not be an MD5 digest of the
+/// object data. If the entity tag is not an MD5 digest of the object data, it will contain one
+/// or more nonhexadecimal characters and/or will consist of less than 32 or more than 32
+/// hexadecimal digits" (`CompleteMultipartUploadOutput$ETag`) — so a tag that IS that digest is
+/// exactly this many of them, which is what [`object_etag`] renders.
+pub const ENTITY_TAG_DIGEST_CHARS: usize = 32;
+
+/// Whether `value` is written in the form S3 publishes an object's ENTITY TAG in.
+///
+/// Two renderings, both of the digest the sentence above describes: the digest alone, which the
+/// tag of an object one write stored carries ([`object_etag`]), and the digest with the
+/// `-<parts>` S3 "appends … with the total number of parts" for an object a multipart upload
+/// assembled ([`multipart_object_etag`]). The digits are the lowercase hexadecimal this service
+/// renders every digest in, and the double quotes the tag is reported inside are HTTP's
+/// quoted-string syntax rather than part of the value ([`etag_value`]), so a value is read with
+/// or without them.
+///
+/// Read where a token of ANOTHER kind is judged, so the two token forms this service publishes
+/// stay apart: an entity tag identifies an object's DATA and names no version of anything, so a
+/// request that carries one where a version id belongs has named no version
+/// ([`super::version_id_is_well_formed`]).
+pub fn is_entity_tag_shaped(value: &str) -> bool {
+    let value = etag_value(value);
+    let (digest, parts) = match value.split_once('-') {
+        Some((digest, parts)) => (digest, Some(parts)),
+        None => (value, None),
+    };
+    digest.chars().count() == ENTITY_TAG_DIGEST_CHARS
+        && digest
+            .chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        && parts.is_none_or(|parts| {
+            !parts.is_empty() && parts.chars().all(|part| part.is_ascii_digit())
+        })
 }
 
 /// What a conditional WRITE's members say about the key it addresses, when they do not all
@@ -1905,20 +1966,36 @@ fn principal_display_name(principal_arn: &str) -> Option<String> {
 /// store — therefore never collide, and the value stays what it was once stored, because
 /// nothing re-derives it.
 ///
-/// Hex, so every character is an ASCII alphanumeric: the id survives a round trip through
-/// the `versionId` query parameter a client sends it back in, where `+` would arrive
-/// decoded as a space and `/` would end the path segment, and it carries only characters
-/// [`version_id_is_well_formed`] accepts.
+/// The rendering is the URL-safe Base64 token every opaque id of this store is written in
+/// ([`url_safe_token`]), which is the alphabet S3's own published version ids are drawn from
+/// (`3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY`, Amazon S3 User Guide, *Working with object
+/// versioning*) — led by one character of [`VERSION_ID_LEAD_CHARS`], derived from the same
+/// digest. That lead character is what makes the token a version id BY CONSTRUCTION rather
+/// than by inspection: it is not a hexadecimal digit, so the id can never come out in the form
+/// this service renders an object's ENTITY TAG in ([`is_entity_tag_shaped`]) — the two are
+/// different kinds of token, and a version id written in the tag's form would make them
+/// indistinguishable wherever one is judged — and it is not the digit the ZERO token is written
+/// in either, so every id handed out is one the shared rule accepts
+/// ([`super::version_id_is_well_formed`], which the unit tests hold this against).
 pub fn mint_version_id(bucket: &str, key: &str, sequence: u64) -> String {
-    use ::sha2::Digest;
-    let mut digest = ::sha2::Sha256::new();
-    digest.update(bucket.as_bytes());
-    // A separator, so ("a", "bc") and ("ab", "c") cannot hash the same bytes.
-    digest.update([0u8]);
-    digest.update(key.as_bytes());
-    digest.update([0u8]);
-    digest.update(sequence.to_be_bytes());
-    // Each byte renders as two hex digits, so half of `VERSION_ID_CHARS` digest bytes
-    // fill the id exactly.
-    ::hex::encode(&digest.finalize()[..VERSION_ID_CHARS / 2])
+    let digest = minted_digest(VERSION_ID_LABEL, bucket, key, sequence);
+    let lead = digest
+        .first()
+        .map_or(VERSION_ID_LEAD_CHARS[0], |byte| {
+            VERSION_ID_LEAD_CHARS[usize::from(*byte) % VERSION_ID_LEAD_CHARS.len()]
+        });
+    let rest: String = url_safe_token(&digest)
+        .chars()
+        .take(VERSION_ID_CHARS - 1)
+        .collect();
+    format!("{lead}{rest}")
 }
+
+/// The characters a minted version id's FIRST one is drawn from: the upper-case letters past
+/// `F`, which are of the alphabet a version id is written in and are neither a hexadecimal
+/// digit — the digits an entity tag's digest is written in — nor the digit the zero token is
+/// written in.
+const VERSION_ID_LEAD_CHARS: [char; 20] = [
+    'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y',
+    'Z',
+];

@@ -330,9 +330,9 @@ async fn every_object_scoped_refusal_names_the_object_it_is_about() {
     bucket_holding(&router, name).await;
 
     // A token of the published shape that this store never minted, so it names no version of
-    // any key: the width `VERSION_ID_CHARS` states, which is what makes it a version id
-    // rather than a refused argument.
-    let absent_version = "0".repeat(VERSION_ID_CHARS);
+    // any key: the width `VERSION_ID_CHARS` states, in a character no hexadecimal digest
+    // carries, which is what makes it a version id rather than a refused argument.
+    let absent_version = "z".repeat(VERSION_ID_CHARS);
 
     for row in operation_rows(&absent_version) {
         let answer = send_row(&router, name, &row).await;
@@ -385,7 +385,7 @@ async fn a_copy_refused_about_its_source_names_the_source_object() {
     let router = router();
     let name = "object-envelope-copy";
     bucket_holding(&router, name).await;
-    let absent_version = "0".repeat(VERSION_ID_CHARS);
+    let absent_version = "z".repeat(VERSION_ID_CHARS);
 
     // (case, the `x-amz-copy-source` the copy carries, the key and version its refusal names)
     for (case, source, code, key, version) in [
