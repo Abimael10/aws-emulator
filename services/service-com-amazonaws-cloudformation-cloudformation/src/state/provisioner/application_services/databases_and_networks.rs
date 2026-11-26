@@ -3428,6 +3428,56 @@ pub(crate) fn push_list(
     Ok(())
 }
 
+/// Write one LIST of STRUCTURES into an awsQuery form body against the entry structure's own
+/// member catalogue: each entry indexed from 1 under `element`, and each of the entry's
+/// members under the name and in the shape the catalogue gives it.
+///
+/// This is [`push_list`] for an entry carrying a LIST of its own. A list member's elements are
+/// indexed under the element name the called list's member `@xmlName` fixes, and
+/// [`push_structure`] has only the Smithy default `member` to go on — so a nested list whose
+/// model fixes another name (Amazon RDS's `OptionConfiguration$OptionSettings`, whose elements
+/// are `OptionSetting`) would be written under a segment the called operation does not read,
+/// and the whole list dropped from the request. The catalogue carries that name, as the
+/// top-level one does ([`QueryMember::List`]).
+///
+/// A member the catalogue does not carry is REFUSED, for the reason [`query_members`] refuses
+/// one: a resource created without something its declaration asked for is configured
+/// differently from what the template declared. An entry the template did not write as a
+/// structure is written the way [`push_structure`] writes it, so a declaration spelled some
+/// other way is not dropped either.
+pub(crate) fn push_structure_list(
+    parameters: &mut Vec<(String, String)>,
+    member: &str,
+    element: &str,
+    entry_members: &[(&str, QueryMember)],
+    declared: &Value,
+    resource_type: &str,
+) -> Result<(), Refusal> {
+    let entries: Vec<&Value> = match declared {
+        Value::Array(values) => values.iter().collect(),
+        single => vec![single],
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let prefix = format!("{member}.{element}.{}", index + 1);
+        let Some(members) = entry.as_object() else {
+            push_structure(parameters, &prefix, entry, 1)?;
+            continue;
+        };
+        for (name, value) in members {
+            let Some((_, shape)) = entry_members.iter().find(|(known, _)| known == name) else {
+                return Err(property_not_sent(resource_type, name));
+            };
+            let key = format!("{prefix}.{name}");
+            match shape {
+                QueryMember::Scalar => parameters.push((key, attribute_text(value))),
+                QueryMember::List(nested) => push_list(parameters, &key, nested, value, 1)?,
+                QueryMember::Structure => push_structure(parameters, &key, value, 1)?,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write one STRUCTURE member into an awsQuery form body: each of its declared members
 /// under `<prefix>.<Member>`, nested structures the same way, and a nested LIST indexed
 /// from 1 under `member` — the Smithy default element name for a list member that fixes

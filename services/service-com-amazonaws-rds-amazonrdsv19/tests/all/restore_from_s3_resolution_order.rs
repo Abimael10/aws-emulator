@@ -95,6 +95,12 @@ enum Location {
     Empty,
 }
 
+/// The sentence `RestoreDBClusterFromS3` refuses a source bucket it cannot reach with, which
+/// is the refusal this suite's positive control expects once the DB subnet group resolves.
+const CLUSTER_BUCKET_UNREACHABLE: &str =
+    "The specified Amazon S3 bucket cannot be found. Make sure that you have created an AWS \
+     Identity and Access Management (IAM) role that lets Amazon RDS access Amazon S3 for you.";
+
 /// A bucket the object store holds nothing under.
 const ABSENT: &str = "emu-order-never-created";
 /// A bucket this Region holds, with a backup file at its root.
@@ -342,7 +348,7 @@ async fn creating_the_subnet_group_moves_the_refusal_on_to_the_source() {
     let message = text(&body, "Message");
     assert_eq!(
         message,
-        st::invalid_ingestion_bucket_message(),
+        CLUSTER_BUCKET_UNREACHABLE,
         "case {CASE:?}: expected the location's own sentence, got {message:?}"
     );
 

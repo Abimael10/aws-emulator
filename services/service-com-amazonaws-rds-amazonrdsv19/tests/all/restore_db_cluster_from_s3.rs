@@ -266,12 +266,14 @@ struct LocationRow {
     message: &'static str,
 }
 
-/// The sentence Amazon RDS words a source location it cannot find or read at all with, which
-/// names the two members a caller can act on.
+/// The sentence Amazon RDS words a source location `RestoreDBClusterFromS3` cannot find or
+/// read at all with: it states that the bucket is not there and points at the IAM role a
+/// caller has to create for Amazon RDS. The DB instance restore words the same cause its own
+/// way, naming that request's two members instead (`restore_db_instance_from_s3` beside this
+/// suite pins it), so this sentence is the cluster restore's alone.
 const BUCKET_UNREACHABLE: &str =
-    "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to \
-     access the specified Amazon S3 bucket. Verify the SourceS3BucketName and \
-     S3IngestionRoleArn values and try again.";
+    "The specified Amazon S3 bucket cannot be found. Make sure that you have created an AWS \
+     Identity and Access Management (IAM) role that lets Amazon RDS access Amazon S3 for you.";
 
 /// The sentence Amazon RDS words a bucket that IS there and readable but holds no backup
 /// files with.

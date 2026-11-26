@@ -58,6 +58,27 @@ const OPTION_CONFIGURATIONS_PROPERTY: &str = "OptionConfigurations";
 /// `@xmlName` (`smithy_query(query="shape", shape="OptionConfigurationList")`).
 const OPTION_CONFIGURATION_ELEMENT: &str = "OptionConfiguration";
 
+/// The members ONE `OptionConfiguration` carries, from Amazon RDS's own model
+/// (`smithy_query(query="shape", shape="OptionConfiguration")`), with each of its three list
+/// members' element name from that list shape's member `@xmlName`
+/// (`smithy_query(query="shape",
+/// shape="OptionSettingsList,DBSecurityGroupNameList,VpcSecurityGroupIdList")` — `OptionSetting`,
+/// `DBSecurityGroupName`, `VpcSecurityGroupId`).
+///
+/// The properties of one `OptionConfigurations` entry ARE these members, and each is written
+/// under the name and in the shape named here ([`push_structure_list`]): a list left to the
+/// Smithy default `member` would be indexed under a segment `ModifyOptionGroup` does not read,
+/// so the settings a template declared would reach Amazon RDS as no settings at all and the
+/// group would report each of them at its published default.
+const OPTION_CONFIGURATION_MEMBERS: &[(&str, QueryMember)] = &[
+    ("DBSecurityGroupMemberships", QueryMember::List("DBSecurityGroupName")),
+    ("OptionName", QueryMember::Scalar),
+    ("OptionSettings", QueryMember::List("OptionSetting")),
+    ("OptionVersion", QueryMember::Scalar),
+    ("Port", QueryMember::Scalar),
+    ("VpcSecurityGroupMemberships", QueryMember::List("VpcSecurityGroupId")),
+];
+
 /// The properties of `AWS::RDS::OptionGroup` the walk over the declaration does NOT turn into
 /// a `CreateOptionGroup` member: the name CloudFormation decides, the tag list it merges, and
 /// the options the modify below carries.
@@ -122,10 +143,11 @@ pub(crate) async fn create_option_group(
 /// the modify a client adds them with.
 ///
 /// `OptionConfigurations` is the `OptionConfiguration` STRUCTURE list `ModifyOptionGroup`'s
-/// `OptionsToInclude` takes, so each declared entry is written as one element of that list
-/// and walked to its leaves ([`push_list`]) — the options a template declares are what
-/// `DescribeOptionGroups` then reports the group carrying. A declaration carrying none makes
-/// no call at all.
+/// `OptionsToInclude` takes, so each declared entry is written as one element of that list and
+/// walked to its leaves against that structure's own members ([`OPTION_CONFIGURATION_MEMBERS`])
+/// — the options a template declares, and the SETTINGS each of them declares, are what
+/// `DescribeOptionGroups` then reports the group carrying. A declaration carrying none makes no
+/// call at all.
 async fn include_declared_options(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -139,12 +161,13 @@ async fn include_declared_options(
         "OptionGroupName".to_string(),
         physical_resource_id.to_string(),
     )];
-    push_list(
+    push_structure_list(
         &mut parameters,
         "OptionsToInclude",
         OPTION_CONFIGURATION_ELEMENT,
+        OPTION_CONFIGURATION_MEMBERS,
         declared,
-        0,
+        RDS_OPTION_GROUP,
     )?;
     // A declaration whose list is empty names no option, so there is nothing to include.
     if parameters.len() == 1 {

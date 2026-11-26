@@ -28,7 +28,8 @@
 //! that role cover the reads this restore makes on the location it resolved.
 
 /// The engine pair ONE restore-from-Amazon-S3 operation migrates between, as that operation's
-/// own members publish it.
+/// own members publish it, plus the sentence that operation words a source bucket it cannot
+/// reach with.
 #[derive(Debug, Clone, Copy)]
 pub struct S3RestorePair {
     /// `Engine`'s published domain for the operation: the engine of the resource the restore
@@ -40,6 +41,12 @@ pub struct S3RestorePair {
     /// bare ("8.0") or with its patch component ("8.0.28"), which is how the member's own
     /// examples spell them.
     pub source_engine_versions: &'static [&'static str],
+    /// The sentence THIS operation refuses a source bucket it cannot find or read at all
+    /// with. A refusal belongs to the operation that answers it, and the two restores word
+    /// this one apart — see [`CLUSTER_BUCKET_UNREACHABLE_MESSAGE`] and
+    /// [`INSTANCE_BUCKET_UNREACHABLE_MESSAGE`] — so it travels with the operation's own facts
+    /// rather than being one text both reach for.
+    pub bucket_unreachable_message: &'static str,
 }
 
 /// What `RestoreDBClusterFromS3` migrates: "Valid Values: aurora-mysql (for Aurora MySQL)"
@@ -49,6 +56,7 @@ pub const S3_RESTORE_CLUSTER: S3RestorePair = S3RestorePair {
     engine: "aurora-mysql",
     source_engine: "mysql",
     source_engine_versions: &["5.7", "8.0"],
+    bucket_unreachable_message: CLUSTER_BUCKET_UNREACHABLE_MESSAGE,
 };
 
 /// What `RestoreDBInstanceFromS3` migrates: "Valid Values: mysql" for both `Engine` and
@@ -65,6 +73,7 @@ pub const S3_RESTORE_INSTANCE: S3RestorePair = S3RestorePair {
     engine: "mysql",
     source_engine: "mysql",
     source_engine_versions: &["5.6", "5.7", "8.0"],
+    bucket_unreachable_message: INSTANCE_BUCKET_UNREACHABLE_MESSAGE,
 };
 
 impl S3RestorePair {
@@ -106,36 +115,49 @@ impl S3RestorePair {
     }
 }
 
-/// What a refusal of a source location the restore cannot FIND OR READ AT ALL carries: the
-/// sentence the MODEL states for that error class on these two operations — "The specified
-/// Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to access the
-/// specified Amazon S3 bucket. Verify the SourceS3BucketName and S3IngestionRoleArn values
-/// and try again." — which states the two conditions that leave a location unreachable and
-/// names the two members a caller can act on.
+/// What a refusal of a source location the restore cannot FIND OR READ AT ALL carries on the
+/// DB CLUSTER restore: "The specified Amazon S3 bucket cannot be found. Make sure that you
+/// have created an AWS Identity and Access Management (IAM) role that lets Amazon RDS access
+/// Amazon S3 for you."
+///
+/// `RestoreDBClusterFromS3` states the one thing that is wrong — the bucket is not there —
+/// and points at the IAM role a caller has to create for Amazon RDS, which is the wording
+/// this operation shares with the refusal of a location its role cannot list
+/// ([`ingestion_role_cannot_list_message`]) and NOT the DB instance restore's, which names
+/// the two members of ITS own request instead ([`INSTANCE_BUCKET_UNREACHABLE_MESSAGE`]).
+///
+/// Fixed text with no variable part: it names neither the bucket nor the role.
+pub const CLUSTER_BUCKET_UNREACHABLE_MESSAGE: &str =
+    "The specified Amazon S3 bucket cannot be found. Make sure that you have created an AWS \
+     Identity and Access Management (IAM) role that lets Amazon RDS access Amazon S3 for you.";
+
+/// The same refusal on the DB INSTANCE restore: the sentence the MODEL states for that error
+/// class on `RestoreDBInstanceFromS3` — "The specified Amazon S3 bucket name can't be found
+/// or Amazon RDS isn't authorized to access the specified Amazon S3 bucket. Verify the
+/// SourceS3BucketName and S3IngestionRoleArn values and try again." — which states the two
+/// conditions that leave a location unreachable and names the two members of that request a
+/// caller can act on.
 ///
 /// One error class, several causes: the CODE is the same for each of them, so the MESSAGE is
 /// what tells a caller which cause it was and therefore what to fix. This sentence is the one
 /// for a location that cannot be found or read. A location that IS there and readable but
 /// holds no backup for the migration to read is a DIFFERENT cause of the same class, and
-/// carries its own sentence ([`no_backup_files_message`]); a role that withholds a read of a
-/// location that is reachable reports the files it cannot list
-/// ([`ingestion_role_cannot_list_message`]).
+/// carries its own sentence ([`no_backup_files_message`]) — that one worded alike on both
+/// operations; a role that withholds a read of a location that is reachable reports the files
+/// it cannot list ([`ingestion_role_cannot_list_message`]).
 ///
 /// It carries no variable part of its own: the bucket and the role are values the request
 /// already holds, and the sentence names the MEMBERS rather than their values.
-#[must_use]
-pub fn invalid_ingestion_bucket_message() -> String {
+pub const INSTANCE_BUCKET_UNREACHABLE_MESSAGE: &str =
     "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to \
      access the specified Amazon S3 bucket. Verify the SourceS3BucketName and \
-     S3IngestionRoleArn values and try again."
-        .to_string()
-}
+     S3IngestionRoleArn values and try again.";
 
 /// What a refusal of a source location that IS there and readable but holds NO BACKUP FILES
 /// carries: "No backup files were found in the specified Amazon S3 bucket. Check the bucket
 /// name or create backup files and try again."
 ///
-/// The other cause of the error class [`invalid_ingestion_bucket_message`] words, and the
+/// The other cause of the error class the unreachable-bucket sentences word, and the
 /// reason the two are worded apart: a caller told to verify the bucket name and the ingestion
 /// role would be checking two values that are already right, when what the location is
 /// missing is the backup itself — the files the migration reads. This sentence states that,
@@ -157,8 +179,8 @@ pub enum IngestionLocationDefect {
     /// This Region's object store holds NO bucket of that name, or holds one that belongs to
     /// another Region: the value `SourceS3BucketName`/`S3BucketName` carried names no bucket
     /// the restore can reach, so it is refused as the parameter value it is — the Query
-    /// API's `InvalidParameterValue`, carrying the sentence this operation words a location
-    /// it cannot find in ([`invalid_ingestion_bucket_message`]).
+    /// API's `InvalidParameterValue`, carrying the sentence the operation that answers it
+    /// words a location it cannot find in ([`S3RestorePair::bucket_unreachable_message`]).
     BucketUnreachable,
     /// The bucket IS there and is readable, and holds no file under the prefix the request
     /// named, so there is no backup under it for the migration to read: the modelled

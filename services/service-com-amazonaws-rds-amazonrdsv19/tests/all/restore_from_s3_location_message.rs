@@ -5,11 +5,13 @@
 //! The rule both restore-from-Amazon-S3 operations are accepted against: one error class
 //! covers several distinct causes of a source location, so the CODE alone does not say what a
 //! caller has to fix and the MESSAGE is the diagnosis. A location the restore cannot find or
-//! read at all carries the sentence that names the bucket-name and ingestion-role members to
+//! read at all carries the sentence the OPERATION THAT ANSWERS IT words that cause with — the
+//! cluster restore stating the bucket is not there and pointing at the IAM role to create, the
+//! DB instance restore naming the bucket-name and ingestion-role members of its own request to
 //! verify; a location that IS there and readable but holds no backup files for the migration
 //! to read carries the sentence that reports the missing backup files and asks for them to be
 //! created — the files themselves are the one thing missing, so neither the bucket name nor
-//! the role is what the caller is pointed at.
+//! the role is what the caller is pointed at, and both operations word that cause alike.
 //!
 //! Each sentence is fixed text: it names no value the request carried, so no bucket name, no
 //! prefix and no role ARN appears in it.
@@ -52,9 +54,16 @@ const INSTANCE_CLASS: &str = "db.t3.micro";
 /// be non-empty.
 const FILE_BYTES: &[u8] = b"percona-xtrabackup-emulated-payload";
 
-/// The sentence Amazon RDS words a source location it cannot find or read at all with: it
-/// names the two members a caller can act on.
-const BUCKET_UNREACHABLE: &str =
+/// The sentence `RestoreDBClusterFromS3` words a source location it cannot find or read at all
+/// with: the bucket is not there, and the remedy is the IAM role that lets Amazon RDS reach
+/// Amazon S3.
+const CLUSTER_BUCKET_UNREACHABLE: &str =
+    "The specified Amazon S3 bucket cannot be found. Make sure that you have created an AWS \
+     Identity and Access Management (IAM) role that lets Amazon RDS access Amazon S3 for you.";
+
+/// The sentence `RestoreDBInstanceFromS3` words that same cause with: it names the two members
+/// of ITS request a caller can act on.
+const INSTANCE_BUCKET_UNREACHABLE: &str =
     "The specified Amazon S3 bucket name can't be found or Amazon RDS isn't authorized to \
      access the specified Amazon S3 bucket. Verify the SourceS3BucketName and \
      S3IngestionRoleArn values and try again.";
@@ -91,7 +100,11 @@ struct Row {
     bucket: &'static str,
     prefix: Option<&'static str>,
     code: &'static str,
-    message: &'static str,
+    /// The sentence `RestoreDBClusterFromS3` words this location's refusal with.
+    cluster_message: &'static str,
+    /// The sentence `RestoreDBInstanceFromS3` words it with — the same text for every cause the
+    /// two operations word alike, and its own for a bucket neither of them can reach.
+    instance_message: &'static str,
 }
 
 /// A bucket this Region's object store holds nothing under.
@@ -113,7 +126,8 @@ const ROWS: &[Row] = &[
         bucket: ABSENT,
         prefix: None,
         code: "InvalidParameterValue",
-        message: BUCKET_UNREACHABLE,
+        cluster_message: CLUSTER_BUCKET_UNREACHABLE,
+        instance_message: INSTANCE_BUCKET_UNREACHABLE,
     },
     Row {
         case: "a bucket that exists in another Region",
@@ -121,7 +135,8 @@ const ROWS: &[Row] = &[
         bucket: ELSEWHERE,
         prefix: None,
         code: "InvalidParameterValue",
-        message: BUCKET_UNREACHABLE,
+        cluster_message: CLUSTER_BUCKET_UNREACHABLE,
+        instance_message: INSTANCE_BUCKET_UNREACHABLE,
     },
     Row {
         case: "an existing, readable bucket left empty",
@@ -129,7 +144,8 @@ const ROWS: &[Row] = &[
         bucket: EMPTY,
         prefix: None,
         code: "InvalidS3BucketFault",
-        message: NO_BACKUP_FILES,
+        cluster_message: NO_BACKUP_FILES,
+        instance_message: NO_BACKUP_FILES,
     },
     Row {
         case: "an existing, readable bucket left empty, under a prefix",
@@ -137,7 +153,8 @@ const ROWS: &[Row] = &[
         bucket: EMPTY,
         prefix: Some(BACKUP_PREFIX),
         code: "InvalidS3BucketFault",
-        message: NO_BACKUP_FILES,
+        cluster_message: NO_BACKUP_FILES,
+        instance_message: NO_BACKUP_FILES,
     },
     Row {
         case: "a bucket holding files under no prefix the request named",
@@ -145,7 +162,8 @@ const ROWS: &[Row] = &[
         bucket: PREFIXED,
         prefix: Some("ledger/"),
         code: "InvalidS3BucketFault",
-        message: NO_BACKUP_FILES,
+        cluster_message: NO_BACKUP_FILES,
+        instance_message: NO_BACKUP_FILES,
     },
     Row {
         case: "a prefix deeper than the one the files are under",
@@ -153,7 +171,8 @@ const ROWS: &[Row] = &[
         bucket: PREFIXED,
         prefix: Some("backups/2026/"),
         code: "InvalidS3BucketFault",
-        message: NO_BACKUP_FILES,
+        cluster_message: NO_BACKUP_FILES,
+        instance_message: NO_BACKUP_FILES,
     },
 ];
 
@@ -212,15 +231,14 @@ fn instance_params(identifier: &str, row: &Row, role_arn: &str) -> Params {
     request
 }
 
-/// Assert one row's refusal: the code of its cause, the sentence of its cause, and that the
-/// sentence carries no value the request named.
-fn expect_refusal(case: &str, row: &Row, response: (u16, String)) {
+/// Assert one row's refusal: the code of its cause, the sentence the operation under test
+/// words that cause with, and that the sentence carries no value the request named.
+fn expect_refusal(case: &str, row: &Row, expected: &str, response: (u16, String)) {
     let body = expect_error(case, response, 400, row.code);
     let message = text(&body, "Message");
     assert_eq!(
-        message, row.message,
-        "case {case:?}: expected the sentence {:?}, got {message:?}",
-        row.message
+        message, expected,
+        "case {case:?}: expected the sentence {expected:?}, got {message:?}"
     );
     for value in [Some(row.bucket), row.prefix].into_iter().flatten() {
         assert!(
@@ -251,6 +269,7 @@ async fn the_cluster_restore_reports_which_cause_refused_the_location() {
         expect_refusal(
             row.case,
             row,
+            row.cluster_message,
             call(
                 &router,
                 "RestoreDBClusterFromS3",
@@ -292,6 +311,7 @@ async fn the_instance_restore_reports_which_cause_refused_the_location() {
         expect_refusal(
             row.case,
             row,
+            row.instance_message,
             call(
                 &router,
                 "RestoreDBInstanceFromS3",
@@ -334,12 +354,14 @@ async fn staging_the_backup_files_accepts_the_restore_that_was_refused() {
         bucket: EMPTY,
         prefix: Some(BACKUP_PREFIX),
         code: "InvalidS3BucketFault",
-        message: NO_BACKUP_FILES,
+        cluster_message: NO_BACKUP_FILES,
+        instance_message: NO_BACKUP_FILES,
     };
 
     expect_refusal(
         CASE,
         &row,
+        row.instance_message,
         call(
             &router,
             "RestoreDBInstanceFromS3",

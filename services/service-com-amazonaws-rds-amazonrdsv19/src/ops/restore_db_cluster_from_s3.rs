@@ -653,8 +653,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.s3_prefix.as_deref(),
         ) {
             Some(crate::state::IngestionLocationDefect::BucketUnreachable) => {
+                // The sentence THIS operation words an unreachable source bucket with, which
+                // is the cluster restore's own and not the DB instance restore's: a refusal
+                // belongs to the operation that answers it.
                 return Err(RestoreDBClusterFromS3Error::invalid_parameter_value(
-                    crate::state::invalid_ingestion_bucket_message(),
+                    crate::state::S3_RESTORE_CLUSTER.bucket_unreachable_message,
                 ));
             }
             Some(crate::state::IngestionLocationDefect::NoBackupUnderPrefix) => {
