@@ -30,7 +30,8 @@
 //! * whether the role MAY read it is IAM's answer about that role's own permissions
 //!   (`service_common::iam_role::role_withholds_action`), the same question this crate puts for
 //!   the retrieval from a configured source
-//!   ([`crate::state::kinesis_source::unreadable_source`]) and for the write a delivery makes.
+//!   ([`crate::state::kinesis_source::source_read_authorization`]) and for the write a delivery
+//!   makes.
 //!
 //! ## Lock order
 //!

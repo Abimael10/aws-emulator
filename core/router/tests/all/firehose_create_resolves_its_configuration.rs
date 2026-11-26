@@ -3,17 +3,18 @@
 //! What `CreateDeliveryStream` RESOLVES, against the services that own them, before it
 //! registers a stream.
 //!
-//! The rule under test: **a Firehose stream's configuration names resources and permissions
-//! that belong to OTHER services, and Firehose resolves them when the stream is WRITTEN — not
-//! when a record is retrieved or delivered. Every `BucketARN` the create names has to be a
-//! bucket Amazon S3 holds, and the `RoleARN` of a `KinesisStreamSourceConfiguration` has to be
-//! a role IAM answers may make the Kinesis Data Streams calls the source retrieval is made of
-//! (`kinesis:DescribeStream`, `kinesis:GetShardIterator`, `kinesis:GetRecords`). A
-//! configuration that fails either check is an ARGUMENT fault — HTTP 400
-//! `InvalidArgumentException` (`smithy_query(query="operation",
+//! The rule under test: **a Firehose stream's configuration names resources that belong to
+//! OTHER services, and Firehose resolves their EXISTENCE when the stream is WRITTEN: every
+//! `BucketARN` the create names has to be a bucket Amazon S3 holds, or the configuration is an
+//! ARGUMENT fault — HTTP 400 `InvalidArgumentException` (`smithy_query(query="operation",
 //! operation="CreateDeliveryStream")` models it as the client error of this operation) whose
 //! message names what did not resolve — and NOTHING is registered: the name the request asked
-//! for is still free, and a create whose configuration does resolve takes it.**
+//! for is still free, and a create whose configuration does resolve takes it. What a role the
+//! configuration names may DO is NOT resolved here: the permissions that decide a call made
+//! under a role are the ones in force at the ATTEMPT, so a create naming a source role whose
+//! policy withholds the Kinesis Data Streams calls the retrieval is made of
+//! (`kinesis:DescribeStream`, `kinesis:GetShardIterator`, `kinesis:GetRecords`) is SERVED, and
+//! the stream it registers becomes usable and reports the source it was configured with.**
 //!
 //! Only a cross-service suite can ask this: the resources are not Firehose's. The flow spans
 //! Amazon S3 (which holds the destination buckets), IAM (which holds the roles and decides
@@ -31,13 +32,17 @@
 //!   made here;
 //! * for the source role, WHICH of the three read calls its policy allows (all three, all of
 //!   Kinesis by wildcard, every one but the records read, every one but the describe, none at
-//!   all) and whether the grant it does carry names the source stream or another one.
+//!   all) and whether the grant it does carry names the source stream or another one — none of
+//!   which the create is entitled to refuse.
 //!
-//! Each refusal is then checked twice over: the stream is not registered, and the same name is
-//! taken by a create whose configuration resolves — so what the refusal answered was the
-//! configuration, not the name.
+//! Each bucket refusal is then checked twice over: the stream is not registered, and the same
+//! name is taken by a create whose configuration resolves — so what the refusal answered was
+//! the configuration, not the name. What a source role's permissions withhold is reported
+//! where a live stream's conditions are reported, which the suites
+//! `cfn_deployed_firehose_source_permission_repair` and
+//! `cfn_deployed_firehose_under_permissioned_source_stack` hold to the rule.
 //!
-//! Nothing here is asserted about how fast the host ran: the one wait polls for the CONDITION
+//! Nothing here is asserted about how fast the host ran: every wait polls for the CONDITION
 //! under a generous deadline.
 
 use std::sync::Arc;
@@ -532,10 +537,11 @@ struct SourceCase {
     granted: &'static [&'static str],
     /// Whether the grant it carries names the source stream (`true`) or another one.
     scoped_to_the_source: bool,
-    /// The refused call the refusal names, or `None` where the create is served.
-    refused: Option<&'static str>,
 }
 
+/// The shapes of source grant a role can carry, from one allowing every call the retrieval
+/// makes to one allowing none of them: the rows a create may NOT tell apart, because what the
+/// role may do is read at each retrieval and not here.
 fn source_cases() -> Vec<SourceCase> {
     vec![
         SourceCase {
@@ -543,48 +549,42 @@ fn source_cases() -> Vec<SourceCase> {
             role_name: "firehose-preflight-every-read",
             granted: EVERY_SOURCE_READ,
             scoped_to_the_source: true,
-            refused: None,
         },
         SourceCase {
             case: "a role allowing every Kinesis call by wildcard",
             role_name: "firehose-preflight-wildcard",
             granted: &["kinesis:*"],
             scoped_to_the_source: true,
-            refused: None,
         },
         SourceCase {
             case: "a role that may not read the records",
             role_name: "firehose-preflight-no-records",
             granted: &["kinesis:DescribeStream", "kinesis:GetShardIterator"],
             scoped_to_the_source: true,
-            refused: Some("kinesis:GetRecords"),
         },
         SourceCase {
             case: "a role that may not describe the source",
             role_name: "firehose-preflight-no-describe",
             granted: &["kinesis:GetShardIterator", "kinesis:GetRecords"],
             scoped_to_the_source: true,
-            refused: Some("kinesis:DescribeStream"),
         },
         SourceCase {
             case: "a role whose source grant names another stream",
             role_name: "firehose-preflight-elsewhere",
             granted: EVERY_SOURCE_READ,
             scoped_to_the_source: false,
-            refused: Some("kinesis:DescribeStream"),
         },
         SourceCase {
             case: "a role carrying no source grant at all",
             role_name: "firehose-preflight-no-grant",
             granted: &[],
             scoped_to_the_source: true,
-            refused: Some("kinesis:DescribeStream"),
         },
     ]
 }
 
 #[tokio::test]
-async fn a_source_role_that_may_not_read_the_source_is_refused_and_registers_nothing() {
+async fn a_create_is_served_whatever_the_source_role_may_do_with_the_source() {
     let aws = Aws::new();
     aws.given_bucket("setup", HELD_BUCKET).await;
     let source_arn = aws.given_source("setup", "preflight-ingest").await;
@@ -621,76 +621,23 @@ async fn a_source_role_that_may_not_read_the_source_is_refused_and_registers_not
                 "Prefix": "data/",
             },
         });
-        let (status, answered) = aws.firehose("CreateDeliveryStream", request.clone()).await;
+        let (status, answered) = aws.firehose("CreateDeliveryStream", request).await;
 
-        let Some(action) = source_case.refused else {
-            // A role that may make the read is served, and the stream it registered reports
-            // the source it will retrieve.
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected the create to be served, got {status} with {answered}"
-            );
-            let description = aws.await_active(case, &stream).await;
-            assert_eq!(
-                description["Source"]["KinesisStreamSourceDescription"]["KinesisStreamARN"],
-                json!(source_arn),
-                "case {case:?}: the stream reports the source it reads, got {description}"
-            );
-            continue;
-        };
-
-        assert_eq!(
-            (status, error_code(&answered).as_str()),
-            (400, INVALID_ARGUMENT),
-            "case {case:?}: expected 400 {INVALID_ARGUMENT}, got {status} with {answered}"
-        );
-        // The authorization sentence, whose fixed text is the one Firehose states for a call a
-        // configuration's own role may not make and whose variable parts — the role, the
-        // refused call and the resource — are read from the request.
-        assert_eq!(
-            error_message(&answered),
-            format!("Role {role} is not authorized to perform: {action} on resource {source_arn}."),
-            "case {case:?}: expected the refusal to name the role, the refused call and the \
-             source, got {answered}"
-        );
-
-        // Nothing was registered under the name the refused create asked for.
-        let (status, described) = aws.describe(&stream).await;
-        assert_eq!(
-            (status, error_code(&described).as_str()),
-            (400, NOT_FOUND),
-            "case {case:?}: a refused create must register nothing, got {status} with {described}"
-        );
-
-        // And the same request is served once the role's policy allows the whole read: what
-        // the refusal answered was the permission in force, not the request's shape.
-        aws.put_role_policy(
-            case,
-            source_case.role_name,
-            &[allow(EVERY_SOURCE_READ, &source_arn)],
-        )
-        .await;
-        let (status, created) = aws.firehose("CreateDeliveryStream", request).await;
+        // Every row is served, whatever its role's policy withholds: the create resolves the
+        // resources the configuration NAMES, not what the role may do with them.
         assert_eq!(
             status, 200,
-            "case {case:?}: expected the repaired role's create to be served, got {status} with \
-             {created}"
+            "case {case:?}: expected the create to be served, got {status} with {answered}"
         );
-        // The stream the repaired create registered, read back at once: a create answers the
-        // source it configured whatever lifecycle status the clock has it in, so this row does
-        // not wait out the activation span the two control rows above already assert.
-        let (status, described) = aws.describe(&stream).await;
+        // And the stream it registered is usable, reporting the source it will retrieve and the
+        // role it will retrieve it under — the configuration, kept as submitted.
+        let description = aws.await_active(case, &stream).await;
+        let source = &description["Source"]["KinesisStreamSourceDescription"];
         assert_eq!(
-            status, 200,
-            "case {case:?}: the repaired create must register the stream, got {status} with \
-             {described}"
-        );
-        assert_eq!(
-            described["DeliveryStreamDescription"]["Source"]["KinesisStreamSourceDescription"]
-                ["RoleARN"],
-            json!(role),
-            "case {case:?}: the stream reports the role it reads its source under, got \
-             {described}"
+            (&source["KinesisStreamARN"], &source["RoleARN"]),
+            (&json!(source_arn), &json!(role)),
+            "case {case:?}: the stream reports the source it reads and the role it reads it \
+             under, got {description}"
         );
     }
 }

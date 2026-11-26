@@ -20,13 +20,14 @@
 //! and the one that may not becomes the one that may the moment its policy says so, with the
 //! records it never took still in the source.
 //!
-//! The stack deploys BOTH roles able to make the whole read, because
-//! `CreateDeliveryStream` resolves the source role's permissions before it writes a stream:
-//! a leg declared with a role that may not read would deploy no stream at all (the sibling
-//! suite `firehose_create_resolves_its_configuration` pins that refusal). The difference
-//! between the legs is therefore stated IN PLACE once both streams are live, which is exactly
-//! the condition this suite is about: what a deployed stream retrieves follows the permissions
-//! in force at each attempt, whichever way the stream was provisioned.
+//! The stack deploys BOTH roles able to make the whole read, and the difference between the
+//! legs is stated IN PLACE once both streams are live, which is exactly the condition this
+//! suite is about: what a deployed stream retrieves follows the permissions in force at each
+//! attempt, whichever way the stream was provisioned, and a stream created under a role that
+//! could read goes on being decided by the policy as it stands. A leg declared with a role
+//! that may not read deploys just as well — the sibling suite
+//! `cfn_deployed_firehose_under_permissioned_source_stack` pins that — and is the same
+//! question asked from the other end.
 //!
 //! Only a cross-service suite can ask this: the flow spans CloudFormation (which deploys the
 //! roles, the log destinations and the streams), IAM (which holds those roles and decides
@@ -180,10 +181,9 @@ impl Leg {
 /// The identity policy the template puts on EITHER leg's role: the object write and the whole
 /// source read.
 ///
-/// Both legs, because `CreateDeliveryStream` resolves the source role's permissions before it
-/// writes a stream, so a leg declared with a role that may not read would deploy no stream at
-/// all. What makes the legs differ is stated in place once both streams are live, which is the
-/// condition this suite is about: the permissions in force at each ATTEMPT.
+/// Both legs, because this suite is about the permissions in force at each ATTEMPT: both
+/// streams start out able to read, and what makes the legs differ is stated in place once both
+/// are live.
 fn deployed_role_policy() -> String {
     let mut reads: Vec<&str> = OTHER_SOURCE_READS.to_vec();
     reads.push(RECORDS_READ);
