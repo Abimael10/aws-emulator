@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelImportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelImportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelImportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels one import task of this account, held in [`crate::state`]: the task the request
+//! names stops moving data at the instant the cancel is accepted — it reaches `CANCELLED`,
+//! the completion the clock owed it is discarded, and the batches it is grouped into settle
+//! with it ([`crate::state::ImportTaskRecord::cancel`]) — and the response reports that task
+//! as it now stands, read off the record rather than echoed from the request.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelImportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelImportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelImportTask"))
+        // `ctx` carries only request metadata; the task to cancel is named by `importId` and
+        // by nothing about the request.
+        let _ = ctx;
+
+        let invalid = |message: &str| {
+            CancelImportTaskError::from(CancelImportTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        // "The ID of the import task to cancel": the one required input, and it names a
+        // resource of this service. The FORM of that id is a precondition on the request,
+        // decided before any state is read: an id outside the form an import id is written in
+        // ([`crate::state::is_uuid_form`]) names no import that could exist, so it is the
+        // incorrectly specified parameter it is rather than an import this account happens not
+        // to hold.
+        if !crate::state::is_uuid_form(&input.import_id) {
+            return Err(invalid(crate::state::IMPORT_ID_FORM_MESSAGE));
+        }
+
+        // Every error this operation models is a CLIENT error, so a store that is not there at
+        // all is reported with the one of them that says the service rather than the request is
+        // at fault — and that a retry may find it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelImportTaskError::from(CancelImportTaskErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // An import runs asynchronously, so the status this cancel is judged against is the one
+        // the CLOCK had already made due at this instant: it is materialised before the
+        // decision rather than moved on because a cancel happened to look.
+        let now = crate::state::now_ms();
+        store.materialize_due_import_transitions(now);
+
+        // An id in the form an import id is written in that this account holds no task under
+        // names nothing to cancel, which is the missing resource this operation models —
+        // stated in the sentence CloudWatch Logs words that condition in for an import it holds
+        // none under.
+        let Some(task) = store.import_tasks.get_mut(&input.import_id) else {
+            return Err(CancelImportTaskErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::NO_MATCHING_IMPORT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Cancels an ACTIVE import task": a task that has already settled has no import left
+        // to stop, so the call is not valid on that resource — and the status it settled at is
+        // left exactly as it is, so a report after the refusal answers what it did before.
+        if task.is_terminal() {
+            return Err(CancelImportTaskErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(crate::state::IMPORT_TASK_NOT_ACTIVE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        task.cancel(now);
+
+        // The response reports the task as the cancel left it, every member read off the
+        // record: the task's own id, the status it now carries ("This will be set to
+        // CANCELLED"), what the import had moved by the time it was stopped, the instant it was
+        // created and the instant this cancel updated it.
+        Ok(CancelImportTaskOutput {
+            import_id: Some(task.import_id.clone()),
+            import_status: Some(task.import_status.clone()),
+            import_statistics: Some(task.import_statistics()),
+            creation_time: Some(task.creation_time_ms),
+            last_updated_time: Some(task.last_updated_time_ms),
+        })
     }
 }

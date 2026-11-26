@@ -750,6 +750,13 @@ pub const NO_MATCHING_IMPORT_MESSAGE: &str = "No matching import found.";
 /// fault and quoting nothing of the value it rejected.
 pub const IMPORT_ID_FORM_MESSAGE: &str = "ImportId must be a valid UUID format";
 
+/// The refusal `CancelImportTask` answers when the import task it names has already settled:
+/// the operation "cancels an active import task", and a task in any status but
+/// [`IMPORT_STATUS_IN_PROGRESS`] has no import left to stop, so the call is not valid on that
+/// resource. Fixed text for the condition, carrying neither the id it was handed nor the
+/// status the task settled at.
+pub const IMPORT_TASK_NOT_ACTIVE_MESSAGE: &str = "The specified import task is not active";
+
 /// The name prefix of the managed log group an import task delivers into, which is also the
 /// one `CreateImportTask`'s own IAM example documents for an import destination
 /// ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/cloudtrail/*").

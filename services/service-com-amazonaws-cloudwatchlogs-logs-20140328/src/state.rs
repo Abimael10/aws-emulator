@@ -1320,6 +1320,21 @@ impl ImportTaskRecord {
         }
     }
 
+    /// Cancel this import: the task reaches [`IMPORT_STATUS_CANCELLED`] at `now_ms` and owes
+    /// the clock no further transition, so the completion it was armed for is DISCARDED rather
+    /// than materialised later over the cancellation. The import stops moving data at that
+    /// instant, so the batches it is grouped into settle with it
+    /// ([`Self::materialize_due_batch_transitions`]): one whose own instant had already passed
+    /// is `COMPLETED`, and one the import never got to takes the status the task stopped in.
+    /// Only a task that is not [`Self::is_terminal`] has an import left to cancel —
+    /// `CancelImportTask` "cancels an ACTIVE import task".
+    pub fn cancel(&mut self, now_ms: i64) {
+        self.import_status = IMPORT_STATUS_CANCELLED.to_string();
+        self.last_updated_time_ms = now_ms;
+        self.completion_due_ms = None;
+        self.materialize_due_batch_transitions(now_ms);
+    }
+
     /// Materialise the status changes the clock owes this task: a running import whose
     /// completion instant has passed is `COMPLETED`, updated AT that instant and not at
     /// the time something happened to look — and the batches it is grouped into move with it
