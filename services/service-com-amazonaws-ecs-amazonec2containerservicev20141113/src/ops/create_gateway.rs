@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a gateway is created from the request and persisted in this service's
+//! state, and every gateway read reports the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +172,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGateway"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGatewayErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The name for the gateway. The name must be unique within your account and can be
+        // up to 255 characters" — the name rule is answered from the REQUEST alone, before
+        // anything is resolved against this account.
+        if let Some(message) = crate::state::requested_gateway_name_violation(&input.name) {
+            return Err(
+                CreateGatewayErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        // The role Amazon ECS manages the gateway's infrastructure as. WHETHER the caller may
+        // hand it over is `iam:PassRole`, decided for this operation before the handler runs
+        // (`crate::service::pass_role`); what is left here is a member that names no role at
+        // all, which is this operation's own refusal.
+        if input.infrastructure_role_arn.trim().is_empty() {
+            return Err(
+                CreateGatewayErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(crate::state::INFRASTRUCTURE_ROLE_BLANK_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // The listener the gateway's load balancers would run: the model allows ONE port and
+        // ONE protocol, so a request naming any other asks for a gateway Amazon ECS does not
+        // serve ([`crate::state::gateway_listener_violation`]).
+        if let Some(message) = crate::state::gateway_listener_violation(&input.configuration) {
+            return Err(
+                CreateGatewayErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(
+                CreateGatewayErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Only the transitions the clock already made due, which were owed at this instant
+        // whether or not anybody called.
+        guard.advance_clock(now);
+
+        if let Some(existing) = guard.gateways.get(&input.name) {
+            // "If this token matches a previous request, the service ignores the request, but
+            // does not return an error": the repeat is answered with the gateway that create
+            // left, and nothing is written.
+            if input.client_token.is_some() && existing.client_token == input.client_token {
+                return Ok(CreateGatewayOutput {
+                    gateway_arn: Some(existing.arn.clone()),
+                    name: Some(existing.name.clone()),
+                    status: Some(existing.status.clone()),
+                });
+            }
+            // A name this account already holds a gateway under, asked for by a call that is
+            // not that create being made again.
+            return Err(
+                CreateGatewayErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(
+                        crate::state::GATEWAY_CREATION_NOT_IDEMPOTENT_MESSAGE.to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+        if guard.gateways.len() >= crate::state::MAX_GATEWAYS {
+            return Err(CreateGatewayErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} gateways; delete one before creating \
+                     another",
+                    crate::state::MAX_GATEWAYS
+                )),
+            })
+            .into());
+        }
+
+        // Every member the request left out takes the value its own doc documents as the
+        // default, and the access type is DERIVED from the scheme that resolution settled
+        // ("The gateway derives this value from its scheme when you create the gateway").
+        let configuration = crate::state::resolved_gateway_configuration(&input.configuration);
+        let access_type = crate::state::gateway_access_type(
+            configuration
+                .scheme
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_GATEWAY_SCHEME),
+        );
+        let created_at = crate::state::reported_instant(now);
+        let record = crate::state::GatewayRecord {
+            arn: crate::state::gateway_arn(&region, &input.name),
+            name: input.name.clone(),
+            // "CreateGateway is a synchronous operation and the gateway is returned with a
+            // status of ACTIVE" — nothing about this create is owed to the clock.
+            status: crate::state::GATEWAY_ACTIVE.to_string(),
+            infrastructure_role_arn: input.infrastructure_role_arn.clone(),
+            deletion_protection: input
+                .deletion_protection
+                .unwrap_or(crate::state::DEFAULT_GATEWAY_DELETION_PROTECTION),
+            propagate_tags: input
+                .propagate_tags
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_PROPAGATE_GATEWAY_TAGS.to_string()),
+            access_type: access_type.to_string(),
+            configuration,
+            tags: input.tags.clone().unwrap_or_default(),
+            client_token: input.client_token.clone(),
+            created_at,
+            updated_at: created_at,
+            // "The load balancers and other infrastructure that a gateway manages aren't
+            // created until a service in an associated cluster begins using the gateway."
+            allocated_albs: 0,
+        };
+        // Inserted and reported back through the store, so the response is the stored record
+        // rather than the request that produced it.
+        let stored = guard.gateways.entry(input.name.clone()).or_insert(record);
+        Ok(CreateGatewayOutput {
+            gateway_arn: Some(stored.arn.clone()),
+            name: Some(stored.name.clone()),
+            status: Some(stored.status.clone()),
+        })
     }
 }

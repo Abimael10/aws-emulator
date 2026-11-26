@@ -610,6 +610,11 @@ pub use task_definition_records::*;
 mod fargate_features;
 pub use fargate_features::*;
 
+/// The GATEWAYS this account holds: the record a create wrote, the configuration it
+/// resolved out of the request, and the one projection every gateway read reports.
+mod gateways;
+pub use gateways::*;
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -4662,6 +4667,10 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// managed by Amazon ECS (it owns a load balancer, target groups and scaling
     /// policies) and is addressed only by the Express operations.
     pub express_gateway_services: HashMap<(String, String), ExpressGatewayServiceRecord>,
+    /// `gatewayName` -> the gateway. A gateway is a resource of the ACCOUNT rather than of a
+    /// cluster ("The name must be unique within your account"), so the name is the whole key
+    /// — exactly as a cluster's name is its own.
+    pub gateways: HashMap<String, GatewayRecord>,
     /// `(principalArn, settingName)` -> the account setting value stored for that ONE
     /// principal by `PutAccountSetting`. An entry here shadows the account-wide default
     /// for that principal alone (`ListAccountSettings$effectiveSettings`: "the account
