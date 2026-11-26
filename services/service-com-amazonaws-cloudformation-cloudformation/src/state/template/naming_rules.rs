@@ -337,6 +337,29 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         | crate::state::provisioner::neptune_relational::NEPTUNE_DB_SUBNET_GROUP => {
             rules(255, Characters::LowercaseAlphanumeric)
         }
+        // The Amazon ElastiCache identifiers a stack GENERATES a name for, each created under
+        // a member whose own doc says the value "is stored as a lowercase string" — so a name
+        // carrying upper case names a resource that service does not hold under it, the
+        // position the Amazon RDS identifiers above are in:
+        // `CreateCacheCluster.CacheClusterId` ("A name must contain from 1 to 50 alphanumeric
+        // characters or hyphens", "The first character must be a letter", "A name cannot end
+        // with a hyphen or contain two consecutive hyphens"),
+        // `CreateReplicationGroup.ReplicationGroupId` (the same rule with 40 characters) and
+        // `CreateCacheSubnetGroup.CacheSubnetGroupName` ("Must contain no more than 255
+        // alphanumeric characters or hyphens") — ElastiCache's model carries no `@length` for
+        // any of them.
+        crate::state::provisioner::elasticache_caches::ELASTICACHE_CACHE_CLUSTER => {
+            rules(50, Characters::LowercaseAlphanumeric)
+        }
+        crate::state::provisioner::elasticache_replication_groups::ELASTICACHE_REPLICATION_GROUP => {
+            rules(
+                crate::state::provisioner::elasticache_replication_groups::REPLICATION_GROUP_ID_MAX_CHARACTERS,
+                Characters::LowercaseAlphanumeric,
+            )
+        }
+        crate::state::provisioner::elasticache_subnet_groups::ELASTICACHE_SUBNET_GROUP => {
+            rules(255, Characters::LowercaseAlphanumeric)
+        }
         // Amazon RDS `CreateDBSnapshot.DBSnapshotIdentifier`: "must contain from 1 to 255
         // letters, numbers, or hyphens", "first character must be a letter" and "can't end
         // with a hyphen or contain two consecutive hyphens" (that member's own doc) — RDS's
@@ -1122,6 +1145,24 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // physical id.
         crate::state::provisioner::elasticache_caches::ELASTICACHE_CACHE_CLUSTER => {
             Some("ClusterName")
+        }
+        // The same service's `CreateReplicationGroup` takes a `ReplicationGroupId`, and the
+        // type publishes it under that name — "Ref returns the replication group's id" — while
+        // the type's last segment is `ReplicationGroup`, so neither `ReplicationGroupName` nor
+        // `Name` finds it. That id is what the group is CREATED under and the identifier every
+        // ElastiCache call on one takes, so it is the physical id.
+        crate::state::provisioner::elasticache_replication_groups::ELASTICACHE_REPLICATION_GROUP => {
+            Some(
+                crate::state::provisioner::elasticache_replication_groups::REPLICATION_GROUP_ID_PROPERTY,
+            )
+        }
+        // The same service's `CreateCacheSubnetGroup` takes a `CacheSubnetGroupName`, and the
+        // type publishes it under that name — "Ref returns the name of the cache subnet group"
+        // — while the type's last segment is `SubnetGroup`, so neither `SubnetGroupName` nor
+        // `Name` finds it. That name is what the group is CREATED under and the name a cache's
+        // own `CacheSubnetGroupName` resolves against, so it is the physical id.
+        crate::state::provisioner::elasticache_subnet_groups::ELASTICACHE_SUBNET_GROUP => {
+            Some("CacheSubnetGroupName")
         }
         // Amazon Cognito's `CreateGroup` takes `GroupName`, so the type publishes
         // `GroupName` — the type's last segment is `UserPoolGroup`, so neither

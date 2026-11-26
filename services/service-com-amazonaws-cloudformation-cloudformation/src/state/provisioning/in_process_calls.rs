@@ -1096,6 +1096,102 @@ pub(crate) fn xml_scalar_children(
     }
 }
 
+/// The scalar children of EVERY `<parent>` element of a document, in document order, one map
+/// per occurrence.
+///
+/// [`xml_scalar_children`] reads the FIRST such element, which is the whole answer for a
+/// member a resource carries once; a member one resource repeats — a replication group's node
+/// group members each carry a `ReadEndpoint`, which is what the group's own read-endpoint
+/// return values are the delimited lists of — is read by this one. Each occurrence is read on
+/// its own, exactly as [`xml_entry_structures`] reads a list's entries, so an optional member
+/// one occurrence does not carry is absent from that occurrence rather than shifting the next
+/// one's value onto it.
+///
+/// A child that HOLDS other elements is not a scalar and is left out of its occurrence, and an
+/// empty element (`<Port/>`) is the empty value of that member, both as they are for
+/// [`xml_scalar_children`]; an occurrence the answer writes empty (`<ReadEndpoint/>`) is one
+/// structure carrying no member at all.
+pub(crate) fn xml_scalar_children_of_each(
+    document: &str,
+    parent: &str,
+) -> Vec<::serde_json::Map<String, Value>> {
+    use ::quick_xml::events::Event;
+
+    let mut reader = ::quick_xml::Reader::from_str(document);
+    reader.config_mut().trim_text(false);
+    let mut found: Vec<::serde_json::Map<String, Value>> = Vec::new();
+    // The occurrence being read, `Some` between that element's start and end tags.
+    let mut members: Option<::serde_json::Map<String, Value>> = None;
+    // How many elements are open BELOW it: a direct child opens at 0, and only a child read at
+    // that level is one of this structure's own members.
+    let mut depth = 0usize;
+    // The direct child being read, while it is still a candidate scalar, and its text.
+    let mut member: Option<String> = None;
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                let name = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
+                if members.is_none() {
+                    if name == parent {
+                        members = Some(::serde_json::Map::new());
+                        depth = 0;
+                        member = None;
+                    }
+                    continue;
+                }
+                if depth == 0 {
+                    member = Some(name);
+                    text.clear();
+                } else {
+                    // The child this is nested in holds elements, so it is not a scalar.
+                    member = None;
+                }
+                depth += 1;
+            }
+            Ok(Event::Text(read)) if members.is_some() && depth == 1 => {
+                text.push_str(&read.xml10_content().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(reference)) if members.is_some() && depth == 1 => {
+                text.push_str(&referenced_text(&reference));
+            }
+            Ok(Event::Empty(empty)) => {
+                let name = String::from_utf8_lossy(empty.local_name().as_ref()).into_owned();
+                match members.as_mut() {
+                    Some(held) if depth == 0 => {
+                        held.insert(name, Value::String(String::new()));
+                    }
+                    None if name == parent => found.push(::serde_json::Map::new()),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(end)) if members.is_some() => {
+                let name = String::from_utf8_lossy(end.local_name().as_ref()).into_owned();
+                if depth == 0 {
+                    if name == parent {
+                        if let Some(held) = members.take() {
+                            found.push(held);
+                        }
+                    }
+                    continue;
+                }
+                if depth == 1 {
+                    if let Some(read) = member.take() {
+                        if read == name {
+                            if let Some(held) = members.as_mut() {
+                                held.insert(read, Value::String(::std::mem::take(&mut text)));
+                            }
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) | Err(_) => return found,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// A service's error answer as the code it carries and the message it worded. The code is
 /// the last segment of the awsJson `__type`
 /// (`com.amazonaws.firehose#ResourceInUseException` -> `ResourceInUseException`), which is

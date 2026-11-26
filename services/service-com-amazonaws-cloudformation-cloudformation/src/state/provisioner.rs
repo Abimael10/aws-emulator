@@ -471,6 +471,7 @@ use super::provisioning::{
     call_rest_json_named, call_rest_xml,
     modelled_declaration, percent_encoded, published_instant, xml_element, xml_elements,
     xml_entry_map, xml_entry_structures, xml_leaf, xml_member_structures, xml_scalar_children,
+    xml_scalar_children_of_each,
     Created, ModelledScalar, Readiness,
     Refusal, Removal,
     AWS_JSON_1_0, AWS_JSON_1_1,
@@ -1032,6 +1033,24 @@ pub(super) enum Provisioner {
     /// versions the declared engine offers, the usage-limit bounds — so a template that
     /// service refuses fails the resource rather than being reported created.
     ElastiCacheServerlessCache,
+    /// `AWS::ElastiCache::ReplicationGroup`: a replication group of Amazon ElastiCache, which
+    /// `CreateReplicationGroup` creates under the `ReplicationGroupId` the declaration states
+    /// — the identifier this type's `Ref` returns — and `DeleteReplicationGroup` deletes by
+    /// it. That create answers the group `creating`, in which it serves nothing and publishes
+    /// no endpoint, so the resource's creation is held open until ElastiCache reports it
+    /// `available`. Creating it there is also what applies that operation's own validation to
+    /// the declaration — the subnet group resolved against the ones that service holds, the
+    /// security groups against Amazon EC2's, the auth token's own form — so a template that
+    /// service refuses fails the resource rather than being reported created.
+    ElastiCacheReplicationGroup,
+    /// `AWS::ElastiCache::SubnetGroup`: the cache subnet group a cluster or a replication
+    /// group of Amazon ElastiCache is placed in, which `CreateCacheSubnetGroup` creates under
+    /// the name the stack decided — the name this type's `Ref` returns — and
+    /// `DeleteCacheSubnetGroup` deletes by it. That service resolves a cache's
+    /// `CacheSubnetGroupName` against the groups it HOLDS before it will create one in it
+    /// (`CacheSubnetGroupNotFoundFault`), so a stack declaring both has to create this one
+    /// there for real.
+    ElastiCacheSubnetGroup,
     RdsDbSubnetGroup,
     /// `AWS::RDS::OptionGroup`: an option group of Amazon RDS, which `CreateOptionGroup`
     /// creates under the name the stack decided — the name this type's `Ref` returns — and
@@ -1907,6 +1926,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_CLUSTER => Some(Provisioner::RdsDbCluster),
         ELASTICACHE_CACHE_CLUSTER => Some(Provisioner::ElastiCacheCacheCluster),
         ELASTICACHE_SERVERLESS_CACHE => Some(Provisioner::ElastiCacheServerlessCache),
+        ELASTICACHE_REPLICATION_GROUP => Some(Provisioner::ElastiCacheReplicationGroup),
+        ELASTICACHE_SUBNET_GROUP => Some(Provisioner::ElastiCacheSubnetGroup),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         rds_option_groups::RDS_OPTION_GROUP => Some(Provisioner::RdsOptionGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
@@ -2479,6 +2500,21 @@ impl Provisioner {
             // takes the whole record beside that identifier.
             Self::ElastiCacheServerlessCache => {
                 Box::pin(delete_serverless_cache(ctx, region, resource, final_snapshot)).await
+            }
+            // The final snapshot a `Snapshot` deletion policy asks for is a member of the
+            // delete itself here too, so the arm takes it beside the group's identifier.
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(delete_replication_group(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    final_snapshot,
+                ))
+                .await
+            }
+            // A subnet group is addressed by its name, which is this resource's physical id.
+            Self::ElastiCacheSubnetGroup => {
+                Box::pin(delete_cache_subnet_group(ctx, region, physical_resource_id)).await
             }
             Self::RedshiftCluster => {
                 delete_redshift_cluster(ctx, region, physical_resource_id, final_snapshot)
@@ -3429,6 +3465,18 @@ pub(super) mod elasticache_caches;
 /// rule `CreateServerlessCache` applies to the declared properties decides the resource's
 /// fate and a client's own read of that service resolves the cache the stack publishes.
 pub(super) mod elasticache_serverless_caches;
+/// The Amazon ElastiCache REPLICATION GROUP arm: the group an
+/// `AWS::ElastiCache::ReplicationGroup` declares, created in the service that owns it so every
+/// rule `CreateReplicationGroup` applies to the declared properties decides the resource's
+/// fate and a client's own read of that service resolves the group the stack publishes.
+/// Visible to the rest of this service's state because the type's own NAME lives here, beside
+/// the arms that provision it, and the naming rules key their entries for it by that name.
+pub(in crate::state) mod elasticache_replication_groups;
+/// The Amazon ElastiCache CACHE SUBNET GROUP arm: the group an `AWS::ElastiCache::SubnetGroup`
+/// declares, created in the service that owns it so a cache's `CacheSubnetGroupName` and a
+/// client's own read of that service resolve the name the stack publishes. Visible for the
+/// reason the replication group's module is.
+pub(in crate::state) mod elasticache_subnet_groups;
 /// The Amazon RDS DB CLUSTER arm: the cluster an `AWS::RDS::DBCluster` declares, created in
 /// the service that owns it so a member DB instance of that cluster resolves it.
 pub(super) mod rds_db_clusters;
@@ -3535,6 +3583,8 @@ use codepipeline_webhooks::*;
 use memorydb_groups::*;
 use elasticache_caches::*;
 use elasticache_serverless_caches::*;
+use elasticache_replication_groups::*;
+use elasticache_subnet_groups::*;
 use rds_db_clusters::*;
 use rds_tags::*;
 use redshift_parameter_groups::*;

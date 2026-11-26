@@ -113,6 +113,18 @@ impl Provisioner {
             Self::ElastiCacheServerlessCache => {
                 Box::pin(serverless_cache_readiness(ctx, region, physical_resource_id)).await
             }
+            // `CreateReplicationGroup` answers the group `creating`, in which it publishes no
+            // endpoint and serves no client, so the resource's creation is finished once
+            // Amazon ElastiCache reports it `available`.
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(replication_group_readiness(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    declared,
+                ))
+                .await
+            }
             // `CreateDBInstance` answers the instance `creating`, in which it serves no
             // connection and publishes no endpoint a client can reach, so the resource's
             // creation is finished once Amazon RDS reports it `available` — which is also
@@ -548,6 +560,18 @@ impl Provisioner {
                 ))
                 .await
             }
+            // A replication group publishes none of its endpoints while it is `creating`: the
+            // addresses a client writes to and reads from are ones Amazon ElastiCache fills in
+            // as it provisions the group's shards, so the type's endpoint attributes are read
+            // off the group once it reports it `available`.
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(replication_group_ready_attributes(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
             // A Redshift cluster has no connection endpoint while it is `creating`: the
             // address and the port a client connects to are what Amazon Redshift publishes
             // once the cluster is serving, so the type's endpoint attributes are read off the
@@ -686,6 +710,14 @@ impl Provisioner {
             // deleting the subnets and the security groups the cache still sits in.
             Self::ElastiCacheServerlessCache => {
                 Box::pin(serverless_cache_removal(ctx, region, physical_resource_id)).await
+            }
+            // `DeleteReplicationGroup` leaves the group `deleting` while Amazon ElastiCache
+            // takes it and its member clusters away, so it is still there when the delete
+            // answers and the deletion is finished once that service no longer holds it —
+            // which is what keeps a stack from deleting the subnet group those clusters still
+            // sit in.
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(replication_group_removal(ctx, region, physical_resource_id)).await
             }
             // `DeleteDBCluster` leaves the cluster `deleting` until the deletion completes,
             // so it is still there when the delete answers and the deletion is finished once

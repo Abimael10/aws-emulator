@@ -415,6 +415,18 @@ impl Provisioner {
             Self::ElastiCacheServerlessCache => {
                 Box::pin(create_serverless_cache(ctx, region, resource, propagated)).await
             }
+            // `AWS::ElastiCache::ReplicationGroup` publishes `Tags` as the same `{Key, Value}`
+            // list, which `CreateReplicationGroup` takes as its own `Tags` member, so a group
+            // a stack creates carries the tags CloudFormation gives it beside the declared
+            // ones.
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(create_replication_group(ctx, region, resource, propagated)).await
+            }
+            // `AWS::ElastiCache::SubnetGroup` publishes `Tags` as that same list, which
+            // `CreateCacheSubnetGroup` takes as its own `Tags` member.
+            Self::ElastiCacheSubnetGroup => {
+                Box::pin(create_cache_subnet_group(ctx, region, resource, propagated)).await
+            }
             Self::RedshiftCluster => {
                 create_redshift_cluster(ctx, region, resource, propagated).await
             }
@@ -1404,6 +1416,11 @@ impl Provisioner {
                 // The same check guards `CreateServerlessCache`'s own `Tags` member, so a
                 // serverless cache is in exactly that position.
                 | Self::ElastiCacheServerlessCache
+                // The same check guards `CreateReplicationGroup`'s and
+                // `CreateCacheSubnetGroup`'s own `Tags` members, so a replication group and a
+                // cache subnet group are in exactly that position.
+                | Self::ElastiCacheReplicationGroup
+                | Self::ElastiCacheSubnetGroup
                 // Resource Groups refuses a tag key in the reserved namespace on every call
                 // that takes tags — `CreateGroup`'s `Tags` map and `Tag` alike, in the one
                 // check its own crate's tag validation makes — so a group carries the stack's

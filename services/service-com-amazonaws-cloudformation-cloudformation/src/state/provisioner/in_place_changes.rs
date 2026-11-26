@@ -190,6 +190,20 @@ impl Provisioner {
                 )
                 .await
             }
+            // Every setting of a replication group that Amazon ElastiCache can change on a
+            // group that exists is a member of `ModifyReplicationGroup`, so a changed
+            // declaration is applied to the group the stack created rather than dropped
+            // ([`elasticache_replication_groups::update_replication_group`]).
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(update_replication_group(ctx, region, resource, declared)).await
+            }
+            // A cache subnet group's description and its subnet list are everything it carries
+            // beside the name it is addressed by, and `ModifyCacheSubnetGroup` takes both, so
+            // a changed declaration reaches the group the stack created
+            // ([`elasticache_subnet_groups::update_cache_subnet_group`]).
+            Self::ElastiCacheSubnetGroup => {
+                Box::pin(update_cache_subnet_group(ctx, region, resource, declared)).await
+            }
             // The Amazon Neptune parameter groups are in exactly that position: their
             // `Parameters` map is the one part of either declaration the owning front door can
             // change on a group that exists, through the same modify their create makes for the

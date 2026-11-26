@@ -931,6 +931,21 @@ impl Provisioner {
             Self::ElastiCacheServerlessCache => {
                 Box::pin(read_serverless_cache(ctx, region, physical_resource_id)).await
             }
+            // The same service's own read of the replication group, by the identifier it was
+            // created under, reported with its SCALAR configuration — the engine, the node
+            // type, the description and the snapshot posture, each the member of the same name
+            // the type declares; a member that is a LIST (the node groups, the member
+            // clusters) or a STRUCTURE (either endpoint) is left out, which is the position
+            // every arm whose property is not a scalar is in.
+            Self::ElastiCacheReplicationGroup => {
+                Box::pin(read_replication_group(ctx, region, physical_resource_id)).await
+            }
+            // The same service's own read of the cache subnet group, by the name it was
+            // created under, reported with its description and the VPC it sits in; its subnet
+            // list is a composite member and is left out the same way.
+            Self::ElastiCacheSubnetGroup => {
+                Box::pin(read_cache_subnet_group(ctx, region, physical_resource_id)).await
+            }
             // Amazon MemoryDB's own read of the group, by the name it was created under.
             Self::MemoryDbGroup(group) => {
                 describe_memorydb_group(ctx, region, group, physical_resource_id).await
