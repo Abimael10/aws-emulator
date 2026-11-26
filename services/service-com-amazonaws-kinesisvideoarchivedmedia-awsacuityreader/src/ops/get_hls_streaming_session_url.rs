@@ -22,7 +22,9 @@
 //!   LIVE_REPLAY and 1000 for ON_DEMAND.
 //! * `HLSFragmentSelector` is required for ON_DEMAND and LIVE_REPLAY and must
 //!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
-//!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
+//!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY, and
+//!   an `EndTimestamp` must be later than the `StartTimestamp` and within 24
+//!   hours of it.
 //! * The session is RECORDED in state with the selection it plays — its window,
 //!   its timestamp origin and its fragment cap — and the playlist it starts
 //!   from, so two calls mint two distinct sessions, and the URL reported for it

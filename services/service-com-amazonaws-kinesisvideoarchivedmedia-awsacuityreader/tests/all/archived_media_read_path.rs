@@ -2044,6 +2044,222 @@ async fn get_hls_streaming_session_url_enforces_the_selector_rules_of_each_mode(
     }
 }
 
+/// The widest span the operations whose range documents it admit, in seconds.
+///
+/// Read off the model, not off a request: `smithy_query(query="doc",
+/// shape="HLSTimestampRange", member="EndTimestamp")` — and the same sentence on
+/// `DASHTimestampRange$EndTimestamp` and `ClipTimestampRange$EndTimestamp` —
+/// states that the end "must be within 24 hours of the specified StartTimestamp,
+/// and it must be later than the StartTimestamp value".
+const MAX_RANGE_SPAN_SECS: i64 = 24 * 60 * 60;
+
+/// The sentence a range wider than [`MAX_RANGE_SPAN_SECS`] is refused with.
+const RANGE_TOO_WIDE: &str = "EndTimestamp must be within 24 hours of StartTimestamp.";
+
+/// The sentence a range whose end is not later than its start is refused with:
+/// the other clause of that same documented sentence.
+const RANGE_OUT_OF_ORDER: &str = "StartTimestamp must be before EndTimestamp.";
+
+/// One operation whose timestamp range carries the 24-hour sentence: the route,
+/// the member its fragment selector is carried in, and the playback mode a
+/// request of it states — `None` for `GetClip`, which models no playback mode.
+struct RangeOperation {
+    path: &'static str,
+    selector_member: &'static str,
+    playback_mode: Option<&'static str>,
+}
+
+/// Every operation of this service whose range documents the 24-hour bound, in
+/// each mode that carries a range. `ListFragments` and `GetImages` are absent on
+/// purpose: neither range's end carries that sentence.
+const RANGE_OPERATIONS: &[RangeOperation] = &[
+    RangeOperation {
+        path: "/getHLSStreamingSessionURL",
+        selector_member: "HLSFragmentSelector",
+        playback_mode: Some("ON_DEMAND"),
+    },
+    RangeOperation {
+        path: "/getHLSStreamingSessionURL",
+        selector_member: "HLSFragmentSelector",
+        playback_mode: Some("LIVE_REPLAY"),
+    },
+    RangeOperation {
+        path: "/getDASHStreamingSessionURL",
+        selector_member: "DASHFragmentSelector",
+        playback_mode: Some("ON_DEMAND"),
+    },
+    RangeOperation {
+        path: "/getDASHStreamingSessionURL",
+        selector_member: "DASHFragmentSelector",
+        playback_mode: Some("LIVE_REPLAY"),
+    },
+    RangeOperation {
+        path: "/getClip",
+        selector_member: "ClipFragmentSelector",
+        playback_mode: None,
+    },
+];
+
+/// What an operation of [`RANGE_OPERATIONS`] is asked over the range
+/// `[T0_SECS, T0_SECS + span_secs]` of the seeded archive, which holds a fragment
+/// at its producer start instant `T0_SECS`.
+fn range_request(operation: &RangeOperation, span_secs: i64) -> serde_json::Value {
+    let mut body = serde_json::json!({ "StreamName": STREAM });
+    if let Some(mode) = operation.playback_mode {
+        body["PlaybackMode"] = serde_json::json!(mode);
+    }
+    body[operation.selector_member] = serde_json::json!({
+        "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+        "TimestampRange": {
+            "StartTimestamp": T0_SECS,
+            "EndTimestamp": T0_SECS + span_secs,
+        },
+    });
+    body
+}
+
+/// What a span is expected to be answered with.
+enum SpanExpectation {
+    /// The span is one the documented window admits, so the archive answers.
+    Admitted,
+    /// HTTP 400 `InvalidArgumentException` with exactly this sentence.
+    Refused(&'static str),
+}
+
+/// How many sessions the service holds.
+fn recorded_sessions(harness: &Harness) -> usize {
+    let state = service_state(&*harness.engine).expect("the service store");
+    let state = state.lock();
+    state.sessions.len()
+}
+
+/// RULE: a timestamp range whose `EndTimestamp` is documented as having to be
+/// "within 24 hours of the specified StartTimestamp" admits a span of at most 24
+/// hours — the bound is inclusive — and a wider span is refused
+/// `InvalidArgumentException` (400) with one fixed sentence, carrying nothing of
+/// the request, before any session or clip exists; the other clause of that same
+/// sentence keeps its own refusal for an end that is not later than the start.
+///
+/// The rows differ along what the rule generalises over: the span (backwards,
+/// zero, the narrowest, each side of the published bound, and far past it), the
+/// operation whose range carries the sentence, and the playback mode the request
+/// states.
+#[tokio::test]
+async fn a_range_wider_than_the_documented_window_is_refused_in_every_operation_that_bounds_it() {
+    let harness = seeded();
+    // (case, the span between the two bounds in seconds, what is expected)
+    let rows: &[(&str, i64, SpanExpectation)] = &[
+        (
+            "a day backwards",
+            -MAX_RANGE_SPAN_SECS,
+            SpanExpectation::Refused(RANGE_OUT_OF_ORDER),
+        ),
+        (
+            "a single instant",
+            0,
+            SpanExpectation::Refused(RANGE_OUT_OF_ORDER),
+        ),
+        ("the narrowest span", 1, SpanExpectation::Admitted),
+        (
+            "one second inside the published bound",
+            MAX_RANGE_SPAN_SECS - 1,
+            SpanExpectation::Admitted,
+        ),
+        (
+            "exactly the published bound",
+            MAX_RANGE_SPAN_SECS,
+            SpanExpectation::Admitted,
+        ),
+        (
+            "one second past the published bound",
+            MAX_RANGE_SPAN_SECS + 1,
+            SpanExpectation::Refused(RANGE_TOO_WIDE),
+        ),
+        (
+            "two days",
+            2 * MAX_RANGE_SPAN_SECS,
+            SpanExpectation::Refused(RANGE_TOO_WIDE),
+        ),
+        (
+            "thirty days",
+            30 * MAX_RANGE_SPAN_SECS,
+            SpanExpectation::Refused(RANGE_TOO_WIDE),
+        ),
+        (
+            "a year",
+            365 * MAX_RANGE_SPAN_SECS,
+            SpanExpectation::Refused(RANGE_TOO_WIDE),
+        ),
+    ];
+
+    for operation in RANGE_OPERATIONS {
+        let mode = operation.playback_mode.unwrap_or("no playback mode");
+        for (case, span, expect) in rows {
+            let case = format!("{case} over {} in {mode}", operation.path);
+            let before = recorded_sessions(&harness);
+            let body = range_request(operation, *span);
+            let response = harness.post(operation.path, &body).await;
+            match expect {
+                SpanExpectation::Admitted => {
+                    assert_eq!(
+                        response.status().as_u16(),
+                        200,
+                        "case {case}: expected HTTP 200, got {} with body {:?}",
+                        response.status(),
+                        String::from_utf8_lossy(response.body())
+                    );
+                }
+                SpanExpectation::Refused(sentence) => {
+                    assert_eq!(
+                        response.status().as_u16(),
+                        400,
+                        "case {case}: expected HTTP 400, got {} with body {:?}",
+                        response.status(),
+                        String::from_utf8_lossy(response.body())
+                    );
+                    let reported = body_json(&response);
+                    assert_eq!(
+                        reported["__type"], "InvalidArgumentException",
+                        "case {case}: expected InvalidArgumentException, got {reported:?}"
+                    );
+                    let message = reported["Message"]
+                        .as_str()
+                        .or_else(|| reported["message"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert_eq!(
+                        message, *sentence,
+                        "case {case}: expected {sentence:?}, got {message:?}"
+                    );
+                    // The sentence is fixed: nothing the request carried — the
+                    // stream it addressed, either bound, the span it asked for —
+                    // can be read back out of it.
+                    for carried in [
+                        STREAM.to_string(),
+                        T0_SECS.to_string(),
+                        (T0_SECS + span).to_string(),
+                        span.to_string(),
+                    ] {
+                        assert!(
+                            !message.contains(&carried),
+                            "case {case}: the refusal must carry nothing of the request, but \
+                             {message:?} contains {carried:?}"
+                        );
+                    }
+                    // A refused request mints nothing: a session is a resource,
+                    // so a request the window rule turns away leaves the store
+                    // exactly as it was.
+                    assert_eq!(
+                        recorded_sessions(&harness),
+                        before,
+                        "case {case}: a refused request must record no session"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// RULE: a stream that retains no data cannot have a streaming session —
 /// `NoDataRetentionException` (400).
 #[tokio::test]

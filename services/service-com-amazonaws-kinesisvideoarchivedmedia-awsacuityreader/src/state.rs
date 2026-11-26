@@ -888,7 +888,8 @@ pub struct SessionParameters {
 /// `LIVE` session that must carry no `TimestampRange`, the range a non-`LIVE`
 /// session must carry, the `StartTimestamp` every such range must carry, the
 /// `EndTimestamp` `ON_DEMAND` must carry, the end that must be later than the
-/// start, and the window built from those bounds. The two operations differ only
+/// start and within [`MAX_RANGE_SPAN_MILLIS`] of it, and the window built from
+/// those bounds. The two operations differ only
 /// in [`SessionRequest::selector_member`], which every refusal that names the
 /// selector is worded with, and in the per-protocol members each input
 /// additionally carries, which stay in their own handlers.
@@ -956,6 +957,12 @@ pub fn session_parameters(request: SessionRequest<'_>) -> Result<SessionParamete
         if let Some(end_millis) = range.end_millis {
             if end_millis <= start_millis {
                 return Err(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string());
+            }
+            // The other half of that same sentence: the end "must be within 24
+            // hours of the specified StartTimestamp", so no session is minted
+            // over a wider span.
+            if !range_within_max_span(start_millis, end_millis) {
+                return Err(TIMESTAMP_RANGE_SPAN_MESSAGE.to_string());
             }
         }
         SessionWindow::Range {
@@ -1162,6 +1169,33 @@ pub fn addressed_endpoint(ctx: &::smithy_server_runtime::OperationContext<'_>) -
 /// The refusal a timestamp range whose end does not come after its start
 /// carries: `EndTimestamp` "must be later than the StartTimestamp value".
 pub const TIMESTAMP_RANGE_ORDER_MESSAGE: &str = "StartTimestamp must be before EndTimestamp.";
+
+/// How many milliseconds a range whose `EndTimestamp` "must be within 24 hours
+/// of the specified StartTimestamp" may span.
+///
+/// Every range of this service whose end carries that sentence shares this one
+/// bound: `HLSTimestampRange`, `DASHTimestampRange` and `ClipTimestampRange`.
+/// The ranges that do NOT carry it keep their own documented bound instead —
+/// `ListFragments`'s `TimestampRange`, whose end is documented as nothing more
+/// than "the ending timestamp in the range of timestamps for which to return
+/// fragments", and `GetImages`, whose documented window is the narrower one its
+/// own handler states — so neither is checked against this one.
+pub const MAX_RANGE_SPAN_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+
+/// The refusal a range wider than [`MAX_RANGE_SPAN_MILLIS`] carries, worded with
+/// the documented bound it exceeds.
+pub const TIMESTAMP_RANGE_SPAN_MESSAGE: &str =
+    "EndTimestamp must be within 24 hours of StartTimestamp.";
+
+/// Whether the span between the two bounds of a range, in epoch milliseconds, is
+/// one the documented 24-hour window admits.
+///
+/// The bound is INCLUSIVE — the end must be "within 24 hours" of the start — so a
+/// range exactly that wide is admitted and only a wider one is refused.
+#[must_use]
+pub fn range_within_max_span(start_millis: i64, end_millis: i64) -> bool {
+    end_millis.saturating_sub(start_millis) <= MAX_RANGE_SPAN_MILLIS
+}
 
 /// Why a `StreamName`/`StreamARN` pair did not name one stream.
 #[derive(Debug, Clone, PartialEq, Eq)]

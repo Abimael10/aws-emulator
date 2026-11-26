@@ -557,7 +557,7 @@ async fn a_session_with_no_fragments_to_serve_is_not_found() {
                     "FragmentSelectorType": "PRODUCER_TIMESTAMP",
                     "TimestampRange": {
                         "StartTimestamp": T0_SECS + 100_000,
-                        "EndTimestamp": T0_SECS + 200_000,
+                        "EndTimestamp": T0_SECS + 150_000,
                     },
                 },
             }),

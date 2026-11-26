@@ -17,7 +17,9 @@
 //! * The clip is assembled from the fragments the archive holds whose selected
 //!   timestamp falls inside the inclusive `ClipTimestampRange`, bounded by the
 //!   documented clip limits ("the first 100 MB or the first 200 fragments from
-//!   the specified start timestamp"). A range the archive holds no fragment in
+//!   the specified start timestamp"). The range's `EndTimestamp` must be later
+//!   than its `StartTimestamp` and within 24 hours of it, or the request is
+//!   `InvalidArgumentException` (400). A range the archive holds no fragment in
 //!   is `ResourceNotFoundException`.
 //! * The clip is an MP4 FILE, whatever container the archive holds: the operation
 //!   "Downloads an MP4 file (clip)", so the selected Matroska fragments are
@@ -149,8 +151,9 @@ use crate::service::archived_container::{
     avcc_sample, read_codec_private, read_fragment, video_track, ContainerFault,
 };
 use crate::state::{
-    date_time_millis, epoch_millis, service_state, ArchivedStream, StoredFragment,
-    StreamLookupError, TimestampOrigin, NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
+    date_time_millis, epoch_millis, range_within_max_span, service_state, ArchivedStream,
+    StoredFragment, StreamLookupError, TimestampOrigin, NO_DATA_RETENTION_MESSAGE,
+    TIMESTAMP_RANGE_ORDER_MESSAGE, TIMESTAMP_RANGE_SPAN_MESSAGE,
 };
 
 /// The content type `GetClip` reports.
@@ -367,6 +370,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // much a refusal as one that ends before it.
             if end_millis <= start_millis {
                 return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
+            }
+            // The other half of that same sentence: the end "must be within 24
+            // hours of the specified StartTimestamp".
+            if !range_within_max_span(start_millis, end_millis) {
+                return Err(invalid(TIMESTAMP_RANGE_SPAN_MESSAGE.to_string()));
             }
 
             let in_range = stream.fragments_in_range(origin, start_millis, end_millis);

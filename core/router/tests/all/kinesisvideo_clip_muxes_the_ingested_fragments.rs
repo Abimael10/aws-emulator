@@ -472,9 +472,19 @@ async fn await_fragments(router: &MultiServiceRouter, stream: &str, count: usize
     panic!("case {stream:?}: expected {count} archived fragment(s), got {last:?}");
 }
 
-/// Clip the whole of `stream` through the announced `GET_CLIP` endpoint.
+/// Clip the archive of `stream` through the announced `GET_CLIP` endpoint.
+///
+/// The window is an hour either side of now, which spans every fragment this
+/// suite ingests (a producer sends them as the test runs) while staying inside
+/// the span `ClipTimestampRange$EndTimestamp` documents: the end "must be within
+/// 24 hours of the specified StartTimestamp".
 async fn get_clip(router: &MultiServiceRouter, stream: &str) -> Answer {
     let authority = data_authority(router, stream, "GET_CLIP").await;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let hour = 3_600_i64;
     call(
         router,
         &authority,
@@ -483,7 +493,10 @@ async fn get_clip(router: &MultiServiceRouter, stream: &str) -> Answer {
             "StreamName": stream,
             "ClipFragmentSelector": {
                 "FragmentSelectorType": "SERVER_TIMESTAMP",
-                "TimestampRange": { "StartTimestamp": 0, "EndTimestamp": 4_000_000_000_i64 },
+                "TimestampRange": {
+                    "StartTimestamp": now - hour,
+                    "EndTimestamp": now + hour,
+                },
             },
         }),
     )

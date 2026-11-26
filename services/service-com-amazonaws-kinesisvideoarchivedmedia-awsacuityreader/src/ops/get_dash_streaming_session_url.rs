@@ -22,7 +22,9 @@
 //!   ON_DEMAND.
 //! * `DASHFragmentSelector` is required for ON_DEMAND and LIVE_REPLAY and must
 //!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
-//!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
+//!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY, and
+//!   an `EndTimestamp` must be later than the `StartTimestamp` and within 24
+//!   hours of it.
 //! * The session is RECORDED in state with the selection it plays and the
 //!   manifest it starts from — by the same selection rule
 //!   `GetHLSStreamingSessionURL` uses — so two calls
