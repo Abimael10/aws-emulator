@@ -1334,12 +1334,20 @@ async fn the_links_a_subscriber_is_handed_perform_the_calls_they_write() {
     );
 }
 
-/// The handler behind the function URL the retry-schedule case subscribes: it records every
-/// request it was sent on the capture queue, exactly as [`SINK_HANDLER`] does, and then answers
-/// from a queue of REFUSALS the case pre-loads — one message per answer of "cannot take this
-/// yet" it owes, each consumed by the request it refuses, so the n+1st request it is sent is
-/// the first it takes. Nothing here reads a clock: how many requests it refuses is state the
+/// The handler behind the function URL the retry-schedule case subscribes: it answers from a
+/// queue of REFUSALS the case pre-loads — one message per answer of "cannot take this yet" it
+/// owes, each consumed by the request it refuses, so the n+1st request it is sent is the first
+/// it takes — and records every request it was sent on the capture queue, exactly as
+/// [`SINK_HANDLER`] does. Nothing here reads a clock: how many requests it refuses is state the
 /// case wrote.
+///
+/// The RECORD is written LAST, after the refusal that request consumed has been taken off the
+/// queue, because the record is what a case sequences on: a case that has collected one
+/// request's record can then empty the refusal queue and load the next phase's refusals onto it
+/// knowing this invocation has already taken what it was owed. Recording FIRST leaves the
+/// consumption still to come, so a straggling invocation of a finished phase can eat a refusal
+/// the next phase loaded — which makes that phase's endpoint take a request a refusal was
+/// waiting for, and nothing in the emulator did it.
 const UNREADY_SINK_HANDLER: &str = r#"
 import base64
 import json
@@ -1354,15 +1362,18 @@ def lambda_handler(event, context):
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode("utf-8")
     sqs = boto3.client("sqs")
-    sqs.send_message(
-        QueueUrl="{queue_url}",
-        MessageBody=json.dumps({"path": path, "headers": headers, "body": body}),
-    )
+    refused = False
     owed = sqs.receive_message(QueueUrl="{refusals_url}", MaxNumberOfMessages=1)
     for message in owed.get("Messages") or []:
         sqs.delete_message(
             QueueUrl="{refusals_url}", ReceiptHandle=message["ReceiptHandle"]
         )
+        refused = True
+    sqs.send_message(
+        QueueUrl="{queue_url}",
+        MessageBody=json.dumps({"path": path, "headers": headers, "body": body}),
+    )
+    if refused:
         return {"statusCode": 503, "body": "the sink cannot take this yet"}
     return {"statusCode": 200, "body": "taken"}
 "#;

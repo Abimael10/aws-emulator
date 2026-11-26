@@ -99,11 +99,17 @@ const PARTIAL_SHARE: f32 = 50.0;
 /// share has clients on both sides of it.
 const CLIENTS: usize = 24;
 
-/// How many INDEPENDENT configuration sessions are opened at the partial share. A session's
-/// place in the rollout is minted with the session, so a handful of them at a half-finished
-/// rollout lands on both sides of it with certainty (the chance of all of them landing on one
-/// side is below one in a hundred).
-const SESSIONS: usize = 8;
+/// How many INDEPENDENT configuration sessions are opened at the partial share.
+///
+/// A session's place in the rollout is minted WITH the session and is independent of every
+/// other session's, so how many of a sweep land on each side of a half-finished rollout is a
+/// draw: the sweep has to be big enough that landing entirely on one side — the only way the
+/// SPLIT assertion below can fail against a service that splits the fleet correctly — is
+/// beyond the reach of chance rather than merely unlikely. At the half share a sweep of `n`
+/// lands one-sided with probability `2 / 2^n`, so a handful of sessions would make this
+/// assertion fail about one run in a hundred and this many makes it about one run in
+/// 10^19 — a bound nothing a test suite runs can reach.
+const SESSIONS: usize = 64;
 
 /// How far two percentages may differ and still be the same share: the member is a float on
 /// the wire, so a reading is compared with slack rather than for bit equality.
