@@ -83,11 +83,24 @@ const COMPOUND_PRIMARY_IDENTIFIERS: &[(&str, &[&str])] = &[
         "AWS::Logs::SubscriptionFilter",
         &["FilterName", "LogGroupName"],
     ),
+    ("AWS::WAFv2::IPSet", WAFV2_ENTITY_IDENTIFIER),
+    ("AWS::WAFv2::RegexPatternSet", WAFV2_ENTITY_IDENTIFIER),
+    ("AWS::WAFv2::RuleGroup", WAFV2_ENTITY_IDENTIFIER),
+    ("AWS::WAFv2::WebACL", WAFV2_ENTITY_IDENTIFIER),
     (
         "AWS::WAFv2::WebACLAssociation",
         &["ResourceArn", "WebACLArn"],
     ),
 ];
+
+/// The pointers each of the four AWS WAF (WAFv2) ENTITY types declares its `primaryIdentifier`
+/// as: the entity's name, the `Id` AWS WAF assigned it and the `Scope` of the namespace it
+/// lives in — the triple every call of that service on one entity is addressed by.
+///
+/// One row for the four, since the four schemas declare the same three pointers in the same
+/// order (a web ACL, a rule group, an IP set and a regex pattern set each live in a scope,
+/// under a name, with an id that service minted).
+const WAFV2_ENTITY_IDENTIFIER: &[&str] = &["Name", "Id", "Scope"];
 
 /// The properties `type_name`'s schema points `primaryIdentifier` at, for a type whose
 /// identifier is made of several of them; `None` for every other type, whose identifier is
@@ -408,6 +421,28 @@ mod tests {
                     "MaxCapacity": 10,
                 }),
                 Ok("table/orders|dynamodb:table:ReadCapacityUnits|dynamodb"),
+            ),
+            (
+                "a web ACL, identified by its name, the id AWS WAF minted and its scope",
+                "AWS::WAFv2::WebACL",
+                ::serde_json::json!({
+                    "Name": "edge-acl",
+                    "Id": "0b1e6a0e-7c44-4a29-9a4e-4d9b0cdc4f21",
+                    "Scope": "REGIONAL",
+                    "DefaultAction": { "Allow": {} },
+                }),
+                Ok("edge-acl|0b1e6a0e-7c44-4a29-9a4e-4d9b0cdc4f21|REGIONAL"),
+            ),
+            (
+                "an IP set, whose schema declares the same three pointers",
+                "AWS::WAFv2::IPSet",
+                ::serde_json::json!({
+                    "Name": "listed",
+                    "Id": "7f2d1a55-3c08-42b7-9f1e-2a6c58b0d913",
+                    "Scope": "CLOUDFRONT",
+                    "IPAddressVersion": "IPV4",
+                }),
+                Ok("listed|7f2d1a55-3c08-42b7-9f1e-2a6c58b0d913|CLOUDFRONT"),
             ),
             (
                 "a model missing one part of the combination",

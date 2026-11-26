@@ -250,6 +250,14 @@ fn visibility(metric: &str) -> Value {
     })
 }
 
+/// The name the one rule of every row's web ACL is declared under, and the metric it reports
+/// under.
+///
+/// A name of its OWN, shared by no entity any row declares: a rule is a member of the web ACL's
+/// configuration — `Rules` is a list of `Rule` structures — rather than a reference to the IP
+/// set its statement names, which it names by that set's ARN.
+const BLOCK_RULE: &str = "blocks-the-listed-addresses";
+
 /// One row: an IP set a stack declares, the addresses the web ACL it deploys must refuse, and
 /// the addresses it must let through.
 struct Row {
@@ -377,7 +385,7 @@ impl Row {
                         "Scope": SCOPE,
                         "DefaultAction": {"Allow": {}},
                         "Rules": [{
-                            "Name": "block-listed",
+                            "Name": BLOCK_RULE,
                             "Priority": 0,
                             "Action": {"Block": {}},
                             "Statement": {
@@ -385,7 +393,7 @@ impl Row {
                                     "Arn": {"Fn::GetAtt": ["Listed", "Arn"]},
                                 },
                             },
-                            "VisibilityConfig": visibility("block-listed"),
+                            "VisibilityConfig": visibility(BLOCK_RULE),
                         }],
                         "VisibilityConfig": visibility(&self.web_acl_name()),
                     },
@@ -400,9 +408,12 @@ impl Row {
             },
             "Outputs": {
                 "WebACLArn": {"Value": {"Fn::GetAtt": ["Acl", "Arn"]}},
-                "WebACLId": {"Value": {"Ref": "Acl"}},
+                // The entity id AWS WAF assigned, read through the attribute that carries it:
+                // `Ref` of one of these resources is the type's COMPOSITE primary identifier
+                // (`<Name>|<Id>|<Scope>`), not the id on its own.
+                "WebACLId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
                 "IPSetArn": {"Value": {"Fn::GetAtt": ["Listed", "Arn"]}},
-                "IPSetId": {"Value": {"Ref": "Listed"}},
+                "IPSetId": {"Value": {"Fn::GetAtt": ["Listed", "Id"]}},
             },
         })
         .to_string()
@@ -616,6 +627,31 @@ async fn an_iac_deployed_web_acl_blocks_the_addresses_its_ip_set_lists() {
         assert_eq!(
             reported, declared,
             "case {case:?}: expected GetIPSet to report the declared addresses, got {read}"
+        );
+
+        // The web ACL AWS WAF holds carries the rule the template declared — under the name
+        // the template gave it, naming the IP set by the ARN that service minted — so what
+        // decides the requests below is the declaration and not a configuration this
+        // deployment altered on the way.
+        let acl = emulator
+            .waf_ok(
+                case,
+                "GetWebACL",
+                json!({"Name": row.web_acl_name(), "Scope": SCOPE, "Id": web_acl_id}),
+            )
+            .await;
+        assert_eq!(
+            acl.pointer("/WebACL/Rules/0/Name").and_then(Value::as_str),
+            Some(BLOCK_RULE),
+            "case {case:?}: expected GetWebACL to report the declared rule {BLOCK_RULE:?}, got \
+             {acl}"
+        );
+        assert_eq!(
+            acl.pointer("/WebACL/Rules/0/Statement/IPSetReferenceStatement/ARN")
+                .and_then(Value::as_str),
+            Some(ip_set_arn.as_str()),
+            "case {case:?}: expected the rule to name the IP set by the minted ARN \
+             {ip_set_arn:?}, got {acl}"
         );
 
         // And the binding the stack made is one AWS WAF holds for that stage.

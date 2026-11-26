@@ -1627,7 +1627,9 @@ pub const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
 /// Amplify UI Builder MINTS. So the row says what a client names one of these resources by
 /// ([`crate::state::primary_identifier`]), while [`composite_identity`] answers `None` for one
 /// — the declaration carries no `Id` to join — and the identity is built from the entity that
-/// service answered instead ([`amplifyuibuilder_identity`]).
+/// service answered instead ([`amplifyuibuilder_identity`]). The four WAFv2 ENTITY types are
+/// the same case ([`WAFV2_ENTITY_IDENTITY`]): each is addressed by its name, the `Id` AWS WAF
+/// assigned and the scope it lives in.
 pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
         WAFV2_WEB_ACL_ASSOCIATION => &["ResourceArn", "WebACLArn"],
@@ -1729,6 +1731,16 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         // ([`crate::state::provisioner::lex_bots::bot_version_identity`]).
         lex_bots::LEX_BOT_VERSION => &["BotId", lex_bots::LEX_BOT_VERSION_ATTRIBUTE],
         lex_bots::LEX_BOT_ALIAS => &["BotAliasId", "BotId"],
+        // The four WAFv2 ENTITY types are in that position too: a web ACL, a rule group, an IP
+        // set and a regex pattern set are each addressed by the triple their own schema declares
+        // as the primary identifier — the name, the `Id` WAF assigned and the scope the entity
+        // lives in ([`WAFV2_ENTITY_IDENTITY`]) — and the middle part is that service's to mint,
+        // so [`composite_identity`] answers `None` for one (the declaration carries no `Id` to
+        // join) and the identity is built from what the create answered instead
+        // ([`wafv2_entity_identity`]).
+        WAFV2_WEB_ACL | WAFV2_RULE_GROUP | WAFV2_IP_SET | WAFV2_REGEX_PATTERN_SET => {
+            WAFV2_ENTITY_IDENTITY
+        }
         _ => &[],
     }
 }

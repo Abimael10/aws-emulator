@@ -2135,6 +2135,34 @@ pub const WAFV2_RULE_GROUP: &str = "AWS::WAFv2::RuleGroup";
 pub const WAFV2_IP_SET: &str = "AWS::WAFv2::IPSet";
 pub const WAFV2_REGEX_PATTERN_SET: &str = "AWS::WAFv2::RegexPatternSet";
 
+/// The properties whose values identify ONE of those four entities, in the order each type's
+/// own schema declares its primary identifier in: the NAME the entity was created under, the
+/// `Id` WAF assigned and the `Scope` of the namespace it lives in — exactly the triple
+/// `GetWebACL`, `DeleteWebACL` and every sibling call take to address one entity
+/// ([`composite_identity_properties`]).
+///
+/// So the physical resource id of one is those three values joined
+/// ([`wafv2_entity_identity`]): a client reads the entity out of the stack and splits the id to
+/// recover the `Id` and the `Scope` it has to pass to that service.
+///
+/// Not a row [`composite_identity`] can compute: the middle part is WAF's to mint, which no
+/// declaration carries, so the identity is built from what the create answered instead
+/// ([`crate::state::provisioner::create_wafv2_entity`]).
+pub(super) const WAFV2_ENTITY_IDENTITY: &[&str] = &["Name", "Id", "Scope"];
+
+/// The physical resource id of one of those four entities: the triple above joined with
+/// [`COMPOSITE_IDENTITY_SEPARATOR`], which is what the type's `Ref` returns and what the stack
+/// reports the resource under.
+pub(crate) fn wafv2_entity_identity(name: &str, id: &str, scope: &str) -> String {
+    composite_identity_triple(name, id, scope)
+}
+
+/// The three parts of such an identity, where `identity` is one
+/// ([`wafv2_entity_identity`]); `None` for a value that is not.
+pub(crate) fn wafv2_entity_identity_parts(identity: &str) -> Option<(&str, &str, &str)> {
+    composite_identity_triple_parts(identity)
+}
+
 /// The type that puts one of those web ACLs IN FRONT OF a protected resource (the same
 /// model, `cloudFormationName: WAFv2`).
 ///

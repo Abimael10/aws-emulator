@@ -305,11 +305,15 @@ fn referenced_arn(logical_id: &str) -> Value {
 }
 
 /// The outputs every row publishes: the ARN the referenced entity carries, and the `Id` AWS
-/// WAF assigned the REFERRING one, which is its `Ref` and what its own `Get…` takes.
+/// WAF assigned the REFERRING one, which is what its own `Get…` takes.
+///
+/// The id is read through `Fn::GetAtt <logical id>.Id`, the attribute that carries it: `Ref` of
+/// one of these resources is the type's COMPOSITE primary identifier (`<Name>|<Id>|<Scope>`)
+/// rather than the id on its own.
 fn outputs(referenced: &str, referrer: &str) -> Value {
     json!({
         "ReferencedArn": {"Value": referenced_arn(referenced)},
-        "ReferrerId": {"Value": {"Ref": referrer}},
+        "ReferrerId": {"Value": {"Fn::GetAtt": [referrer, "Id"]}},
     })
 }
 
@@ -647,9 +651,11 @@ async fn a_deployed_protection_publishes_identifiers_waf_resolves() {
         },
         "Outputs": {
             "WebACLArn": {"Value": referenced_arn("Acl")},
-            "WebACLId": {"Value": {"Ref": "Acl"}},
+            // The entity id each one carries, through the attribute that publishes it: `Ref`
+            // of one of these resources is its composite primary identifier.
+            "WebACLId": {"Value": {"Fn::GetAtt": ["Acl", "Id"]}},
             "IPSetArn": {"Value": referenced_arn("Listed")},
-            "IPSetId": {"Value": {"Ref": "Listed"}},
+            "IPSetId": {"Value": {"Fn::GetAtt": ["Listed", "Id"]}},
         },
     })
     .to_string();

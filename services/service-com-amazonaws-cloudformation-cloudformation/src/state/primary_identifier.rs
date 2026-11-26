@@ -434,10 +434,19 @@ mod tests {
     }
 
     /// A type whose resource IS a binding is identified by the parts of that binding, which
-    /// is more than one property.
+    /// is more than one property — and so is a type whose identifier is composite for another
+    /// reason: each WAFv2 ENTITY type is identified by its name, the id AWS WAF assigned and
+    /// the scope it lives in.
     #[test]
     fn a_binding_is_identified_by_every_part_of_its_composite_identifier() {
-        for resource_type in ["AWS::WAFv2::WebACLAssociation", "AWS::EKS::AccessEntry"] {
+        for resource_type in [
+            "AWS::WAFv2::WebACLAssociation",
+            "AWS::EKS::AccessEntry",
+            "AWS::WAFv2::WebACL",
+            "AWS::WAFv2::RuleGroup",
+            "AWS::WAFv2::IPSet",
+            "AWS::WAFv2::RegexPatternSet",
+        ] {
             let identifiers = properties(resource_type);
             assert_eq!(
                 identifiers,

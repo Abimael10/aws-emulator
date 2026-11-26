@@ -4338,8 +4338,9 @@ pub(super) const WAFV2_REGEX_PATTERN_SET_CALLS: &Wafv2Calls = &Wafv2Calls {
 };
 
 /// Create the WAFv2 entity a declaration of one of the four types describes, and answer the
-/// identity WAF MINTED for it: the `Id` it assigned as the resource's physical id, and the
-/// `ARN` it built as the resource's `Arn`/`<Type>Arn` attributes.
+/// identity WAF MINTED for it: the resource's physical id, which is the TRIPLE that type's
+/// primary identifier is ([`super::template::wafv2_entity_identity`]), and the `ARN` WAF
+/// built as the resource's `Arn`/`<Type>Arn` attributes beside the `Id` it assigned.
 ///
 /// Those identifiers are WAF's to produce, not CloudFormation's to compute: a WAFv2 ARN is
 /// `…:wafv2:<region>:<account>:<global|regional>/<kind>/<name>/<id>`, which carries the
@@ -4348,6 +4349,10 @@ pub(super) const WAFV2_REGEX_PATTERN_SET_CALLS: &Wafv2Calls = &Wafv2Calls {
 /// the create's own answer and reported back here: what the stack publishes for the
 /// resource is what a client can hand straight to `AssociateWebACL`, a logging
 /// configuration or a `Get…`, instead of a value that identifies nothing.
+///
+/// The NAME is the one WAF reports the entity under, falling back to the name the create was
+/// made with; the SCOPE is the namespace the declaration states, which is a required member of
+/// every one of these creates, so a create that answered success carried one.
 pub(super) async fn create_wafv2_entity(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -4370,12 +4375,41 @@ pub(super) async fn create_wafv2_entity(
             message: format!("{} answered no Summary.Id or Summary.ARN", calls.create),
         });
     };
-    Ok(Created {
-        physical_resource_id: Some(id),
-        attributes: super::template::arn_attributes(&resource.resource_type, &arn)
+    let name = summary
+        .get("Name")
+        .and_then(scalar_text)
+        .unwrap_or_else(|| declared_name(resource));
+    let mut attributes: BTreeMap<String, String> =
+        super::template::arn_attributes(&resource.resource_type, &arn)
             .into_iter()
-            .collect(),
+            .collect();
+    // The `Id`/`<Type>Id` the type publishes is the entity id itself — "the unique identifier
+    // for the … You use this to … update and delete" — and not the composite the physical id
+    // is, so it is reported here rather than being read off that id.
+    attributes.extend(super::template::identity_attributes(
+        &resource.resource_type,
+        &id,
+    ));
+    Ok(Created {
+        physical_resource_id: Some(wafv2_identity(resource, &name, &id)),
+        attributes,
     })
+}
+
+/// The physical resource id of one WAFv2 entity: the triple its type's primary identifier is —
+/// the name it was created under, the `Id` WAF assigned and the scope it lives in — joined the
+/// way CloudFormation joins the parts of a composite identifier
+/// ([`super::template::wafv2_entity_identity`]).
+///
+/// A declaration that states no `Scope` names no namespace to report one in, and WAF's own
+/// validation of that required member is what refuses such a create — so the entity id alone
+/// identifies an entity created without one, rather than a triple with a part this module
+/// stood in for.
+fn wafv2_identity(resource: &StoredResource, name: &str, id: &str) -> String {
+    match property(resource, WAFV2_SCOPE) {
+        Some(scope) => super::template::wafv2_entity_identity(name, id, &scope),
+        None => id.to_string(),
+    }
 }
 
 /// Delete the WAFv2 entity a stack created.
@@ -4483,21 +4517,43 @@ pub(super) fn wafv2_create_request(
     Ok(Value::Object(request))
 }
 
-/// The triple WAF addresses one entity by: the NAME the declaration asked for, the SCOPE it
-/// declared and the `Id` that service assigned, which is this resource's physical id.
+/// The triple WAF addresses one entity by: the NAME it was created under, the SCOPE it lives
+/// in and the `Id` that service assigned.
+///
+/// All three are the parts of this resource's physical id, which IS that triple
+/// ([`super::template::wafv2_entity_identity`]), so a call is addressed by the identity WAF
+/// really minted and never by a stand-in the naming rules computed. A record whose id is not
+/// such a triple — an entity created before its scope was known, or one adopted under the
+/// entity id alone — is addressed by the declaration's own name and scope with that id.
 ///
 /// A declaration with no `Scope` carries none, and WAF's own validation of its required
 /// member is what refuses the call — this module never stands a value in for one the
 /// template did not declare.
 pub(super) fn wafv2_entity_key(resource: &StoredResource) -> Value {
+    let identity = resource.physical_resource_id.as_str();
+    let parts = super::template::wafv2_entity_identity_parts(identity);
     let mut key = Map::new();
-    key.insert("Name".to_string(), Value::String(declared_name(resource)));
-    if let Some(scope) = property(resource, WAFV2_SCOPE) {
+    key.insert(
+        "Name".to_string(),
+        Value::String(
+            parts
+                .map(|(name, _, _)| name.to_string())
+                .unwrap_or_else(|| declared_name(resource)),
+        ),
+    );
+    if let Some(scope) = parts
+        .map(|(_, _, scope)| scope.to_string())
+        .or_else(|| property(resource, WAFV2_SCOPE))
+    {
         key.insert(WAFV2_SCOPE.to_string(), Value::String(scope));
     }
     key.insert(
         "Id".to_string(),
-        Value::String(resource.physical_resource_id.clone()),
+        Value::String(
+            parts
+                .map(|(_, id, _)| id.to_string())
+                .unwrap_or_else(|| identity.to_string()),
+        ),
     );
     Value::Object(key)
 }
