@@ -24,9 +24,8 @@
 //! carries, replaces the bot's `Configuration` only when the request carries one — leaving
 //! the stored configuration in place when it does not — re-stamps the bot's last-updated
 //! instant without moving its created instant, and writes to no other bot; an
-//! `AppInstanceBotArn` this service holds no bot for persists nothing and is refused with
-//! the modelled client error, whose table of cases is the same one the describe's refusal
-//! spans.
+//! `AppInstanceBotArn` that resolves to no bot persists nothing and is refused with that
+//! same permanent 403, whose table of cases is the one the describe's refusal spans.
 
 use serde_json::{json, Value};
 
@@ -909,11 +908,10 @@ async fn an_update_replaces_the_stored_pair_and_only_the_configuration_it_is_giv
     );
 }
 
-/// RULE: an `UpdateAppInstanceBot` addressed to an `AppInstanceBotArn` this service holds
-/// no bot for persists nothing and is refused with the modelled client error — the
-/// permanent 403 `ForbiddenException` once the bot's own `AppInstance` has been deleted,
-/// and otherwise the modelled 400 `BadRequestException` carrying the `NotFound` code, this
-/// operation declaring no 404 shape.
+/// RULE: an `UpdateAppInstanceBot` addressed to an `AppInstanceBotArn` this service
+/// resolves no bot for persists nothing and is refused as a request this caller may not
+/// make — the permanent 403 `ForbiddenException` carrying that refusal's one fixed sentence
+/// — whichever way the ARN failed to resolve.
 #[tokio::test]
 async fn updating_an_arn_this_service_holds_no_bot_for_is_refused_and_writes_nothing() {
     let emulator = Emulator::new();
@@ -964,84 +962,60 @@ async fn updating_an_arn_this_service_holds_no_bot_for_is_refused_and_writes_not
     delete_app_instance(&emulator, &doomed_instance).await;
 
     // Rows span every way a well-formed `ChimeArn` can fail to name a bot this service
-    // holds, split by which refusal class the ARN falls in: one at or under a DELETED
-    // `AppInstance` is a request the caller may no longer make, every other is reported
-    // as a resource that was not found.
-    let rows: Vec<(&str, String, u16, &str)> = vec![
+    // holds; each is a request the caller may not make, so each earns the same refusal.
+    let rows: Vec<(&str, String)> = vec![
         (
             "a bot never minted under a live AppInstance",
             format!("{instance}/bot/never-minted"),
-            400,
-            "NotFound",
         ),
         (
             "a bot under an AppInstance that never existed",
             format!("{instance}-absent/bot/orphan"),
-            400,
-            "NotFound",
         ),
-        ("a bot that was deleted", deleted.clone(), 400, "NotFound"),
+        ("a bot that was deleted", deleted.clone()),
         (
             "a live AppInstanceUser's ARN in the bot space",
             user.clone(),
-            400,
-            "NotFound",
         ),
-        (
-            "the live parent AppInstance's own ARN",
-            instance.clone(),
-            400,
-            "NotFound",
-        ),
+        ("the live parent AppInstance's own ARN", instance.clone()),
         (
             "a live bot's ARN in another account",
             in_another_account(&kept),
-            400,
-            "NotFound",
         ),
         (
             "a live bot's ARN in another region",
             in_another_region(&kept),
-            400,
-            "NotFound",
         ),
         (
             "a bot whose parent AppInstance was deleted",
             cascaded.clone(),
-            403,
-            "Forbidden",
         ),
         (
             "the deleted AppInstance's own ARN",
             doomed_instance.clone(),
-            403,
-            "Forbidden",
         ),
     ];
 
-    for (label, arn, expected_status, expected_code) in &rows {
+    for (label, arn) in &rows {
         let (status, body) = update_bot(&emulator, arn, "written", "written", None).await;
         assert_eq!(
-            status, *expected_status,
-            "case {label:?}: expected {arn:?} to be refused with {expected_status}, got \
-             {status} {body:?}"
+            status, 403,
+            "case {label:?}: expected {arn:?} to be refused with 403, got {status} {body:?}"
         );
         assert_eq!(
             body["Code"].as_str(),
-            Some(*expected_code),
-            "case {label:?}: expected the {expected_code:?} code, got {body:?}"
+            Some("Forbidden"),
+            "case {label:?}: expected the Forbidden code, got {body:?}"
         );
         assert!(
             body.get("AppInstanceBotArn").is_none(),
             "case {label:?}: expected the refusal to report no ARN, got {body:?}"
         );
-        if *expected_status == 403 {
-            assert_eq!(
-                body["Message"].as_str(),
-                Some(FORBIDDEN_MESSAGE),
-                "case {label:?}: expected the forbidden-request sentence, got {body:?}"
-            );
-        }
+        assert_eq!(
+            body["Message"].as_str(),
+            Some(FORBIDDEN_MESSAGE),
+            "case {label:?}: expected the forbidden-request sentence, got {body:?}"
+        );
     }
 
     // None of the refused writes landed anywhere: the one live bot is byte for byte what
@@ -1170,6 +1144,150 @@ async fn the_refusal_tracks_whether_the_bot_is_in_the_system() {
             );
         }
     }
+}
+
+/// Which operations are addressed BY an `AppInstanceBotArn`: the ones whose refusal of an
+/// ARN that resolves to no bot the rule below is about
+/// (`smithy_query(query="digest")` on this crate's model lists the three paths under
+/// `/app-instance-bots/{AppInstanceBotArn}`).
+const BOT_ADDRESSED_OPERATIONS: [(&str, &str); 3] = [
+    ("DescribeAppInstanceBot", "GET"),
+    ("UpdateAppInstanceBot", "PUT"),
+    ("DeleteAppInstanceBot", "DELETE"),
+];
+
+/// RULE: EVERY operation addressed by an `AppInstanceBotArn` refuses an ARN this service
+/// resolves no bot for the same way — the permanent 403 `ForbiddenException`, `Code`
+/// `Forbidden`, carrying this service's one fixed sentence for a request the caller may not
+/// make — whichever way that ARN failed to resolve; the control is the live bot, which every
+/// one of those operations serves.
+#[tokio::test]
+async fn every_operation_addressed_by_a_bot_arn_refuses_an_unresolvable_one_alike() {
+    let emulator = Emulator::new();
+    let instance = emulator.app_instance("bot-arn-class", "tok-arn-class").await;
+    let user = emulator
+        .user(&instance, "arn-class-user", "tok-arn-class-user")
+        .await;
+
+    let deleted = create_bot(
+        &emulator,
+        &instance,
+        "tok-arn-class-deleted",
+        Some("deleted"),
+        None,
+        &responds_to_configuration("BOTIDCLASA", "en_US"),
+    )
+    .await;
+    delete_bot(&emulator, &deleted).await;
+
+    let doomed_instance = emulator
+        .app_instance("arn-class-doomed", "tok-arn-class-doomed")
+        .await;
+    let cascaded = create_bot(
+        &emulator,
+        &doomed_instance,
+        "tok-arn-class-cascaded",
+        Some("cascaded"),
+        None,
+        &responds_to_configuration("BOTIDCLASB", "en_US"),
+    )
+    .await;
+    delete_app_instance(&emulator, &doomed_instance).await;
+
+    // The ways a well-formed `ChimeArn` fails to resolve to a bot: never minted, minted and
+    // deleted, cascaded away with its parent `AppInstance`, another account's, another
+    // region's, and a live ARN of another resource kind.
+    let unresolvable: Vec<(&str, String)> = vec![
+        (
+            "a bot never minted under a live AppInstance",
+            format!("{instance}/bot/never-minted"),
+        ),
+        (
+            "a bot under an AppInstance that never existed",
+            format!("{instance}-absent/bot/orphan"),
+        ),
+        ("a bot that was deleted", deleted.clone()),
+        (
+            "a bot whose parent AppInstance was deleted",
+            cascaded.clone(),
+        ),
+        (
+            "a deleted bot's ARN in another account",
+            in_another_account(&deleted),
+        ),
+        (
+            "a deleted bot's ARN in another region",
+            in_another_region(&deleted),
+        ),
+        ("a live AppInstanceUser's ARN", user.clone()),
+        ("the live parent AppInstance's own ARN", instance.clone()),
+    ];
+
+    for (operation, method) in BOT_ADDRESSED_OPERATIONS {
+        for (label, arn) in &unresolvable {
+            let case = format!("{operation} on {label}");
+            // `UpdateAppInstanceBot` is the one of the three with a body, and its
+            // `Name`/`Metadata` pair is `@required`.
+            let body = (operation == "UpdateAppInstanceBot")
+                .then(|| json!({ "Name": "written", "Metadata": "written" }));
+            let (status, answered) = emulator
+                .call(
+                    method,
+                    &format!("/app-instance-bots/{}", uri_encode(arn)),
+                    body,
+                )
+                .await;
+            assert_eq!(
+                (
+                    status,
+                    answered["Code"].as_str(),
+                    answered["Message"].as_str()
+                ),
+                (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+                "case {case:?}: expected the permanent refusal, got {status} {answered:?}"
+            );
+        }
+    }
+
+    // The control: a bot that IS there is served by every one of those operations, so the
+    // refusals above are about the ARN resolving to nothing and not a blanket answer.
+    let live = create_bot(
+        &emulator,
+        &instance,
+        "tok-arn-class-live",
+        Some("live"),
+        Some("still here"),
+        &responds_to_configuration("BOTIDCLASC", "en_US"),
+    )
+    .await;
+    let (status, described) = describe_bot(&emulator, &live).await;
+    assert_eq!(
+        status, 200,
+        "expected the live bot to be described, got {status} {described:?}"
+    );
+    let (status, updated) = update_bot(&emulator, &live, "written", "written", None).await;
+    assert_eq!(
+        status, 200,
+        "expected the live bot to take the update, got {status} {updated:?}"
+    );
+    let (status, removed) = emulator
+        .call(
+            "DELETE",
+            &format!("/app-instance-bots/{}", uri_encode(&live)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 204,
+        "expected the live bot to be deleted, got {status} {removed:?}"
+    );
+    // And once it is gone its own ARN earns the refusal the rule states.
+    let (status, after) = describe_bot(&emulator, &live).await;
+    assert_eq!(
+        (status, after["Code"].as_str()),
+        (403, Some("Forbidden")),
+        "expected the deleted bot's own ARN to earn the refusal, got {status} {after:?}"
+    );
 }
 
 /// RULE: the describe's refusal of an unresolvable `AppInstanceBotArn` is PER-RESOURCE and

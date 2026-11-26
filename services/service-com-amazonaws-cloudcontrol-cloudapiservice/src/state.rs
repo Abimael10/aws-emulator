@@ -464,8 +464,7 @@ impl From<NativeRefusal> for EffectFailure {
             NativeRefusal::AlreadyExists => Self::ResourceExists,
             NativeRefusal::AtCapacity(detail)
             | NativeRefusal::Invalid(detail)
-            | NativeRefusal::Rejected(detail)
-            | NativeRefusal::Denied(detail) => Self::Owning {
+            | NativeRefusal::Rejected(detail) => Self::Owning {
                 code: refusal.handler_error_code(),
                 detail: detail.clone(),
             },
@@ -480,10 +479,9 @@ impl EffectFailure {
     /// own is reported in the handler's own sentence about the CALL it was making
     /// ([`native::downstream_failure`]) rather than in the downstream service's words: the
     /// handler does not relay that service's diagnosis, so neither does the request's
-    /// terminal event. Every other refusal is the handler's own verdict and keeps its own
-    /// wording ([`Self::from`]) — an AUTHORIZATION denial among them, which is a decided
-    /// verdict about the call rather than an error that mapped to nothing, so the sentence
-    /// the refusing service states is what the terminal event carries.
+    /// terminal event — and a call that service refused for want of a grant is one of those
+    /// errors, so it carries that same sentence. Every other refusal is the handler's own
+    /// verdict and keeps its own wording ([`Self::from`]).
     fn of(
         refusal: NativeRefusal,
         provider: &dyn native::NativeResourceProvider,
@@ -643,7 +641,9 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
         if let Some(provider) = native.provider(&record.type_name) {
             // The work is carried out with the permissions of the role the request named, so
             // a call that role may not make is refused HERE — before the provider writes
-            // anything, which is what leaves the owning service's resource as it was.
+            // anything, which is what leaves the owning service's resource as it was. It is
+            // the OWNING service's refusal of a call the handler made, so it is reported the
+            // way that service's other errors on that call are ([`EffectFailure::of`]).
             if let Some(denied) = native.roles().refusal(
                 record.role_arn.as_deref(),
                 provider,
@@ -651,7 +651,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 &owning_api::region_of(&effect),
                 &identifier,
             ) {
-                return Err(EffectFailure::from(denied));
+                return Err(EffectFailure::of(denied, provider, &record.operation));
             }
             return match effect {
                 ResourceEffect::Create {

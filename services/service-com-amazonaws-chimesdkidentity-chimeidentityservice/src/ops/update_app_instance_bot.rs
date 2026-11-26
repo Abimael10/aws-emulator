@@ -175,34 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which refusal an unresolvable ARN earns is decided from the store BEFORE the
         // record is taken for writing, so the decision is one read rather than a second
         // borrow inside the refusal.
-        let unresolved = state.unresolved_arn(&input.app_instance_bot_arn);
         let Some(record) = state.bot_mut(&input.app_instance_bot_arn) else {
-            return Err(match unresolved {
-                // The AppInstance this bot hung off has been deleted, taking the bot with
-                // it, so nothing is left to write: the answer is the modelled permanent
-                // refusal, as it is for every other write addressed to a dead instance.
-                crate::state::UnresolvedArn::DeletedAppInstance => {
-                    UpdateAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
-                        code: Some("Forbidden".to_string()),
-                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
-                    })
-                    .into()
-                }
-                // This operation models no 404 shape, so an ARN that never named a bot is
-                // refused with the modelled `BadRequestException` carrying the `NotFound`
-                // error code — the same refusal the sibling `UpdateAppInstanceUser`, whose
-                // modelled error set is identical, states for an absent user.
-                crate::state::UnresolvedArn::NeverExisted => {
-                    UpdateAppInstanceBotErrorModeled::BadRequestException(BadRequestException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!(
-                            "AppInstanceBot {} does not exist",
-                            input.app_instance_bot_arn
-                        )),
-                    })
-                    .into()
-                }
-            });
+            // An `AppInstanceBotArn` that resolves to NO bot of this service is refused as
+            // a request this caller may not make, exactly as the read of one is
+            // (`crate::ops::describe_app_instance_bot`): a bot is addressed by an ARN
+            // alone, so an ARN no bot answers to names nothing the caller's access to could
+            // be decided on, whether the bot's `AppInstance` was deleted under it or
+            // nothing here ever named it.
+            return Err(
+                UpdateAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                })
+                .into(),
+            );
         };
 
         // `Name` and `Metadata` are both `required`, so an update REPLACES the stored

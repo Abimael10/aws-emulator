@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH `HandlerErrorCode` a resource operation reports an AUTHORIZATION denial under.
+//! WHICH `HandlerErrorCode` a resource operation reports a call the role it names may not
+//! make under.
 //!
 //! The rule every case here holds the service to: **when the work a resource operation owes
 //! needs a call the policies in force on the role the request named do not allow, the request
-//! terminates `FAILED` with `ErrorCode` `AccessDenied` — the member the model's own
-//! `HandlerErrorCode` enum declares for a call that was not authorized
-//! (`smithy_query(query="shape",shape="HandlerErrorCode")`), which is a value of that enum
-//! distinct from the `GeneralServiceException` reserved for "the downstream service generated
-//! an error that doesn't map to any other handler error code" — carrying the sentence the
-//! owning service refuses such a call with, and the resource is left exactly as it was.**
+//! terminates `FAILED` and the resource is left exactly as it was. The handler made that call
+//! with the role's credentials and read the owning service's refusal of it, so the failure is
+//! an error that service generated which the handler maps to no verdict of its own: the
+//! `ErrorCode` is `GeneralServiceException`, the member the model's own `HandlerErrorCode`
+//! enum declares for "the downstream service generated an error that doesn't map to any other
+//! handler error code" (`smithy_query(query="shape",shape="HandlerErrorCode")`), and the
+//! `StatusMessage` is the handler's own sentence about the CALL it was making — the same
+//! sentence every other failure of that call carries, because the handler relays nothing the
+//! downstream service said.**
 //!
-//! Which member a failed request carries is what a client classifies the failure by: an
-//! authorization denial is permanent until the policies change, so it must not be reported as
-//! an unclassifiable downstream fault that a retry layer may treat as transient.
+//! So the answer does not change with WHICH of IAM's rules withheld the grant: a client
+//! reading a failed request learns which downstream call did not happen, and nothing of the
+//! policy evaluation behind it.
 //!
 //! The rows differ along what the rule generalises over: which owning service the refused
 //! call would have been made on (`AWS::SQS::Queue`, `AWS::SSM::Parameter`,
@@ -30,77 +34,33 @@
 
 use serde_json::{json, Value};
 
-use ::service_common::iam_authorization as iam;
-
 use super::emulator::{text, Emulator, SIGNING_REGION, STATUS_FAILED, STATUS_SUCCESS};
 use super::role_arn_permissions::{
     allow_but_deny, bare_role, create_request, iam_ok, one_statement, role_with, terminal_event,
 };
 use super::sqs_queue_read_through::{queue_url, QUEUE};
 
-/// The member of the model's `HandlerErrorCode` enum for a call the resource type's handler
-/// was not authorized to make (`smithy_query(query="shape",shape="HandlerErrorCode")`).
-pub(crate) const ACCESS_DENIED: &str = "AccessDenied";
+/// The member of the model's `HandlerErrorCode` enum for an error the owning service raised
+/// that the resource type's handler maps to no verdict of its own, which is what a call that
+/// service refused for want of a grant is
+/// (`smithy_query(query="shape",shape="HandlerErrorCode")`).
+pub(crate) const DENIED_CALL_CODE: &str = "GeneralServiceException";
 
-/// The name of the SESSION the calls a resource operation makes are taken under.
-///
-/// A role is never acted AS: a service handed one assumes it and calls as a session of it, so
-/// the identity an authorization refusal of such a call is about is
-/// `arn:<partition>:sts::<account>:assumed-role/<role name>/<this name>`.
-const SESSION_NAME: &str = "AWSCloudControlAPI";
-
-/// Which of IAM's rules withheld the grant, which the refusal names in its reason clause.
-#[derive(Clone, Copy)]
-pub(crate) enum Withheld {
-    /// An explicit `Deny` of the call in one of the role's own documents.
-    ExplicitDeny,
-    /// No document of the role states anything that allows the call — IAM's default deny.
-    NoStatement,
-    /// The role's own documents allow the call and the permissions boundary in force on it
-    /// does not.
-    NoBoundary,
-}
-
-impl Withheld {
-    /// The reason clause of the refusal, as the workspace's one authorization wording states
-    /// each of IAM's rules.
-    fn clause(self, action: &str) -> String {
-        let action = iam::reported_action(action);
-        match self {
-            Self::ExplicitDeny => iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
-            Self::NoStatement => iam::no_identity_policy_allows(&action),
-            Self::NoBoundary => iam::no_permissions_boundary_allows(&action),
-        }
-    }
-}
-
-/// The sentence the owning service refuses an unauthorized call with: the session the call
-/// was made as, the action as that service words an action in its own refusals, the resource
-/// it was taken on, and which of IAM's rules withheld the grant.
-pub(crate) fn denial_sentence(
-    role_arn: &str,
-    action: &str,
-    resource: &str,
-    withheld: Withheld,
-) -> String {
-    iam::not_authorized_by_identity_policy(
-        &::service_common::iam_role::assumed_role_session_arn(role_arn, SESSION_NAME),
-        &iam::reported_action(action),
-        resource,
-        &withheld.clause(action),
-    )
+/// The sentence such a failure carries: the handler's own statement about the CALL it was
+/// making, which is the owning service's API operation named without the namespace an IAM
+/// action carries it under. The handler does not relay what the downstream service said, so
+/// the sentence is the same for every reason that service refused the call.
+pub(crate) fn downstream_sentence(action: &str) -> String {
+    let operation = action
+        .rsplit_once(':')
+        .map_or(action, |(_namespace, operation)| operation);
+    format!("Error occurred during operation '{operation}'.")
 }
 
 /// Hold a terminal `ProgressEvent` to the verdict the rule states: `FAILED`, the handler
-/// error code for a call that was not authorized, and the owning service's own refusal of it.
-pub(crate) fn assert_denied(
-    case: &str,
-    event: &Value,
-    role_arn: &str,
-    action: &str,
-    resource: &str,
-    withheld: Withheld,
-) {
+/// error code for an error the owning service raised, and the handler's sentence about the
+/// call it was making — `action`, as the owning service's API names it.
+pub(crate) fn assert_denied(case: &str, event: &Value, action: &str) {
     assert_eq!(
         text(event, "OperationStatus"),
         STATUS_FAILED,
@@ -108,10 +68,10 @@ pub(crate) fn assert_denied(
     );
     assert_eq!(
         text(event, "ErrorCode"),
-        ACCESS_DENIED,
-        "case {case:?}: expected the {ACCESS_DENIED} handler error code, got {event:?}"
+        DENIED_CALL_CODE,
+        "case {case:?}: expected the {DENIED_CALL_CODE} handler error code, got {event:?}"
     );
-    let expected = denial_sentence(role_arn, action, resource, withheld);
+    let expected = downstream_sentence(action);
     let reported = text(event, "StatusMessage");
     assert_eq!(
         reported, expected,
@@ -169,22 +129,6 @@ impl Owning {
         match self {
             Self::Sqs => queue_url(name),
             Self::Ssm | Self::Logs => name.to_string(),
-        }
-    }
-
-    /// The ARN of `name`, as the OWNING service names it — the resource an IAM statement
-    /// about it names, and so the resource the refusal is about.
-    fn resource_arn(self, name: &str) -> String {
-        match self {
-            Self::Sqs => super::sqs_queue_read_through::queue_arn(name),
-            Self::Ssm => {
-                service_com_amazonaws_ssm_amazonssm::state::parameter_arn(SIGNING_REGION, name)
-            }
-            Self::Logs => service_com_amazonaws_cloudwatchlogs_logs_20140328::state::log_group_arn(
-                SIGNING_REGION,
-                name,
-                true,
-            ),
         }
     }
 
@@ -263,8 +207,6 @@ struct Denial {
     operation: &'static str,
     /// The owning service's API action the handler would have been refused on.
     action: &'static str,
-    /// Which of IAM's rules withheld the grant.
-    withheld: Withheld,
     /// What the owning service holds afterwards.
     after: After,
 }
@@ -298,9 +240,10 @@ fn patch_of(owning: Owning) -> Value {
 }
 
 /// A request whose work needs a call the role it names may not make FAILS with the handler
-/// error code for an authorization denial, and the owning service is left as it was.
+/// error code for an error the owning service raised and that handler's sentence about the
+/// call, and that service is left as it was.
 #[tokio::test]
-async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
+async fn a_call_the_role_may_not_make_is_reported_as_a_downstream_failure() {
     let rows = [
         Denial {
             case: "a queue create by a role carrying no policy at all",
@@ -308,7 +251,6 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             policy: None,
             operation: "CreateResource",
             action: "sqs:CreateQueue",
-            withheld: Withheld::NoStatement,
             after: After::Absent,
         },
         Denial {
@@ -317,7 +259,6 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             policy: Some(allow_but_deny(json!("sqs:*"), json!("sqs:CreateQueue"))),
             operation: "CreateResource",
             action: "sqs:CreateQueue",
-            withheld: Withheld::ExplicitDeny,
             after: After::Absent,
         },
         Denial {
@@ -326,7 +267,6 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             policy: Some(one_statement("Allow", json!("sqs:CreateQueue"), json!("*"))),
             operation: "UpdateResource",
             action: "sqs:SetQueueAttributes",
-            withheld: Withheld::NoStatement,
             after: After::Present,
         },
         Denial {
@@ -335,7 +275,6 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             policy: Some(allow_but_deny(json!("sqs:*"), json!("sqs:DeleteQueue"))),
             operation: "DeleteResource",
             action: "sqs:DeleteQueue",
-            withheld: Withheld::ExplicitDeny,
             after: After::Present,
         },
         Denial {
@@ -351,7 +290,6 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             )),
             operation: "CreateResource",
             action: "ssm:PutParameter",
-            withheld: Withheld::NoStatement,
             after: After::Absent,
         },
         Denial {
@@ -360,7 +298,6 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             policy: Some(one_statement("Allow", json!("s3:*"), json!("*"))),
             operation: "CreateResource",
             action: "logs:CreateLogGroup",
-            withheld: Withheld::NoStatement,
             after: After::Absent,
         },
     ];
@@ -387,14 +324,7 @@ async fn a_call_the_role_may_not_make_is_reported_as_an_authorization_denial() {
             request_of(row, &name, &role),
         )
         .await;
-        assert_denied(
-            case,
-            &event,
-            &role,
-            row.action,
-            &row.owning.resource_arn(&name),
-            row.withheld,
-        );
+        assert_denied(case, &event, row.action);
 
         let held = row.owning.holds(&emulator, &name).await;
         assert_eq!(
@@ -457,14 +387,7 @@ async fn a_denied_patch_changes_nothing_in_the_owning_service() {
         }),
     )
     .await;
-    assert_denied(
-        case,
-        &event,
-        &role,
-        "sqs:SetQueueAttributes",
-        &super::sqs_queue_read_through::queue_arn(name),
-        Withheld::ExplicitDeny,
-    );
+    assert_denied(case, &event, "sqs:SetQueueAttributes");
     let after = native_attribute(&emulator, name, "VisibilityTimeout").await;
     assert_eq!(
         after, before,
@@ -485,14 +408,7 @@ async fn the_same_request_succeeds_once_the_role_is_granted_the_call() {
 
     let case = "the create before the grant";
     let denied = terminal_event(&emulator, case, "CreateResource", request.clone()).await;
-    assert_denied(
-        case,
-        &denied,
-        &role,
-        "sqs:CreateQueue",
-        &super::sqs_queue_read_through::queue_arn(name),
-        Withheld::NoStatement,
-    );
+    assert_denied(case, &denied, "sqs:CreateQueue");
     assert!(
         !Owning::Sqs.holds(&emulator, name).await,
         "case {case:?}: the refused create must write nothing, and must not fall back to the \

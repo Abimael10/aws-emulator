@@ -873,8 +873,9 @@ async fn a_repeated_client_request_token_mints_nothing_new() {
 }
 
 /// RULE: deleting an `AppInstanceBot` removes it from its parent's listing and leaves
-/// every other bot in place, while a bot ARN the service does not hold — including one
-/// already deleted — is refused with the modelled `NotFound` code rather than answered.
+/// every other bot in place, while a bot ARN the service resolves no bot for — including
+/// one already deleted — is refused as a request the caller may not make rather than
+/// answered.
 #[tokio::test]
 async fn deleting_a_bot_removes_it_from_the_listing() {
     // Rows differ in WHICH bot of a collection is deleted (the first in key order, one
@@ -926,26 +927,27 @@ async fn deleting_a_bot_removes_it_from_the_listing() {
         // The second delete of the same ARN has nothing to delete.
         let (status, body) = delete_bot(&emulator, &doomed).await;
         assert_eq!(
-            status, 400,
+            status, 403,
             "case {label:?}: expected a repeated delete to be refused, got {status} {body:?}"
         );
         assert_eq!(
             body["Code"].as_str(),
-            Some("NotFound"),
-            "case {label:?}: expected the repeated delete to carry the NotFound code, got {body:?}"
+            Some("Forbidden"),
+            "case {label:?}: expected the repeated delete to carry the Forbidden code, got \
+             {body:?}"
         );
     }
 
     // An ARN under the right parent that was never minted.
     let (status, body) = delete_bot(&emulator, &format!("{instance}/bot/never-minted")).await;
     assert_eq!(
-        status, 400,
+        status, 403,
         "expected deleting a bot ARN the service never minted to be refused, got {status} {body:?}"
     );
     assert_eq!(
         body["Code"].as_str(),
-        Some("NotFound"),
-        "expected the unknown-bot refusal to carry the NotFound code, got {body:?}"
+        Some("Forbidden"),
+        "expected the unknown-bot refusal to carry the Forbidden code, got {body:?}"
     );
 
     // A deleted bot's idempotency token no longer replays it: the token that minted the

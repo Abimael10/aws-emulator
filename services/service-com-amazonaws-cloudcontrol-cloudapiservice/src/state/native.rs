@@ -76,11 +76,12 @@ use ::std::time::{SystemTime, UNIX_EPOCH};
 /// service holds to a charset or keeps for itself, a value set only that service publishes,
 /// the resource's own state — is that service's error ([`Self::Rejected`]).
 ///
-/// A catch-all code is for a verdict that falls under no OTHER member of that enum, so a
-/// refusal the enum does name a member for carries that member instead: an AUTHORIZATION
-/// denial is `AccessDenied` ([`Self::Denied`]), never the code for a downstream error
-/// nothing could classify — the two are distinct members, and which one a failed request
-/// carries is what tells a client whether the failure is permanent until a policy changes.
+/// A call the OWNING service would have refused for want of a grant is one of those
+/// downstream errors too ([`Self::Rejected`]): the handler made that call with the role's
+/// credentials, that service answered its own authorization refusal, and the handler maps
+/// that answer to no verdict of its own — so it is reported exactly as that service's other
+/// errors are, under `GeneralServiceException` and in the handler's own sentence about the
+/// call it was making.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NativeRefusal {
     /// The owning service holds no such resource.
@@ -101,17 +102,10 @@ pub enum NativeRefusal {
     /// other verdict: a model whose every value is within what the type's schema publishes
     /// for its property, whose call that service's own API would still refuse — a name it
     /// holds to a charset of its own or keeps for itself, a value set only it publishes, a
-    /// combination of properties it will not take, the resource's own state. Carries that
-    /// service's own diagnostic.
+    /// combination of properties it will not take, the resource's own state — and a call it
+    /// would refuse for want of a grant ([`role_permissions::RolePermissions::refusal`]).
+    /// Carries that service's own diagnostic.
     Rejected(String),
-    /// The call the handler had to make was not AUTHORIZED: the policies in force on the
-    /// identity the handler ran as do not allow it, so the owning service would have refused
-    /// that very call with an authorization error. Carries that refusal's sentence.
-    ///
-    /// This is a decided verdict rather than an error nothing could place
-    /// ([`Self::Rejected`]): a client reading it knows the request cannot succeed until the
-    /// policies change, so retrying it unchanged is pointless.
-    Denied(String),
 }
 
 impl NativeRefusal {
@@ -124,7 +118,6 @@ impl NativeRefusal {
             Self::AtCapacity(_) => HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED,
             Self::Invalid(_) => HANDLER_ERROR_INVALID_REQUEST,
             Self::Rejected(_) => HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION,
-            Self::Denied(_) => HANDLER_ERROR_ACCESS_DENIED,
         }
     }
 }
@@ -138,14 +131,11 @@ pub const HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceeded";
 /// ([`HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION`]).
 pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 
-/// The `HandlerErrorCode` for a call the identity the type's handler ran as was not allowed
-/// to make: the member the model's own enum declares for an authorization denial, which is
-/// what a permission-denied downstream call is reported under.
-pub const HANDLER_ERROR_ACCESS_DENIED: &str = "AccessDenied";
-
 /// The `HandlerErrorCode` for an error the OWNING SERVICE raised that the resource type's
 /// handler maps to none of the others — which is what this code is for: the downstream
-/// service generated an error, and the handler has no verdict of its own for it.
+/// service generated an error, and the handler has no verdict of its own for it. A call that
+/// service refused for want of a grant is such an error: the handler made the call and read
+/// that service's refusal of it ([`NativeRefusal::Rejected`]).
 pub const HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION: &str = "GeneralServiceException";
 
 /// EVERY property each resource type's registry schema declares, by `TypeName`.
@@ -716,7 +706,6 @@ mod tests {
             NativeRefusal::AtCapacity("at the quota".to_string()),
             NativeRefusal::Invalid("not a property of the type".to_string()),
             NativeRefusal::Rejected("the resource is not in a state for this".to_string()),
-            NativeRefusal::Denied("no policy allows the call".to_string()),
         ] {
             let code = refusal.handler_error_code();
             assert!(

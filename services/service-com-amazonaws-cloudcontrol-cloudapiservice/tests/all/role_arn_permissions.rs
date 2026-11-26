@@ -8,8 +8,9 @@
 //! operation. The role specified must have the permissions required for this operation"
 //! (`CreateResource$RoleArn`) — so when the identity-based policies in force on that role do
 //! not allow the owning service's call the type's handler has to make, the request reaches a
-//! terminal `FAILED` `ProgressEvent` carrying the handler error code for a call that was not
-//! authorized, and the owning service's resource is left exactly as it was.**
+//! terminal `FAILED` `ProgressEvent` carrying the handler error code for an error that
+//! service raised and the handler's sentence about the call it was making, and the owning
+//! service's resource is left exactly as it was.**
 //! A `SUCCESS` means the call happened, which is why a request the role could not have made
 //! must not report one.
 //!
@@ -26,7 +27,7 @@
 
 use serde_json::{json, Value};
 
-use super::denied_call_classification::{assert_denied, Withheld};
+use super::denied_call_classification::assert_denied;
 use super::emulator::{element, progress, text, Emulator, STATUS_SUCCESS};
 
 /// The type whose resources live in the Systems Manager service's own store.
@@ -171,15 +172,14 @@ async fn native_parameter(emulator: &Emulator, case: &str, name: &str) -> Option
 }
 
 /// One row of the denial table: the case, the policy in force on the role, the operation the
-/// request is, whether the parameter is already there, the OWNING service's API action the
-/// handler would have been refused on, and which of IAM's rules withheld the grant.
+/// request is, whether the parameter is already there, and the OWNING service's API action
+/// the handler would have been refused on.
 struct Denial {
     case: &'static str,
     policy: Value,
     operation: &'static str,
     existing: bool,
     action: &'static str,
-    withheld: Withheld,
 }
 
 /// A request naming a role whose policies do not allow the call the handler has to make
@@ -197,7 +197,6 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             operation: "CreateResource",
             existing: false,
             action: "ssm:PutParameter",
-            withheld: Withheld::ExplicitDeny,
         },
         Denial {
             case: "a create no statement of the role allows",
@@ -205,7 +204,6 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             operation: "CreateResource",
             existing: false,
             action: "ssm:PutParameter",
-            withheld: Withheld::NoStatement,
         },
         Denial {
             case: "a create the role is granted the write on another resource only",
@@ -220,7 +218,6 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             operation: "CreateResource",
             existing: false,
             action: "ssm:PutParameter",
-            withheld: Withheld::NoStatement,
         },
         Denial {
             case: "a patch no statement of the role allows",
@@ -228,7 +225,6 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             operation: "UpdateResource",
             existing: true,
             action: "ssm:PutParameter",
-            withheld: Withheld::NoStatement,
         },
         Denial {
             case: "a delete the role is explicitly denied the removal by",
@@ -236,7 +232,6 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             operation: "DeleteResource",
             existing: true,
             action: "ssm:DeleteParameter",
-            withheld: Withheld::ExplicitDeny,
         },
     ];
 
@@ -276,17 +271,7 @@ async fn a_call_the_requests_role_may_not_make_fails_it_and_writes_nothing() {
             }),
         };
         let event = terminal_event(&emulator, case, row.operation, request).await;
-        assert_denied(
-            case,
-            &event,
-            &role,
-            row.action,
-            &service_com_amazonaws_ssm_amazonssm::state::parameter_arn(
-                super::emulator::SIGNING_REGION,
-                &name,
-            ),
-            row.withheld,
-        );
+        assert_denied(case, &event, row.action);
 
         // And the owning service holds exactly what it held before: nothing for a create
         // that was refused, and the untouched first version for the other two.
@@ -450,17 +435,7 @@ async fn the_boundary_in_force_on_the_role_caps_what_it_may_do() {
         ),
     )
     .await;
-    assert_denied(
-        case,
-        &event,
-        &role,
-        "ssm:PutParameter",
-        &service_com_amazonaws_ssm_amazonssm::state::parameter_arn(
-            super::emulator::SIGNING_REGION,
-            name,
-        ),
-        Withheld::NoBoundary,
-    );
+    assert_denied(case, &event, "ssm:PutParameter");
     assert!(
         native_parameter(&emulator, case, name).await.is_none(),
         "case {case:?}: the refused create must write nothing"
@@ -556,18 +531,7 @@ async fn the_rule_holds_for_every_owning_service_the_calls_are_made_on() {
                 "case {name:?}: the owning service must hold the group, got {held:?}"
             );
         } else {
-            assert_denied(
-                name,
-                &event,
-                &role,
-                "logs:CreateLogGroup",
-                &service_com_amazonaws_cloudwatchlogs_logs_20140328::state::log_group_arn(
-                    super::emulator::SIGNING_REGION,
-                    name,
-                    true,
-                ),
-                Withheld::ExplicitDeny,
-            );
+            assert_denied(name, &event, "logs:CreateLogGroup");
             assert!(
                 held.is_empty(),
                 "case {name:?}: the refused create must write nothing, got {held:?}"

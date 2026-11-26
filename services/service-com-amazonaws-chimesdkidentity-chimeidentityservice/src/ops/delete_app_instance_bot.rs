@@ -192,31 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         if state.remove_bot(&input.app_instance_bot_arn).is_none() {
-            return Err(match state.unresolved_arn(&input.app_instance_bot_arn) {
-                // The AppInstance this bot hung off has been deleted, taking the bot with
-                // it, so there is nothing left to delete: the answer is the modelled
-                // permanent refusal.
-                crate::state::UnresolvedArn::DeletedAppInstance => {
-                    DeleteAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
-                        code: Some("Forbidden".to_string()),
-                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
-                    })
-                    .into()
-                }
-                // This operation models no 404 shape, so an ARN that never named a bot is
-                // refused with the modelled `BadRequestException` carrying the `NotFound`
-                // error code.
-                crate::state::UnresolvedArn::NeverExisted => {
-                    DeleteAppInstanceBotErrorModeled::BadRequestException(BadRequestException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!(
-                            "AppInstanceBot {} does not exist",
-                            input.app_instance_bot_arn
-                        )),
-                    })
-                    .into()
-                }
-            });
+            // An `AppInstanceBotArn` that resolves to NO bot of this service is refused as
+            // a request this caller may not make, exactly as the read of one is
+            // (`crate::ops::describe_app_instance_bot`): a bot is addressed by an ARN
+            // alone, so an ARN no bot answers to names nothing the caller's access to could
+            // be decided on, whether the bot's `AppInstance` was deleted under it or
+            // nothing here ever named it.
+            return Err(
+                DeleteAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                })
+                .into(),
+            );
         }
 
         // The ARN is WITHDRAWN rather than merely forgotten — the record carries the class

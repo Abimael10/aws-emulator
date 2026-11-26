@@ -15,13 +15,14 @@
 //!
 //! The refusal is the OWNING service's own: its API would have refused that very call the
 //! same way, and the authorization answer is a fact about the call rather than about the
-//! resource model the handler judged. What it is reported AS follows from that: an
-//! authorization denial is a verdict the model's `HandlerErrorCode` enum declares a member of
-//! its own for, so the request fails with `AccessDenied` ([`NativeRefusal::Denied`]) and never
-//! with the catch-all for a downstream error the handler could place nowhere — a client
-//! classifying a failed request off that code learns that the work cannot succeed until the
-//! policies in force on the role change, rather than that something downstream may have
-//! glitched. The sentence it carries is the one the owning service refuses such a call with
+//! resource model the handler judged. What it is reported AS follows from that: the handler
+//! made the call and read that service's refusal of it, so the failure is an error the
+//! downstream service generated which the handler maps to no verdict of its own
+//! ([`NativeRefusal::Rejected`]) — reported exactly as that service's other errors are, under
+//! the catch-all `GeneralServiceException` and in the handler's own sentence about the call
+//! it was making, which the request's terminal event carries in place of any diagnosis the
+//! downstream service stated. The sentence this verdict carries is the one that service
+//! refuses such a call with
 //! ([`authz::not_authorized_by_identity_policy`]), named after the SESSION of the role the
 //! call was made as ([`::service_common::iam_role::assumed_role_session_arn`]) and stating
 //! which of IAM's rules withheld the grant, so this service and the owning service cannot
@@ -99,8 +100,9 @@ impl RolePermissions {
     /// out. The refusal is about the FIRST such call, which is the one the handler would have
     /// been refused on.
     ///
-    /// It is an authorization verdict ([`NativeRefusal::Denied`]), stated in the sentence the
-    /// owning service refuses such a call with: the session the call was made as, the action
+    /// It is the owning service's own refusal of the call ([`NativeRefusal::Rejected`]),
+    /// stated in the sentence that service refuses such a call with: the session the call was
+    /// made as, the action
     /// it asked for as that service words an action in its own refusals
     /// ([`authz::reported_action`]), the resource it was taken on, and which of IAM's rules
     /// withheld the grant — an explicit `Deny`, no statement at all, or the ceiling the
@@ -165,7 +167,7 @@ impl RolePermissions {
             // The identity the call was made as is what its refusal is about.
             let principal =
                 ::service_common::iam_role::assumed_role_session_arn(role_arn, SESSION_NAME);
-            return Some(NativeRefusal::Denied(
+            return Some(NativeRefusal::Rejected(
                 authz::not_authorized_by_identity_policy(&principal, &action, &resource, &reason),
             ));
         }

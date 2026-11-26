@@ -410,10 +410,16 @@ struct AddressedCall {
 /// `DescribeAppInstanceBot` is not here: it refuses every `AppInstanceBotArn` it resolves
 /// no bot for with the permanent 403 refusal, so it answers the deleted instance and the
 /// ARN that never existed identically rather than with the unknown-ARN refusal the rows
-/// below expect of the second half of the table.
+/// below expect of the second half of the table; the suite that owns the bot rule covers
+/// it (`app_instance_bot_description`).
 /// `DescribeAppInstanceAdmin` is out for another reason: the grant it addresses is the
 /// resource it resolves, so it answers the permanent refusal for any pair of ARNs it
 /// holds no promotion for.
+///
+/// `DeleteAppInstanceBot` IS a row, but it is addressed by an `AppInstanceBotArn`: an ARN
+/// that resolves to no bot is a request the caller may not make, so it answers the
+/// permanent refusal in both tables below rather than the unknown-ARN one the rows keyed by
+/// an instance or a user answer.
 ///
 /// Every other operation keyed by an `AppInstanceArn` is a row, including the ones that
 /// address a SUB-RESOURCE of the instance (its administrators, its retention settings):
@@ -592,7 +598,8 @@ fn calls_addressed_to(instance: &str, user: &str, bot: &str) -> Vec<AddressedCal
 /// RULE: a request addressed to a deleted `AppInstance` — its own ARN, or the ARN of a
 /// resource the delete cascaded away with it — is refused the modelled
 /// `ForbiddenException` (403) carrying AWS's fixed forbidden sentence, while an ARN that
-/// never named a resource of this service keeps the unknown-ARN refusal (400 `NotFound`).
+/// never named a resource of this service keeps the unknown-ARN refusal (400 `NotFound`) —
+/// save where the ARN addresses a bot, which is the permanent refusal either way.
 #[tokio::test]
 async fn a_request_addressed_to_a_deleted_app_instance_is_forbidden() {
     let emulator = Emulator::new();
@@ -672,7 +679,9 @@ async fn a_request_addressed_to_a_deleted_app_instance_is_forbidden() {
     }
 
     // The control: the SAME calls against ARNs of the same shapes that never named a
-    // resource keep the unknown-ARN refusal, so the deleted case is a class of its own.
+    // resource keep the unknown-ARN refusal, so the deleted case is a class of its own —
+    // except the one call addressed by an `AppInstanceBotArn`, which is a request the
+    // caller may not make however that ARN failed to resolve.
     let live = emulator.app_instance("live-app", "tok-live-parent").await;
     let absent_instance = format!("{live}x");
     let absent_user = format!("{absent_instance}/user/nobody");
@@ -684,12 +693,18 @@ async fn a_request_addressed_to_a_deleted_app_instance_is_forbidden() {
             path,
             body,
         } = call;
+        let addressed_by_a_bot_arn = label == "DeleteAppInstanceBot";
         let (status, answer) = emulator.call(method, &path, body).await;
+        let expected = if addressed_by_a_bot_arn {
+            (403, Some("Forbidden"))
+        } else {
+            (400, Some("NotFound"))
+        };
         assert_eq!(
             (status, answer["Code"].as_str()),
-            (400, Some("NotFound")),
-            "case {label:?} on an ARN that never existed: expected the unknown-ARN \
-             refusal, got {status} {answer:?}"
+            expected,
+            "case {label:?} on an ARN that never existed: expected {expected:?}, got \
+             {status} {answer:?}"
         );
     }
 
