@@ -893,7 +893,7 @@ async fn a_job_template_request_the_store_cannot_take_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            format!("Job template {absent} cannot be found."),
+            format!("Job Template {absent} cannot be found."),
             "case {absent:?}: expected the refusal to name the template, got {:?}",
             reply.body
         );

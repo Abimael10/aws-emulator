@@ -192,9 +192,12 @@ pub fn missing_job_message(job_id: &str) -> String {
 ///
 /// A job template is a resource of the JOBS plane, so the miss is stated the way that
 /// plane states every other one ([`plane_not_found`]): the family noun, the id the request
-/// asked about, and the clause ` cannot be found.`
+/// asked about, and the clause ` cannot be found.` The noun is this family's own, in TWO
+/// capitalised words — the same one its already-exists sentence carries
+/// ([`super::existing_job_template_message`]), because a family has ONE noun whichever
+/// sentence states it.
 pub fn missing_job_template_message(job_template_id: &str) -> String {
-    plane_not_found("Job template", job_template_id)
+    plane_not_found("Job Template", job_template_id)
 }
 
 /// How this service states that a `commandId` names no command: the commands plane's
