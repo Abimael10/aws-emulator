@@ -11,17 +11,19 @@
 //! way has no un-tenanted execution environment to be invoked in, and an invocation of it
 //! that names no `TenantId` is refused: nothing runs, and no version is reported as having
 //! executed. The requirement is CONDITIONAL on the function's stored configuration, which no
-//! constraint of an input shape can express, so Lambda words it itself — the form its other
-//! conditionally required members are refused in — carried by the modelled
-//! `InvalidParameterValueException` (HTTP 400). An invocation that names a tenant
-//! is served, and a function configured for no tenancy at all is invoked with or without one
-//! exactly as before.
+//! constraint of an input shape can express, so Lambda words the refusal itself, carried by
+//! the modelled `InvalidParameterValueException` (HTTP 400) — and the sentence it words it in
+//! is Lambda's OWN text for this error class ([`ABSENT_TENANT_ID_MESSAGE`] below), fixed
+//! text with no variable part, the same whatever the call left the tenant out of. An
+//! invocation that names a tenant is served, and a function configured for no tenancy at all
+//! is invoked with or without one exactly as before.
 //!
 //! The rows differ along what the rule generalises over: whether the function carries the
 //! configuration, whether the call names a tenant and what form that tenant id takes (a
-//! plain name, and one carrying the punctuation the member's own pattern admits), and WHICH
-//! invoking operation makes the call — `Invoke` and `InvokeWithResponseStream` both bind
-//! `TenantId`, so both require it.
+//! plain name, and one carrying the punctuation the member's own pattern admits), what the
+//! call asked the invocation to be (the default, the asynchronous `InvocationType` and the
+//! dry run), and WHICH invoking operation makes the call — `Invoke` and
+//! `InvokeWithResponseStream` both bind `TenantId`, so both require it.
 //!
 //! Every row drives a real HTTP request through the production `MultiServiceRouter` against
 //! a function created through `CreateFunction`, whose stored configuration is read back
@@ -62,13 +64,22 @@ const INVALID_PARAMETER: &str = "InvalidParameterValueException";
 /// (`@httpHeader X-Amz-Tenant-Id`).
 const TENANT_HEADER: &str = "x-amz-tenant-id";
 
-/// The clause that refusal carries: fixed text naming the member the invocation left out and
-/// the condition that requires it, in the form this service words every other conditionally
-/// required member's refusal in ("Runtime is required if the deployment package is a .zip
-/// file archive").
-fn untenanted_refusal() -> String {
-    "TenantId is required if the function is configured for tenant isolation".to_string()
-}
+/// The header `InvocationType` is bound to (`@httpHeader X-Amz-Invocation-Type`), and the two
+/// of its modelled values a row names — the asynchronous invocation and the one that only
+/// "validate[s] parameter values"
+/// (`smithy_query(query="shape", shape="InvocationType")`: `Event`, `RequestResponse`,
+/// `DryRun`).
+const INVOCATION_TYPE_HEADER: &str = "x-amz-invocation-type";
+/// See [`INVOCATION_TYPE_HEADER`].
+const ASYNCHRONOUS: &str = "Event";
+/// See [`INVOCATION_TYPE_HEADER`].
+const DRY_RUN: &str = "DryRun";
+
+/// The sentence that refusal carries: Lambda's own text for this error class, as its
+/// documentation of invoking a function configured for tenancy words it. It is fixed text
+/// with no variable part, so every refused row below is pinned to this one string.
+const ABSENT_TENANT_ID_MESSAGE: &str = "The invoked function is enabled with tenancy \
+     configuration. Add a valid tenant ID in your request and try again.";
 
 /// The `message` of a wire error, under either casing the JSON envelopes use.
 fn message(answer: &Answer) -> String {
@@ -164,6 +175,9 @@ struct Row {
     /// `true` for the function configured for per-tenant isolation.
     isolated: bool,
     tenant: Option<&'static str>,
+    /// What the call asked for as its `InvocationType` (`X-Amz-Invocation-Type`), and `None`
+    /// for a call that named none and so takes the modelled default.
+    invocation_type: Option<&'static str>,
     refused: bool,
 }
 
@@ -174,6 +188,7 @@ fn rows() -> Vec<Row> {
             call: Call::Invoke,
             isolated: true,
             tenant: None,
+            invocation_type: None,
             refused: true,
         },
         Row {
@@ -181,6 +196,7 @@ fn rows() -> Vec<Row> {
             call: Call::Invoke,
             isolated: true,
             tenant: Some("tenant-a"),
+            invocation_type: None,
             refused: false,
         },
         Row {
@@ -191,13 +207,35 @@ fn rows() -> Vec<Row> {
             call: Call::Invoke,
             isolated: true,
             tenant: Some("acct:1234/unit=b_2@x"),
+            invocation_type: None,
             refused: false,
+        },
+        Row {
+            // The requirement is the function's, so it holds whatever the call asked the
+            // invocation to be: an asynchronous one is refused rather than queued, and the
+            // refusal is worded the same way.
+            case: "an isolated function invoked asynchronously with no tenant",
+            call: Call::Invoke,
+            isolated: true,
+            tenant: None,
+            invocation_type: Some(ASYNCHRONOUS),
+            refused: true,
+        },
+        Row {
+            // A dry run "validate[s] parameter values", and this is one of them.
+            case: "an isolated function dry-run with no tenant",
+            call: Call::Invoke,
+            isolated: true,
+            tenant: None,
+            invocation_type: Some(DRY_RUN),
+            refused: true,
         },
         Row {
             case: "an isolated function invoked for no tenant on the streaming path",
             call: Call::Streaming,
             isolated: true,
             tenant: None,
+            invocation_type: None,
             refused: true,
         },
         Row {
@@ -205,6 +243,7 @@ fn rows() -> Vec<Row> {
             call: Call::Invoke,
             isolated: false,
             tenant: None,
+            invocation_type: None,
             refused: false,
         },
         Row {
@@ -212,6 +251,7 @@ fn rows() -> Vec<Row> {
             call: Call::Invoke,
             isolated: false,
             tenant: Some("tenant-a"),
+            invocation_type: None,
             refused: false,
         },
     ]
@@ -229,10 +269,13 @@ async fn an_invocation_of_a_tenant_isolated_function_has_to_name_its_tenant() {
     for row in rows() {
         let case = row.case;
         let function = if row.isolated { isolated } else { plain };
-        let headers: Vec<(&str, String)> = row
+        let mut headers: Vec<(&str, String)> = row
             .tenant
             .map(|tenant| vec![(TENANT_HEADER, tenant.to_string())])
             .unwrap_or_default();
+        if let Some(invocation_type) = row.invocation_type {
+            headers.push((INVOCATION_TYPE_HEADER, invocation_type.to_string()));
+        }
         let answer = send(
             &router,
             "POST",
@@ -257,11 +300,10 @@ async fn an_invocation_of_a_tenant_isolated_function_has_to_name_its_tenant() {
                 "case {case:?}: expected {INVALID_PARAMETER}, got {}",
                 answer.error_code()
             );
-            let expected = untenanted_refusal();
             assert_eq!(
                 message(&answer),
-                expected,
-                "case {case:?}: expected {expected:?}, got {:?}",
+                ABSENT_TENANT_ID_MESSAGE,
+                "case {case:?}: expected {ABSENT_TENANT_ID_MESSAGE:?}, got {:?}",
                 message(&answer)
             );
             // Nothing executed: a refused invocation reports no version as having run.

@@ -625,9 +625,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names no tenant is refused here — before the run, before an environment is chosen
         // and before the invocation is metered — rather than served with no tenant context.
         // The requirement is the FUNCTION's and conditional on its stored configuration,
-        // which no input constraint can state, so Lambda words it itself — the sentence this
-        // service words every other conditionally required member's refusal in — carried by
-        // the modelled 400 AWS answers this refusal with (see
+        // which no input constraint can state, so Lambda words the refusal itself, in its own
+        // text for this error class, carried by the modelled 400 AWS answers it with (see
         // [`crate::state::untenanted_invocation_refusal`]). The DRY RUN
         // returns below this point deliberately: it "validate[s] parameter values", and this
         // is one of them.

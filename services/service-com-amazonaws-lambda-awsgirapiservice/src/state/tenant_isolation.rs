@@ -22,12 +22,13 @@
 //!
 //! The requirement is CONDITIONAL on the stored configuration of the function the call
 //! addressed, so no constraint of an input shape can express it and no envelope of the
-//! request walk states it. Lambda words such a requirement itself, as a sentence naming the
-//! member it needs and the condition that needs it — the form this service's own recorded
-//! refusals take for every other conditionally required member: "Runtime is required if the
-//! deployment package is a .zip file archive", and `Handler` likewise
-//! ([`crate::ops::create_function`]) — so this refusal is worded in that same form, fixed
-//! text naming this member and this condition.
+//! request walk states it: Lambda words this refusal itself, and the sentence it words it in
+//! is part of the error's contract. So the sentence here is LAMBDA's own text for this error
+//! class, as its documentation of invoking a tenant-isolated function words it — not a
+//! sentence composed by analogy with how another conditionally required member of this
+//! service is refused ("Runtime is required if the deployment package is a .zip file
+//! archive", which is the model's own wording of THAT requirement, quoted in
+//! [`crate::ops::create_function`]).
 //!
 //! It travels as the modelled `InvalidParameterValueException` (400, "One of the parameters
 //! in the request is not valid"), which is the error AWS answers this refusal with: RECORDED,
@@ -44,15 +45,16 @@
 
 use super::*;
 
-/// Lambda's sentence for an invocation of a tenant-isolated function that names no tenant:
-/// the member it needs, and the condition that needs it.
+/// Lambda's own sentence for an invocation of a tenant-isolated function that names no
+/// tenant: that the function invoked is configured for tenancy, and what the caller has to
+/// do about it.
 ///
-/// Fixed text, in the form this service words every other conditionally required member's
-/// refusal in (see the module header): nothing of the request or of the stored configuration
-/// is quoted into it, because what makes the member required is the configuration being in
-/// force at all rather than any value it carries.
-pub const ABSENT_TENANT_ID_MESSAGE: &str =
-    "TenantId is required if the function is configured for tenant isolation";
+/// Fixed text throughout, as Lambda words this error class (see the module header): it has no
+/// variable part, because what makes the member required is the configuration being in force
+/// at all rather than any value it or the request carries, so nothing of either is quoted
+/// into it.
+pub const ABSENT_TENANT_ID_MESSAGE: &str = "The invoked function is enabled with tenancy \
+     configuration. Add a valid tenant ID in your request and try again.";
 
 /// The refusal an invocation of a function configured for tenant isolation owes when it
 /// names no tenant, or `None` when the invocation may be served.
@@ -168,16 +170,18 @@ mod tests {
         }
     }
 
-    /// The sentence names the member the invocation left out and the condition that needs
-    /// it, and names nothing of the request or of the stored configuration (see the module
-    /// header): it is the fixed text of this error class.
+    /// The sentence is Lambda's own text for this error class, carrying nothing of the
+    /// request or of the stored configuration (see the module header).
     #[test]
-    fn the_refusal_names_the_member_and_the_condition_that_requires_it() {
+    fn the_refusal_is_worded_as_lambda_words_this_error_class() {
         let stated = untenanted_invocation_refusal(Some(&isolated("PER_TENANT")), None);
         assert_eq!(
             stated.as_deref(),
-            Some("TenantId is required if the function is configured for tenant isolation"),
-            "expected the sentence naming the member and the condition, got {stated:?}"
+            Some(
+                "The invoked function is enabled with tenancy configuration. Add a valid \
+                 tenant ID in your request and try again."
+            ),
+            "expected Lambda's own sentence for this error class, got {stated:?}"
         );
     }
 

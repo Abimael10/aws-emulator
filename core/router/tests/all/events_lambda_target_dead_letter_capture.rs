@@ -94,8 +94,8 @@ const UNKNOWN: &str = "UNKNOWN";
 /// carried. Spelled here rather than imported from the service, as the conditions above are.
 const INVALID_PARAMETER: &str = "InvalidParameterValueException";
 /// See [`INVALID_PARAMETER`].
-const ABSENT_TENANT_ID: &str =
-    "TenantId is required if the function is configured for tenant isolation";
+const ABSENT_TENANT_ID: &str = "The invoked function is enabled with tenancy configuration. \
+     Add a valid tenant ID in your request and try again.";
 
 /// The `TenantIsolationMode` that dedicates an execution environment to one tenant, and so
 /// makes every invocation of the function name the tenant it is for
