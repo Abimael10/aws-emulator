@@ -236,7 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group's position in the reported order ([`crate::state::TRACKED_SOURCE_TYPES`]) and
         // the answer resumes there; a token naming no group this operation reports names no
         // page and is refused, the rule this service's other readers refuse an unknown token
-        // by.
+        // by, worded as the whole crate words that refusal
+        // ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]) so no two readers of this service
+        // refuse the same token differently.
         let resume_at = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
@@ -248,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(at) => at,
                     None => {
                         return Err(invalid_parameter(
-                            "The value supplied for parameter nextToken is not valid.".to_string(),
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                         ))
                     }
                 }

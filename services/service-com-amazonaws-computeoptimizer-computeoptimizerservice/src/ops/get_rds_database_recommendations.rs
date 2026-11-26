@@ -270,7 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // selection it was taken over — the Region the request was signed for included, since
         // the databases analysed are that endpoint's — so resuming a walk with a different
         // selection, at a different Region's endpoint, or with a token another operation
-        // issued, is refused rather than answered with a page of a different result set.
+        // issued, is refused rather than answered with a page of a different result set —
+        // worded as the whole crate words that refusal
+        // ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]), so no two readers of this service
+        // refuse the same token differently.
         let selection_fingerprint = crate::state::fingerprint(&(
             Self::NAME,
             &resource_arns,
@@ -286,11 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .filter(|cursor| cursor.selection_fingerprint == selection_fingerprint);
                 let Some(cursor) = cursor else {
                     return Err(invalid_parameter(
-                        "The value supplied for parameter nextToken is not valid: it must be a \
-                         token returned by a previous GetRDSDatabaseRecommendations call to this \
-                         Region's endpoint for the same resourceArns, accountIds, filters and \
-                         recommendationPreferences."
-                            .to_string(),
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                     ));
                 };
                 cursor.offset

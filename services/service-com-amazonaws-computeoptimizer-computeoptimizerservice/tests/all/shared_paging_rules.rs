@@ -21,6 +21,10 @@
 //!   it with a page of a different result set. The Region a request is signed for is part of
 //!   that selection wherever it scopes what the reader answers, so a token minted at one
 //!   regional endpoint does not resume a walk at another.
+//! * HOW a reader refuses a token it cannot resume — with the ONE sentence this crate words
+//!   for that condition (`crate::state::INVALID_NEXT_TOKEN_MESSAGE`), identical at every
+//!   reader, so a client walking two readers of this service with a token neither can resume
+//!   reads the same refusal from both rather than a sentence per operation.
 //!
 //! Both are asserted over a TABLE of every reader of this service whose page the request
 //! sizes, each with its own default and ceiling (the eleven rows below), crossed with the
@@ -41,8 +45,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     service_state, AnalysedResource, MemberAccountEnrollment, DEFAULT_PAGE_SIZE,
-    ENROLLMENT_STATUSES_MAX_PAGE_SIZE, IDLE_MAX_PAGE_SIZE, MAX_PAGE_SIZE, RESOURCE_TYPE_EBS_VOLUME,
-    SCOPE_ACCOUNT_ID, SCOPE_ORGANIZATION, SCOPE_RESOURCE_ARN, SOURCE_TYPE_RDS_DB_INSTANCE,
+    ENROLLMENT_STATUSES_MAX_PAGE_SIZE, IDLE_MAX_PAGE_SIZE, INVALID_NEXT_TOKEN_MESSAGE,
+    MAX_PAGE_SIZE, RESOURCE_TYPE_EBS_VOLUME, SCOPE_ACCOUNT_ID, SCOPE_ORGANIZATION,
+    SCOPE_RESOURCE_ARN, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -410,6 +415,159 @@ async fn a_next_token_resumes_only_the_walk_that_minted_it() {
                 "case {label:?}: expected InvalidParameterValueException, got {body}"
             );
         }
+    }
+}
+
+/// The forms a value that is not a token of the walk it was handed to arrives in: not a token
+/// at all, the empty value (`NextToken` carries no length constraint —
+/// `smithy_query(query="shape",shape="NextToken")`), a value that decodes as this service's
+/// own hex encoding but names no boundary (`7b7d`, the empty JSON object), one that decodes to
+/// bytes that are no payload of this service at all (`deadbeef`), and one hex decoding itself
+/// refuses because its length is odd (`0`). The rows differ in the FORM of the value, because
+/// what makes a token unresumable is that the walk never minted it, not how it looks.
+const UNRESUMABLE_TOKENS: &[&str] = &["not-a-token", "", "7b7d", "deadbeef", "0"];
+
+/// The request members that scope a reader's selection, which the refusal of a token does NOT
+/// name: the fingerprint a token carries is this service's business, so the sentence a reader
+/// answers with cannot vary with — or disclose — the members that made it up.
+const SELECTION_MEMBER_NAMES: &[&str] = &[
+    "resourceArns",
+    "accountIds",
+    "filters",
+    "orderBy",
+    "recommendationPreferences",
+    "jobIds",
+    "resourceType",
+    "scope",
+];
+
+/// Assert `body` is the one refusal this service answers a `nextToken` it cannot resume with:
+/// `400 InvalidParameterValueException` carrying the crate's single sentence, naming neither
+/// the operation that refused nor any member of the selection the token was fingerprinted
+/// over, and reporting no page at all.
+fn assert_one_invalid_token_refusal(
+    case: &str,
+    operation: &str,
+    status: u16,
+    body: &Value,
+    items: &str,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the token to be refused with 400, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        "InvalidParameterValueException",
+        "case {case:?}: expected InvalidParameterValueException, got {body}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message, INVALID_NEXT_TOKEN_MESSAGE,
+        "case {case:?}: expected the crate's one sentence {INVALID_NEXT_TOKEN_MESSAGE:?}, got \
+         {message:?}"
+    );
+    assert!(
+        !message.contains(operation),
+        "case {case:?}: the refusal must not name the operation that answered it, got {message:?}"
+    );
+    for member in SELECTION_MEMBER_NAMES {
+        assert!(
+            !message.contains(member),
+            "case {case:?}: the refusal must not name the selection member {member:?}, got \
+             {message:?}"
+        );
+    }
+    assert!(
+        body[items].is_null(),
+        "case {case:?}: a refused read reports no page at all, got {body}"
+    );
+}
+
+/// Every paginated reader of this service, as the operation plus the request members it needs
+/// besides `maxResults` and `nextToken` and the output member it reports its page in: the
+/// table above, plus `GetRecommendationSummaries`, which is absent from it because its cursor
+/// names the GROUP a page resumes at rather than an offset into a selection, yet resolves a
+/// `nextToken` a request carries by the same rule.
+fn token_reading_surfaces() -> Vec<(&'static str, Value, &'static str)> {
+    let mut surfaces: Vec<(&'static str, Value, &'static str)> = readers()
+        .iter()
+        .map(|reader| (reader.operation, reader.request.clone(), reader.items))
+        .collect();
+    surfaces.push((
+        "GetRecommendationSummaries",
+        json!({}),
+        "recommendationSummaries",
+    ));
+    surfaces
+}
+
+/// A `nextToken` no walk of this service minted is refused with the SAME sentence by every
+/// reader that reads one, whatever form the value arrived in: one wording for the whole crate,
+/// so two readers never refuse the identical condition differently.
+#[tokio::test]
+async fn an_unresumable_next_token_is_refused_with_one_wording_by_every_reader() {
+    let (router, _engine) = paged_emulator().await;
+
+    for (operation, base, items) in token_reading_surfaces() {
+        for token in UNRESUMABLE_TOKENS {
+            let case = format!("{operation} handed {token:?}");
+            let mut request = base.clone();
+            request["nextToken"] = json!(token);
+            let (status, body) = call(&router, operation, request).await;
+            assert_one_invalid_token_refusal(&case, operation, status, &body, items);
+        }
+    }
+}
+
+/// A token ANOTHER reader minted — a value this service did issue, for a walk the reader
+/// handed it is not — is refused with that same one sentence, and the reader's own token still
+/// resumes its walk, so what is pinned is the wording of a refusal rather than a reader that
+/// refuses every token.
+#[tokio::test]
+async fn a_foreign_readers_token_is_refused_with_the_same_one_wording() {
+    let (router, _engine) = paged_emulator().await;
+
+    // One token per reader, minted by a one-item page of its own walk.
+    let mut minted: Vec<(&'static str, String)> = Vec::new();
+    for reader in readers() {
+        let body = read(&router, &reader, "minting a token", Some(1), None).await;
+        let token = body["nextToken"].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {:?}: a one-item page of a longer sequence must hand out a nextToken, got \
+                 {body}",
+                reader.operation
+            )
+        });
+        minted.push((reader.operation, token.to_string()));
+    }
+
+    for (operation, base, items) in token_reading_surfaces() {
+        for (minted_by, token) in &minted {
+            if *minted_by == operation {
+                continue;
+            }
+            let case = format!("{operation} handed a token {minted_by} minted");
+            let mut request = base.clone();
+            request["nextToken"] = json!(token);
+            let (status, body) = call(&router, operation, request).await;
+            assert_one_invalid_token_refusal(&case, operation, status, &body, items);
+        }
+    }
+
+    // The control: every minted token still resumes the walk that minted it.
+    for reader in readers() {
+        let own = minted
+            .iter()
+            .find(|(operation, _)| *operation == reader.operation)
+            .map(|(_, token)| token.clone())
+            .expect("every reader of the table minted a token");
+        let label = format!("{} resuming its own token", reader.operation);
+        let body = read(&router, &reader, &label, Some(1), Some(&own)).await;
+        assert!(
+            body[reader.items].is_array(),
+            "case {label:?}: a reader's own token resumes its walk, got {body}"
+        );
     }
 }
 

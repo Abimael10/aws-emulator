@@ -253,7 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the recommendations reported are that endpoint's — so resuming a walk with a
         // different selection, at a different Region's endpoint, or with a token another
         // operation issued, is refused rather than answered with a page of a different result
-        // set.
+        // set — worded as the whole crate words that refusal
+        // ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]), so no two readers of this service
+        // refuse the same token differently.
         let selection_fingerprint = crate::state::fingerprint(&(
             Self::NAME,
             &resource_arns,
@@ -270,11 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 let Some(cursor) = cursor else {
                     return Err(invalid_parameter(
-                        "The value supplied for parameter nextToken is not valid: it must be a \
-                         token returned by a previous GetIdleRecommendations call to this \
-                         Region's endpoint for the same resourceArns, accountIds, filters and \
-                         orderBy."
-                            .to_string(),
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                     ));
                 };
                 cursor.offset
