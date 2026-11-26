@@ -20114,6 +20114,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rand 0.9.5",
  "rustls",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",

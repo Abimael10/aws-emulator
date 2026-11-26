@@ -57,6 +57,9 @@ emulator-core-build-support = { workspace = true }
 # `tests/all/main.rs` declares one suite module per `tests/all/<name>.rs`, so a new suite is a
 # new file and nothing lists it.
 automod = { workspace = true }
+# `rand`: the generator the property-based untagging suite draws its tag sets and removal key
+# lists from, over a fixed set of seeds. Test-only: nothing in `src/` draws random values.
+rand = "0.9"
 sha2 = { workspace = true }
 # The socket and byte-stream helpers the workgroup-endpoint suite drives the PostgreSQL wire a
 # workgroup publishes with, from a client of its own in this same process, and the timer the
