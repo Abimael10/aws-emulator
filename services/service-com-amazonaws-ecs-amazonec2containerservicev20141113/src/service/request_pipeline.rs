@@ -36,9 +36,10 @@ use smithy_server_runtime::{
 };
 
 use crate::ops::types::{
-    AccessDeniedException, InvalidParameterException, SCHEMA_ACCESS_DENIED_EXCEPTION,
-    SCHEMA_INVALID_PARAMETER_EXCEPTION,
+    AccessDeniedException, InvalidParameterException, ServerException,
+    SCHEMA_ACCESS_DENIED_EXCEPTION, SCHEMA_INVALID_PARAMETER_EXCEPTION, SCHEMA_SERVER_EXCEPTION,
 };
+use crate::service::refusal_wording::{RefusedShape, WordedRefusal};
 
 /// The error code the model pins on `AccessDeniedException`, which is also its shape name.
 const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
@@ -49,12 +50,12 @@ const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// The error code the model pins on `InvalidParameterException`, which is also its shape
 /// name — the one error this service declares for a request whose parameters it will not
-/// serve, and the class every refusal worded in [`super::refusal_wording`] carries.
+/// serve, and the class all but a handful of the refusals worded in
+/// [`super::refusal_wording`] carry.
 const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
 
-/// The status the model pins on `InvalidParameterException`: `@httpError 400`
-/// (`smithy_query(query="operation",operation="CreateService",…)`).
-const INVALID_PARAMETER_STATUS: u16 = 400;
+/// The error code the model pins on `ServerException`, which is also its shape name.
+const SERVER_EXCEPTION: &str = "ServerException";
 
 /// The pre-dispatch sequence of this service.
 ///
@@ -136,8 +137,8 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestPipeline<Eng> {
                             None => match super::refusal_wording::operation_worded_refusal(
                                 key, protocol, req,
                             ) {
-                                Some(message) => {
-                                    Ok(invalid_parameter_response(definition, req, message))
+                                Some(refusal) => {
+                                    Ok(worded_refusal_response(definition, req, refusal))
                                 }
                                 None => match definition.routing_table().get(key) {
                                     Some(operation) => Err(operation),
@@ -164,39 +165,67 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestPipeline<Eng> {
 
 /// A refusal worded by [`super::refusal_wording`] as a response in this service's own
 /// protocol envelope, serialized through the same protocol call the framework's error tail
-/// makes — so a sentence chosen here and one a handler returns are indistinguishable on the
+/// makes — so a refusal chosen here and one a handler returns are indistinguishable on the
 /// wire.
+///
+/// The shape, the status and the sentence are all the refusal's own: a client branches on the
+/// shape, so each is rendered as the modelled error it names rather than as the one error a
+/// bad parameter earns.
 ///
 /// Where the modelled envelope cannot be rendered at all, the same code and message are
 /// answered through the service's framework-refusal envelope instead, so the refusal still
 /// reaches the caller rather than falling through to a handler.
-fn invalid_parameter_response(
+fn worded_refusal_response(
     definition: &dyn ErasedServiceDefinition,
     req: &RtRequest,
-    message: String,
+    refusal: WordedRefusal,
 ) -> RtResponse {
-    let refused = InvalidParameterException {
-        message: Some(message),
-    };
-    definition
-        .protocol()
-        .serialize_error(
-            &refused,
-            &SCHEMA_INVALID_PARAMETER_EXCEPTION,
+    let WordedRefusal {
+        shape,
+        status,
+        message,
+    } = refusal;
+    let stated = Some(message.clone());
+    let protocol = definition.protocol();
+    let (code, rendered) = match shape {
+        RefusedShape::InvalidParameter => (
             INVALID_PARAMETER_EXCEPTION,
-            INVALID_PARAMETER_STATUS,
+            protocol.serialize_error(
+                &InvalidParameterException { message: stated },
+                &SCHEMA_INVALID_PARAMETER_EXCEPTION,
+                INVALID_PARAMETER_EXCEPTION,
+                status,
+            ),
+        ),
+        RefusedShape::AccessDenied => (
+            ACCESS_DENIED_EXCEPTION,
+            protocol.serialize_error(
+                &AccessDeniedException { message: stated },
+                &SCHEMA_ACCESS_DENIED_EXCEPTION,
+                ACCESS_DENIED_EXCEPTION,
+                status,
+            ),
+        ),
+        RefusedShape::Server => (
+            SERVER_EXCEPTION,
+            protocol.serialize_error(
+                &ServerException { message: stated },
+                &SCHEMA_SERVER_EXCEPTION,
+                SERVER_EXCEPTION,
+                status,
+            ),
+        ),
+    };
+    rendered.ok().unwrap_or_else(|| {
+        definition.refusal_response(
+            ProtocolError::Invalid(Vec::new()),
+            Some(Refused {
+                code: code.to_string(),
+                message,
+            }),
+            req,
         )
-        .ok()
-        .unwrap_or_else(|| {
-            definition.refusal_response(
-                ProtocolError::Invalid(Vec::new()),
-                Some(Refused {
-                    code: INVALID_PARAMETER_EXCEPTION.to_string(),
-                    message: refused.message.clone().unwrap_or_default(),
-                }),
-                req,
-            )
-        })
+    })
 }
 
 /// The authorization refusal as a response in this service's own protocol envelope,

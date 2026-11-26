@@ -10,8 +10,10 @@
 //! violations without the operation
 //! ([`smithy_server_runtime::Service::override_refusal`] takes a refusal and nothing else),
 //! so those sentences are decided HERE, where the routing key is still in hand, and the
-//! layer that owns the pre-dispatch sequence ([`super::request_pipeline`]) answers them in
-//! this service's modelled `InvalidParameterException` (HTTP 400).
+//! layer that owns the pre-dispatch sequence ([`super::request_pipeline`]) answers them in the
+//! modelled error shape each refusal names ([`WordedRefusal`]) — this service's
+//! `InvalidParameterException` (HTTP 400) for all but the ones the gateway surface publishes
+//! its own shape and status for ([`gateways`]).
 //!
 //! One function per operation, each reading the request ONCE through the same protocol and
 //! generated input schema the dispatch sequence will hand the handler ([`read_input`]), so
@@ -46,7 +48,9 @@
 //!   ([`FILTER_SERVICE_DEPLOYMENT_STATUSES`]).
 //! * **A required identifier the request leaves out, or names nothing at all in**, refused
 //!   with the one sentence that operation publishes for it — naming no member path, no value
-//!   and no count, which is what the framework's clause would state.
+//!   and no count, which is what the framework's clause would state. The gateway surface
+//!   publishes one per required member, with the error SHAPE and status it answers each with
+//!   ([`gateways`]).
 //! * **A list of identifiers that names the same one twice**, refused as the malformed
 //!   request Amazon ECS calls it, with the fixed sentence that operation publishes — judged
 //!   on the list as the request spells it, before any entry is resolved.
@@ -62,11 +66,78 @@
 //! because it has to be answered BEFORE the cluster is resolved, which each handler does for
 //! itself.
 
+pub mod gateways;
+
 use ::aws_smithy_runtime_api::http::Request as RtRequest;
 use ::smithy_server_runtime::ServerHttpProtocol;
 
 use crate::ops::types::*;
 use crate::service::{absent_member, read_input};
+
+/// WHICH modelled error shape a refusal worded here is answered as.
+///
+/// This service words most of what it refuses before dispatch as the one error it declares for
+/// a request whose parameters it will not serve, but not all of it: a surface that publishes
+/// its own refusal publishes the SHAPE too, and a client branches on that shape — an
+/// authorization refusal is a role or a policy to fix, a server failure is a call to retry, a
+/// bad parameter is a request to correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedShape {
+    /// `InvalidParameterException`.
+    InvalidParameter,
+    /// `AccessDeniedException`.
+    AccessDenied,
+    /// `ServerException`.
+    Server,
+}
+
+/// A refusal this service words itself, as the caller sees it: the modelled error shape, the
+/// status it is answered with, and the sentence.
+///
+/// The status travels with the refusal rather than with the shape, because the status a shape
+/// is answered with is not always the one the model pins on it — see
+/// [`WordedRefusal::access_denied`].
+#[derive(Debug, Clone)]
+pub struct WordedRefusal {
+    pub shape: RefusedShape,
+    pub status: u16,
+    pub message: String,
+}
+
+impl WordedRefusal {
+    /// A refusal of the request's PARAMETERS: `InvalidParameterException` at the status the
+    /// model pins on it (`@httpError 400`), which is what every refusal this layer worded
+    /// before there was anything else to word was answered as.
+    pub fn invalid_parameter(message: impl Into<String>) -> Self {
+        Self {
+            shape: RefusedShape::InvalidParameter,
+            status: 400,
+            message: message.into(),
+        }
+    }
+
+    /// An AUTHORIZATION refusal: `AccessDeniedException` at `status`, stated by the caller
+    /// because the status such a refusal carries is a property of the surface that publishes
+    /// it — this service's IAM gate answers the 403 the model pins on the shape, while a
+    /// surface recorded answering one in the 400 class states that.
+    pub fn access_denied(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            shape: RefusedShape::AccessDenied,
+            status,
+            message: message.into(),
+        }
+    }
+
+    /// A SERVER-side failure: `ServerException` at the status the model pins on it
+    /// (`@httpError 500`), the class an SDK retries.
+    pub fn server(message: impl Into<String>) -> Self {
+        Self {
+            shape: RefusedShape::Server,
+            status: 500,
+            message: message.into(),
+        }
+    }
+}
 
 /// The member every operation below names the launch type in, as the words its refusal is
 /// built from ([`crate::state::member_words`]).
@@ -182,21 +253,30 @@ const TARGET_TYPE_MEMBER: &str = "targetType";
 /// ([`crate::state::unsupported_stop_type_message`]).
 const INVALID_STOP_TYPE_MESSAGE: &str = "The StopType is invalid.";
 
-/// The sentence this service refuses `req` with before any handler runs, or `None` when the
+/// The refusal this service answers `req` with before any handler runs, or `None` when the
 /// request earns no refusal of its own here — which leaves it to the framework's walk and to
 /// the operation exactly as before.
 ///
-/// Two layers, in this order: the condition the OPERATION words its own sentence for
-/// ([`operation_condition_refusal`]), and then the one MEMBER rule every operation that takes
-/// it shares — the `cluster` the request names, which has to be one of the two forms that
-/// member documents ([`cluster_reference_refusal`]).
+/// Three layers, in this order: the refusal a GATEWAY operation publishes for a member it
+/// requires and the request names nothing in ([`gateways`]), the condition the OPERATION words
+/// its own sentence for ([`operation_condition_refusal`]), and then the one MEMBER rule every
+/// operation that takes it shares — the `cluster` the request names, which has to be one of
+/// the two forms that member documents ([`cluster_reference_refusal`]). The three are disjoint:
+/// no operation of the gateway surface is keyed in either of the two below it.
 pub fn operation_worded_refusal(
     operation: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<String> {
-    operation_condition_refusal(operation, protocol, req)
-        .or_else(|| cluster_reference_refusal(operation, protocol, req))
+) -> Option<WordedRefusal> {
+    gateways::gateway_member_refusal(operation, protocol, req)
+        .or_else(|| {
+            operation_condition_refusal(operation, protocol, req)
+                .map(WordedRefusal::invalid_parameter)
+        })
+        .or_else(|| {
+            cluster_reference_refusal(operation, protocol, req)
+                .map(WordedRefusal::invalid_parameter)
+        })
 }
 
 /// The `cluster` reference `req` carries, judged against the two forms that member documents
