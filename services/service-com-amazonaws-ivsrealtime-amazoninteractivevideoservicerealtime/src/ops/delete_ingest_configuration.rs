@@ -189,17 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `state` follows), so the refusal and the `ACTIVE` a caller just read are one
         // fact and not two.
         let publishers = crate::state::ingest_configuration_publishers(&store, &configuration);
-        if !input.force {
-            if let Some(publisher) = publishers.first() {
-                return Err(crate::state::conflict(
-                    DeleteIngestConfigurationErrorModeled::ConflictException,
-                    crate::state::ingest_configuration_publishing_message(
-                        &input.arn,
-                        &publisher.participant_id,
-                        &configuration.stage_arn,
-                    ),
-                ));
-            }
+        if !input.force && !publishers.is_empty() {
+            return Err(crate::state::conflict(
+                DeleteIngestConfigurationErrorModeled::ConflictException,
+                crate::state::ingest_configuration_publishing_message(&input.arn),
+            ));
         }
 
         // With `force`, "the participant is disconnected from the stage, followed by

@@ -15,10 +15,11 @@
 //!
 //! The module is split by concern: the stage sessions and the participants, events and
 //! replications inside them in [`sessions`], the addresses every stage this service
-//! reports announces in [`stage_endpoints`], the pagination tokens every listing pages
-//! with in [`page_tokens`], and how this service words and classifies the failures it
-//! answers in [`refusals`]. Each part is re-exported here, so a handler reaches all of
-//! it as `crate::state::…`.
+//! reports announces in [`stage_endpoints`], the socket an encoder publishes a stage's
+//! contribution to and what an accepted publish writes in [`ingest_plane`], the pagination
+//! tokens every listing pages with in [`page_tokens`], and how this service words and
+//! classifies the failures it answers in [`refusals`]. Each part is re-exported here, so a
+//! handler reaches all of it as `crate::state::…`.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1225,10 +1226,19 @@ impl StageRecord {
     /// The modelled `Stage` this record reports to the request in `ctx`.
     ///
     /// Everything but the endpoints is the record as it is stored; the endpoints are
-    /// composed for the address this request reached the emulator at
+    /// composed for the address this request reached the emulator at and for the socket
+    /// this deployment's contribution plane answers on
     /// ([`announced_stage_endpoints`]), because they are addresses a client then dials and
     /// this emulator is the thing serving the stage.
-    pub fn to_stage(&self, ctx: &::smithy_server_runtime::OperationContext<'_>) -> Stage {
+    ///
+    /// `contribute` is the `host:port` that plane answers at
+    /// ([`contribute_authority`], read off the store the caller already holds), or `None`
+    /// for a deployment that could open none.
+    pub fn to_stage(
+        &self,
+        ctx: &::smithy_server_runtime::OperationContext<'_>,
+        contribute: Option<&str>,
+    ) -> Stage {
         Stage {
             arn: self.arn.clone(),
             name: self.name.clone(),
@@ -1240,7 +1250,7 @@ impl StageRecord {
             auto_participant_recording_configuration: Some(
                 self.auto_participant_recording_configuration.clone(),
             ),
-            endpoints: Some(announced_stage_endpoints(ctx)),
+            endpoints: Some(announced_stage_endpoints(ctx, contribute)),
         }
     }
 
@@ -2875,6 +2885,17 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     /// ARN and held in start order — the order `ListParticipantReplicas` pages over.
     /// Removed when either stage a replica names is deleted.
     pub participant_replicas: HashMap<String, Vec<ParticipantReplicaRecord>>,
+    /// The socket this deployment's stage CONTRIBUTION plane answers RTMP and RTMPS on,
+    /// once a call that announces it has opened it, and the handle that keeps that port
+    /// open — see [`ensure_ingest_plane`]. One socket serves the whole deployment, because
+    /// the endpoints a stage announces carry no part of a stage's own identity and the
+    /// ingest key a publisher presents is what names the stage it publishes to.
+    pub ingest_plane: Option<StageIngestPlane>,
+    /// How many publish connections the contribution plane is serving for one participant
+    /// of one session right now ([`IngestPublishConnection`]). Redundant ingest publishes
+    /// one participant over more than one connection, so the participant leaves when the
+    /// last of them is gone; an entry lives exactly as long as a connection does.
+    pub ingest_publish_connections: HashMap<IngestPublishConnection, u32>,
     /// Monotonic counter behind every id this service mints, so two stages created
     /// in the same instant still get distinct ids and a distinct page position.
     next_id: u64,
@@ -4229,6 +4250,13 @@ pub fn mint_redundant_ingest_credentials(
 /// not a request to the emulator's API, so the emulator keeps no credential it would
 /// accept as SigV4 and nothing accumulates per call.
 ///
+/// What is minted is RENDERED in the URL-safe alphabet, through the tree's one base64url
+/// coder: the whole key is a PATH SEGMENT of the address an encoder is configured with
+/// (`rtmp(s)://<endpoint>/<streamKey>`, the value `StageEndpoints$rtmp`/`$rtmps` is dialed
+/// with), so a character that ends a path segment or begins a query would leave a key no
+/// encoder can present. The rendering changes none of the secret's bytes, so the key is as
+/// hard to guess as the secret the store minted.
+///
 /// `None` when the store minted no secret; see [`mint_ingest_credential`].
 pub fn mint_stream_key(
     credentials: &::emulator_server::CredentialStore,
@@ -4244,7 +4272,7 @@ pub fn mint_stream_key(
     Some(format!(
         "rt_{}_{region}_{participant_id}_{}",
         ::engine::emulator_account_id(),
-        secret?,
+        ::service_common::jwt::encode_base64url(secret?.as_bytes()),
     ))
 }
 
@@ -4396,11 +4424,13 @@ mod tests;
 
 // The parts this module is split into, each one concern of the store, re-exported so
 // every path a handler already uses (`crate::state::…`) keeps resolving.
+mod ingest_plane;
 mod page_tokens;
 mod recording_bucket;
 mod refusals;
 mod sessions;
 mod stage_endpoints;
+pub use ingest_plane::*;
 pub use page_tokens::*;
 pub use recording_bucket::*;
 pub use refusals::*;

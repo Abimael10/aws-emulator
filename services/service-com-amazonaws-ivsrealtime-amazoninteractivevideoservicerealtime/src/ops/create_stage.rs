@@ -203,6 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx);
+        // The RTMP and RTMPS endpoints every stage announces are served by a socket of
+        // this emulator's OWN, and the call that creates the thing an encoder contributes
+        // to is the call that has to be able to tell it where — so the address that socket
+        // is bound at is what this call announces. Opened once per deployment and before
+        // the store is read, because the bind is awaited and a store guard cannot be held
+        // across an await; a deployment that could open none announces no contribution
+        // address.
+        let contribute = crate::state::ensure_ingest_plane(&*self.engine, &state).await;
         let mut store = state.lock();
 
         // The configuration's documented defaults are applied, and the storage
@@ -284,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
         };
 
-        let stage = record.to_stage(ctx);
+        let stage = record.to_stage(ctx, contribute.as_deref());
         // Reported only when the request asked for tokens: the model's doc for
         // `participantTokens` is "Participant tokens attached to the stage. These
         // correspond to the participants in the request", so a request that named no

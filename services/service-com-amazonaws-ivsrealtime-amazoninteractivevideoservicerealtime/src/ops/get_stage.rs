@@ -162,8 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.arn,
             )
         })?;
+        // The contribution endpoints name the socket this deployment's contribution plane
+        // already answers on (`crate::state::contribute_authority`), read off the store
+        // this read already holds: a read opens no socket, so what a caller is told here is
+        // what the call that created the stage announced.
+        let contribute = crate::state::contribute_authority(&store).map(str::to_string);
         Ok(GetStageOutput {
-            stage: Some(record.to_stage(ctx)),
+            stage: Some(record.to_stage(ctx, contribute.as_deref())),
         })
     }
 }

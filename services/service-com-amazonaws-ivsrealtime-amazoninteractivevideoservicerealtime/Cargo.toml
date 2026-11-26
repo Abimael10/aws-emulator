@@ -44,6 +44,10 @@ pem = "3"
 spki = "0.7"
 # MD5 digest: a public key's fingerprint is the MD5 of its public key's DER.
 md-5 = "0.10"
+# The RTMP protocol: the handshake, the chunk stream and the AMF0 commands an encoder
+# publishing to a stage's `rtmp`/`rtmps` contribution endpoint speaks, which the stage
+# ingest listener serves the server half of (`state::ingest_plane`).
+rml_rtmp = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -52,6 +56,15 @@ emulator-core-build-support = { workspace = true }
 # Real key pairs for the public-key tests, so what they import is a genuine public key
 # rather than a hand-built byte string.
 rcgen = "0.13"
+# The RTMP protocol, for the PUBLISHER side of the stage contribution plane: the suite that
+# proves the announced `rtmp`/`rtmps` endpoints are dialable drives a real encoder's
+# handshake, commands and media messages over a socket.
+rml_rtmp = "0.8"
+# The CLIENT side of the TLS an `rtmps://` encoder opens on that announced address:
+# `rustls`/`tokio-rustls` run the handshake the core's own TLS server terminates, so the
+# suite drives the encrypted wire a broadcaster really dials. TEST-ONLY.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 # The storage-configuration suite mounts the service that OWNS a recording bucket beside
 # this one on a single engine — exactly as the assembled emulator does — because a create
 # resolves that bucket and amends its policy by calling it in process.

@@ -16569,11 +16569,14 @@ dependencies = [
  "pem",
  "rcgen",
  "ring",
+ "rml_rtmp",
+ "rustls",
  "serde_json",
  "service-com-amazonaws-s3-amazons3",
  "service-common",
  "spki 0.7.3",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

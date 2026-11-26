@@ -880,8 +880,8 @@ async fn an_active_configuration_cannot_be_updated() {
                 answer.body
             );
             let expected = format!(
-                "Resource: {configuration_arn} is in use: participant {participant_id} is \
-                 publishing with it to {stage}"
+                "Unable to mutate resource {configuration_arn} while participant is actively \
+                 publishing"
             );
             let message = member(&answer.body, "message");
             assert_eq!(

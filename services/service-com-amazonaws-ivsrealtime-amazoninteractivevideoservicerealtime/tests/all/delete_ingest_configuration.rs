@@ -585,10 +585,13 @@ async fn a_publishing_configuration_is_refused_without_force_and_deleted_with_it
                 "case {case:?} force={force:?}: expected ConflictException, got {response}"
             );
             let message = member(&response, "message");
-            assert!(
-                message.contains(&configuration_arn) && message.contains(&participant_id),
-                "case {case:?} force={force:?}: expected a refusal naming the configuration \
-                 and the publisher, got {message:?}"
+            let expected = format!(
+                "Unable to mutate resource {configuration_arn} while participant is actively \
+                 publishing"
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?} force={force:?}: expected {expected:?}, got {message:?}"
             );
             let (status, read) = emulator.get(&configuration_arn).await;
             assert_eq!(

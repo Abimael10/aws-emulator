@@ -502,22 +502,16 @@ pub fn stage_recording_active_message(
     )
 }
 
-/// How this service states a request to delete an ingest configuration a publisher is
-/// broadcasting with: it names the configuration, the participant publishing with it
-/// and the stage it publishes to, so the caller can see what is in use.
+/// How this service states a request to MUTATE an ingest configuration a publisher is
+/// broadcasting with (`ConflictException`, HTTP 409): one sentence naming the
+/// configuration the request addressed and what is being done with it — the ARN is the only
+/// variable part.
 ///
-/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
-/// deleting a resource can cause an inconsistent state"), so the sentence is built from
-/// the request and the store, the way every other refusal of this service is.
-pub fn ingest_configuration_publishing_message(
-    arn: &str,
-    participant_id: &str,
-    stage_arn: &str,
-) -> String {
-    format!(
-        "Resource: {arn} is in use: participant {participant_id} is publishing with it to \
-         {stage_arn}"
-    )
+/// The sentence the service was recorded answering a delete without `force` while a
+/// publisher is live; the same refusal governs the update ("an IngestConfiguration that is
+/// active cannot be updated"), so both operations answer it from here.
+pub fn ingest_configuration_publishing_message(arn: &str) -> String {
+    format!("Unable to mutate resource {arn} while participant is actively publishing")
 }
 
 // =============================================================================

@@ -10,18 +10,30 @@
 //! a client then DIALS — "the endpoint to be used for IVS real-time streaming using the
 //! WHIP protocol", the RTMP and RTMPS endpoints beside it, and the events endpoint
 //! (`smithy_query(query="shape",shape="StageEndpoints")`). A client does exactly what the
-//! member says: it caches the value and connects to it. So the HOST of each is the
-//! `host[:port]` this deployment answers on ([`announced_authority`]) rather than a name
-//! belonging to someone else.
+//! member says: it caches the value and connects to it. So the HOST of each is an address
+//! of this deployment's that answers the member's own protocol, rather than a name
+//! belonging to someone else: the event channel and the WHIP endpoint name the `host[:port]`
+//! this deployment answers HTTP on ([`announced_authority`]), the address their client
+//! already reached it at.
+//!
+//! The two CONTRIBUTION endpoints are the exception, and for the same reason: an
+//! `rtmp`/`rtmps` value is dialed by an ENCODER speaking RTMP, which the address this
+//! emulator answers HTTP on does not serve, so both name the socket this deployment's own
+//! contribution plane answers that protocol on ([`super::ingest_plane`], whose
+//! `host:port` the core assigns) — the one address a publisher outside this process can
+//! complete a handshake against. A deployment that could open no such plane announces
+//! neither member: an address nothing answers on is the one thing a member whose whole
+//! purpose is to be dialed may not carry.
 //!
 //! What stays fixed is each member's PROTOCOL: the scheme a client parses out of the value
 //! (`wss`, `https`, `rtmp`, `rtmps`) and the path that protocol dials under the host — the
 //! event channel and the WHIP endpoint are dialed at the host itself, while an RTMP or
 //! RTMPS contribution dials the application path both carry. Nothing of the stage's own
 //! identity is in any of them: which stage a connection joins is carried by the
-//! participant token the client presents on these endpoints (its audience is the stage's
-//! ARN), which is why the model's four endpoints are a summary a client may cache and
-//! reuse.
+//! participant token the client presents on the WHIP and events endpoints (its audience is
+//! the stage's ARN) and by the ingest key an encoder authenticates with on the two
+//! contribution endpoints, which is why the model's four endpoints are a summary a client
+//! may cache and reuse.
 //!
 //! All four are therefore composed at PROJECTION time, per request
 //! ([`announced_stage_endpoints`]), and none is stored: a stage reached at one address is
@@ -30,7 +42,9 @@
 //!
 //! Nothing here is ever CONNECTED to. This module formats strings into a response and holds
 //! no outbound client, socket or resolver; every address it composes is one of this
-//! process's own inbound addresses, so no value it reports leads off this machine.
+//! process's own inbound addresses — the address the request was answered on, and the
+//! socket the core bound for the contribution plane — so no value it reports leads off this
+//! machine.
 
 use crate::ops::types::StageEndpoints;
 
@@ -40,21 +54,28 @@ use crate::ops::types::StageEndpoints;
 const CONTRIBUTE_APPLICATION_PATH: &str = "/app/";
 
 /// The four endpoints every stage of this deployment announces, as this service reports
-/// them to the request in `ctx`.
+/// them to the request in `ctx`, contributed to on the plane open at `contribute`.
 ///
 /// Every operation that answers a `Stage` runs it through this, so the create, the read and
 /// the update all announce one set — which is what the model's "cache these values at stage
 /// creation" depends on.
+///
+/// `contribute` is the `host:port` this deployment's contribution plane answers RTMP and
+/// RTMPS on ([`super::contribute_authority`]), or `None` for a deployment that could open
+/// none — and then the stage announces no contribution address at all, for either member,
+/// because an address nothing answers on is the one thing a member whose whole purpose is
+/// to be dialed may not carry.
 #[must_use]
 pub fn announced_stage_endpoints(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
+    contribute: Option<&str>,
 ) -> StageEndpoints {
     let authority = announced_authority(ctx);
     StageEndpoints {
         events: Some(format!("wss://{authority}")),
         whip: Some(format!("https://{authority}")),
-        rtmp: Some(format!("rtmp://{authority}{CONTRIBUTE_APPLICATION_PATH}")),
-        rtmps: Some(format!("rtmps://{authority}{CONTRIBUTE_APPLICATION_PATH}")),
+        rtmp: contribute.map(|plane| format!("rtmp://{plane}{CONTRIBUTE_APPLICATION_PATH}")),
+        rtmps: contribute.map(|plane| format!("rtmps://{plane}{CONTRIBUTE_APPLICATION_PATH}")),
     }
 }
 

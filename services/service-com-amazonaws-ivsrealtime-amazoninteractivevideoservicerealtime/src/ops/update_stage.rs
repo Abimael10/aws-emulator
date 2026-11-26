@@ -234,9 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(configuration) = recording_configuration {
             record.auto_participant_recording_configuration = configuration;
         }
+        let updated = record.clone();
 
+        // The contribution endpoints name the socket this deployment's contribution plane
+        // already answers on, read off the store this update already holds, so the update
+        // announces exactly what the create announced.
+        let contribute = crate::state::contribute_authority(&store);
         Ok(UpdateStageOutput {
-            stage: Some(record.to_stage(ctx)),
+            stage: Some(updated.to_stage(ctx, contribute)),
         })
     }
 }

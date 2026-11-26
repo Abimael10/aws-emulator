@@ -213,16 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // now (`crate::state::ingest_configuration_publishers`, the lookup
         // `DeleteIngestConfiguration` refuses over too) — so the refusal and the state a
         // caller just read are one fact and not two.
-        if let Some(publisher) =
-            crate::state::ingest_configuration_publishers(&store, &record).first()
-        {
+        if !crate::state::ingest_configuration_publishers(&store, &record).is_empty() {
             return Err(crate::state::conflict(
                 UpdateIngestConfigurationErrorModeled::ConflictException,
-                crate::state::ingest_configuration_publishing_message(
-                    &input.arn,
-                    &publisher.participant_id,
-                    &record.stage_arn,
-                ),
+                crate::state::ingest_configuration_publishing_message(&input.arn),
             ));
         }
 
