@@ -18,6 +18,9 @@
 //! ARN the store does not hold at all, `ValidationException` (400) naming the
 //! `channelArn` member for a channel with no valid ad configuration associated, and only
 //! then `ChannelNotBroadcasting` (404) for a channel that is not ingesting.
+//! That order is a property of the REQUEST rather than of the channel's state, so it is
+//! exercised over the whole broadcast cycle of one channel as well — before any ingest,
+//! while it is ingesting, and after `StopStream`.
 //! The marker belongs to the broadcast, so it does not outlive it.
 //!
 //! No IVS operation reads an ad break back — the model has no such read
@@ -38,6 +41,9 @@ use service_com_amazonaws_ivs_amazoninteractivevideoservice::state;
 // The one harness for this crate's suites, declared in `channel_lifecycle.rs` and shared
 // by every suite here rather than copied.
 use super::channel_lifecycle::{text, Ivs, Reply, CHANNEL_ARN_PREFIX};
+// The broadcast-state sentence this service words one way, shared from the suite that holds
+// this crate's reading of every stated failure rather than written a second time here.
+use super::stated_failures::offline;
 
 /// The modelled bounds of `AdDurationSeconds` (`@range 1..300`, from
 /// `smithy_query(query="shape",shape="AdDurationSeconds")`).
@@ -532,28 +538,7 @@ async fn a_channel_with_no_ad_configuration_is_refused_before_its_broadcast_stat
 
     for (case, arn, duration) in cases {
         let reply = insert_ad_break(&ivs, &arn, duration).await;
-        assert_eq!(
-            (
-                reply.status,
-                reply.error_code.as_str(),
-                text(&reply.body, "message").as_str()
-            ),
-            (
-                400,
-                "ValidationException",
-                ad_configuration_required(&arn).as_str()
-            ),
-            "case {case:?}: expected 400 ValidationException {:?}, got {} {} {}",
-            ad_configuration_required(&arn),
-            reply.status,
-            reply.error_code,
-            reply.body
-        );
-        assert!(
-            reply.body.get("adBreakId").is_none(),
-            "case {case:?}: a refusal carries no adBreakId, got {}",
-            reply.body
-        );
+        assert_refused_for_its_ad_configuration(case, &reply, &arn);
         assert_eq!(
             stored_ad_break(&ivs, &arn),
             None,
@@ -586,6 +571,159 @@ async fn a_channel_with_no_ad_configuration_is_refused_before_its_broadcast_stat
             reply.status,
             reply.error_code,
             reply.body
+        );
+    }
+}
+
+/// Assert an insert was refused for the channel's AD CONFIGURATION: 400
+/// `ValidationException`, the service's member-constraint sentence naming the `channelArn`
+/// the request sent, and no marker reported back.
+fn assert_refused_for_its_ad_configuration(case: &str, reply: &Reply, arn: &str) {
+    assert_eq!(
+        (
+            reply.status,
+            reply.error_code.as_str(),
+            text(&reply.body, "message").as_str()
+        ),
+        (
+            400,
+            "ValidationException",
+            ad_configuration_required(arn).as_str()
+        ),
+        "case {case:?}: expected 400 ValidationException {:?}, got {} {} {}",
+        ad_configuration_required(arn),
+        reply.status,
+        reply.error_code,
+        reply.body
+    );
+    assert!(
+        reply.body.get("adBreakId").is_none(),
+        "case {case:?}: a refusal carries no adBreakId, got {}",
+        reply.body
+    );
+}
+
+/// The same precondition over the whole broadcast LIFECYCLE of one channel, rather than
+/// over one channel per state: because the refusal is on the request's own member, it can
+/// depend neither on where the channel stands in that cycle nor on how it got there. Each
+/// row is driven idle → ingesting → stopped and must answer the identical 400 at all three
+/// points; associating a configuration is then what moves the very same insert on to the
+/// broadcast-state rule, and ingesting again is what gets it served.
+#[tokio::test]
+async fn the_ad_configuration_refusal_does_not_depend_on_the_broadcast_lifecycle() {
+    let ivs = Ivs::new();
+    let ads = ad_configuration(&ivs, "lifecycle-ads").await;
+    // Well formed under the modelled `AdConfigurationArn` pattern and never minted, so the
+    // channel that names it has no configuration associated either.
+    let never_minted = "arn:aws:ivs:us-east-1:000000000000:ad-configuration/abcdef123456";
+
+    // Rows differ along HOW the channel comes to have no valid ad configuration and along
+    // the channel's own surface; the three points of the broadcast cycle are the inner
+    // sweep, each asking for a different duration so no two calls are the same request.
+    let cases: Vec<(&str, Value)> = vec![
+        ("the member absent", json!({ "name": "cycle_absent" })),
+        (
+            "the member sent empty",
+            json!({ "name": "cycle_empty", "latencyMode": "NORMAL",
+                    "adConfigurationArn": "" }),
+        ),
+        (
+            "an ad configuration that was never minted",
+            json!({ "name": "cycle_dangling", "type": "BASIC",
+                    "adConfigurationArn": never_minted }),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let arn = ivs.create_arn(request).await;
+
+        // Before any ingest: the channel has never been live.
+        let reply = insert_ad_break(&ivs, &arn, DURATION_MIN).await;
+        assert_refused_for_its_ad_configuration(&format!("{case}, before any ingest"), &reply, &arn);
+
+        // While the channel is genuinely ingesting, which `GetStream` reports as LIVE.
+        let ingesting = start_ingest(&ivs, &arn);
+        let stream = ivs.call("GetStream", &json!({ "channelArn": arn })).await;
+        assert_eq!(
+            (
+                stream.status,
+                text(&stream.body["stream"], "state").as_str()
+            ),
+            (200, "LIVE"),
+            "case {case:?}: the channel must be ingesting stream {ingesting} at the live point \
+             of the cycle, got {} {}",
+            stream.status,
+            stream.body
+        );
+        let reply = insert_ad_break(&ivs, &arn, 150).await;
+        assert_refused_for_its_ad_configuration(&format!("{case}, while LIVE"), &reply, &arn);
+
+        // And once that broadcast has been stopped again.
+        let stop = ivs.call("StopStream", &json!({ "channelArn": arn })).await;
+        assert_eq!(
+            stop.status, 200,
+            "case {case:?}: StopStream on the live channel must succeed, got {} {}",
+            stop.status, stop.body
+        );
+        let reply = insert_ad_break(&ivs, &arn, DURATION_MAX).await;
+        assert_refused_for_its_ad_configuration(&format!("{case}, after StopStream"), &reply, &arn);
+
+        assert_eq!(
+            stored_ad_break(&ivs, &arn),
+            None,
+            "case {case:?}: no point of the cycle may persist an ad break for {arn}"
+        );
+
+        // Associating a configuration is what gets past the precondition: the stopped
+        // channel then reaches the broadcast-state rule, and ingesting again takes the
+        // break against that configuration and that new stream.
+        let update = ivs
+            .call(
+                "UpdateChannel",
+                &json!({ "arn": arn, "adConfigurationArn": ads }),
+            )
+            .await;
+        assert_eq!(
+            update.status, 200,
+            "case {case:?}: UpdateChannel must associate the ad configuration, got {} {}",
+            update.status, update.body
+        );
+        let reply = insert_ad_break(&ivs, &arn, 30).await;
+        assert_eq!(
+            (
+                reply.status,
+                reply.error_code.as_str(),
+                text(&reply.body, "message").as_str()
+            ),
+            (
+                404,
+                "ChannelNotBroadcasting",
+                offline(&arn).as_str()
+            ),
+            "case {case:?}, associated and stopped: expected 404 ChannelNotBroadcasting {:?}, \
+             got {} {} {}",
+            offline(&arn),
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+        let live_again = start_ingest(&ivs, &arn);
+        let reply = insert_ad_break(&ivs, &arn, 30).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}, associated and ingesting: expected HTTP 200, got {} {}",
+            reply.status, reply.body
+        );
+        let id = text(&reply.body, "adBreakId");
+        assert!(
+            ad_break_id_is_well_formed(&id),
+            "case {case:?}: adBreakId must be 12 characters over ^[a-zA-Z0-9]+$, got {id:?}"
+        );
+        assert_eq!(
+            stored_ad_break(&ivs, &arn),
+            Some((id.clone(), 30, Some(ads.clone()), Some(live_again.clone()))),
+            "case {case:?}: the served break must be held against the channel's own ad \
+             configuration and its current stream"
         );
     }
 }

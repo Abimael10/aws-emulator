@@ -207,7 +207,11 @@ fn not_found(arn: &str) -> String {
 }
 
 /// The text the service states for an operation on a channel that is not ingesting.
-fn offline(arn: &str) -> String {
+///
+/// `pub(crate)` because it is one sentence this service words one way: the suite that drives
+/// the broadcast-state refusal of an ad break (`ad_break_insert.rs`) asserts the same text,
+/// and shares this reading rather than writing a second one.
+pub(crate) fn offline(arn: &str) -> String {
     format!("Channel: {arn} is not currently online")
 }
 
