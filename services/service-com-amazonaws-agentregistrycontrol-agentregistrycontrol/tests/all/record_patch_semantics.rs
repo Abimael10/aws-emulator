@@ -1787,7 +1787,7 @@ async fn the_custom_metadata_schema_may_only_be_widened() {
                 }),
                 declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
             ),
-            refusal: Some(vec!["owner", "defaultSchema"]),
+            refusal: Some(vec!["'owner'", "record type 'default schema'"]),
         },
         SchemaEvolutionRow {
             case: "a field nested inside an object field is removed",
@@ -1799,7 +1799,7 @@ async fn the_custom_metadata_schema_may_only_be_widened() {
                 }),
                 declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
             ),
-            refusal: Some(vec!["contact.email", "defaultSchema"]),
+            refusal: Some(vec!["'contact.email'", "record type 'default schema'"]),
         },
         SchemaEvolutionRow {
             case: "a field's type is changed",
@@ -1814,7 +1814,7 @@ async fn the_custom_metadata_schema_may_only_be_widened() {
                 }),
                 declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
             ),
-            refusal: Some(vec!["owner", "string", "integer"]),
+            refusal: Some(vec!["'owner'", "from 'string' to 'integer'"]),
         },
         SchemaEvolutionRow {
             case: "an allowed value is removed",
@@ -1829,17 +1829,17 @@ async fn the_custom_metadata_schema_may_only_be_widened() {
                 }),
                 declared_overrides(json!({ "environment": { "enum": ["dev", "prod"] } })),
             ),
-            refusal: Some(vec!["silver", "tier"]),
+            refusal: Some(vec!["enum value 'silver'", "field 'tier'"]),
         },
         SchemaEvolutionRow {
             case: "the schema of a record type is dropped",
             wanted: schema_configuration(declared_properties(), json!([])),
-            refusal: Some(vec!["environment", "record type CUSTOM"]),
+            refusal: Some(vec!["'environment'", "record type 'CUSTOM'"]),
         },
         SchemaEvolutionRow {
             case: "the whole configuration is cleared with an empty wrapper",
             wanted: Value::Null,
-            refusal: Some(vec!["contact", "defaultSchema"]),
+            refusal: Some(vec!["'contact'", "record type 'default schema'"]),
         },
     ];
 

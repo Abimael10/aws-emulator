@@ -44,12 +44,11 @@ const TYPE_KEYWORD: &str = "type";
 /// The keyword a JSON Schema enumerates a field's allowed values in.
 const ENUM_KEYWORD: &str = "enum";
 
-/// The configuration member carrying the schema that applies to every record type, as the
-/// model names it.
-const DEFAULT_SCHEMA_LABEL: &str = "defaultSchema";
-
-/// The configuration member carrying the per-record-type schemas, as the model names it.
-const RECORD_TYPE_SCHEMA_LABEL: &str = "recordTypeSchemaOverrides";
+/// How a refusal names the scope of the schema that applies to every record type. A refusal
+/// names a scope by the RECORD TYPE the withdrawn field was scoped to, and the schema
+/// `defaultSchema` carries is the one every record type is held to rather than one record
+/// type's own, so it is named in those words and not by the member it is carried in.
+const DEFAULT_SCHEMA_SCOPE: &str = "default schema";
 
 /// The most JSON nodes one schema may hold for this comparison to walk it. EMULATOR-chosen:
 /// the model bounds a schema's length, not its shape.
@@ -73,14 +72,12 @@ enum Scope {
 }
 
 impl Scope {
-    /// How a refusal names this scope: the configuration member it is carried in, and for a
-    /// per-record-type schema the record type it applies to.
-    fn label(&self) -> String {
+    /// How a refusal names this scope: the record type the schema's fields are scoped to, and
+    /// [`DEFAULT_SCHEMA_SCOPE`] for the schema every record type is held to.
+    fn label(&self) -> &str {
         match self {
-            Scope::EveryRecordType => DEFAULT_SCHEMA_LABEL.to_string(),
-            Scope::RecordType(record_type) => {
-                format!("{RECORD_TYPE_SCHEMA_LABEL} for record type {record_type}")
-            }
+            Scope::EveryRecordType => DEFAULT_SCHEMA_SCOPE,
+            Scope::RecordType(record_type) => record_type.as_str(),
         }
     }
 }
@@ -236,32 +233,33 @@ fn withdrawal(
 /// How this service refuses a schema replacement that withdraws something. The ONE place
 /// these sentences are written.
 ///
-/// The fixed text names what cannot be taken away; the variable parts are the scope the
-/// schema is carried in, the path of the field and the value or types concerned, all taken
-/// from the two configurations the request compared.
+/// The fixed text names what cannot be taken away; the variable parts are the path of the
+/// field, the value or types concerned, and the record type the schema is scoped to, all
+/// taken from the two configurations the request compared and each single-quoted, which is
+/// what makes them readable back out of the sentence.
 fn message(scope: &Scope, withdrawal: &Withdrawal) -> String {
     let scope = scope.label();
     match withdrawal {
         Withdrawal::Field { path } => format!(
-            "The custom metadata schema cannot remove field {path} from {scope}; fields can \
-             only be added."
+            "Cannot remove field '{path}' from record type '{scope}'. Schema evolution is \
+             additive-only."
         ),
         Withdrawal::Type { path, from, to } => format!(
-            "The custom metadata schema cannot change the type of field {path} in {scope} \
-             from {} to {}.",
+            "Cannot change the type of field '{path}' from '{}' to '{}' in record type \
+             '{scope}'. Schema evolution is additive-only.",
             render(from),
             render(to)
         ),
         Withdrawal::AllowedValue { path, value } => format!(
-            "The custom metadata schema cannot remove allowed value {} of field {path} in \
-             {scope}; allowed values can only be added.",
+            "Cannot remove enum value '{}' from field '{path}' in record type '{scope}'.",
             render(value)
         ),
     }
 }
 
-/// A schema value as a refusal quotes it: a JSON string unquoted, since that is how a type
-/// name or an enumerated value reads, and anything else as the JSON the schema wrote.
+/// A schema value as a refusal states it inside the single quotes it puts around it: a JSON
+/// string without its own quotes, since that is how a type name or an enumerated value
+/// reads, and anything else as the JSON the schema wrote.
 fn render(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),

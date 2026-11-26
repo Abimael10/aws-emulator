@@ -17,7 +17,14 @@
 //!   the conflicting name back out of the sentence;
 //! * a value outside its member's `@pattern` is refused with the expression that member
 //!   admits, quoted without the whole-value anchors the model wraps it in, and with no
-//!   value quoted at all.
+//!   value quoted at all;
+//! * a replacement custom-metadata schema configuration that withdraws a field, a field's
+//!   type or an allowed value is refused with the sentence for that withdrawal, naming the
+//!   record type the withdrawn declaration was scoped to — the configuration's
+//!   `defaultSchema` being the schema every record type is held to, so named `default
+//!   schema` and never by the member it is carried in — with the field path, the dropped
+//!   value and that scope each in SINGLE QUOTES, so a client reads them back out of the
+//!   sentence.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -564,5 +571,349 @@ async fn a_pattern_violation_states_the_unanchored_expression_and_quotes_no_valu
                 reply.message()
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// How a withdrawal from the custom-metadata schema configuration is worded.
+// ---------------------------------------------------------------------------------------
+
+/// How long a wait for a transition the clock owes may take before a test gives up.
+/// Generous on purpose: the wait is on the CONDITION, so a loaded or slow host only polls
+/// more times.
+const TRANSITION_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a poll loop pauses between two looks at a registry.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The schema every record type of the test registry is held to
+/// (`CustomMetadataSchemaConfiguration.defaultSchema`, a JSON Schema carried as a string):
+/// a boolean field, a string field with two enumerated values, and an object-valued field
+/// with a field of its own, so a replacement can withdraw a field, a nested field, a type
+/// and an allowed value.
+const DEFAULT_SCHEMA: &str = r#"{"type":"object","properties":{"critical":{"type":"boolean"},"environment":{"type":"string","enum":["dev","prod"]},"owner":{"type":"object","properties":{"team":{"type":"string"}}}},"required":["environment"]}"#;
+
+/// The same schema with the `critical` field dropped.
+const DEFAULT_SCHEMA_WITHOUT_CRITICAL: &str = r#"{"type":"object","properties":{"environment":{"type":"string","enum":["dev","prod"]},"owner":{"type":"object","properties":{"team":{"type":"string"}}}},"required":["environment"]}"#;
+
+/// The same schema with the field nested inside `owner` dropped.
+const DEFAULT_SCHEMA_WITHOUT_NESTED_TEAM: &str = r#"{"type":"object","properties":{"critical":{"type":"boolean"},"environment":{"type":"string","enum":["dev","prod"]},"owner":{"type":"object","properties":{}}},"required":["environment"]}"#;
+
+/// The same schema with `environment`'s enumerated values narrowed to one of the two.
+const DEFAULT_SCHEMA_NARROWED_ENUM: &str = r#"{"type":"object","properties":{"critical":{"type":"boolean"},"environment":{"type":"string","enum":["prod"]},"owner":{"type":"object","properties":{"team":{"type":"string"}}}},"required":["environment"]}"#;
+
+/// The same schema with `critical` declared as a string instead of a boolean.
+const DEFAULT_SCHEMA_RETYPED_CRITICAL: &str = r#"{"type":"object","properties":{"critical":{"type":"string"},"environment":{"type":"string","enum":["dev","prod"]},"owner":{"type":"object","properties":{"team":{"type":"string"}}}},"required":["environment"]}"#;
+
+/// The same schema with a field added and an allowed value added — the widening the
+/// operation's own documentation admits ("You can add fields and allowed values").
+const DEFAULT_SCHEMA_WIDENED: &str = r#"{"type":"object","properties":{"critical":{"type":"boolean"},"environment":{"type":"string","enum":["dev","prod","staging"]},"owner":{"type":"object","properties":{"team":{"type":"string"}}},"ticket":{"type":"string"}},"required":["environment"]}"#;
+
+/// The schema one record type is held to on top of the common attributes
+/// (`RecordTypeSchemaOverride.schema`).
+const AGENT_SCHEMA: &str = r#"{"type":"object","properties":{"tier":{"type":"string","enum":["gold","silver"]}}}"#;
+
+/// The same per-record-type schema with its only field dropped.
+const AGENT_SCHEMA_WITHOUT_TIER: &str = r#"{"type":"object","properties":{}}"#;
+
+/// The same per-record-type schema with `tier`'s enumerated values narrowed.
+const AGENT_SCHEMA_NARROWED_TIER: &str = r#"{"type":"object","properties":{"tier":{"type":"string","enum":["gold"]}}}"#;
+
+/// The same per-record-type schema with one more allowed value for `tier`.
+const AGENT_SCHEMA_WIDENED: &str = r#"{"type":"object","properties":{"tier":{"type":"string","enum":["gold","silver","bronze"]}}}"#;
+
+/// The schema a second record type is held to, so a replacement can also drop a whole
+/// per-record-type scope.
+const SKILL_SCHEMA: &str = r#"{"type":"object","properties":{"level":{"type":"integer"}}}"#;
+
+/// A `customMetadataSchemaConfiguration` carrying the schema every record type is held to
+/// (omitted when `default_schema` is `None`) and one `recordTypeSchemaOverrides` entry per
+/// `(recordType, schema)` pair. The record types are `RecordType`'s own
+/// (`smithy_query(query="shape", shape="RecordType")`: MCP | AGENT | CUSTOM | SKILL |
+/// GATEWAY).
+fn schema_configuration(default_schema: Option<&str>, overrides: &[(&str, &str)]) -> Value {
+    let mut configuration = serde_json::Map::new();
+    if let Some(schema) = default_schema {
+        configuration.insert("defaultSchema".to_string(), json!(schema));
+    }
+    if !overrides.is_empty() {
+        configuration.insert(
+            "recordTypeSchemaOverrides".to_string(),
+            Value::Array(
+                overrides
+                    .iter()
+                    .map(|(record_type, schema)| {
+                        json!({ "recordType": record_type, "schema": schema })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(configuration)
+}
+
+async fn get_registry(router: &MultiServiceRouter, registry_id: &str) -> Reply {
+    call(
+        router,
+        "GET",
+        &format!("/registries/{}", encode_label(registry_id)),
+        None,
+    )
+    .await
+}
+
+/// Look at a registry until it reports `wanted`, or give up at the deadline. The wait is on
+/// the CONDITION — a transition the clock owes — never on a fixed span.
+async fn registry_reaching(
+    router: &MultiServiceRouter,
+    case: &str,
+    registry_id: &str,
+    wanted: &str,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let reply = get_registry(router, registry_id).await;
+        if reply.str_field("status") == wanted {
+            return;
+        }
+        assert!(
+            started.elapsed() < TRANSITION_DEADLINE,
+            "case {case:?}: the registry never reached {wanted}, last answer {} {:?}",
+            reply.status,
+            reply.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Create a registry carrying `configuration` and wait until it is `READY`. Returns its id.
+async fn registry_with_schema(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    configuration: &Value,
+) -> String {
+    let created = call(
+        router,
+        "POST",
+        "/registries",
+        Some(json!({
+            "name": name,
+            "customMetadataSchemaConfiguration": configuration,
+        })),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "case {case:?}: CreateRegistry answers 202, got {} {:?}",
+        created.status, created.body
+    );
+    let registry_id = id_of(created.str_field("registryArn")).to_string();
+    registry_reaching(router, case, &registry_id, "READY").await;
+    registry_id
+}
+
+/// Ask `UpdateRegistry` to replace the registry's custom-metadata schema configuration.
+async fn replace_schema(
+    router: &MultiServiceRouter,
+    registry_id: &str,
+    configuration: &Value,
+) -> Reply {
+    call(
+        router,
+        "PATCH",
+        &format!("/registries/{}", encode_label(registry_id)),
+        Some(json!({
+            "customMetadataSchemaConfiguration": { "optionalValue": configuration },
+        })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_withdrawing_schema_replacement_is_refused_in_the_sentence_for_that_withdrawal() {
+    let router = router();
+    let overrides: [(&str, &str); 2] = [("AGENT", AGENT_SCHEMA), ("SKILL", SKILL_SCHEMA)];
+    let stored = schema_configuration(Some(DEFAULT_SCHEMA), &overrides);
+    let registry_id = registry_with_schema(
+        &router,
+        "the stored configuration",
+        "schema-evolution-wording",
+        &stored,
+    )
+    .await;
+
+    // Rows differ along WHAT the replacement withdraws (a field, a field nested inside an
+    // object-valued field, an allowed value, a field's type, a whole scope) and along WHICH
+    // scope it withdraws it from (the schema every record type is held to, and the schema of
+    // either of two record types) — the two things the sentence names.
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "a field dropped from the schema every record type is held to",
+            schema_configuration(Some(DEFAULT_SCHEMA_WITHOUT_CRITICAL), &overrides),
+            "Cannot remove field 'critical' from record type 'default schema'. Schema \
+             evolution is additive-only."
+                .to_string(),
+        ),
+        (
+            "a field nested inside an object-valued field dropped",
+            schema_configuration(Some(DEFAULT_SCHEMA_WITHOUT_NESTED_TEAM), &overrides),
+            "Cannot remove field 'owner.team' from record type 'default schema'. Schema \
+             evolution is additive-only."
+                .to_string(),
+        ),
+        (
+            "the schema every record type is held to dropped altogether",
+            schema_configuration(None, &overrides),
+            "Cannot remove field 'critical' from record type 'default schema'. Schema \
+             evolution is additive-only."
+                .to_string(),
+        ),
+        (
+            "an allowed value narrowed away from a common field",
+            schema_configuration(Some(DEFAULT_SCHEMA_NARROWED_ENUM), &overrides),
+            "Cannot remove enum value 'dev' from field 'environment' in record type \
+             'default schema'."
+                .to_string(),
+        ),
+        (
+            "a common field's declared type changed",
+            schema_configuration(Some(DEFAULT_SCHEMA_RETYPED_CRITICAL), &overrides),
+            "Cannot change the type of field 'critical' from 'boolean' to 'string' in \
+             record type 'default schema'. Schema evolution is additive-only."
+                .to_string(),
+        ),
+        (
+            "a field dropped from one record type's own schema",
+            schema_configuration(
+                Some(DEFAULT_SCHEMA),
+                &[("AGENT", AGENT_SCHEMA_WITHOUT_TIER), ("SKILL", SKILL_SCHEMA)],
+            ),
+            "Cannot remove field 'tier' from record type 'AGENT'. Schema evolution is \
+             additive-only."
+                .to_string(),
+        ),
+        (
+            "an allowed value narrowed away from one record type's own field",
+            schema_configuration(
+                Some(DEFAULT_SCHEMA),
+                &[
+                    ("AGENT", AGENT_SCHEMA_NARROWED_TIER),
+                    ("SKILL", SKILL_SCHEMA),
+                ],
+            ),
+            "Cannot remove enum value 'silver' from field 'tier' in record type 'AGENT'."
+                .to_string(),
+        ),
+        (
+            "one record type's scope dropped altogether",
+            schema_configuration(Some(DEFAULT_SCHEMA), &[("AGENT", AGENT_SCHEMA)]),
+            "Cannot remove field 'level' from record type 'SKILL'. Schema evolution is \
+             additive-only."
+                .to_string(),
+        ),
+    ];
+
+    for (case, replacement, expected) in rows {
+        let reply = replace_schema(&router, &registry_id, &replacement).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: a withdrawal is the modelled 400, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: expected ValidationException, got {:?}",
+            reply.error_code
+        );
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            reply.message()
+        );
+        assert!(
+            !reply.message().contains("defaultSchema")
+                && !reply.message().contains("recordTypeSchemaOverrides"),
+            "case {case:?}: a scope is named as a record type, not by the member it is \
+             carried in, got {:?}",
+            reply.message()
+        );
+        // The refusal happens before the registry is written, so the stored configuration is
+        // the one the create left and the registry is still usable.
+        let current = get_registry(&router, &registry_id).await;
+        assert_eq!(
+            current.body["customMetadataSchemaConfiguration"], stored,
+            "case {case:?}: a refused replacement leaves the stored configuration alone, \
+             got {:?}",
+            current.body["customMetadataSchemaConfiguration"]
+        );
+        assert_eq!(
+            current.str_field("status"),
+            "READY",
+            "case {case:?}: a refused replacement leaves the registry READY, got {:?}",
+            current.str_field("status")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_schema_replacement_that_withdraws_nothing_is_accepted_and_read_back() {
+    let router = router();
+    let overrides: [(&str, &str); 2] = [("AGENT", AGENT_SCHEMA), ("SKILL", SKILL_SCHEMA)];
+    let stored = schema_configuration(Some(DEFAULT_SCHEMA), &overrides);
+
+    // Rows differ along WHAT the replacement adds — a field, an allowed value of a common
+    // field, an allowed value of one record type's own field — and one row replaces the
+    // configuration with itself, which withdraws nothing either.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a field added to the schema every record type is held to",
+            "schema-widened-field",
+            schema_configuration(Some(DEFAULT_SCHEMA_WIDENED), &overrides),
+        ),
+        (
+            "an allowed value added to one record type's own field",
+            "schema-widened-enum",
+            schema_configuration(
+                Some(DEFAULT_SCHEMA),
+                &[("AGENT", AGENT_SCHEMA_WIDENED), ("SKILL", SKILL_SCHEMA)],
+            ),
+        ),
+        (
+            "a scope added for one more record type",
+            "schema-added-scope",
+            schema_configuration(
+                Some(DEFAULT_SCHEMA),
+                &[
+                    ("AGENT", AGENT_SCHEMA),
+                    ("SKILL", SKILL_SCHEMA),
+                    ("GATEWAY", SKILL_SCHEMA),
+                ],
+            ),
+        ),
+        (
+            "the configuration replaced with itself",
+            "schema-unchanged",
+            stored.clone(),
+        ),
+    ];
+
+    for (case, name, replacement) in rows {
+        let registry_id = registry_with_schema(&router, case, name, &stored).await;
+        let reply = replace_schema(&router, &registry_id, &replacement).await;
+        assert_eq!(
+            reply.status, 202,
+            "case {case:?}: a replacement that withdraws nothing is accepted, got {} {:?}",
+            reply.status, reply.body
+        );
+        registry_reaching(&router, case, &registry_id, "READY").await;
+        let current = get_registry(&router, &registry_id).await;
+        assert_eq!(
+            current.body["customMetadataSchemaConfiguration"], replacement,
+            "case {case:?}: the accepted configuration is what a later read reports, got {:?}",
+            current.body["customMetadataSchemaConfiguration"]
+        );
     }
 }
