@@ -88,12 +88,14 @@ pub use super::volume_data::{VolumeData, DATA_BLOCK_BYTES, MAX_VOLUME_GUEST_BYTE
 
 /// How many bytes ONE copy may move at once ([`COPY_PROGRAM`]).
 ///
-/// The EMULATOR's own bound, and the one that dominates every allocation a copy makes: the
-/// invocation is caller-supplied text, so what one of them can make this process materialise — the
-/// bytes read off a device, the bytes a destination is grown to — is bounded here rather than by
-/// the device's own size or by the offsets the operands name. A copy asking for more moves this
-/// much and reports a short transfer, the way a device at its end answers one.
-pub const MAX_VOLUME_TRANSFER_BYTES: usize = 32 * 1024 * 1024;
+/// The bytes one copy materialises — the bytes read off a device, the bytes a destination is grown
+/// to — are bounded, the invocation being caller-supplied text; and they are bounded by what the
+/// DEVICE can take and by nothing smaller: as much as one volume holds for its guest
+/// ([`MAX_VOLUME_GUEST_BYTES`]), which is the one ceiling a copy through a device meets. So a copy
+/// moves every byte the invocation asked for wherever the device has room for them, and reports a
+/// short transfer only where it has none — the way a device at its end answers one — rather than
+/// cutting a transfer the device could have taken whole.
+pub const MAX_VOLUME_TRANSFER_BYTES: usize = MAX_VOLUME_GUEST_BYTES;
 
 /// How many bytes one RUN of a guest's programs may move through its devices and its storage in
 /// TOTAL.
@@ -1475,12 +1477,15 @@ mod tests {
         // script carries cannot multiply what one request makes this process materialise: once it
         // is spent, a copy answers the way one at the end of a device does.
         let full_size_copies = MAX_GUEST_RUN_TRANSFER_BYTES / MAX_VOLUME_TRANSFER_BYTES;
+        // One copy of the full size a copy may move, stated in the mebibyte blocks the invocation
+        // asks for it in, so the loop below spends the budget at the rate the bound itself sets.
+        let full_size = format!("count={}", MAX_VOLUME_TRANSFER_BYTES / (1024 * 1024));
         let mut performed_copies = 0_usize;
         let spent = loop {
             let moved = run(
                 &vast,
                 &mut tree,
-                &["dd", "if=/dev/zero", "of=/dev/null", "bs=1M", "count=32"],
+                &["dd", "if=/dev/zero", "of=/dev/null", "bs=1M", &full_size],
             );
             if moved.status != SUCCESS {
                 break moved;
