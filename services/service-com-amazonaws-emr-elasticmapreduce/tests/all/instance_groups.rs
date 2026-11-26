@@ -44,6 +44,21 @@ const MAX_INSTANCE_GROUPS_PER_CLUSTER: usize = 50;
 const MAX_EBS_VOLUMES_PER_INSTANCE: i64 = 25;
 const MAX_EBS_BLOCK_DEVICE_CONFIGS: usize = 25;
 
+/// The default Amazon EBS layout Amazon EMR attaches to every instance of a collection
+/// whose configuration declared no volume, as `(device, volume type)` per volume: the
+/// volumes are general-purpose SSD, their count follows the instance size — one for a
+/// `large`, two for an `xlarge`, four from `2xlarge` up — and they are named from
+/// `/dev/sdb` because `/dev/sda` is the root volume (the Amazon EMR Management Guide's
+/// default Amazon EBS storage table, which `crate::state`'s launch defaults are declared
+/// from).
+const DEFAULT_EBS_TWO: &[(&str, &str)] = &[("/dev/sdb", "gp2"), ("/dev/sdc", "gp2")];
+const DEFAULT_EBS_FOUR: &[(&str, &str)] = &[
+    ("/dev/sdb", "gp2"),
+    ("/dev/sdc", "gp2"),
+    ("/dev/sdd", "gp2"),
+    ("/dev/sde", "gp2"),
+];
+
 /// Cluster ids no cluster carries: the shape a real id has, a prefix with nothing after
 /// it, the empty string (`ClusterId` is `len 0..256`, so the boundary validator passes it
 /// on to the handler) and a value that is no cluster id at all.
@@ -82,6 +97,8 @@ impl Expected {
             bid_price: None,
             name: None,
             custom_ami_id: None,
+            // A group that configured no volume is attached the default layout of its
+            // instance type, which every row that leaves this out states for itself.
             ebs_devices: &[],
             ebs_optimized: None,
             configuration_classifications: &[],
@@ -224,11 +241,18 @@ fn assert_group(case: &str, expected: &Expected, got: &Value) {
         ),
     }
 
-    // Nothing has reconfigured or resized this group, so it carries no configuration
-    // version and no shrink policy.
-    assert!(
-        got["ConfigurationsVersion"].is_null() && got["ShrinkPolicy"].is_null(),
-        "case {case:?}: an unmodified group carries no version and no shrink policy, got {got}"
+    // Nothing has reconfigured or resized this group, so the specification it requests is
+    // the version before any reconfiguration and it customizes no shrink — both reported,
+    // as the zero version and the empty structure, rather than left out.
+    assert_eq!(
+        got["ConfigurationsVersion"].as_i64(),
+        Some(0),
+        "case {case:?}: an unreconfigured group requests version 0, got {got}"
+    );
+    assert_eq!(
+        got["ShrinkPolicy"].as_object().map(|policy| policy.len()),
+        Some(0),
+        "case {case:?}: an unresized group reports the empty shrink policy, got {got}"
     );
 }
 
@@ -312,12 +336,14 @@ fn configured_expectations() -> Vec<Expected> {
     vec![
         Expected {
             name: Some("primary"),
+            ebs_devices: DEFAULT_EBS_TWO,
             ..Expected::group("MASTER", "m5.xlarge", 1)
         },
         Expected {
             market: "SPOT",
             bid_price: Some("0.10"),
             configuration_classifications: &["spark-defaults"],
+            ebs_devices: DEFAULT_EBS_TWO,
             ..Expected::group("CORE", "r5.xlarge", 2)
         },
         Expected {
@@ -362,7 +388,10 @@ async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with(
             instances: json!({ "InstanceCount": 1, "MasterInstanceType": "m5.xlarge" }),
             // "The number of Amazon EC2 instances in the cluster" is one, and that one
             // is the master.
-            expected: vec![Expected::group("MASTER", "m5.xlarge", 1)],
+            expected: vec![Expected {
+                ebs_devices: DEFAULT_EBS_TWO,
+                ..Expected::group("MASTER", "m5.xlarge", 1)
+            }],
         },
         Case {
             label: "uniform form, three nodes",
@@ -374,8 +403,14 @@ async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with(
             }),
             // One instance is the master; the core and task nodes hold the rest.
             expected: vec![
-                Expected::group("MASTER", "m5.xlarge", 1),
-                Expected::group("CORE", "m5.2xlarge", 2),
+                Expected {
+                    ebs_devices: DEFAULT_EBS_TWO,
+                    ..Expected::group("MASTER", "m5.xlarge", 1)
+                },
+                Expected {
+                    ebs_devices: DEFAULT_EBS_FOUR,
+                    ..Expected::group("CORE", "m5.2xlarge", 2)
+                },
             ],
         },
         Case {
@@ -383,7 +418,10 @@ async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with(
             instances: json!({ "InstanceCount": 2, "MasterInstanceType": "m5.4xlarge" }),
             // Nothing in the request says what to provision the core nodes as, so the
             // cluster carries only the master group.
-            expected: vec![Expected::group("MASTER", "m5.4xlarge", 1)],
+            expected: vec![Expected {
+                ebs_devices: DEFAULT_EBS_FOUR,
+                ..Expected::group("MASTER", "m5.4xlarge", 1)
+            }],
         },
         Case {
             label: "configured groups, all three roles",

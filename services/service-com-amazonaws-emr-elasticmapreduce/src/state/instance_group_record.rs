@@ -272,20 +272,24 @@ impl InstanceGroupRecord {
             requested_instance_count: Some(self.config.instance_count),
             running_instance_count: Some(self.running_instance_count()),
             status: Some(self.to_status()),
-            // Served with the property map every configuration carries; an empty list is
-            // left absent for the reason [`instance_type_specification`] states.
-            configurations: self
-                .config
-                .configurations
-                .as_deref()
-                .map(served_configurations)
-                .filter(|configurations| !configurations.is_empty()),
+            // Served with the property map every configuration carries, and served even
+            // when the group holds none: a group reports the specification it requests as
+            // the EMPTY list rather than leaving the member out, so a client iterating it
+            // has no missing collection to special-case.
+            configurations: Some(
+                self.config
+                    .configurations
+                    .as_deref()
+                    .map(served_configurations)
+                    .unwrap_or_default(),
+            ),
             // The configuration versions are what a RECONFIGURATION moves ("the version
             // number of the requested configuration specification"), so a group nothing
-            // has reconfigured carries none, and the ones last SUCCESSFULLY APPLIED are
-            // the specification of the last reconfiguration the clock has made applied —
-            // not the one still in flight.
-            configurations_version: self.configurations_version,
+            // has reconfigured requests version zero — the version before any
+            // reconfiguration — and the ones last SUCCESSFULLY APPLIED are the
+            // specification of the last reconfiguration the clock has made applied, which
+            // a group that has had none carries nothing of at all.
+            configurations_version: Some(self.configurations_version.unwrap_or(0)),
             last_successfully_applied_configurations: self
                 .last_successfully_applied_configurations
                 .as_deref()
@@ -293,17 +297,21 @@ impl InstanceGroupRecord {
                 .filter(|configurations| !configurations.is_empty()),
             last_successfully_applied_configurations_version: self
                 .last_successfully_applied_configurations_version,
-            ebs_block_devices: optional_list(&ebs_block_devices(
-                self.config.ebs_configuration.as_ref(),
-            )),
+            // One device per volume every instance of this group is attached, which is the
+            // layout the group configured or the DEFAULT layout of its instance type
+            // ([`group_ebs_block_devices`]) — the same rule a fleet's instance type is
+            // served by.
+            ebs_block_devices: Some(group_ebs_block_devices(&self.config)),
             ebs_optimized: self
                 .config
                 .ebs_configuration
                 .as_ref()
                 .and_then(|configuration| configuration.ebs_optimized),
             // "Policy for customizing shrink operations" — a shrink policy arrives with a
-            // `ModifyInstanceGroups` resize, so a group nobody has resized carries none.
-            shrink_policy: self.shrink_policy.clone(),
+            // `ModifyInstanceGroups` resize, and a group nobody has resized is served the
+            // EMPTY structure rather than no member at all, so a client dereferencing it
+            // reads a policy that customizes nothing.
+            shrink_policy: Some(self.shrink_policy.clone().unwrap_or_default()),
             auto_scaling_policy: self.to_auto_scaling_policy(),
             custom_ami_id: self.config.custom_ami_id.clone(),
         }

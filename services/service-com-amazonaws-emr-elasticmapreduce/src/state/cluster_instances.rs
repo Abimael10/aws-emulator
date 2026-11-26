@@ -277,8 +277,8 @@ pub struct InstanceLaunch {
     pub market: String,
     pub count: i32,
     /// The Amazon EBS block devices the collection maps onto EVERY one of its instances
-    /// ([`super::ebs_block_devices`]): "the block device mapping, which defines the EBS
-    /// volumes … to attach to the instance at launch"
+    /// ([`super::collection_ebs_block_devices`]): "the block device mapping, which defines
+    /// the EBS volumes … to attach to the instance at launch"
     /// (`RunInstancesRequest$BlockDeviceMappings` doc, Amazon EC2 model) is what the launch
     /// states them as, so each instance holds the volumes its collection asked for from the
     /// moment Amazon EC2 launched it.
@@ -322,7 +322,11 @@ pub fn group_launch(group: &InstanceGroupRecord) -> Option<InstanceLaunch> {
         instance_type: group.config.instance_type.clone(),
         market: group.market().to_string(),
         count,
-        ebs_devices: ebs_block_devices(group.config.ebs_configuration.as_ref()),
+        // The devices every instance of this group is attached, by the one rule both
+        // collection types name their devices by
+        // ([`super::collection_ebs_block_devices`]): the layout the group configured, or
+        // the default layout of its instance type when it configured none.
+        ebs_devices: group_ebs_block_devices(&group.config),
         ebs_optimized: group
             .config
             .ebs_configuration

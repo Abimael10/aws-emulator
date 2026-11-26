@@ -324,26 +324,32 @@ pub fn effective_resize_specifications(
     Some(specifications)
 }
 
-/// The Amazon EBS block devices one instance of a fleet's instance type is attached.
+/// The Amazon EBS block devices one instance of `instance_type` is attached, for a
+/// collection that configured `configuration`.
 ///
-/// An `InstanceTypeConfig` whose `EbsConfiguration` declares block devices gets exactly
-/// the volumes it requested, one `EbsBlockDevice` per requested volume
-/// ([`ebs_block_devices`]) — so a configuration that requested none of a declared device
-/// keeps that answer. One that declares no block device at all gets the DEFAULT layout of
-/// its instance type ([`default_ebs_volume_specifications`]), which is what the service
-/// attaches so the instance has storage to run on. Both forms are named in the same
-/// `/dev/sd…` sequence, so an instance type's devices read the same whoever chose the
-/// volumes.
-pub fn fleet_ebs_block_devices(config: &InstanceTypeConfig) -> Vec<EbsBlockDevice> {
-    let declares_devices = config
-        .ebs_configuration
-        .as_ref()
+/// A collection whose `EbsConfiguration` declares block devices gets exactly the volumes
+/// it requested, one `EbsBlockDevice` per requested volume ([`ebs_block_devices`]) — so a
+/// configuration that requested none of a declared device keeps that answer. One that
+/// declares no block device at all gets the DEFAULT layout of its instance type
+/// ([`default_ebs_volume_specifications`]), which is what the service attaches so the
+/// instance has storage to run on. Both forms are named in the same `/dev/sd…` sequence,
+/// so an instance type's devices read the same whoever chose the volumes.
+///
+/// A collection is an instance GROUP or one instance type of an instance FLEET: both state
+/// their storage as the same `EbsConfiguration` and both are provisioned by the same
+/// service, so one rule answers for either ([`group_ebs_block_devices`],
+/// [`fleet_ebs_block_devices`]).
+pub fn collection_ebs_block_devices(
+    instance_type: &str,
+    configuration: Option<&EbsConfiguration>,
+) -> Vec<EbsBlockDevice> {
+    let declares_devices = configuration
         .and_then(|configuration| configuration.ebs_block_device_configs.as_deref())
         .is_some_and(|configs| !configs.is_empty());
     if declares_devices {
-        return ebs_block_devices(config.ebs_configuration.as_ref());
+        return ebs_block_devices(configuration);
     }
-    default_ebs_volume_specifications(&config.instance_type)
+    default_ebs_volume_specifications(instance_type)
         .into_iter()
         .enumerate()
         .map(|(index, volume_specification)| EbsBlockDevice {
@@ -351,6 +357,18 @@ pub fn fleet_ebs_block_devices(config: &InstanceTypeConfig) -> Vec<EbsBlockDevic
             device: Some(ebs_device_name(index)),
         })
         .collect()
+}
+
+/// The Amazon EBS block devices one instance of a fleet's instance type is attached
+/// ([`collection_ebs_block_devices`]).
+pub fn fleet_ebs_block_devices(config: &InstanceTypeConfig) -> Vec<EbsBlockDevice> {
+    collection_ebs_block_devices(&config.instance_type, config.ebs_configuration.as_ref())
+}
+
+/// The Amazon EBS block devices one instance of the instance GROUP `config` is attached
+/// ([`collection_ebs_block_devices`]).
+pub fn group_ebs_block_devices(config: &InstanceGroupConfig) -> Vec<EbsBlockDevice> {
+    collection_ebs_block_devices(&config.instance_type, config.ebs_configuration.as_ref())
 }
 
 /// The Amazon EBS volume type the default layout is made of.

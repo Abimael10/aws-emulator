@@ -72,9 +72,20 @@ struct Group {
     bid_price: Option<&'static str>,
     name: Option<&'static str>,
     classifications: &'static [&'static str],
-    /// The device name of each EBS volume the group requested, in configuration order.
+    /// The device name of each EBS volume the group's instances are attached, in
+    /// configuration order: the ones its `EbsConfiguration` requested, or the default
+    /// layout of its instance type when it requested none.
     ebs_devices: &'static [&'static str],
 }
+
+/// The default Amazon EBS layout Amazon EMR attaches to every instance of a group whose
+/// configuration declared no volume, by instance size: general-purpose SSD volumes, one
+/// for a `large`, two for an `xlarge` and four from `2xlarge` up (the Amazon EMR
+/// Management Guide's default Amazon EBS storage table, which `crate::state`'s launch
+/// defaults are declared from), named from `/dev/sdb` because `/dev/sda` is the root
+/// volume.
+const DEFAULT_EBS_LARGE: &[&str] = &["/dev/sdb"];
+const DEFAULT_EBS_XLARGE: &[&str] = &["/dev/sdb", "/dev/sdc"];
 
 impl Group {
     const fn of(role: &'static str, instance_type: &'static str, count: i64) -> Self {
@@ -86,7 +97,10 @@ impl Group {
             bid_price: None,
             name: None,
             classifications: &[],
-            ebs_devices: &[],
+            // Every `Group::of` row below provisions an `xlarge`, whose default layout is
+            // two volumes; a row at another size, or one that requested volumes of its
+            // own, states its own devices.
+            ebs_devices: DEFAULT_EBS_XLARGE,
         }
     }
 }
@@ -337,7 +351,10 @@ async fn add_instance_groups_appends_every_submitted_group_and_a_listing_reads_t
                     bid_price: Some("0.10"),
                     ..Group::of("CORE", "r5.xlarge", 2)
                 },
-                Group::of("TASK", "m5.large", 1),
+                Group {
+                    ebs_devices: DEFAULT_EBS_LARGE,
+                    ..Group::of("TASK", "m5.large", 1)
+                },
             ],
             added: 2,
         },

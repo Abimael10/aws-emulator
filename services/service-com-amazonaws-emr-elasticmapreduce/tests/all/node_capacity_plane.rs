@@ -15,8 +15,9 @@
 //! * a collection's `EbsConfiguration` asks the LAUNCH for so many Amazon EBS volumes per
 //!   instance, so every node of it holds one volume per requested device and `ListInstances`
 //!   reports each as an `Instance$EbsVolumes` entry naming the device and the volume Amazon
-//!   EC2 minted — with the size and type the `VolumeSpecification` asked for, and the
-//!   cluster's `EbsRootVolumeSize` on the node's root device;
+//!   EC2 minted — with the size and type the `VolumeSpecification` asked for, the default
+//!   layout of the instance type where the collection configured none, and the cluster's
+//!   `EbsRootVolumeSize` on the node's root device;
 //! * the instances a collection holds follow its TARGET: whatever moves that target, Amazon
 //!   EMR provisions instances up to it and releases the ones past it, and `ListInstances`
 //!   reports exactly the ones Amazon EC2 holds;
@@ -246,7 +247,8 @@ async fn volumes_of(
 /// per instance, so every node of it holds one volume per requested device — reported as an
 /// `Instance$EbsVolumes` entry naming the device and the volume Amazon EC2 minted, with the
 /// size and type the `VolumeSpecification` asked for — and a collection that configures none
-/// reports none.
+/// holds the DEFAULT layout of its instance type, which is what Amazon EMR attaches so the
+/// node has storage to run on.
 ///
 /// The table spans the request shape: how many volumes per instance (one, two, three), the
 /// volume type and size asked for (`gp2`, `gp3`, `st1` — three of the types
@@ -309,7 +311,10 @@ async fn an_ebs_configuration_provisions_the_volumes_every_node_of_the_collectio
             label: "a collection that configures no Amazon EBS volume",
             role: "CORE",
             ebs: None,
-            expected: Vec::new(),
+            // The default layout of an `xlarge` ([`INSTANCE_TYPE`]): two general-purpose
+            // SSD volumes of 32 GiB, from the Amazon EMR Management Guide's default
+            // Amazon EBS storage table.
+            expected: vec![("/dev/sdb", 32, "gp2"), ("/dev/sdc", 32, "gp2")],
         },
     ];
 
@@ -362,13 +367,6 @@ async fn an_ebs_configuration_provisions_the_volumes_every_node_of_the_collectio
             case.expected.len()
         );
         if case.expected.is_empty() {
-            // A collection that asks for no volume leaves the member absent, the way its
-            // group's own `EbsBlockDevices` is left absent.
-            assert!(
-                node["EbsVolumes"].is_null(),
-                "case {:?}: a node whose collection configured no volume reports none, got {node}",
-                case.label
-            );
             continue;
         }
 
