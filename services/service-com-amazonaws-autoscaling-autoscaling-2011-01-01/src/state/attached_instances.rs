@@ -316,6 +316,9 @@ impl AutoScalingState {
                     // ([`super::suspended_processes::PROCESS_ADD_TO_LOAD_BALANCER`]) — so
                     // nothing is withheld from it.
                     load_balancer_registration_withheld: false,
+                    // An attach takes an instance that was running in Amazon EC2 on its own
+                    // into the group, so that is where this instance has come from.
+                    arrived_from: super::LifecycleEndpoint::Ec2,
                 })
             })
             .collect();

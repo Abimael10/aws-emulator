@@ -110,15 +110,110 @@ pub const INSTANCE_TERMINATE_UNSUCCESSFUL: &str = "EC2 Instance Terminate Unsucc
 pub const DEFAULT_EVENT_BUS: &str = "default";
 
 /// Amazon EC2 itself, as one end of the move a lifecycle step made: where an instance a
-/// group launched came FROM, and where one it scaled in went TO.
+/// group launched from cold came FROM, and where one it scaled in went TO.
 ///
-/// Fixed text naming a place an instance can be, never a value of the request: the pair of
-/// endpoints is read off the direction of the step alone
-/// ([`InstanceLifecycle::origin`], [`InstanceLifecycle::destination`]).
+/// Fixed text naming a place an instance can be, never a value of the request: WHICH two of
+/// those places one step moves between is read off the step and the group's own state
+/// ([`InstanceMove`]).
 pub const LIFECYCLE_ENDPOINT_EC2: &str = "EC2";
 
-/// The group itself, as the other end of both of those moves.
+/// The group itself, as the end of a move that brings an instance into service — and the
+/// start of one that takes it out.
 pub const LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP: &str = "AutoScalingGroup";
+
+/// The group's WARM POOL, as the third such place: the pool holds "a pool of
+/// pre-initialized EC2 instances" of the group ([`super::warm_pools`]), so an instance the
+/// group takes into service out of its pool comes from there rather than from Amazon EC2,
+/// and one the pool prepares goes there rather than into the group.
+pub const LIFECYCLE_ENDPOINT_WARM_POOL: &str = "WarmPool";
+
+/// One PLACE an instance of a group can stand, which is one end of the move a lifecycle
+/// step makes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleEndpoint {
+    /// Amazon EC2 itself, outside the group altogether.
+    Ec2,
+    /// In service in the group.
+    AutoScalingGroup,
+    /// Prepared in the group's warm pool.
+    WarmPool,
+}
+
+impl LifecycleEndpoint {
+    /// This place as an event's `detail.Origin` / `detail.Destination` names it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ec2 => LIFECYCLE_ENDPOINT_EC2,
+            Self::AutoScalingGroup => LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP,
+            Self::WarmPool => LIFECYCLE_ENDPOINT_WARM_POOL,
+        }
+    }
+}
+
+/// The two ENDS of the move one lifecycle step makes with one instance: where the instance
+/// is coming FROM and where it is going TO.
+///
+/// What a consumer branches on — an EventBridge rule whose pattern filters `detail.Origin`
+/// or `detail.Destination` — so it is read off the step and the group's own state for that
+/// instance ([`AutoScalingState::instance_move`]) and never off anything in the request: a
+/// group that launches an instance from cold takes it from Amazon EC2 into itself, a group
+/// that draws on its warm pool takes the same instance from that pool, and a group that
+/// takes one out of service hands it back to Amazon EC2 from wherever it stood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceMove {
+    /// Where the instance came from.
+    pub origin: LifecycleEndpoint,
+    /// Where it is going.
+    pub destination: LifecycleEndpoint,
+}
+
+impl InstanceMove {
+    /// The move a step of `kind` makes for an instance whose two ends this store cannot
+    /// name: the plain move of that direction, between Amazon EC2 and the group.
+    ///
+    /// What a step that moved no instance at all reports (a launch the account could not
+    /// place has no instance to read a place off), and the floor under a step whose
+    /// instance the group no longer holds.
+    #[must_use]
+    pub fn of_step(kind: InstanceLifecycle) -> Self {
+        match kind {
+            InstanceLifecycle::Launched => Self {
+                origin: LifecycleEndpoint::Ec2,
+                destination: LifecycleEndpoint::AutoScalingGroup,
+            },
+            InstanceLifecycle::Terminated => Self {
+                origin: LifecycleEndpoint::AutoScalingGroup,
+                destination: LifecycleEndpoint::Ec2,
+            },
+        }
+    }
+
+    /// The move a step of `kind` makes for an instance that ARRIVED where it now stands
+    /// from `arrived_from` and is standing in `standing_in`.
+    ///
+    /// A step that brings an instance IN ends where the instance now stands and starts
+    /// where it came from, so a member the group took out of its warm pool reports that
+    /// pool as its origin. A step that takes one OUT starts where it stands and ends in
+    /// Amazon EC2, which is where an instance leaving a group goes.
+    #[must_use]
+    pub fn of_instance(
+        kind: InstanceLifecycle,
+        arrived_from: LifecycleEndpoint,
+        standing_in: LifecycleEndpoint,
+    ) -> Self {
+        match kind {
+            InstanceLifecycle::Launched => Self {
+                origin: arrived_from,
+                destination: standing_in,
+            },
+            InstanceLifecycle::Terminated => Self {
+                origin: standing_in,
+                destination: LifecycleEndpoint::Ec2,
+            },
+        }
+    }
+}
 
 /// How many lifecycle events the queue holds at once.
 ///
@@ -252,31 +347,6 @@ impl InstanceLifecycle {
         }
     }
 
-    /// Where the instance this step moved came FROM — the event's `detail.Origin`.
-    ///
-    /// A step moves an instance between two places, and which two is decided by the step's
-    /// DIRECTION alone: a group that launches one takes it from Amazon EC2 into itself, and
-    /// a group that scales one in hands it back to Amazon EC2. So the pair is fixed text
-    /// per direction, with nothing of the request in it, and the two reads are each other's
-    /// reverse.
-    #[must_use]
-    pub fn origin(self) -> &'static str {
-        match self {
-            Self::Launched => LIFECYCLE_ENDPOINT_EC2,
-            Self::Terminated => LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP,
-        }
-    }
-
-    /// Where it went — the event's `detail.Destination`, the other end of the same move
-    /// ([`Self::origin`]).
-    #[must_use]
-    pub fn destination(self) -> &'static str {
-        match self {
-            Self::Launched => LIFECYCLE_ENDPOINT_AUTO_SCALING_GROUP,
-            Self::Terminated => LIFECYCLE_ENDPOINT_EC2,
-        }
-    }
-
     /// The `Activity$Description` the scaling activity for this step carries, naming the
     /// instance it moved — the one wording for it in this crate, so the activity log and
     /// the event agree about what happened.
@@ -340,6 +410,10 @@ pub struct PendingLifecycleEvent {
     /// ([`StepOutcome`]): a step is queued as one that is going to complete and re-marked
     /// where it turns out not to have ([`AutoScalingState::settle_held_step`]).
     pub outcome: StepOutcome,
+    /// The two ENDS of the move this step made with the instance — the event's
+    /// `detail.Origin` and `detail.Destination` — read from the group's own state for the
+    /// instance when the step was recorded ([`AutoScalingState::instance_move`]).
+    pub instance_move: InstanceMove,
     /// The Amazon SNS topics the group's notification configurations selected this step
     /// for when it was recorded, which is where its notifications go
     /// ([`super::sns_notifications`]). Empty for a group configured for no topic, or for
@@ -459,6 +533,48 @@ pub struct FailedLifecycleStep<'a> {
 }
 
 impl AutoScalingState {
+    /// The two ENDS of the move a step of `kind` makes with `instance_id` of `group_name`.
+    ///
+    /// THE ONE reading of a step's `Origin` and `Destination`, so the event announcing a
+    /// hold ([`super::lifecycle_actions`]) and the event reporting the settled step cannot
+    /// disagree about which move the instance is on. It is read off the group's OWN state
+    /// for that instance — where the instance arrived from
+    /// ([`super::StoredInstance::arrived_from`]) and which of the group's two collections it
+    /// stands in — rather than off the step's direction alone, because a group draws on its
+    /// warm pool as well as on Amazon EC2: a member the group took out of its pool is on the
+    /// move from that pool, while one it launched from cold is on the move from Amazon EC2.
+    ///
+    /// An instance this store no longer holds (one a step has already taken out of the
+    /// group's record) names no place, so such a step reports the plain move of its
+    /// direction ([`InstanceMove::of_step`]).
+    pub(crate) fn instance_move(
+        &self,
+        group_name: &str,
+        instance_id: &str,
+        kind: InstanceLifecycle,
+    ) -> InstanceMove {
+        let Some(group) = self.groups.get(group_name) else {
+            return InstanceMove::of_step(kind);
+        };
+        let standing = group
+            .instances
+            .iter()
+            .map(|instance| (instance, LifecycleEndpoint::AutoScalingGroup))
+            .chain(
+                group
+                    .warm_pool_instances()
+                    .iter()
+                    .map(|instance| (instance, LifecycleEndpoint::WarmPool)),
+            )
+            .find(|(instance, _)| instance.instance_id == instance_id);
+        match standing {
+            Some((instance, standing_in)) => {
+                InstanceMove::of_instance(kind, instance.arrived_from, standing_in)
+            }
+            None => InstanceMove::of_step(kind),
+        }
+    }
+
     /// Record the scaling activity ONE lifecycle step of a group produces and queue the
     /// event that reports it.
     ///
@@ -531,12 +647,16 @@ impl AutoScalingState {
                 )
             })
             .unwrap_or_default();
+        // The two ends of the move this step is making, read off the group's own state for
+        // the instance while that state still says where it came from and where it stands.
+        let instance_move = self.instance_move(change.group_name, change.instance_id, change.kind);
         self.queue_lifecycle_event(PendingLifecycleEvent {
             kind: change.kind,
             // The step is under way: it is queued as one that is going to complete, and the
             // one place a step that did NOT complete is settled re-marks it
             // ([`Self::settle_held_step`]).
             outcome: StepOutcome::Completed,
+            instance_move,
             notification_topics,
             group_name: change.group_name.to_string(),
             group_arn: change.group_arn.to_string(),
@@ -610,9 +730,18 @@ impl AutoScalingState {
         let subnet_id = step
             .instance_id
             .and_then(|instance_id| super::ec2_instances::subnet_of(engine, instance_id));
+        // The ends of the move the step SET OUT to make: an attempt the account took back
+        // left no instance in the group to read a place off, so this is the plain move of
+        // that direction ([`InstanceMove::of_step`]) unless the group still holds the
+        // instance the attempt minted.
+        let instance_move = step.instance_id.map_or_else(
+            || InstanceMove::of_step(step.kind),
+            |instance_id| self.instance_move(step.group_name, instance_id, step.kind),
+        );
         self.queue_lifecycle_event(PendingLifecycleEvent {
             kind: step.kind,
             outcome: StepOutcome::Unsuccessful,
+            instance_move,
             notification_topics,
             group_name: step.group_name.to_string(),
             group_arn: step.group_arn.to_string(),
@@ -875,7 +1004,8 @@ fn group_due_instants(group: &StoredGroup) -> Vec<SystemTime> {
 /// Beside the activity, the detail names the two ENDS of the move the step made — `Origin`
 /// and `Destination` — so a consumer branches on the direction (a rule pattern on
 /// `detail.Origin`, say) instead of reading the step out of the description. They come from
-/// the step's direction alone, never from the request.
+/// the group's own state for the instance at the instant the step was recorded
+/// ([`AutoScalingState::instance_move`]), never from the request.
 fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value {
     let mut placement = ::serde_json::Map::new();
     if let Some(zone) = event.availability_zone.as_ref() {
@@ -941,14 +1071,15 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
         ::serde_json::Value::String(event.cause.clone()),
     );
     // Which WAY the instance moved, so a consumer can branch on direction without parsing
-    // the description: the two endpoints of the step, read off its direction alone.
+    // the description: the two endpoints of the step, as the group's own state named them
+    // when it was recorded.
     detail.insert(
         "Origin".to_string(),
-        ::serde_json::Value::String(event.kind.origin().to_string()),
+        ::serde_json::Value::String(event.instance_move.origin.name().to_string()),
     );
     detail.insert(
         "Destination".to_string(),
-        ::serde_json::Value::String(event.kind.destination().to_string()),
+        ::serde_json::Value::String(event.instance_move.destination.name().to_string()),
     );
     ::serde_json::Value::Object(detail)
 }

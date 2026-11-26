@@ -265,7 +265,7 @@ pub mod lifecycle_hook_test_notification;
 
 pub use lifecycle_events::{
     drive_lifecycle_clock, FailedLifecycleStep, InstanceLifecycle, InstanceLifecycleChange,
-    PendingLifecycleEvent, StepOutcome,
+    InstanceMove, LifecycleEndpoint, PendingLifecycleEvent, StepOutcome,
 };
 
 /// The instances a caller asks a group to launch outright — `LaunchInstances` — beside
@@ -1037,6 +1037,15 @@ pub struct StoredInstance {
     /// brought into service by a group running that process. Not part of what the API
     /// reports for an instance.
     pub load_balancer_registration_withheld: bool,
+    /// WHERE this instance came from into the place it now stands, which is the `Origin` of
+    /// the move that brought it there ([`AutoScalingState::instance_move`]).
+    ///
+    /// [`LifecycleEndpoint::Ec2`] for an instance the group launched from cold and for one
+    /// a caller attached, and [`LifecycleEndpoint::WarmPool`] for one the group took out of
+    /// its own warm pool — written by each move that changes which collection of the group
+    /// holds the instance ([`warm_pools`]), so the two ends an event reports are the move
+    /// the instance actually made. Not part of what the API reports for an instance.
+    pub arrived_from: LifecycleEndpoint,
 }
 
 impl StoredInstance {
@@ -3227,6 +3236,10 @@ impl AutoScalingState {
                 pending_lifecycle_actions: Vec::new(),
                 held_step: None,
                 load_balancer_registration_withheld: withhold_registration,
+                // A LAUNCH takes the instance from Amazon EC2 into wherever this request
+                // places it, whether that is the group itself or the group's warm pool: it
+                // is Amazon EC2 the instance has just come from either way.
+                arrived_from: LifecycleEndpoint::Ec2,
             })
             .collect();
         let launched_ids: Vec<String> = launched

@@ -67,7 +67,7 @@ use super::{
     StoredLifecycleHook, LIFECYCLE_ACTION_CONTINUE, LIFECYCLE_PENDING, LIFECYCLE_TERMINATING,
     LIFECYCLE_TRANSITION,
 };
-use super::lifecycle_events::{instance_arn, publish_events, OutboundEvent};
+use super::lifecycle_events::{instance_arn, publish_events, InstanceMove, OutboundEvent};
 use super::sns_notifications::insert_text;
 
 /// The transition a hook holds a SCALE-OUT at, from the model's own documentation for
@@ -287,6 +287,10 @@ pub struct PendingLifecycleActionEvent {
     /// Which transition the hold is at, which is what the `detail-type` and the
     /// `LifecycleTransition` in the detail are both read from.
     pub transition: HeldTransition,
+    /// The two ENDS of the move the held instance is MID-WAY through — the event's
+    /// `detail.Origin` and `detail.Destination` — read from the group's own state for the
+    /// instance when the hold was taken ([`AutoScalingState::instance_move`]).
+    pub instance_move: InstanceMove,
     /// The group whose hook is holding the instance.
     pub group_name: String,
     /// That group's ARN, carried in the envelope's `resources`.
@@ -642,6 +646,9 @@ impl AutoScalingState {
         let mut held: Vec<(String, Vec<StoredLifecycleAction>)> = Vec::with_capacity(holding.len());
         let mut events: Vec<PendingLifecycleActionEvent> = Vec::new();
         for instance_id in &holding {
+            // The move this hold stands inside, read off the group's own state for the
+            // instance while it is still standing where the hold took it.
+            let instance_move = self.instance_move(group_name, instance_id, transition.step());
             let mut actions = Vec::with_capacity(hooks.len());
             for (hook_name, hook) in &hooks {
                 let token = self.mint_lifecycle_action_token();
@@ -659,6 +666,7 @@ impl AutoScalingState {
                 });
                 events.push(PendingLifecycleActionEvent {
                     transition,
+                    instance_move,
                     group_name: group_name.to_string(),
                     group_arn: group_arn.clone(),
                     region: region.clone(),
@@ -1458,8 +1466,8 @@ fn hold_timeout(value: i32) -> Duration {
 /// through — `Origin` and `Destination` — exactly as the event reporting a completed step
 /// does ([`super::lifecycle_events`]): the hold stands inside that move, so a consumer
 /// branches on its direction (a rule pattern on `detail.Origin`, say) without reading it out
-/// of the transition's name. They come from the held transition's own direction alone, never
-/// from the request.
+/// of the transition's name. They come from the group's own state for the held instance
+/// ([`AutoScalingState::instance_move`]), never from the request.
 fn lifecycle_action_detail(event: &PendingLifecycleActionEvent) -> ::serde_json::Value {
     let mut detail = ::serde_json::Map::new();
     insert_text(&mut detail, "LifecycleActionToken", &event.token);
@@ -1470,9 +1478,9 @@ fn lifecycle_action_detail(event: &PendingLifecycleActionEvent) -> ::serde_json:
     if let Some(metadata) = event.notification_metadata.as_deref() {
         insert_text(&mut detail, "NotificationMetadata", metadata);
     }
-    let step = event.transition.step();
-    insert_text(&mut detail, "Origin", step.origin());
-    insert_text(&mut detail, "Destination", step.destination());
+    let step = event.instance_move;
+    insert_text(&mut detail, "Origin", step.origin.name());
+    insert_text(&mut detail, "Destination", step.destination.name());
     ::serde_json::Value::Object(detail)
 }
 

@@ -407,6 +407,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The delete shut them down as it ran, so each of these terminations is a
                 // step that carried through.
                 outcome: crate::state::StepOutcome::Completed,
+                // Each of them was in service in the group and is handed back to Amazon
+                // EC2, which is the move a termination of a group's member makes.
+                instance_move: crate::state::InstanceMove::of_step(
+                    crate::state::InstanceLifecycle::Terminated,
+                ),
                 notification_topics: notification_topics.clone(),
                 group_name: name.clone(),
                 group_arn: arn.clone(),

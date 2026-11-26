@@ -68,8 +68,8 @@ use std::time::SystemTime;
 use crate::ops::types::{InstanceReusePolicy, WarmPoolConfiguration};
 
 use super::{
-    AutoScalingState, GroupLaunch, HeldTransition, LaunchDestination, StoredGroup, StoredInstance,
-    LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
+    AutoScalingState, GroupLaunch, HeldTransition, LaunchDestination, LifecycleEndpoint,
+    StoredGroup, StoredInstance, LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_TRANSITION,
 };
 
 /// `MinSize` when a request that CREATES a warm pool omits it.
@@ -686,6 +686,10 @@ impl AutoScalingState {
             // ([`super::instance_health`]).
             instance.lifecycle_state = LIFECYCLE_PENDING.to_string();
             instance.transition_due = Some(due);
+            // THIS is the move the instance is on: it is coming into service out of the
+            // group's own warm pool rather than from Amazon EC2, which is what the events
+            // announcing the move report as its origin ([`super::lifecycle_events`]).
+            instance.arrived_from = LifecycleEndpoint::WarmPool;
             // THIS is where a pooled instance comes into service, so this is the call that
             // owes it its registration with the group's load balancing — withheld, for the
             // rest of its life in the group, while the process that performs the
@@ -756,6 +760,9 @@ impl AutoScalingState {
             if returned.contains(&instance.instance_id) {
                 instance.lifecycle_state = WARMED_PENDING.to_string();
                 instance.transition_due = Some(due);
+                // And this is the reverse move: the instance is going into the pool out of
+                // the group's own service, so that is where it has come from.
+                instance.arrived_from = LifecycleEndpoint::AutoScalingGroup;
                 // An instance out of service owes its group's health check nothing: the
                 // replacement a failed check had coming for it is not owed by a pool.
                 instance.health_check_due = None;
