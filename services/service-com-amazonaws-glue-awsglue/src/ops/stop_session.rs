@@ -22,6 +22,12 @@
 //! a session whose provisioning was due to finish is stopped rather than refused on a stale
 //! status.
 //!
+//! An `Id` this Region holds no session under has no runtime left to take down either, and
+//! this operation models no entity-miss failure to report one with, so that call is SERVED
+//! too: nothing is written and the answer names the id the stop was addressed by, which makes
+//! a stop of a session this endpoint no longer holds — the ordinary teardown path, and the
+//! retry path after a timed-out stop — idempotent rather than terminal.
+//!
 //! A runtime that is being taken down runs nothing further, so the statements still in
 //! flight on the session are cancelled with it.
 //!
@@ -89,8 +95,6 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
-//! * `EntityNotFoundException` (HTTP 400) — widened in through `extra_errors` (see below):
-//!   the entity miss this service models, for an `Id` this Region holds no session under.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -107,20 +111,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `EntityNotFoundException` is widened in through `extra_errors`: an `Id` this Region holds
-// no session under addresses no runtime to stop, which is the entity miss this SERVICE models
-// and which every other operation that resolves a session by its `Id` (`GetSession`,
-// `RunStatement`) declares, while this operation's own `errors` list omits it. Answering such
-// a request as `InvalidInputException` instead would tell the caller its `Id` was malformed
-// when it was well-formed and simply names nothing.
-#[smithy_macros::operation_error(
-    "com.amazonaws.glue#StopSession",
-    extra_errors = ["EntityNotFoundException"]
-)]
+// The list is the model's own: this operation declares NO entity-miss failure, so an `Id`
+// this Region holds no session under is not refused at all — see the `handle` body — and
+// nothing here can report one.
+#[smithy_macros::operation_error("com.amazonaws.glue#StopSession")]
 #[derive(Debug)]
 pub enum StopSessionErrorModeled {
     AccessDeniedException(AccessDeniedException),
-    EntityNotFoundException(EntityNotFoundException),
     ConcurrentModificationException(ConcurrentModificationException),
     IllegalSessionStateException(IllegalSessionStateException),
     InternalServiceException(InternalServiceException),
@@ -199,15 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(entry) = store.session_mut(&region, &input.id) else {
-            return Err(StopSessionErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    // The refusal names the id that resolved to nothing, which is the whole
-                    // address of a session.
-                    message: Some(crate::state::messages::session_not_found(&input.id)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+            // NOTHING HELD UNDER THE ID: there is no runtime to take down, and the operation
+            // models no entity-miss failure to report one with, so the stop is served and
+            // writes nothing — the id names no session, which is the state a stop asks for.
+            ::tracing::debug!(
+                operation = "StopSession",
+                region = %region,
+                session = %input.id,
+                "a Glue interactive session id this endpoint holds nothing under needs no stop"
+            );
+            return Ok(StopSessionOutput { id: Some(input.id) });
         };
         // The only write made before the stop is judged is the one the clock had already
         // made due: a session whose provisioning was due to finish has finished it whether
@@ -258,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Returns the Id of the stopped session": the id the stop was addressed by, which
-        // is the record it acted on.
+        // is the record it acted on — or, for an id holding no session, the one it asked about.
         Ok(StopSessionOutput { id: Some(input.id) })
     }
 }

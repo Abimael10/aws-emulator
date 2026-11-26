@@ -620,13 +620,14 @@ async fn stopping_a_session_already_coming_down_or_down_changes_nothing() {
 // An id the Region holds no session under
 // ---------------------------------------------------------------------------
 
-/// A stop of an id this Region holds no session under addresses no runtime, so it is refused
-/// as the service's entity miss naming that id and writes nothing. A session is addressed by
-/// its id and the Region it was created in together, so a differently-cased or partial id, an
-/// id already deleted, and a stored id asked for through another Region's endpoint all hold no
+/// A stop of an id this Region holds no session under has no runtime to take down, and the
+/// operation models no entity-miss failure to report one with, so the call is SERVED: it
+/// answers with the id it was addressed by and writes nothing. A session is addressed by its
+/// id and the Region it was created in together, so a differently-cased or partial id, an id
+/// already deleted, and a stored id asked for through another Region's endpoint all hold no
 /// session — while the stored id itself stops.
 #[tokio::test]
-async fn stopping_an_id_no_session_is_held_under_is_an_entity_miss() {
+async fn stopping_an_id_no_session_is_held_under_is_served() {
     let (router, engine) = harness();
     ready_session(&router, &engine, "StoredSession").await;
     ready_session(&router, &engine, "already-deleted").await;
@@ -653,22 +654,17 @@ async fn stopping_an_id_no_session_is_held_under_is_an_entity_miss() {
     for (case, id) in &misses {
         let (code, body) = call(&router, "StopSession", &json!({ "Id": id })).await;
         assert_eq!(
-            code, 400,
-            "case {case}: stopping {id:?} must be refused, got {code} with {body}"
-        );
-        assert!(
-            error_code(&body).ends_with("EntityNotFoundException"),
-            "case {case}: expected EntityNotFoundException for {id:?}, got {} in {body}",
-            error_code(&body)
+            code, 200,
+            "case {case}: stopping {id:?} must be served, got {code} with {body}"
         );
         assert_eq!(
-            error_message(&body),
-            messages::session_not_found(id),
-            "case {case}: the refusal must name the session asked for, got {body}"
+            body.get("Id").and_then(Value::as_str),
+            Some(*id),
+            "case {case}: the answer must name the id the stop was addressed by, got {body}"
         );
         assert!(
             !stored_session(&engine, REGION, id),
-            "case {case}: a refused stop must write no session under {id:?}"
+            "case {case}: a stop that found nothing must write no session under {id:?}"
         );
         // Nothing else moved with it: the one stored session is still up.
         let read = get_session(&router, "StoredSession").await;
@@ -690,14 +686,19 @@ async fn stopping_an_id_no_session_is_held_under_is_an_entity_miss() {
     )
     .await;
     assert_eq!(
-        code, 400,
-        "case a stored id in another Region: expected the stop to be refused, got {code} with \
+        code, 200,
+        "case a stored id in another Region: expected the stop to be served, got {code} with \
          {body}"
     );
+    assert_eq!(
+        body.get("Id").and_then(Value::as_str),
+        Some("StoredSession"),
+        "case a stored id in another Region: the answer must name the id asked about, got {body}"
+    );
     assert!(
-        error_code(&body).ends_with("EntityNotFoundException"),
-        "case a stored id in another Region: expected EntityNotFoundException, got {} in {body}",
-        error_code(&body)
+        !stored_session(&engine, "eu-west-1", "StoredSession"),
+        "case a stored id in another Region: a stop that found nothing must write no session \
+         there"
     );
     let read = get_session(&router, "StoredSession").await;
     assert_eq!(
