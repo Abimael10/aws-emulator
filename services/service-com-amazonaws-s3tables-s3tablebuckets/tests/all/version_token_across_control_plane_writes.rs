@@ -4,13 +4,14 @@
 //! once, and what finally supersedes it.
 //!
 //! The rule under test: a table's `versionToken` is the optimistic-concurrency token over
-//! the open-table metadata document THIS SERVICE holds for the table, so a write that
-//! touches only control-plane state — the coordinates the table is addressed by, a
-//! maintenance configuration, the tags on it, the pointer to a metadata file the caller
-//! supplied — leaves the token exactly as it was however many such writes are made and in
-//! whatever order, and only a catalog commit that writes a NEW metadata document re-mints
-//! it. The token a client read before such a run is therefore still the table's
-//! precondition afterwards, and the one that is superseded is refused as the modelled
+//! WHICH open-table metadata document the table is at, so a write that touches only
+//! control-plane state — the coordinates the table is addressed by, a maintenance
+//! configuration, the tags on it — leaves the token exactly as it was however many such
+//! writes are made and in whatever order, while a write that moves the table to another
+//! metadata document advances it: a catalog commit, which writes the document, and a
+//! metadata-location write, which points the table at a document the caller wrote. The
+//! token a client read before a run of control-plane writes is therefore still the table's
+//! precondition afterwards, and a token that has been superseded is refused as the modelled
 //! conflict while the current one is honoured.
 //!
 //! The model leaves this to recorded behaviour: `versionToken` is a plain
@@ -55,8 +56,8 @@ const TABLE: &str = "token_chain_tbl";
 const TABLE_VERSION_TOKEN_MISMATCH: &str =
     "Provided version token does not match the table version token.";
 
-/// One control-plane write in a run. None of them writes the table's metadata document,
-/// so none of them may touch the token.
+/// One write in a run. All but [`Step::MetadataPointer`] leave the table at the metadata
+/// document it was already at, so none of those may touch the token.
 #[derive(Debug, Clone, Copy)]
 enum Step {
     /// A plain re-read of the table: a read may change nothing a later caller sees.
@@ -79,9 +80,17 @@ enum Step {
     /// `UntagResource` of a key a previous step attached.
     Untag(&'static str),
     /// `UpdateTableMetadataLocation`: the caller tells the service which metadata file it
-    /// wrote, under the token it holds as the precondition. The service records a pointer
-    /// the caller supplied; it writes no metadata document of its own.
+    /// wrote, under the token it holds as the precondition. The write moves the table to
+    /// another metadata document, so it advances the token.
     MetadataPointer(&'static str),
+}
+
+impl Step {
+    /// Whether this step moves the table to another metadata document, which is what
+    /// advances the table's token.
+    fn advances_the_token(self) -> bool {
+        matches!(self, Step::MetadataPointer(_))
+    }
 }
 
 /// One row: a run of control-plane writes made on one table, in this order.
@@ -352,11 +361,11 @@ impl Fixture {
                     "case {case:?}: UpdateTableMetadataLocation under the token the client \
                      holds: {updated:?}"
                 );
-                assert_eq!(
+                assert_ne!(
                     updated.text("versionToken"),
                     held,
-                    "case {case:?}: the conditional write answered with a token the client \
-                     never presented: {updated:?}"
+                    "case {case:?}: the conditional write answered with the token it was \
+                     given, so the table's version never moved: {updated:?}"
                 );
             }
         }
@@ -399,24 +408,25 @@ impl Fixture {
     }
 }
 
-/// The rule, over every run: the token the client read once survives the whole run of
-/// control-plane writes, the commit afterwards supersedes it, and the pair of conditional
-/// deletes that follow agree about which token is the table's.
+/// The rule, over every run: the token the client read survives every control-plane write
+/// of the run and advances on a metadata-pointer write, the commit afterwards supersedes
+/// it, and the pair of conditional deletes that follow agree about which token is the
+/// table's.
 #[tokio::test]
-async fn control_plane_writes_leave_the_token_and_only_a_metadata_commit_supersedes_it() {
+async fn control_plane_writes_leave_the_token_and_a_move_to_another_metadata_document_advances_it() {
     for (index, run) in RUNS.iter().enumerate() {
         let case = run.label;
         let mut fixture = Fixture::new(&format!("token-chain-{index}"), case).await;
 
-        // The one token the client ever reads: everything below presents it.
+        // The token the client starts from; every step below presents the one it holds.
         let before = fixture.describe().await;
         assert_eq!(before.status, 200, "case {case:?}: GetTable: {before:?}");
-        let held = before.text("versionToken");
+        let mut held = before.text("versionToken");
         assert_table_version_token(&held, "the token the create minted", case);
 
-        // After EVERY step of the run, the table still reports the token the client
-        // holds — so no write in the run invalidated the precondition it carries, and a
-        // step that itself presents the token is honoured rather than refused.
+        // After EVERY step of the run: a control-plane write left the token the client
+        // holds — so it did not invalidate the precondition it carries — and a
+        // metadata-pointer write advanced it to the token the client holds from then on.
         for step in run.steps {
             fixture.take(*step, &held, case).await;
             let after = fixture.describe().await;
@@ -425,11 +435,21 @@ async fn control_plane_writes_leave_the_token_and_only_a_metadata_commit_superse
                 "case {case:?}: GetTable after {step:?}: {after:?}"
             );
             let reported = after.text("versionToken");
-            assert_eq!(
-                reported, held,
-                "case {case:?}: {step:?} left the table reporting {reported:?}, expected the \
-                 token {held:?} the client read"
-            );
+            if step.advances_the_token() {
+                assert_ne!(
+                    reported, held,
+                    "case {case:?}: {step:?} left the table reporting the token {held:?} it \
+                     was given, so the table's version never moved"
+                );
+                assert_table_version_token(&reported, "the token the write advanced to", case);
+                held = reported;
+            } else {
+                assert_eq!(
+                    reported, held,
+                    "case {case:?}: {step:?} left the table reporting {reported:?}, expected \
+                     the token {held:?} the client holds"
+                );
+            }
         }
 
         // The commit is the one write that supersedes the token: it writes a new metadata
@@ -510,12 +530,13 @@ async fn control_plane_writes_leave_the_token_and_only_a_metadata_commit_superse
     }
 }
 
-/// The same rule where the control-plane writes come AFTER a commit: a commit mints a
-/// token, the control-plane writes that follow it leave that token, and a second commit
-/// supersedes it in turn — so the token tracks the metadata document and nothing else,
-/// however the two kinds of write are interleaved.
+/// The same rule where the writes come AFTER a commit: a commit mints a token, the
+/// control-plane writes that follow it leave that token, a metadata-pointer write among
+/// them advances it, and a second commit supersedes it in turn — so the token tracks which
+/// metadata document the table is at and nothing else, however the kinds of write are
+/// interleaved.
 #[tokio::test]
-async fn a_run_of_control_plane_writes_after_a_commit_leaves_the_token_the_commit_minted() {
+async fn a_run_of_writes_after_a_commit_tracks_the_metadata_document_the_table_is_at() {
     let case = "control-plane writes between two commits";
     let mut fixture = Fixture::new("token-chain-interleaved", case).await;
 
@@ -529,14 +550,14 @@ async fn a_run_of_control_plane_writes_after_a_commit_leaves_the_token_the_commi
         after_first.status, 200,
         "case {case:?}: GetTable after the first commit: {after_first:?}"
     );
-    let after_commit = after_first.text("versionToken");
+    let mut after_commit = after_first.text("versionToken");
     assert_table_version_token(&after_commit, "the token the first commit minted", case);
     assert_ne!(
         after_commit, minted_by_create,
         "case {case:?}: the first commit left the token the create minted"
     );
 
-    // Every control-plane write this suite knows, on the table the commit just wrote.
+    // Every write this suite knows, on the table the commit just wrote.
     let steps = [
         Step::Rename {
             new_namespace: Some(AWAY_NAMESPACE),
@@ -560,11 +581,21 @@ async fn a_run_of_control_plane_writes_after_a_commit_leaves_the_token_the_commi
             "case {case:?}: GetTable after {step:?}: {read:?}"
         );
         let reported = read.text("versionToken");
-        assert_eq!(
-            reported, after_commit,
-            "case {case:?}: {step:?} left the table reporting {reported:?}, expected the \
-             token {after_commit:?} the commit minted"
-        );
+        if step.advances_the_token() {
+            assert_ne!(
+                reported, after_commit,
+                "case {case:?}: {step:?} left the table reporting the token {after_commit:?} \
+                 it was given, so the table's version never moved"
+            );
+            assert_table_version_token(&reported, "the token the write advanced to", case);
+            after_commit = reported;
+        } else {
+            assert_eq!(
+                reported, after_commit,
+                "case {case:?}: {step:?} left the table reporting {reported:?}, expected the \
+                 token {after_commit:?} the table carried"
+            );
+        }
     }
 
     // The second commit supersedes it, and the metadata document it answers with carries

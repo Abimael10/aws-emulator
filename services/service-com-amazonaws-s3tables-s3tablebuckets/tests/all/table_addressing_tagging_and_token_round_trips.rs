@@ -23,12 +23,13 @@
 //! naming the same resource, and the removal is read back through it.
 //!
 //! RULE 3 — `UpdateTableMetadataLocation` records the pointer the caller supplies
-//! under the caller's `versionToken` as its precondition, and answers with the
-//! token the table carries rather than a fresh one: the token the caller holds
-//! stays the table's, so the next conditional write it makes is honoured. Driven
-//! over a RUN of writes, because a single write cannot tell a carried token from a
-//! re-minted one that happens to be read back; a token that is not the table's is
-//! the modelled `ConflictException` (409) and leaves the pointer where it was.
+//! under the caller's `versionToken` as its precondition, and ADVANCES that token:
+//! the write moves the table to another metadata document, so it answers with a
+//! token different from the one presented, that token is the table's from then on,
+//! and the presented one is superseded. Driven over a RUN of writes, because a
+//! single write cannot tell a token that advances from one minted per response; a
+//! token that is not the table's is the modelled `ConflictException` (409) and
+//! leaves the pointer where it was.
 
 use serde_json::{json, Value};
 
@@ -415,11 +416,11 @@ const METADATA_FILES: &[&str] = &[
     "/metadata/00003-99887766554433221100ffeeddccbbaa.metadata.json.gz",
 ];
 
-/// RULE 3: every write of the chain answers with the token the caller presented —
-/// the table's own — and a token that is not the table's is refused and records
-/// nothing.
+/// RULE 3: every write of the chain presents the token the one before it settled,
+/// answers with a token that differs from the presented one, and a token that is not
+/// the table's is refused and records nothing.
 #[tokio::test]
-async fn successive_metadata_location_writes_answer_the_token_the_caller_still_holds() {
+async fn successive_metadata_location_writes_each_advance_the_tables_version_token() {
     let emulator = Emulator::new();
     let bucket_arn = table_bucket(&emulator, "metadata-location-chain", &[NAMESPACE]).await;
     table(&emulator, &bucket_arn, NAMESPACE, SUBJECT).await;
@@ -431,10 +432,13 @@ async fn successive_metadata_location_writes_answer_the_token_the_caller_still_h
         "GetTable",
         "the chain",
     );
-    let held = created.text("versionToken");
+    let mut held = created.text("versionToken");
     assert_table_version_token(&held, "the token the create minted", "the chain");
     let warehouse = created.text("warehouseLocation");
 
+    // Every token the chain has settled on, so a write is never answered with one the
+    // table already carried earlier in the run.
+    let mut seen = vec![held.clone()];
     let mut recorded = created.optional_text("metadataLocation");
     for file in METADATA_FILES {
         let case = format!("writing {file}");
@@ -452,12 +456,12 @@ async fn successive_metadata_location_writes_answer_the_token_the_caller_still_h
             "UpdateTableMetadataLocation",
             &case,
         );
-        assert_eq!(
-            updated.text("versionToken"),
-            held,
-            "case {case:?}: expected the write to answer the token {held:?} the caller \
-             presented, got {actual:?}",
-            actual = updated.text("versionToken")
+        let settled = updated.text("versionToken");
+        assert_table_version_token(&settled, "the versionToken the write settled", &case);
+        assert!(
+            !seen.contains(&settled),
+            "case {case:?}: the write answered with {settled:?}, a token the table already \
+             carried in this run ({seen:?}), so its version did not move"
         );
         assert_eq!(
             updated.text("metadataLocation"),
@@ -466,8 +470,8 @@ async fn successive_metadata_location_writes_answer_the_token_the_caller_still_h
             actual = updated.text("metadataLocation")
         );
 
-        // Both reads of the table agree with the write: the pointer moved, the
-        // token did not.
+        // Both reads of the table agree with the write: the pointer moved, and the token
+        // the write settled is the table's.
         let read = served(
             emulator
                 .get_table_metadata_location(REGION, &bucket_arn, NAMESPACE, SUBJECT)
@@ -483,8 +487,8 @@ async fn successive_metadata_location_writes_answer_the_token_the_caller_still_h
         );
         assert_eq!(
             read.text("versionToken"),
-            held,
-            "case {case:?}: expected the read to report the token {held:?}, got {actual:?}",
+            settled,
+            "case {case:?}: expected the read to report the token {settled:?}, got {actual:?}",
             actual = read.text("versionToken")
         );
         let described = served(
@@ -496,8 +500,8 @@ async fn successive_metadata_location_writes_answer_the_token_the_caller_still_h
         );
         assert_eq!(
             described.text("versionToken"),
-            held,
-            "case {case:?}: expected GetTable to report the token {held:?}, got {actual:?}",
+            settled,
+            "case {case:?}: expected GetTable to report the token {settled:?}, got {actual:?}",
             actual = described.text("versionToken")
         );
         recorded = described.optional_text("metadataLocation");
@@ -506,6 +510,29 @@ async fn successive_metadata_location_writes_answer_the_token_the_caller_still_h
             Some(location.as_str()),
             "case {case:?}: expected GetTable to report {location}, got {recorded:?}"
         );
+
+        // The token the client holds from here on, and the superseded one it does not.
+        let superseded = std::mem::replace(&mut held, settled.clone());
+        let refused = emulator
+            .update_table_metadata_location(
+                REGION,
+                &bucket_arn,
+                NAMESPACE,
+                SUBJECT,
+                &json!({
+                    "metadataLocation": format!("{warehouse}/metadata/00098-probe.metadata.json"),
+                    "versionToken": superseded,
+                }),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case:?}: the superseded token {superseded:?} must be refused, got {status} \
+             {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        seen.push(settled);
     }
 
     // A token that is not the table's is the modelled conflict, and the pointer

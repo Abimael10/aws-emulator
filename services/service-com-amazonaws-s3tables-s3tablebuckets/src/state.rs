@@ -1282,9 +1282,10 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         }
     }
 
-    /// A fresh `versionToken` for a table whose metadata document this service
-    /// is writing: the table's create, and a catalog commit of a new metadata
-    /// file for it.
+    /// A fresh `versionToken` for a table that is being moved to another
+    /// metadata document: the table's create, a catalog commit of a new
+    /// metadata file for it, and a write that points the table at a metadata
+    /// file the caller wrote.
     ///
     /// A table's version token is the precondition handle `CreateTable` hands
     /// back and `GetTable` echoes, which `DeleteTable`, `RenameTable` and
@@ -1293,10 +1294,10 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     /// token form ([`Self::mint_opaque_token`]) rather than in the id form
     /// [`Self::mint_id`] lays out.
     ///
-    /// It is NOT minted by a write that only records a pointer or a coordinate
-    /// the caller supplies (a rename, a metadata-location update): such a write
-    /// takes the caller's token as its precondition and leaves it in place, so
-    /// the view a caller holds stays current.
+    /// It is NOT minted by a write that leaves the table at the metadata
+    /// document it was already at — a rename, a maintenance configuration, a
+    /// tag — so a caller's view of the table survives a write of the control
+    /// plane around it.
     pub fn mint_version_token(&mut self) -> String {
         self.mint_opaque_token("table-version")
     }

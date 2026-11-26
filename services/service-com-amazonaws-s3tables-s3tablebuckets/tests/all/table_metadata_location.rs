@@ -11,12 +11,12 @@
 //! and `warehouseLocation` required, `metadataLocation` optional, `@readonly`).
 //!
 //! RULE 2 — `UpdateTableMetadataLocation` POINTS the table at the metadata file the
-//! request names, under the precondition the caller's `versionToken` states, and leaves
-//! that token where it is: the file the location names was written by the CALLER, so this
-//! service writes no metadata document for the table and mints no token for one, and the
-//! token the caller presented is still the table's afterwards — every later read reports
-//! the new location under the same token, and presenting it again is honoured rather than
-//! refused
+//! request names, under the precondition the caller's `versionToken` states, and ADVANCES
+//! that token: the write moves the table to another metadata document, so the response
+//! carries a token different from the one presented, that token is the table's current one
+//! afterwards (every later read reports it beside the new location, and a further write
+//! presenting it is honoured and advances it again), and the token the caller presented is
+//! superseded, so presenting it again is refused as the conflict RULE 3 states
 //! (`smithy_query(query="operation", operation="UpdateTableMetadataLocation")`: PUT on the
 //! same path, 200, required `versionToken` + `metadataLocation` in, and `name`/`tableARN`/
 //! `namespace`/`versionToken`/`metadataLocation` out).
@@ -225,8 +225,8 @@ const ACCEPTED: &[Accepted] = &[
     },
 ];
 
-/// RULE 2: the write points the table at the file it names, leaves the table's token
-/// where it was, and every read afterwards agrees.
+/// RULE 2: the write points the table at the file it names, advances the table's token,
+/// and every read afterwards agrees.
 #[tokio::test]
 async fn an_update_points_the_table_at_the_metadata_file_it_names() {
     for (index, case) in ACCEPTED.iter().enumerate() {
@@ -276,11 +276,10 @@ async fn an_update_points_the_table_at_the_metadata_file_it_names() {
             "case {label:?}: the write reports a different tableARN from the describe"
         );
         let settled = updated.text("versionToken");
-        assert_eq!(
+        assert_ne!(
             settled, token,
-            "case {label:?}: the write answered with {settled:?} instead of the token \
-             {token:?} the caller presented, so the view the caller holds is spent by a \
-             write of its own"
+            "case {label:?}: the write answered with the token {token:?} it was given, so \
+             the table's version never moved"
         );
         assert_table_version_token(&settled, "the versionToken an update settles", label);
         assert!(
@@ -318,24 +317,48 @@ async fn an_update_points_the_table_at_the_metadata_file_it_names() {
             "case {label:?}: GetTable reports a different token: {described:?}"
         );
 
-        // The presented token is NOT spent: the same write again is honoured under it,
-        // and the location stays where this write put it.
+        // The presented token IS spent: re-presenting it is the conflict, and the
+        // location stays where the accepted write put it.
         let replayed = fixture
             .update(&json!({ "metadataLocation": location, "versionToken": token }))
             .await;
         assert_eq!(
-            replayed.status, 200,
-            "case {label:?}: re-presenting the token: expected 200, got {replayed:?}"
+            replayed.status, 409,
+            "case {label:?}: re-presenting the superseded token {token:?}: expected 409, got \
+             {replayed:?}"
         );
         assert_eq!(
-            replayed.text("versionToken"),
-            token,
-            "case {label:?}: the second write answered with another token: {replayed:?}"
+            replayed.message(),
+            TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
+            "case {label:?}: unexpected message on the superseded-token write: {replayed:?}"
         );
         assert_eq!(
             fixture.read().await.optional_text("metadataLocation"),
             Some(location),
-            "case {label:?}: the second write moved the metadata location"
+            "case {label:?}: the refused write moved the metadata location"
+        );
+
+        // And the token the write settled is the table's: a further write presenting it is
+        // honoured, and advances the token again.
+        let next_location = format!("{warehouse}/metadata/00099-next.metadata.json");
+        let next = fixture
+            .update(&json!({ "metadataLocation": next_location, "versionToken": settled }))
+            .await;
+        assert_eq!(
+            next.status, 200,
+            "case {label:?}: the write presenting the table's current token {settled:?}: \
+             expected 200, got {next:?}"
+        );
+        let advanced = next.text("versionToken");
+        assert_ne!(
+            advanced, settled,
+            "case {label:?}: the second accepted write answered with the token {settled:?} \
+             it was given"
+        );
+        assert_eq!(
+            fixture.read().await.text("versionToken"),
+            advanced,
+            "case {label:?}: the read reports a token other than {advanced:?}"
         );
     }
 }

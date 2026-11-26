@@ -3,13 +3,14 @@
 //! WHEN a table's `versionToken` changes, across every write of this service that touches
 //! a table.
 //!
-//! The rule under test: a table's `versionToken` names the metadata document THIS SERVICE
-//! holds for the table, so it is minted when the table is created and re-minted only when
-//! the service writes a new metadata document for it (a catalog commit); a write that only
-//! records a pointer, a coordinate, a configuration or a tag the CALLER supplied — under
-//! the caller's token as its precondition, where the operation takes one — leaves the token
-//! exactly as it was and answers with it, so the view a caller holds stays current and its
-//! next conditional call is honoured rather than refused.
+//! The rule under test: a table's `versionToken` is the table's optimistic-concurrency
+//! version over WHICH metadata document the table is at, so it is minted when the table is
+//! created and advances exactly where a write moves the table to another metadata document
+//! — a catalog commit, which writes the document itself, and a metadata-location write,
+//! which points the table at a document the CALLER wrote; a write that only records a
+//! coordinate, a configuration or a tag leaves the token exactly as it was and the view a
+//! caller holds stays current, so its next conditional call is honoured rather than
+//! refused.
 //!
 //! The model leaves this to recorded behaviour: `versionToken` is a plain
 //! `@length(1, 2048)` string documented only as "The version token of the table"
@@ -70,8 +71,8 @@ enum Write {
     CommitWithoutUpdates,
 }
 
-/// One row: the write it makes, and whether the service writes the table's metadata
-/// document while making it.
+/// One row: the write it makes, and whether that write moves the table to another metadata
+/// document.
 #[derive(Debug, Clone, Copy)]
 struct Case {
     label: &'static str,
@@ -79,9 +80,9 @@ struct Case {
     /// Whether the table's create describes its Iceberg metadata, which is what gives the
     /// table a metadata document to begin with.
     created_with_metadata: bool,
-    /// Whether the service writes a NEW metadata document for the table while making this
-    /// write, which is the one thing that re-mints the token.
-    writes_metadata_document: bool,
+    /// Whether this write moves the table to another metadata document, which is the one
+    /// thing that advances the token.
+    advances_the_token: bool,
 }
 
 /// The rows.
@@ -90,19 +91,19 @@ const CASES: &[Case] = &[
         label: "the next metadata file in the metadata directory",
         write: Write::MetadataLocation("/metadata/00001-0f1e2d3c4b5a69788796a5b4c3d2e1f0.metadata.json"),
         created_with_metadata: true,
-        writes_metadata_document: false,
+        advances_the_token: true,
     },
     Case {
         label: "the first metadata file of a table created without metadata",
         write: Write::MetadataLocation("/metadata/00000-112233445566778899aabbccddeeff00.metadata.json"),
         created_with_metadata: false,
-        writes_metadata_document: false,
+        advances_the_token: true,
     },
     Case {
         label: "a Gzip-compressed metadata file under a deeper prefix",
         write: Write::MetadataLocation("/metadata/snapshots/2026/v7.metadata.json.gz"),
         created_with_metadata: true,
-        writes_metadata_document: false,
+        advances_the_token: true,
     },
     Case {
         label: "a rename presenting the caller's token",
@@ -111,7 +112,7 @@ const CASES: &[Case] = &[
             with_token: true,
         },
         created_with_metadata: true,
-        writes_metadata_document: false,
+        advances_the_token: false,
     },
     Case {
         label: "a rename presenting no token at all",
@@ -120,37 +121,37 @@ const CASES: &[Case] = &[
             with_token: false,
         },
         created_with_metadata: false,
-        writes_metadata_document: false,
+        advances_the_token: false,
     },
     Case {
         label: "a maintenance configuration put on the table",
         write: Write::Maintenance,
         created_with_metadata: true,
-        writes_metadata_document: false,
+        advances_the_token: false,
     },
     Case {
         label: "tags attached to the table",
         write: Write::Tag,
         created_with_metadata: false,
-        writes_metadata_document: false,
+        advances_the_token: false,
     },
     Case {
         label: "a tag removed from the table",
         write: Write::Untag,
         created_with_metadata: true,
-        writes_metadata_document: false,
+        advances_the_token: false,
     },
     Case {
         label: "a catalog commit that writes a new metadata document",
         write: Write::Commit,
         created_with_metadata: true,
-        writes_metadata_document: true,
+        advances_the_token: true,
     },
     Case {
         label: "a catalog commit that asks for no update",
         write: Write::CommitWithoutUpdates,
         created_with_metadata: true,
-        writes_metadata_document: false,
+        advances_the_token: false,
     },
 ];
 
@@ -248,11 +249,11 @@ impl Fixture {
                     updated.status, 200,
                     "case {label:?}: UpdateTableMetadataLocation: {updated:?}"
                 );
-                assert_eq!(
+                assert_ne!(
                     updated.text("versionToken"),
                     held,
-                    "case {label:?}: the write answered with a token the caller never \
-                     presented: {updated:?}"
+                    "case {label:?}: the write answered with the token it was given, so the \
+                     table's version never moved: {updated:?}"
                 );
             }
             Write::Rename {
@@ -362,7 +363,7 @@ async fn prepare(fixture: &Fixture, case: &Case) {
 /// The rule, over every row: the token after the write, and whether the token the caller
 /// held is still the table's.
 #[tokio::test]
-async fn only_a_metadata_document_the_service_writes_re_mints_a_tables_version_token() {
+async fn only_a_move_to_another_metadata_document_advances_a_tables_version_token() {
     for (index, case) in CASES.iter().enumerate() {
         let label = case.label;
         let mut fixture = Fixture::new(
@@ -388,7 +389,7 @@ async fn only_a_metadata_document_the_service_writes_re_mints_a_tables_version_t
         fixture.write(case, &held).await;
 
         // What the reads report afterwards: one token, in the service's token form, and
-        // re-minted only where the service wrote the table's metadata document.
+        // advanced only where the write moved the table to another metadata document.
         let after = fixture.describe().await;
         assert_eq!(
             after.status, 200,
@@ -401,11 +402,11 @@ async fn only_a_metadata_document_the_service_writes_re_mints_a_tables_version_t
             reported,
             "case {label:?}: the two reads report different tokens after the write"
         );
-        if case.writes_metadata_document {
+        if case.advances_the_token {
             assert_ne!(
                 reported, held,
-                "case {label:?}: the service wrote a new metadata document and still \
-                 reports the token {held:?}, so a caller cannot tell the document moved"
+                "case {label:?}: the write moved the table to another metadata document and \
+                 still reports the token {held:?}, so a caller cannot tell it moved"
             );
         } else {
             assert_eq!(
@@ -416,12 +417,12 @@ async fn only_a_metadata_document_the_service_writes_re_mints_a_tables_version_t
         }
 
         // And what that means for the caller: the token it holds is still the table's
-        // precondition, unless the service minted a new one — in which case the stale one
+        // precondition, unless the write advanced it — in which case the stale one
         // is the modelled conflict and the current one is honoured.
         let probe = fixture
             .update_under(&held, "/metadata/00042-probe.metadata.json")
             .await;
-        if case.writes_metadata_document {
+        if case.advances_the_token {
             assert_eq!(
                 probe.status, 409,
                 "case {label:?}: the superseded token {held:?} must be refused as a \
@@ -437,7 +438,7 @@ async fn only_a_metadata_document_the_service_writes_re_mints_a_tables_version_t
                 .await;
             assert_eq!(
                 current.status, 200,
-                "case {label:?}: the token the commit minted must be the table's: {current:?}"
+                "case {label:?}: the token the write settled must be the table's: {current:?}"
             );
         } else {
             assert_eq!(
@@ -445,10 +446,11 @@ async fn only_a_metadata_document_the_service_writes_re_mints_a_tables_version_t
                 "case {label:?}: the token {held:?} the caller holds must still be the \
                  table's, got {probe:?}"
             );
-            assert_eq!(
+            assert_ne!(
                 probe.text("versionToken"),
                 held,
-                "case {label:?}: the conditional write answered with another token: {probe:?}"
+                "case {label:?}: the conditional write answered with the token it was \
+                 given: {probe:?}"
             );
         }
     }

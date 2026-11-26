@@ -312,7 +312,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // coordinates the table is addressed by, which live outside that
         // metadata — so the token a caller holds still describes the table it
         // read, and the next conditional call it makes with that token is
-        // honoured. The token advances when the table's metadata is committed.
+        // honoured. The token advances where the table is moved to another
+        // metadata document (a catalog commit, a metadata-location write).
         let mut moved = table.clone();
         let table_arn = moved.table_arn.clone();
         moved.name = target_name.clone();

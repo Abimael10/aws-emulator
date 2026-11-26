@@ -538,8 +538,8 @@ async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
         }
 
         // The precondition: the write that moves the table's metadata file accepts the
-        // token the reads reported and answers with that same token, which a second write
-        // under it is still honoured by.
+        // token the reads reported and answers with the table's new one, which is what the
+        // next conditional call takes.
         let table = fixture.tables[0];
         let before = emulator
             .get_table(fixture.region, &bucket_arn, fixture.namespace, table)
@@ -565,10 +565,10 @@ async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
         );
         let settled = updated.text("versionToken");
         assert_table_version_token(&settled, "the versionToken a write answers with", case);
-        assert_eq!(
+        assert_ne!(
             settled, held,
-            "case {case:?}: the write answered with {settled:?} instead of the token \
-             {held:?} the read reported, so a caller's view is spent by a write of its own"
+            "case {case:?}: the write answered with the token {held:?} the read reported, so \
+             the table's version never moved"
         );
         let replayed = emulator
             .update_table_metadata_location(
@@ -576,22 +576,24 @@ async fn a_table_version_token_is_an_opaque_token_that_guards_the_table() {
                 &bucket_arn,
                 fixture.namespace,
                 table,
-                &json!({ "metadataLocation": metadata_location, "versionToken": held }),
+                &json!({ "metadataLocation": metadata_location, "versionToken": settled }),
             )
             .await;
         assert_eq!(
             replayed.status, 200,
-            "case {case:?}: the token {held:?} must still be the table's: {replayed:?}"
+            "case {case:?}: the token {settled:?} must be the table's: {replayed:?}"
         );
+        let current = replayed.text("versionToken");
+        assert_table_version_token(&current, "the versionToken the second write answers with", case);
 
-        // And it is still the one the delete's precondition takes.
+        // And that one is the one the delete's precondition takes.
         let deleted = emulator
             .delete_table(
                 fixture.region,
                 &bucket_arn,
                 fixture.namespace,
                 table,
-                &[("versionToken", held.clone())],
+                &[("versionToken", current.clone())],
             )
             .await;
         assert_eq!(

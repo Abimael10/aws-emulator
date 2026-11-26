@@ -234,18 +234,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The write: the table points at the metadata file the request names.
-        // The table's stored metadata document is NOT rewritten — the file this
+        // The write: the table points at the metadata file the request names,
+        // and the table's `versionToken` ADVANCES. The token is the table's
+        // optimistic-concurrency version over which metadata document the table
+        // is at, so a write that moves the table to another metadata document —
+        // whether the service wrote that document itself (a catalog commit) or
+        // the caller wrote it and names it here — leaves the table at a new
+        // version: the token this call answers with is the table's current one
+        // afterwards, the one the caller presented is superseded, and presenting
+        // the superseded one again is the conflict checked above. The table's
+        // stored metadata document is NOT rewritten, though: the file this
         // location names was written by the caller, so what it holds is not this
-        // service's to invent — and for the same reason the table's
-        // `versionToken` is NOT re-minted here: the token names the metadata
-        // document this service holds for the table, so it advances only where
-        // the service writes one (the table's create, a catalog commit), and a
-        // write that records a pointer or a coordinate the caller supplies,
-        // under the caller's token as its precondition, leaves it as it is. The
-        // token the caller presented is therefore still the table's after this
-        // write, and still the one a later conditional call presents — the same
-        // rule `RenameTable` applies to the same member.
+        // service's to invent.
+        let version_token = store.mint_version_token();
         let table = store
             .table_buckets
             .get_mut(&input.table_bucket_arn)
@@ -253,6 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|namespace| namespace.tables.get_mut(&input.name))
             .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
         table.metadata_location = Some(input.metadata_location.clone());
+        table.version_token = version_token;
         table.record_modification(account, now);
 
         // The answer is read back out of the record that was just written, so a
