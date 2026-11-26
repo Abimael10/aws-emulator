@@ -840,7 +840,10 @@ async fn a_validator_refusal_runs_no_lifecycle_action_point() {
                 queue_url: &queue_url,
                 until: TERMINAL_DEPLOYMENT_STATES,
                 required: &LET_THROUGH_POINTS,
-                logging: None,
+                // This row asserts on the records those stages keep as well, and the last of
+                // its bound points is the one the completion owes, so the wait ends once that
+                // record is there — the earlier stage's is written before it.
+                logging: Some("DEPLOYMENT_COMPLETED"),
             },
         )
         .await;

@@ -575,7 +575,10 @@ async fn measure_share(
 /// those reads are taken at is the share written here however long the host takes over them.
 /// It is a ceiling on those reads and never a wait: nothing sleeps for it and no assertion is
 /// about it.
-fn pin_percentage(
+///
+/// `pub(crate)` because more than one suite in this target reads a fleet while a rollout is
+/// held part-way through.
+pub(crate) fn pin_percentage(
     engine: &Arc<engine::InMemoryEngine>,
     application_id: &str,
     environment_id: &str,
@@ -632,7 +635,9 @@ async fn host_version(
 }
 
 /// Create a deployment strategy and answer its id.
-async fn create_strategy(
+///
+/// `pub(crate)` because more than one suite in this target paces a rollout with one.
+pub(crate) async fn create_strategy(
     router: &MultiServiceRouter,
     name: &str,
     growth_factor: f32,
