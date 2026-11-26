@@ -36,3 +36,41 @@ Actual (emulator): no phase of the lifecycle completed and no converted object o
 1. Deploy the ETL estate (bucket, execution role, converter function) and seed the three fixed CSV objects.
 2. Call PutBucketNotificationConfiguration on the bucket with a LambdaFunctionConfigurations entry for s3:ObjectCreated:* targeting the converter function.
 3. Poll by uploading a NEW .csv key every 15 s and reading back the expected .xlsx output object; on AWS the configuration arms and the output appears, while on the emulator no output object is ever produced and the lifecycle never advances past its first phase.
+
+## Fix status
+
+Cause 1 (the lifecycle never progressing, hypothesised as "the emulator accepts
+PutBucketNotificationConfiguration but never delivers the ObjectCreated event to the Lambda
+target"): NOT A DEFECT of the emulator's own answers. The delivery IS made, and every call of
+the reported sequence is served:
+
+* the estate the report describes — IAM `CreateRole`/`PutRolePolicy`, lambda `CreateFunction`
+  (`python3.12`, a real .zip) polled to `Active`, `AddPermission` for `s3.amazonaws.com` with
+  the bucket as `SourceArn`, `PutBucketNotificationConfiguration` with one Lambda configuration
+  on `s3:ObjectCreated:*` filtered to prefix `raw/` and suffix `.csv` — converts a NEWLY written
+  `raw/*.csv` key with no further API call, in under five seconds, and the converted object is
+  readable where a client reads it. Pinned by `notification_lambda_handler_run.rs` and
+  `notification_filter_delivery.rs` in this crate, by `handler_workbook_pipeline.rs` in the
+  Lambda crate (which builds a real Office Open XML package stamped
+  `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`) and by
+  `core/router/tests/all/s3_notification_pipeline_lifecycle.rs` (the whole life of the pipeline,
+  the filter-rejected non-effect and the teardown).
+* the legs the earlier replays of this check had not yet reached are now pinned too, by
+  `notification_pipeline_dismantling.rs` in this crate: once the configuration is narrowed to
+  another event class, cleared with the empty container, or its destination function deleted, a
+  matching write is still accepted and is published to nobody, the recorded configuration stays
+  what was last recorded, and the estate then empties and deletes clean through its own listing.
+
+What the replay reports is its own wall-clock ceiling, not an emulator answer. This check's
+replay key has walked forward with each fix — `phase#9` (the backfill invocation, a runtime
+defect, fixed 2026-11-05), then `phase#10` (lambda `GetPolicy`'s not-found wording in
+`post_invoke`, fixed 2026-11-08), and now `_watch_absent|Timeout|return found`: the leg that
+WATCHES for an absence, which spends wall clock by design and only after the positive control
+has already arrived. The sibling filing
+`issues/things-that-now-work/20261117T134237Z-lambda-s3-the-armed-s3-objectcreated-notification-csv-conversion-scenario.md`
+quotes that helper's own window for the other check in this family (60 s), against a harness
+that abandons the run at 60 s. The only difference left between this emulator and the recording
+is the propagation delay the recording measured (about 330 s, the S3 User Guide's "usually takes
+about five minutes"), which is a per-run AWS timing value an emulator must not sleep for: the
+configuration here takes effect when it is recorded, which is inside the check's own 540 s
+propagation budget.

@@ -38,20 +38,20 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The XML namespace a client puts on an S3 request payload.
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// Where `CreateFunction` is bound, and the module and attribute the package carries its
 /// handler as.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
-const HANDLER: &str = "lambda_function.lambda_handler";
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// The service principal Amazon S3 publishes notifications under, and the action it performs on
 /// a function destination.
-const S3_PRINCIPAL: &str = "s3.amazonaws.com";
-const INVOKE_ACTION: &str = "lambda:InvokeFunction";
+pub(crate) const S3_PRINCIPAL: &str = "s3.amazonaws.com";
+pub(crate) const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
 /// The bucket, the function and the execution role this suite drives.
 const BUCKET: &str = "armed-notification-conversion";
@@ -60,19 +60,19 @@ const ROLE: &str = "convert-uploaded-csv-role";
 
 /// The key-name filter the configuration carries: the two rule kinds `FilterRuleName` publishes
 /// (`smithy_query(query="shape",shape="FilterRuleName")` reports `[prefix, suffix]`).
-const FILTER_PREFIX: &str = "raw/";
-const FILTER_SUFFIX: &str = ".csv";
+pub(crate) const FILTER_PREFIX: &str = "raw/";
+pub(crate) const FILTER_SUFFIX: &str = ".csv";
 
 /// Where the handler writes what it converted, which no rule of the filter admits — so the
 /// handler's own write starts no second delivery.
-const CONVERTED_PREFIX: &str = "converted/";
+pub(crate) const CONVERTED_PREFIX: &str = "converted/";
 
 /// The CSV every object this suite writes holds, so a delivery that happened always converts:
 /// an absence is then the delivery S3 did not make and never a handler that failed.
-const CSV_BODY: &str = "id,total\n1,42\n2,7\n";
+pub(crate) const CSV_BODY: &str = "id,total\n1,42\n2,7\n";
 
 /// What that CSV converts to, which is what the handler must have written.
-fn converted_document() -> Value {
+pub(crate) fn converted_document() -> Value {
     json!([
         {"id": "1", "total": "42"},
         {"id": "2", "total": "7"},
@@ -83,8 +83,8 @@ fn converted_document() -> Value {
 /// window, and the asynchronous delivery of an object event — and how often it looks while
 /// waiting. Generous: nothing under test depends on the span, and the suite waits for the
 /// CONDITION rather than for a time to pass.
-const BUDGET: Duration = Duration::from_secs(90);
-const LOOK: Duration = Duration::from_millis(50);
+pub(crate) const BUDGET: Duration = Duration::from_secs(90);
+pub(crate) const LOOK: Duration = Duration::from_millis(50);
 
 /// The handler the function runs: for each record it is handed it reads the object the event
 /// named, parses the CSV it holds and writes the rows back as JSON under
@@ -94,7 +94,7 @@ const LOOK: Duration = Duration::from_millis(50);
 /// It accepts a `.CSV` key as readily as a `.csv` one (`key.lower().endswith`), which is what
 /// makes the suppression legs meaningful: a key the S3-side filter admits is converted, and a
 /// key only the handler would have accepted is never handed to it.
-const CONVERTING_HANDLER: &str = r#"
+pub(crate) const CONVERTING_HANDLER: &str = r#"
 import csv
 import io
 import json
@@ -123,18 +123,18 @@ def lambda_handler(event, context):
 "#;
 
 /// Amazon S3, Lambda, IAM and the token service over ONE shared engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -173,7 +173,7 @@ impl Emulator {
 
     /// Dispatch one request, signed for `signing_name` so the router resolves the service the
     /// way it does in production.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         signing_name: &str,
         method: &str,
@@ -202,13 +202,13 @@ impl Emulator {
     }
 
     /// One Amazon S3 request, path style.
-    async fn s3(&self, method: &str, uri: &str, body: &[u8]) -> Answer {
+    pub(crate) async fn s3(&self, method: &str, uri: &str, body: &[u8]) -> Answer {
         self.send("s3", method, uri, "application/octet-stream", body.to_vec())
             .await
     }
 
     /// One Amazon S3 request that must be served.
-    async fn s3_ok(&self, case: &str, method: &str, uri: &str, body: &[u8]) {
+    pub(crate) async fn s3_ok(&self, case: &str, method: &str, uri: &str, body: &[u8]) {
         let answer = self.s3(method, uri, body).await;
         assert!(
             (200..300).contains(&answer.status),
@@ -219,13 +219,19 @@ impl Emulator {
     }
 
     /// One Lambda `restJson1` call.
-    async fn lambda(&self, method: &str, uri: &str, body: Vec<u8>) -> Answer {
+    pub(crate) async fn lambda(&self, method: &str, uri: &str, body: Vec<u8>) -> Answer {
         self.send("lambda", method, uri, "application/json", body)
             .await
     }
 
     /// One awsQuery call of `signing_name` that must be served.
-    async fn query(&self, case: &str, signing_name: &str, action: &str, params: &[(&str, String)]) {
+    pub(crate) async fn query(
+        &self,
+        case: &str,
+        signing_name: &str,
+        action: &str,
+        params: &[(&str, String)],
+    ) {
         let mut body = format!("Action={action}&Version=2010-05-08");
         for (name, value) in params {
             body.push('&');
@@ -265,9 +271,37 @@ fn form_encode(value: &str) -> String {
     encoded
 }
 
+/// The container that makes the pipeline LIVE: one Lambda configuration naming `function_arn`
+/// for `events`, filtered to [`FILTER_PREFIX`] and [`FILTER_SUFFIX`]. The Lambda list is bound
+/// as `CloudFunctionConfiguration` and its ARN member as `CloudFunction`
+/// (`smithy_query(query="shape",shape="NotificationConfiguration")`).
+///
+/// `pub(crate)`: the ONE spelling of this container in the crate, so a suite that varies the
+/// event class ([`super::notification_pipeline_dismantling`]) varies that and nothing else.
+pub(crate) fn lambda_configuration(function_arn: &str, events: &str) -> String {
+    format!(
+        "<NotificationConfiguration xmlns=\"{XMLNS}\"><CloudFunctionConfiguration>\
+         <Id>convert</Id><CloudFunction>{function_arn}</CloudFunction>\
+         <Event>{events}</Event><Filter><S3Key>\
+         <FilterRule><Name>prefix</Name><Value>{FILTER_PREFIX}</Value></FilterRule>\
+         <FilterRule><Name>suffix</Name><Value>{FILTER_SUFFIX}</Value></FilterRule>\
+         </S3Key></Filter></CloudFunctionConfiguration></NotificationConfiguration>"
+    )
+}
+
+/// The EMPTY container, which is what turns notifications off for the bucket: "you can disable
+/// notifications by adding the empty NotificationConfiguration element"
+/// (`PutBucketNotificationConfiguration`'s own documentation).
+///
+/// `pub(crate)`: beside [`lambda_configuration`], so the suites of this family spell the
+/// container one way.
+pub(crate) fn cleared_configuration() -> String {
+    format!("<NotificationConfiguration xmlns=\"{XMLNS}\"></NotificationConfiguration>")
+}
+
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory the
 /// way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -352,7 +386,10 @@ fn rows() -> Vec<Row> {
 /// Where the handler writes the conversion of `key`: the last element of the key, with its
 /// extension replaced, under [`CONVERTED_PREFIX`]. One target per row, so no row's absence can
 /// be satisfied by another row's delivery.
-fn converted_key(key: &str) -> String {
+///
+/// `pub(crate)`: the ONE reading of the key the converting handler derives, so a suite driving
+/// that handler ([`super::notification_pipeline_dismantling`]) cannot drift from what it writes.
+pub(crate) fn converted_key(key: &str) -> String {
     let name = key.rsplit('/').next().unwrap_or(key);
     let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
     format!("{CONVERTED_PREFIX}{stem}.json")
@@ -492,14 +529,7 @@ async fn an_armed_lambda_notification_runs_its_handler_only_for_a_key_its_filter
     // The configuration: the Lambda list is bound as `CloudFunctionConfiguration`, whose ARN
     // member is bound as `CloudFunction`
     // (`smithy_query(query="shape",shape="NotificationConfiguration")`).
-    let configuration = format!(
-        "<NotificationConfiguration xmlns=\"{XMLNS}\"><CloudFunctionConfiguration>\
-         <Id>convert</Id><CloudFunction>{function_arn}</CloudFunction>\
-         <Event>s3:ObjectCreated:*</Event><Filter><S3Key>\
-         <FilterRule><Name>prefix</Name><Value>{FILTER_PREFIX}</Value></FilterRule>\
-         <FilterRule><Name>suffix</Name><Value>{FILTER_SUFFIX}</Value></FilterRule>\
-         </S3Key></Filter></CloudFunctionConfiguration></NotificationConfiguration>"
-    );
+    let configuration = lambda_configuration(&function_arn, "s3:ObjectCreated:*");
     emulator
         .s3_ok(
             "setup",
