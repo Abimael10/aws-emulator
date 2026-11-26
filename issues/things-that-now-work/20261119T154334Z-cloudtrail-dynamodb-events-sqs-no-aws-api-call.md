@@ -44,3 +44,37 @@ Actual (emulator): zero messages in any of the three sinks. The control leg (sqs
    - the same with eventName DeleteTable.
 4. Call sqs TagQueue on the first queue and poll its sink. On AWS an "AWS API Call via CloudTrail" envelope with source aws.sqs arrives; on the emulator nothing arrives and the poll runs until the harness kills the check.
 5. (Unreachable on the emulator) dynamodb CreateTable, wait ACTIVE, poll the second sink for source aws.dynamodb / detail.eventName CreateTable with detail.requestParameters.tableName equal to the table created; then DeleteTable and poll the third sink; assert neither DynamoDB sink holds the other's eventName and the aws.sqs sink holds no aws.dynamodb event.
+
+## Resolution
+
+The channel this report describes as absent is served: the management-event fan-out hangs off the
+recording seam every audited service is served behind, so a served control-plane write is published
+onto the Region's default bus as `AWS API Call via CloudTrail` and handed to the rules whose
+patterns name it. The steps above were replayed one by one — including the parts no suite covered
+before: a single-Region trail created with `IncludeGlobalServiceEvents=false` outside the
+partition's leader Region, its selectors, its logging switch and its status addressed by the trail's
+own ARN, a destination carrying the policy CloudTrail documents (`s3:GetBucketAcl` on the bucket and
+`s3:PutObject` under `AWSLogs/<account-id>/` with the bucket-owner-full-control condition), and the
+control write made on the control rule's own sink — and each sink received exactly its own
+envelope. That wiring is now pinned by
+`core/router/tests/all/cloudtrail_api_call_events_for_the_documented_trail_setup.rs`, beside the
+suites that already drove the default-selector wiring in process and against the started binary.
+
+Replicating step 1 did surface two defects on the TRAIL's own S3 leg, both fixed here:
+
+- the log-file write named no canned ACL, while CloudTrail's destination judging accepts a bucket
+  only if its policy admits a write carrying `bucket-owner-full-control` — so a destination hardened
+  with the documented deny of every write that is not owner-granting was accepted and then received
+  no log file. The write now names that ACL, from one constant both halves read;
+- the condition context a delivery states to a destination's policy answered no transport key, so a
+  destination carrying the other documented deny — every write made outside TLS — left that `Deny`
+  undecided, which is read fail-closed, and `CreateTrail` refused the bucket. The delivery now
+  answers `aws:SecureTransport`, as the sibling access-log delivery does.
+
+`services/service-com-amazonaws-cloudtrail-cloudtrail-20131101/tests/all/trail_log_file_delivery_canned_acl.rs`
+spans the destination policies a client writes over that ACL and fails without either fix.
+
+The replay unit still ends `Check timed out after 60.0s`. That is the replay harness's own ceiling
+on a whole check, not an observation of a missing delivery: the check's recorded run budgets 1800 s
+for its first delivery and re-emits its control write every 120 s, while on this emulator every leg
+of the pipeline above completes in well under a second.

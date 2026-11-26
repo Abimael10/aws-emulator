@@ -51,7 +51,11 @@ const X_AMZ_ACL_CONDITION_KEY: &str = "s3:x-amz-acl";
 
 /// The canned ACL CloudTrail writes a log file under, so the bucket's owner owns the
 /// object it delivers.
-const BUCKET_OWNER_FULL_CONTROL: &str = "bucket-owner-full-control";
+///
+/// The delivery's own constant
+/// ([`service_common::trail_log_files::DELIVERY_CANNED_ACL`]): the write names this ACL, so
+/// the grant judged here is the grant that write needs and the two cannot drift apart.
+const BUCKET_OWNER_FULL_CONTROL: &str = ::service_common::trail_log_files::DELIVERY_CANNED_ACL;
 
 /// The global condition key naming the resource a service-principal call is made ON
 /// BEHALF OF: the trail, for a delivery CloudTrail makes for one.
@@ -60,17 +64,34 @@ const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
 /// The global condition key naming the account that resource belongs to.
 const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
 
+/// The global condition key saying whether the call was made over a secure transport, and
+/// the value every delivery carries for it: the delivery reaches the owning service over
+/// TLS, which is also what that service's own gate answers for every request it judges.
+///
+/// It is ANSWERED rather than left open because the delivery knows it, and a destination
+/// whose policy refuses every write made outside TLS — the clause a hardened destination
+/// carries beside the documented grant — admits the delivery on AWS and so must admit it
+/// here.
+const SECURE_TRANSPORT_CONDITION_KEY: &str = "aws:SecureTransport";
+/// See [`SECURE_TRANSPORT_CONDITION_KEY`].
+const SECURE_TRANSPORT_VALUE: &str = "true";
+
 /// The condition keys a delivery CloudTrail makes FOR the trail `trail_arn` carries, so
 /// a statement scoped by them is decided rather than left undecided.
 ///
-/// These two and no others: they are the keys a grant to a SERVICE PRINCIPAL is scoped
-/// by, naming the resource the call is made on behalf of and the account that resource
-/// belongs to. A key about the CALLING account is deliberately not among them — the call
-/// is not made by the trail's owner — so a statement conditioned on one stays undecided,
-/// which is the fail-closed reading, and never turns into a grant for this delivery.
+/// These three and no others: the keys a grant to a SERVICE PRINCIPAL is scoped by, naming
+/// the resource the call is made on behalf of and the account that resource belongs to, and
+/// the transport the delivery is made over. A key about the CALLING account is deliberately
+/// not among them — the call is not made by the trail's owner — so a statement conditioned
+/// on one stays undecided, which is the fail-closed reading, and never turns into a grant
+/// for this delivery.
 fn delivery_context(trail_arn: &str) -> Vec<(String, String)> {
     vec![
         (SOURCE_ARN_CONDITION_KEY.to_string(), trail_arn.to_string()),
+        (
+            SECURE_TRANSPORT_CONDITION_KEY.to_string(),
+            SECURE_TRANSPORT_VALUE.to_string(),
+        ),
         (
             SOURCE_ACCOUNT_CONDITION_KEY.to_string(),
             ::engine::emulator_account_id().to_string(),

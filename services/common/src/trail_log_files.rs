@@ -49,6 +49,19 @@ pub const RECORDS_MEMBER: &str = "Records";
 /// The media type of the object a log file is: a gzip stream.
 const GZIP_MEDIA_TYPE: &str = "application/x-gzip";
 
+/// The canned ACL every log-file write NAMES, so the bucket's owner owns the object the
+/// delivery left there.
+///
+/// It is part of the write and not a detail of it: the destination policy CloudTrail
+/// documents for a trail grants the delivery `s3:PutObject` only where the write asks for
+/// this ACL (`"Condition": {"StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}}`),
+/// so a bucket whose policy admits only such a write — or denies every write that is not one
+/// — receives the trail's log files exactly as it does on AWS. Stated once, and read by the
+/// permission question CloudTrail asks of a destination before it accepts a trail
+/// (`service-com-amazonaws-cloudtrail-cloudtrail-20131101`'s referenced-resource judging), so
+/// the ACL a delivery names and the ACL its grant is judged under cannot drift apart.
+pub const DELIVERY_CANNED_ACL: &str = "bucket-owner-full-control";
+
 /// How many characters of the unique field a log file's name ends with — the field that
 /// tells two files of the same minute apart.
 const UNIQUE_FIELD_LEN: usize = 16;
@@ -173,6 +186,9 @@ impl DeliveredLogFile {
             .put_object()
             .bucket(&self.bucket)
             .key(&self.key)
+            .acl(::aws_sdk_s3::types::ObjectCannedAcl::from(
+                DELIVERY_CANNED_ACL,
+            ))
             .content_type(GZIP_MEDIA_TYPE)
             .body(::aws_sdk_s3::primitives::ByteStream::from(body))
             .send()
