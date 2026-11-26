@@ -477,15 +477,20 @@ impl State {
         for triggered_ms in due_instants(&record, now_ms) {
             let query_id = super::mint_query_id(self.take_query_seq());
             let (start_secs, end_secs) = execution_window_secs(&record, triggered_ms, &schedule);
+            let (run_names, run_identifiers) = run_log_groups(&record);
             let mut query = super::QueryRecord::new(
                 &query_id,
                 &record.query_language,
                 &record.query_string,
-                run_log_group_names(&record),
+                run_names,
                 start_secs,
                 end_secs,
                 triggered_ms,
             );
+            // The configuration named those log groups by name or by ARN, and a query reports
+            // the groups it processed under the identifier it was given
+            // ([`super::QueryRecord::log_group_identifiers`]).
+            query.log_group_identifiers = run_identifiers;
             // The run happened AT the instant the schedule made it due, so the query it minted
             // is not one waiting on the clock to run: it is one that has run, whose results
             // this same call records on it ([`settle`]).
@@ -540,18 +545,23 @@ impl State {
 }
 
 /// The log groups one run of `record` reads, resolved to the names the store keys log groups
-/// by: "An array of log group names or ARNs to query", so either form names the same group. A
+/// by: "An array of log group names or ARNs to query", so either form names the same group —
+/// and, beside each, the identifier the configuration named that group by, which is the form a
+/// query reports its processed log groups under
+/// ([`super::QueryRecord::log_group_identifiers`]). A
 /// query that names none leaves them to its own query string, exactly as a started query whose
 /// `SOURCE` command selects them does.
-fn run_log_group_names(record: &ScheduledQueryRecord) -> Vec<String> {
+fn run_log_groups(record: &ScheduledQueryRecord) -> (Vec<String>, Vec<String>) {
     let mut names: Vec<String> = Vec::with_capacity(record.log_group_identifiers.len());
+    let mut named_by: Vec<String> = Vec::with_capacity(record.log_group_identifiers.len());
     for identifier in &record.log_group_identifiers {
         let name = super::log_group_name_from_identifier(identifier).to_string();
         if !names.contains(&name) {
             names.push(name);
+            named_by.push(identifier.clone());
         }
     }
-    names
+    (names, named_by)
 }
 
 /// Materialise, run and deliver every execution the clock owes the scheduled query

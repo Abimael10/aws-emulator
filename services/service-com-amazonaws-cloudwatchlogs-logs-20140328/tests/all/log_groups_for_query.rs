@@ -7,7 +7,8 @@
 //!
 //! * the report is computed from the query the `queryId` names — "An array of the names and
 //!   ARNs of the log groups that were processed in the query" — so it names exactly the log
-//!   groups that query reads, however the start selected them, and reading it changes nothing
+//!   groups that query reads, each under the identifier the START named it by (a bare name, or
+//!   either ARN form of one), however the start selected them, and reading it changes nothing
 //!   a later caller sees;
 //! * a `queryId` that names no query of this account is an AUTHORIZATION refusal
 //!   (`AccessDeniedException`) carrying no sentence at all, rather than a missing resource;
@@ -19,8 +20,10 @@
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
 //! response a handler does not actually compute cannot pass.
 //!
-//! The tables span what the rules generalise over: how many log groups the query reads and
-//! which member the start named them by, which form an unresolvable `queryId` takes (both
+//! The tables span what the rules generalise over: how many log groups the query reads, which
+//! member the start named them by and which identifier FORM each was named in (a bare name, a
+//! log-group ARN, and two forms of the same group in one request),
+//! which form an unresolvable `queryId` takes (both
 //! published length bounds of `QueryId` included), and which end of the `maxResults` range a
 //! value sits outside.
 
@@ -79,7 +82,8 @@ fn identifiers(case: &str, page: &Value) -> Vec<String> {
 }
 
 /// The report names the log groups the query reads, whichever member the start selected them
-/// by — and reading it twice reports the same thing.
+/// by and in the identifier form that member carried — and reading it twice reports the same
+/// thing.
 #[tokio::test]
 async fn the_report_names_the_log_groups_the_query_reads() {
     let logs = Logs::new();
@@ -90,28 +94,31 @@ async fn the_report_names_the_log_groups_the_query_reads() {
         logs.ok("CreateLogGroup", &json!({"logGroupName": group}))
             .await;
     }
-    // The ARN form a log group is reported under: `logGroupArn`, the ARN without the trailing
-    // `:*`, read back from the group itself so the identifier is not restated here.
-    let one = logs.group_arns(ONE).await.1;
+    // The ARN form a log group is named by: `logGroupArn`, the ARN without the trailing `:*`
+    // (the wildcard form the `arn` member carries is outside the pattern
+    // `logGroupIdentifiers` admits), read back from the group itself so no identifier is
+    // restated here.
     let two = logs.group_arns(TWO).await.1;
     let three = logs.group_arns(THREE).await.1;
 
-    // (case, the member that selects the log groups, the identifiers the report must name)
+    // (case, the member that selects the log groups, the identifiers the report must name) —
+    // each expected identifier is the one the start SUBMITTED, because that is the form the
+    // report echoes.
     let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (
             "one group named by logGroupName",
             json!({"logGroupName": ONE}),
-            vec![one.clone()],
+            vec![ONE.to_string()],
         ),
         (
             "one group named by logGroupNames",
             json!({"logGroupNames": [TWO]}),
-            vec![two.clone()],
+            vec![TWO.to_string()],
         ),
         (
             "three groups named by logGroupNames",
             json!({"logGroupNames": [TWO, THREE, ONE]}),
-            vec![one.clone(), three.clone(), two.clone()],
+            vec![ONE.to_string(), TWO.to_string(), THREE.to_string()],
         ),
         (
             "one group named by its ARN",
@@ -119,9 +126,21 @@ async fn the_report_names_the_log_groups_the_query_reads() {
             vec![three.clone()],
         ),
         (
+            "two groups named by ARN and one by name",
+            json!({"logGroupIdentifiers": [two.clone(), ONE, three.clone()]}),
+            vec![two.clone(), ONE.to_string(), three.clone()],
+        ),
+        (
+            // One group named twice over is ONE processed group, identified by the first form
+            // that named it.
+            "the same group named by name and then by ARN",
+            json!({"logGroupIdentifiers": [TWO, two.clone()]}),
+            vec![TWO.to_string()],
+        ),
+        (
             "the same group named twice",
             json!({"logGroupNames": [ONE, ONE]}),
-            vec![one.clone()],
+            vec![ONE.to_string()],
         ),
         (
             // A query whose own SOURCE command selects the log groups names none of the three

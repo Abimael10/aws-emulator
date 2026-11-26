@@ -850,22 +850,36 @@ pub fn parse_timestamp(rendered: &str) -> Option<i64> {
 /// opaque token this service mints.
 const POINTER_KIND: &str = "LogRecordPointer";
 
+/// The scheme a log record pointer is written under: a pointer is `<scheme><base64 payload>`,
+/// which is the encoding CloudWatch Logs hands `@ptr` out in — a scheme prefix naming the
+/// store the record is held in, then the pointer's own payload in base64.
+const POINTER_SCHEME: &str = "hotstore:";
+
 /// The `@ptr` of one log event: "the identifier for the log record. You can use the value of
 /// @ptr in a GetLogRecord operation to get the full log record" (`GetQueryResults`).
 ///
 /// A pointer therefore has to address ONE event in this store, which the log group, the log
 /// stream and the event's own position in that stream's order (its timestamp and ingestion
-/// sequence — `crate::state::EventKey`) do uniquely. The payload is encoded the way this
-/// service encodes every opaque token ([`crate::state::encode_token`]), so a client only ever
-/// round-trips it.
+/// sequence — `crate::state::EventKey`) do uniquely. What a pointer MEANS is this service's
+/// own, but the FORM it is written in is the one CloudWatch Logs publishes
+/// ([`POINTER_SCHEME`]): the scheme prefix, then the payload in base64, so nothing of the
+/// service's internal structure is readable on the wire and a client only ever round-trips the
+/// token ([`log_record_pointer_parts`] reads it back).
 pub fn log_record_pointer(group: &str, stream: &str, timestamp_ms: i64, seq: u64) -> String {
-    super::encode_token(&::serde_json::json!({
+    let payload = ::serde_json::json!({
         "kind": POINTER_KIND,
         "logGroupName": group,
         "logStreamName": stream,
         "timestamp": timestamp_ms,
         "seq": seq,
-    }))
+    });
+    // A pointer with an empty payload would address nothing while still LOOKING like one, so
+    // the payload is written rather than defaulted: the value above is a closed object of
+    // scalars, which serialises.
+    let encoded = ::aws_smithy_types::base64::encode(
+        ::serde_json::to_vec(&payload).expect("a log record pointer's payload serialises"),
+    );
+    format!("{POINTER_SCHEME}{encoded}")
 }
 
 /// What one log record pointer addresses.
@@ -881,10 +895,13 @@ pub struct LogRecordPointer {
     pub seq: u64,
 }
 
-/// Read a pointer [`log_record_pointer`] minted. `None` for anything else, which a reader
+/// Read a pointer [`log_record_pointer`] minted. `None` for anything else — a token in another
+/// scheme, a body that is not base64, and a payload that is not a pointer's — which a reader
 /// refuses as an invalid `logRecordPointer`.
 pub fn log_record_pointer_parts(pointer: &str) -> Option<LogRecordPointer> {
-    let value = super::decode_token(pointer)?;
+    let body = pointer.strip_prefix(POINTER_SCHEME)?;
+    let bytes = ::aws_smithy_types::base64::decode(body).ok()?;
+    let value: ::serde_json::Value = ::serde_json::from_slice(&bytes).ok()?;
     if value.get("kind")?.as_str()? != POINTER_KIND {
         return None;
     }

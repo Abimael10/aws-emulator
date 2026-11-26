@@ -214,6 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid(message));
         }
 
+        // The import runs under the role this request PASSES to CloudWatch Logs ("The API
+        // caller must have permissions to [...] perform iam:PassRole on the provided import
+        // role"), and a principal of one account cannot pass a role of another: a role ARN
+        // naming an account other than the caller's is a defect in the VALUE the request
+        // carried, so it is refused as the parameter it is
+        // ([`crate::state::cross_account_role_refusal`]) — and BEFORE the `importSourceArn` is
+        // resolved against the service that holds the source, because this refusal is decided
+        // on the request alone while that resolution asks another service about a resource.
+        if let Some(message) = crate::state::cross_account_role_refusal(&input.import_role_arn) {
+            return Err(invalid(message.to_string()));
+        }
+
         // "The startEventTime must be less than or equal to endEventTime": the window is a
         // filter over EVENT TIMES, so a window bounded at one end only is still a window, and
         // the one window that spans no instant is the one whose end precedes its start.

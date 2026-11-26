@@ -676,6 +676,25 @@ pub const MAX_IMPORT_TASKS: usize = 1_000;
 pub const IMPORT_SOURCE_NOT_ACTIVE_MESSAGE: &str =
     "The specified source must be in an ACTIVE state.";
 
+/// The refusal CloudWatch Logs answers when a request hands it a role of ANOTHER account to
+/// act under: a role is passed to this service by the caller that holds it
+/// (`CreateImportTask`'s own documentation states the caller must "have permissions to [...]
+/// perform iam:PassRole on the provided import role"), and a principal of one account cannot
+/// pass a role of another, so the request is a permanent defect in the value it carried.
+///
+/// Fixed text for the whole class: it names neither the member, the role nor the account, so
+/// nothing of the request is interpolated.
+pub const CROSS_ACCOUNT_ROLE_MESSAGE: &str = "Cross-account role passing is not allowed.";
+
+/// That refusal for the role ARN `role_arn`, or `None` where the role may be passed: a role of
+/// the caller's own account, and an ARN naming no account at all — which names no role either
+/// and is refused for the form it is in instead
+/// ([`super::unparsable_arn_message`]).
+pub fn cross_account_role_refusal(role_arn: &str) -> Option<&'static str> {
+    let account = super::arn_account_id(role_arn)?;
+    (account != ::engine::emulator_account_id()).then_some(CROSS_ACCOUNT_ROLE_MESSAGE)
+}
+
 /// The refusal `CreateImportTask` answers when the `importSourceArn` it is given is in no
 /// form a CloudTrail Lake event data store is named by: an ARN of another resource kind or
 /// another service, a value that is not an ARN at all, or an event data store ARN whose

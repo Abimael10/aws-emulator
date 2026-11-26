@@ -180,9 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The Region the request was signed for: a log group's ARN names the Region it lives
-        // in, and this report names the log groups by ARN.
-        let region = crate::state::request_region(ctx.parts());
+        // `ctx` carries only request metadata: the log groups this report names are the ones
+        // the START named, held on the query record, so nothing about THIS request enters into
+        // it — not even the Region, because the identifiers are echoed as they were submitted
+        // rather than re-rendered as ARNs of the Region this read was signed for.
+        let _ = ctx;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListLogGroupsForQueryError::from(
@@ -234,9 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An array of the names and ARNs of the log groups that were processed in the
         // query": the groups are the ones the query reads, held on the query record, each
-        // named by its ARN — the identifier that names a log group whichever account and
-        // Region it lives in. The enumeration is ordered by that identifier, so a page a
-        // client resumes names the same position on every call.
+        // reported under the identifier the START named it by — a bare log-group name or
+        // either ARN form of one, whichever the request carried
+        // ([`crate::state::QueryRecord::log_group_identifiers`]). The report echoes that form
+        // rather than re-rendering the group from state, so a caller correlates this list
+        // against the identifiers it passed. The enumeration is ordered by that identifier, so
+        // a page a client resumes names the same position on every call.
         //
         // A query whose own `SOURCE` command selects the log groups is recorded with none:
         // which groups such a selection matches is decided where the query is STARTED
@@ -244,11 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolve a `SOURCE` selection into them), so this report names what that record
         // holds rather than resolving the selection a second time here — one place decides
         // which groups a query reads, and this operation reports it.
-        let mut identifiers: Vec<String> = query
-            .log_group_names
-            .iter()
-            .map(|name| crate::state::log_group_arn(&region, name, false))
-            .collect();
+        let mut identifiers: Vec<String> = query.log_group_identifiers.clone();
         identifiers.sort_unstable();
         identifiers.dedup();
 

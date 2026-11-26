@@ -49,8 +49,15 @@ const SOURCE: &str =
     "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/11111111-1111-1111-1111-111111111111";
 
 /// The role an import runs under ("The ARN of the IAM role that grants CloudWatch Logs
-/// permission to import from the CloudTrail Lake Event Data Store").
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/CloudWatchLogsImport";
+/// permission to import from the CloudTrail Lake Event Data Store"), in the CALLER's own
+/// account: a role of another account cannot be passed to the service, so a create that is
+/// meant to be accepted names one of this account's own roles.
+fn role_arn() -> String {
+    format!(
+        "arn:aws:iam::{}:role/CloudWatchLogsImport",
+        ::engine::emulator_account_id()
+    )
+}
 
 /// One day of event time, which is the span one batch of an import groups: a batch is "a subset
 /// of stored events grouped by their eventTime" (`DescribeImportTaskBatches`).
@@ -96,7 +103,7 @@ fn seed_task(logs: &Logs, id: &str, filter: Option<ImportFilter>) -> usize {
     let mut record = ImportTaskRecord::new(
         id,
         SOURCE,
-        ROLE_ARN,
+        &role_arn(),
         &destination_arn(id),
         filter.as_ref(),
         now,
@@ -291,7 +298,7 @@ async fn a_created_import_reports_the_batches_its_window_implies() {
         // rows of this table.
         let logs = Logs::new();
 
-        let mut request = json!({"importSourceArn": SOURCE, "importRoleArn": ROLE_ARN});
+        let mut request = json!({"importSourceArn": SOURCE, "importRoleArn": role_arn()});
         if let Some(filter) = grouping.filter.clone() {
             request["importFilter"] = filter;
         }

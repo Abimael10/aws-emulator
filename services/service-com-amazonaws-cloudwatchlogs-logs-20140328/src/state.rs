@@ -1366,6 +1366,18 @@ pub struct QueryRecord {
     /// Every log group this query reads, resolved to log group NAMES from whichever member
     /// the start named them by. Empty for a query whose `SOURCE` command selects its own.
     pub log_group_names: Vec<String>,
+    /// The same log groups as the start IDENTIFIED them: the identifier each one was submitted
+    /// under — a bare log-group name, or either ARN form of one — one per group in
+    /// [`Self::log_group_names`].
+    ///
+    /// `ListLogGroupsForQuery` reports "the names and ARNs of the log groups that were
+    /// processed in the query" from this list, so a caller reads back the identifiers it
+    /// passed rather than a form this service re-rendered them in.
+    ///
+    /// Defaults to [`Self::log_group_names`], which is the identifier form of a query whose
+    /// groups were SELECTED rather than named one by one: a selection names no identifier for
+    /// the groups it matches, so each is identified by its own name.
+    pub log_group_identifiers: Vec<String>,
     /// `StartQuery$startTime` — the beginning of the time range queried, in epoch SECONDS,
     /// the unit that member documents ("Specified as epoch time, the number of seconds since
     /// January 1, 1970, 00:00:00 UTC").
@@ -1439,6 +1451,7 @@ impl QueryRecord {
                 [only] => Some(only.clone()),
                 _ => None,
             },
+            log_group_identifiers: log_group_names.clone(),
             log_group_names,
             start_time_secs,
             end_time_secs,

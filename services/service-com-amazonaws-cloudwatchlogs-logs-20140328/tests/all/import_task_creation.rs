@@ -10,8 +10,12 @@
 //! CloudWatch Logs.
 //!
 //! The rule under test: `CreateImportTask` starts an import only from a data source the
-//! service that OWNS it holds in a state it can be read from, and each way that can fail is
-//! refused as the condition it is — an `importSourceArn` in no form an event data store is
+//! service that OWNS it holds in a state it can be read from, and only under a role of the
+//! CALLER's own account, and each way that can fail is
+//! refused as the condition it is — a role naming another account is a defect in that
+//! parameter (`InvalidParameterException`, `Cross-account role passing is not allowed.`),
+//! decided before the source is resolved at all, an `importSourceArn` in no form an event data
+//! store is
 //! named by is a defect in that parameter (`InvalidParameterException`, `Invalid Event Data
 //! Store ARN: <the value sent>`), a well-formed one no store answers to is a missing resource
 //! (`ResourceNotFoundException`), a store queued for deletion is `InvalidOperationException`
@@ -28,7 +32,9 @@
 //!
 //! The table spans what the rule generalises over rather than one request: each form an
 //! `importFilter` takes (absent, one bound, both bounds, both equal), several sources, a role
-//! ARN of either form, and — for the refusals — a well-formed source ARN that names no store
+//! ARN of either form, and — for the refusals — a role of another account (several account
+//! ids, each form of role ARN, and beside a source and a window that are themselves wrong), a
+//! well-formed source ARN that names no store
 //! in this account and Region and one that names none in another, a source ARN whose id is no
 //! identifier the owning service mints and one whose id is a UUID in another spelling, one
 //! that names another resource kind of the owning service, one that names a resource of
@@ -41,7 +47,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
-    log_group_arn, IMPORT_COMPLETION_DELAY_MS, IMPORT_STATUS_IN_PROGRESS, MAX_ACTIVE_IMPORT_TASKS,
+    log_group_arn, IMPORT_STATUS_IN_PROGRESS, MAX_ACTIVE_IMPORT_TASKS,
 };
 
 /// The Region every request here is signed for, which is the Region the ARNs carry.
@@ -51,8 +57,33 @@ const REGION: &str = "eu-west-2";
 const OP: &str = "CreateImportTask";
 
 /// The role an import runs under ("The ARN of the IAM role that grants CloudWatch Logs
-/// permission to import from the CloudTrail Lake Event Data Store").
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/CloudWatchLogsImport";
+/// permission to import from the CloudTrail Lake Event Data Store"), in the CALLER's OWN
+/// account: the caller passes the role to the service, and a role of another account cannot be
+/// passed, so every create that is meant to be accepted names a role of this account.
+fn role_arn() -> String {
+    format!(
+        "arn:aws:iam::{}:role/CloudWatchLogsImport",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The same role written under a PATH, which is the other form a caller writes a role ARN in.
+fn path_role_arn() -> String {
+    format!(
+        "arn:aws:iam::{}:role/service-role/CloudWatchLogsImport",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// A role of ANOTHER account, which is what a create may not pass.
+fn foreign_role_arn(account: &str) -> String {
+    format!("arn:aws:iam::{account}:role/CloudWatchLogsImport")
+}
+
+/// The sentence CloudWatch Logs refuses a role of another account with. Spelled out here
+/// rather than read from the crate, so the wording is pinned by the test; it is fixed text for
+/// the whole class and carries nothing of the request.
+const CROSS_ACCOUNT_ROLE: &str = "Cross-account role passing is not allowed.";
 
 /// The sentence CloudWatch Logs states the event-time window constraint in: "The
 /// startEventTime must be less than or equal to endEventTime" (`CreateImportTask`'s own
@@ -64,9 +95,12 @@ const EVENT_TIME_RANGE: &str = "The startEventTime must be less than or equal to
 /// must be in an ACTIVE state". Spelled out for the same reason as [`EVENT_TIME_RANGE`].
 const SOURCE_NOT_ACTIVE: &str = "The specified source must be in an ACTIVE state.";
 
-/// Room for a test's own scheduling on top of the span the import clock owes, so a sleep that
-/// has to land past that instant does even on a loaded host.
-const SCHEDULING_SLACK_MS: i64 = 1_000;
+/// How long one poll of the import clock waits before looking again, and how long the test
+/// looks before giving up. The span the clock owes is the service's own; what the test waits
+/// for is the CONDITION it makes true, so the deadline is generous and never a limit a case is
+/// about.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// CloudWatch Logs and CloudTrail on one shared engine, reached over the wire.
 struct Emulator {
@@ -273,7 +307,7 @@ struct Accepted {
     case: &'static str,
     /// The `importFilter` member, or `None` for a create that sends none.
     filter: Option<Value>,
-    role_arn: &'static str,
+    role_arn: String,
 }
 
 /// The accepted creates, spanning each form an `ImportFilter` takes — both members are
@@ -284,17 +318,17 @@ fn accepted_cases() -> Vec<Accepted> {
         Accepted {
             case: "no event-time filter",
             filter: None,
-            role_arn: ROLE_ARN,
+            role_arn: role_arn(),
         },
         Accepted {
             case: "a start bound only",
             filter: Some(json!({"startEventTime": 1_600_000_000_000i64})),
-            role_arn: ROLE_ARN,
+            role_arn: role_arn(),
         },
         Accepted {
             case: "an end bound only",
             filter: Some(json!({"endEventTime": 1_700_000_000_000i64})),
-            role_arn: "arn:aws:iam::123456789012:role/service-role/CloudWatchLogsImport",
+            role_arn: path_role_arn(),
         },
         Accepted {
             case: "both bounds",
@@ -302,7 +336,7 @@ fn accepted_cases() -> Vec<Accepted> {
                 "startEventTime": 1_600_000_000_000i64,
                 "endEventTime": 1_700_000_000_000i64,
             })),
-            role_arn: ROLE_ARN,
+            role_arn: role_arn(),
         },
         Accepted {
             case: "both bounds at the same instant",
@@ -310,7 +344,7 @@ fn accepted_cases() -> Vec<Accepted> {
                 "startEventTime": 1_650_000_000_000i64,
                 "endEventTime": 1_650_000_000_000i64,
             })),
-            role_arn: ROLE_ARN,
+            role_arn: role_arn(),
         },
     ]
 }
@@ -330,7 +364,7 @@ async fn created_imports_are_persisted_and_read_back() {
 
         let mut request = json!({
             "importSourceArn": source,
-            "importRoleArn": accepted.role_arn,
+            "importRoleArn": accepted.role_arn.clone(),
         });
         if let Some(filter) = accepted.filter.clone() {
             request["importFilter"] = filter;
@@ -432,7 +466,7 @@ async fn two_imports_from_one_source_share_the_managed_destination() {
     let case = "two imports from one source";
     let emulator = Emulator::new();
     let source = emulator.event_data_store(case, "lake-store-twice", true).await;
-    let request = json!({"importSourceArn": source, "importRoleArn": ROLE_ARN});
+    let request = json!({"importSourceArn": source, "importRoleArn": role_arn()});
 
     let first = emulator.logs_ok(case, OP, &request).await;
     let second = emulator.logs_ok(case, OP, &request).await;
@@ -513,7 +547,7 @@ async fn a_source_is_refused_as_absent_or_as_malformed_by_what_is_wrong_with_it(
         .logs_ok(
             case,
             OP,
-            &json!({"importSourceArn": source, "importRoleArn": ROLE_ARN}),
+            &json!({"importSourceArn": source, "importRoleArn": role_arn()}),
         )
         .await;
     assert!(
@@ -532,7 +566,7 @@ async fn a_source_is_refused_as_absent_or_as_malformed_by_what_is_wrong_with_it(
         .logs_refusal(
             case,
             OP,
-            &json!({"importSourceArn": absent, "importRoleArn": ROLE_ARN}),
+            &json!({"importSourceArn": absent, "importRoleArn": role_arn()}),
         )
         .await;
     assert_eq!(
@@ -549,7 +583,7 @@ async fn a_source_is_refused_as_absent_or_as_malformed_by_what_is_wrong_with_it(
         .logs_refusal(
             case,
             OP,
-            &json!({"importSourceArn": malformed, "importRoleArn": ROLE_ARN}),
+            &json!({"importSourceArn": malformed, "importRoleArn": role_arn()}),
         )
         .await;
     assert_eq!(
@@ -614,7 +648,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                 "importSourceArn":
                     "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
                      11111111-1111-1111-1111-111111111111",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "ResourceNotFoundException",
             message: SOURCE_ABSENT.to_string(),
@@ -625,7 +659,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                 "importSourceArn":
                     "arn:aws:cloudtrail:ap-southeast-1:210987654321:eventdatastore/\
                      f1d45bff-d0e3-4868-b5d9-2eb678aa32fb",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "ResourceNotFoundException",
             message: SOURCE_ABSENT.to_string(),
@@ -637,7 +671,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             request: json!({
                 "importSourceArn":
                     "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/lake-store-present",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source(
@@ -650,7 +684,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
                 "importSourceArn":
                     "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
                      F1D45BFF-D0E3-4868-B5D9-2EB678AA32FB",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source(
@@ -662,7 +696,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             case: "a source ARN naming another resource kind of the owning service",
             request: json!({
                 "importSourceArn": "arn:aws:cloudtrail:eu-west-2:123456789012:trail/management",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source("arn:aws:cloudtrail:eu-west-2:123456789012:trail/management"),
@@ -671,7 +705,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             case: "a source ARN carrying no event data store id at all",
             request: json!({
                 "importSourceArn": "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source("arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/"),
@@ -680,7 +714,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             case: "a source ARN naming a resource of another service",
             request: json!({
                 "importSourceArn": "arn:aws:s3:::import-source-bucket",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source("arn:aws:s3:::import-source-bucket"),
@@ -690,7 +724,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             request: json!({
                 "importSourceArn":
                     "arn:aws:logs:eu-west-2:123456789012:log-group:/aws/cloudtrail/not-a-source",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source(
@@ -701,7 +735,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             case: "a source that is not an ARN at all",
             request: json!({
                 "importSourceArn": "lake-store-present",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source("lake-store-present"),
@@ -710,10 +744,56 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             case: "an empty source",
             request: json!({
                 "importSourceArn": "",
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
             }),
             code: "InvalidParameterException",
             message: invalid_source(""),
+        },
+        Refused {
+            case: "a role of another account",
+            request: json!({
+                "importSourceArn": source.clone(),
+                "importRoleArn": foreign_role_arn("123456789012"),
+            }),
+            code: "InvalidParameterException",
+            message: CROSS_ACCOUNT_ROLE.to_string(),
+        },
+        Refused {
+            case: "a role of another account again, under a path",
+            request: json!({
+                "importSourceArn": source.clone(),
+                "importRoleArn": "arn:aws:iam::210987654321:role/service-role/Importer",
+            }),
+            code: "InvalidParameterException",
+            message: CROSS_ACCOUNT_ROLE.to_string(),
+        },
+        Refused {
+            // The role's account is read off the REQUEST, so this refusal is decided before
+            // the source is resolved anywhere: a create that is wrong in both ways is refused
+            // for the role.
+            case: "a role of another account beside a source no store answers to",
+            request: json!({
+                "importSourceArn":
+                    "arn:aws:cloudtrail:eu-west-2:123456789012:eventdatastore/\
+                     22222222-2222-2222-2222-222222222222",
+                "importRoleArn": foreign_role_arn("999999999999"),
+            }),
+            code: "InvalidParameterException",
+            message: CROSS_ACCOUNT_ROLE.to_string(),
+        },
+        Refused {
+            // ... and before the event-time window is read, for the same reason.
+            case: "a role of another account beside a window in the wrong order",
+            request: json!({
+                "importSourceArn": source.clone(),
+                "importRoleArn": foreign_role_arn("111122223333"),
+                "importFilter": {
+                    "startEventTime": 1_700_000_000_000i64,
+                    "endEventTime": 1_600_000_000_000i64,
+                },
+            }),
+            code: "InvalidParameterException",
+            message: CROSS_ACCOUNT_ROLE.to_string(),
         },
         Refused {
             case: "a role that is not an ARN at all",
@@ -728,7 +808,7 @@ async fn a_create_the_service_cannot_start_is_refused_and_persists_nothing() {
             case: "an event-time window whose end precedes its start",
             request: json!({
                 "importSourceArn": source.clone(),
-                "importRoleArn": ROLE_ARN,
+                "importRoleArn": role_arn(),
                 "importFilter": {
                     "startEventTime": 1_700_000_000_000i64,
                     "endEventTime": 1_600_000_000_000i64,
@@ -786,7 +866,7 @@ async fn a_source_on_its_way_out_is_not_in_an_active_state() {
         .logs_ok(
             "a source that is there",
             OP,
-            &json!({"importSourceArn": source, "importRoleArn": ROLE_ARN}),
+            &json!({"importSourceArn": source, "importRoleArn": role_arn()}),
         )
         .await;
     let started = text("a source that is there", &accepted, "importId");
@@ -797,7 +877,7 @@ async fn a_source_on_its_way_out_is_not_in_an_active_state() {
         .logs_refusal(
             case,
             OP,
-            &json!({"importSourceArn": source, "importRoleArn": ROLE_ARN}),
+            &json!({"importSourceArn": source, "importRoleArn": role_arn()}),
         )
         .await;
     assert_eq!(
@@ -839,7 +919,7 @@ async fn the_account_runs_at_most_the_documented_imports_at_once() {
                 .await,
         );
     }
-    let create = |source: &str| json!({"importSourceArn": source, "importRoleArn": ROLE_ARN});
+    let create = |source: &str| json!({"importSourceArn": source, "importRoleArn": role_arn()});
 
     for (index, source) in sources.iter().take(MAX_ACTIVE_IMPORT_TASKS).enumerate() {
         let accepted = emulator
@@ -884,12 +964,22 @@ async fn the_account_runs_at_most_the_documented_imports_at_once() {
     // million groups, which no wire suite can stand up.
 
     // The imports the clock has since completed hold no slot, so the create it refused a
-    // moment ago is accepted — without anything having been cancelled or deleted.
-    tokio::time::sleep(std::time::Duration::from_millis(
-        u64::try_from(IMPORT_COMPLETION_DELAY_MS + SCHEDULING_SLACK_MS)
-            .expect("a span of the clock is not negative"),
-    ))
-    .await;
+    // moment ago is accepted — without anything having been cancelled or deleted. The CLOCK
+    // frees the slots, so the test looks again until it has rather than waiting out a span.
+    let giving_up_at = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let running = emulator.imports(case, &json!({})).await;
+        if running.iter().all(|import| {
+            import.get("importStatus").and_then(Value::as_str) != Some(IMPORT_STATUS_IN_PROGRESS)
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < giving_up_at,
+            "case {case:?}: the clock completes the running imports, got {running:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
     let accepted = emulator
         .logs_ok(
             &format!("{case}: once the clock has completed the running imports"),

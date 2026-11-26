@@ -646,8 +646,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Whichever place names them, the log groups are resolved to the names the store keys
-        // them by: an identifier may be a name or either ARN form of one group.
-        let log_group_names: Vec<String> = if sql {
+        // them by: an identifier may be a name or either ARN form of one group — and, beside
+        // each name, the identifier the request NAMED that group by, which is what
+        // `ListLogGroupsForQuery` reports the processed log groups as
+        // ([`crate::state::QueryRecord::log_group_identifiers`]).
+        let (log_group_names, log_group_identifiers): (Vec<String>, Vec<String>) = if sql {
             let sources =
                 crate::state::insights::sql::statement_sources(&input.query_string);
             // A statement of this language that does not compile is a malformed query, which
@@ -681,14 +684,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request asked for, and it is done with the store held: it is bounded by the same
             // budget a run of the query spends ([`crate::state::insights::Budget`]), so one
             // statement cannot buy an unbounded resolution here either.
-            crate::state::insights::selected_groups(
+            let selected: Vec<String> = crate::state::insights::selected_groups(
                 &store,
                 &selectors,
                 &crate::state::insights::Budget::new(),
             )
             .into_iter()
             .filter(|name| store.log_groups.contains_key(name))
-            .collect()
+            .collect();
+            // The statement's own source clause SELECTS the groups rather than naming an
+            // identifier for each, so each selected group is identified by its own name.
+            (selected.clone(), selected)
         } else {
             if named_members.is_empty() && !selects_own_sources {
                 return Err(log_groups_unnamed(&input.query_string));
@@ -708,6 +714,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             let mut names: Vec<String> = Vec::with_capacity(identifiers.len());
+            // The identifier each of those groups was named by, kept as the request wrote it:
+            // one entry per group, so a group named twice over — by its name and by its ARN,
+            // or twice the same way — is identified by the FIRST form that named it.
+            let mut named_by: Vec<String> = Vec::with_capacity(identifiers.len());
             for identifier in &identifiers {
                 let name = crate::state::log_group_name_from_identifier(identifier).to_string();
                 if !store.log_groups.contains_key(&name) {
@@ -715,9 +725,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 if !names.contains(&name) {
                     names.push(name);
+                    named_by.push(identifier.clone());
                 }
             }
-            names
+            (names, named_by)
         };
 
         // A query in one of the OpenSearch languages reads log groups of ONE log class, so a
@@ -803,6 +814,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         record.limit = input.limit;
+        record.log_group_identifiers = log_group_identifiers;
         record.user_identity = Some(user_identity);
         // What this service stores for the query is the EFFECTIVE one: the log groups, the
         // range and the row limit this request named as parameters are the `SOURCE` and `limit`
