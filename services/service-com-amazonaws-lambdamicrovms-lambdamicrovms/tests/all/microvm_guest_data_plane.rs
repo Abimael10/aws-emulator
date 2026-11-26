@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_endpoint::{
-    serve_request, AUTH_TOKEN_HEADER,
+    serve_request, AUTH_TOKEN_HEADER, NO_GUEST_RESPONSE_STATUS,
 };
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::microvm_network::connector_state;
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::ComAmazonawsLambdamicrovmsLambdamicrovmsState as MicrovmState;
@@ -525,7 +525,12 @@ async fn through_endpoint(
         serve_request(&state, connectors.as_ref(), &callback(router), microvm_id, &request)
             .await;
     let status = response.status().as_u16();
-    let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    let body = serde_json::from_slice(response.body()).unwrap_or_else(|_| {
+        // A body that is not the guest's own JSON — the proxy's own sentence for a MicroVM it
+        // reached nothing inside of — is carried as the text it is, so an assertion that
+        // fails on it names what the endpoint answered.
+        Value::String(String::from_utf8_lossy(response.body()).to_string())
+    });
     (status, body)
 }
 
@@ -810,9 +815,544 @@ async fn the_destinations_security_group_gates_the_connectors_path() {
     }
 }
 
-/// The .zip a client uploads whose ONLY entry is the container specification: the guest
-/// does not exist as an entry of the archive at all — the build's own `RUN` steps
-/// materialise it, which is the ordinary container-image shape for this service.
+/// The PYTHON guest the suites below run: an `http.server` program that answers `/health`,
+/// reports ONE outbound connection for `/connect?host=&port=`, and reports what each attempt
+/// to reach the HOST raised for `/escape?what=`.
+///
+/// Nothing in the assertions below is a value this emulator chooses — each is what this
+/// program computed inside its MicroVM.
+const PYTHON_GUEST: &str = r#"
+import errno
+import json
+import socket
+import sys
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def _walk(root, seen=None):
+    """Every type reachable from `root` by subclass, which is how a type nothing names any
+    more is still reached."""
+    if seen is None:
+        seen = set()
+    for kind in root.__subclasses__():
+        if id(kind) in seen:
+            continue
+        seen.add(id(kind))
+        yield kind
+        for held in _walk(kind, seen):
+            yield held
+
+
+def attempt(what, path):
+    """What reaching the host this way raised, or "allowed" when nothing did."""
+    try:
+        if what == "host_file":
+            open(path).read()
+        elif what == "io_open":
+            import io
+
+            io.open(path).read()
+        elif what == "raw_file":
+            import _io
+
+            _io.FileIO(path, "r").read()
+        elif what == "traverse":
+            # The type behind a host file, reached by WALKING the type graph rather than by
+            # the name it was taken off: a type this interpreter registered would still be
+            # one `object.__subclasses__()` away.
+            reached = [kind for kind in _walk(object) if kind.__name__ == "FileIO"]
+            if not reached:
+                return "no such type"
+            for kind in reached:
+                kind(path, "r").read()
+        elif what == "socket_extension":
+            import _socket
+        elif what == "listen":
+            socket.socket().bind(("0.0.0.0", 9000))
+        elif what == "thread":
+            import _thread
+
+            _thread.start_new_thread(lambda: None, ())
+        elif what == "subprocess":
+            import subprocess
+
+            subprocess.run(["/bin/sh", "-c", "id"])
+        elif what == "native_library":
+            import ctypes
+        elif what == "untrace":
+            sys.settrace(None)
+        elif what == "recursion":
+            sys.setrecursionlimit(10 ** 6)
+        elif what == "builtin_module":
+            import _imp
+
+            _imp.create_builtin("posix")
+        else:
+            return "no such attempt"
+    except BaseException as raised:
+        return type(raised).__name__
+    return "allowed"
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/health":
+            self.answer(200, {"healthy": True})
+            return
+        if parsed.path == "/escape":
+            what = query.get("what", [""])[0]
+            path = query.get("path", [""])[0]
+            self.answer(
+                200,
+                {
+                    "what": what,
+                    "raised": attempt(what, path),
+                    "builtins": sorted(sys.builtin_module_names),
+                },
+            )
+            return
+        if parsed.path == "/spin":
+            while True:
+                pass
+        if parsed.path == "/recurse":
+            self.answer(200, self.recursed())
+            return
+        if parsed.path != "/connect":
+            self.answer(404, {"error": "no such path"})
+            return
+        host = query.get("host", [""])[0]
+        port = int(query.get("port", ["0"])[0])
+        self.answer(200, self.connected(host, port))
+
+    def recursed(self):
+        """How deep this guest got before the platform stopped it recursing."""
+        depth = [0]
+
+        def descend():
+            depth[0] += 1
+            descend()
+
+        try:
+            descend()
+        except RecursionError:
+            return {"depth": depth[0], "raised": "RecursionError"}
+        return {"depth": depth[0], "raised": "none"}
+
+    def connected(self, host, port):
+        try:
+            opened = socket.create_connection((host, port), timeout=8)
+        except TimeoutError as raised:
+            return {
+                "connected": False,
+                "outcome": "timed_out",
+                "peer": [host, port],
+                "detail": str(raised)[:200],
+            }
+        except ConnectionRefusedError:
+            return {"connected": False, "outcome": "refused", "peer": [host, port]}
+        except OSError as raised:
+            unreachable = (errno.EHOSTUNREACH, errno.ENETUNREACH)
+            outcome = (
+                "unreachable"
+                if raised.errno in unreachable
+                else "error:" + type(raised).__name__
+            )
+            return {"connected": False, "outcome": outcome, "peer": [host, port]}
+        try:
+            return {
+                "connected": True,
+                "outcome": "connected",
+                "peer": list(opened.getpeername()),
+                "local": list(opened.getsockname()),
+            }
+        finally:
+            opened.close()
+
+    def answer(self, status, body):
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+if __name__ == "__main__":
+    HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+"#;
+
+/// The container specification that declares a PYTHON guest the way a client's build
+/// context does: the interpreter is installed, the module is written by a `RUN` step, and
+/// the command starts it.
+fn python_specification(server: &str) -> String {
+    let encoded = aws_smithy_types::base64::encode(server);
+    format!(
+        "FROM public.ecr.aws/amazonlinux/amazonlinux:2023\n\
+         RUN dnf install -y python3 && dnf clean all\n\
+         RUN mkdir -p /srv\n\
+         RUN echo {encoded} | base64 -d > /srv/app.py\n\
+         CMD [\"/bin/sh\", \"-c\", \"python3 /srv/app.py\"]\n"
+    )
+}
+
+/// The .zip a client uploads whose Python guest is an ENTRY of the archive rather than a
+/// file a build step writes — the other form the same image is staged in.
+fn python_entry_artifact(server: &str) -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+        for (name, source) in [
+            (
+                "Dockerfile",
+                "FROM public.ecr.aws/amazonlinux/amazonlinux:2023\nCOPY . /srv\n\
+                 CMD [\"python3\", \"/srv/app.py\"]\n"
+                    .to_string(),
+            ),
+            ("srv/app.py", server.to_string()),
+        ] {
+            writer.start_file(name, options).expect("the entry starts");
+            writer
+                .write_all(source.as_bytes())
+                .expect("the entry's bytes");
+        }
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
+}
+
+/// Everything the Python suites stand up once: the network, the ACTIVE connector, the
+/// staged Python guest and the two MicroVMs it runs.
+async fn python_standing() -> Standing {
+    let (router, engine) = emulator();
+    let network = network(&router).await;
+    ingress(&router, &network.target_group, ADMITTED_PORT, true).await;
+    let connector = active_connector(&router, &network).await;
+    stage_artifact(
+        &router,
+        "mvm-python-artifacts",
+        "guest.zip",
+        specification_only_artifact(&python_specification(PYTHON_GUEST)),
+    )
+    .await;
+    let image = guest_image(
+        &router,
+        "python-guest-serving",
+        "s3://mvm-python-artifacts/guest.zip",
+    )
+    .await;
+    let connected = running_microvm(&router, &image, &[connector]).await;
+    let internet_only = running_microvm(&router, &image, &[internet_egress_arn()]).await;
+    Standing {
+        router,
+        engine,
+        network,
+        connected,
+        internet_only,
+    }
+}
+
+/// RULE: a MicroVM whose image declares a PYTHON guest runs that program, so an
+/// authenticated request to the published endpoint is answered with the response the
+/// program itself produced — whichever form the image was staged in, and whichever of its
+/// own paths is asked for.
+///
+/// The rows differ along the form the image is staged in (a guest a build step wrote, a
+/// guest the archive carries as an entry) and, within each, along the path asked for and the
+/// status the guest's own program answers with.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_python_guests_own_response_is_what_the_endpoint_answers() {
+    // (the case of this staging form, the artifact staged)
+    let forms: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a guest a build step wrote",
+            specification_only_artifact(&python_specification(PYTHON_GUEST)),
+        ),
+        (
+            "a guest the archive carries as an entry",
+            python_entry_artifact(PYTHON_GUEST),
+        ),
+    ];
+    // (the path asked for, the status and body the guest answers it with)
+    let paths: Vec<(&str, u16, Value)> = vec![
+        ("/health", 200, json!({"healthy": true})),
+        ("/health?probe=1", 200, json!({"healthy": true})),
+        ("/nothing-here", 404, json!({"error": "no such path"})),
+    ];
+
+    for (form, artifact) in forms {
+        let (router, engine) = emulator();
+        stage_artifact(&router, "mvm-python-forms", "guest.zip", artifact).await;
+        let image = guest_image(
+            &router,
+            "python-guest-form",
+            "s3://mvm-python-forms/guest.zip",
+        )
+        .await;
+        let microvm = running_microvm(&router, &image, &[internet_egress_arn()]).await;
+        let token = auth_token(&router, &microvm.0).await;
+        for (path, status, expected) in &paths {
+            let (actual_status, actual) =
+                through_endpoint(&router, &engine, &microvm.0, path, &token).await;
+            assert_eq!(
+                actual_status, *status,
+                "case {form:?} on {path:?}: expected the guest's status {status}, got \
+                 {actual_status} {actual}"
+            );
+            assert_eq!(
+                actual, *expected,
+                "case {form:?} on {path:?}: expected the guest's body {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+/// RULE: a PYTHON guest's outbound connection is decided by exactly what a JavaScript
+/// guest's is — only an attached ACTIVE VPC-egress connector whose VPC holds the
+/// destination and whose path the destination's security groups admit on that port carries
+/// one — and the guest observes the carried one as established with a LINK-LOCAL local
+/// address, and an uncarried one as the timeout its own `socket` call raised.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_connector_decides_a_python_guests_connection() {
+    let standing = python_standing().await;
+    let target = standing.network.target_address.clone();
+
+    // (case, the MicroVM asked, the destination, the port, whether it connects)
+    let rows: Vec<ConnectRow> = vec![
+        (
+            "the connector's own VPC, on the admitted port",
+            &standing.connected,
+            target.clone(),
+            ADMITTED_PORT,
+            true,
+        ),
+        (
+            "the same destination on a port nothing admits",
+            &standing.connected,
+            target.clone(),
+            9_999,
+            false,
+        ),
+        (
+            "an address of the connector's subnet nothing holds",
+            &standing.connected,
+            "10.90.1.200".to_string(),
+            ADMITTED_PORT,
+            false,
+        ),
+        (
+            "an address outside the connector's VPC",
+            &standing.connected,
+            "10.99.1.4".to_string(),
+            ADMITTED_PORT,
+            false,
+        ),
+        (
+            "the same destination from a MicroVM attached only to internet egress",
+            &standing.internet_only,
+            target.clone(),
+            ADMITTED_PORT,
+            false,
+        ),
+    ];
+
+    for (case, microvm, address, port, connects) in rows {
+        let body = guest_connect(&standing, microvm, &address, port).await;
+        assert_eq!(
+            body["connected"].as_bool(),
+            Some(connects),
+            "case {case:?}: expected connected={connects}, got {body}"
+        );
+        let expected_outcome = if connects { "connected" } else { "timed_out" };
+        assert_eq!(
+            body["outcome"].as_str(),
+            Some(expected_outcome),
+            "case {case:?}: expected outcome {expected_outcome:?}, got {body}"
+        );
+        assert_eq!(
+            body["peer"],
+            json!([address, port]),
+            "case {case:?}: the guest reports the peer it was asked for, got {body}"
+        );
+        if !connects {
+            assert!(
+                body["local"].is_null(),
+                "case {case:?}: an unreached connection has no local end, got {body}"
+            );
+            continue;
+        }
+        let local = body["local"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: a carried connection has a local end: {body}"))
+            .to_string();
+        let octets: Vec<u8> = local
+            .split('.')
+            .filter_map(|octet| octet.parse::<u8>().ok())
+            .collect();
+        assert_eq!(
+            (octets.first().copied(), octets.get(1).copied()),
+            (Some(LINK_LOCAL_PREFIX.0), Some(LINK_LOCAL_PREFIX.1)),
+            "case {case:?}: expected a link-local local address, got {local:?}"
+        );
+    }
+}
+
+/// ONE MicroVM running the Python guest, on the AWS-managed internet-egress connector and
+/// with no VPC of its own: what a suite that reads the GUEST rather than the network it
+/// reaches needs, and one live guest process rather than the two a connector-attached
+/// standing holds.
+async fn python_microvm() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String, String) {
+    let (router, engine) = emulator();
+    stage_artifact(
+        &router,
+        "mvm-python-guest",
+        "guest.zip",
+        specification_only_artifact(&python_specification(PYTHON_GUEST)),
+    )
+    .await;
+    let image = guest_image(&router, "python-guest", "s3://mvm-python-guest/guest.zip").await;
+    let microvm = running_microvm(&router, &image, &[internet_egress_arn()]).await;
+    let token = auth_token(&router, &microvm.0).await;
+    (router, engine, microvm.0, token)
+}
+
+/// RULE: nothing of the HOST is reachable from a MicroVM's Python guest, and no bound of
+/// its run can be switched off from inside it — every attempt raises, and the names the
+/// interpreter reports as built in carry no module whose calls land on the host.
+///
+/// The rows are one attempt each, from GUEST code, over the surfaces a program would reach
+/// the host through: a file, the stream type behind one, a socket extension, a listening
+/// socket, a thread, a child process, a native library, the trace slot, the recursion
+/// limit and the creation of a built-in module.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_of_the_host_is_reachable_from_a_python_guest() {
+    let (router, engine, microvm, token) = python_microvm().await;
+    // A file this process itself can read, which the MicroVM's own machine holds nothing at:
+    // what a guest asking for a path of the HOST is asking for.
+    let host_file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
+    // The host-reaching modules a program would name, none of which this interpreter
+    // registers (`guest_python::ALLOWED_NATIVE_MODULES` names what it does).
+    let unregistered = [
+        "_socket", "_ssl", "_posixsubprocess", "mmap", "_ctypes", "fcntl", "_signal",
+    ];
+    // (the attempt, the error classes a platform answers it with)
+    let attempts: Vec<(&str, &[&str])> = vec![
+        ("host_file", &["FileNotFoundError", "OSError", "PermissionError"]),
+        ("io_open", &["OSError", "PermissionError"]),
+        ("raw_file", &["OSError", "PermissionError", "TypeError"]),
+        // The traversal row: this interpreter registers no type that opens a host file at
+        // all, so the walk from `object` reaches none — and where a build did register one,
+        // its construction is the refusal the substrate installs and reads back.
+        (
+            "traverse",
+            &["no such type", "OSError", "PermissionError", "TypeError"],
+        ),
+        (
+            "socket_extension",
+            &["ImportError", "ModuleNotFoundError"],
+        ),
+        ("listen", &["OSError", "PermissionError"]),
+        (
+            "thread",
+            &["RuntimeError", "ImportError", "ModuleNotFoundError"],
+        ),
+        ("subprocess", &["ImportError", "ModuleNotFoundError"]),
+        ("native_library", &["ImportError", "ModuleNotFoundError"]),
+        ("untrace", &["AttributeError"]),
+        ("recursion", &["AttributeError"]),
+        ("builtin_module", &["ImportError", "ModuleNotFoundError"]),
+    ];
+
+    for (what, expected) in attempts {
+        let (status, body) = through_endpoint(
+            &router,
+            &engine,
+            &microvm,
+            &format!("/escape?what={what}&path={host_file}"),
+            &token,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {what:?}: the guest answers what the attempt raised, got {status} {body}"
+        );
+        let raised = body["raised"].as_str().unwrap_or_default();
+        assert!(
+            expected.contains(&raised),
+            "case {what:?}: expected one of {expected:?}, got {raised:?} in {body}"
+        );
+        let names: Vec<&str> = body["builtins"]
+            .as_array()
+            .map(|held| held.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        for name in unregistered {
+            assert!(
+                !names.contains(&name),
+                "case {what:?}: {name} is no built-in module of this interpreter, got {body}"
+            );
+        }
+    }
+}
+
+/// RULE: a request a MicroVM's Python guest never answers is bounded by the HOST — the guest
+/// is stopped and the client is answered for a MicroVM nothing was reached inside of — and
+/// the bound is spent per REQUEST, so the MicroVM goes on answering afterwards. How deep the
+/// guest may recurse is clamped the same way, which its own code observes as the recursion
+/// error a platform raises.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_python_guest_that_never_answers_is_stopped_and_the_microvm_goes_on() {
+    let (router, engine, microvm, token) = python_microvm().await;
+
+    // (case, the path asked for, the status the endpoint answers)
+    let rows: Vec<(&str, &str, u16)> = vec![
+        ("a request the guest answers", "/health", 200),
+        (
+            "a request the guest never returns from",
+            "/spin",
+            NO_GUEST_RESPONSE_STATUS,
+        ),
+        (
+            "the request after it, which has its own budget",
+            "/health",
+            200,
+        ),
+    ];
+
+    for (case, path, expected) in rows {
+        let (status, body) = through_endpoint(&router, &engine, &microvm, path, &token).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected} from {path}, got {status} {body}"
+        );
+    }
+
+    let (status, body) =
+        through_endpoint(&router, &engine, &microvm, "/recurse", &token).await;
+    assert_eq!(
+        status, 200,
+        "the guest reports what its own recursion came to, got {status} {body}"
+    );
+    assert_eq!(
+        body["raised"].as_str(),
+        Some("RecursionError"),
+        "a guest that recurses without end reads the platform's own error, got {body}"
+    );
+    let depth = body["depth"].as_i64().unwrap_or_default();
+    assert!(
+        depth > 0 && depth < 10_000,
+        "the clamp the host installed is what stopped it, got depth {depth} in {body}"
+    );
+}
+
+/// The .zip a client uploads whose ONLY entry is the container specification: the guest does
+/// not exist as an entry of the archive at all — the build's own `RUN` steps materialise it,
+/// which is the ordinary container-image shape for this service.
 fn specification_only_artifact(dockerfile: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {

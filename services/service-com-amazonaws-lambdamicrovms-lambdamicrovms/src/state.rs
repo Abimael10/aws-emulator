@@ -61,6 +61,9 @@ pub mod regions;
 
 /// The guest a MicroVM runs: the program held in the image version's code artifact.
 pub mod guest_program;
+
+/// The PYTHON half of running that guest: the interpreter an image whose command starts
+/// `python3` is run in, and everything that contains and bounds it.
 pub mod guest_python;
 
 /// The MACHINE that guest runs on: the identity its MicroVM publishes to it, the

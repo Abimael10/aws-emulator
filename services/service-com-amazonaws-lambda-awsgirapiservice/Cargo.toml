@@ -329,6 +329,13 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 #   version is pinned and resolves with a checksum in Cargo.lock. No advisory stands
 #   against this line.
 rquickjs = { version = "0.14", features = ["loader"] }
+# The CONTAINED Python interpreter, shared with the other service of this emulator that runs
+# caller-supplied Python (`service-com-amazonaws-lambdamicrovms-lambdamicrovms`, which runs a
+# MicroVM image's guest): the interpreter's construction and native-module narrowing, the
+# containment patches the host reads back, the clamped sleep and recursion limit, the watch
+# that samples a run from outside it, and the memory reading a run's ceiling is judged on all
+# live there, so a hole cannot be closed in one service and left open in the other.
+python-guest-substrate = { path = "../python-guest-substrate" }
 rustpython-vm = { version = "0.6", default-features = false, features = [
     "compiler",
 ] }

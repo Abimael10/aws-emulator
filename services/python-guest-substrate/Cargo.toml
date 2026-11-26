@@ -1,0 +1,51 @@
+[package]
+name = "python-guest-substrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The EXECUTION SUBSTRATE itself, which this crate exists to CONTAIN: RustPython interprets
+# caller-supplied Python in this process, and the services that run such code
+# (`service-com-amazonaws-lambda-awsgirapiservice`, which runs a function's handler, and
+# `service-com-amazonaws-lambdamicrovms-lambdamicrovms`, which runs a MicroVM image's guest)
+# narrow it through THIS crate rather than through a copy each. Every containment patch and
+# every reading a bound is judged on therefore has one implementation, so a hole cannot open
+# in one service and not the other.
+#
+# Each crate is taken with its host-reaching surface switched off at compile time, exactly as
+# the services that embed it take it:
+#
+# * `rustpython-vm` with `default-features = false` leaves `host_env`, `stdio` and
+#   `threading` out of the build, so the interpreter registers no `_ctypes` host loader,
+#   writes nothing to this process's standard streams and starts no interpreter thread;
+#   `compiler` is the bytecode compiler for the caller's own modules.
+# * `rustpython-stdlib` with `default-features = false` is the NATIVE-MODULE POOL this crate
+#   filters through the caller's allow-list ([`contained_interpreter`]): a module absent from
+#   that list is dropped from the interpreter's table before any guest code runs.
+# * `rustpython-pylib` with `freeze-stdlib` is the Python standard library, FROZEN into the
+#   binary: no host path is searched for a module.
+# * `rustpython-ruff_*` are RustPython's own forks of the Python parser's AST crates, PINNED
+#   exactly: `rustpython-codegen` 0.6 is built against the 0.16.5 AST and 0.16.10 renamed
+#   fields it uses, so an unpinned resolution picks a newer 0.16.x and fails to compile.
+# * `nix` (`resource` only) reads this process's own resource usage, which is how a run is
+#   bounded in memory: RustPython exposes no allocator seam, so the reading is taken from
+#   outside the guest. It compiles no C.
+#
+# Advisories considered: RUSTSEC-2026-0394 (RustPython up to 0.5, fixed in the 0.6 line taken
+# here) and the `atty` advisory the 0.3/0.4 lines pull in (not reachable from 0.6).
+rustpython-vm = { version = "0.6", default-features = false, features = [
+    "compiler",
+] }
+rustpython-stdlib = { version = "0.6", default-features = false }
+rustpython-pylib = { version = "0.6", features = ["freeze-stdlib"] }
+rustpython-ruff_python_ast = "=0.16.5"
+rustpython-ruff_python_parser = "=0.16.5"
+rustpython-ruff_python_trivia = "=0.16.5"
+rustpython-ruff_source_file = "=0.16.5"
+rustpython-ruff_text_size = "=0.16.5"
+nix = { version = "0.31", default-features = false, features = ["resource"] }
+
+[lints]
+workspace = true

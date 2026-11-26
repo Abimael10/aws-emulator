@@ -124,7 +124,7 @@ const MAX_LOG_ENTRIES: usize = 200;
 const MAX_LOG_ENTRY_BYTES: usize = 4_096;
 
 /// How many outbound connections one request may open.
-const MAX_CONNECTS: u64 = 16;
+pub(super) const MAX_CONNECTS: u64 = 16;
 
 /// How many engine jobs one request may spend.
 const MAX_PENDING_JOBS: usize = 20_000;
@@ -151,6 +151,39 @@ fn guest_slots() -> &'static Arc<::tokio::sync::Semaphore> {
     SLOTS.get_or_init(|| Arc::new(::tokio::sync::Semaphore::new(MAX_LIVE_GUESTS)))
 }
 
+/// The live-process slot ONE guest thread holds out of [`MAX_LIVE_GUESTS`].
+///
+/// It is held here rather than moved into the thread, so the host can take it back from
+/// OUTSIDE that thread: a guest the host has GIVEN UP on — one still inside a call of its
+/// engine after its budget was spent, which only that engine can leave
+/// ([`super::guest_python`]) — stops holding the room a guest that answers could use, while
+/// the thread it is on is counted as given up on for as long as it lasts. Dropping every
+/// handle releases the slot too, which is what happens when the thread ends.
+#[derive(Debug, Clone)]
+pub(super) struct GuestSlot {
+    held: Arc<Mutex<Option<::tokio::sync::OwnedSemaphorePermit>>>,
+}
+
+impl GuestSlot {
+    /// Take one of this emulator's live-process slots, or `None` where every one is taken.
+    fn take() -> Option<Self> {
+        let permit = Arc::clone(guest_slots()).try_acquire_owned().ok()?;
+        Some(Self {
+            held: Arc::new(Mutex::new(Some(permit))),
+        })
+    }
+
+    /// Give the slot back at once. Idempotent: a slot already given back stays given back.
+    pub(super) fn release(&self) {
+        drop(
+            self.held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
 /// The host stack the engine's own thread is given, well outside the JavaScript stack
 /// ([`RUN_STACK_BYTES`]) the engine is built with.
 const GUEST_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
@@ -162,7 +195,7 @@ const MAX_QUEUED_REQUESTS: usize = 64;
 
 /// How long the host waits for one outbound-connection decision before the connection is
 /// reported as one nothing carried.
-const CONNECT_DECISION_CEILING: Duration = Duration::from_secs(5);
+pub(super) const CONNECT_DECISION_CEILING: Duration = Duration::from_secs(5);
 
 /// One request a client sent through a MicroVM's published endpoint, as the guest is
 /// handed it.
@@ -258,17 +291,19 @@ impl GuestProcess {
     /// taken, or where no thread could be started at all — each of which leaves the caller
     /// to report a MicroVM it reached nothing inside of rather than a guest that answered.
     pub fn boot(program: Arc<GuestProgram>, machine: Arc<GuestMachine>) -> Option<Self> {
-        // The slot is held by the THREAD, so it goes back exactly where the engine's heap
-        // is freed rather than when the store stops holding the process.
-        let slot = Arc::clone(guest_slots()).try_acquire_owned().ok()?;
+        // The slot is held by the PROCESS and dropped where its engine is freed, so it goes
+        // back when the thread ends — and the host can give it back earlier for a guest it
+        // has given up on ([`GuestSlot`]).
+        let slot = GuestSlot::take()?;
+        let held = slot.clone();
         let (calls, mut queue) = ::tokio::sync::mpsc::channel::<Call>(MAX_QUEUED_REQUESTS);
         let (bound, ports) = ::tokio::sync::watch::channel(None);
         ::std::thread::Builder::new()
             .name("microvm-guest".to_string())
             .stack_size(GUEST_THREAD_STACK_BYTES)
             .spawn(move || {
-                let _slot = slot;
-                serve_calls(&program, &machine, &mut queue, &bound);
+                let _slot = held;
+                serve_calls(&program, &machine, &slot, &mut queue, &bound);
             })
             .ok()?;
         Some(Self { calls, ports })
@@ -353,17 +388,21 @@ impl GuestProcess {
 fn serve_calls(
     program: &GuestProgram,
     machine: &Arc<GuestMachine>,
+    slot: &GuestSlot,
     queue: &mut ::tokio::sync::mpsc::Receiver<Call>,
     bound: &::tokio::sync::watch::Sender<Option<Vec<i32>>>,
 ) {
     let seams = Seams::new(Arc::clone(machine));
-    let started = start_guest(program, &seams);
+    let started = start_guest(program, machine, slot, &seams);
     // What the guest bound is published whichever way its program started, so nothing waits
     // on a process that started no server at all.
     let _ = bound.send(Some(started.ports()));
     while let Some(call) = queue.blocking_recv() {
         let outcome = match &started {
             Guest::Engine(engine) => engine.answer(&seams, &call.request, &call.connects),
+            // The interpreter this crate embeds for a PYTHON guest, which holds that
+            // engine's own seams and bounds ([`super::guest_python`]).
+            Guest::Python(process) => process.answer(&call.request, &call.connects),
             // The interpreter's own server, answering out of the machine's filesystem.
             Guest::Files(served) => {
                 super::guest_file_server::answer(machine, served, &call.request)
@@ -380,6 +419,10 @@ fn serve_calls(
 enum Guest {
     /// A program the embedded engine compiled and started.
     Engine(Engine),
+    /// A PYTHON program, in the RustPython interpreter this crate embeds
+    /// ([`super::guest_python`]), which holds the whole of that engine's own seams and
+    /// bounds.
+    Python(Box<super::guest_python::PythonProcess>),
     /// The interpreter's own HTTP file server, over the machine's filesystem
     /// ([`super::guest_file_server`]).
     Files(::service_common::static_web_servers::ServedModule),
@@ -393,6 +436,7 @@ impl Guest {
     fn ports(&self) -> Vec<i32> {
         match self {
             Guest::Engine(engine) => engine.ports.clone(),
+            Guest::Python(process) => process.ports().to_vec(),
             Guest::Files(served) => vec![served.port],
             Guest::None(_) => Vec::new(),
         }
@@ -403,9 +447,15 @@ impl Guest {
 /// ([`super::guest_program::GuestStart`]): the module it names, in the engine that module's
 /// own suffix names, or the interpreter's own server where the command starts that instead.
 ///
-/// A program of a language this emulator embeds no engine for is a MicroVM nothing is
-/// listening inside of, which is what the endpoint then answers for.
-fn start_guest(program: &GuestProgram, seams: &Seams) -> Guest {
+/// Each of the two languages this emulator embeds an engine for is started in that engine, on
+/// the same machine and with the same live-process slot, so what a client reads back is the
+/// guest's own answer whichever one its image declares.
+fn start_guest(
+    program: &GuestProgram,
+    machine: &Arc<GuestMachine>,
+    slot: &GuestSlot,
+    seams: &Seams,
+) -> Guest {
     match &program.start {
         GuestStart::Module { language, .. } => match language {
             GuestLanguage::JavaScript => match Engine::start(program, seams) {
@@ -413,7 +463,14 @@ fn start_guest(program: &GuestProgram, seams: &Seams) -> Guest {
                 Err(outcome) => Guest::None(outcome),
             },
             GuestLanguage::Python => {
-                Guest::None(super::guest_python::no_engine_for_a_python_guest())
+                match super::guest_python::PythonProcess::start(
+                    program,
+                    Arc::clone(machine),
+                    slot.clone(),
+                ) {
+                    Ok(process) => Guest::Python(Box::new(process)),
+                    Err(outcome) => Guest::None(outcome),
+                }
             }
         },
         GuestStart::FileServer(served) => Guest::Files(served.clone()),
@@ -1076,24 +1133,35 @@ struct Collected {
 }
 
 impl Collected {
-    /// Record one line, under the count and length ceilings, cut on a character boundary
-    /// so a capped line is still a string.
+    /// Record one line, under the count and length ceilings.
     fn log(&mut self, message: &str) {
-        if self.logs.len() >= MAX_LOG_ENTRIES {
-            return;
+        if let Some(line) = capped_log_line(self.logs.len(), message) {
+            self.logs.push(line);
         }
-        let mut line = message.to_string();
-        if line.len() > MAX_LOG_ENTRY_BYTES {
-            let boundary = line
-                .char_indices()
-                .map(|(index, _)| index)
-                .take_while(|index| *index <= MAX_LOG_ENTRY_BYTES)
-                .last()
-                .unwrap_or_default();
-            line.truncate(boundary);
-        }
-        self.logs.push(line);
     }
+}
+
+/// One log line a guest wrote, under this module's ceilings — the count of lines already
+/// held decides whether there is room for it at all, and a line past the length ceiling is
+/// cut on a character boundary so what is kept is still a string.
+///
+/// Shared by both engines ([`super::guest_python`]), so what a guest's log costs this process
+/// is the same whichever language its program is written in.
+pub(super) fn capped_log_line(held: usize, message: &str) -> Option<String> {
+    if held >= MAX_LOG_ENTRIES {
+        return None;
+    }
+    let mut line = message.to_string();
+    if line.len() > MAX_LOG_ENTRY_BYTES {
+        let boundary = line
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= MAX_LOG_ENTRY_BYTES)
+            .last()
+            .unwrap_or_default();
+        line.truncate(boundary);
+    }
+    Some(line)
 }
 
 /// The budget one REQUEST is held to, as the engine's interrupt handler spends it, and

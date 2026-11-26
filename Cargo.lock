@@ -8364,6 +8364,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "python-guest-substrate"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "rustpython-pylib",
+ "rustpython-ruff_python_ast",
+ "rustpython-ruff_python_parser",
+ "rustpython-ruff_python_trivia",
+ "rustpython-ruff_source_file",
+ "rustpython-ruff_text_size",
+ "rustpython-stdlib",
+ "rustpython-vm",
+]
+
+[[package]]
 name = "qip"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17099,6 +17114,7 @@ dependencies = [
  "nix",
  "pbkdf2 0.12.2",
  "percent-encoding",
+ "python-guest-substrate",
  "quick-xml",
  "rand 0.9.5",
  "regex",
@@ -17222,7 +17238,17 @@ dependencies = [
  "hex",
  "http",
  "ipnet",
+ "nix",
+ "python-guest-substrate",
  "rquickjs",
+ "rustpython-pylib",
+ "rustpython-ruff_python_ast",
+ "rustpython-ruff_python_parser",
+ "rustpython-ruff_python_trivia",
+ "rustpython-ruff_source_file",
+ "rustpython-ruff_text_size",
+ "rustpython-stdlib",
+ "rustpython-vm",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-lambdacore-lambdacoreapiservice",

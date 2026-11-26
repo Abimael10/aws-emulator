@@ -9,6 +9,12 @@ build = "build.rs"
 [dependencies]
 # The shared request-claim rule for a SigV4 signing name several services share.
 service-common = { path = "../common" }
+# The CONTAINED Python interpreter this emulator runs caller-supplied Python in, shared with
+# the service that runs a function's own handler: the interpreter's construction, its
+# native-module narrowing, the containment patches the host reads back, and the readings a
+# run's memory bound is judged on all live there, so a MicroVM guest and a Lambda handler are
+# contained by one implementation rather than by a copy each (`src/state/guest_python.rs`).
+python-guest-substrate = { path = "../python-guest-substrate" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -90,6 +96,51 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # * no advisory is open against the 0.14 line (`cargo_audit` at the merge gate reads the
 #   locked tree).
 rquickjs = "0.14"
+# The PYTHON half of the same execution substrate: an image whose container specification
+# starts `python3` on a module holds a Python guest, so the response a client reads from that
+# MicroVM's endpoint has to be the one that program produced (`src/state/guest_python.rs`).
+# RustPython interprets it IN THIS PROCESS, and every crate here is taken with its
+# host-reaching surface switched off at compile time, so the capability class is "run the
+# MicroVM image's own Python in this process, with no host access at all":
+#
+# * `rustpython-vm` with `default-features = false` leaves `host_env`, `stdio` and
+#   `threading` out of the build, so the interpreter registers no `_ctypes` host loader,
+#   writes nothing to this process's standard streams and starts no interpreter thread;
+#   `compiler` is the bytecode compiler for the image's own modules.
+# * `rustpython-stdlib` with `default-features = false` is the NATIVE-MODULE POOL, and it is
+#   never registered wholesale: `guest_python::ALLOWED_NATIVE_MODULES` filters
+#   `stdlib_module_defs`, so `_socket`, `_ssl`, `select`, `_posixsubprocess`, `mmap`,
+#   `_ctypes`, `fcntl`, `_signal` and `posix` are never registered and are therefore
+#   reachable through no import, and the modules a program expects of its operating system
+#   (`posix`, `socket`, `socketserver`, `select`) are this crate's own, which reach the
+#   MicroVM's in-memory machine and the emulated network and nothing else.
+# * `rustpython-pylib` with `freeze-stdlib` is the Python standard library, FROZEN into this
+#   binary: no host path is searched for a module.
+# * `rustpython-ruff_*` are RustPython's own forks of the Python parser's AST crates, PINNED
+#   exactly: `rustpython-codegen` 0.6 is built against the 0.16.5 AST and 0.16.10 renamed
+#   fields it uses, so an unpinned resolution picks a newer 0.16.x and fails to compile.
+# * `nix` (`resource` only) reads this process's own resource usage — the guest thread's
+#   faulted pages — which is how a run is bounded in MEMORY: RustPython exposes no allocator
+#   seam, so the bound is sampled from outside the guest, and a per-thread reading is the
+#   only one that belongs to one guest. It compiles no C.
+#
+# Native and unsafe surface accepted here: the RustPython tree uses `unsafe` for its object
+# model and its frozen-module tables, and its arithmetic dependencies compile Rust only. No
+# crate in this set compiles a C toolchain dependency, loads a shared library, or opens a
+# socket, a process or a host file. Advisories considered: RUSTSEC-2026-0394 (RustPython up
+# to 0.5, fixed in the 0.6 line taken here) and the `atty` advisory the 0.3/0.4 lines pull in
+# (not reachable from 0.6).
+rustpython-vm = { version = "0.6", default-features = false, features = [
+    "compiler",
+] }
+rustpython-stdlib = { version = "0.6", default-features = false }
+rustpython-pylib = { version = "0.6", features = ["freeze-stdlib"] }
+rustpython-ruff_python_ast = "=0.16.5"
+rustpython-ruff_python_parser = "=0.16.5"
+rustpython-ruff_python_trivia = "=0.16.5"
+rustpython-ruff_source_file = "=0.16.5"
+rustpython-ruff_text_size = "=0.16.5"
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

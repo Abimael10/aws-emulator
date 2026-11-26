@@ -23,18 +23,14 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// The size of a page of this process's memory, which the faulted-page count is scaled by.
-const PAGE_BYTES: u64 = 4_096;
-
 /// How many bytes of memory THIS thread has faulted in, as the host reports it.
+///
+/// The reading is the SHARED one of this emulator's Python substrate
+/// ([`::python_guest_substrate::faulted_bytes`]), so what a run of a function's handler is
+/// judged to hold and what a run of a MicroVM's guest is judged to hold are the same figure
+/// taken the same way.
 pub(super) fn faulted_bytes() -> u64 {
-    match ::nix::sys::resource::getrusage(::nix::sys::resource::UsageWho::RUSAGE_THREAD) {
-        Ok(usage) => {
-            let pages = usage.minor_page_faults().saturating_add(usage.major_page_faults());
-            u64::try_from(pages).unwrap_or(0).saturating_mul(PAGE_BYTES)
-        }
-        Err(_) => 0,
-    }
+    ::python_guest_substrate::faulted_bytes()
 }
 
 /// What ONE run holds of the host: the baseline the host took for it, and the greatest

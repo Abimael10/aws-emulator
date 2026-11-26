@@ -104,7 +104,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rustpython_vm::function::{FuncArgs, OptionalArg};
 use rustpython_vm::builtins::PyModule;
-use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyRef, PyResult, Settings, VirtualMachine};
+use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyRef, PyResult, VirtualMachine};
 
 // The half of an execution environment's build that no function's configuration is read for,
 // which is why it can stand before the invocation that is served in it arrives.
@@ -1155,108 +1155,43 @@ fn served(
     ))
 }
 
-/// How often the host's own watch samples a run's deadline.
-///
-/// A long NATIVE call emits no traced event, so a deadline checked only from the trace hook is
-/// one the guest decides the timing of. The watch reads the same clock from a thread of its
-/// own, so a run that stops producing events is still noticed and still stopped.
-const WATCH_INTERVAL: Duration = Duration::from_millis(50);
-
 /// Have the host's own watch sample this run's deadline while the run lasts.
 ///
-/// The watch is ONE thread for the whole process, not one per run: it holds a WEAK reference
-/// to each run's bounds, so a run it is watching is one that is still going and a run that
-/// ended simply falls out of the list. The thread is started with the list, on the first run
-/// of this process.
+/// The watch is the SHARED one of this emulator's Python substrate
+/// ([`::python_guest_substrate::watch_run`]): ONE thread for the whole process, holding a
+/// WEAK reference to each run's bounds, so a run it is sampling is one that is still going
+/// and a run that ended simply falls out of its list. A long NATIVE call emits no traced
+/// event, so a deadline checked only from the trace hook is one the guest decides the timing
+/// of; the watch reads the same clock from outside the run, so a run that stops producing
+/// events is still noticed and still stopped.
 fn watch_run(bounds: &Arc<Bounds>) {
-    let mut watched = watched_runs()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    watched.retain(|run| run.strong_count() > 0);
-    watched.push(Arc::downgrade(bounds));
-    drop(watched);
-    start_watch_thread();
+    ::python_guest_substrate::watch_run(bounds);
 }
 
-/// The bounds of every run the watch is sampling.
-fn watched_runs() -> &'static Mutex<Vec<::std::sync::Weak<Bounds>>> {
-    static WATCHED: ::std::sync::OnceLock<Mutex<Vec<::std::sync::Weak<Bounds>>>> =
-        ::std::sync::OnceLock::new();
-    WATCHED.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Start the one watch thread of this process, if it is not already running.
-fn start_watch_thread() {
-    static STARTED: ::std::sync::OnceLock<()> = ::std::sync::OnceLock::new();
-    STARTED.get_or_init(|| {
-        let _ = ::std::thread::Builder::new()
-            .name("lambda-run-watch".to_string())
-            .spawn(|| loop {
-                ::std::thread::sleep(WATCH_INTERVAL);
-                // The live runs are copied out under the lock and sampled outside it, so a
-                // sample never holds the list against the next run that starts.
-                let live: Vec<Arc<Bounds>> = {
-                    let mut watched = watched_runs()
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    watched.retain(|run| run.strong_count() > 0);
-                    watched.iter().filter_map(::std::sync::Weak::upgrade).collect()
-                };
-                for bounds in live {
-                    bounds.watch();
-                }
-            });
-    });
+/// What the watch does with a sample of one run of a function's handler, which is this
+/// module's own reading of its budget.
+impl ::python_guest_substrate::WatchedRun for Bounds {
+    fn watch(&self) {
+        Self::watch(self);
+    }
 }
 
 /// The interpreter itself: the frozen standard library and the ALLOW-LISTED native
-/// modules, and nothing else.
+/// modules, and nothing else ([`::python_guest_substrate::contained_interpreter`], shared
+/// with the other service of this emulator that runs caller-supplied Python).
 ///
-/// `contained` reports whether the narrowing really happened: the module table is reached
-/// through the one mutable borrow the initialisation hook has, and a run is refused rather
-/// than served if that borrow is not available.
+/// `contained` reports whether the narrowing really happened: a run is refused rather than
+/// served if it did not.
 fn interpreter(contained: &Arc<AtomicBool>) -> Interpreter {
-    let mut settings = Settings::default();
-    // No host path is searched for a module: the standard library is the frozen one and
-    // the package's modules are resolved by the runtime's own finder.
-    settings.path_list = Vec::new();
-    settings.ignore_environment = true;
-    settings.isolated = true;
-    settings.write_bytecode = false;
-    settings.quiet = true;
-    // Nothing of the HOST is processed on the way up: no signal handler is installed for
-    // this process, and the `site` module — which exists to read host directories — is not
-    // imported.
-    settings.install_signal_handlers = false;
-    settings.import_site = false;
-    let contained = Arc::clone(contained);
-    Interpreter::with_init(settings, move |vm| {
-        let allowed: Vec<&'static ::rustpython_vm::builtins::PyModuleDef> =
-            ::rustpython_stdlib::stdlib_module_defs(&vm.ctx)
-                .into_iter()
-                .filter(|def| ALLOWED_NATIVE_MODULES.contains(&def.name.as_str()))
-                .collect();
+    ::python_guest_substrate::contained_interpreter(
+        ALLOWED_NATIVE_MODULES,
         // The `posix` module a run is built on is THIS crate's (see [`super::host_posix`]):
-        // the import system requires a module of that name to exist, and the engine's own
-        // — whose calls are the host's — needs an engine feature this crate does not build
-        // at all, so there is none in the binary to register.
-        let posix = super::host_posix::module::module_def(&vm.ctx);
-        let Some(state) = ::std::rc::Rc::get_mut(&mut vm.state) else {
-            return;
-        };
-        // The native surface of the interpreter, narrowed to the allow-list: the engine's
-        // own core modules that are not on it — every one whose calls land on the host —
-        // are dropped from the table, so no guest import of them can succeed.
-        state
-            .module_defs
-            .retain(|name, _| ALLOWED_NATIVE_MODULES.contains(name));
-        for def in allowed {
-            state.module_defs.insert(def.name.as_str(), def);
-        }
-        state.module_defs.insert("posix", posix);
-        state.frozen.extend(::rustpython_pylib::FROZEN_STDLIB);
-        contained.store(true, Ordering::SeqCst);
-    })
+        // the import system requires a module of that name to exist, and the engine's own —
+        // whose calls are the host's — needs an engine feature this crate does not build at
+        // all, so there is none in the binary to register.
+        |vm| vec![super::host_posix::module::module_def(&vm.ctx)],
+        contained,
+    )
 }
 
 /// Install everything the guest sees of the host that is the same for EVERY execution
@@ -1515,48 +1450,21 @@ fn install_codec_registry(vm: &VirtualMachine) -> PyResult<()> {
 /// are read back afterwards and each must answer the refusal this function installed
 /// ([`installed_refusal`]).
 fn refuse_host_file_access(vm: &VirtualMachine) -> PyResult<()> {
-    // `io` is loaded FIRST, so the standard library's own stream classes are bound and
-    // registered from the real module before anything on it is replaced.
-    vm.import("io", 0)?;
-    let refusing = vm.new_function("open", |_args: FuncArgs, vm: &VirtualMachine| {
-        Err::<PyObjectRef, _>(vm.new_os_error(
-            "a Lambda function in this emulator cannot open a file of the host".to_owned(),
-        ))
-    });
-    let refusing: PyObjectRef = refusing.into();
-    // The TYPE, before the name it is read off is replaced: its construction is what opens a
-    // host file, so that is where the refusal goes — in a build of the interpreter that
-    // registers such a type at all. This one does not (`_io` carries no `FileIO`), so there
-    // is no type in the graph to reach; where there is one, the refusal going on it is
-    // CHECKED like every other patch here. That the type behind a host file refuses however
-    // it is reached is pinned from guest code by
-    // [`tests::the_type_behind_a_host_file_refuses_however_it_is_reached`].
-    if let Ok(raw_file) = vm.import("_io", 0)?.get_attr("FileIO", vm) {
-        for slot in ["__new__", "__init__"] {
-            raw_file.set_attr(slot, refusing.clone(), vm)?;
-        }
-    }
-    let targets: [(&str, &[&str]); 2] = [
-        ("_io", &["open", "open_code", "FileIO"]),
-        ("io", &["open", "open_code", "FileIO"]),
-    ];
-    for (name, attributes) in targets {
-        let module = vm.import(name, 0)?;
-        for attribute in attributes {
-            module.set_attr(*attribute, refusing.clone(), vm)?;
-            installed_refusal(vm, &module, attribute, &refusing, name)?;
-        }
-    }
-    let builtins = vm.builtins.as_object();
-    for attribute in ["open", "open_code"] {
-        builtins.set_attr(attribute, refusing.clone(), vm)?;
-        installed_refusal(vm, builtins, attribute, &refusing, "builtins")?;
-    }
-    Ok(())
+    ::python_guest_substrate::refuse_host_file_access(
+        vm,
+        "a Lambda function in this emulator cannot open a file of the host",
+        REFUSED_RUN,
+    )
 }
 
+/// What this crate refuses when a containment patch did not take effect, named as this
+/// service's own run.
+const REFUSED_RUN: &str = "no function is run in this interpreter";
+
 /// Read `attribute` of `holder` back and answer whether it IS the refusal that was just put
-/// there — the host's own confirmation that a containment patch took effect.
+/// there — the host's own confirmation that a containment patch took effect
+/// ([`::python_guest_substrate::installed_refusal`], shared with the other service of this
+/// emulator that runs caller-supplied Python).
 ///
 /// A patch that was applied and did not take — a name the interpreter would not let this host
 /// replace — is a containment hole no later reading would report, so it is an error here and
@@ -1568,14 +1476,7 @@ fn installed_refusal(
     refusing: &PyObjectRef,
     held_by: &str,
 ) -> PyResult<()> {
-    let held = holder.get_attr(attribute, vm)?;
-    if held.is(refusing) {
-        return Ok(());
-    }
-    Err(vm.new_runtime_error(format!(
-        "the refusal this emulator installs on {held_by}.{attribute} did not take effect, so \
-         no function is run in this interpreter"
-    )))
+    ::python_guest_substrate::installed_refusal(vm, holder, attribute, refusing, held_by, REFUSED_RUN)
 }
 
 /// Replace the interpreter's own `sleep` with one clamped to what the run has left, on the
@@ -1586,17 +1487,9 @@ fn installed_refusal(
 /// served.
 fn clamp_guest_sleep(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<()> {
     let sleeping = Arc::clone(session);
-    let clamped = vm.new_function("sleep", move |args: FuncArgs, vm: &VirtualMachine| {
-        let seconds: f64 = args.bind(vm)?;
+    ::python_guest_substrate::clamp_guest_sleep(vm, REFUSED_RUN, move |seconds| {
         bounded_sleep(&sleeping.bounds(), seconds);
-        Ok::<PyObjectRef, ::rustpython_vm::builtins::PyBaseExceptionRef>(vm.ctx.none())
-    });
-    let clamped: PyObjectRef = clamped.into();
-    // Checked: an unclamped `sleep` would let a guest wait past what its run has left, so a
-    // replacement that did not take effect refuses the run.
-    let clock = vm.import("time", 0)?;
-    clock.set_attr("sleep", clamped.clone(), vm)?;
-    installed_refusal(vm, &clock, "sleep", &clamped, "time")
+    })
 }
 
 /// Wait for `seconds`, but never past what the run has left: a blocking wait the guest
@@ -1892,24 +1785,7 @@ type TraceCell = ::std::rc::Rc<::std::cell::RefCell<Option<PyObjectRef>>>;
 
 /// Clamp how deep the guest may recurse, and take away the call that would raise it.
 fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
-    let setter = vm.sys_module.as_object().get_attr("setrecursionlimit", vm)?;
-    setter.call((limit,), vm)?;
-    // Checked, like every containment patch here: a call left in place would let a guest
-    // raise the limit the host clamped, so one that could not be taken away refuses the run.
-    let _ = vm.sys_module.as_object().del_attr("setrecursionlimit", vm);
-    if vm
-        .sys_module
-        .as_object()
-        .get_attr("setrecursionlimit", vm)
-        .is_ok()
-    {
-        return Err(vm.new_runtime_error(
-            "sys.setrecursionlimit could not be taken away, so no function is run in this \
-             interpreter"
-                .to_owned(),
-        ));
-    }
-    Ok(())
+    ::python_guest_substrate::clamp_recursion(vm, limit, REFUSED_RUN)
 }
 
 /// The module the host functions live on, and the whole of what guest code can call of
@@ -2675,26 +2551,11 @@ fn narrow_posix(vm: &VirtualMachine) -> PyResult<()> {
 /// guest imports is the engine's own thread-less stub; these refusals are what make that
 /// explicit at every name that starts something.
 fn refuse_guest_threads(vm: &VirtualMachine) -> PyResult<()> {
-    let refusing = vm.new_function(
-        "start_new_thread",
-        |_args: FuncArgs, vm: &VirtualMachine| {
-            Err::<PyObjectRef, _>(vm.new_runtime_error(
-                "a Lambda function in this emulator cannot start a thread".to_owned(),
-            ))
-        },
-    );
-    let refusing: PyObjectRef = refusing.into();
-    let threads = vm.import("_thread", 0)?;
-    for attribute in [
-        "start_new_thread",
-        "start_new",
-        "start_joinable_thread",
-        "interrupt_main",
-        "_set_sentinel",
-    ] {
-        threads.set_attr(attribute, refusing.clone(), vm)?;
-        installed_refusal(vm, &threads, attribute, &refusing, "_thread")?;
-    }
+    ::python_guest_substrate::refuse_guest_threads(
+        vm,
+        "a Lambda function in this emulator cannot start a thread",
+        REFUSED_RUN,
+    )?;
     install_thread_local(vm)?;
     Ok(())
 }
