@@ -310,13 +310,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = collect_tags(input.tags.as_deref())?;
 
         // The ADDRESS this load balancer answers at, composed BEFORE the store is locked
-        // because an emulator with no endpoint of its own opens a socket here, which is
-        // asynchronous. `DNSName` is the host NAME a client resolves and then sends its
-        // traffic to, served at the endpoint this emulator is reached on
-        // ([`crate::state::LoadBalancerEndpoint`]): a name in Elastic Load Balancing's own
-        // zone resolves to nothing on the machine this emulator runs on, and an extra
-        // loopback port of this emulator's own choosing is no address a client handed a NAME
-        // can reach. A create this request goes on to refuse drops the record again.
+        // because the create opens a socket for it, which is asynchronous. `DNSName` is the
+        // address a client opens a connection to and sends the load balancer its traffic on,
+        // and this emulator's one dialable address for ONE load balancer is a socket of that
+        // load balancer's own ([`crate::state::LoadBalancerEndpoint`]): a name in Elastic Load
+        // Balancing's own zone resolves to nothing on the machine this emulator runs on, and
+        // one host of this emulator's own would be the address of every load balancer at once.
+        // A create this request goes on to refuse drops the record again.
         let endpoint = crate::state::open_load_balancer_endpoint(
             &*self.engine,
             ctx,
@@ -358,12 +358,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // What this load balancer PUBLISHES as its `DNSName`: the host name composed above,
-        // so a client that resolves what this load balancer published and sends traffic to
-        // the endpoint it resolved reaches this load balancer. What is published is the name
-        // the store KEPT — the record already held under this (region, name) is the one
-        // every published name comes from — so a caller is never told an address that was
-        // withdrawn again.
+        // What this load balancer PUBLISHES as its `DNSName`: the address composed above, so
+        // a client that dials what this load balancer published reaches this load balancer.
+        // What is published is the address the store KEPT — the record already held under this
+        // (region, name) is the one every published address comes from — so a caller is never
+        // told an address that was withdrawn again.
         let dns_name = guard.remember_endpoint(&region, &input.load_balancer_name, endpoint);
         // The default health check targets the instance port of the first listener.
         let health_check = crate::state::HealthCheckConfig::default_for_instance_port(

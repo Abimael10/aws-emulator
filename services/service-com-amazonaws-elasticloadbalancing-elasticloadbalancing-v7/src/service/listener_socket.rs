@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The SOCKET a Classic load balancer of an UNSERVED emulator is dialled at, and the hand-off
-//! of every request it accepts to the data plane ([`super::data_plane`]).
+//! The SOCKET a Classic load balancer is dialled at, and the hand-off of every request it
+//! accepts to the data plane ([`super::data_plane`]).
 //!
-//! `CreateAccessPointOutput$DNSName` is "the DNS name of the load balancer" — the name a
-//! CLIENT resolves and then sends its traffic to — and what is published is a name served at
-//! the endpoint this emulator is reached on ([`crate::state::LoadBalancerEndpoint`]), not an
-//! address of this emulator's own choosing. An emulator embedded in a host's process is served
-//! on NO endpoint at all, though, and then there is no endpoint for that name to be served at:
-//! such a load balancer is given a socket of its own, opened through the core
-//! (`engine.listeners().tcp_plaintext(..)`, which owns the socket, the bind interface, the
-//! port range and the connection caps), which is the one address a client of that emulator can
-//! dial.
+//! `CreateAccessPointOutput$DNSName` is "the DNS name of the load balancer" — the one address
+//! a CLIENT opens a connection to and sends the load balancer its traffic on — and what is
+//! published is the `host:port` of this socket ([`crate::state::LoadBalancerEndpoint`]), which
+//! is the one address of this process that both names THIS load balancer and can be dialled as
+//! it stands. It is opened through the core (`engine.listeners().tcp_plaintext(..)`, which owns
+//! the socket, the bind interface, the port range and the connection caps).
 //!
 //! ONE address serves both schemes a Classic load balancer's listeners carry: the first
 //! byte of a connection says whether the client opened with a TLS record or with a request

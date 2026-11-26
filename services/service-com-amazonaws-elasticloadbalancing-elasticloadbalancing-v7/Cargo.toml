@@ -62,6 +62,9 @@ emulator-core-build-support = { workspace = true }
 # `RunInstances$UserData` is base64, and a suite whose backend must ANSWER a health check
 # launches it with the program that starts its server (`tests/all/wire.rs`).
 base64 = "0.22"
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a new suite is a
+# new file and nothing lists it.
+automod = { workspace = true }
 
 [lints]
 workspace = true

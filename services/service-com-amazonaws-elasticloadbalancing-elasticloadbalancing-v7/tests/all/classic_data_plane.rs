@@ -5,14 +5,14 @@
 //!
 //! The rules under test:
 //!
-//! 1. **the address a load balancer publishes as its `DNSName` is a host NAME served at the
-//!    endpoint this emulator is reached on, and the load balancer answers there.** `DNSName`
-//!    is the address a client RESOLVES and then sends its traffic to, so a host in Elastic
-//!    Load Balancing's own DNS zone — which resolves to nothing on the machine this emulator
-//!    runs on — is no address at all, and neither is a `host:port` of this emulator's own
-//!    choosing: what is published is a name in the zone of the address this emulator is
-//!    reached at, which is the name `CanonicalHostedZoneName` reports too wherever that
-//!    member is reported at all.
+//! 1. **the address a load balancer publishes as its `DNSName` is the `host:port` of the
+//!    SOCKET it was given, and the load balancer answers there.** `DNSName` is the address a
+//!    client OPENS A CONNECTION TO and sends its traffic on, so a host in Elastic Load
+//!    Balancing's own DNS zone — which resolves to nothing on the machine this emulator runs
+//!    on — is no address at all, and neither is one host of this emulator's own, which would
+//!    be the published address of every load balancer at once: what is published is this load
+//!    balancer's own socket, which is the address `CanonicalHostedZoneName` reports too
+//!    wherever that member is reported at all.
 //! 2. **a request is answered only by a registered instance the load balancer may send it
 //!    to**: one its own health checks report `InService` and — while
 //!    `CrossZoneLoadBalancing` is off — one in the zone of the node that took the request.
@@ -43,10 +43,10 @@
 //! `AWSELB` cookie the answer hands back, whose token names one instance of one load
 //! balancer ([`instance_token`]).
 //!
-//! Most cases drive the plane through the router, which is the path a published name is
-//! addressed on; two of them DIAL the socket an emulator served on no endpoint of its own
-//! gives each load balancer and speak HTTP/1.1 on it, so the transport and the region-exact
-//! addressing behind it are exercised too.
+//! Most cases drive the plane through the router, which is the path a published address is
+//! also claimed on; two of them DIAL the socket each load balancer was given and speak
+//! HTTP/1.1 on it, so the transport and the region-exact addressing behind it are exercised
+//! too.
 //!
 //! The health checks the clock owes a registration are placed in the past rather than slept
 //! for ([`age_registrations`]), exactly as this crate's health suites place them.
@@ -66,7 +66,6 @@ use super::wire::{
     emulator_with_ec2_served_at, kid_text, launch_backend, members, move_instance, param, parse,
     serving_user_data, settle_ec2_transition, SERVED_BODY,
 };
-use service_common::data_plane_addressing::LOOPBACK_ZONE;
 
 /// The region every call below is signed for, unless a row names another.
 const REGION: &str = "us-east-1";
@@ -472,9 +471,9 @@ async fn fixture(name: &'static str, cross_zone: bool) -> (Fixture, Arc<engine::
     )
 }
 
-/// RULE 1: the address a load balancer publishes is a host NAME served at the endpoint this
-/// emulator is reached on, the load balancer answers there, and `CanonicalHostedZoneName` —
-/// where it is reported — carries that same name.
+/// RULE 1: the address a load balancer publishes is the socket it was given, the load balancer
+/// answers there, and `CanonicalHostedZoneName` — where it is reported — carries that same
+/// address.
 #[tokio::test]
 async fn the_published_address_is_one_the_emulator_answers_on() {
     let (router, _engine) = emulator_with_ec2();
@@ -502,7 +501,7 @@ async fn the_published_address_is_one_the_emulator_answers_on() {
     for (case, region, name, scheme, protocol) in cases {
         let zone = format!("{region}a");
         let dns = create_load_balancer(&router, region, name, *scheme, protocol, &[&zone]).await;
-        assert_published_dns_name(case, &dns, region, name, *scheme, LOOPBACK_ZONE);
+        assert_published_dns_name(case, &dns);
 
         let described = call(
             &router,
@@ -577,65 +576,75 @@ async fn the_published_address_is_one_the_emulator_answers_on() {
     }
 }
 
-/// RULE 1, the ADDRESSING half: the name a load balancer publishes carries no port and sits
-/// in the DNS zone of the address this emulator is REACHED at, and that name is served by
-/// that load balancer at the endpoint it reached.
+/// RULE 1, the ADDRESSING half: the address a load balancer publishes is the `host:port` of
+/// the socket it was given — WHATEVER address this emulator's own API is served at — and that
+/// address is the one the load balancer answers on, read back unchanged by a describe.
 ///
 /// `DNSName` is the one address a Classic client is given, and what a client does with it is
-/// RESOLVE it and then send its traffic to what it resolved — so the published value is a host
-/// name, and the zone it sits in has to be one that resolves to the interface this emulator is
-/// reached on. A name in a zone AWS serves is never announced: it resolves nowhere near this
-/// process or, worse, at genuine AWS infrastructure.
+/// open a connection to it and send its traffic, so it has to be dialable as it stands. The
+/// address this emulator's API happens to be served at is no part of it: a name derived from
+/// that address resolves to nothing on the machine this emulator runs on, and the address
+/// itself is one host for every load balancer this emulator holds. A host in a zone AWS serves
+/// is never published either: it resolves nowhere near this process or, worse, at genuine AWS
+/// infrastructure.
 ///
-/// The rows span what the rule generalises over: the address this emulator is SERVED at — an
-/// IPv4 loopback address, an IPv6 one, a name of this emulator's own, and no endpoint at all
-/// (the position a host that embeds the emulator in its own process is in) — because that
-/// address is what the announced zone is read off.
+/// The rows span what the rule generalises over: the address this emulator's API is SERVED at
+/// — an IPv4 loopback address, an IPv6 one, a name of its own, a host in a zone AWS serves,
+/// and no endpoint at all (the position a host that embeds the emulator in its own process is
+/// in).
 #[tokio::test]
-async fn the_published_name_sits_in_the_zone_of_the_address_this_emulator_is_reached_at() {
-    const NAME: &str = "zoned-elb";
-    let cases: &[(&str, Option<&str>, &str)] = &[
+async fn the_published_address_is_this_load_balancers_own_socket_however_the_api_is_served() {
+    const NAME: &str = "socketed-elb";
+    let cases: &[(&str, Option<&str>)] = &[
+        ("served on an IPv4 loopback address", Some("https://127.0.0.1:9297")),
+        ("served on an IPv6 loopback address", Some("https://[::1]:8443")),
+        ("served on a name of its own", Some("https://emulator.example:9297")),
         (
-            "served on an IPv4 loopback address",
-            Some("https://127.0.0.1:9297"),
-            LOOPBACK_ZONE,
+            "served on a host in a zone AWS serves",
+            Some("https://elasticloadbalancing.us-east-1.amazonaws.com"),
         ),
-        (
-            "served on an IPv6 loopback address",
-            Some("https://[::1]:8443"),
-            LOOPBACK_ZONE,
-        ),
-        (
-            "served on a name of its own",
-            Some("https://emulator.example:9297"),
-            "emulator.example",
-        ),
-        ("served on no endpoint at all", None, LOOPBACK_ZONE),
+        ("served on no endpoint at all", None),
     ];
-    for (case, endpoint, zone) in cases {
-        let (router, _engine) = match endpoint {
+    for (case, endpoint) in cases {
+        let (router, engine) = match endpoint {
             Some(endpoint) => emulator_with_ec2_served_at(endpoint),
             None => emulator_with_ec2(),
         };
         let dns =
             create_load_balancer(&router, REGION, NAME, None, "HTTP", &[NODE_ZONE]).await;
-        assert_published_dns_name(case, &dns, REGION, NAME, None, zone);
-        // The name is SERVED at the endpoint this emulator is reached on: a request carrying
-        // it as its host is answered out of that load balancer's own state — nothing is
-        // registered yet, so what it answers is its own "no instance to send this to".
+        assert_published_dns_name(case, &dns);
+        // The address published is THIS load balancer's own socket, which is what makes it an
+        // address naming one load balancer rather than this emulator.
+        assert_eq!(
+            dns,
+            dialled_authority(&engine, REGION, NAME),
+            "case {case:?}: the published address must be this load balancer's own socket"
+        );
+        // And it is served: a request carrying it as its host is answered out of that load
+        // balancer's own state — nothing is registered yet, so what it answers is its own "no
+        // instance to send this to".
         let answered = send(&router, &dns, "/", None).await;
         assert_eq!(
             answered.status, NO_INSTANCE,
-            "case {case:?}: the published name {dns:?} must be served by the load balancer, \
-             got {}",
+            "case {case:?}: the published address {dns:?} must be served by the load \
+             balancer, got {}",
             answered.status
         );
-        // And a client that did not keep the create's answer reads the same name back.
+        // A real connection to it is served by the same load balancer, which is what a client
+        // that holds nothing but `DNSName` opens.
+        let dialled = dial(&dns, &dns, "/", None).await;
+        assert_eq!(
+            dialled.status, NO_INSTANCE,
+            "case {case:?}: a connection dialled to {dns:?} must be served by the load \
+             balancer, got {}",
+            dialled.status
+        );
+        // And a client that did not keep the create's answer reads the same address back.
         let reported = described_dns_name(&router, REGION, NAME).await;
         assert_eq!(
             reported.as_deref(),
             Some(dns.as_str()),
-            "case {case:?}: a describe must report the name the create published, got \
+            "case {case:?}: a describe must report the address the create published, got \
              {reported:?}"
         );
     }
@@ -1263,9 +1272,10 @@ async fn a_client_that_dials_the_published_address_reaches_that_load_balancer() 
 }
 
 /// Dial one load balancer's own socket over TCP and speak one HTTP/1.1 request on it,
-/// carrying `host` — the name that load balancer published — as the request's `Host`, exactly
-/// as a client of an unserved emulator does. The connection is closed by the answer
-/// (`Connection: close`), so the response is read to end of stream rather than framed here.
+/// carrying `host` — the address that load balancer published — as the request's `Host`,
+/// exactly as a client that holds nothing but `DNSName` does. The connection is closed by the
+/// answer (`Connection: close`), so the response is read to end of stream rather than framed
+/// here.
 ///
 /// The address dialled is this machine's own: the port is read off the `authority` the socket
 /// answers at and the host is the loopback literal, which is the only interface a core-owned
@@ -1393,10 +1403,10 @@ async fn a_published_address_stays_the_address_its_load_balancer_answers_on() {
             row.zones,
         )
         .await;
-        assert_published_dns_name(case, &dns, REGION, row.name, row.scheme, LOOPBACK_ZONE);
-        // A client ADDRESSES the published name at the endpoint this emulator is reached on,
-        // carrying no AWS credential: nothing is registered yet, so what answers there is
-        // this load balancer's own "no instance to send this to" — a name nothing served
+        assert_published_dns_name(case, &dns);
+        // A client ADDRESSES the published address at the endpoint this emulator is reached
+        // on, carrying no AWS credential: nothing is registered yet, so what answers there is
+        // this load balancer's own "no instance to send this to" — an address nothing served
         // would not answer at all.
         let answered = send(&router, &dns, "/", None).await;
         assert_eq!(

@@ -1,58 +1,63 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The NAME a Classic load balancer PUBLISHES as its `DNSName`, and where a client that
-//! holds that name reaches it.
+//! The ADDRESS a Classic load balancer PUBLISHES as its `DNSName`, and where a client that
+//! holds that address reaches it.
 //!
 //! `CreateAccessPointOutput$DNSName` is "the DNS name of the load balancer", and
-//! `DescribeLoadBalancers` reports the same value: it is the one address a Classic client is
-//! given, and what a client does with it is RESOLVE it and then connect to a listener port on
-//! what it resolved. So the published value is a HOST NAME and nothing else — no port, no
-//! scheme — in the shape Elastic Load Balancing's own names carry
-//! ([`published_dns_name`]): a value with a port embedded in it is not a name a client can
-//! resolve, put in a `Host` header or point a DNS record at.
+//! `DescribeLoadBalancers` reports the same value: it is the ONE address a Classic client is
+//! given, and what a client does with it is OPEN A CONNECTION to it and send the load
+//! balancer its traffic. So the only thing the value may carry is an address the client that
+//! was handed it can reach.
 //!
-//! WHICH zone that name sits in is what makes it reachable. A name in a zone Amazon Web
-//! Services serves resolves nowhere near this process or, worse, at genuine AWS
-//! infrastructure, so this emulator never announces one; the zone it MAY announce a name of
-//! its own in is read off the address the request reached it at
-//! ([`::service_common::data_plane_addressing::announced_zone_of_authority`], the workspace's
-//! one reading of that question) — the loopback zone, which a resolver answers with the very
-//! interface the core binds, for a request that reached an address. The same reading the
-//! database endpoints of this tree are minted under
-//! (`service_com_amazonaws_rds_amazonrdsv19::state::served_endpoint_suffix`).
+//! RULE: that address is a SOCKET OF THIS LOAD BALANCER'S OWN, opened through the core when
+//! the load balancer is created and published as the `host:port` a client dials
+//! ([`open_load_balancer_endpoint`]) — the same reading the ELBv2 half of this endpoint
+//! publishes a load balancer's address under
+//! (`service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::ops::create_load_balancer`).
+//! Two addresses a load balancer could be published at are NOT reachable, and neither is
+//! published:
 //!
-//! The name is SERVED at the endpoint this emulator is reached on: a request whose host is a
-//! load balancer's published name is claimed by this service and answered by that load
-//! balancer's own plane ([`crate::service::data_plane`]), whichever port of this emulator it
-//! arrived on. Nothing of a second address of this emulator's own choosing is published: an
-//! extra loopback port is not an address a client that was handed a NAME can reach, and the
-//! endpoint the caller is already talking to is.
+//! * a NAME of this emulator's own, in Elastic Load Balancing's zone or in the zone a
+//!   resolver answers with the interface the core binds ([`published_dns_name`]): the first
+//!   resolves nowhere near this process or, worse, at genuine AWS infrastructure, and nothing
+//!   on the machine this emulator runs on resolves the second either, so a client handed one
+//!   reaches nothing at all;
+//! * ONE host of this emulator's own — the address its API is served at — which would be the
+//!   published address of EVERY load balancer at once, leaving nothing in a request addressed
+//!   there to say which load balancer a client was handed it for.
 //!
-//! A load balancer is given a SOCKET of its own only where this emulator is reached on no
-//! endpoint at all — an emulator embedded in a host's process, which is served on no port, so
-//! there is no endpoint for a published name to be served at. That socket is then the one
-//! address a client of such an emulator can dial, and it hands every request it accepts to
-//! the same data plane ([`crate::service::listener_socket`]); it is opened on the same reading
-//! a distribution's edge follows
-//! (`service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::opened_edge_endpoint`,
-//! "a create that reached the emulator's OWN endpoint needs no address of its own").
+//! A port therefore travels in the value, because the address has to be dialable as it stands:
+//! this emulator's sockets are opened on ports the core assigns, so an address of one of them
+//! without its port names nothing.
+//!
+//! The socket is opened through the core (`engine.listeners()`), which owns the bind
+//! interface, the port range and the connection caps, and every request it accepts is handed
+//! to this load balancer's own data plane ([`crate::service::listener_socket`], then
+//! [`crate::service::data_plane`]). That plane also claims a request whose host IS the
+//! published address on whatever endpoint of this emulator it arrived, so an in-process client
+//! reaches the load balancer through the address it read off the control plane too.
+//!
+//! A load balancer of an emulator whose engine vends no listener at all has no socket to
+//! publish, and then the name this service would have minted is published instead
+//! ([`published_dns_name`]) — a value of the modelled shape, naming the load balancer and
+//! nothing of AWS's own zone, for an emulator that can hand out no dialable address of any
+//! kind.
 //!
 //! The record lives for exactly as long as the load balancer: it is held on the store under
-//! the load balancer's region and name, and dropping it closes any port it kept open.
+//! the load balancer's region and name, and dropping it closes the port it kept open.
 
 use ::smithy_server_runtime::OperationContext;
 
-/// One load balancer's published address: the name it hands a client, the address a client of
-/// an UNSERVED emulator dials, and the socket — where one was opened at all — that keeps that
-/// port open.
+/// One load balancer's published address: the address it hands a client, the socket that
+/// address answers at, and the handle that keeps that port open.
 pub struct LoadBalancerEndpoint {
-    /// The host name a client resolves, which is what the load balancer publishes as its
-    /// `DNSName`.
+    /// The address a client dials, which is what the load balancer publishes as its
+    /// `DNSName`: the `host:port` of its own socket, or the minted name for an emulator whose
+    /// engine vends no listener.
     published_name: String,
-    /// The `host:port` of the socket this load balancer was given, for an emulator that is
-    /// served on no endpoint of its own — the one address a client of such an emulator can
-    /// dial. `None` for a load balancer whose published name is served at this emulator's own
-    /// endpoint.
+    /// The `host:port` of the socket this load balancer was given — the address a client
+    /// opens a connection to — and `None` for a load balancer of an emulator whose engine
+    /// vends no listener at all.
     dialled_authority: Option<String>,
     /// The socket of its own this load balancer was given. Never read: it is held because
     /// dropping it closes the port.
@@ -60,8 +65,8 @@ pub struct LoadBalancerEndpoint {
 }
 
 impl ::std::fmt::Debug for LoadBalancerEndpoint {
-    /// Everything about this record that is not a live socket: the name it publishes and the
-    /// address its own socket answers at. `ResourceListener` is not `Debug`.
+    /// Everything about this record that is not a live socket: the address it publishes and
+    /// the address its own socket answers at. `ResourceListener` is not `Debug`.
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         f.debug_struct("LoadBalancerEndpoint")
             .field("published_name", &self.published_name)
@@ -71,13 +76,13 @@ impl ::std::fmt::Debug for LoadBalancerEndpoint {
 }
 
 impl LoadBalancerEndpoint {
-    /// The host name a client reaches this load balancer at — its `DNSName`.
+    /// The address a client reaches this load balancer at — its `DNSName`.
     pub fn published_name(&self) -> &str {
         &self.published_name
     }
 
-    /// The `host:port` a client of an unserved emulator dials this load balancer at, and
-    /// `None` for one whose published name is served at this emulator's own endpoint.
+    /// The `host:port` a client dials this load balancer at, and `None` for a load balancer
+    /// of an emulator whose engine vends no listener at all.
     pub fn dialled_authority(&self) -> Option<&str> {
         self.dialled_authority.as_deref()
     }
@@ -92,8 +97,14 @@ pub const ELB_DNS_LABEL: &str = "elb";
 /// published name that says whether a load balancer's address resolves to private addresses.
 pub const INTERNAL_NAME_PREFIX: &str = "internal-";
 
-/// The name load balancer `load_balancer_name` of `region` publishes as its `DNSName`:
+/// The name load balancer `load_balancer_name` of `region` would be published under where
+/// this emulator can hand out no dialable address at all:
 /// `[internal-]<name>-<id>.<region>.elb.<zone>`.
+///
+/// What a load balancer publishes is the address of its own socket
+/// ([`open_load_balancer_endpoint`]); this is the value for an emulator whose engine vends no
+/// listener, where there is no socket to name and a value of the modelled shape says at least
+/// WHICH load balancer it belongs to.
 ///
 /// The fixed text is [`INTERNAL_NAME_PREFIX`] — carried only by the `internal` scheme, whose
 /// name resolves to private addresses — [`ELB_DNS_LABEL`] and the separating dots; the
@@ -146,8 +157,8 @@ pub fn announced_zone(ctx: &OperationContext<'_>) -> String {
 }
 
 /// The `host[:port]` of THIS EMULATOR's own endpoint for the request in `ctx` — the address
-/// the published name's zone is read off, and the endpoint that name is served at — or `None`
-/// for a request this emulator has no endpoint of its own to name.
+/// the minted name's zone is read off ([`announced_zone`]) — or `None` for a request this
+/// emulator has no endpoint of its own to name.
 ///
 /// In the order the other data planes of this tree read it:
 ///
@@ -170,8 +181,8 @@ fn endpoint_authority(ctx: &OperationContext<'_>) -> Option<String> {
 }
 
 /// The published address of the load balancer `load_balancer_name` one create is minting in
-/// `region`: the name it publishes, and the socket it is given where this emulator has no
-/// endpoint of its own to serve that name at.
+/// `region`: the socket it is given, and the `host:port` of that socket, which is what it
+/// publishes as its `DNSName`.
 pub async fn open_load_balancer_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
@@ -179,25 +190,24 @@ pub async fn open_load_balancer_endpoint<Eng: Send + Sync + 'static>(
     load_balancer_name: &str,
     scheme: &str,
 ) -> LoadBalancerEndpoint {
-    let published_name =
-        published_dns_name(region, load_balancer_name, scheme, &announced_zone(ctx));
-    // An emulator served on an endpoint of its own serves the whole surface there, this load
-    // balancer's plane among it, so nothing of a second address is opened.
-    let listener = match endpoint_authority(ctx) {
-        Some(_) => None,
-        None => open_listener(engine, region, load_balancer_name, ctx.callback().clone()).await,
-    };
+    // A socket of this load balancer's OWN, whatever address this emulator's API is served
+    // at: the published value has to be dialable by the client that was handed it, and this
+    // is the one address of this process that names THIS load balancer (see the module docs).
+    let listener = open_listener(engine, region, load_balancer_name, ctx.callback().clone()).await;
+    let dialled_authority = listener
+        .as_ref()
+        .map(::service_common::data_plane_addressing::listener_authority);
     LoadBalancerEndpoint {
-        published_name,
-        dialled_authority: listener
-            .as_ref()
-            .map(::service_common::data_plane_addressing::listener_authority),
+        published_name: dialled_authority.clone().unwrap_or_else(|| {
+            published_dns_name(region, load_balancer_name, scheme, &announced_zone(ctx))
+        }),
+        dialled_authority,
         _listener: listener,
     }
 }
 
-/// Open the socket a load balancer of an UNSERVED emulator is dialled at, or `None` when this
-/// engine vends no listeners at all.
+/// Open the socket a load balancer is dialled at, or `None` when this engine vends no
+/// listeners at all.
 ///
 /// `callback` is the handle into the emulator this request is running within
 /// (`ctx.callback()`), which is how a request the socket accepts reaches the data plane: the

@@ -442,10 +442,10 @@ pub(crate) async fn call_at_version(
 /// `OperationContext::endpoint` reports, which is what a running emulator's data port records
 /// through `EmulatorService::serving_at`.
 ///
-/// The address this emulator is reached at is what the zone of every name it announces is read
-/// off (`…::state::announced_zone`), so a suite that varies that address builds its emulator
-/// here. [`emulator_with_ec2`] is the same emulator served on no port at all, which is the
-/// position a host that embeds it in its own process is in.
+/// A suite that varies the address this emulator's API is reached at builds its emulator here.
+/// [`emulator_with_ec2`] is the same emulator served on no port at all, which is the position a
+/// host that embeds it in its own process is in — and a load balancer publishes the address of
+/// its OWN socket either way.
 pub(crate) fn emulator_with_ec2_served_at(
     endpoint: &str,
 ) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
@@ -457,13 +457,11 @@ pub(crate) fn emulator_with_ec2_served_at(
     (router, engine)
 }
 
-/// The `host:port` a client of an UNSERVED emulator dials one load balancer at, read off this
-/// service's own store.
+/// The `host:port` a client dials one load balancer at, read off this service's own store.
 ///
-/// A load balancer publishes a host NAME, served at the endpoint this emulator is reached on;
-/// an emulator served on no endpoint at all gives each load balancer a socket of its own
-/// instead, and this is the address that socket answers at — which only the store knows,
-/// because no response carries a port.
+/// Every load balancer is given a socket of its own, and this is the address that socket
+/// answers at — which is also the address the load balancer PUBLISHES as its `DNSName`, so a
+/// suite reads it here to pin that the published value is that very socket's.
 pub(crate) fn dialled_authority(
     engine: &Arc<engine::InMemoryEngine>,
     region: &str,
@@ -481,37 +479,20 @@ pub(crate) fn dialled_authority(
         })
 }
 
-/// RULE: a load balancer publishes its `DNSName` as a HOST NAME — no port and no scheme — in
-/// the shape Elastic Load Balancing's own names carry,
-/// `[internal-]<name>-<10 digits>.<region>.elb.<zone>`, where `zone` is the DNS zone this
-/// emulator may announce a name of its own in: never one AWS serves, and one that resolves to
-/// the interface this emulator is reached on.
+/// RULE: a load balancer publishes, as its `DNSName`, the address of the SOCKET it was given
+/// — the `host:port` a client OPENS A CONNECTION TO as it stands: a host of this emulator's
+/// own (the interface the core binds its listeners on), the port the core assigned that
+/// socket, and nothing else — no scheme, no path, and never a host in a zone AWS serves,
+/// which resolves nowhere near this process.
 ///
 /// Asserted here, once, because every suite that reads a published address reads the same
 /// value: `DNSName` on the create, on every `DescribeLoadBalancers`, and
-/// `CanonicalHostedZoneName` beside it.
-pub(crate) fn assert_published_dns_name(
-    case: &str,
-    dns: &str,
-    region: &str,
-    load_balancer_name: &str,
-    scheme: Option<&str>,
-    zone: &str,
-) {
+/// `CanonicalHostedZoneName` beside it. That the address is this load balancer's OWN socket is
+/// [`dialled_authority`]'s question, and the suite that dials it answers it.
+pub(crate) fn assert_published_dns_name(case: &str, dns: &str) {
     assert!(
-        dns.parse::<std::net::SocketAddr>().is_err() && !dns.contains(':'),
-        "case {case:?}: the published DNSName is a host name a client RESOLVES, so it carries \
-         no port, got {dns:?}"
-    );
-    assert!(
-        !dns.contains('/') && !dns.contains("://"),
-        "case {case:?}: the published DNSName is a host name, not a URL, got {dns:?}"
-    );
-    assert!(
-        dns.bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'),
-        "case {case:?}: a DNS name is written in lower-case letters, digits, hyphens and dots, \
-         got {dns:?}"
+        !dns.contains("://") && !dns.contains('/'),
+        "case {case:?}: the published DNSName is an address, not a URL, got {dns:?}"
     );
     for suffix in service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
         assert!(
@@ -520,36 +501,17 @@ pub(crate) fn assert_published_dns_name(
              {dns:?}"
         );
     }
-    let expected_suffix = format!(".{region}.elb.{zone}");
+    let host = service_common::data_plane_addressing::host_only(dns);
     assert!(
-        dns.ends_with(&expected_suffix),
-        "case {case:?}: expected a name under {expected_suffix:?}, got {dns:?}"
+        service_common::data_plane_addressing::names_the_loopback_interface(host),
+        "case {case:?}: the published DNSName must name an interface this emulator binds its \
+         listeners on, got the host {host:?} in {dns:?}"
     );
-    let minted = dns
-        .strip_suffix(&expected_suffix)
-        .unwrap_or_else(|| panic!("case {case:?}: {dns:?} has no {expected_suffix:?} suffix"));
-    let internal = scheme == Some("internal");
-    assert_eq!(
-        minted.starts_with("internal-"),
-        internal,
-        "case {case:?}: only an internal load balancer's name carries the internal- prefix, \
-         got {dns:?}"
-    );
-    let minted = match internal {
-        true => minted.strip_prefix("internal-").unwrap_or(minted),
-        false => minted,
-    };
-    let (name, id) = minted
-        .rsplit_once('-')
-        .unwrap_or_else(|| panic!("case {case:?}: {dns:?} carries no generated id"));
-    assert_eq!(
-        name,
-        load_balancer_name.to_ascii_lowercase(),
-        "case {case:?}: the published name carries the load balancer's own name, got {dns:?}"
-    );
+    let port = service_common::data_plane_addressing::addressed_port(Some(dns));
     assert!(
-        id.len() == 10 && id.bytes().all(|byte| byte.is_ascii_digit()),
-        "case {case:?}: the generated id is 10 digits, got {id:?} in {dns:?}"
+        port.is_some_and(|port| (1..=65_535).contains(&port)),
+        "case {case:?}: the published DNSName carries the port its socket answers on, so a \
+         client can dial it as it stands, got {port:?} in {dns:?}"
     );
 }
 

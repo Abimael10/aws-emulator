@@ -36,9 +36,9 @@
 //! to (its own no-capacity status).
 //!
 //! Every row's answer is taken BOTH over the request this emulator carries in process to the
-//! published name and over a TCP connection DIALLED to the socket that load balancer's
-//! listeners are served on — the address an emulator served on no endpoint of its own gives it,
-//! which is the only way that socket is exercised. The two sibling suites below read the same answer for
+//! published address and over a TCP connection DIALLED to the socket that load balancer's
+//! listeners are served on — the socket every load balancer is given, whose address it also
+//! publishes, which is the only way that socket is exercised. The two sibling suites below read the same answer for
 //! the two rules that decide WHICH registered instance a request is sent to and are only
 //! observable once the instance's own body comes back: the `AWSELB` pin a duration-based policy
 //! mints, and the zone a node serves while `CrossZoneLoadBalancing` is off. Every clock-owed move
@@ -456,10 +456,9 @@ fn dialled(
 /// The `host:port` the socket of the load balancer `name` answers at, read off the Classic
 /// service's own store.
 ///
-/// What a load balancer PUBLISHES is a host NAME served at the endpoint this emulator is
-/// reached on; an emulator served on no endpoint of its own — which a suite driving the router
-/// in process is — gives each load balancer a socket of its own as well, and only the store
-/// knows the port it landed on, because no response carries one.
+/// Every load balancer is given a socket of its own, and what it PUBLISHES as its `DNSName` is
+/// that socket's address — so this is the same value the responses carry, read from the store
+/// where a case needs it without a response to hand.
 fn socket_authority(engine: &Arc<InMemoryEngine>, region: &str, name: &str) -> String {
     let state = service_state(&**engine).expect("the Classic service's own store");
     let guard = state.lock();

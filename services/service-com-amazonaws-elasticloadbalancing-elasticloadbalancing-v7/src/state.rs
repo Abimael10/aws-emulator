@@ -770,9 +770,9 @@ impl Default for AttributeConfig {
 #[derive(Debug, Clone)]
 pub struct LoadBalancer {
     pub name: String,
-    /// The address this load balancer PUBLISHES, generated once at create and kept for the
-    /// record's lifetime: the host NAME a client resolves and then sends its traffic to,
-    /// served at the endpoint this emulator is reached on ([`LoadBalancerEndpoint`]).
+    /// The address this load balancer PUBLISHES, composed once at create and kept for the
+    /// record's lifetime: the `host:port` a client opens a connection to and sends the load
+    /// balancer its traffic on ([`LoadBalancerEndpoint`]).
     pub dns_name: String,
     pub canonical_hosted_zone_name_id: String,
     pub scheme: String,
@@ -1038,10 +1038,10 @@ pub struct ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
     /// The published address of each load balancer, keyed by the region and the name of the
     /// load balancer it belongs to ([`LoadBalancerEndpoint`]).
     ///
-    /// Held here rather than on [`LoadBalancer`] because it may hold a LIVE socket: the
+    /// Held here rather than on [`LoadBalancer`] because it holds a LIVE socket: the
     /// record is cloned by every read, and a socket is not a value that may be copied —
     /// dropping a handle closes the port. The load balancer's own record keeps the published
-    /// NAME, as its `dns_name`, which is what every reader reports.
+    /// ADDRESS, as its `dns_name`, which is what every reader reports.
     pub endpoints: BTreeMap<(String, String), LoadBalancerEndpoint>,
 }
 
@@ -1078,7 +1078,7 @@ impl ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
         Some(self.regions.entry(region.to_string()).or_default())
     }
 
-    /// Remember one load balancer's published address, answering the host NAME the load
+    /// Remember one load balancer's published address, answering the address the load
     /// balancer then publishes as its `DNSName`.
     ///
     /// A load balancer that already holds an address keeps it: the record already held is
@@ -1097,7 +1097,7 @@ impl ComAmazonawsElasticloadbalancingElasticloadbalancingV7State {
             .to_string()
     }
 
-    /// Forget one load balancer's published address: dropping the record closes any port it
+    /// Forget one load balancer's published address: dropping the record closes the port it
     /// kept open, severing every connection in flight on it, which is what a deleted load
     /// balancer's address does.
     pub fn forget_endpoint(&mut self, region: &str, load_balancer_name: &str) {
