@@ -469,14 +469,14 @@ async fn each_created_interface_round_trips_through_the_describe() {
             "case {:?}: expected an eni- id, got {network_interface_id:?} from {created}",
             case.name
         );
-        // The create's OWN answer carries the status it created the interface in; the clock
-        // then makes it `available` a span later, which
-        // `network_interface_create_comes_up_pending` is the suite for — so the describe below
-        // reads every other member rather than racing that move.
+        // The create's OWN answer carries the status the interface rests in: nothing holds
+        // an interface a create minted, so it is `available` from here on, which
+        // `network_interface_create_comes_up_pending` is the suite for — so the describe
+        // below reads every other member.
         assert_eq!(
             element(&created, "status").as_deref(),
-            Some("pending"),
-            "case {:?}: expected the create to answer the interface coming up, got {created}",
+            Some("available"),
+            "case {:?}: expected the create to answer the interface available, got {created}",
             case.name
         );
 

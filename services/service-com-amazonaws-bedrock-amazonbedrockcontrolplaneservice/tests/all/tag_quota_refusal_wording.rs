@@ -2,16 +2,16 @@
 
 //! How this service WORDS a `TooManyTagsException`, and what it leaves out of it.
 //!
-//! The rule under test, one sentence: **a tag-quota refusal is worded for the set the quota
-//! was evaluated against — a call that merges the request's tags into a resource's existing
-//! set is refused over the RESULTANT set, in Amazon Bedrock's fixed sentence for that rule,
-//! while a create carrying more tags than one resource may hold is refused over the list the
-//! request itself carries, in its own fixed sentence — and neither refusal quotes any part of
-//! the request, so the optional `TooManyTagsException$resourceName` is left UNSET.**
+//! The rule under test, one sentence: **every call Amazon Bedrock refuses on the
+//! per-resource tag quota — a merge into a resource's existing tags and a create's own
+//! over-long `tags` list alike — carries ONE fixed sentence, which states the bound and
+//! nothing of the request, so the optional `TooManyTagsException$resourceName` is left
+//! UNSET.**
 //!
-//! Both sentences state the bound (`MAX_TAGS_PER_RESOURCE`, the "50 tags per resource"
+//! That sentence states the bound (`MAX_TAGS_PER_RESOURCE`, the "50 tags per resource"
 //! `TooManyTagsException` documents) and nothing else: no ARN, no tag key, no submitted
-//! count. `TooManyTagsException$resourceName` is modelled optional
+//! count, and nothing about WHICH set the quota was reached through.
+//! `TooManyTagsException$resourceName` is modelled optional
 //! (`smithy_query(query="shape",shape="TooManyTagsException")`: members `message` and
 //! `resourceName`, neither `@required`), and this service leaves it out.
 //!
@@ -40,15 +40,11 @@ use crate::tagging::{
     given_guardrail, list_tags, listed, numbered_tags, owned_tag_list, tag, MAX_TAGS,
 };
 
-/// The sentence Amazon Bedrock refuses a RESULTANT-SET tag quota with, and the one it
-/// refuses a CREATE's own over-long `tags` list with. Spelled here rather than read off the
-/// handler, so a re-wording of either is caught: the bound is the one
-/// `TooManyTagsException` documents ("50 tags per resource").
-fn resultant_set_sentence() -> String {
-    format!("The resultant tag set must not have more than {MAX_TAGS} user tags.")
-}
-
-fn create_list_sentence() -> String {
+/// The one sentence Amazon Bedrock refuses a tag-quota call with, whichever set the quota
+/// was reached through. Spelled here rather than read off the handler, so a re-wording of it
+/// is caught: the bound is the one `TooManyTagsException` documents ("50 tags per
+/// resource").
+fn quota_sentence() -> String {
     format!("You can assign a maximum of {MAX_TAGS} tags to a resource")
 }
 
@@ -145,8 +141,8 @@ const MERGE_ROWS: &[MergeRow] = &[
 #[tokio::test]
 async fn a_resultant_set_past_the_bound_is_refused_over_the_resultant_set() {
     let emu = emulator();
-    // The sentence Amazon Bedrock words this refusal with, stating the rule and the bound.
-    let expected_message = resultant_set_sentence();
+    // The sentence Amazon Bedrock words this refusal with, stating the bound.
+    let expected_message = quota_sentence();
 
     for (index, row) in MERGE_ROWS.iter().enumerate() {
         let case = format!("{} / {:?}", row.case, row.family);
@@ -279,15 +275,10 @@ const CREATE_ROWS: &[CreateRow] = &[
 #[tokio::test]
 async fn a_creates_own_tag_list_past_the_bound_is_refused_over_that_list() {
     let emu = emulator();
-    // A create is evaluated against the list it CARRIES, which this service words its own
-    // way — a different sentence from the resultant-set one, so a client can tell the two
-    // refusals apart.
-    let expected_message = create_list_sentence();
-    assert_ne!(
-        expected_message,
-        resultant_set_sentence(),
-        "the two refusals are worded for the set each was evaluated against"
-    );
+    // A create is evaluated against the list it CARRIES, and the quota refusal it reads is
+    // the service's one sentence for the quota: a client reads the same wording whichever
+    // set the quota was reached through.
+    let expected_message = quota_sentence();
 
     for (index, row) in CREATE_ROWS.iter().enumerate() {
         let case = row.case;

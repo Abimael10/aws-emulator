@@ -528,11 +528,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             interface_type,
             private_ip_addresses: addresses,
             groups,
-            // A created interface is attached to nothing, so EC2 brings it up on its own:
-            // the create answers it `pending` and the clock makes it `available` a span
-            // later, until an attach moves it instead.
+            // A created interface is attached to nothing, which is the resting `available`
+            // state the store derives for it: only an attach moves it off that status.
             attachment: None,
-            coming_up: true,
             // Nothing but the caller manages an interface the caller created itself.
             requester: None,
             // The IPv6 space resolved above, in the order the interface holds it.

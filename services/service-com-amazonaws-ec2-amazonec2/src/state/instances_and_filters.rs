@@ -772,25 +772,10 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The transition is applied once; nothing is owed on this gateway any more.
                 false
             });
-        // A network interface a create answered as `pending` is `available` once its own due
-        // instant has passed, whether or not anybody called — EC2 brings the interface up
-        // asynchronously, the same contract as the `pending` gateway above. An interface
-        // something took hold of while it was coming up is reported in the status that holds
-        // it, so the move is applied only to one still sitting in `pending`.
-        let network_interfaces = &mut self.network_interfaces;
-        self.network_interface_available_at
-            .retain(|network_interface_id, due_at| {
-                if now < *due_at {
-                    return true;
-                }
-                if let Some(interface) = network_interfaces.get_mut(network_interface_id) {
-                    if interface.status.as_deref() == Some(NETWORK_INTERFACE_STATUS_PENDING) {
-                        interface.status = Some(NETWORK_INTERFACE_STATUS_AVAILABLE.to_string());
-                    }
-                }
-                // The transition is applied once; nothing is owed on this interface any more.
-                false
-            });
+        // A network interface has nothing owed on it by this clock: an unattached interface
+        // rests in `available` from the call that created it, and the only moves its status
+        // makes are the ones its ATTACHMENT lifecycle drives
+        // ([`Self::network_interface_attachment_move_at`] above).
         // A managed prefix list `CreateManagedPrefixList` answered as `create-in-progress`
         // reaches `create-complete` once its due instant has passed, whether or not anybody
         // called — the same contract as a `create-in-progress` IPAM scope's move below, and

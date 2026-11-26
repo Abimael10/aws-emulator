@@ -30,9 +30,9 @@
 //! * whether that refused batch also re-values keys the resource already carries, which do
 //!   not grow it.
 //!
-//! The refusal's WORDING — the sentence Amazon Bedrock words a resultant-set quota refusal
-//! with, and the `resourceName` it leaves unset — is `crate::tag_quota_refusal_wording`'s
-//! rule; these rows assert it holds for every family too.
+//! The refusal's WORDING — the one sentence Amazon Bedrock words a tag-quota refusal with,
+//! and the `resourceName` it leaves unset — is `crate::tag_quota_refusal_wording`'s rule;
+//! these rows assert it holds for every family too.
 //!
 //! The 404 side of the same resolution (an ARN naming no resource) is
 //! `crate::automated_reasoning_policy_tagging`'s third suite; this one is about the quota
@@ -304,9 +304,10 @@ async fn the_quota_contract_holds_for(family: TaggedFamily) {
             )
         });
         // The quota was evaluated against the RESULTANT tag set, and the sentence states
-        // that rule and the bound — nothing of the request. Spelled here rather than read
-        // off the handler, so a re-wording of it fails this row.
-        let expected = format!("The resultant tag set must not have more than {MAX_TAGS} user tags.");
+        // the bound — nothing of the request, and nothing of which set the quota was
+        // reached through. Spelled here rather than read off the handler, so a re-wording
+        // of it fails this row.
+        let expected = format!("You can assign a maximum of {MAX_TAGS} tags to a resource");
         assert_eq!(
             message, expected,
             "case {case:?}: the refusal must be worded {expected:?}, got {message:?}"

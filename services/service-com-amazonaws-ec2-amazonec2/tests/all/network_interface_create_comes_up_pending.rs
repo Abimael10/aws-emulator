@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A created network interface COMES UP: `CreateNetworkInterface` answers it `pending` and the
-//! clock makes it `available`.
+//! The STATUS a created network interface is reported in, by the create and by every read.
 //!
 //! Driven over the wire this service speaks: `ec2Query` — an
 //! `application/x-www-form-urlencoded` POST whose body carries `Action=<Operation>`, answered
 //! with XML (README.md / OPERATIONS.md "Wire protocol").
 //!
-//! The rule under test: a resource EC2 builds asynchronously is answered in the non-terminal
-//! status it is being built in, and the clock — not the next caller — moves it to the terminal
-//! one. So the create's own answer and a read taken straight after it report `pending`, a read
-//! taken after the span the move is owed in reports `available`, and nothing a caller does in
-//! between is needed to make the move. An interface that is NOT being brought up — one another
-//! service's resource is served by, which is held from the moment it is stored — is reported in
-//! the status that holds it instead, which is the boundary of the rule.
+//! The rule under test: a network interface's `Status` is decided by WHAT HOLDS IT, and
+//! `available` — the resting state of an interface nothing holds
+//! (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`, whose value set is
+//! `available`, `associated`, `attaching`, `in-use`, `detaching`) — is what a create answers
+//! and what every later read reports, until something attaches it. An interface that is
+//! already HELD when it reaches the store — one another Amazon Web Services service created
+//! to serve a resource of the account — is reported in the status that holds it (`in-use`)
+//! instead, which is the boundary of the rule. No read ever reports a value outside the
+//! modelled set, and no caller has to wait for the status to settle: nothing is owed on the
+//! interface by the clock.
 //!
-//! The rows differ along what the create carries (nothing beyond the subnet, a description and
-//! a tag, a second interface beside the first) and along which of the account's subnets it sits
-//! in, because none of that bears on the status: the status follows from the interface being
-//! brought up.
+//! The rows differ along what the create carries (nothing beyond the subnet, a description
+//! and a tag, a second interface beside the first) and along which of the account's subnets
+//! it sits in, because none of that bears on the status; and the interface is read back both
+//! by `NetworkInterfaceId` and enumerated by a `vpc-id` filter after further calls, because
+//! neither bears on it either.
 //!
 //! Beside the status, each row pins the two members a created interface carries that follow
 //! from the interface rather than from the request: the principal that created it
@@ -26,20 +29,28 @@
 //! (`NetworkInterface$PublicDnsName`), which is the EMPTY name for an interface holding no
 //! public address — reported either way, so an absent member cannot be read as a name.
 
-use std::time::{Duration, Instant};
-
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, NETWORK_INTERFACE_STATUS_AVAILABLE,
-    NETWORK_INTERFACE_STATUS_IN_USE, NETWORK_INTERFACE_STATUS_PENDING, NetworkInterfaceSpec,
-    TRANSITION_DELAY,
+    NETWORK_INTERFACE_STATUS_IN_USE, NetworkInterfaceSpec,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, indexed};
+use super::ec2_query::{call, element, elements, filters, indexed};
 
 /// The Region every call here is signed for; the account's default subnets are seeded for it.
 const REGION: &str = "us-east-1";
+
+/// The values `NetworkInterfaceStatus` publishes
+/// (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`): a reported status is one
+/// of these, whichever path reported it.
+const NETWORK_INTERFACE_STATUS_VALUES: [&str; 5] = [
+    "available",
+    "associated",
+    "attaching",
+    "in-use",
+    "detaching",
+];
 
 /// One form field.
 fn param(name: &str, value: &str) -> (String, String) {
@@ -55,6 +66,17 @@ fn subnet_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+/// The VPC of one of the account's subnets.
+fn vpc_of_subnet(engine: &engine::InMemoryEngine, subnet_id: &str) -> String {
+    engine
+        .state::<Ec2State>()
+        .lock()
+        .subnets
+        .get(subnet_id)
+        .and_then(|subnet| subnet.vpc_id.clone())
+        .unwrap_or_default()
 }
 
 /// One call that must be served, as its body.
@@ -85,21 +107,7 @@ async fn described_status(case: &str, router: &MultiServiceRouter, id: &str) -> 
         .unwrap_or_else(|| panic!("case {case:?}: the reported interface carries no status: {body}"))
 }
 
-/// The interface's status once the clock has had the chance to bring it up: polled until it is
-/// `available` or a deadline many times the owed span has passed, so the outcome is the move
-/// rather than how fast the host runs.
-async fn status_once_up(case: &str, router: &MultiServiceRouter, id: &str) -> String {
-    let deadline = Instant::now() + TRANSITION_DELAY * 20;
-    loop {
-        let status = described_status(case, router, id).await;
-        if status == NETWORK_INTERFACE_STATUS_AVAILABLE || Instant::now() >= deadline {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// One create whose interface must come up.
+/// One create whose interface must be reported `available`.
 #[derive(Debug, Clone)]
 struct CreateRow {
     /// What the row is about.
@@ -110,10 +118,9 @@ struct CreateRow {
     extra: Vec<(String, String)>,
 }
 
-/// Rule: a create answers the interface `pending`, and the clock — not a later caller — makes
-/// it `available`.
+/// Rule: a create answers the interface `available`, and so does every read of it.
 #[tokio::test]
-async fn a_created_interface_is_pending_until_the_clock_makes_it_available() {
+async fn a_created_interface_is_available_from_the_create_on() {
     let (router, engine) = super::ec2_query::emulator();
     let subnets = subnet_ids(&engine);
     assert!(
@@ -131,7 +138,7 @@ async fn a_created_interface_is_pending_until_the_clock_makes_it_available() {
             case: "a description and a tag",
             subnet_index: 1,
             extra: vec![
-                param("Description", "coming up"),
+                param("Description", "a described interface"),
                 param("TagSpecification.1.ResourceType", "network-interface"),
                 param("TagSpecification.1.Tag.1.Key", "Name"),
                 param("TagSpecification.1.Tag.1.Value", "web"),
@@ -150,19 +157,25 @@ async fn a_created_interface_is_pending_until_the_clock_makes_it_available() {
         extra,
     } in rows
     {
-        let mut params = vec![param("SubnetId", &subnets[subnet_index])];
+        let subnet_id = subnets[subnet_index].clone();
+        let mut params = vec![param("SubnetId", &subnet_id)];
         params.extend(extra);
         let created = ok(case, &router, "CreateNetworkInterface", &params).await;
         let network_interface_id = element(&created, "networkInterfaceId")
             .unwrap_or_else(|| panic!("case {case:?}: the create must answer an id: {created}"));
 
-        // The create's OWN answer: the interface is being brought up.
+        // The create's OWN answer: nothing holds the interface, so it rests in `available`.
         let created_status = element(&created, "status");
         assert_eq!(
             created_status.as_deref(),
-            Some(NETWORK_INTERFACE_STATUS_PENDING),
+            Some(NETWORK_INTERFACE_STATUS_AVAILABLE),
             "case {case:?}: expected the create to answer \
-             {NETWORK_INTERFACE_STATUS_PENDING:?}, got {created_status:?} in {created}"
+             {NETWORK_INTERFACE_STATUS_AVAILABLE:?}, got {created_status:?} in {created}"
+        );
+        // Nothing holds it, so the create reports no attachment either.
+        assert!(
+            element(&created, "attachment").is_none(),
+            "case {case:?}: an interface nothing holds carries no attachment, got {created}"
         );
         // And the two members that follow from the interface rather than the request: the
         // principal that created it, and the empty public hostname of an interface holding no
@@ -180,29 +193,63 @@ async fn a_created_interface_is_pending_until_the_clock_makes_it_available() {
              hostname, got {created}"
         );
 
-        // Nothing but the clock is asked, and the move comes: a read is a read, so the
-        // interface reaches `available` because its instant passed.
-        let settled = status_once_up(case, &router, &network_interface_id).await;
+        // The read taken straight after the create reports the same status: a caller that
+        // waits for `available` before attaching has nothing to wait for.
+        let read = described_status(case, &router, &network_interface_id).await;
         assert_eq!(
-            settled, NETWORK_INTERFACE_STATUS_AVAILABLE,
-            "case {case:?}: one owed span after the create the interface must be \
-             {NETWORK_INTERFACE_STATUS_AVAILABLE:?}, got {settled:?}"
+            read, NETWORK_INTERFACE_STATUS_AVAILABLE,
+            "case {case:?}: the first read after the create must report \
+             {NETWORK_INTERFACE_STATUS_AVAILABLE:?}, got {read:?}"
         );
-        // And it STAYS there: the move is applied once, so a second read reports the same.
+        assert!(
+            NETWORK_INTERFACE_STATUS_VALUES.contains(&read.as_str()),
+            "case {case:?}: a reported status is one of the modelled \
+             {NETWORK_INTERFACE_STATUS_VALUES:?}, got {read:?}"
+        );
+
+        // And it STAYS there, however many further calls the account makes: the status is
+        // the interface's resting state rather than a transient the next caller settles.
+        ok(case, &router, "DescribeVpcs", &[]).await;
+        ok(case, &router, "DescribeSubnets", &[]).await;
         let again = described_status(case, &router, &network_interface_id).await;
         assert_eq!(
-            again, settled,
-            "case {case:?}: a second read must report the same status, got {again:?} after \
-             {settled:?}"
+            again, read,
+            "case {case:?}: a later read must report the same status, got {again:?} after \
+             {read:?}"
+        );
+
+        // Enumerated by the VPC rather than by its own id — a different read path, same
+        // status: the interface is reported, and every interface the VPC enumerates carries
+        // a modelled status.
+        let vpc_id = vpc_of_subnet(&engine, &subnet_id);
+        let enumerated = ok(
+            case,
+            &router,
+            "DescribeNetworkInterfaces",
+            &filters(&[("vpc-id", &[vpc_id.as_str()])]),
+        )
+        .await;
+        assert!(
+            enumerated.contains(&network_interface_id),
+            "case {case:?}: the VPC must enumerate the interface, got {enumerated}"
+        );
+        let statuses = elements(&enumerated, "status");
+        assert!(
+            !statuses.is_empty()
+                && statuses
+                    .iter()
+                    .all(|status| status == NETWORK_INTERFACE_STATUS_AVAILABLE),
+            "case {case:?}: every unattached interface the VPC enumerates must be \
+             {NETWORK_INTERFACE_STATUS_AVAILABLE:?}, got {statuses:?}"
         );
     }
 }
 
 /// The boundary of that rule: an interface that is already HELD when it reaches the store —
 /// one another Amazon Web Services service created to serve a resource of the account — is
-/// never `pending`, because nothing is bringing it up.
+/// reported in the status that holds it rather than `available`.
 #[tokio::test]
-async fn an_interface_a_service_holds_is_not_coming_up() {
+async fn an_interface_a_service_holds_is_in_use() {
     let (router, engine) = super::ec2_query::emulator();
     let subnets = subnet_ids(&engine);
     let case = "an interface a service holds";
@@ -241,8 +288,8 @@ async fn an_interface_a_service_holds_is_not_coming_up() {
          service holds, got {status:?}"
     );
 
-    // And it stays held once the clock HAS moved: an interface created beside it comes up,
-    // which is what says the owed span has passed, and the held one has not moved with it.
+    // And the two statuses do not drift into each other: an interface created beside the
+    // held one is `available`, and the held one keeps the status that holds it.
     let created = ok(
         case,
         &router,
@@ -250,17 +297,18 @@ async fn an_interface_a_service_holds_is_not_coming_up() {
         &[param("SubnetId", &subnets[1])],
     )
     .await;
-    let coming_up = element(&created, "networkInterfaceId")
+    let unheld = element(&created, "networkInterfaceId")
         .unwrap_or_else(|| panic!("case {case:?}: the create must answer an id: {created}"));
-    let settled = status_once_up(case, &router, &coming_up).await;
+    let unheld_status = described_status(case, &router, &unheld).await;
     assert_eq!(
-        settled, NETWORK_INTERFACE_STATUS_AVAILABLE,
-        "case {case:?}: the interface created beside it must come up, got {settled:?}"
+        unheld_status, NETWORK_INTERFACE_STATUS_AVAILABLE,
+        "case {case:?}: the interface created beside it is held by nothing, got \
+         {unheld_status:?}"
     );
     let later = described_status(case, &router, &network_interface_id).await;
     assert_eq!(
         later, NETWORK_INTERFACE_STATUS_IN_USE,
-        "case {case:?}: an interface nothing is bringing up keeps the status that holds it, \
-         got {later:?}"
+        "case {case:?}: an interface a service holds keeps the status that holds it, got \
+         {later:?}"
     );
 }

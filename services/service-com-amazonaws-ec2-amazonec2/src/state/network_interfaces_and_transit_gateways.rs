@@ -107,20 +107,9 @@ pub const NETWORK_INTERFACE_TYPE_GATEWAY_LOAD_BALANCER_ENDPOINT: &str =
 
 /// The status of a network interface nothing holds: the `NetworkInterfaceStatus` enum's
 /// `available` member (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`), which
-/// is where an interface with no attachment sits — and the one state a delete accepts.
+/// is where an interface with no attachment sits — the status a create answers and every
+/// read reports until something attaches it — and the one state a delete accepts.
 pub const NETWORK_INTERFACE_STATUS_AVAILABLE: &str = "available";
-
-/// The status a freshly created network interface is reported in: `pending`, the status the
-/// live wire answers a create with before the interface is ready to be used.
-///
-/// NON-TERMINAL — EC2 brings the interface up asynchronously, so the clock owes it
-/// [`NETWORK_INTERFACE_STATUS_AVAILABLE`] one [`TRANSITION_DELAY`] later
-/// ([`ComAmazonawsEc2Amazonec2State::network_interface_available_at`]), whether or not
-/// anybody calls again. The value is NOT in this checkout's `NetworkInterfaceStatus` enum,
-/// whose members are `available`, `associated`, `attaching`, `in-use` and `detaching`: the
-/// model is a snapshot and the recorded create answers `pending`, so the wire is the
-/// requirement here.
-pub const NETWORK_INTERFACE_STATUS_PENDING: &str = "pending";
 
 /// The status of a network interface something holds: the `NetworkInterfaceStatus` enum's
 /// `in-use` member, which is where an interface with an attachment sits.
@@ -421,9 +410,6 @@ impl ComAmazonawsEc2Amazonec2State {
         network_interface_id: &str,
     ) -> Option<NetworkInterface> {
         let interface = self.network_interfaces.remove(network_interface_id)?;
-        // Nothing is owed on an interface the store no longer holds: the entry goes with the
-        // record, the reverse of the write in [`Self::insert_network_interface`].
-        self.network_interface_available_at.remove(network_interface_id);
         // The reverse of the index write in [`Self::insert_network_interface`]: the entry
         // goes with the record, so no instance goes on holding an interface the store no
         // longer has.

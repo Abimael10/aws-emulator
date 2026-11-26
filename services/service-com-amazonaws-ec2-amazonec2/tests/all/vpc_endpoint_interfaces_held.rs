@@ -392,18 +392,13 @@ async fn an_interface_nothing_holds_is_available_and_deletable() {
     .await;
     let network_interface_id = element(&body, "networkInterfaceId").unwrap_or_default();
     let view = described("a caller's own interface", &router, &network_interface_id).await;
-    // Coming up, or up: nothing holds an interface the caller created, which is what this
-    // assertion is about (`network_interface_create_comes_up_pending` owns the move between
-    // the two).
-    assert!(
-        matches!(
-            view.as_ref().map(|held| held.status.as_str()),
-            Some(
-                ec2::state::NETWORK_INTERFACE_STATUS_PENDING
-                    | ec2::state::NETWORK_INTERFACE_STATUS_AVAILABLE
-            )
-        ),
-        "an interface nothing holds is coming up, or up, got {view:?}"
+    // Nothing holds an interface the caller created, so it rests in `available`, which is
+    // what this assertion is about (`network_interface_create_comes_up_pending` owns the
+    // rule that the status follows what holds the interface).
+    assert_eq!(
+        view.as_ref().map(|held| held.status.as_str()),
+        Some(ec2::state::NETWORK_INTERFACE_STATUS_AVAILABLE),
+        "an interface nothing holds is available, got {view:?}"
     );
     assert_eq!(
         view.as_ref().map(|held| held.requester_managed.as_str()),
