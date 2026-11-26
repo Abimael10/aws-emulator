@@ -22,7 +22,10 @@
 //!   dropped, which happens however that invocation ends — a handler that returned, one
 //!   that raised, a run the sandbox killed for its memory or its timeout, a caller that
 //!   went away. So a slot cannot leak and strand a function's capacity, and the next
-//!   caller's admission sees the pool as it really is.
+//!   caller's admission sees the pool as it really is. An asynchronous event's delivery
+//!   attempt, which no caller is waiting for, is not done while its run still has span to
+//!   spend, and holds its slot for that remainder too
+//!   ([`hold_for_the_rest_of_the_execution`]).
 //! * WHAT IS IN FLIGHT IS WHAT IS COUNTED. The counts live on the function record
 //!   ([`super::FunctionRecord::concurrent_executions`] and its per-qualifier breakdown), so
 //!   the account's concurrency metering publishes the executions that are really running
@@ -46,7 +49,7 @@
 //! slot. Nothing here waits: an invocation that cannot be admitted is refused at once with
 //! the modelled throttle, which is what a client retries on.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ::engine::ServiceState;
 
@@ -297,6 +300,64 @@ pub fn admit_invocation(
             served_from_pool,
         },
     })
+}
+
+/// Keep `slot` claimed for the rest of its invocation's EXECUTION, then release it.
+///
+/// For an invocation NOBODY IS WAITING FOR — a delivery attempt of an accepted asynchronous
+/// event ([`super::async_invocation::deliver`]) — because there the execution's span and the
+/// queue's own windows are read off the same clock: "If your function is throttled, Lambda
+/// returns the event to the queue and attempts to run the function again", for as long as
+/// `MaximumEventAgeInSeconds` retains the event, so how long the running execution occupies
+/// the pool is what decides whether the next event is admitted inside its window or discarded
+/// at the end of it.
+///
+/// An admitted invocation holds its slot until it is DONE, and an execution is done when the
+/// span it spent is over. A WAIT the handler asked for is charged to the function's `Timeout`
+/// in full while this host waits out at most part of it
+/// ([`super::execution::GUEST_WAIT_HOST_SPAN`]), so a run can ANSWER with some of its own span
+/// still to pass ([`super::execution::Invoked::unwaited`]) — and for that remainder the
+/// function is still processing the invocation, so the slot stays claimed: a queued event
+/// arriving inside it meets a pool that is as full as the execution really makes it.
+///
+/// A SYNCHRONOUS invocation is the other case and reaches none of this: "Keep the connection
+/// open until the function returns a response or times out" (`Invoke`), so that caller's own
+/// call is what the execution's span is spent inside — a client that calls again has already
+/// been answered, which on AWS it could only be once the execution was over. Its slot is
+/// released when its answer is given, which is where the operation holding it drops it.
+///
+/// The remainder is waited out on a task of its own, so nothing of the answer waits for it,
+/// and the slot is released however that task ends. A run with nothing left to pass — every
+/// run this host waited out in full, and every attempt that ran no handler at all — releases
+/// the slot here and now, as does one with no async runtime to hold it on.
+///
+/// What this can hold is bounded on both sides: at most ONE task per delivery attempt that was
+/// admitted, which the function's own pool, the attempts in flight
+/// ([`super::async_invocation::MAX_IN_FLIGHT_DELIVERIES`]) and the run envelope already bound
+/// ([`super::execution::MAX_CONCURRENT_RUN_MEMORY_MB`]) — and for a function with a
+/// reservation the held slot bounds the admissions after it — and each task waits for a span
+/// no longer than the run's own, which is what the function's `Timeout` allows it
+/// ([`super::execution::run_budget`]). The task only waits: it holds no store guard and no
+/// payload.
+pub fn hold_for_the_rest_of_the_execution(
+    slot: ExecutionSlot,
+    run: &Result<super::execution::Invoked, super::execution::Unrunnable>,
+) {
+    let left = run
+        .as_ref()
+        .map_or(Duration::ZERO, |invoked| invoked.unwaited);
+    if left.is_zero() {
+        return;
+    }
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        // Moved into the task, so the capacity goes back when the execution's span is over
+        // however this task ends.
+        let _held = slot;
+        ::tokio::time::sleep(left).await;
+    });
 }
 
 /// Whether `function_name` admits NO invocation at all, however idle it is.

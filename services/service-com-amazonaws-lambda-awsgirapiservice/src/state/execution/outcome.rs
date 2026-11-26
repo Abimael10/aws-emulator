@@ -183,6 +183,20 @@ pub struct Finished {
     pub log_stream: Option<String>,
     /// How long the run took.
     pub elapsed: Duration,
+    /// How much of the span this run's handler asked to WAIT for no time of this host passed
+    /// over.
+    ///
+    /// A wait the handler asks for is charged to the function's `Timeout` in FULL, while this
+    /// host waits out at most part of it ([`super::GUEST_WAIT_HOST_SPAN`]) — so a run can
+    /// ANSWER with some of its own execution span still to pass, and this is that remainder.
+    /// The execution therefore lasts [`Finished::elapsed`] of this host plus this, which is
+    /// the span the invocation holds the function's concurrency for
+    /// ([`crate::state::execution_slot`]).
+    ///
+    /// Zero for a run this host waited out in full, which is every run whose handler asked to
+    /// wait for no longer than that span, and for every run of an engine that waits each of
+    /// its waits out ([`super::node`]).
+    pub unwaited: Duration,
     /// The MOST memory this run was measured holding, in bytes, or `None` for a run nothing
     /// measured because nothing ran.
     ///

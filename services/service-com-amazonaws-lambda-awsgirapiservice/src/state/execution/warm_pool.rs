@@ -292,6 +292,9 @@ fn reported(why: String) -> Finished {
         init_duration: None,
         log_stream: None,
         elapsed: Duration::ZERO,
+        // Nothing ran, so no handler asked to wait for anything and no span of a run is still
+        // to pass.
+        unwaited: Duration::ZERO,
         // Nothing ran, so no reading of a run's memory was taken.
         max_memory_bytes: None,
     }

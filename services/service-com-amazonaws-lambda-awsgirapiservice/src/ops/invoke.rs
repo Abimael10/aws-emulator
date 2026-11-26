@@ -1057,7 +1057,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
         // The slot this invocation holds, released when it goes out of scope — which is when
-        // this invocation is answered, however it ends.
+        // this invocation is answered, however it ends. "Keep the connection open until the
+        // function returns a response or times out": this caller's own call is what the
+        // execution's span is spent inside, so the answer is where its capacity goes back
+        // (`crate::state::execution_slot`).
         let _slot = slot;
         let executed_version = invocation.executed_version.clone();
         // The invocation is admitted to the function at this point, so it is metered before

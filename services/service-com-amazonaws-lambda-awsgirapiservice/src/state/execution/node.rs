@@ -262,6 +262,10 @@ pub fn run_against(request: &Run<'_>, clock: &Clock) -> Finished {
         init_duration: bounds.init_duration(),
         log_stream: None,
         elapsed,
+        // This engine WAITS OUT every wait its run asks for — a timer is waited for on the
+        // run's own thread until it comes due ([`drive`]) — so none of the run's execution
+        // span is still to pass once it has answered.
+        unwaited: Duration::ZERO,
         max_memory_bytes: Some(bounds.max_memory_bytes()),
     }
 }

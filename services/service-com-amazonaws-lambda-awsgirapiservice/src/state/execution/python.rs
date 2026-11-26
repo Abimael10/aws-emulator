@@ -940,6 +940,11 @@ fn settled(
         // environment they were written in ([`super::warm_pool`]).
         log_stream: None,
         elapsed,
+        // What the handler asked to WAIT for that no host time passed over: the run's own
+        // execution lasted that much longer than this host's elapsed time, which is what the
+        // invocation holds the function's concurrency for
+        // ([`Bounds::unwaited`]).
+        unwaited: bounds.unwaited(),
         max_memory_bytes: Some(bounds.max_memory_bytes()),
     }
 }
@@ -2894,11 +2899,34 @@ impl Bounds {
     /// its work has taken, plus the waits it asked for that this host did not wait out
     /// ([`Self::wait`]).
     fn spent_against_the_timeout(&self) -> Duration {
+        self.spent_at(self.remaining())
+    }
+
+    /// The same quantity, read against ONE reading of this run's clock: how much of the span
+    /// its `Timeout` allows the handler it has spent when the run has `remaining` of its host
+    /// deadline left.
+    ///
+    /// Taken as a parameter so a caller that reads the clock once — [`Self::wait`], which both
+    /// charges a wait against the span and holds it inside what is left of the deadline — does
+    /// its whole arithmetic at one instant: read twice, the gap between the two readings would
+    /// be waived off every wait as a span no bound withheld.
+    fn spent_at(&self, remaining: Duration) -> Duration {
         self.host_span()
-            .saturating_sub(self.remaining())
+            .saturating_sub(remaining)
             .saturating_add(Duration::from_nanos(
                 self.waived_waiting.load(Ordering::Relaxed),
             ))
+    }
+
+    /// How much of the span this run's handler asked to WAIT for no host time passed over
+    /// ([`Self::wait`]).
+    ///
+    /// A wait is charged to the function's `Timeout` in full and really passes on this host
+    /// only up to [`super::GUEST_WAIT_HOST_SPAN`], so a run can answer with this much of its
+    /// own execution span still to pass; the invocation holds the function's concurrency for
+    /// that remainder too ([`super::super::execution_slot`]).
+    fn unwaited(&self) -> Duration {
+        Duration::from_nanos(self.waived_waiting.load(Ordering::Relaxed))
     }
 
     /// Whether the handler has had the whole span its function's `Timeout` allows it, which is
@@ -2926,13 +2954,17 @@ impl Bounds {
             self.wait_in_init(asked);
             return;
         }
-        let allowed = self
-            .wall_clock
-            .saturating_sub(self.spent_against_the_timeout());
+        // ONE reading of the run's clock answers both halves of the decision below, so the
+        // span the wait is charged and the span it is held for are of the same instant: read
+        // twice, the sliver of time between the two readings would be waived off every wait as
+        // though a bound had withheld it, and the invocation would hold its slot past a run
+        // this host waited out in full ([`Self::unwaited`]).
+        let remaining = self.remaining();
+        let allowed = self.wall_clock.saturating_sub(self.spent_at(remaining));
         let held = asked.min(allowed);
         let host_left = super::GUEST_WAIT_HOST_SPAN
             .saturating_sub(Duration::from_nanos(self.host_waiting.load(Ordering::Relaxed)));
-        let really = held.min(self.remaining()).min(host_left);
+        let really = held.min(remaining).min(host_left);
         self.host_waiting
             .fetch_add(nanoseconds(really), Ordering::Relaxed);
         self.waived_waiting

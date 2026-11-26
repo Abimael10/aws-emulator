@@ -870,6 +870,16 @@ pub struct Invoked {
     pub log_events: Vec<LogEvent>,
     /// How long the run took.
     pub duration: Duration,
+    /// How much of the span the handler asked to WAIT for no time of this host passed over,
+    /// so the EXECUTION this invocation is lasted that much longer than
+    /// [`Invoked::duration`] ([`outcome::Finished::unwaited`]).
+    ///
+    /// It is what an invocation still holds the function's concurrency for once its run has
+    /// answered ([`super::execution_slot::hold_for_the_rest_of_the_execution`]): the slot an
+    /// admitted invocation takes is held until that invocation is done, and an execution is
+    /// done when the span it spent against the function's `Timeout` is over. Zero for a run
+    /// this host waited out in full.
+    pub unwaited: Duration,
     /// The WRITES a response-streaming handler made, in order — empty for a handler that
     /// returned a value instead. A streaming caller is delivered one chunk per entry, so
     /// the chunk boundaries it sees are the handler's own.
@@ -1614,6 +1624,9 @@ fn answered(
         log_events: log_delivery::events(&log.records, log.opened, started, finished.elapsed),
         log: log.text(),
         duration: finished.elapsed,
+        // What the run asked to wait for that no host time passed over: the span of this
+        // execution that is still to pass now the run has answered.
+        unwaited: finished.unwaited,
         chunks: match &finished.completion {
             Completion::Streamed { chunks, .. } => {
                 chunks.iter().map(|chunk| chunk.clone().into_bytes()).collect()
@@ -2840,6 +2853,7 @@ mod tests {
                 init_duration: None,
                 log_stream: None,
                 elapsed: budget.wall_clock,
+                unwaited: Duration::ZERO,
                 max_memory_bytes: None,
             };
             let invoked = answered(
@@ -2911,6 +2925,7 @@ mod tests {
                     init_duration: None,
                     log_stream: None,
                     elapsed: budget.wall_clock,
+                    unwaited: Duration::ZERO,
                     max_memory_bytes: None,
                 };
                 let invoked = answered(
@@ -2988,6 +3003,7 @@ mod tests {
                     init_duration: None,
                     log_stream: None,
                     elapsed: Duration::ZERO,
+                    unwaited: Duration::ZERO,
                     max_memory_bytes: None,
                 };
                 let invoked = answered(
@@ -3042,6 +3058,7 @@ mod tests {
                     init_duration: None,
                     log_stream: None,
                     elapsed: Duration::ZERO,
+                    unwaited: Duration::ZERO,
                     max_memory_bytes: None,
                 };
                 let invoked = answered(
@@ -3116,6 +3133,7 @@ mod tests {
                 init_duration: None,
                 log_stream: None,
                 elapsed: Duration::ZERO,
+                unwaited: Duration::ZERO,
                 max_memory_bytes: None,
             };
             let invoked = answered(
@@ -3403,6 +3421,7 @@ mod tests {
                 log: "L".repeat(size),
                 log_events: Vec::new(),
                 duration: Duration::ZERO,
+                unwaited: Duration::ZERO,
                 chunks: Vec::new(),
                 stream_failure: None,
                 stopped: None,

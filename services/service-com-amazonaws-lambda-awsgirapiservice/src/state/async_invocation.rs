@@ -270,7 +270,7 @@ pub fn deliver(
             // whole, drawn on by every qualifier alike (`super::execution_slot`). An event
             // the pool had no room for RAN nothing, so it is the throttle below rather than
             // an outcome of the function; the slot an admitted attempt takes is held for
-            // exactly as long as its run lasts and released however that run ends.
+            // exactly as long as its EXECUTION lasts and released however that run ends.
             let run = match super::execution_slot::admit_invocation(
                 &state,
                 &function_name,
@@ -278,14 +278,21 @@ pub fn deliver(
                 SystemTime::now(),
             ) {
                 Ok(admitted) => {
-                    let _slot = admitted.slot;
+                    let slot = admitted.slot;
                     // An attempt served by one of the environments the qualifier's provisioned
                     // concurrency keeps initialised is metered on that family, exactly as a
                     // synchronous invocation of the same qualifier is (`super::metrics`).
                     if let Some(metrics) = invocation.metrics.as_ref() {
                         metrics.publish_provisioned_concurrency(&admitted.provisioned);
                     }
-                    super::execution::run_invocation(invocation.clone(), journal).await
+                    let ran = super::execution::run_invocation(invocation.clone(), journal).await;
+                    // The attempt's execution is over only once the span it spent is: a
+                    // handler that asked to wait for longer than this host waits out answered
+                    // with some of that span still to pass, and the function is processing
+                    // this attempt — and admits no further invocation into its slot — until it
+                    // is over (`super::execution_slot`).
+                    super::execution_slot::hold_for_the_rest_of_the_execution(slot, &ran);
+                    ran
                 }
                 Err(refused) => {
                     // The attempt was throttled, which is one invocation request the service

@@ -802,6 +802,7 @@ mod tests {
             log: String::new(),
             log_events: Vec::new(),
             duration: Duration::from_millis(1),
+            unwaited: Duration::ZERO,
             chunks: Vec::new(),
             stream_failure: None,
             stopped: None,
