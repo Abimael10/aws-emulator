@@ -244,8 +244,8 @@ const X12_RESPONSIBLE_AGENCY_CODE: &str = "X";
 /// name of an element or of a member.
 use super::test_parsing::{
     isa_element_names, FUNCTIONAL_GROUPS_KEY, FUNCTIONAL_GROUP_ITEM, GS_ELEMENTS,
-    INTERCHANGES_KEY, INTERCHANGE_ITEM, SEGMENTS_KEY, SEGMENT_ITEM, ST_ELEMENTS, TRANSACTIONS_KEY,
-    TRANSACTION_ITEM,
+    INTERCHANGES_KEY, INTERCHANGE_ITEM, ISA11_PRE_4020, SEGMENTS_KEY, SEGMENT_ITEM, ST_ELEMENTS,
+    TRANSACTIONS_KEY, TRANSACTION_ITEM,
 };
 
 /// The value a starter template carries wherever the caller must supply the content:
@@ -925,9 +925,7 @@ fn isa_element_value(position: usize, name: &str, version_code: &str) -> Option<
         // ISA11 is the control standards identifier up to the release where the repetition
         // separator takes its position; a separator is a delimiter of the file, so from
         // that release on the element is left to the writer the way ISA16 is.
-        11 if name == INTERCHANGE_CONTROL_STANDARDS_ELEMENT => {
-            Some(INTERCHANGE_CONTROL_STANDARDS_ID.to_string())
-        }
+        11 if name == ISA11_PRE_4020 => Some(INTERCHANGE_CONTROL_STANDARDS_ID.to_string()),
         // The interchange control version number: the five-digit form of the version X12
         // carries in GS08 (`004010` → `00401`).
         12 => Some(
@@ -948,10 +946,6 @@ fn isa_element_value(position: usize, name: &str, version_code: &str) -> Option<
 /// themselves (ISA02 and ISA04) stay the caller's, the way every other element a mapping
 /// supplies does.
 const NO_INFORMATION_QUALIFIER: &str = "00";
-
-/// The name the X12 reader gives ISA11 up to the release where the repetition separator
-/// takes that position, which is where the element is data rather than a delimiter.
-const INTERCHANGE_CONTROL_STANDARDS_ELEMENT: &str = "InterchangeControlStandardsId";
 
 /// ISA11, the interchange control standards identifier: `U`, the U.S. EDI community of ASC
 /// X12, TDCC and UCS.

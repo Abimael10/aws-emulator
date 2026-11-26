@@ -136,8 +136,9 @@ type TemplateCase<'a> = (
     &'a str,
 );
 
-/// Element 11 of the interchange control header before X12 release 004020.
-const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsId";
+/// Element 11 of the interchange control header before X12 release 004020, in the
+/// service's short form of the X12 title "Interchange Control Standards Identifier".
+const ISA11_PRE_4020: &str = "ISA_11_StandardsId";
 /// Element 11 of the interchange control header from X12 release 004020 on.
 const ISA11_FROM_4020: &str = "ISA_11_RepetitionSeparator";
 

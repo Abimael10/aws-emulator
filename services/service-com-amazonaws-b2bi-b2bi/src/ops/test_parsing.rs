@@ -74,8 +74,10 @@
 //!   even though it starts like one;
 //! * an object larger than [`MAX_INPUT_FILE_BYTES`] — "The input file has a file size
 //!   limit of 250 KB" (this operation's own documentation);
-//! * a split that would answer more than [`MAX_SPLIT_FILES`] files or more than
-//!   [`MAX_SPLIT_OUTPUT_BYTES`] of them together, and more than
+//! * content whose segment identifier is not one (longer than
+//!   [`MAX_SEGMENT_ID_CHARS`], or not alphanumeric starting with a letter), a document
+//!   whose rendering would hold more than [`MAX_RENDERED_OUTPUT_BYTES`], a split that
+//!   would answer more than [`MAX_SPLIT_FILES`] files, and more than
 //!   [`MAX_VALIDATION_RULES`] configured validation rules: the file count, the per-file
 //!   size and the rule count are factors of the work this operation does that AWS's input
 //!   limit does not bound on its own, so each one carries its own bound;
@@ -261,14 +263,19 @@ pub(crate) const SEGMENT_ID_KEY: &str = "segment_id";
 /// split output, and AWS's input limit bounds only their sum, so a 250 KB file of minimal
 /// transaction sets would otherwise be answered with a multiple of its own size: each
 /// split file repeats the interchange and group envelope its transaction set sits in. This
-/// bounds the count; [`MAX_SPLIT_OUTPUT_BYTES`] bounds what they hold together. A request
+/// bounds the count; [`MAX_RENDERED_OUTPUT_BYTES`] bounds what they hold together. A request
 /// past either is refused with the modelled `ValidationException` rather than answered.
 pub const MAX_SPLIT_FILES: usize = 1_000;
 
-/// The most bytes the split files of one request hold together — sixteen times the input
-/// limit, which leaves room for the key-per-element document a 250 KB interchange renders
-/// to while keeping one request's resident output bounded. See [`MAX_SPLIT_FILES`].
-pub const MAX_SPLIT_OUTPUT_BYTES: usize = 16 * MAX_INPUT_FILE_BYTES;
+/// The most bytes of rendered document one request is answered with — sixteen times the
+/// input limit, which leaves room for the key-per-element document a 250 KB interchange
+/// renders to while keeping one request's resident output bounded.
+///
+/// It bounds BOTH renderings: the whole-file document, and the split files together (see
+/// [`MAX_SPLIT_FILES`], which bounds how many of those there are). A rendering past it is
+/// refused with the modelled `ValidationException` rather than answered, because a document
+/// this operation cannot hold is a document it cannot report.
+pub const MAX_RENDERED_OUTPUT_BYTES: usize = 16 * MAX_INPUT_FILE_BYTES;
 
 /// The most validation rules one request configures.
 ///
@@ -298,9 +305,11 @@ const REQUIREMENT_MANDATORY: &str = "MANDATORY";
 /// document, which are the short form of each element's ASC X12 title rather than the
 /// title itself: the interchange sender id is `SenderId` and not
 /// `InterchangeSenderId`, the usage indicator is `TestIndicator`, and the authorization
-/// and security qualifiers drop the `Information` the X12 table carries
-/// (`ISA_01_AuthorizationQualifier`, `ISA_06_SenderId`, `ISA_13_InterchangeControlNumber`,
-/// `ISA_15_TestIndicator` as the recorded canonical documents key them). A name is how a
+/// and security qualifiers drop the `Information` the X12 table carries, and the
+/// interchange control standards identifier is `StandardsId`
+/// (`ISA_01_AuthorizationQualifier`, `ISA_06_SenderId`, `ISA_11_StandardsId`,
+/// `ISA_13_InterchangeControlNumber`,
+/// `ISA_15_TestIndicator` as the recorded documents key them). A name is how a
 /// caller's mapping expression addresses the element, so these are a wire requirement,
 /// not a label.
 ///
@@ -309,10 +318,11 @@ const REQUIREMENT_MANDATORY: &str = "MANDATORY";
 /// elements by, so a parsed document and a starter template describe the same tree with
 /// the same keys.
 ///
-/// Six of the names are read off a recorded canonical document — ISA01, ISA06, ISA13 and
-/// ISA15 above, plus GS01 and GS08 in [`GS_ELEMENTS`]. The rest are that same short-form
-/// rule applied to the remaining elements, so a later recording that spells one of them
-/// differently corrects that entry rather than the rule.
+/// Seven of the names are read off a recorded document — ISA01, ISA06, ISA13 and ISA15
+/// above, the pre-4020 position 11 ([`ISA11_PRE_4020`]), plus GS01 and GS08 in
+/// [`GS_ELEMENTS`]. The rest are that same short-form rule applied to the remaining
+/// elements, so a later recording that spells one of them differently corrects that entry
+/// rather than the rule.
 pub(crate) const ISA_ELEMENTS: &[&str] = &[
     "AuthorizationQualifier",
     "AuthorizationInformation",
@@ -338,8 +348,15 @@ pub(crate) const ISA_ELEMENTS: &[&str] = &[
 /// Element 11 of the interchange control header from X12 release 004020 on.
 const ISA11_FROM_4020: &str = "RepetitionSeparator";
 
-/// Element 11 of the interchange control header before X12 release 004020.
-const ISA11_PRE_4020: &str = "InterchangeControlStandardsId";
+/// Element 11 of the interchange control header before X12 release 004020: the X12
+/// "Interchange Control Standards Identifier", in the same short form as every other name
+/// of [`ISA_ELEMENTS`] — the qualifying words of the title dropped, the way "Interchange
+/// Sender ID" is `SenderId`.
+///
+/// Visible to the crate because `CreateStarterMappingTemplate` fixes this element's VALUE
+/// for the releases that carry it as data, and so has to recognise the element by the one
+/// name this table gives it.
+pub(crate) const ISA11_PRE_4020: &str = "StandardsId";
 
 /// The element names of the interchange control trailer (IEA), in positional order.
 pub(crate) const IEA_ELEMENTS: &[&str] =
@@ -482,18 +499,31 @@ fn detail_loop_key(segment: &str) -> String {
 /// loop rather than inside its last occurrence.
 const SUMMARY_SEGMENTS: &[&str] = &["CTT", "TDS", "AK9"];
 
-/// Whether `value` is shaped like an X12 segment identifier: alphanumeric and STARTING
-/// WITH A LETTER, as every id in the X12 segment directory is.
+/// The longest an X12 segment identifier is: every id in the ASC X12 segment directory is
+/// two or three alphanumeric characters (`ST`, `BEG`, `PO1`).
+///
+/// The id is repeated in the document key of EVERY element of its segment
+/// (`<SEGMENT>_<position>`), so it is also the per-element cost of a rendered document: the
+/// directory's own width is what keeps that cost constant and the rendering of an input
+/// file linear in its size.
+const MAX_SEGMENT_ID_CHARS: usize = 3;
+
+/// Whether `value` is shaped like an X12 segment identifier: alphanumeric, STARTING WITH A
+/// LETTER and no longer than [`MAX_SEGMENT_ID_CHARS`], as every id in the X12 segment
+/// directory is.
 ///
 /// That is also what keeps the document keys built from it legal XML element names, so an
 /// `XML` rendering cannot answer a success a conforming parser would reject — which is why
 /// this service's X12 WRITER (`super::test_conversion`) asks the same question of the
 /// `segment_id` a document hands it.
 pub(crate) fn is_segment_id(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
+    // The width is read FIRST, and read without walking past the bound, so a field far
+    // longer than an identifier is rejected without being scanned.
+    value.chars().take(MAX_SEGMENT_ID_CHARS + 1).count() <= MAX_SEGMENT_ID_CHARS
+        && value
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
         && value.chars().all(|character| character.is_ascii_alphanumeric())
 }
 
@@ -1316,7 +1346,7 @@ fn split_document_node(
 /// Every split file's parsed content: one per transaction set the input file holds.
 ///
 /// Bounded twice, INDEPENDENTLY of the input's own 250 KB limit — by [`MAX_SPLIT_FILES`]
-/// over the number of files and by [`MAX_SPLIT_OUTPUT_BYTES`] over the bytes they hold
+/// over the number of files and by [`MAX_RENDERED_OUTPUT_BYTES`] over the bytes they hold
 /// together — because the number of transaction sets and the size of each one are separate
 /// factors of the output and the input limit bounds only their sum. Each rendering yields
 /// to the runtime afterwards, so a cancelled or timed-out request stops here rather than
@@ -1354,10 +1384,10 @@ async fn split_file_contents(
                     release,
                 ))?;
                 rendered = rendered.saturating_add(document.len());
-                if rendered > MAX_SPLIT_OUTPUT_BYTES {
+                if rendered > MAX_RENDERED_OUTPUT_BYTES {
                     return Err(validation(format!(
                         "The split files of this input file hold more than the \
-                         {MAX_SPLIT_OUTPUT_BYTES} bytes this emulator answers one request \
+                         {MAX_RENDERED_OUTPUT_BYTES} bytes this emulator answers one request \
                          with. Parse it without \
                          advancedOptions.x12.splitOptions.splitBy TRANSACTION, or split the \
                          input file first."
@@ -1374,6 +1404,26 @@ async fn split_file_contents(
 /// The JSON rendering of a parsed document.
 fn json_document(document: &Node) -> Result<String, TestParsingError> {
     ::serde_json::to_string_pretty(document).map_err(internal)
+}
+
+/// `document` when it holds no more than [`MAX_RENDERED_OUTPUT_BYTES`], else the modelled
+/// refusal.
+///
+/// Every element of the document is keyed by its segment id and position
+/// (`<SEGMENT>_<position>`), and a segment id is at most
+/// [`MAX_SEGMENT_ID_CHARS`] characters ([`is_segment_id`]), so a rendering costs a bounded
+/// number of bytes per element of the input and this bound is reached only by an input
+/// near its own limit. It is what keeps the answer to one request resident-bounded even
+/// then: a document larger than this is refused rather than held.
+fn rendered_document(document: String) -> Result<String, TestParsingError> {
+    if document.len() > MAX_RENDERED_OUTPUT_BYTES {
+        return Err(validation(format!(
+            "The parsed document of this input file holds more than the \
+             {MAX_RENDERED_OUTPUT_BYTES} bytes this emulator answers one request with. \
+             Split the input file first, or parse fewer transaction sets at a time."
+        )));
+    }
+    Ok(document)
 }
 
 /// The XML rendering of a parsed document: the same tree, each node an element named by
@@ -1851,7 +1901,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .unwrap_or_default();
 
-        let parsed_file_content = format.render(&document_node(&interchanges, &delimiters, release))?;
+        let parsed_file_content =
+            rendered_document(format.render(&document_node(&interchanges, &delimiters, release))?)?;
 
         let parsed_split_file_contents = if split {
             Some(split_file_contents(&interchanges, &delimiters, release, format).await?)

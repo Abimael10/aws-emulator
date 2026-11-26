@@ -593,7 +593,7 @@ async fn both_document_formats_report_the_same_interchange() {
             STANDARD,
             "VERSION_4010",
             "00401",
-            "ISA_11_InterchangeControlStandardsId",
+            "ISA_11_StandardsId",
         ),
         (
             "release 5010",
@@ -1594,8 +1594,9 @@ async fn parsing_a_document_changes_nothing_a_later_caller_sees() {
 ///
 /// Source: the element table of the ASC X12 interchange control header — position 11 is
 /// the Interchange Control Standards Identifier until release 004020, where the Repetition
-/// Separator takes it.
-const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsId";
+/// Separator takes it. The member name is the service's short form of that title, the way
+/// "Interchange Sender ID" is `SenderId`.
+const ISA11_PRE_4020: &str = "ISA_11_StandardsId";
 const ISA11_FROM_4020: &str = "ISA_11_RepetitionSeparator";
 
 #[tokio::test]
@@ -1895,5 +1896,90 @@ async fn every_interchange_a_file_holds_is_parsed_in_file_order() {
                  got {split}"
             );
         }
+    }
+}
+
+/// RULE: a field where an X12 segment identifier belongs is one only when it is
+/// alphanumeric, begins with a letter and is no wider than the identifiers of the ASC X12
+/// segment directory itself (two or three characters); anything else is refused with the
+/// modelled `ValidationException` instead of parsed.
+///
+/// The identifier is repeated in the document key of every element of its segment
+/// (`<SEGMENT>_<position>`), so its width is the per-element cost of the parsed document:
+/// bounding it is what keeps the answer to one request proportionate to the input file
+/// rather than to the product of the file's element count and the width a sender chose.
+#[tokio::test]
+async fn a_segment_identifier_wider_than_the_x12_directory_is_refused() {
+    let router = parsing_router();
+    create_bucket(&router).await;
+
+    // Source: the ASC X12 segment directory, whose every segment identifier is two or three
+    // alphanumeric characters (`N1`, `BEG`, `PO1`). The rows span the directory's widths,
+    // the bound itself, one character past it, and a width far past it.
+    let far_past = "N".repeat(512);
+    let cases: Vec<(&str, &str, bool)> = vec![
+        ("two characters, a directory width", "N1", true),
+        ("three characters, the widest directory id", "BEG", true),
+        ("four characters, one past the bound", "BEGX", false),
+        ("far past the bound", far_past.as_str(), false),
+    ];
+
+    for (case, id, parses) in cases {
+        let document = interchange(
+            STANDARD,
+            "SENDERID",
+            "RECEIVERID",
+            "00401",
+            &[(
+                "PO",
+                vec![TransactionSet {
+                    code: "850",
+                    control: "0001",
+                    body: vec![vec![id, "ZZ", "VALUE"], vec!["CTT", "1"]],
+                }],
+            )],
+        );
+        let key = format!("segment-id/{}.edi", id.len());
+        let input_file = stage(&router, &key, document.as_bytes()).await;
+        let (status, response) = call(
+            &router,
+            "TestParsing",
+            request(input_file, "JSON", "X12_850", "VERSION_4010"),
+        )
+        .await;
+
+        if parses {
+            let parsed = parsed_json(case, status, &response);
+            let segments = parsed["interchanges"][0]["functional_groups"][0]["transactions"][0]
+                ["segments"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let first = format!("{id}_01");
+            assert!(
+                segments
+                    .iter()
+                    .any(|segment| segment[&first].as_str() == Some("ZZ")),
+                "case {case:?}: the segment must be reported as <{first}>, got {segments:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an identifier of {} characters must be refused, got {status} \
+             with body {response:?}",
+            id.len()
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {response:?}"
+        );
+        let message = message(&response);
+        assert!(
+            message.contains("is not an X12 segment identifier"),
+            "case {case:?}: the refusal must say the identifier is not one, got {message:?}"
+        );
     }
 }

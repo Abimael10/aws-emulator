@@ -25,10 +25,13 @@ use serde_json::{json, Value};
 
 use crate::edi_parsing::{given_object, BUCKET};
 use crate::onboarding_loop::{b2bi_router, call};
-use crate::test_parsing::body_segments_in_order;
+use crate::test_parsing::{
+    body_segments_in_order, interchange as x12_interchange, purchase_order, STANDARD,
+};
 // The handler's own placeholder constant, so this suite cannot drift from the value it
-// asserts on.
+// asserts on; `MAPPING_TYPE_VALUES` is the model's own member list.
 use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::PLACEHOLDER;
+use service_com_amazonaws_b2bi_b2bi::ops::types::MAPPING_TYPE_VALUES;
 
 /// An X12 interchange carrying one transaction set of `transaction_set` whose body is
 /// `body`, written with the classic delimiters (`*`, `>`, `~`).
@@ -163,7 +166,7 @@ async fn every_envelope_element_carries_its_canonical_member_name() {
         ("ISA_08_ReceiverId", "RECEIVER       "),
         ("ISA_09_Date", "240101"),
         ("ISA_10_Time", "1200"),
-        ("ISA_11_InterchangeControlStandardsId", "U"),
+        ("ISA_11_StandardsId", "U"),
         ("ISA_12_Version", "00401"),
         ("ISA_13_InterchangeControlNumber", "000000007"),
         ("ISA_14_AcknowledgmentRequested", "0"),
@@ -575,5 +578,274 @@ async fn a_template_generated_for_a_sample_carries_its_values_as_placeholders() 
                 );
             }
         }
+    }
+}
+
+/// The member name of interchange header element 11 before X12 release 004020: the
+/// Interchange Control Standards Identifier, in the canonical short form.
+const ISA11_PRE_4020: &str = "ISA_11_StandardsId";
+
+/// The member name of interchange header element 11 from X12 release 004020 on, where the
+/// Repetition Separator takes that position.
+const ISA11_FROM_4020: &str = "ISA_11_RepetitionSeparator";
+
+/// The interchange header's data elements, in positional order, as a document at a release
+/// below 004020 keys them.
+///
+/// Source: the canonical short form of each element's ASC X12 interchange control header
+/// title, the four recorded names among them as the service's own element table records
+/// (`ISA_01_AuthorizationQualifier`, `ISA_06_SenderId`,
+/// `ISA_13_InterchangeControlNumber`, `ISA_15_TestIndicator`). ISA16, the component element
+/// separator, is a delimiter of the FILE rather than data in it, so a starter template
+/// carries no member for it.
+const PRE_4020_INTERCHANGE_MEMBERS: &[&str] = &[
+    "ISA_01_AuthorizationQualifier",
+    "ISA_02_AuthorizationInformation",
+    "ISA_03_SecurityQualifier",
+    "ISA_04_SecurityInformation",
+    "ISA_05_SenderQualifier",
+    "ISA_06_SenderId",
+    "ISA_07_ReceiverQualifier",
+    "ISA_08_ReceiverId",
+    "ISA_09_Date",
+    "ISA_10_Time",
+    ISA11_PRE_4020,
+    "ISA_12_Version",
+    "ISA_13_InterchangeControlNumber",
+    "ISA_14_AcknowledgmentRequested",
+    "ISA_15_TestIndicator",
+];
+
+/// One row of the release table: the case, the `X12Version` the request names, the ISA12
+/// Interchange Control Version Number a sample at that release declares, and the member
+/// name position 11 takes there.
+///
+/// Every `X12Version` value is a row
+/// (`smithy_query(query="shape",shape="X12Version")`: VERSION_4010, VERSION_4030,
+/// VERSION_4050, VERSION_4060, VERSION_5010, VERSION_5010_HIPAA), which spans the one bound
+/// the name of position 11 follows — release 004020, below it the Interchange Control
+/// Standards Identifier, from it on the Repetition Separator.
+fn release_cases() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    vec![
+        ("release 4010", "VERSION_4010", "00401", ISA11_PRE_4020),
+        ("release 4030", "VERSION_4030", "00403", ISA11_FROM_4020),
+        ("release 4050", "VERSION_4050", "00405", ISA11_FROM_4020),
+        ("release 4060", "VERSION_4060", "00406", ISA11_FROM_4020),
+        ("release 5010", "VERSION_5010", "00501", ISA11_FROM_4020),
+        (
+            "release 5010 HIPAA",
+            "VERSION_5010_HIPAA",
+            "00501",
+            ISA11_FROM_4020,
+        ),
+    ]
+}
+
+/// The `mappingTemplate` a `CreateStarterMappingTemplate` call answers with, in the named
+/// mapping type and at the named version, deriving it from the sample at `sample_key` when
+/// one is given.
+async fn template_text(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    mapping_type: &str,
+    version: &str,
+    sample_key: Option<&str>,
+) -> String {
+    let mut request = json!({
+        "mappingType": mapping_type,
+        "templateDetails": { "x12": { "transactionSet": "X12_850", "version": version } }
+    });
+    if let Some(key) = sample_key {
+        request["outputSampleLocation"] = json!({ "bucketName": BUCKET, "key": key });
+    }
+    let (status, body) = call(router, "CreateStarterMappingTemplate", request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: a starter template must be generated, got {status} {body}"
+    );
+    body["mappingTemplate"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a mappingTemplate, got {body}"))
+        .to_string()
+}
+
+/// The interchange object of the document `TestParsing` answers for the object at `key`,
+/// read at the named version.
+async fn parsed_interchange(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    key: &str,
+    version: &str,
+) -> Value {
+    let (status, body) = call(
+        router,
+        "TestParsing",
+        json!({
+            "inputFile": { "bucketName": BUCKET, "key": key },
+            "fileFormat": "JSON",
+            "ediType": { "x12Details": { "transactionSet": "X12_850", "version": version } }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: TestParsing must parse the sample, got {status} {body}"
+    );
+    let content = body["parsedFileContent"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a parsedFileContent, got {body}"));
+    let document: Value = serde_json::from_str(content).unwrap_or_else(|failure| {
+        panic!("case {case:?}: parsedFileContent must be a JSON document: {failure}: {content}")
+    });
+    document["interchanges"][0].clone()
+}
+
+/// Every element name of the XSLT stylesheet `xml` in document order. Panics when the
+/// stylesheet is not well-formed, which is how a generated one is asserted to parse.
+fn xml_element_names(case: &str, xml: &str) -> Vec<String> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut names: Vec<String> = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(quick_xml::events::Event::Start(start))
+            | Ok(quick_xml::events::Event::Empty(start)) => {
+                names.push(String::from_utf8_lossy(start.name().into_inner()).to_string());
+            }
+            Ok(_) => {}
+            Err(failure) => panic!(
+                "case {case:?}: an XSLT template must be well-formed XML, got {failure}: {xml}"
+            ),
+        }
+    }
+    names
+}
+
+/// The member names of the interchange header a generated template of `mapping_type`
+/// carries, in positional order: the keys of the JSON document's interchange object for
+/// `JSONATA`, the element names of the stylesheet for `XSLT`. The two-digit position in
+/// each key makes the keys sort positionally.
+fn template_interchange_members(case: &str, mapping_type: &str, template: &str) -> Vec<String> {
+    let prefix = "ISA_";
+    let mut members: Vec<String> = if mapping_type == "JSONATA" {
+        let document: Value = serde_json::from_str(template).unwrap_or_else(|failure| {
+            panic!("case {case:?}: a JSONATA template must be a JSON document: {failure}")
+        });
+        document["interchanges"][0]
+            .as_object()
+            .map(|members| members.keys().cloned().collect())
+            .unwrap_or_default()
+    } else {
+        xml_element_names(case, template)
+    };
+    members.retain(|member| member.starts_with(prefix));
+    members.sort();
+    members
+}
+
+/// RULE: the interchange header's element at position 11 is keyed by the canonical short
+/// form of the title the requested X12 release gives it — the Interchange Control Standards
+/// Identifier below release 004020, the Repetition Separator from it on — and the starter
+/// template (in either mapping type) and the parsed document, which describe the same
+/// canonical document, key it the same way.
+///
+/// The rows are every `X12Version` the model declares ([`release_cases`]), crossed with
+/// every `MappingType`, so the table spans both sides of the one release bound the name
+/// follows and both renderings of the document.
+#[tokio::test]
+async fn interchange_element_eleven_is_keyed_by_its_canonical_name_at_every_release() {
+    let router = b2bi_router();
+
+    for (case, version, isa12, expected) in release_cases() {
+        let other = if expected == ISA11_PRE_4020 {
+            ISA11_FROM_4020
+        } else {
+            ISA11_PRE_4020
+        };
+
+        for mapping_type in MAPPING_TYPE_VALUES {
+            let case = format!("{case} {mapping_type}");
+            let template = template_text(&router, &case, mapping_type, version, None).await;
+            let members = template_interchange_members(&case, mapping_type, &template);
+            assert!(
+                members.iter().any(|member| member == expected),
+                "case {case:?}: the generated template's interchange header must carry \
+                 <{expected}>, got {members:?}"
+            );
+            assert!(
+                !members.iter().any(|member| member == other),
+                "case {case:?}: element 11 must be named once, not also <{other}>, got \
+                 {members:?}"
+            );
+        }
+
+        // The X12 READER names the element the same way at the same release: a starter
+        // template describes the very document the reader answers, so the two cannot name
+        // one element differently.
+        let sample = x12_interchange(
+            STANDARD,
+            "SENDERID",
+            "RECEIVERID",
+            isa12,
+            &[("PO", vec![purchase_order("0001", "PO-11")])],
+        );
+        let key = format!("canonical/isa11-{version}.edi");
+        given_object(&router, &key, &sample).await;
+        let parsed = parsed_interchange(&router, case, &key, version).await;
+        assert_eq!(
+            parsed[expected].as_str(),
+            Some("U"),
+            "case {case:?}: the parsed document must report element 11 as <{expected}> \
+             carrying the interchange's own value, got {parsed}"
+        );
+        assert!(
+            parsed.get(other).is_none(),
+            "case {case:?}: the parsed document must name element 11 once, not also \
+             <{other}>, got {parsed}"
+        );
+    }
+}
+
+/// RULE: every data element of the interchange header is keyed
+/// `ISA_<two-digit position>_<canonical short-form name>`
+/// ([`PRE_4020_INTERCHANGE_MEMBERS`]), whichever mapping type renders the template and
+/// whether or not the request names a sample to take the envelope's VALUES from.
+#[tokio::test]
+async fn every_interchange_header_element_is_keyed_by_its_canonical_name() {
+    let router = b2bi_router();
+
+    let sample = x12_interchange(
+        STANDARD,
+        "SENDERID",
+        "RECEIVERID",
+        "00401",
+        &[("PO", vec![purchase_order("0001", "PO-12")])],
+    );
+    let key = "canonical/isa-names-4010.edi";
+    given_object(&router, key, &sample).await;
+
+    for mapping_type in MAPPING_TYPE_VALUES {
+        for (sample_case, sample_key) in [("no sample", None), ("with a sample", Some(key))] {
+            let case = format!("{mapping_type} {sample_case}");
+            let template =
+                template_text(&router, &case, mapping_type, "VERSION_4010", sample_key).await;
+            let members = template_interchange_members(&case, mapping_type, &template);
+            assert_eq!(
+                members, PRE_4020_INTERCHANGE_MEMBERS,
+                "case {case:?}: the interchange header's members must be the canonical \
+                 short-form names, got {members:?}"
+            );
+        }
+    }
+
+    // The reader's own document carries the same elements under the same names, and beyond
+    // them the ISA16 component element separator a template leaves to the EDI writer.
+    let parsed = parsed_interchange(&router, "parsed document", key, "VERSION_4010").await;
+    for expected in PRE_4020_INTERCHANGE_MEMBERS {
+        assert!(
+            parsed.get(expected).is_some(),
+            "case \"parsed document\": the interchange header must carry <{expected}>, got \
+             {parsed}"
+        );
     }
 }
