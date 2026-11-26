@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The refusal a request that both SETS and DELETES one stack attribute carries.
+//! The refusal a request that both SETS and DELETES one attribute of a resource carries.
 //!
-//! `UpdateStack` takes the members that set a stack's configuration AND an
-//! `AttributesToDelete` naming the attributes to clear, so one request can ask for two
-//! different outcomes for one attribute. That combination is refused rather than resolved
-//! one way, and the sentence it is refused with names the CONFIGURATION in prose — not the
-//! request member that sets it and not the enum value that clears it — so the sentence is
-//! stated here, once, over the attribute the request named twice.
+//! `UpdateStack` and `UpdateAppBlockBuilder` each take the members that set their
+//! resource's configuration AND an `AttributesToDelete` naming the attributes to clear, so
+//! one request can ask for two different outcomes for one attribute. That combination is
+//! refused rather than resolved one way, and the sentence it is refused with names the
+//! CONFIGURATION in prose — not the request member that sets it and not the enum value that
+//! clears it — so the sentence is stated here, once, over the attribute the request named
+//! twice.
 //!
 //! Which member sets which attribute stays with the operation that reads the request
-//! (`crate::ops::update_stack`); what the refusal SAYS is a property of the service, and so
-//! lives beside the other refusal sentences this store words.
+//! (`crate::ops::update_stack`, `crate::ops::update_app_block_builder`); what the refusal
+//! SAYS is a property of the service, and so lives beside the other refusal sentences this
+//! store words.
 
 /// The words AWS's sentence names the configuration an attribute clears, for the
 /// attributes whose wording is not the attribute's own words read as prose.
@@ -24,9 +26,10 @@ const STATED_ATTRIBUTE_PROSE: &[(&str, &str)] = &[("ACCESS_ENDPOINTS", "vpc endp
 
 /// The configuration `attribute` names, in the words AWS's refusal states it with: the
 /// wording stated above where there is one, and otherwise the attribute's own words — the
-/// `StackAttribute` value (`smithy_query(query="shape", shape="StackAttribute")`, kept as
-/// `STACK_ATTRIBUTE_VALUES` in `ops/types/shared_types.rs`) read as prose, lower case with
-/// the separators spelled as spaces.
+/// attribute enum value (`StackAttribute` for a stack, `AppBlockBuilderAttribute` for an
+/// app block builder, kept as `STACK_ATTRIBUTE_VALUES` and
+/// `APP_BLOCK_BUILDER_ATTRIBUTE_VALUES` in `ops/types/shared_types.rs`) read as prose,
+/// lower case with the separators spelled as spaces.
 fn attribute_prose(attribute: &str) -> String {
     STATED_ATTRIBUTE_PROSE
         .iter()

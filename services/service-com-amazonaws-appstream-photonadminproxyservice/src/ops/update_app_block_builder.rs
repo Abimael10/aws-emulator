@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAppBlockBuilder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAppBlockBuilder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAppBlockBuilder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request carries — and clears the attributes its
+//! `AttributesToDelete` names — to the stored [`crate::state::AppBlockBuilderRecord`] the
+//! `Name` addresses, and returns the modelled `AppBlockBuilder` rendered FROM that record,
+//! so a later `DescribeAppBlockBuilders` reports exactly what this wrote. Which attributes
+//! a write may touch is decided by the builder's own instance state, as this operation's
+//! documentation states it: a builder on its way up or down admits no write at all, a
+//! running builder admits its `DisplayName` and `Description` alone, and a stopped builder
+//! admits every attribute but the `Name` — a write outside that answers
+//! `ResourceInUseException` (HTTP 400) and leaves the stored builder untouched. Setting an
+//! attribute's configuration while naming that attribute in `AttributesToDelete` answers
+//! `InvalidParameterCombinationException` (HTTP 400); an `IamRoleArn` this service cannot
+//! assume answers `InvalidRoleException` (HTTP 400); a name this account holds no builder
+//! under answers `ResourceNotFoundException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +198,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAppBlockBuilder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppBlockBuilderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAppBlockBuilder"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("UpdateAppBlockBuilder")
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The attributes to delete from the app block builder": the attributes a builder
+        // has are the modelled `AppBlockBuilderAttribute` values, so a request naming
+        // anything else asks to delete an attribute no builder has.
+        let attributes_to_delete = input.attributes_to_delete.clone().unwrap_or_default();
+        for attribute in &attributes_to_delete {
+            if !APP_BLOCK_BUILDER_ATTRIBUTE_VALUES.contains(&attribute.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AttributesToDelete contains an unknown app block builder attribute: \
+                     {attribute}"
+                )));
+            }
+            // Setting an attribute's configuration and deleting it in one request asks for
+            // two different outcomes for the same attribute, which is an incorrect
+            // combination of parameters — refused with the sentence AWS states for the
+            // configuration both halves name, rather than resolved silently one way.
+            if supplied_member(&input, attribute).is_some() {
+                return Err(
+                    UpdateAppBlockBuilderErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(crate::state::attribute_set_and_deleted_message(
+                                attribute,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The Amazon Resource Name (ARN) of the IAM role to apply to the app block
+        // builder": the modelled pattern only says the value has the shape of an ARN, so
+        // whether this account holds a role under it that this service may assume is IAM's
+        // answer — asked the way `CreateAppBlockBuilder` asks it, and BEFORE anything is
+        // written, so an update naming a role the service cannot assume changes nothing.
+        // Asked with no guard held: nothing may lock this store across a call into another
+        // service.
+        if let Some(role_arn) = input.iam_role_arn.as_deref() {
+            if ::service_common::iam_role::role_is_unassumable(
+                ctx,
+                &region,
+                role_arn,
+                crate::state::SERVICE_PRINCIPAL,
+            )
+            .await
+            {
+                return Err(UpdateAppBlockBuilderErrorModeled::InvalidRoleException(
+                    InvalidRoleException {
+                        message: Some(crate::state::invalid_role_message(role_arn)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        // The state this update is gated on is the one the clock has already made due, not
+        // the one an earlier start or stop left behind.
+        state.settle_app_block_builder_states();
+
+        // The builder is the resource this operation updates, so it is the one that has to
+        // exist: a name this account holds no builder under is a resource that was not
+        // found, as it is for every other resource this API names by name.
+        let record = state.app_block_builders.get_mut(&input.name).ok_or_else(|| {
+            UpdateAppBlockBuilderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::resource_not_found_message(
+                    crate::state::APP_BLOCK_BUILDER_KIND,
+                    &input.name,
+                )),
+            })
+        })?;
+
+        // The state gate, as this operation's documentation states it: a builder that is
+        // STARTING or STOPPING admits no write, a RUNNING one admits its display members
+        // alone, and a STOPPED one admits every attribute but the `Name`. What the request
+        // asks to write decides which of those it needs, so a request carrying only the
+        // display members goes through on a running builder and the same request carrying
+        // any other attribute is refused — with the stored builder left exactly as it was.
+        let admitted = if writes_beyond_display_members(&input, &attributes_to_delete) {
+            crate::state::app_block_builder_accepts_any_update(&record.state)
+        } else {
+            crate::state::app_block_builder_accepts_display_update(&record.state)
+        };
+        if !admitted {
+            return Err(UpdateAppBlockBuilderErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(
+                        crate::state::app_block_builder_attributes_not_updatable_message(
+                            &input.name,
+                            &record.state,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every member the request carries replaces the stored field; a member the request
+        // omits leaves that field alone. `Name` addresses the builder rather than renaming
+        // it — "you can update any attribute except the Name" — so it is never written
+        // here.
+        if let Some(display_name) = input.display_name {
+            record.display_name = Some(display_name);
+        }
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(platform) = input.platform {
+            record.platform = platform;
+        }
+        if let Some(instance_type) = input.instance_type {
+            record.instance_type = instance_type;
+        }
+        if let Some(vpc_config) = input.vpc_config {
+            record.vpc_config = vpc_config;
+        }
+        if let Some(enabled) = input.enable_default_internet_access {
+            record.enable_default_internet_access = Some(enabled);
+        }
+        if let Some(iam_role_arn) = input.iam_role_arn {
+            record.iam_role_arn = Some(iam_role_arn);
+        }
+        if let Some(access_endpoints) = input.access_endpoints {
+            record.access_endpoints = access_endpoints;
+        }
+        if let Some(disabled) = input.disable_imdsv1 {
+            record.disable_imdsv1 = Some(disabled);
+        }
+        for attribute in &attributes_to_delete {
+            record.delete_attribute(attribute);
+        }
+
+        // The result renders the stored record, so what this answers is what a later
+        // `DescribeAppBlockBuilders` reports.
+        Ok(UpdateAppBlockBuilderOutput {
+            app_block_builder: Some(record.to_app_block_builder()),
+        })
     }
+}
+
+/// The `UpdateAppBlockBuilder` member that SETS the builder attribute `attribute` clears,
+/// when this request carries it — so naming both can be refused rather than silently
+/// resolved one way.
+///
+/// The attribute values are `AppBlockBuilderAttribute`'s (`smithy_query(query="shape",
+/// shape="AppBlockBuilderAttribute")`, also kept as `APP_BLOCK_BUILDER_ATTRIBUTE_VALUES`
+/// in `types/shared_types.rs`). `VPC_CONFIGURATION_SECURITY_GROUP_IDS` clears the security
+/// groups of the builder's VPC configuration, so only a `VpcConfig` that NAMES security
+/// groups conflicts with it: one carrying subnets alone asks nothing of them.
+fn supplied_member(input: &UpdateAppBlockBuilderInput, attribute: &str) -> Option<&'static str> {
+    match attribute {
+        crate::state::APP_BLOCK_BUILDER_ATTRIBUTE_IAM_ROLE_ARN => {
+            input.iam_role_arn.is_some().then_some("IamRoleArn")
+        }
+        crate::state::APP_BLOCK_BUILDER_ATTRIBUTE_ACCESS_ENDPOINTS => {
+            input.access_endpoints.is_some().then_some("AccessEndpoints")
+        }
+        crate::state::APP_BLOCK_BUILDER_ATTRIBUTE_VPC_CONFIGURATION_SECURITY_GROUP_IDS => input
+            .vpc_config
+            .as_ref()
+            .is_some_and(|config| config.security_group_ids.is_some())
+            .then_some("VpcConfig"),
+        _ => None,
+    }
+}
+
+/// Whether this request asks to write anything beyond the builder's display members — the
+/// `DisplayName` and `Description` a running builder admits.
+///
+/// Every other input member names an attribute of the instance the builder runs on, and so
+/// does every `AttributesToDelete` entry: clearing the IAM role, the access endpoints or
+/// the VPC configuration's security groups changes what that instance is, not what the
+/// builder is called.
+fn writes_beyond_display_members(
+    input: &UpdateAppBlockBuilderInput,
+    attributes_to_delete: &[String],
+) -> bool {
+    input.platform.is_some()
+        || input.instance_type.is_some()
+        || input.vpc_config.is_some()
+        || input.enable_default_internet_access.is_some()
+        || input.iam_role_arn.is_some()
+        || input.access_endpoints.is_some()
+        || input.disable_imdsv1.is_some()
+        || !attributes_to_delete.is_empty()
 }

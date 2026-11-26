@@ -30,9 +30,13 @@
 //!
 //! A builder's own instance state lives here too, with the transition the clock owes it:
 //! `StartAppBlockBuilder` moves the stored record to `STARTING` and records the instant
-//! from which `RUNNING` is due ([`PendingState`]), and
+//! from which `RUNNING` is due ([`PendingState`]), `StopAppBlockBuilder` moves it to
+//! `STOPPING` and records the instant from which `STOPPED` is due, and
 //! `DescribeAppBlockBuilders` materialises what is already due before it reports
 //! ([`ComAmazonawsAppstreamPhotonadminproxyserviceState::settle_app_block_builder_states`]).
+//! That state is also the gate `UpdateAppBlockBuilder` applies: which of a builder's
+//! attributes may be written depends on the state it is in, worded once in its own module
+//! ([`app_block_builder_updates`]).
 //!
 //! Usage reporting lives here too: it is ONE account-and-Region-wide setting, so
 //! `CreateUsageReportSubscription` writes the single [`UsageReportSubscriptionRecord`]
@@ -124,6 +128,7 @@
 //! ([`stack_attribute_conflicts`]).
 
 mod access_endpoints;
+mod app_block_builder_updates;
 mod entitlements;
 mod images;
 mod stack_attribute_conflicts;
@@ -134,6 +139,7 @@ mod vpc_access_endpoints;
 mod wire_refusals;
 
 pub use access_endpoints::*;
+pub use app_block_builder_updates::*;
 pub use entitlements::*;
 pub use images::*;
 pub use stack_attribute_conflicts::*;
@@ -192,14 +198,19 @@ pub const FLEET_STATE_RUNNING: &str = "RUNNING";
 /// transition is applied the next time the fleet is read.
 pub const FLEET_START_SPAN: ::std::time::Duration = ::std::time::Duration::from_secs(3);
 
+/// The `AppBlockBuilderState` of a builder that has no instance running, one of
+/// `APP_BLOCK_BUILDER_STATE_VALUES` (`ops/types/shared_types.rs`).
+///
+/// It is terminal: a stopped builder stays stopped until a caller starts it again.
+pub const APP_BLOCK_BUILDER_STATE_STOPPED: &str = "STOPPED";
+
 /// The `AppBlockBuilderState` a freshly created app block builder carries.
 ///
 /// A builder is created stopped: `StartAppBlockBuilder`'s doc states that "an app block
 /// builder can only be started when it's associated with an app block", and a create
 /// associates none — so this is where a created builder stays until a caller associates an
-/// app block and starts it. The value is `AppBlockBuilderState`'s
-/// (`APP_BLOCK_BUILDER_STATE_VALUES` in `ops/types/shared_types.rs`).
-pub const APP_BLOCK_BUILDER_STATE_CREATED: &str = "STOPPED";
+/// app block and starts it.
+pub const APP_BLOCK_BUILDER_STATE_CREATED: &str = APP_BLOCK_BUILDER_STATE_STOPPED;
 
 /// The `AppBlockBuilderState` a builder carries while the instance
 /// `StartAppBlockBuilder` asked for is coming up, one of `APP_BLOCK_BUILDER_STATE_VALUES`.
@@ -221,6 +232,23 @@ pub const APP_BLOCK_BUILDER_STATE_RUNNING: &str = "RUNNING";
 /// the due instant is stored on the builder and the transition is applied the next time the
 /// builder is read.
 pub const APP_BLOCK_BUILDER_START_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_secs(3);
+
+/// The `AppBlockBuilderState` a builder carries while the instance it was running on is
+/// being terminated — `StopAppBlockBuilder`'s doc states that "stopping an app block
+/// builder terminates the instance". It is not terminal: the clock owes the builder
+/// [`APP_BLOCK_BUILDER_STATE_STOPPED`] once [`APP_BLOCK_BUILDER_STOP_SPAN`] has passed.
+pub const APP_BLOCK_BUILDER_STATE_STOPPING: &str = "STOPPING";
+
+/// How long a builder stays [`APP_BLOCK_BUILDER_STATE_STOPPING`] before the clock owes it
+/// [`APP_BLOCK_BUILDER_STATE_STOPPED`].
+///
+/// AWS takes minutes to drain the builder's instance; the span here is the emulator's own,
+/// chosen so that a caller acting straight after `StopAppBlockBuilder` still observes the
+/// transient state and the refusals that go with it, without any caller having to wait
+/// minutes. Nothing sleeps for it: the due instant is stored on the builder and the
+/// transition is applied the next time the builder is read.
+pub const APP_BLOCK_BUILDER_STOP_SPAN: ::std::time::Duration =
     ::std::time::Duration::from_secs(3);
 
 /// How many records one `DescribeStacks`/`DescribeFleets` page carries.
@@ -1083,6 +1111,19 @@ impl AppBlockBuilderRecord {
     /// Whether this builder's instance is up, which is the state a start settles it in.
     pub fn is_running(&self) -> bool {
         self.state == APP_BLOCK_BUILDER_STATE_RUNNING
+    }
+
+    /// Whether this builder has no instance, which is the state a stop settles it in and
+    /// the state a create leaves a builder in.
+    pub fn is_stopped(&self) -> bool {
+        self.state == APP_BLOCK_BUILDER_STATE_STOPPED
+    }
+
+    /// The state the clock owes this builder, when one is owed: what tells a builder on
+    /// its way to one state from a builder that is already there, so a repeated start or
+    /// stop asks for nothing new.
+    pub fn owed_state(&self) -> Option<&'static str> {
+        self.pending_state.map(|pending| pending.state)
     }
 
     /// Render the stored record as the modelled `AppBlockBuilder` every reader returns.
