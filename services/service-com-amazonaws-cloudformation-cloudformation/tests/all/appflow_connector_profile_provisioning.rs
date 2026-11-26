@@ -19,6 +19,15 @@
 //! `Fn::GetAtt CredentialsArn`). The rollback leg differs in the one thing that decides it: the
 //! trust policy of the Data API role the UPDATE points the profile at.
 //!
+//! What that leg asserts about the failed resource is the CLASS and the WORDING the owning
+//! service's refusal is reported with: a Data API role Amazon AppFlow's connector cannot take on
+//! fails the CONNECTION TEST that service runs while it re-configures the profile, which is a
+//! connector-endpoint failure rather than a defect in the declaration — so the provider reports
+//! it under `HandlerErrorCode: GeneralServiceException` and quotes that service's
+//! connector-communication sentence, with the diagnostic its SDK appends to the refused call.
+//! `InvalidRequest`, the class of a declaration CloudFormation's caller has to fix, is never
+//! what this failure carries.
+//!
 //! Everything goes over the wire each service speaks through the one router `harness.rs` builds —
 //! the CloudFormation calls over its awsQuery wire, the AppFlow calls over its `restJson1` wire,
 //! the Redshift Serverless and Secrets Manager calls over their `awsJson1_1` wires — so what is
@@ -60,6 +69,22 @@ const UPDATE_ROLLBACK_COMPLETE: &str = "UPDATE_ROLLBACK_COMPLETE";
 /// The service principal a Data API role's trust policy has to admit for Amazon AppFlow to reach
 /// a Redshift database through it.
 const APPFLOW_PRINCIPAL: &str = "appflow.amazonaws.com";
+
+/// The opening of the sentence Amazon AppFlow words for a connection test its connector could
+/// not complete, which the failed resource's reason quotes.
+const CONNECTOR_TEST_FAILURE: &str =
+    "Error while communicating to connector: The test connection request failed due to:";
+
+/// The diagnostic that service's own SDK appends to the refused call, which is part of what the
+/// provider reports: the SDK's name for Amazon AppFlow (`Appflow`, that model's own `sdkId`) and
+/// the status it answered.
+const APPFLOW_SDK_DIAGNOSTIC: &str = "(Service: Appflow, Status Code: 400, Request ID: ";
+
+/// The `HandlerErrorCode` class a refusal of the OWNING SERVICE's own — one the provider maps
+/// nothing for — is reported under, and the class of a declaration at fault, which this failure
+/// is not.
+const SERVICE_FAILED: &str = "HandlerErrorCode: GeneralServiceException";
+const INVALID_REQUEST: &str = "HandlerErrorCode: InvalidRequest";
 
 /// The status Amazon Redshift Serverless reports a usable workgroup in.
 const AVAILABLE: &str = "AVAILABLE";
@@ -586,14 +611,29 @@ async fn rolled_back(router: &MultiServiceRouter, s3_role: &str, usable: &str, u
         "case rolled back: expected the stack to reach {UPDATE_ROLLBACK_COMPLETE}; the events: \
          {reasons:?}"
     );
+    let reason = reasons
+        .iter()
+        .find(|reason| reason.contains(CONNECTOR_TEST_FAILURE))
+        .unwrap_or_else(|| {
+            panic!(
+                "case rolled back: expected the connector-test failure as the resource's failure \
+                 reason, got {reasons:?}"
+            )
+        });
     assert!(
-        reasons.iter().any(|reason| {
-            reason.contains("Update Connector Profile request failed")
-                && reason.contains(&unusable)
-                && reason.contains(APPFLOW_PRINCIPAL)
-        }),
-        "case rolled back: expected AppFlow's own refusal naming the role and the principal as \
-         the resource's failure reason, got {reasons:?}"
+        reason.contains(unusable.as_str()),
+        "case rolled back: expected the reason to name the Data API role the update declared, got \
+         {reason:?}"
+    );
+    assert!(
+        reason.contains(APPFLOW_SDK_DIAGNOSTIC),
+        "case rolled back: expected the owning service's own SDK diagnostic in the reason, got \
+         {reason:?}"
+    );
+    assert!(
+        reason.contains(SERVICE_FAILED) && !reason.contains(INVALID_REQUEST),
+        "case rolled back: a connector-endpoint failure is the owning service's, so the reason \
+         closes {SERVICE_FAILED:?}; got {reason:?}"
     );
     assert!(
         !reasons

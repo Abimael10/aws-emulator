@@ -12,14 +12,18 @@
 //!    delete takes it away — so every value a read answers comes from the store and not from the
 //!    call that read it.
 //!
-//! 2. A profile AppFlow stores is one it could USE: every IAM role the configuration names that
-//!    AppFlow itself has to assume — an Amazon Redshift profile's `dataApiRoleArn`, "an IAM role
-//!    that permits Amazon AppFlow to access your Amazon Redshift database through the Data API" —
-//!    must be one this account's IAM shows AppFlow can assume. A profile naming a role IAM holds
-//!    nothing under, or one whose trust policy does not admit the AppFlow service principal, is
-//!    refused 400 `ValidationException` when it is defined, by the create and by the update
-//!    alike, and nothing is stored or changed. A value that names no role of this account at all
-//!    establishes nothing, because another account's IAM is not this emulator's to ask.
+//! 2. A profile AppFlow stores is one whose CONNECTION TEST passed: while it defines a profile,
+//!    AppFlow runs the connector's test connection, and every IAM role the configuration names
+//!    that AppFlow itself has to assume — an Amazon Redshift profile's `dataApiRoleArn`, "an IAM
+//!    role that permits Amazon AppFlow to access your Amazon Redshift database through the Data
+//!    API" — must be one this account's IAM shows AppFlow can assume. A profile naming a role IAM
+//!    holds nothing under, or one whose trust policy does not admit the AppFlow service
+//!    principal, fails that test: the request was well formed, so the failure is the connector's
+//!    and is answered 400 `ConnectorServerException` ("An error occurred when retrieving data
+//!    from the connector endpoint") carrying the connector-communication sentence, by the create
+//!    and by the update alike, and nothing is stored or changed. A value that names no role of
+//!    this account at all establishes nothing, because another account's IAM is not this
+//!    emulator's to ask.
 //!
 //! Every call goes over the wire through the same `MultiServiceRouter` the production router
 //! assembles, with the emulator's own IAM mounted BESIDE AppFlow on one engine — what the role
@@ -43,18 +47,18 @@ use crate::flow_lifecycle::{
 /// The service principal a Data API role's trust policy has to admit for AppFlow to reach the
 /// database through it, written out here rather than read from the crate's own constant so this
 /// suite pins it.
-const APPFLOW_PRINCIPAL: &str = "appflow.amazonaws.com";
+pub(crate) const APPFLOW_PRINCIPAL: &str = "appflow.amazonaws.com";
 
 /// The URIs of the four operations under test, as this service's model binds them.
-const CREATE: &str = "/create-connector-profile";
-const UPDATE: &str = "/update-connector-profile";
+pub(crate) const CREATE: &str = "/create-connector-profile";
+pub(crate) const UPDATE: &str = "/update-connector-profile";
 const DESCRIBE: &str = "/describe-connector-profiles";
 const DELETE: &str = "/delete-connector-profile";
 
 /// This service with the emulator's own IAM and Secrets Manager mounted BESIDE it on the same
 /// engine — what `core/router` assembles, narrowed to the services a connector profile reaches:
 /// IAM answers the Data API role question, and Secrets Manager HOLDS the profile's credentials.
-fn appflow_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn appflow_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The signature itself is not what these cases are about; the credential scope still
@@ -107,7 +111,11 @@ async fn held_secret(router: &MultiServiceRouter, secret_id: &str) -> Option<Val
 /// Seed `role_name` into the shared engine's IAM store carrying `trust` as its
 /// `AssumeRolePolicyDocument` — the record `CreateRole` writes — and answer the ARN IAM holds it
 /// under.
-fn seed_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str, trust: Option<String>) -> String {
+pub(crate) fn seed_role(
+    engine: &Arc<engine::InMemoryEngine>,
+    role_name: &str,
+    trust: Option<String>,
+) -> String {
     let state = engine.state::<IamState>();
     let mut store = state.lock();
     let arn = role_arn(DEFAULT_PATH, role_name);
@@ -133,7 +141,7 @@ fn seed_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str, trust: Optio
 
 /// A trust document with one statement: `effect` for the service principals `principals`
 /// performing `sts:AssumeRole`.
-fn trust(effect: &str, principals: &[&str]) -> String {
+pub(crate) fn trust(effect: &str, principals: &[&str]) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -150,7 +158,7 @@ fn trust(effect: &str, principals: &[&str]) -> String {
 ///
 /// `data_api_role_arn` is the member rule 2 is about; `None` is a profile that names no Data API
 /// role at all.
-fn redshift_config(
+pub(crate) fn redshift_config(
     s3_role_arn: &str,
     data_api_role_arn: Option<&str>,
     database_name: &str,
@@ -190,7 +198,7 @@ async fn described(router: &MultiServiceRouter, body: &Value) -> Vec<Value> {
 }
 
 /// The one profile the account holds under `name`, or `None`.
-async fn described_one(router: &MultiServiceRouter, name: &str) -> Option<Value> {
+pub(crate) async fn described_one(router: &MultiServiceRouter, name: &str) -> Option<Value> {
     described(router, &json!({ "connectorProfileNames": [name] }))
         .await
         .into_iter()
@@ -441,6 +449,43 @@ async fn a_connector_profile_round_trips_through_describe() {
     );
 }
 
+/// The connector-communication sentence AppFlow words for a connection test the connector could
+/// not complete, up to the one REQUEST value it carries: the Data API role ARN.
+///
+/// Written out here rather than read from the crate's own builder so this suite pins the fixed
+/// text — the doubled space in `for the  Redshift` included, which is AWS's own.
+pub(crate) const CONNECTOR_TEST_FAILURE_OPENING: &str = "Error while communicating to connector: \
+     The test connection request failed due to: \
+     com.amazonaws.sandstoneconfigurationservicelambda.coral.model.ConnectorServerException: \
+     Failed to validate Connection while attempting \"select distinct(table_schema) from \
+     information_schema.tables limit 1\" with connector failure The request for the  Redshift \
+     failed with the status code 403: AccessDenied while trying to assume user-provided ";
+
+/// The fixed text between the role ARN and the per-call id of the connector client's own call.
+pub(crate) const CONNECTOR_TEST_FAILURE_MIDDLE: &str = " role by AppFlow service principal. \
+     (Service: null; Status Code: 400; Error Code: Client; Request ID: ";
+
+/// What the sentence closes with, past that id.
+pub(crate) const CONNECTOR_TEST_FAILURE_CLOSE: &str = "; Proxy: null)";
+
+/// The per-call id `message` carries, when `message` is exactly the connector-communication
+/// sentence for `role_arn` — `None` when any fixed part of it differs, or when the role the
+/// sentence names is not the one the request sent.
+///
+/// Splitting the sentence at its two variable parts is what separates the REQUIREMENT (the fixed
+/// text, and the role ARN taken verbatim from the request) from the one value that is a per-run
+/// value of the call.
+pub(crate) fn connector_test_failure_id<'message>(
+    message: &'message str,
+    role_arn: &str,
+) -> Option<&'message str> {
+    message
+        .strip_prefix(CONNECTOR_TEST_FAILURE_OPENING)?
+        .strip_prefix(role_arn)?
+        .strip_prefix(CONNECTOR_TEST_FAILURE_MIDDLE)?
+        .strip_suffix(CONNECTOR_TEST_FAILURE_CLOSE)
+}
+
 /// One row of [`a_data_api_role_appflow_cannot_assume_is_refused`]: what the account's IAM holds
 /// for the role the profile names, and whether AppFlow may store such a profile.
 struct RoleRow {
@@ -576,17 +621,16 @@ async fn a_data_api_role_appflow_cannot_assume_is_refused() {
         if row.refused {
             assert_eq!(
                 (created.status, created.error.as_str()),
-                (400, "ValidationException"),
-                "case {case:?}: expected the create refused 400 ValidationException, got {:?}",
+                (400, "ConnectorServerException"),
+                "case {case:?}: expected the create answered 400 ConnectorServerException, got \
+                 {:?}",
                 created.body
             );
             let message = created.string("message").to_string();
             assert!(
-                message.contains("Create Connector Profile request failed")
-                    && message.contains(&data_api_role)
-                    && message.contains(APPFLOW_PRINCIPAL),
-                "case {case:?}: expected the refusal to name the call, the role and the \
-                 principal, got {message:?}"
+                connector_test_failure_id(&message, &data_api_role).is_some(),
+                "case {case:?}: expected the connector-communication sentence naming the role \
+                 the request sent, got {message:?}"
             );
             assert_eq!(
                 described_one(&router, &name).await,
@@ -655,15 +699,15 @@ async fn an_update_onto_an_unusable_data_api_role_changes_nothing() {
     .await;
     assert_eq!(
         (refused.status, refused.error.as_str()),
-        (400, "ValidationException"),
-        "case refused update: expected 400 ValidationException, got {:?}",
+        (400, "ConnectorServerException"),
+        "case refused update: expected 400 ConnectorServerException, got {:?}",
         refused.body
     );
     let message = refused.string("message").to_string();
     assert!(
-        message.contains("Update Connector Profile request failed") && message.contains(&bad),
-        "case refused update: expected the refusal to name the call and the role, got \
-         {message:?}"
+        connector_test_failure_id(&message, &bad).is_some(),
+        "case refused update: expected the connector-communication sentence naming the role the \
+         request sent, got {message:?}"
     );
     let held = described_one(&router, "warehouse")
         .await

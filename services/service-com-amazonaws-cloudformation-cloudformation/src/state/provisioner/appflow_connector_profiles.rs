@@ -46,6 +46,17 @@ const DELETE_CONNECTOR_PROFILE_URI: &str = "/delete-connector-profile";
 const DESCRIBE_CONNECTOR_PROFILES: &str = "DescribeConnectorProfiles";
 const DESCRIBE_CONNECTOR_PROFILES_URI: &str = "/describe-connector-profiles";
 
+/// The error code Amazon AppFlow answers when the connector endpoint itself failed the call —
+/// the modelled `ConnectorServerException` (`smithy_query(query="shape",
+/// shape="ConnectorServerException")`: @httpError 400, "An error occurred when retrieving data
+/// from the connector endpoint"), which is what a connection test that service could not
+/// complete is reported as. Judged on the CODE and never on a message.
+///
+/// Read by [`crate::state::provisioner::Provisioner::handler_error_class`]: the type's provider
+/// maps none of that service's connector-endpoint exceptions, so the plugin files such a refusal
+/// under its class for a service that failed.
+pub(super) const APPFLOW_CONNECTOR_SERVER_EXCEPTION: &str = "ConnectorServerException";
+
 /// The error code Amazon AppFlow answers for a connector profile it does not hold — the
 /// modelled 404 of `UpdateConnectorProfile` and `DeleteConnectorProfile`
 /// (`smithy_query(query="operation", operation="UpdateConnectorProfile,DeleteConnectorProfile")`).

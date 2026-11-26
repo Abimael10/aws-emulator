@@ -97,6 +97,8 @@
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request would cause a service quota
 //!   (such as the number of flows) to be exceeded.
 //! * `ValidationException` (HTTP 400) — The request has invalid or missing parameters.
+//! * `ConnectorServerException` (HTTP 400) — widened in through `extra_errors` (see below): An
+//!   error occurred when retrieving data from the connector endpoint.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -112,11 +114,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-appflow-sandstoneconfig
 // here — hence the `CreateConnectorProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.appflow#CreateConnectorProfile")]
+//
+// `ConnectorServerException` is widened in through `extra_errors`: defining a profile runs the
+// connector's TEST CONNECTION, and a test the connector could not complete is an error at the
+// connector endpoint rather than a defect in the request. That shape is this SERVICE's own
+// (`com.amazonaws.appflow#ConnectorServerException`, @httpError 400, "An error occurred when
+// retrieving data from the connector endpoint"), declared in `types/shared_types.rs` and listed
+// by the operations that reach a connector (`CreateFlow`, `UpdateFlow`, `ListConnectorEntities`);
+// this operation's own `errors` list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.appflow#CreateConnectorProfile",
+    extra_errors = ["ConnectorServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateConnectorProfileErrorModeled {
     ConflictException(ConflictException),
     ConnectorAuthenticationException(ConnectorAuthenticationException),
+    ConnectorServerException(ConnectorServerException),
     InternalServerException(InternalServerException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -181,23 +195,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         // Every IAM role the configuration names that AppFlow itself would have to take on
-        // has to be one this account's IAM shows it CAN take on, so a profile that could
-        // never reach the connector is refused when it is defined rather than stored.
-        // Judged before the store's guard is taken, because the question is put to IAM.
-        if let Some(reason) = crate::state::unusable_connector_profile_role(
+        // has to be one this account's IAM shows it CAN take on, so a profile whose
+        // connection test could never reach the connector is not stored. Judged before the
+        // store's guard is taken, because the question is put to IAM. The request itself is
+        // well formed — what failed is the call to the connector — so it is answered with the
+        // connector-endpoint error and not with a parameter refusal.
+        if let Some(message) = crate::state::unusable_connector_profile_role(
             ctx,
             &region,
-            crate::state::CREATE_CONNECTOR_PROFILE_REQUEST,
             &input.connector_profile_config.connector_profile_properties,
         )
         .await
         {
-            return Err(CreateConnectorProfileErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(reason),
-                },
-            )
-            .into());
+            return Err(
+                CreateConnectorProfileErrorModeled::ConnectorServerException(
+                    ConnectorServerException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
 
         let now = ::std::time::SystemTime::now();

@@ -77,6 +77,20 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // types this emulator provisions over this signing name are all that service's
     // ([`provisioning::appconfig_resources`]).
     ("appconfig", "AppConfig", SdkDiagnostic::Envelope),
+    // Amazon AppFlow's SDK names it `Appflow` — that model's own `sdkId`, which is also the
+    // `cloudFormationName` the type names of its resources carry
+    // (`smithy_query(query="service_info")` on that service's model: `sdkId: "Appflow"`,
+    // `cloudFormationName: Appflow`), so the name is not the signing name (`appflow`) nor that
+    // name initial-capped. The shape is the ATTEMPT-counting one, as the recorded
+    // `ResourceStatusReason` of an `AWS::AppFlow::ConnectorProfile` whose declared Data API role
+    // that service's connector could not take on carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `appflow__cloudformation.deploy-appflow-connector-\
+    // profile-redshift-bad-data-api-role-update-rejected-and-rolled-back`, whose reason reads
+    // `Resource handler returned message: "<the service's sentence> (Service: Appflow, Status
+    // Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+    // GeneralServiceException)`). The one resource type this emulator provisions over this
+    // signing name is that service's ([`provisioner::appflow_connector_profiles`]).
+    ("appflow", "Appflow", SdkDiagnostic::Attempts),
     // Application Auto Scaling's SDK names it by its `sdkId` without the spaces, which is
     // also the `cloudFormationName` the type names of its resources carry
     // (`smithy_query(query="service_info")`).

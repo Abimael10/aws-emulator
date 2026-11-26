@@ -214,6 +214,22 @@ impl Provisioner {
         if matches!(self, Self::AcmCertificate) && code.contains(INVALID_CHANGE_BATCH) {
             return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
         }
+        // The `AWS::AppFlow::ConnectorProfile` provider maps none of Amazon AppFlow's
+        // CONNECTOR-ENDPOINT exceptions: a connection test that service could not complete is
+        // the connector failing rather than the declaration being wrong, and the plugin reports
+        // an exception it has no mapping for under its class for a service that failed. Recorded
+        // behaviour, read from the reason of the failed resource of a stack whose profile
+        // declares a Data API role that service's connector cannot take on (in the behavioral
+        // corpus `simparity-behavioral-aws-v1`, check `appflow__cloudformation.deploy-appflow-\
+        // connector-profile-redshift-bad-data-api-role-update-rejected-and-rolled-back`, whose
+        // reason closes `HandlerErrorCode: GeneralServiceException`), and decided — as everywhere
+        // here — by the CODE that service answered rather than by its message. Its refusals of
+        // the request itself keep the class their own codes fall in.
+        if matches!(self, Self::AppFlowConnectorProfile)
+            && code == APPFLOW_CONNECTOR_SERVER_EXCEPTION
+        {
+            return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
+        }
         let references_another_resource = match self {
             // A record set is written INSIDE a hosted zone its declaration names
             // (`HostedZoneId`/`HostedZoneName`), and the record set itself is the resource

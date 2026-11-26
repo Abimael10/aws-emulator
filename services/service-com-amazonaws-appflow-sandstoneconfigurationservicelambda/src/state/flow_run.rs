@@ -116,8 +116,6 @@ pub const UPDATE_FLOW_REQUEST: &str = "Update Flow";
 ///
 /// AppFlow validates a whole definition and reports what it found wrapped in the request
 /// it was validating, so a client reads which call failed and why from the one sentence.
-/// Shared with the connector-profile pre-flight ([`super::connector_profiles`]), so one
-/// service states one class of refusal one way.
 pub fn request_failed(request: &str, reason: &str) -> String {
     format!("{request} request failed: [{reason}]")
 }

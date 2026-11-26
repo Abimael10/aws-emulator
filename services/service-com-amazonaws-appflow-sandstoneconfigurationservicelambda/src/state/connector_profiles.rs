@@ -43,13 +43,50 @@ pub const DEFAULT_CONNECTOR_PROFILE_PAGE_SIZE: usize = 20;
 /// so a long-lived process cannot grow without limit.
 pub const MAX_CONNECTOR_PROFILES_PER_ACCOUNT: usize = 100;
 
-/// How AppFlow names the request it refused, in the envelope a definition-time refusal's
-/// message opens with ([`super::request_failed`]) — the same envelope the Amazon S3
-/// pre-flight of a flow definition is stated in, so one service words one class of refusal one
-/// way.
-pub const CREATE_CONNECTOR_PROFILE_REQUEST: &str = "Create Connector Profile";
-/// See [`CREATE_CONNECTOR_PROFILE_REQUEST`].
-pub const UPDATE_CONNECTOR_PROFILE_REQUEST: &str = "Update Connector Profile";
+/// The connector key an Amazon Redshift profile's settings travel under inside
+/// `ConnectorProfileProperties`, which that shape spells with an UPPER-case initial on the wire
+/// (`smithy_query(query="shape", shape="ConnectorProfileProperties")`) — and the name AppFlow
+/// calls the connector by in what it reports about a connection test it could not complete.
+const REDSHIFT_CONNECTOR: &str = "Redshift";
+
+/// The class AppFlow names a connector-endpoint failure by inside the sentence it words for a
+/// failed connection test: this service's own `ConnectorServerException`
+/// (`smithy_query(query="shape", shape="ConnectorServerException")` — @httpError 400, "An error
+/// occurred when retrieving data from the connector endpoint"), under the package its own
+/// service name makes (`smithy_query(query="service_info")`:
+/// `service: SandstoneConfigurationServiceLambda`).
+const CONNECTOR_SERVER_EXCEPTION_CLASS: &str =
+    "com.amazonaws.sandstoneconfigurationservicelambda.coral.model.ConnectorServerException";
+
+/// The statement AppFlow's Amazon Redshift connector runs as its CONNECTION TEST: one row of the
+/// catalogue of schemas, which is all it takes to establish that the connector can reach the
+/// database through the Data API role.
+const REDSHIFT_TEST_CONNECTION_QUERY: &str =
+    "select distinct(table_schema) from information_schema.tables limit 1";
+
+/// The gap AWS's own sentence carries between `for the` and the connector's name: TWO spaces,
+/// because the sentence interpolates something empty between them. Written as a constant so the
+/// doubled space is explicit rather than something a reader has to count.
+const CONNECTOR_NAME_GAP: &str = "  ";
+
+/// The HTTP status and the error the connector reports for an assume it was not allowed to make:
+/// the refusal is the role's own trust policy withholding the assume, so it is the forbidden
+/// status under the access-denied code.
+const ASSUME_DENIED_STATUS: u16 = 403;
+/// See [`ASSUME_DENIED_STATUS`].
+const ASSUME_DENIED_CODE: &str = "AccessDenied";
+
+/// The status the connector client files the failed call under, which is the one
+/// `ConnectorServerException` itself carries (@httpError 400).
+const CONNECTOR_FAILURE_STATUS: u16 = 400;
+
+/// What the connector client names for the SERVICE it called and the PROXY it called through: it
+/// names neither, and states so.
+const CONNECTOR_CLIENT_UNNAMED: &str = "null";
+
+/// The class of error that client filed the failure under: one the caller's own request is
+/// answered with rather than one the client itself could retry.
+const CONNECTOR_CLIENT_ERROR_CODE: &str = "Client";
 
 /// One connector profile of this account, as the two writes stored it.
 ///
@@ -150,8 +187,14 @@ pub fn connector_profile_arn(region: &str, connector_profile_name: &str) -> Stri
 }
 
 /// Why an IAM role a connector profile's configuration names is one AppFlow could not use, as
-/// the sentence the refusal carries — or `None` when every role it names is one AppFlow could
-/// take on.
+/// the sentence the CONNECTOR-TEST failure carries — or `None` when every role it names is one
+/// AppFlow could take on.
+///
+/// A role AppFlow cannot assume is NOT a defect in the request: the request is well formed, and
+/// what fails is the connection test AppFlow runs against the connector while it defines the
+/// profile. So the sentence is the connector-communication failure
+/// ([`connector_test_failed`]), which the caller answers with the connector-endpoint error of
+/// this service rather than with a parameter refusal.
 ///
 /// The principal AppFlow takes such a role on AS is the SAME one a bucket policy has to grant a
 /// flow's reads and writes to ([`super::APPFLOW_SERVICE_PRINCIPAL`]), because AppFlow acts on the
@@ -178,13 +221,12 @@ pub fn connector_profile_arn(region: &str, connector_profile_name: &str) -> Stri
 /// value naming no role of this account, and an emulator with no IAM to ask, establish nothing.
 ///
 /// Shared by every operation that stores a configuration (`CreateConnectorProfile`,
-/// `UpdateConnectorProfile`), so one cannot accept a profile the other would refuse; `request`
-/// is how the refusal names the call it refused ([`CREATE_CONNECTOR_PROFILE_REQUEST`],
-/// [`UPDATE_CONNECTOR_PROFILE_REQUEST`]).
+/// `UpdateConnectorProfile`), so one cannot accept a profile the other would refuse — and both
+/// state the one failure one way, the connection test being the connector's answer rather than
+/// anything about which call asked for it.
 pub async fn unusable_connector_profile_role(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    request: &str,
     properties: &ConnectorProfileProperties,
 ) -> Option<String> {
     let role_arn = properties
@@ -202,23 +244,39 @@ pub async fn unusable_connector_profile_role(
     )
     .await
     {
-        return Some(super::request_failed(request, &unassumable_role(role_arn)));
+        return Some(connector_test_failed(REDSHIFT_CONNECTOR, role_arn));
     }
     None
 }
 
-/// What the caller has to repair, named as AppFlow names it: the role it could not take on and
-/// the principal that role's trust policy has to admit.
+/// What AppFlow reports when the CONNECTION TEST it runs while defining a profile fails because
+/// the connector could not take the Data API role on.
 ///
-/// The wording stays inside the pattern every message this service words has to satisfy in the
-/// contexts it is re-stated in, so it carries no comma, colon or apostrophe. It states only what
-/// was CHECKED — what the account's IAM answered about the role — and claims no connection
-/// attempt, no query and no round trip to the warehouse, none of which this emulator makes.
-pub fn unassumable_role(role_arn: &str) -> String {
+/// The failure is a connector-communication fault, so the sentence is built from the outside in:
+/// AppFlow could not communicate with the connector, the test connection request is what failed,
+/// the connector-endpoint class it failed under
+/// ([`CONNECTOR_SERVER_EXCEPTION_CLASS`]), the statement the test was attempting
+/// ([`REDSHIFT_TEST_CONNECTION_QUERY`]), and then the connector's own answer: the assume was
+/// forbidden ([`ASSUME_DENIED_STATUS`], [`ASSUME_DENIED_CODE`]) for the role the caller supplied,
+/// taken on by the AppFlow service principal. It closes with the diagnostic the connector client
+/// appends to a call it could not make.
+///
+/// `connector` is the connector the profile is an instance of, as the configuration spells it;
+/// `role_arn` is the role the request named, carried through VERBATIM — a client parsing the
+/// sentence reads back exactly the value it sent. Everything else is fixed text, bar the
+/// per-call id of the connector client's own call ([`super::new_execution_id`]), which identifies
+/// that call and nothing about the profile.
+pub fn connector_test_failed(connector: &str, role_arn: &str) -> String {
     format!(
-        "Amazon AppFlow is not authorized to assume the role [{role_arn}]. Update the trust \
-         policy of the role so that it can be assumed by the [{principal}] service principal",
-        principal = super::APPFLOW_SERVICE_PRINCIPAL
+        "Error while communicating to connector: The test connection request failed due to: \
+         {CONNECTOR_SERVER_EXCEPTION_CLASS}: Failed to validate Connection while attempting \
+         \"{REDSHIFT_TEST_CONNECTION_QUERY}\" with connector failure The request for \
+         the{CONNECTOR_NAME_GAP}{connector} failed with the status code {ASSUME_DENIED_STATUS}: \
+         {ASSUME_DENIED_CODE} while trying to assume user-provided {role_arn} role by AppFlow \
+         service principal. (Service: {CONNECTOR_CLIENT_UNNAMED}; Status Code: \
+         {CONNECTOR_FAILURE_STATUS}; Error Code: {CONNECTOR_CLIENT_ERROR_CODE}; Request ID: \
+         {request_id}; Proxy: {CONNECTOR_CLIENT_UNNAMED})",
+        request_id = super::new_execution_id(),
     )
 }
 
