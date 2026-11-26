@@ -39,8 +39,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{
-    EXPRESS_CALLBACK_UNSUPPORTED, EXPRESS_RUN_A_JOB_UNSUPPORTED, POSSIBLY_UNDEFINED_VARIABLE,
-    UNDEFINED_VARIABLE,
+    EXPRESS_CALLBACK_UNSUPPORTED, POSSIBLY_UNDEFINED_VARIABLE, UNDEFINED_VARIABLE,
 };
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
     INVALID_STATE_MACHINE_DEFINITION, VALIDATION_RESULT_FAIL, VALIDATION_RESULT_OK,
@@ -363,31 +362,21 @@ fn retrying(members: Value) -> Value {
 // Rule 2: the integration patterns a workflow type can perform
 // ---------------------------------------------------------------------------
 
-/// A definition asking for an integration pattern only the STANDARD workflow type
-/// performs is refused as an EXPRESS state machine, stating the pattern at the
-/// `Resource` that asked for it, and is served as a STANDARD one.
+/// A definition asking for the integration pattern the EXPRESS workflow type is refused
+/// the DEFINITION of — the callback pattern — is refused as an EXPRESS state machine,
+/// stating the pattern at the `Resource` that asked for it, and is served as a STANDARD
+/// one. RECORDED: a `Resource` asking for the RUN-A-JOB pattern is served as either type,
+/// and every execution of the Express machine then fails at that state — that refusal
+/// belongs to the execution and not to the submitted document
+/// (`express_run_a_job_refusal` is the rule for it).
 ///
-/// The rows differ along the pattern (`.sync`, its second revision, and
-/// `.waitForTaskToken`), along the INTEGRATION it is asked of (a container task, a
-/// queue, a nested execution — including services not mounted beside this one, so
-/// nothing the integration itself answered could decide the refusal) and along the name
-/// of the state that asked.
+/// The rows differ along the INTEGRATION the pattern is asked of (a queue, a function —
+/// including services not mounted beside this one, so nothing the integration itself
+/// answered could decide the refusal) and along the name of the state that asked.
 #[tokio::test]
 async fn an_express_definition_is_refused_the_patterns_only_standard_performs() {
     // (case, the state name, the Resource, the sentence the refusal states)
     let rows: Vec<(&str, &str, &str, &str)> = vec![
-        (
-            "a container task through the run-a-job pattern",
-            "RunTask",
-            "arn:aws:states:::ecs:runTask.sync",
-            EXPRESS_RUN_A_JOB_UNSUPPORTED,
-        ),
-        (
-            "a nested execution through the pattern's second revision",
-            "CallChild",
-            "arn:aws:states:::states:startExecution.sync:2",
-            EXPRESS_RUN_A_JOB_UNSUPPORTED,
-        ),
         (
             "a queue through the callback pattern",
             "SendMessage",
@@ -464,28 +453,58 @@ async fn an_express_definition_is_refused_the_patterns_only_standard_performs() 
     }
 
     // A `Resource` naming NO pattern is served as either type, which is the control
-    // for the reading of the suffix.
-    let plain = one_state(
-        "Call",
-        json!({
-            "Type": "Task",
-            "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
-            "End": true,
-        }),
-    );
-    for machine_type in ["EXPRESS", "STANDARD"] {
-        let (status, code, message) = created(
-            &emulator,
-            &format!("plain-{machine_type}"),
-            &plain,
-            Some(machine_type),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case \"a request-response task as {machine_type}\": expected 200, got {status} \
-             {code} with {message:?}"
+    // for the reading of the suffix — and so is one asking for the RUN-A-JOB pattern,
+    // whichever revision of it and whichever integration it is asked of: that pattern is
+    // no defect of the submitted document, so the create stores the state machine and
+    // every execution of it fails at the state instead.
+    let served: Vec<(&str, &str, &str)> = vec![
+        (
+            "a request-response task, which asks for no pattern at all",
+            "Call",
+            "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
+        ),
+        (
+            "a container task through the run-a-job pattern",
+            "RunTask",
+            "arn:aws:states:::ecs:runTask.sync",
+        ),
+        (
+            "a nested execution through the pattern's second revision",
+            "CallChild",
+            "arn:aws:states:::states:startExecution.sync:2",
+        ),
+    ];
+    for (index, (case, state, resource)) in served.iter().enumerate() {
+        let definition = one_state(
+            state,
+            json!({ "Type": "Task", "Resource": resource, "End": true }),
         );
+        for machine_type in ["EXPRESS", "STANDARD"] {
+            let (status, code, message) = created(
+                &emulator,
+                &format!("served-{index}-{machine_type}"),
+                &definition,
+                Some(machine_type),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} as {machine_type}: expected 200, got {status} {code} with \
+                 {message:?}"
+            );
+            let validated = validate(
+                &emulator,
+                case,
+                &json!({ "definition": definition.to_string(), "type": machine_type }),
+            )
+            .await;
+            assert_eq!(
+                result_of(&validated),
+                VALIDATION_RESULT_OK,
+                "case {case:?} as {machine_type}: expected {VALIDATION_RESULT_OK}, got \
+                 {validated:?}"
+            );
+        }
     }
 }
 
@@ -1007,9 +1026,12 @@ async fn an_unassignable_variable_is_an_error_only_where_the_language_resolves_i
          {message:?}"
     );
 
-    // And a variable only ONE path to the read assigns is an ERROR where the language
-    // resolves a path at the field and the warning where an expression evaluates it:
-    // the severity is the FIELD's, not the variable's.
+    // And a variable only ONE path to the read assigns is the WARNING in either
+    // language: the read resolves on the runs that took the assigning path and not on
+    // the others, so the definition is CREATED. RECORDED behaviour — a definition whose
+    // catcher assigns a variable a later state reads is accepted — and an ERROR is for a
+    // name NO run reaching the field could have assigned, which the rows above are.
+    // `catcher_assign_downstream_scope` is the rule over that whole class.
     let partly = machine(
         "C",
         json!({
@@ -1034,16 +1056,28 @@ async fn an_unassignable_variable_is_an_error_only_where_the_language_resolves_i
     .await;
     assert_eq!(
         result_of(&validated),
-        VALIDATION_RESULT_FAIL,
-        "case \"a reference naming a variable only one path assigns\": expected FAIL, got \
+        VALIDATION_RESULT_OK,
+        "case \"a reference naming a variable only one path assigns\": expected OK, got \
          {validated:?}"
+    );
+    let reported: Vec<(String, String)> = diagnostics(&validated)
+        .iter()
+        .map(|diagnostic| (string(diagnostic, "severity"), string(diagnostic, "code")))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![(
+            "WARNING".to_string(),
+            POSSIBLY_UNDEFINED_VARIABLE.to_string()
+        )],
+        "case \"a reference naming a variable only one path assigns\": expected one WARNING \
+         {POSSIBLY_UNDEFINED_VARIABLE} diagnostic, got {validated:?}"
     );
     let (status, code, message) = created(&emulator, "partly", &partly, None).await;
     assert_eq!(
-        (status, code.as_str()),
-        (400, "InvalidDefinition"),
-        "case \"the same definition at a create\": expected 400 InvalidDefinition, got {status} \
-         {code} with {message:?}"
+        status, 200,
+        "case \"the same definition at a create\": expected 200, got {status} {code} with \
+         {message:?}"
     );
 
     // While the same shape read by an EXPRESSION is created: the read evaluates to

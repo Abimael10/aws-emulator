@@ -580,6 +580,7 @@ mod tests {
             variables: &[],
             allowed_ms: 250,
             allowance: 4096,
+            clock: None,
         })
         .map(|produced| produced.map(|(value, _)| value))
     }

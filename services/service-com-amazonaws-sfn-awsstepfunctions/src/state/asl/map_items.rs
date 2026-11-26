@@ -320,14 +320,19 @@ impl Interpreter<'_> {
     /// Run ONE chunk of the state's items — the `MaxConcurrency` of them that run at
     /// once — and report the offset at which the last of them finished.
     ///
-    /// The items of a chunk all BEGIN at `batch_start` and run concurrently, so the
-    /// iteration that runs is the one whose own clock is earliest, by the position of
-    /// its item where two are due at the same instant: an iteration is walked until a
-    /// `Wait` of its own puts it later than a sibling, and the sibling then runs. An
-    /// item that has not begun yet begins at `batch_start`, which is no later than any
-    /// live iteration's clock, so it is started as soon as every live one has moved past
-    /// that instant — which is how a chunk whose items never wait runs them in the order
-    /// they are listed, one after another.
+    /// Every item of the chunk is STARTED before any iteration body is walked: the
+    /// chunk is the set of iterations the state's concurrency admits at once, and a
+    /// concurrency that admits them all dispatches them all — so the record of the
+    /// fan-out carries one started event per admitted iteration, in item order, ahead of
+    /// whatever those iterations then do. A reader counts the dispatch off those events,
+    /// which is why their number and their place say how many iterations ran together
+    /// rather than how long each took.
+    ///
+    /// They all begin at `batch_start` and run concurrently, so the iteration that runs
+    /// is the one whose own clock is earliest, by the position of its item where two are
+    /// due at the same instant: an iteration is walked until a `Wait` of its own puts it
+    /// later than a sibling, and the sibling then runs — which is how a chunk whose items
+    /// never wait walks them in the order they are listed, one after another.
     ///
     /// Their WORK, though, is in flight together: an iteration that reaches the call its
     /// `Task` state is made of hands that call over and is PUT DOWN there
@@ -371,11 +376,10 @@ impl Interpreter<'_> {
         let mut in_flight: BinaryHeap<Reverse<(Duration, usize, usize)>> = BinaryHeap::new();
         let mut begun = 0usize;
         loop {
-            let begins = begun < chunk.len()
-                && ready
-                    .peek()
-                    .is_none_or(|Reverse((due, _, _))| *due > batch_start);
-            if let Some(item) = begins.then(|| chunk.get(begun)).flatten() {
+            // Every item admitted by the concurrency is dispatched FIRST, before any of
+            // their bodies is walked, so the chunk's started events are recorded together
+            // and in item order.
+            if let Some(item) = chunk.get(begun) {
                 begun += 1;
                 match self.start_item(plan, item, effective, context, batch_start, tallied) {
                     Ok(Started::Running(iteration)) => {

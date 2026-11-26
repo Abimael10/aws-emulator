@@ -498,6 +498,36 @@ fn invalid_choice_condition_path(path: &str) -> String {
     format!("{INVALID_PATH_OPENING}{path}': {CHOICE_CONDITION_PATH_INVALID}")
 }
 
+/// The diagnosis for a `Choice` comparator's `*Path` operand that resolved to an
+/// explicit NULL: the path it was written with, and what the service states about
+/// comparing against no value.
+///
+/// RECORDED text. A null is a value the document really carries, so it is a different
+/// outcome from a path that selected nothing ([`invalid_choice_condition_path`]) and
+/// from one whose value is of a type the comparator cannot read
+/// ([`invalid_comparator_value_at_path`]): a reader classifying the failure acts on
+/// which of the three authoring mistakes was made, so the three are never worded the
+/// same way.
+fn null_comparator_value_at_path(path: &str) -> String {
+    format!("{NULL_VALUE_OPENING}{path}': Unable to compare with a null input.")
+}
+
+/// The diagnosis for a `Choice` comparator's `*Path` operand that resolved to a value
+/// of a type that comparator cannot read as an operand at all: the path it was written
+/// with.
+///
+/// RECORDED text: the service states that the VALUE at the path is invalid, and nothing
+/// about the type it wanted — the comparator the rule names is what says that, and it is
+/// read beside the path in the definition.
+fn invalid_comparator_value_at_path(path: &str) -> String {
+    format!("{INVALID_VALUE_OPENING}{path}'")
+}
+
+/// How the two diagnoses above open, which is what tells each from every other cause and
+/// makes the state name itself around it ([`names_its_state`]).
+const NULL_VALUE_OPENING: &str = "Null value provided at path '";
+const INVALID_VALUE_OPENING: &str = "Invalid value provided at path '";
+
 /// Whether `cause` is the diagnosis `path` SELECTING NOTHING reports
 /// ([`no_results_for_path`]), as opposed to any other reason a path could not be
 /// evaluated — one this service refuses, a syntax it does not evaluate — each of which
@@ -628,6 +658,29 @@ fn referenced_value_must_be(member: &str, must_be: &str, value: &Value) -> Strin
     format!("{REFERENCED_VALUE_OPENING}{member} must be {must_be}, but the value was: {value}")
 }
 
+/// The diagnosis for a `Task` state's REQUEST DOCUMENT member — `Arguments` in JSONata,
+/// which the state hands its work — whose expression produced a value that is no
+/// document: the value as the compact JSON of what was produced, and then, in brackets,
+/// what is wrong with that value for the member.
+///
+/// RECORDED text: the service names the REQUEST the task could not be started with
+/// (which it calls the parameters of the task whichever member the state's query
+/// language spells it as), quotes the value, and states the member's own rule in
+/// brackets — a STRING is named as a type the member cannot carry at all, since a
+/// string is also the form an expression is written in there, and every other value is
+/// told what the member must be instead. The state names itself around the whole of it
+/// ([`executing_state`]).
+pub(super) fn request_document_unusable(member: &str, value: &Value) -> String {
+    let reason = match value.is_string() {
+        true => format!("The value for the '{member}' field cannot be a string"),
+        false => format!("The value for the '{member}' field must be an object"),
+    };
+    format!(
+        "{}{value}' could not be used to start the Task: [{reason}]",
+        super::integration::UNUSABLE_PARAMETERS_OPENING
+    )
+}
+
 /// What a `Wait` state's `Seconds` must carry: "a time, in seconds, the state machine
 /// waits before continuing" — a whole number of them, and never a negative one.
 pub(super) const WHOLE_SECONDS: &str = "a non-negative whole number of seconds";
@@ -738,6 +791,8 @@ fn produced_by_state(name: &str, failure: Failure) -> Failure {
 /// ([`diagnosed`]) rather than carrying a name of its own.
 fn names_its_state(cause: &str) -> bool {
     cause.starts_with(INVALID_PATH_OPENING)
+        || cause.starts_with(NULL_VALUE_OPENING)
+        || cause.starts_with(INVALID_VALUE_OPENING)
         || cause == NO_NEXT_STATE
         || cause.starts_with(super::jsonata::DIAGNOSIS_OPENING)
         || cause.starts_with(CONTEXT_PATH_OPENING)
@@ -2927,6 +2982,10 @@ fn interpret(
         timeout_left: definition_timeout(&document).map(|timeout| timeout.saturating_sub(elapsed)),
         timed_out: false,
         retry_count: 0,
+        // Where the walk's clock stands before any state is reached: the offset every
+        // instant it reports is measured from ([`Interpreter::clock_offset`]) is the one
+        // the states themselves carry, which begins at none.
+        clock_offset: Duration::ZERO,
         steps: Vec::new(),
         first_event_id,
         start,
@@ -3475,6 +3534,18 @@ struct Interpreter<'tasks> {
     /// own states, each with its own count, so [`Interpreter::nested_walk`] starts
     /// them at zero.
     retry_count: u64,
+    /// WHERE the walk stands on the execution's own clock: the offset from [`start`] at
+    /// which the state being run was reached.
+    ///
+    /// The walk SLEEPS for none of the spans a definition asks for — a `Wait` state's
+    /// seconds, the interval between two attempts of a `Retry` — it adds each to the
+    /// offset it carries, so the instant an execution stands at runs ahead of the instant
+    /// this process is at. Every clock the execution READS reads this one: the context
+    /// object's `State.EnteredTime` ([`Interpreter::context_for`]) and the current-instant
+    /// functions of its query language ([`super::jsonata::Bindings::clock`]), so a
+    /// definition that measures a span against the instant its run started measures the
+    /// spans that run was charged.
+    clock_offset: Duration,
     steps: Vec<Step>,
     /// The id the FIRST history event this walk records carries: the events of one
     /// execution are numbered in order, and a walk that continues an execution

@@ -612,13 +612,13 @@ pub(super) fn compare(
             // document, so the value it selects has to be one the comparator can read
             // as an operand at all: no comparator reads one from null, and the
             // timestamp families read an instant out of a STRING. A path that selects
-            // such a value leaves the rule undecidable — reported the way a condition
-            // path that references a value that is not there is
-            // ([`invalid_choice_condition_path`]) — rather than deciding it does not
-            // match, which is what a value of a type the family merely does not
-            // compare (a numeral written as a string under a numeric comparator) is.
-            if !readable_operand(family, &operand) {
-                return Err(runtime(invalid_choice_condition_path(path)));
+            // such a value leaves the rule undecidable — reported as the KIND of
+            // unreadable value it selected ([`unreadable_operand`]) — rather than
+            // deciding it does not match, which is what a value of a type the family
+            // merely does not compare (a numeral written as a string under a numeric
+            // comparator) is.
+            if let Some(diagnosis) = unreadable_operand(family, &operand, path) {
+                return Err(runtime(diagnosis));
             }
             (family, operand)
         }
@@ -683,22 +683,30 @@ pub(super) fn compare(
     Err(undefined())
 }
 
-/// Whether the value a `Choice` comparator's `*Path` operand selected is one that
-/// comparator can READ as its operand.
+/// Why the value a `Choice` comparator's `*Path` operand selected at `path` is one that
+/// comparator cannot READ as its operand, or `None` where it can.
 ///
 /// `family` is the comparator without its `Path` suffix, which is the family that
 /// decides what reading an operand means: the timestamp families compare the instants
 /// their operands denote, and an instant is written as a string, so a value of any
 /// other type names no instant to compare against. Null is no operand for any family:
 /// it is the absence of a value rather than a value of some type.
-fn readable_operand(family: &str, operand: &Value) -> bool {
+///
+/// The two are told APART in the diagnosis, as the service tells them apart: a null is
+/// a value the document carries and nothing can be compared with
+/// ([`null_comparator_value_at_path`]), while a value of another type is one the
+/// comparator cannot read at that path ([`invalid_comparator_value_at_path`]) — and a
+/// path that selected nothing at all is the third of the three
+/// ([`invalid_choice_condition_path`], reported where the path is resolved). Each names
+/// one authoring mistake, so a reader acting on the cause can tell them apart.
+fn unreadable_operand(family: &str, operand: &Value, path: &str) -> Option<String> {
     if operand.is_null() {
-        return false;
+        return Some(null_comparator_value_at_path(path));
     }
-    if family.starts_with("Timestamp") {
-        return operand.is_string();
+    if family.starts_with("Timestamp") && !operand.is_string() {
+        return Some(invalid_comparator_value_at_path(path));
     }
-    true
+    None
 }
 
 /// One of the five comparisons ASL's `String*`, `Numeric*` and `Timestamp*` comparator

@@ -230,6 +230,9 @@ pub fn evaluated_text(
         variables: &[(EVENTS_TERM, &document)],
         allowed_ms,
         allowance,
+        // This service's clock IS this host's: nothing here simulates a span, so the
+        // language's own clock functions keep the engine's own bindings.
+        clock: None,
     });
     budget.spend(began.elapsed());
     Ok(produced.map_err(refusal)?.map(|(value, _)| as_text(value)))

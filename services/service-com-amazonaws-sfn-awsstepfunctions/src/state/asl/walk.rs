@@ -673,6 +673,10 @@ impl Interpreter<'_> {
         }
 
         let context = self.context_for(scope, name, state_type, at);
+        // Where the execution's own clock stands for this state's turn: the instant every
+        // expression of it that reads the current time reads ([`Interpreter::clock_offset`]),
+        // which is the same offset the context object reports this state as entered at.
+        self.clock_offset = at;
         // The variables in scope for THIS state, installed on the thread for its turn:
         // a JSONPath reference reads one as the first term of a path, and the paths of
         // this state are evaluated by plain functions the walk reaches through several
@@ -835,6 +839,12 @@ impl Interpreter<'_> {
             result,
             error_output,
             variables: &self.variables,
+            // The instant the execution's own clock stands at, which is what the
+            // language's current-instant functions answer from: the walk sleeps for none
+            // of the spans a definition asks for, so this is ahead of this process's own
+            // clock by every span the run has been charged
+            // ([`Interpreter::clock_offset`]).
+            clock: super::super::after(self.start, self.clock_offset),
         }
     }
 
@@ -1146,6 +1156,7 @@ impl Interpreter<'_> {
                     result,
                     error_output,
                     variables: &variables,
+                    clock: super::super::after(self.start, self.clock_offset),
                 };
                 super::super::jsonata::render(
                     template,
@@ -1247,11 +1258,11 @@ impl Interpreter<'_> {
                     // value of any other kind names no request for the call to make.
                     // That is this state's own refusal rather than the expression
                     // misevaluating: the expression produced a value, and the member
-                    // cannot carry it.
+                    // cannot carry it, which is what the service's own sentence for
+                    // such a request says ([`request_document_unusable`]).
                     if !built.is_object() {
-                        return Err(runtime(referenced_value_must_be(
+                        return Err(runtime(request_document_unusable(
                             ARGUMENTS_MEMBER,
-                            "a JSON object",
                             &built,
                         )));
                     }

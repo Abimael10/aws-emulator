@@ -119,6 +119,16 @@ pub struct Bindings<'b> {
     pub error_output: Option<&'b Value>,
     /// The variables in scope, each read under its own name (`$total`).
     pub variables: &'b BTreeMap<String, Value>,
+    /// The instant the EXECUTION's own clock stands at, which the language's
+    /// current-instant functions (`$now`, `$millis`) answer from.
+    ///
+    /// An execution's clock is not this process's: the walk adds every span a definition
+    /// asks for — a `Wait` state's seconds, the interval a `Retry` waits between two
+    /// attempts — to the offset it carries rather than sleeping for it, so the instant
+    /// the execution stands at is ahead of this host's by the spans the run has been
+    /// charged. A definition that measures elapsed time against the instant its own run
+    /// started reads it, so the spans it measures are the spans the run was charged.
+    pub clock: std::time::SystemTime,
 }
 
 impl Bindings<'_> {
@@ -312,6 +322,9 @@ fn evaluate(
         variables: &variables,
         allowed_ms,
         allowance: budget.bytes,
+        // The execution's own clock, which the language's current-instant functions
+        // answer from rather than this host's ([`Bindings::clock`]).
+        clock: Some(bindings.clock),
     });
     // An expression is a caller's own code running inside the engine, so what it costs
     // the interpretation around it is the span it RAN for: charged whether it produced

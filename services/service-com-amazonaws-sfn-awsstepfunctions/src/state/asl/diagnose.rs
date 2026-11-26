@@ -2339,23 +2339,27 @@ fn diagnose_state<'a>(
     // One diagnostic per FIELD that reads a variable the scope reaching it may not
     // hold, which is the granularity `location` documents
     // (`/States/<StateName>/<FieldName>`), reported in the order the state writes those
-    // fields — of the code and the severity the FIELD that reads it decides:
+    // fields — of the code and the severity WHAT COULD HAVE ASSIGNED IT decides:
     //
-    // * a field the language RESOLVES a path at ([`reads_a_path`]: the `*Path` family,
-    //   a payload template's reference field, a `Choice` rule's `Variable`) names the
-    //   variable as the first term of that path, so a path naming one the state cannot
-    //   count on is an ERROR ([`UNDEFINED_VARIABLE`]) — there is nothing for the
-    //   language to resolve it against;
-    // * every other read is a term of a JSONata expression, which EVALUATES to nothing
-    //   where the scope does not hold the name and fails the state that reads it then
-    //   (`States.QueryEvaluationError`), so it is the WARNING the definition is still
-    //   created with ([`POSSIBLY_UNDEFINED_VARIABLE`]).
+    // * a name NO run reaching the field could have assigned is a read with nothing to
+    //   resolve against on any run, so a field the language RESOLVES a path at
+    //   ([`reads_a_path`]: the `*Path` family, a payload template's reference field, a
+    //   `Choice` rule's `Variable`) is an ERROR ([`UNDEFINED_VARIABLE`]): the definition
+    //   declares no assignment that could reach it;
+    // * a name SOME run reaching the field has assigned and another has not resolves on
+    //   some runs and not on others — a `Catch` catcher's `Assign` seen by a state the
+    //   success path also reaches is exactly that — so the definition is CREATED and the
+    //   read earns the warning ([`POSSIBLY_UNDEFINED_VARIABLE`]), whichever language it
+    //   is written in;
+    // * every read written as a JSONata expression is that warning too, whatever the
+    //   scope: the expression EVALUATES to nothing where the scope does not hold the
+    //   name and fails the state that reads it then (`States.QueryEvaluationError`).
     let reads = variable_reads(state, &here, into.order());
     for (field, (read, reference_field)) in reads {
         if own.contains(&read) || scopes.holds(declared, &read) || into.given_variable(&read) {
             continue;
         }
-        if reference_field {
+        if reference_field && !scopes.may_hold(declared, &read) {
             into.push(error(
                 UNDEFINED_VARIABLE,
                 at(&here, &field),
@@ -2597,16 +2601,22 @@ fn diagnose_declared_objects(
 /// waits for a job the call started to reach an end state, and the callback pattern
 /// (`.waitForTaskToken`) waits for an answer from outside the execution. Both are
 /// served for the STANDARD workflow type alone — an EXPRESS execution is a single
-/// at-most-once run with no durable state to suspend — so a definition asking for one
-/// inside an EXPRESS state machine declares work no execution of that state machine
-/// could ever do, and is refused where it is submitted rather than failing every
-/// execution at that state.
+/// at-most-once run with no durable state to suspend.
+///
+/// Only ONE of the two is a defect of the SUBMITTED DOCUMENT, though, and the two are
+/// decided in different places. RECORDED: a `Resource` asking for the run-a-job pattern
+/// is ACCEPTED here whatever the workflow type, and every execution of the state machine
+/// then fails AT that state ([`super::EXPRESS_RUN_A_JOB_UNSUPPORTED`], raised by the
+/// interpreter, which starts no job for it) — the refusal is the workflow type's at RUN
+/// TIME and not the schema's, so a client that deploys such a definition gets the state
+/// machine and sees the failure per execution. The callback pattern is refused where the
+/// definition is submitted instead.
 ///
 /// Reported under the code every defect of the language's SCHEMA is reported under
 /// ([`SCHEMA_VALIDATION_FAILED`]), located at the member that asked for the pattern,
 /// and worded by the one sentence this service states each unsupported pattern with
-/// ([`super::EXPRESS_RUN_A_JOB_UNSUPPORTED`], [`super::EXPRESS_CALLBACK_UNSUPPORTED`]),
-/// so the create-time refusal and the data plane's own cannot word one rule two ways.
+/// ([`super::EXPRESS_CALLBACK_UNSUPPORTED`]), so the create-time refusal and the data
+/// plane's own cannot word one rule two ways.
 fn diagnose_task_resource(
     state: &Map<String, Value>,
     state_type: &str,
@@ -2620,10 +2630,6 @@ fn diagnose_task_resource(
         return;
     };
     let unsupported = match crate::state::integration::named_pattern(resource) {
-        Some(crate::state::integration::RUN_A_JOB_PATTERN)
-        | Some(crate::state::integration::RUN_A_JOB_PATTERN_2) => {
-            super::EXPRESS_RUN_A_JOB_UNSUPPORTED
-        }
         Some(crate::state::integration::CALLBACK_PATTERN) => super::EXPRESS_CALLBACK_UNSUPPORTED,
         _ => return,
     };
@@ -2905,6 +2911,14 @@ impl Outer<'_> {
             Outer::State { machine, state } => machine.holds(state, name),
         }
     }
+
+    /// Whether SOME run reaching the enclosing state had assigned `name`.
+    fn may_hold(&self, name: &str) -> bool {
+        match self {
+            Outer::Nothing => false,
+            Outer::State { machine, state } => machine.may_hold(state, name),
+        }
+    }
 }
 
 /// Which variables each state of ONE state machine can count on having been assigned
@@ -2915,6 +2929,10 @@ impl Outer<'_> {
 /// having assigned it — which is what makes the ones outside it "possibly" undefined:
 /// the read resolves on some runs and not on others. A state no run reaches has
 /// nothing but the inherited variables in scope.
+///
+/// It answers the WEAKER question too ([`Scopes::may_hold`]): whether SOME run reaching
+/// the state has assigned the variable, which is what tells a read that resolves on some
+/// runs from one that could resolve on none.
 pub(super) struct Scopes<'a> {
     /// Every variable some state of this machine assigns, and which bit of a state's
     /// [`ScopeMask`] answers for it. A variable the analysis did NOT follow — the
@@ -2923,6 +2941,9 @@ pub(super) struct Scopes<'a> {
     assigned: BTreeMap<String, Option<usize>>,
     /// Per state, which of the followed variables every run reaching it has assigned.
     masks: BTreeMap<&'a str, ScopeMask>,
+    /// Per state, which of them SOME run reaching it has assigned: the weaker question,
+    /// and the one that tells a name no run could have assigned from one a run could.
+    possible: BTreeMap<&'a str, ScopeMask>,
     /// What this machine is declared inside.
     outer: Outer<'a>,
 }
@@ -2941,47 +2962,60 @@ impl<'a> Scopes<'a> {
         outer: Outer<'a>,
         into: &mut Diagnosis,
     ) -> Self {
-        // Which assignment block runs on the way along each transition: a state's own
-        // when its work completed, and a `Catch` catcher's when it did not. The blocks
-        // are held ONCE and the transitions name them by index, so a state with many
-        // transitions does not hold its block once per transition.
+        // Which assignment block runs on the way along each transition: the state's own
+        // when its work completed, a `Catch` catcher's when it did not, and a `Choice`
+        // rule's for the rule that matched. The blocks are held ONCE and the transitions
+        // name them by index, so a state with many transitions does not hold its block
+        // once per transition.
         let mut blocks: Vec<BTreeSet<String>> = Vec::new();
         let mut graph: BTreeMap<&str, Vec<ScopeEdge>> = BTreeMap::new();
         for (name, state) in states {
             let mut out = Vec::new();
             if let Some(state) = state.as_object() {
-                let Assignments { own, caught } = assignments(state);
+                let Assignments {
+                    own,
+                    caught,
+                    chosen,
+                } = assignments(state);
                 let own_block = blocks.len();
                 blocks.push(own);
-                let caught_blocks: Vec<usize> = caught
-                    .into_iter()
-                    .map(|block| {
-                        blocks.push(block);
-                        blocks.len() - 1
-                    })
-                    .collect();
+                let mut held = |of: Vec<BTreeSet<String>>| -> Vec<usize> {
+                    of.into_iter()
+                        .map(|block| {
+                            blocks.push(block);
+                            blocks.len() - 1
+                        })
+                        .collect()
+                };
+                let caught_blocks = held(caught);
+                let chosen_blocks = held(chosen);
                 for transition in transitions(state) {
                     if !states.contains_key(transition.target.as_str()) {
                         continue;
                     }
-                    let assigns = transition
-                        .caught
-                        .and_then(|index| caught_blocks.get(index).copied())
-                        .unwrap_or(own_block);
+                    let assigns = match transition.assigns {
+                        AssignedOnTheWay::Own => Some(own_block),
+                        AssignedOnTheWay::Catcher(index) => caught_blocks.get(index).copied(),
+                        AssignedOnTheWay::ChoiceRule(index) => chosen_blocks.get(index).copied(),
+                    };
                     out.push(ScopeEdge {
                         target: transition.target,
-                        assigns,
+                        assigns: assigns.unwrap_or(own_block),
                     });
                 }
             }
             graph.insert(name.as_str(), out);
         }
         // Each walk below visits each state at most once, so one walk costs at most
-        // this many visits of the budget.
+        // this many visits of the budget; following one variable takes TWO of them — one
+        // for the states that reach it unassigned and one for the states some
+        // assignment of it reaches.
         let per_walk = states.len();
+        let per_variable = per_walk.saturating_mul(2);
         let mut scopes = Self {
             assigned: BTreeMap::new(),
             masks: states.keys().map(|name| (name.as_str(), 0)).collect(),
+            possible: states.keys().map(|name| (name.as_str(), 0)).collect(),
             outer,
         };
         // Every variable this machine assigns somewhere. One set per MACHINE, so what
@@ -2995,8 +3029,9 @@ impl<'a> Scopes<'a> {
         // A machine whose entry point names no declared state has no run to reason
         // about, so no state of it reaches a read with anything assigned.
         let entry = start_at.filter(|start_at| states.contains_key(*start_at));
+        let entries: Vec<&str> = entry.into_iter().collect();
         // Where a run can be at all: the states a read of a variable is judged in.
-        let reachable = reached_from(entry, &graph, &blocks, None);
+        let reachable = reached_from(&entries, &graph, &blocks, None);
         let mut followed = 0_usize;
         for name in declared {
             // A variable the enclosing scope already holds is in scope at every state
@@ -3004,7 +3039,7 @@ impl<'a> Scopes<'a> {
             // the budget cannot reach is taken to be, so neither is followed.
             if followed >= MAX_SCOPED_VARIABLES
                 || scopes.outer.holds(name)
-                || !into.spend_scope_visits(per_walk)
+                || !into.spend_scope_visits(per_variable)
             {
                 scopes.assigned.insert(name.clone(), None);
                 continue;
@@ -3013,9 +3048,29 @@ impl<'a> Scopes<'a> {
             followed += 1;
             // Where the variable is NOT yet assigned: every state a run can reach
             // without having taken a transition that assigns it.
-            let unassigned = reached_from(entry, &graph, &blocks, Some(name));
+            let unassigned = reached_from(&entries, &graph, &blocks, Some(name));
+            // And where SOME run has assigned it: every state reachable from the far
+            // side of a transition that assigns it, which is the states a run could
+            // arrive at carrying the variable.
+            let assigned_at: Vec<&str> = graph
+                .iter()
+                .filter(|(state, _)| reachable.contains(**state))
+                .flat_map(|(_, edges)| edges.iter())
+                .filter(|edge| {
+                    blocks
+                        .get(edge.assigns)
+                        .is_some_and(|block| block.contains(name))
+                })
+                .map(|edge| edge.target.as_str())
+                .collect();
+            let assigned_before = reached_from(&assigned_at, &graph, &blocks, None);
             for (state, mask) in &mut scopes.masks {
                 if reachable.contains(state) && !unassigned.contains(state) {
+                    *mask |= 1 << index;
+                }
+            }
+            for (state, mask) in &mut scopes.possible {
+                if reachable.contains(state) && assigned_before.contains(state) {
                     *mask |= 1 << index;
                 }
             }
@@ -3039,6 +3094,23 @@ impl<'a> Scopes<'a> {
             None => self.outer.holds(name),
         }
     }
+
+    /// Whether SOME run reaching `state` has assigned `name` by the time it runs.
+    ///
+    /// The weaker question [`Scopes::holds`] asks, and the one that tells a read the
+    /// definition leaves with NOTHING to resolve from a read that resolves on some runs
+    /// of it and not on others: a variable this machine assigns somewhere upstream of
+    /// `state` is one a run can arrive carrying, however many other runs arrive without
+    /// it.
+    fn may_hold(&self, state: &str, name: &str) -> bool {
+        match self.assigned.get(name) {
+            Some(Some(index)) => {
+                self.possible.get(state).copied().unwrap_or(0) & (1 << index) != 0
+            }
+            Some(None) => true,
+            None => self.outer.may_hold(name),
+        }
+    }
 }
 
 /// One transition of a machine's graph as the scope analysis walks it: where it goes,
@@ -3049,20 +3121,20 @@ struct ScopeEdge {
     assigns: usize,
 }
 
-/// The states one run can reach from `entry`, following `graph` — past a transition
-/// whose own block assigns `without`, that run has assigned it, so such a transition
-/// is not followed.
+/// The states one run can reach from any of `entries`, following `graph` — past a
+/// transition whose own block assigns `without`, that run has assigned it, so such a
+/// transition is not followed.
 ///
 /// `without` `None` makes this the states reachable at all. The walk visits each state
-/// once, so it costs one pass over the graph.
+/// once, so it costs one pass over the graph whatever it was entered from.
 fn reached_from<'a>(
-    entry: Option<&'a str>,
+    entries: &[&str],
     graph: &BTreeMap<&'a str, Vec<ScopeEdge>>,
     blocks: &[BTreeSet<String>],
     without: Option<&str>,
 ) -> BTreeSet<&'a str> {
     let mut reached = BTreeSet::new();
-    let mut pending: Vec<&str> = entry.into_iter().collect();
+    let mut pending: Vec<&str> = entries.to_vec();
     while let Some(state) = pending.pop() {
         let Some((state, edges)) = graph.get_key_value(state) else {
             continue;
@@ -3097,6 +3169,10 @@ struct Assignments {
     /// The keys of each `Catch` catcher's own `Assign`, in the catchers' own order,
     /// which are evaluated INSTEAD when the work failed and that catcher took over.
     caught: Vec<BTreeSet<String>>,
+    /// The keys of each `Choice` rule's own `Assign`, in the rules' own order, which are
+    /// evaluated for the ONE rule that matched — "you can use Assign in a Choice rule" —
+    /// so they are the assignments made on the way along that rule's transition.
+    chosen: Vec<BTreeSet<String>>,
 }
 
 /// The ASSIGNMENT rules of one state: every block of assignments it declares is a JSON
@@ -3178,16 +3254,20 @@ fn assignments(state: &Map<String, Value>) -> Assignments {
             })
             .unwrap_or_default()
     };
-    Assignments {
-        own: names(state.get(ASSIGN_MEMBER)),
-        caught: state
-            .get(CATCH_MEMBER)
+    let blocks_of = |member: &str| -> Vec<BTreeSet<String>> {
+        state
+            .get(member)
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .map(|catcher| names(catcher.get(ASSIGN_MEMBER)))
-            .collect(),
+            .map(|entry| names(entry.get(ASSIGN_MEMBER)))
+            .collect()
+    };
+    Assignments {
+        own: names(state.get(ASSIGN_MEMBER)),
+        caught: blocks_of(CATCH_MEMBER),
+        chosen: blocks_of(CHOICES_MEMBER),
     }
 }
 
@@ -3198,7 +3278,11 @@ fn assignments(state: &Map<String, Value>) -> Assignments {
 /// Which of them a state the transition LEADS TO can count on is a different question,
 /// and the one [`Scopes`] answers per transition.
 fn assigned_variables(state: &Map<String, Value>) -> BTreeSet<String> {
-    let Assignments { mut own, caught } = assignments(state);
+    let Assignments {
+        mut own,
+        caught,
+        chosen: _,
+    } = assignments(state);
     for block in caught {
         own.extend(block);
     }
@@ -4146,15 +4230,31 @@ fn looks_like_an_intrinsic(text: &str) -> bool {
 }
 
 /// One transition a state declares: where it goes, where in the state the member that
-/// names it sits, and whether it is taken because the state FAILED.
+/// names it sits, and WHICH of the state's assignment blocks runs on the way there.
 pub(super) struct Transition {
     pub(super) target: String,
     /// The path from the state to the member naming the target.
     path: String,
-    /// `Some(index)` for the `Next` of the `Catch` catcher at that index: a
-    /// transition the state's own work never completed, so the state's own `Assign`
-    /// did not run and that catcher's did.
-    caught: Option<usize>,
+    /// Which block of the state's assignments the language evaluates on the way along
+    /// this transition.
+    assigns: AssignedOnTheWay,
+}
+
+/// Which of a state's assignment blocks runs on the way along one of its transitions.
+///
+/// A state declares its assignments in three positions and the position decides WHEN
+/// they run, so which of them a state the transition leads to can count on is a fact
+/// about the transition rather than about the state: the state's own `Assign` runs when
+/// its work COMPLETED, a `Catch` catcher's instead where the work failed and that
+/// catcher took over, and a `Choice` rule's for the ONE rule that matched.
+#[derive(Clone, Copy)]
+enum AssignedOnTheWay {
+    /// The state's own `Assign`.
+    Own,
+    /// The `Assign` of the `Catch` catcher at that index.
+    Catcher(usize),
+    /// The `Assign` of the `Choice` rule at that index.
+    ChoiceRule(usize),
 }
 
 /// Every transition `state` declares, in the order the members that name them are
@@ -4174,11 +4274,11 @@ pub(super) fn transitions(state: &Map<String, Value>) -> Vec<Transition> {
             transitions.push(Transition {
                 target: target.to_string(),
                 path: format!("/{member}"),
-                caught: None,
+                assigns: AssignedOnTheWay::Own,
             });
         }
     }
-    for (member, caught) in [("Choices", false), (CATCH_MEMBER, true)] {
+    for (member, from_choices) in [(CHOICES_MEMBER, true), (CATCH_MEMBER, false)] {
         let entries = state
             .get(member)
             .and_then(Value::as_array)
@@ -4189,7 +4289,10 @@ pub(super) fn transitions(state: &Map<String, Value>) -> Vec<Transition> {
                 transitions.push(Transition {
                     target: target.to_string(),
                     path: nested_at(&element_at("", member, index), "/Next"),
-                    caught: caught.then_some(index),
+                    assigns: match from_choices {
+                        true => AssignedOnTheWay::ChoiceRule(index),
+                        false => AssignedOnTheWay::Catcher(index),
+                    },
                 });
             }
         }

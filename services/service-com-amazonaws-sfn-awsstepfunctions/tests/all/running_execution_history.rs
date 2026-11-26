@@ -118,11 +118,14 @@ async fn a_running_execution_reports_the_events_it_has_already_written() {
                 "ExecutionStarted",
                 "MapStateEntered",
                 "MapStateStarted",
+                // RECORDED order: the state declares no `MaxConcurrency`, so both
+                // iterations are admitted at once and both are STARTED before either
+                // body runs (`map_iteration_dispatch_order` is that rule).
+                "MapIterationStarted",
                 "MapIterationStarted",
                 "PassStateEntered",
                 "PassStateExited",
                 "MapIterationSucceeded",
-                "MapIterationStarted",
                 "PassStateEntered",
                 "PassStateExited",
                 "MapIterationSucceeded",

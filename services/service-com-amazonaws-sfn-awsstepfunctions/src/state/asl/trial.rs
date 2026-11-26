@@ -147,6 +147,9 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // The state is tested as the attempt the request says it is on, which is what a
         // state of a kind that can be retried reads through `$$.State.RetryCount`.
         retry_count: test.retries_taken,
+        // The state is tested at the instant the request is answered at, so the clock it
+        // reads stands where this walk begins.
+        clock_offset: Duration::ZERO,
         steps: Vec::new(),
         // `TestState` keeps no history: the state under test is the first thing this
         // walk would record, so a diagnosis it raises names the id the first event of

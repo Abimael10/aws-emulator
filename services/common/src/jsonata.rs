@@ -79,6 +79,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 
+mod clock;
 mod library;
 
 pub use library::bind as bind_library;
@@ -211,8 +212,21 @@ const UNBOUNDED_CONSTRUCT_NODES: &[(&str, &str)] = &[
     (r#"Var("distinct")"#, "$distinct"),
 ];
 
-/// How one `$pad` call opens in the engine's own parse ([`unboundable_pad`]).
+/// How one `$pad` CALL opens in the engine's own parse ([`unboundable_pad`]): the node a
+/// call is written as, the member its function's name sits in, and that name TERMINATED
+/// by the closing quote of the rendered string.
+///
+/// The quote is what makes this a WHOLE-name match: a call of a longer name that merely
+/// begins with it (`$padded`, `$padx`, a binding a caller named after the function)
+/// renders another byte before its own closing quote, so it is not matched here — and is
+/// therefore not counted as a call this reading bounded ([`PAD_CALLEE_BOUNDARY`]).
 const PAD_CALL: &str = r#"Function { name: "pad""#;
+
+/// That terminator, asserted where the needle is written: the reading below counts a
+/// match of [`PAD_CALL`] as one whole `$pad` call, which holds only while the needle ends
+/// at the name's own boundary.
+const PAD_CALLEE_BOUNDARY: u8 = b'"';
+const _: () = assert!(PAD_CALL.as_bytes()[PAD_CALL.len() - 1] == PAD_CALLEE_BOUNDARY);
 
 /// How the `$pad` BINDING itself is written in that parse, wherever the expression
 /// reaches it: the callee of a call written `$pad(…)` is one, and so is a reference
@@ -249,18 +263,33 @@ const PAD_WIDTH_ARGUMENT: usize = 1;
 /// the end, a call that does not write a width where this function reads one — a chained
 /// or piped invocation — and a reference that reaches the binding WITHOUT calling it
 /// there (binding it to a variable, handing it to a higher-order function) are each
-/// refused, since none of them names a width this reading can bound. That is what the
-/// count below holds: every appearance of the binding must be the callee of a call this
-/// scan bounded, so no other way of reaching `$pad` is evaluated.
+/// refused, since none of them names a width this reading can bound.
+///
+/// Every reference to the binding is RESOLVED to the call it is the callee of, rather
+/// than answered for by a count: a call writes the binding it invokes between its own
+/// name and its arguments, so the callee of each call this scan bounded sits at a known
+/// place in the rendering, and an appearance of the binding anywhere else is a `$pad`
+/// whose width this reading never saw. Nothing is therefore cancelled out by an
+/// appearance of the function's name that this scan read as something else.
 fn unboundable_pad(rendered: &str, allowance: usize) -> Option<String> {
-    let mut bounded = 0usize;
+    let unreadable = || Some("a call this emulator cannot read the width of".to_string());
+    // The span of each bounded call's own HEAD: from the end of its name to the start of
+    // its arguments, which is where the call writes the binding it invokes.
+    let mut callees: Vec<(usize, usize)> = Vec::new();
     for opened in unquoted_matches(rendered, PAD_CALL) {
-        let rest = &rendered[opened + PAD_CALL.len()..];
+        let head_from = opened + PAD_CALL.len();
+        let rest = &rendered[head_from..];
         let Some(arguments) = rest.find(CALL_ARGUMENTS) else {
-            return Some("a call this emulator cannot read the width of".to_string());
+            return unreadable();
         };
+        // The callee this call invokes, written exactly once in that head. A head this
+        // reading cannot resolve to one appearance of the binding is a shape it does not
+        // bound, so the expression is not evaluated for it.
+        if unquoted_matches(&rest[..arguments], PAD_TERM).len() != 1 {
+            return unreadable();
+        }
         let Some(listed) = balanced(&rest[arguments + CALL_ARGUMENTS.len()..], b']') else {
-            return Some("a call this emulator cannot read the width of".to_string());
+            return unreadable();
         };
         match argument_kind(listed, PAD_WIDTH_ARGUMENT) {
             // A call that writes no width where this reading takes one — the width
@@ -268,16 +297,21 @@ fn unboundable_pad(rendered: &str, allowance: usize) -> Option<String> {
             // number to hold to the allowance.
             None => return Some("a call that writes its width elsewhere".to_string()),
             Some(kind) => match literal_number(kind) {
-                Some(width) if width.abs() <= allowance as f64 => bounded += 1,
+                Some(width) if width.abs() <= allowance as f64 => {
+                    callees.push((head_from, head_from + arguments));
+                }
                 Some(width) => return Some(format!("a width of {width}")),
                 None => return Some("a width it computes".to_string()),
             },
         }
     }
-    // And every OTHER way the expression reaches the binding: a reference that is not
+    // And every OTHER way the expression reaches the binding: an appearance that is not
     // the callee of one of the calls above is a `$pad` whose width this reading never
     // saw, so the expression is not evaluated for it.
-    match unquoted_matches(rendered, PAD_TERM).len() > bounded {
+    let unresolved = unquoted_matches(rendered, PAD_TERM)
+        .into_iter()
+        .any(|at| !callees.iter().any(|(from, to)| at >= *from && at < *to));
+    match unresolved {
         true => Some("a reference this emulator cannot read a width for".to_string()),
         false => None,
     }
@@ -445,6 +479,15 @@ pub struct Expression<'a> {
     pub allowed_ms: usize,
     /// The most bytes the value it produces may serialize to.
     pub allowance: usize,
+    /// The instant the CALLING SERVICE's own clock stands at, for the functions of the
+    /// language that SAMPLE the time (`$now`, `$millis`) to answer from.
+    ///
+    /// `None` keeps the engine's own bindings, which read this host's clock: a service
+    /// whose clock IS this host's supplies none. One that simulates the spans its API
+    /// documents — moving a run's clock forward by a wait instead of sleeping for it —
+    /// supplies the instant that run stands at, so an expression of it measures the
+    /// spans the run was charged ([`clock`]).
+    pub clock: Option<::std::time::SystemTime>,
 }
 
 /// Evaluate `expression`, and report the value it produced beside the bytes that value
@@ -668,10 +711,19 @@ fn contained(
     input: &str,
 ) -> Result<Option<(Value, usize)>, Refused> {
     let text = expression.text;
+    // What the ENGINE is handed: the expression itself, or — where the calling service
+    // supplied the instant its own clock stands at — that expression as the BODY of a
+    // block binding the language's two clock functions to it, which is the only binding
+    // of those names the engine leaves standing ([`clock`]). The block adds a FIXED
+    // prefix and one closing bracket, whose size and nesting are this module's own and
+    // not a caller's, so the ceilings already applied to the caller's text still bound
+    // what is parsed here. Every diagnosis quotes the expression the CALLER wrote.
+    let composed = expression.clock.map(|clock| clock::binding_block(text, clock));
+    let handed = composed.as_deref().unwrap_or(text);
     let evaluated = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
         let arena = ::bumpalo::Bump::new();
         arena.set_allocation_limit(Some(MAX_EVALUATION_ARENA_BYTES));
-        let parsed = ::jsonata_rs::JsonAta::new(text, &arena).map_err(|why| {
+        let parsed = ::jsonata_rs::JsonAta::new(handed, &arena).map_err(|why| {
             Refused::NotEvaluated(format!("'{text}' is not a valid JSONata expression: {why}"))
         })?;
         // Read off the ENGINE's own parse, before anything is evaluated: a step this
@@ -1040,7 +1092,90 @@ mod tests {
             variables: &[],
             allowed_ms: 250,
             allowance: 1024,
+            clock: None,
         })
+    }
+
+    /// The same expression, with the instant a calling service's own clock stands at.
+    fn over_at(
+        text: &str,
+        input: &Value,
+        clock: ::std::time::SystemTime,
+    ) -> Result<Option<(Value, usize)>, Refused> {
+        evaluate(&Expression {
+            text,
+            input,
+            variables: &[],
+            allowed_ms: 250,
+            allowance: 1024,
+            clock: Some(clock),
+        })
+    }
+
+    /// The two functions of the language that SAMPLE the time answer from the instant
+    /// the calling service supplied, and from this host's clock when it supplies none.
+    ///
+    /// The rows differ along the instant handed in (the epoch, a calendar instant, one
+    /// carrying a millisecond fraction) and along which of the two functions reads it.
+    #[test]
+    fn the_clock_functions_answer_from_the_instant_the_caller_supplied() {
+        // (case, milliseconds since the epoch, how `$now()` renders that instant)
+        let rows: [(&str, u64, &str); 4] = [
+            ("the epoch itself", 0, "1970-01-01T00:00:00.000Z"),
+            ("a whole second", 1_767_225_600_000, "2026-01-01T00:00:00.000Z"),
+            (
+                "an instant carrying a millisecond fraction",
+                1_767_225_600_820,
+                "2026-01-01T00:00:00.820Z",
+            ),
+            (
+                "one five seconds later, the span a retry of it would wait",
+                1_767_225_605_000,
+                "2026-01-01T00:00:05.000Z",
+            ),
+        ];
+        let input = json!({});
+        for (case, millis, rendered) in rows {
+            let clock = ::std::time::UNIX_EPOCH + ::std::time::Duration::from_millis(millis);
+            let answered = over_at("$now()", &input, clock);
+            assert_eq!(
+                answered.as_ref().ok().and_then(Clone::clone).map(|(value, _)| value),
+                Some(json!(rendered)),
+                "case {case:?}: expected $now() to render the supplied instant as \
+                 {rendered:?}, got {answered:?}"
+            );
+            let sampled = over_at("$millis()", &input, clock);
+            assert_eq!(
+                sampled.as_ref().ok().and_then(Clone::clone).map(|(value, _)| value),
+                Some(json!(millis)),
+                "case {case:?}: expected $millis() to report {millis}, got {sampled:?}"
+            );
+            let round_tripped = over_at("$toMillis($now())", &input, clock);
+            assert_eq!(
+                round_tripped
+                    .as_ref()
+                    .ok()
+                    .and_then(Clone::clone)
+                    .map(|(value, _)| value),
+                Some(json!(millis)),
+                "case {case:?}: expected the rendered instant to read back as {millis}, got \
+                 {round_tripped:?}"
+            );
+        }
+
+        // With no instant supplied the functions answer this host's clock, which is what
+        // the engine's own bindings read: the figure is a real one rather than nothing.
+        let host = over("$millis()", &input);
+        let reported = host
+            .as_ref()
+            .ok()
+            .and_then(Clone::clone)
+            .and_then(|(value, _)| value.as_f64());
+        assert!(
+            reported.is_some_and(|millis| millis > 0.0),
+            "case \"no instant supplied\": expected $millis() to report this host's clock, got \
+             {host:?}"
+        );
     }
 
     /// The name of the class a refusal belongs to, for a test's own message.
@@ -1142,6 +1277,7 @@ mod tests {
             variables: &[("states", &input), ("extra", &total)],
             allowed_ms: 250,
             allowance: 1024,
+            clock: None,
         })
         .expect("the expression is evaluated");
         let (value, bytes) = answered.expect("it produces a value");
@@ -1158,6 +1294,19 @@ mod tests {
         assert!(
             answered.is_none(),
             "a field an expression resolves nothing for carries no value, got {answered:?}"
+        );
+    }
+
+    /// The other side of the `$pad` reading: a call written with a width inside the
+    /// allowance IS evaluated, so the reading refuses what it cannot bound rather than
+    /// everything that names the function.
+    #[test]
+    fn a_pad_call_whose_width_is_inside_the_allowance_is_evaluated() {
+        let answered = over("$pad('x', 8)", &json!({})).expect("it is evaluated");
+        assert_eq!(
+            answered.map(|(value, _)| value),
+            Some(json!("x       ")),
+            "a bounded $pad builds its result"
         );
     }
 
@@ -1267,6 +1416,24 @@ mod tests {
                 "NotEvaluated",
             ),
             (
+                // A call of a LONGER name that merely begins with the function's is not
+                // a `$pad` call at all, so it answers for nothing: the aliased `$pad`
+                // beside it is still a reference this reading never saw a width for.
+                "an expression calling a pad-prefixed name beside an aliased $pad",
+                "$padx('y', 2) & ( $p := $pad; $p('z', 1e12) )",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
+                // And two of them, so no number of such calls can answer for it either.
+                "two pad-prefixed calls beside an aliased $pad",
+                "$padx('y', 2) & $padded('y', 2) & ( $p := $pad; $p('z', 1e12) )",
+                json!({}),
+                1024,
+                "NotEvaluated",
+            ),
+            (
                 // A literal spelling this module's own reading of the parse is the
                 // caller's DATA, so it answers for nothing.
                 "an expression whose literal spells a bounded call beside an aliased $pad",
@@ -1305,6 +1472,7 @@ mod tests {
                 variables: &[],
                 allowed_ms: 250,
                 allowance,
+                clock: None,
             });
             let refused = answered
                 .as_ref()
