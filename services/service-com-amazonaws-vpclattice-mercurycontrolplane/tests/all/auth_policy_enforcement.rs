@@ -40,8 +40,8 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_sto
 
 /// The values `AuthType` admits (`smithy_query(query="shape",shape="AuthType")`), written out
 /// here rather than read from the service.
-const AUTH_TYPE_AWS_IAM: &str = "AWS_IAM";
-const AUTH_TYPE_NONE: &str = "NONE";
+pub(crate) const AUTH_TYPE_AWS_IAM: &str = "AWS_IAM";
+pub(crate) const AUTH_TYPE_NONE: &str = "NONE";
 
 /// The `AuthPolicyState` of a policy that decides requests, and of one that decides nothing
 /// (`smithy_query(query="shape",shape="AuthPolicyState")`).
@@ -51,17 +51,18 @@ const STATE_INACTIVE: &str = "Inactive";
 /// The action a client performs on a Lattice service's data plane, as the statements of an
 /// auth policy name it: the data plane's own action namespace and its one operation. Written
 /// out rather than read from the code under test, so no row can pass by agreeing with it.
-const INVOKE_ACTION: &str = "vpc-lattice-svcs:Invoke";
+pub(crate) const INVOKE_ACTION: &str = "vpc-lattice-svcs:Invoke";
 
 /// The fixed clauses of the refusal AWS answers a denied request with. The variable parts —
 /// the caller's ARN, the action and the resource — are the request's and the account's.
-const DENIED_PREFIX: &str = "AccessDeniedException: User: ";
-const DENIED_PERFORM: &str = " is not authorized to perform: ";
-const DENIED_RESOURCE: &str = " on resource: ";
-const DENIED_EXPLICIT_DENY: &str = " with an explicit deny in a service-based policy";
+pub(crate) const DENIED_PREFIX: &str = "AccessDeniedException: User: ";
+pub(crate) const DENIED_PERFORM: &str = " is not authorized to perform: ";
+pub(crate) const DENIED_RESOURCE: &str = " on resource: ";
+pub(crate) const DENIED_EXPLICIT_DENY: &str =
+    " with an explicit deny in a service-based policy";
 
 /// The path every row addresses, and the path the policies below scope a statement to.
-const PROBE_PATH: &str = "/probe/42";
+pub(crate) const PROBE_PATH: &str = "/probe/42";
 
 /// The name of the role whose session every signed row speaks for, and the name of the
 /// session the token service mints for it.
@@ -69,7 +70,11 @@ const DRIVER_ROLE: &str = "lattice-auth-driver";
 const DRIVER_SESSION: &str = "probe";
 
 /// `PUT /authpolicy/{resourceIdentifier}`, whose `policy` is the document as JSON text.
-async fn put_auth_policy(lattice: &Lattice, identifier: &str, policy: &serde_json::Value) -> u16 {
+pub(crate) async fn put_auth_policy(
+    lattice: &Lattice,
+    identifier: &str,
+    policy: &serde_json::Value,
+) -> u16 {
     let answer = lattice
         .call(
             "PUT",
@@ -82,7 +87,7 @@ async fn put_auth_policy(lattice: &Lattice, identifier: &str, policy: &serde_jso
 
 /// One auth policy statement: `effect` for `principal` on `resource`, over the data plane's
 /// own action.
-fn statement(effect: &str, principal: &str, resource: &str) -> serde_json::Value {
+pub(crate) fn statement(effect: &str, principal: &str, resource: &str) -> serde_json::Value {
     serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -119,7 +124,7 @@ fn identity_statement(effect: &str, resource: &str) -> serde_json::Value {
 /// the policies in force on that role.
 ///
 /// Answers the access key id the session signs with, the session's own ARN and the role's.
-fn a_driver_session(
+pub(crate) fn a_driver_session(
     engine: &Arc<engine::InMemoryEngine>,
     service_arn: &str,
 ) -> (String, String, String) {
@@ -194,7 +199,7 @@ fn a_driver_session(
 
 /// One request to the service's published name, signed as the session `access_key_id` names —
 /// the credential scope the data plane of a Lattice service is addressed with.
-async fn signed_fetch(
+pub(crate) async fn signed_fetch(
     lattice: &Lattice,
     host: &str,
     access_key_id: &str,

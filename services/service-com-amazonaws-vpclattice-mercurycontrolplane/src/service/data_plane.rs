@@ -27,8 +27,8 @@
 //!   service's id, so no two services share one) — or the host IS a stored service's
 //!   `customDomainName`. The whole request path is then the path the rules are matched
 //!   against;
-//! * PREFIXED PATH-STYLE, the addressing a client holding nothing but the host the control
-//!   plane announced uses: the plane is named by the reserved namespace segment
+//! * PREFIXED PATH-STYLE, the addressing a client holding nothing but this emulator's own
+//!   endpoint uses: the plane is named by the reserved namespace segment
 //!   ([`::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`]) and this
 //!   service's own ([`DATA_PLANE_SEGMENT`]), then the service's id, name or own label,
 //!   then the request path — `/_aws/vpc-lattice/{service}/{path}`. The namespace segment
@@ -249,7 +249,12 @@ pub fn claims_parts<Eng: Send + Sync + 'static>(
 ///   through the front door's own reader of it — is that service's, whatever address it was
 ///   sent to. A key read off the HOST instead is not such a signal here: it is the first label
 ///   of the address the client dialled, and the address this control plane announces names no
-///   service in it;
+///   service in it. THIS plane's OWN namespace is not another service's either: a client of a
+///   Lattice service signs its request for the data plane's own signing name
+///   ([`super::data_plane_authorization::DATA_PLANE_ACTION_NAMESPACE`], the name the auth
+///   policy's actions are published under and what a caller inside an associated VPC signs a
+///   `GET` of the announced address with), which no service of this emulator is registered
+///   under — so reading it as another service's would leave that request answered by nothing;
 /// * a request this service's own MODEL binds a route for is its CONTROL plane's, which
 ///   answers at that very host.
 fn reads_announced_address(
@@ -257,8 +262,12 @@ fn reads_announced_address(
     definition: &dyn ErasedServiceDefinition,
 ) -> bool {
     let signing_name = definition.identity().signing_name();
+    let own = [
+        signing_name,
+        super::data_plane_authorization::DATA_PLANE_ACTION_NAMESPACE,
+    ];
     let named_elsewhere = carried_service_name(parts)
-        .is_some_and(|carried| !carried.eq_ignore_ascii_case(signing_name));
+        .is_some_and(|carried| !own.iter().any(|name| carried.eq_ignore_ascii_case(name)));
     !named_elsewhere && !::service_common::addresses_modeled_route(parts, definition)
 }
 
