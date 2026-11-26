@@ -45,6 +45,13 @@
 //! emulator's OWN endpoint, and the published SCEP host for a client that resolves AWS's own
 //! hostnames.
 //!
+//! A published SCEP host carries the access path the connector was created with as well as its
+//! id, and only the connector published at that whole address is served there
+//! (`ComAmazonawsPcaconnectorscepPcaconnectorscepState::connector_addressed`): a host of this
+//! service's shape that this service published for no connector is claimed here — so the
+//! client is answered by the service that owns the surface rather than by the front door's
+//! "unknown service" — and answered [`NOT_FOUND_STATUS`].
+//!
 //! Serving writes NOTHING beyond the transitions the clock already owed
 //! (`ComAmazonawsPcaconnectorscepPcaconnectorscepState::settle`): fetching a CA certificate
 //! moves no status, consumes no quota and bumps no counter.
@@ -152,7 +159,6 @@ impl<Eng: Send + Sync + 'static> ScepDataPlane<Eng> {
         let Some(addressed) = addressed_connector(req) else {
             return refused(NOT_FOUND_STATUS, "This URL names no SCEP connector.");
         };
-        let connector_arn = addressed.connector_arn();
 
         // What the connector record says, read under the lock and carried out of it, so the
         // private CA is read with no lock held.
@@ -169,7 +175,11 @@ impl<Eng: Send + Sync + 'static> ScepDataPlane<Eng> {
             // create owed it was due at this instant whether or not anybody called, which is
             // what makes a client that waited for activation able to enrol.
             store.settle(SystemTime::now());
-            let Some(connector) = store.connector(&addressed.region, &connector_arn) else {
+            // Resolved through the WHOLE address, access path included: a connector serves
+            // only at the address this service published for it, so the public host of a
+            // connector restricted to one VPC endpoint — and a PrivateLink host naming any
+            // other endpoint — names no connector here.
+            let Some(connector) = store.connector_addressed(&addressed) else {
                 return refused(NOT_FOUND_STATUS, "This URL names no SCEP connector.");
             };
             connector

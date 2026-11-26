@@ -23,6 +23,13 @@
 //! case the host is written in, whether the host names a connector of that Region at all, the
 //! connector's status, and the SCEP operation named.
 //!
+//! The second rule here is which of those host forms a given connector is PUBLISHED at, and
+//! so serves: the access path its create chose, and no other
+//! (`a_connector_serves_only_at_the_published_host_form_of_its_own_access_path`). Those rows
+//! differ along the access path the connector was created with, and the host form the request
+//! is dialled at — the other access path, a PrivateLink host naming another VPC endpoint, and
+//! a PrivateLink host whose endpoint label is no endpoint id at all.
+//!
 //! The OTHER addressing the same plane is published at — the reserved path on the emulator's
 //! own endpoint — is pinned beside this in `connector_scep_endpoint`, which is also where the
 //! choice between the two addressings is.
@@ -654,6 +661,236 @@ async fn a_published_scep_host_is_answered_by_this_service_even_when_it_cannot_s
         assert_ne!(
             answer.content_type, CA_CERTIFICATE_CONTENT_TYPE,
             "case {row:?}: a request this plane cannot serve carries no certificate, got {:?}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+}
+
+/// Which published host form a case DIALS a connector at.
+///
+/// Each is built by this service's own host builder (`scep::state::connector_endpoint`), so a
+/// case addresses a host of exactly the form the service publishes rather than one spelled out
+/// here: what differs between the forms is the access path the host expresses.
+#[derive(Debug, Clone, Copy)]
+enum Dialled {
+    /// The public host form, where a connector accessible over the public internet serves.
+    Public,
+    /// A PrivateLink host form qualified by this VPC endpoint id.
+    VpcEndpoint(&'static str),
+    /// The connector's OWN published host, written in another letter case: a DNS name is
+    /// case-insensitive, so this addresses the same access path.
+    OwnHostUpperCased,
+}
+
+/// The URL one case dials: the host form, carrying the connector's own id, with the operation
+/// every row asks for.
+fn dialled_url(
+    dialled: Dialled,
+    region: &str,
+    connector_id: &str,
+    created_with: Option<&str>,
+) -> String {
+    let host = match dialled {
+        Dialled::Public => scep::state::connector_endpoint(region, connector_id, None),
+        Dialled::VpcEndpoint(vpc_endpoint_id) => {
+            scep::state::connector_endpoint(region, connector_id, Some(vpc_endpoint_id))
+        }
+        Dialled::OwnHostUpperCased => with_upper_case_host(&scep::state::connector_endpoint(
+            region,
+            connector_id,
+            created_with,
+        )),
+    };
+    format!("{host}?operation=GetCACert")
+}
+
+/// One row of the access-path table: the access path a connector's create chose, the addresses
+/// it is therefore published at, and the addresses of the same published SHAPE that it is not.
+#[derive(Debug)]
+struct AccessPathRow {
+    name: &'static str,
+    created_with: Option<&'static str>,
+    /// Addresses this connector IS published at: each must serve its CA's certificate.
+    serves_at: &'static [Dialled],
+    /// Addresses of this service's own published host shape that this connector was NEVER
+    /// published at: each names no connector, so none of them may serve anything.
+    never_published_at: &'static [Dialled],
+}
+
+/// A VPC endpoint id at the LOWER published `@length` bound of `VpcEndpointId` (13, pattern
+/// `^vpce-[0-9a-f]{8}([0-9a-f]{9})?$`, smithy_query shape=VpcEndpointId).
+const SHORT_VPCE: &str = "vpce-0123abcd";
+
+/// One at the UPPER bound (22) which has [`SHORT_VPCE`] as its prefix, so neither host form
+/// can be matched by a prefix of the other's endpoint label.
+const LONG_VPCE: &str = "vpce-0123abcd456789abc";
+
+/// A well-formed endpoint id no connector in the table was created with.
+const OTHER_VPCE: &str = "vpce-fedcba9887654321f";
+
+/// An endpoint label that is no VPC endpoint id at all, which is still a single DNS label in
+/// the position the PrivateLink host form puts the endpoint id in.
+const UNRELATED_LABEL: &str = "endpoint";
+
+/// The table: the three access paths a create can choose here — none, and an endpoint id at
+/// each published `@length` bound of `VpcEndpointId` — crossed with the host forms a client
+/// can dial.
+fn access_path_rows() -> Vec<AccessPathRow> {
+    vec![
+        AccessPathRow {
+            name: "a connector accessible over the public internet",
+            created_with: None,
+            serves_at: &[Dialled::Public, Dialled::OwnHostUpperCased],
+            never_published_at: &[
+                Dialled::VpcEndpoint(SHORT_VPCE),
+                Dialled::VpcEndpoint(LONG_VPCE),
+                Dialled::VpcEndpoint(OTHER_VPCE),
+                Dialled::VpcEndpoint(UNRELATED_LABEL),
+            ],
+        },
+        AccessPathRow {
+            name: "a connector accessible only through the shorter VPC endpoint",
+            created_with: Some(SHORT_VPCE),
+            serves_at: &[
+                Dialled::VpcEndpoint(SHORT_VPCE),
+                Dialled::OwnHostUpperCased,
+            ],
+            never_published_at: &[
+                Dialled::Public,
+                Dialled::VpcEndpoint(LONG_VPCE),
+                Dialled::VpcEndpoint(OTHER_VPCE),
+                Dialled::VpcEndpoint(UNRELATED_LABEL),
+            ],
+        },
+        AccessPathRow {
+            name: "a connector accessible only through the longer VPC endpoint",
+            created_with: Some(LONG_VPCE),
+            serves_at: &[Dialled::VpcEndpoint(LONG_VPCE), Dialled::OwnHostUpperCased],
+            never_published_at: &[
+                Dialled::Public,
+                Dialled::VpcEndpoint(SHORT_VPCE),
+                Dialled::VpcEndpoint(OTHER_VPCE),
+                Dialled::VpcEndpoint(UNRELATED_LABEL),
+            ],
+        },
+    ]
+}
+
+/// The URL with the OTHER DNS suffix of the two published forms: the PrivateLink suffix put on
+/// a host whose labels are the public form's, and taken off one whose labels carry a VPC
+/// endpoint. Neither is a host this service builds for any connector, because each pairs one
+/// form's suffix with the other form's labels.
+fn with_the_other_dns_suffix(url: &str) -> String {
+    match url.strip_suffix(".vpce.amazonaws.com") {
+        Some(head) => format!("{head}.amazonaws.com"),
+        None => format!(
+            "{}.vpce.amazonaws.com",
+            url.strip_suffix(".amazonaws.com")
+                .expect("a published SCEP host sits under one of the two DNS suffixes")
+        ),
+    }
+}
+
+/// A connector serves its SCEP plane at the published host form of the access path its create
+/// chose, and at NO other.
+///
+/// `VpcEndpointId`'s own doc: with no value the connector is "accessible over the public
+/// internet", with one "accessible only through that specific VPC endpoint". So the access path
+/// is part of the address — the public host form for a public connector, the host qualified by
+/// that endpoint's id for a restricted one — and a host of this service's published shape that
+/// it published for no connector names none: it is still this service's to answer (never the
+/// front door's routing error), and it is answered 404 with no certificate.
+#[tokio::test]
+async fn a_connector_serves_only_at_the_published_host_form_of_its_own_access_path() {
+    let region = "eu-central-1";
+    let fixture = "the private CA every connector of the access-path table links";
+    let (router, engine) = router_with_private_ca();
+    let (ca_arn, held) = active_private_ca(&router, fixture, region, "scep-access-path").await;
+    let expected = identity_of_pem(&held, fixture);
+
+    for row in access_path_rows() {
+        let arn = active_connector(
+            &router,
+            &engine,
+            row.name,
+            region,
+            &ca_arn,
+            row.created_with,
+        )
+        .await;
+        let id = connector_id_of(&arn).to_string();
+
+        // The address this service PUBLISHED for this connector, asked for rather than
+        // assumed: the host form the access path chose.
+        let published = reported_endpoint(&router, row.name, region, &arn).await;
+        assert_eq!(
+            published,
+            scep::state::connector_endpoint(region, &id, row.created_with),
+            "case {row:?}: expected the Endpoint to name the host form of the access path the \
+             create chose, got {published:?}"
+        );
+
+        for dialled in row.serves_at {
+            let url = dialled_url(*dialled, region, &id, row.created_with);
+            let answer = fetch(&router, &url).await;
+            assert_not_the_front_doors_routing_error(&answer, row.name);
+            assert_eq!(
+                answer.status, 200,
+                "case {row:?} at {dialled:?}: a connector serves at the address it was \
+                 published at, so expected 200 from {url:?}, got {} / {:?}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert_eq!(
+                answer.content_type, CA_CERTIFICATE_CONTENT_TYPE,
+                "case {row:?} at {dialled:?}: expected the DER certificate media type, got {:?}",
+                answer.content_type
+            );
+            let served = identity_of_der(&answer.body, row.name);
+            assert_eq!(
+                served, expected,
+                "case {row:?} at {dialled:?}: expected the certificate of {ca_arn:?} (subject, \
+                 serial) {expected:?}, got {served:?}"
+            );
+        }
+
+        for dialled in row.never_published_at {
+            let url = dialled_url(*dialled, region, &id, row.created_with);
+            let answer = fetch(&router, &url).await;
+            assert_not_the_front_doors_routing_error(&answer, row.name);
+            assert_eq!(
+                answer.status, 404,
+                "case {row:?} at {dialled:?}: this service published no connector at {url:?}, so \
+                 that address names none; expected 404, got {} / {:?}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert_ne!(
+                answer.content_type, CA_CERTIFICATE_CONTENT_TYPE,
+                "case {row:?} at {dialled:?}: an address this connector was never published at \
+                 carries no certificate, got {:?}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
+
+        // The published host with the suffix of the OTHER form: one form's suffix over the
+        // other form's labels is a host this service published for nothing, so nothing is
+        // served there either.
+        let crossed = format!(
+            "{}?operation=GetCACert",
+            with_the_other_dns_suffix(&published)
+        );
+        let answer = fetch(&router, &crossed).await;
+        assert_ne!(
+            answer.status, 200,
+            "case {row:?}: {crossed:?} pairs one published form's DNS suffix with the other \
+             form's labels, so it names no connector; got 200 / {:?}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_ne!(
+            answer.content_type, CA_CERTIFICATE_CONTENT_TYPE,
+            "case {row:?}: {crossed:?} is a host this service published for no connector and \
+             carries no certificate, got {:?}",
             String::from_utf8_lossy(&answer.body)
         );
     }
