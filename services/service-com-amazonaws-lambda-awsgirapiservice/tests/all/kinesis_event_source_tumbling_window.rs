@@ -84,7 +84,10 @@ const FUNCTION_TIMEOUT: u64 = 30;
 /// is a failure. Well above the poller's interval, the state-settle span, the longest window
 /// any row below has to see the end of and one interpreted run of the handler, so a row fails
 /// only when the work did not happen at all.
-const BUDGET: Duration = Duration::from_secs(120);
+///
+/// `pub(crate)` because every suite over this surface waits with the same generous budget
+/// (`tests/all/kinesis_event_source_window_boundary.rs`).
+pub(crate) const BUDGET: Duration = Duration::from_secs(120);
 
 /// The one `State` a mapping that is reading rests in.
 const STATE_ENABLED: &str = "Enabled";
@@ -105,9 +108,12 @@ const WINDOW_MID: i64 = 10;
 const SHARD_PREFIX: &str = "shardId-";
 
 /// The member each report carries the window's own bounds under.
-const START: &str = "start";
+///
+/// `pub(crate)` because every suite reading a window out of a report reads these two members
+/// (`tests/all/kinesis_event_source_window_boundary.rs`).
+pub(crate) const START: &str = "start";
 /// See [`START`].
-const END: &str = "end";
+pub(crate) const END: &str = "end";
 
 /// The handler every function below runs: it puts ONE record onto the sink stream per
 /// INVOCATION, carrying everything that invocation was told about its tumbling window beside
@@ -155,7 +161,11 @@ def lambda_handler(event, context):
 
 /// A function whose package RUNS [`HANDLER_SOURCE`], running as `role_arn` and told through
 /// its environment which stream to write, waited out to `Active`.
-async fn given_handler_function(
+///
+/// `pub(crate)` because every suite that reads what an invocation was told about its window
+/// reads it out of this one handler's reports
+/// (`tests/all/kinesis_event_source_window_boundary.rs`).
+pub(crate) async fn given_handler_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -214,7 +224,10 @@ async fn given_handler_function(
 ///
 /// The create's own answer is checked for the window it was given, so a row cannot pass
 /// against a mapping that never carried one.
-async fn given_windowed_mapping(
+///
+/// `pub(crate)` because every suite over this surface wires its mapping this one way
+/// (`tests/all/kinesis_event_source_window_boundary.rs`).
+pub(crate) async fn given_windowed_mapping(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -323,7 +336,10 @@ async fn given_mapped_stream(
 }
 
 /// How many records the report of one invocation says it was handed.
-fn size_of(case: &str, report: &Value) -> usize {
+///
+/// `pub(crate)` because every suite reading these reports reads them this one way
+/// (`tests/all/kinesis_event_source_window_boundary.rs`).
+pub(crate) fn size_of(case: &str, report: &Value) -> usize {
     report["size"]
         .as_u64()
         .and_then(|size| usize::try_from(size).ok())
@@ -331,7 +347,9 @@ fn size_of(case: &str, report: &Value) -> usize {
 }
 
 /// Whether the report of one invocation says it was the FINAL invocation of its window.
-fn is_final(report: &Value) -> bool {
+///
+/// See [`size_of`] for why this is `pub(crate)`.
+pub(crate) fn is_final(report: &Value) -> bool {
     report["final"] == json!(true)
 }
 
@@ -364,7 +382,9 @@ async fn wait_for_reports(
 
 /// One bound of the window a report carries, in whole seconds since the epoch; a bound it
 /// carries nothing for, or one that is no instant, fails the row where it stands.
-fn window_bound(case: &str, report: &Value, member: &str) -> i64 {
+///
+/// See [`size_of`] for why this is `pub(crate)`.
+pub(crate) fn window_bound(case: &str, report: &Value, member: &str) -> i64 {
     let held = report["window"][member].as_str().unwrap_or_else(|| {
         panic!(
             "case {case:?}: an invocation inside a window must report the window's {member}, got \
@@ -382,7 +402,9 @@ fn window_bound(case: &str, report: &Value, member: &str) -> i64 {
 }
 
 /// Every `eventID` the reports say was delivered, in the order the invocations carried them.
-fn delivered_ids(reports: &[Value]) -> Vec<String> {
+///
+/// See [`size_of`] for why this is `pub(crate)`.
+pub(crate) fn delivered_ids(reports: &[Value]) -> Vec<String> {
     reports
         .iter()
         .flat_map(|report| report["ids"].as_array().cloned().unwrap_or_default())
