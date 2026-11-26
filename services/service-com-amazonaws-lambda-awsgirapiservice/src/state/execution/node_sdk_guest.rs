@@ -329,6 +329,26 @@ function errorClass(name) {
     return Thrown;
 }
 
+// The classes a refusal carrying NO DOCUMENT is thrown as, by the status it answered.
+//
+// An answer with no body names no error shape — a `HEAD` "returns a generic 400 Bad Request,
+// 403 Forbidden, or 404 Not Found HTTP status code. A message body isn't included, so you can't
+// determine the exception beyond these HTTP response codes" (`HeadBucket`'s own documentation) —
+// so what such a refusal carries in place of a shape is the STATUS itself. A v3 client has no
+// shape to name the error it throws after and names it after that status: its reason phrase as
+// one word, which is the name a handler branches on (`error.name === 'NotFound'` for the probe
+// of something that is not there). Source: the three statuses that sentence names, each under
+// its own reason phrase.
+var STATUS_CLASSES = { '400': 'BadRequest', '403': 'Forbidden', '404': 'NotFound' };
+
+// The class ONE refusal is thrown as: the error shape it named, or — for a refusal that named
+// no shape because its answer carried no document — the class its status stands for above. A
+// status none of them covers is left exactly as the answer named it rather than renamed here.
+function statusClass(named) {
+    var held = STATUS_CLASSES[named];
+    return held === undefined ? named : held;
+}
+
 // The error a v3 client throws for a service's refusal: an instance of the class the error
 // shape names, its message, and the metadata of the answer that carried them.
 function serviceError(answered) {
@@ -355,7 +375,7 @@ function serviceError(answered) {
     var message = document.message === undefined
         ? (document.Message === undefined ? '' : document.Message)
         : document.message;
-    var Thrown = errorClass(named);
+    var Thrown = errorClass(statusClass(named));
     var error = new Thrown({
         message: message,
         $metadata: {
@@ -562,11 +582,20 @@ function materialiseInstant(document, path) {
     });
 }
 
+// A call this runtime did not make at all is raised INSIDE the client, before any request is
+// sent, so it is classified as what it is — the SDK's own refusal to make the call — and never
+// under a name a SERVICE answers a request with: no service judged this call, so no code of any
+// service's model describes it, and a caller that read one would retry or re-resolve
+// credentials against a condition no request and no credential can change. The name is the one
+// the runtime's other bundled SDK gives the same condition ([`super::aws_sdk_guest`]), so one
+// condition carries one classification whichever language the handler is written in.
+var CALL_NOT_MADE = 'SdkCallNotMade';
+
 function notMade(answered) {
     var error = new Error(answered.detail === undefined || answered.detail === null
         ? 'The request was not made: ' + answered.outcome
         : answered.detail);
-    error.name = 'UnrecognizedClientException';
+    error.name = CALL_NOT_MADE;
     if (answered.outcome === 'unknown_service') {
         error.name = 'NotImplemented';
         error.message = 'This emulator makes no call to ' + SERVICE

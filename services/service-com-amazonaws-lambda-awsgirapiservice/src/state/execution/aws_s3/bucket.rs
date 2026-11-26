@@ -4,7 +4,8 @@
 //! bucket's own configuration subresources, and the operations that act on the objects it
 //! holds as a SET.
 //!
-//! A handler that administers storage rather than storing through it calls these: it probes
+//! A handler that administers storage rather than storing through it calls these: it brings a
+//! bucket into being and tears it down again, probes
 //! whether a bucket is there and usable at all, lists the account's buckets, reads the Region
 //! a bucket resides in, reads and
 //! replaces the notification container that decides where a bucket's object events are
@@ -17,20 +18,24 @@
 //! status for a refusal.
 //!
 //! The input of each is read out of the document the handler's client method was given, with
-//! the nested containers these operations carry (`NotificationConfiguration`, `Tagging`,
-//! `Delete`) walked member by member as the model lays them out. A member this binding does
+//! the nested containers these operations carry (`CreateBucketConfiguration`,
+//! `NotificationConfiguration`, `Tagging`, `Delete`) walked member by member as the model lays
+//! them out. A member this binding does
 //! not carry stops the call rather than travelling dropped, which is the rule the whole seam
 //! holds to.
 
 use ::serde_json::{Map, Value};
 
 use ::aws_sdk_s3::types::{
-    BucketLocationConstraint, BucketVersioningStatus, ChecksumAlgorithm, Delete, Event,
+    BucketCannedAcl, BucketInfo, BucketLocationConstraint, BucketType, BucketVersioningStatus,
+    ChecksumAlgorithm, CreateBucketConfiguration, DataRedundancy, Delete, Event,
     EventBridgeConfiguration, FilterRule,
-    FilterRuleName, LambdaFunctionConfiguration, MfaDelete, MfaDeleteStatus,
-    NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, Owner,
+    FilterRuleName, LambdaFunctionConfiguration, LocationInfo, LocationType, MfaDelete,
+    MfaDeleteStatus,
+    NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, ObjectOwnership,
+    Owner,
     QueueConfiguration, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, TopicConfiguration,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, TopicConfiguration,
     VersioningConfiguration,
 };
 use ::aws_sdk_s3::Client;
@@ -40,6 +45,166 @@ use super::{
     insert_flag, insert_number, insert_text, insert_timestamp, not_made, read_tagging, refused,
     refused_without_a_document, tag_set_document, Input, Observed,
 };
+
+/// `CreateBucket`: the bucket itself, brought into being by this call.
+///
+/// "Creates a new S3 bucket… By creating the bucket, you become the bucket owner"
+/// (`CreateBucket`'s own documentation): the first call a handler that PROVISIONS storage makes,
+/// which is why it is bound beside the probe and the listing below. Where the bucket is placed
+/// is the `CreateBucketConfiguration` payload's to say — the Region a general purpose bucket
+/// resides in (`CreateBucketConfiguration$LocationConstraint`), the zone and the kind a
+/// directory bucket is placed in (`$Location`, `$Bucket`) and the tag set it comes into being
+/// with (`$Tags`) — so that container is walked member by member and sent as the operation
+/// binds it.
+///
+/// A name the account already holds, or another account holds, is S3's own refusal to answer
+/// (`BucketAlreadyOwnedByYou`, `BucketAlreadyExists`), reported as every other refusal of this
+/// seam is: the service's own code, message and status.
+pub(super) async fn create_bucket(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "Bucket",
+        "CreateBucketConfiguration",
+        "ACL",
+        "GrantFullControl",
+        "GrantRead",
+        "GrantReadACP",
+        "GrantWrite",
+        "GrantWriteACP",
+        "ObjectLockEnabledForBucket",
+        "ObjectOwnership",
+    ])?;
+    let configuration = match input.structure("CreateBucketConfiguration")? {
+        Some(carried) => Some(create_bucket_configuration(&carried)?),
+        None => None,
+    };
+    let sent = client
+        .create_bucket()
+        .bucket(input.required_text("Bucket")?)
+        .set_create_bucket_configuration(configuration)
+        .set_acl(
+            input
+                .text("ACL")?
+                .map(|value| BucketCannedAcl::from(value.as_str())),
+        )
+        .set_grant_full_control(input.text("GrantFullControl")?)
+        .set_grant_read(input.text("GrantRead")?)
+        .set_grant_read_acp(input.text("GrantReadACP")?)
+        .set_grant_write(input.text("GrantWrite")?)
+        .set_grant_write_acp(input.text("GrantWriteACP")?)
+        .set_object_lock_enabled_for_bucket(input.boolean("ObjectLockEnabledForBucket")?)
+        .set_object_ownership(
+            input
+                .text("ObjectOwnership")?
+                .map(|value| ObjectOwnership::from(value.as_str())),
+        )
+        .send()
+        .await;
+    let created = match sent {
+        Ok(created) => created,
+        Err(error) => return refused(&error, observed),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "Location", created.location());
+    insert_text(&mut document, "BucketArn", created.bucket_arn());
+    observed.answer(document, Vec::new())
+}
+
+/// The `CreateBucketConfiguration` payload a create carries, read off the input the handler
+/// passed.
+///
+/// Every member of the container is optional (`smithy_query(query="shape",
+/// shape="CreateBucketConfiguration")`: `LocationConstraint`, `Location`, `Bucket`, `Tags`), so
+/// a container carrying none of one leaves that member off the call rather than sending a value
+/// the handler did not ask for; a member this binding does not carry stops the call, as
+/// everywhere else on this seam.
+fn create_bucket_configuration(carried: &Input) -> Result<CreateBucketConfiguration, Refusal> {
+    carried.only(&["LocationConstraint", "Location", "Bucket", "Tags"])?;
+    let location = match carried.structure("Location")? {
+        Some(held) => {
+            held.only(&["Type", "Name"])?;
+            Some(
+                LocationInfo::builder()
+                    .set_type(
+                        held.text("Type")?
+                            .map(|value| LocationType::from(value.as_str())),
+                    )
+                    .set_name(held.text("Name")?)
+                    .build(),
+            )
+        }
+        None => None,
+    };
+    let kind = match carried.structure("Bucket")? {
+        Some(held) => {
+            held.only(&["DataRedundancy", "Type"])?;
+            Some(
+                BucketInfo::builder()
+                    .set_data_redundancy(
+                        held.text("DataRedundancy")?
+                            .map(|value| DataRedundancy::from(value.as_str())),
+                    )
+                    .set_type(
+                        held.text("Type")?
+                            .map(|value| BucketType::from(value.as_str())),
+                    )
+                    .build(),
+            )
+        }
+        None => None,
+    };
+    let mut tags = Vec::new();
+    for tag in carried.structures("Tags")? {
+        tag.only(&["Key", "Value"])?;
+        tags.push(
+            Tag::builder()
+                .key(tag.required_text("Key")?)
+                .value(tag.required_text("Value")?)
+                .build()
+                .map_err(not_made)?,
+        );
+    }
+    Ok(CreateBucketConfiguration::builder()
+        .set_location_constraint(
+            carried
+                .text("LocationConstraint")?
+                .map(|value| BucketLocationConstraint::from(value.as_str())),
+        )
+        .set_location(location)
+        .set_bucket(kind)
+        .set_tags((!tags.is_empty()).then_some(tags))
+        .build())
+}
+
+/// `DeleteBucket`: the bucket itself, removed by this call.
+///
+/// "Deletes the S3 bucket. All objects (including all object versions and delete markers) in
+/// the bucket must be deleted before the bucket itself can be deleted" (`DeleteBucket`'s own
+/// documentation) — the last call a handler that tears its own storage down makes, which is why
+/// it is bound beside the create above and the set removal below. A bucket that still holds
+/// anything, or that does not exist, is S3's own refusal to answer, reported as such.
+pub(super) async fn delete_bucket(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "ExpectedBucketOwner"])?;
+    let sent = client
+        .delete_bucket()
+        .bucket(input.required_text("Bucket")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    match sent {
+        // The operation's output is `Unit`: the success IS the status, with no member to
+        // report.
+        Ok(_) => observed.answer(Map::new(), Vec::new()),
+        Err(error) => refused(&error, observed),
+    }
+}
 
 /// `HeadBucket`: whether the bucket is there and whether this identity may use it.
 ///
