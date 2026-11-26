@@ -1030,6 +1030,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
             }
+            // `AWS::AIOps::InvestigationGroup` publishes `Tags` as the usual `[{Key, Value}]`
+            // list while `CreateInvestigationGroup` takes a tag MAP, so the tags
+            // CloudFormation gives the group travel beside the declaration's own in that
+            // shape, and the set is reconciled afterwards through that service's own
+            // `TagResource`/`UntagResource` ([`retag_investigation_group`]).
+            Self::AiOpsInvestigationGroup => {
+                create_investigation_group(ctx, region, resource, propagated).await
+            }
             // Both `AWS::GameLift::*` types publish `Tags` as the `[{Key, Value}]` list
             // `CreateBuild`'s and `CreateScript`'s own `Tags` member takes, so a build and a
             // script a stack creates each carry the tags CloudFormation gives them beside the
@@ -1494,6 +1502,12 @@ impl Provisioner {
                 // alike, in the one check its own crate's tag validation makes — so a
                 // configuration manager carries the stack's own tags without the three.
                 | Self::SsmQuickSetupConfigurationManager
+                // Amazon CloudWatch investigations refuses a tag key in the reserved namespace
+                // on every call that takes tags — `CreateInvestigationGroup`'s own `tags` map,
+                // `TagResource` and `UntagResource` alike, in the one check its own crate's tag
+                // validation makes — so an investigation group carries the stack's own tags
+                // without the three.
+                | Self::AiOpsInvestigationGroup
         );
         // ...and a type whose registry SCHEMA states that it does not take CloudFormation's own
         // system tags is in the same position for a different reason: a resource type's schema

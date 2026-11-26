@@ -2350,6 +2350,35 @@ pub(crate) fn return_values(
             }
             (arn, attributes)
         }
+        // Amazon CloudWatch investigations' own control plane: the investigation group an
+        // `AWS::AIOps::InvestigationGroup` declares. "Ref returns the Arn" (the type's primary
+        // identifier); Fn::GetAtt reads `Arn`, `CreatedBy`, `CreatedAt`, `LastModifiedBy` and
+        // `LastModifiedAt`. That service MINTS the identifier inside the ARN —
+        // `CreateInvestigationGroup` takes the group's name, role and configuration and no
+        // identifier at all, and answers the `arn` it assigned, whose resource path carries
+        // sixteen characters of its own (`InvestigationGroupArn`:
+        // `…:investigation-group\/[A-Za-z0-9]{16}$`) — so the value here is a STAND-IN of that
+        // same form, which `super::provisioning` re-points at the ARN the create really
+        // answered ([`super::provisioner::Provisioner::AiOpsInvestigationGroup`]). The CALLER
+        // that service records and the two instants of its clock are not computed here: each
+        // reaches the resource off that service's own report of the group it created.
+        AIOPS_INVESTIGATION_GROUP => {
+            let arn = ::emulator_server::emulator_arn(
+                AIOPS_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "{AIOPS_INVESTIGATION_GROUP_PATH}/{}",
+                    derived_digits(
+                        AIOPS_INVESTIGATION_GROUP_ID_SALT,
+                        name,
+                        AIOPS_INVESTIGATION_GROUP_ID_CHARACTERS,
+                        Alphabet::Lower,
+                    )
+                ),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            (arn, attributes)
+        }
         // Amazon Braket's own control plane: the spending limit an
         // `AWS::Braket::SpendingLimit` declares. "Ref returns the spending limit ARN" (the
         // type's primary identifier); Fn::GetAtt reads `SpendingLimitArn` and `CreatedAt`.

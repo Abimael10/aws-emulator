@@ -99,7 +99,8 @@ use super::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET;
 use super::provisioning::sagemaker_studio::SAGEMAKER_SPACE;
 use super::template::{
     DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
-    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
+    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AIOPS_INVESTIGATION_GROUP,
+    AMPLIFYUIBUILDER_COMPONENT,
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH,
     APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME,
@@ -220,6 +221,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
     ACMPCA_PERMISSION,
+    // Amazon CloudWatch investigations. An investigation group is the per-Region group that
+    // service's own `CreateInvestigationGroup` makes, which `super::provisioner` creates
+    // there.
+    AIOPS_INVESTIGATION_GROUP,
     // Amazon MQ
     "AWS::AmazonMQ::Broker",
     "AWS::AmazonMQ::Configuration",

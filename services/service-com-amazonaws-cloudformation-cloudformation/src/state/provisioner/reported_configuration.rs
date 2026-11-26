@@ -810,6 +810,11 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Amazon CloudWatch investigations' own read of ONE investigation group, by the
+            // ARN it minted for the group — this resource's physical id.
+            Self::AiOpsInvestigationGroup => {
+                describe_investigation_group(ctx, region, physical_resource_id).await
+            }
             // Amazon GameLift Servers' own reads of the build and of the script, each by the
             // id it minted for the resource.
             Self::GameLiftBuild => {

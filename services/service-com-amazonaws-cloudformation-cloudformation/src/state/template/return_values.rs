@@ -408,6 +408,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // `CreatedAt` is Amazon Braket's clock, which reaches the resource off that
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
+        // An investigation group's ARN is the one return value these naming rules can compute;
+        // the caller Amazon CloudWatch investigations records for it and the two instants of
+        // its clock reach the resource off that service's own report of the group rather than
+        // from here, exactly as a spending limit's `CreatedAt` does.
+        AIOPS_INVESTIGATION_GROUP => &["Arn"],
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
         // An Amazon GameLift Servers build and a Realtime script each publish the id that
         // service minted and the ARN built around it, which are the two return values these
@@ -1212,6 +1217,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // An Amazon CloudWatch investigations INVESTIGATION GROUP is one more:
+        // `CreateInvestigationGroup` takes no identifier for the group — the declaration
+        // states its name, the role it gathers data as and its configuration — and answers the
+        // `arn` that service minted, whose resource path carries sixteen characters it drew.
+        // That ARN is what the type's `Ref` returns and the `identifier` every later call on
+        // the group takes, so the identity in force is the one it answered.
+        || resource_type == AIOPS_INVESTIGATION_GROUP
         // The two Amazon GameLift Servers types are two more: neither `CreateBuild` nor
         // `CreateScript` takes an identifier for the resource — a template declares the
         // name, the runtime and the Amazon S3 storage location the code is shipped from —

@@ -390,6 +390,36 @@ pub(super) const VPCLATTICE_SERVICE_NETWORK_ATTRIBUTES: &[&str] =
 pub(super) const VPCLATTICE_ACCESS_LOG_SUBSCRIPTION_ATTRIBUTES: &[&str] =
     &["Arn", "Id", "ResourceArn", "ResourceId"];
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon CloudWatch investigations
+/// INVESTIGATION GROUP: the per-Region group that service's own `CreateInvestigationGroup`
+/// makes, which "help[s] you centrally manage the common properties of your investigations".
+/// The middle segment is that model's own `awsService.sdkId` (`AIOps`).
+///
+/// "Ref returns the Arn", and `Fn::GetAtt` reads `Arn`, `CreatedBy`, `CreatedAt`,
+/// `LastModifiedBy` and `LastModifiedAt`. That service MINTS the identifier the ARN carries
+/// (`InvestigationGroupArn`:
+/// `^arn:(aws|aws-us-gov|aws-cn|aws-iso|aws-iso-b):aiops:[a-zA-Z0-9-]*:[0-9]{12}:\
+/// investigation-group\/[A-Za-z0-9]{16}$`, for which its create takes no member at all), which
+/// is why [`identity_is_service_assigned`] names this type; the caller it records and the two
+/// instants of its clock are that service's own and reach the resource off its report of the
+/// group rather than being computed here.
+pub const AIOPS_INVESTIGATION_GROUP: &str = "AWS::AIOps::InvestigationGroup";
+
+/// Amazon CloudWatch investigations' ARN namespace, which that model carries as
+/// `awsService.arnNamespace` (`aiops`) and an investigation group's ARN is named under.
+pub const AIOPS_ARN_NAMESPACE: &str = "aiops";
+
+/// The resource path an investigation group's ARN carries before the identifier that service
+/// minted, and how many characters that identifier holds — both read off the modelled
+/// `InvestigationGroupArn` pattern above, so the STAND-IN computed before the create is of
+/// that same form.
+pub(super) const AIOPS_INVESTIGATION_GROUP_PATH: &str = "investigation-group";
+pub(super) const AIOPS_INVESTIGATION_GROUP_ID_CHARACTERS: usize = 16;
+
+/// The salt that keeps that stand-in apart from every other identifier derived for one
+/// resource ([`derived_digits`]).
+pub(super) const AIOPS_INVESTIGATION_GROUP_ID_SALT: &str = "aiops/investigation-group";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Braket SPENDING LIMIT: the
 /// cost control that service's own `CreateSpendingLimit` makes for a quantum device. The
 /// middle segment is that model's own `awsService.sdkId` (`Braket`).

@@ -479,7 +479,8 @@ use super::provisioning::{
 use super::template::{
     ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY, ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
     ACMPCA_PERMISSION,
-    ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AMPLIFYUIBUILDER_COMPONENT, AMPLIFYUIBUILDER_FORM,
+    ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AIOPS_INVESTIGATION_GROUP,
+    AMPLIFYUIBUILDER_COMPONENT, AMPLIFYUIBUILDER_FORM,
     AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH, AOSS_COLLECTION,
     AOSS_SECURITY_POLICY, AOSS_VPC_ENDPOINT, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
@@ -1467,6 +1468,15 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::AIOps::InvestigationGroup`: the per-Region investigation group Amazon CloudWatch
+    /// investigations' own `CreateInvestigationGroup` makes, `UpdateInvestigationGroup`
+    /// reconfigures and `DeleteInvestigationGroup` removes. That service MINTS the `arn` the
+    /// type publishes — the `identifier` every investigation-group API takes — so it is read
+    /// off that create's own answer and is the identity a `Ref` resolves to. The group's
+    /// resource POLICY is a property of the same type and a call of its own
+    /// (`PutInvestigationGroupPolicy` / `DeleteInvestigationGroupPolicy`), which those arms
+    /// make beside the create and the update ([`aiops_investigation_groups`]).
+    AiOpsInvestigationGroup,
     /// `AWS::GameLift::Build` and `AWS::GameLift::Script`: the custom game server build and
     /// the Realtime script Amazon GameLift Servers' own `CreateBuild` and `CreateScript`
     /// record for the zip file at the Amazon S3 location the template names, `UpdateBuild` and
@@ -2070,6 +2080,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        AIOPS_INVESTIGATION_GROUP => Some(Provisioner::AiOpsInvestigationGroup),
         GAMELIFT_BUILD => Some(Provisioner::GameLiftBuild),
         GAMELIFT_SCRIPT => Some(Provisioner::GameLiftScript),
         HEALTHLAKE_FHIR_DATASTORE => Some(Provisioner::HealthLakeFhirDatastore),
@@ -3024,6 +3035,12 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // The investigation group is removed by the ARN Amazon CloudWatch investigations
+            // minted for it, which is this resource's physical id and the `identifier` that
+            // delete takes.
+            Self::AiOpsInvestigationGroup => {
+                delete_investigation_group(ctx, region, physical_resource_id).await
+            }
             // Each delete addresses the build or the script by the id Amazon GameLift Servers
             // minted for it, which is this resource's physical id.
             Self::GameLiftBuild => {
@@ -3311,6 +3328,12 @@ mod bedrock_inference_profiles;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The Amazon CloudWatch investigations INVESTIGATION GROUP arms: the group an
+/// `AWS::AIOps::InvestigationGroup` declares, created in the service that owns it so a
+/// client's own `GetInvestigationGroup` and `ListInvestigationGroups` resolve the ARN the
+/// stack publishes and the role, configuration, tags and resource policy it declared are
+/// really in force.
+mod aiops_investigation_groups;
 /// The AWS Systems Manager Quick Setup CONFIGURATION MANAGER arms: the manager an
 /// `AWS::SSMQuickSetup::ConfigurationManager` declares, created in the service that owns it so
 /// a client's own `GetConfigurationManager` and `ListConfigurationManagers` resolve the ARN the
@@ -3653,6 +3676,7 @@ use sagemaker_resources::*;
 mod directconnect_resources;
 use directconnect_resources::*;
 use braket_spending_limits::*;
+use aiops_investigation_groups::*;
 /// The AWS HealthLake arms: the FHIR data store an `AWS::HealthLake::FHIRDatastore` declares
 /// and the data transformation profile an `AWS::HealthLake::DataTransformationProfile`
 /// declares, each created in the service that owns it so a client's own

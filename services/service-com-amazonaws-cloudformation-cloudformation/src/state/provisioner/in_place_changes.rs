@@ -546,6 +546,19 @@ impl Provisioner {
             Self::BraketSpendingLimit => update_braket_spending_limit(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateInvestigationGroup` "updates the configuration of the specified
+            // investigation group" by the ARN Amazon CloudWatch investigations minted, taking
+            // the role it gathers data as, its encryption configuration, its tag key
+            // boundaries, its chat channels, its CloudTrail flag and its cross-account
+            // configurations — every property of the type but the two its create alone fixes,
+            // which replace the resource instead — so a changed declaration of one reaches the
+            // group the stack created. The group's resource POLICY is a call of its own, which
+            // the same arm makes ([`update_investigation_group`]).
+            Self::AiOpsInvestigationGroup => {
+                update_investigation_group(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateBuild` and `UpdateScript` each change the resource the stack created by
             // the id Amazon GameLift Servers minted for it: a build's name and version, and a
             // script's name, version and content source, are what those calls take — so a
@@ -1116,6 +1129,14 @@ impl Provisioner {
             // this is where the set a manager is to end up carrying is reconciled.
             Self::SsmQuickSetupConfigurationManager => {
                 retag_configuration_manager(ctx, region, resource, declared, propagated).await
+            }
+            // An investigation group's tags are Amazon CloudWatch investigations' own
+            // `TagResource` and `UntagResource`: `CreateInvestigationGroup`'s `tags` map
+            // applies to the group that call creates, and `UpdateInvestigationGroup` carries no
+            // tags at all, so this is where the set a group is to end up carrying is
+            // reconciled.
+            Self::AiOpsInvestigationGroup => {
+                retag_investigation_group(ctx, region, resource, declared, propagated).await
             }
             // Either Amazon VPC Lattice resource's tags are that service's own `TagResource`
             // and `UntagResource`: each create's `tags` map applies to the resource that call

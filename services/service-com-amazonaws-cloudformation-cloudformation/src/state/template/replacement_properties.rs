@@ -181,6 +181,14 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // An investigation group keeps the RETENTION its create fixed: `retentionInDays` is a
+        // member of `CreateInvestigationGroup` and of no member of `UpdateInvestigationGroup`
+        // — which takes the group's role, encryption configuration, tag key boundaries, chat
+        // channels, CloudTrail flag and cross-account configurations and nothing else
+        // (`smithy_query(query="operation",operation="UpdateInvestigationGroup")`) — so a
+        // declaration restating it asks for a DIFFERENT group. (Its `Name` is in that same
+        // position through [`name_is_create_only`], that call taking no name either.)
+        AIOPS_INVESTIGATION_GROUP => &["RetentionInDays"],
         // A custom game build keeps what its create made it with: the operating system its
         // binaries run on, the server SDK version they were integrated with and the Amazon S3
         // location the files were read from are members of `CreateBuild` and of no member of

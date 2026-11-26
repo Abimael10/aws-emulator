@@ -135,6 +135,10 @@ pub mod declared_properties;
 /// about a value.
 pub mod patterned_properties;
 
+/// How LONG a property's value may be, which is the question its schema's `minLength` and
+/// `maxLength` make decidable about that value.
+pub mod bounded_properties;
+
 /// Which TYPE a property's value has to have, which is the first question its schema makes
 /// decidable about that value.
 pub mod typed_properties;
@@ -443,6 +447,14 @@ pub const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: crate::state::template::SSM_QUICKSETUP_CONFIGURATION_MANAGER,
         required: &["ConfigurationDefinitions"],
     },
+    // `AWS::AIOps::InvestigationGroup`: an investigation group gathers its investigation data
+    // AS a role — `CreateInvestigationGroup` declares `roleArn` required beside the `name` that
+    // call also takes, which is the one CloudFormation may generate — so a declaration stating
+    // no role describes a group that could investigate nothing.
+    RequiredProperties {
+        resource_type: crate::state::template::AIOPS_INVESTIGATION_GROUP,
+        required: &["RoleArn"],
+    },
 ];
 
 /// One group of properties a resource type's schema admits AT MOST ONE of: the `oneOf` that
@@ -556,12 +568,14 @@ pub fn member_path(logical_id: &str, property: &[&str]) -> String {
 /// ([`structured_properties`]) and the scalar TYPE it states
 /// ([`typed_properties`]), then the set it publishes (the one this emulator knows from the
 /// type's property reference, [`CONSTRAINED_PROPERTIES`], and the one its registry schema
-/// states as an `enum`, [`enum_properties`]), and then the pattern it admits
-/// ([`patterned_properties`]) and the numeric range it admits ([`ranged_properties`]), since a
-/// value of another type is no value of a published set and a value outside such a set is not
-/// one of its values whatever it is spelled like — while the spelling a text is held to and the
-/// bound a number is held to are questions about values of two different types, so neither can
-/// stand in for the other.
+/// states as an `enum`, [`enum_properties`]), then the length bounds it states
+/// ([`bounded_properties`]), the pattern it admits ([`patterned_properties`]) and the numeric
+/// range it admits ([`ranged_properties`]), since a value of another type is no value of a
+/// published set and a value outside such a set is not one of its values whatever it is spelled
+/// like — while the spelling a text is held to and the bound a number is held to are questions
+/// about values of two different types, so neither can stand in for the other, and a text
+/// outside its LENGTH bounds is reported as that rather than as a spelling, which is the verdict
+/// a schema validator reports for a value that is both too short and mis-spelled.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
         missing_required_property(resource)
@@ -571,6 +585,7 @@ pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
             .or_else(|| typed_properties::value_of_another_type(resource))
             .or_else(|| inadmissible_value(resource))
             .or_else(|| enum_properties::value_outside_its_enum(resource))
+            .or_else(|| bounded_properties::value_outside_its_length(resource))
             .or_else(|| patterned_properties::value_outside_its_pattern(resource))
             .or_else(|| ranged_properties::value_outside_its_range(resource))
     })

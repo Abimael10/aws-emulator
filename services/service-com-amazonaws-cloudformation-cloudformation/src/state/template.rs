@@ -3008,6 +3008,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ACMPCA_CERTIFICATE,
     ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
+    // The Amazon CloudWatch investigations INVESTIGATION GROUP, publishing the ARN that
+    // service minted for it — the one return value these naming rules compute a stand-in for
+    // before the group exists.
+    AIOPS_INVESTIGATION_GROUP,
     APIGATEWAY_ACCOUNT,
     APIGATEWAY_API_KEY,
     APIGATEWAY_AUTHORIZER,

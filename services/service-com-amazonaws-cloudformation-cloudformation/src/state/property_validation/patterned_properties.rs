@@ -159,6 +159,25 @@ pub const PATTERNED_PROPERTIES: &[PatternedProperty] = &[
         property: &["Widgets", "Description"],
         pattern: r"^(?!.* {2})[ a-zA-Z0-9.,!?;:@#$%&\-_/\\]*$",
     },
+    // `AWS::AIOps::InvestigationGroup`'s `RoleArn` is `CreateInvestigationGroup$roleArn`, "the
+    // ARN of the IAM role that CloudWatch investigations will use when it gathers investigation
+    // data", and its `Name` that call's `name`, "a name for the investigation group" — the forms
+    // that service publishes for those members
+    // (`smithy_query(query="operation",operation="CreateInvestigationGroup")` of the
+    // `com-amazonaws-aiops-aiops` model: `^arn:.*$` and
+    // `^[\-_A-Za-z0-9\[\]\(\)\{\}\.: ]+$`), which this type's schema states verbatim, anchors
+    // and all. A value outside either is one that service would refuse, so the stage that runs
+    // before provisioning refuses it first.
+    PatternedProperty {
+        resource_type: crate::state::template::AIOPS_INVESTIGATION_GROUP,
+        property: &["Name"],
+        pattern: r"^[\-_A-Za-z0-9\[\]\(\)\{\}\.: ]+$",
+    },
+    PatternedProperty {
+        resource_type: crate::state::template::AIOPS_INVESTIGATION_GROUP,
+        property: &["RoleArn"],
+        pattern: r"^arn:.*$",
+    },
     // `AWS::BackupGateway::Hypervisor`'s properties, in the order its own property reference
     // publishes them, each held to the form Backup Gateway publishes for the member of
     // `ImportHypervisorConfiguration`/`UpdateHypervisor` the property is passed to, which this
@@ -251,7 +270,7 @@ fn admits(pattern: &'static str, value: &str) -> bool {
 /// first failure from, and at most [`MAX_JUDGED_VALUES`] of them. A member the declaration does
 /// not carry, a value that is not text and a chain that runs into a value no member can be read
 /// off contribute nothing: none of them is a spelling this stage judges.
-fn judged_values<'a>(document: &'a Value, chain: &[&str]) -> Vec<(Vec<String>, &'a str)> {
+pub(super) fn judged_values<'a>(document: &'a Value, chain: &[&str]) -> Vec<(Vec<String>, &'a str)> {
     let mut found = Vec::new();
     collect(document, chain, &mut Vec::new(), &mut found);
     found

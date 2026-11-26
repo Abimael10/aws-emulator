@@ -127,6 +127,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // An Amazon CloudWatch investigations investigation group, identified by the ARN that
+        // service minted for it ("Ref returns the Arn"), which is the `identifier` every
+        // investigation-group API takes; its own `Name` is only what the group is called, and
+        // no ARN a template states could be it.
+        AIOPS_INVESTIGATION_GROUP => "Arn",
         // An Amazon GameLift Servers build and a Realtime script, each identified by the id
         // that service minted for it ("Ref returns the build ID" / "the script ID") — the
         // `BuildId`/`ScriptId` every call on one takes; each type's own `Name` is only what
