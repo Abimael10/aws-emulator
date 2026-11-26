@@ -586,9 +586,25 @@ pub fn new_rule_id() -> String {
     hex::encode(bytes)
 }
 
+/// The canonical form a collection member enters a [`fingerprint`] in: its entries in
+/// sorted order.
+///
+/// A collection whose STORED form carries no order — a list the handler keys by one of
+/// its members, or a map — is a set as far as an idempotent replay is concerned, so the
+/// incidental order the request happened to list it in must not reach the hash: two
+/// requests whose parameters are equal fingerprint equal, however each listed them.
+pub fn canonical_collection(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut entries: Vec<String> = entries.into_iter().collect();
+    entries.sort();
+    entries
+}
+
 /// A stable fingerprint of the parameters a request carried, used to tell a genuine
 /// idempotent replay (same token, same parameters) from a token reused with a changed
 /// parameter.
+///
+/// Every collection member folded in here goes through [`canonical_collection`] first, so
+/// the fingerprint is a function of the parameters and not of their order on the wire.
 pub fn fingerprint(fields: &[String]) -> String {
     // `\u{1f}` (unit separator) cannot appear in any of the modelled patterns these
     // fields come from, so joining on it cannot make two different requests collide.

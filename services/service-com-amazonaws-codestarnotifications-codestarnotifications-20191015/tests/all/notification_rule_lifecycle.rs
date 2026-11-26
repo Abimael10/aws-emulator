@@ -716,6 +716,201 @@ async fn an_idempotency_token_replays_the_first_rule() {
     }
 }
 
+/// Every permutation of three positions — the whole order space of a three-entry
+/// collection, used to re-list one in every order a caller could have sent it.
+const PERMUTATIONS_OF_THREE: [[usize; 3]; 6] = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+];
+
+/// One replay whose collections changed in CONTENT, which stays a changed parameter.
+struct ChangedCase<'a> {
+    label: &'a str,
+    targets: Vec<(&'a str, &'a str)>,
+    event_ids: Vec<&'a str>,
+}
+
+/// The collections a `ClientRequestToken` is matched on carry no order in the rule a
+/// create stores, so a replay that differs only in the order it lists one of them reports
+/// the first request's rule — while a replay that changes what a collection CONTAINS is
+/// still the "repeated with a changed parameter" the member refuses.
+///
+/// The replaying rows walk every permutation of both three-entry collections (and a
+/// re-listed address, which is one subscription); the refused rows change the content of
+/// each collection in every way one can change: an entry's value, an entry added, an entry
+/// removed. (`Tags` has no wire order to vary: a JSON object's members reach the handler
+/// key-ordered, and the rule stores them key-ordered too.)
+#[tokio::test]
+async fn an_idempotent_replay_ignores_the_order_a_collection_was_listed_in() {
+    let emulator = Emulator::new();
+
+    const TARGETS: [(&str, &str); 3] = [
+        ("SNS", "arn:aws:sns:us-east-1:123456789012:order-a"),
+        ("SNS", "arn:aws:sns:us-east-1:123456789012:order-b"),
+        (
+            "AWSChatbotSlack",
+            "arn:aws:chatbot::123456789012:chat-configuration/slack-channel/order",
+        ),
+    ];
+    // Three catalogued CodeCommit event types (the catalog in src/state.rs, whose source
+    // is `EventTypeSummary$EventTypeId`'s own documentation).
+    const EVENT_IDS: [&str; 3] = [
+        "codecommit-repository-pull-request-created",
+        "codecommit-repository-comments-on-commits",
+        "codecommit-repository-branches-and-tags-created",
+    ];
+    const TOKEN: &str = "order-insensitive-token";
+    const NAME: &str = "order-insensitive";
+
+    fn request(targets: &[(&str, &str)], event_ids: &[&str]) -> Value {
+        json!({
+            "Name": NAME,
+            "Resource": "arn:aws:codecommit:us-east-1:123456789012:MyRepo",
+            "DetailType": "BASIC",
+            "EventTypeIds": event_ids,
+            "Targets": targets.iter().map(target_json).collect::<Vec<_>>(),
+            "Tags": { "Team": "dev", "env": "prod" },
+            "ClientRequestToken": TOKEN,
+        })
+    }
+
+    let first = emulator
+        .ok(
+            "the first create",
+            "/createNotificationRule",
+            &request(&TARGETS, &EVENT_IDS),
+        )
+        .await;
+    let arn = string(&first, "Arn");
+
+    for targets_order in PERMUTATIONS_OF_THREE {
+        for event_order in PERMUTATIONS_OF_THREE {
+            let case = format!("targets {targets_order:?}, event ids {event_order:?}");
+            let targets: Vec<(&str, &str)> =
+                targets_order.iter().map(|index| TARGETS[*index]).collect();
+            let event_ids: Vec<&str> = event_order
+                .iter()
+                .map(|index| EVENT_IDS[*index])
+                .collect();
+            let replay = emulator
+                .ok(&case, "/createNotificationRule", &request(&targets, &event_ids))
+                .await;
+            assert_eq!(
+                string(&replay, "Arn"),
+                arn,
+                "case {case:?}: a replay that only reorders a collection must report the \
+                 first rule {arn:?}, got {replay}"
+            );
+        }
+    }
+
+    // A repeated address is one subscription, with the type last given for it, so naming
+    // an address twice is the same parameter as naming it once.
+    let mut repeated: Vec<(&str, &str)> = TARGETS.to_vec();
+    repeated.insert(0, TARGETS[2]);
+    let replay = emulator
+        .ok(
+            "a repeated target address",
+            "/createNotificationRule",
+            &request(&repeated, &EVENT_IDS),
+        )
+        .await;
+    assert_eq!(
+        string(&replay, "Arn"),
+        arn,
+        "case \"a repeated target address\": expected the first rule {arn:?}, got {replay}"
+    );
+
+    let changed = [
+        ChangedCase {
+            label: "one target address changed",
+            targets: vec![
+                TARGETS[0],
+                ("SNS", "arn:aws:sns:us-east-1:123456789012:order-c"),
+                TARGETS[2],
+            ],
+            event_ids: EVENT_IDS.to_vec(),
+        },
+        ChangedCase {
+            label: "one target type changed",
+            targets: vec![("AWSChatbotSlack", TARGETS[0].1), TARGETS[1], TARGETS[2]],
+            event_ids: EVENT_IDS.to_vec(),
+        },
+        ChangedCase {
+            label: "a target removed",
+            targets: vec![TARGETS[0], TARGETS[1]],
+            event_ids: EVENT_IDS.to_vec(),
+        },
+        ChangedCase {
+            label: "a target added",
+            targets: vec![
+                TARGETS[0],
+                TARGETS[1],
+                TARGETS[2],
+                ("SNS", "arn:aws:sns:us-east-1:123456789012:order-d"),
+            ],
+            event_ids: EVENT_IDS.to_vec(),
+        },
+        ChangedCase {
+            label: "one event id changed",
+            targets: TARGETS.to_vec(),
+            event_ids: vec![
+                EVENT_IDS[0],
+                EVENT_IDS[1],
+                "codecommit-repository-pull-request-merged",
+            ],
+        },
+        ChangedCase {
+            label: "an event id removed",
+            targets: TARGETS.to_vec(),
+            event_ids: vec![EVENT_IDS[0], EVENT_IDS[1]],
+        },
+    ];
+    for ChangedCase {
+        label,
+        targets,
+        event_ids,
+    } in &changed
+    {
+        let (status, parsed) = emulator
+            .post("/createNotificationRule", &request(targets, event_ids))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: a token reused with changed collection content is refused, \
+             got {status} with {parsed}"
+        );
+        assert_eq!(
+            error_code(&parsed),
+            "ValidationException",
+            "case {label:?}: got {parsed}"
+        );
+    }
+
+    // Neither the replays nor the refusals created a second rule.
+    let listed = emulator
+        .ok("after the replays", "/listNotificationRules", &json!({}))
+        .await;
+    let matching = listed
+        .get("NotificationRules")
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter(|summary| string(summary, "Arn") == arn)
+                .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        matching, 1,
+        "case \"after the replays\": exactly one rule must exist for {arn:?}, got {listed}"
+    );
+}
+
 /// Describing an ARN the store does not hold is a 404.
 #[tokio::test]
 async fn describing_an_unknown_rule_is_a_404() {

@@ -233,22 +233,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The parameters this token is allowed to replay: anything else under the same
-        // token is the "repeated with a changed parameter" the member documents.
+        // token is the "repeated with a changed parameter" the member documents. The
+        // scalars enter in a fixed order; every COLLECTION enters canonically ordered,
+        // because none of them carries an order in the rule this request would store, so
+        // the order the request listed one in is not a parameter of the request.
         let mut fields = vec![
             input.name.clone(),
             input.resource.clone(),
             input.detail_type.clone(),
             status.clone(),
         ];
-        let mut sorted_event_type_ids = input.event_type_ids.clone();
-        sorted_event_type_ids.sort();
-        fields.extend(sorted_event_type_ids);
-        fields.extend(
+        fields.extend(st::canonical_collection(
+            input.event_type_ids.iter().cloned(),
+        ));
+        fields.extend(st::canonical_collection(
             targets
                 .iter()
                 .map(|t| format!("{}={}", t.target_type, t.target_address)),
-        );
-        fields.extend(tags.iter().map(|(k, v)| format!("{k}={v}")));
+        ));
+        fields.extend(st::canonical_collection(
+            tags.iter().map(|(k, v)| format!("{k}={v}")),
+        ));
         let fingerprint = st::fingerprint(&fields);
 
         let Some(state) = st::service_state(&*self.engine) else {
