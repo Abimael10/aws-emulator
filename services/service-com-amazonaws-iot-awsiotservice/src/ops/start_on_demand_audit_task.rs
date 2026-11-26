@@ -194,8 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over the resources the account holds right now, and what each amounted to is what
         // the task then reports.
         let checks = crate::state::run_checks(&store, &input.target_check_names, started_at);
-        // "The ID of the on-demand audit you started" — an opaque token of the width and
-        // character class AWS answers an audit with, unique to this audit, and within
+        // "The ID of the on-demand audit you started" — a single-cased hexadecimal token of
+        // the width AWS answers an audit with, unique to this audit, and within
         // `AuditTaskId`'s modelled length and pattern. An id can only be minted from the
         // system random source, so a source that cannot be read starts no audit.
         let task_id = crate::state::mint_audit_task_id(&store).ok_or_else(|| {

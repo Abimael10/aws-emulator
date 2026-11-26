@@ -15,8 +15,8 @@
 //!   enabled;
 //! * a `taskId` the account started no audit under is reported missing by one sentence,
 //!   whichever operation addressed the task and whatever form the id took;
-//! * the id `StartOnDemandAuditTask` mints is an OPAQUE fixed-width token of mixed-case
-//!   ASCII letters and digits, unique per audit, and the audit is readable back under it;
+//! * the id `StartOnDemandAuditTask` mints is a hyphen-free lowercase hexadecimal token of
+//!   fixed width, unique per audit, and the audit is readable back under it;
 //! * every check entry `DescribeAuditTask` reports carries the three resource counters,
 //!   zero while the check has performed none of them — one still in progress, and one the
 //!   cancel of its audit stopped — and the counts of what it evaluated once it has run.
@@ -28,8 +28,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_iot_awsiotservice::state::{
-    ComAmazonawsIotAwsiotserviceState, AUDIT_SPAN, AUDIT_TASK_COMPLETED, AUDIT_TASK_ID_ALPHABET,
-    AUDIT_TASK_ID_LENGTH, AUDIT_TASK_IN_PROGRESS,
+    ComAmazonawsIotAwsiotserviceState, AUDIT_SPAN, AUDIT_TASK_COMPLETED, AUDIT_TASK_IN_PROGRESS,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -408,11 +407,11 @@ async fn a_task_id_no_audit_was_started_under_is_reported_missing_by_one_sentenc
     }
 }
 
-/// RULE: the id an on-demand audit is started under is an opaque fixed-width token of
-/// mixed-case ASCII letters and digits, unique per audit, and the audit is readable back
-/// under it.
+/// RULE: the id an on-demand audit is started under is a hyphen-free lowercase
+/// hexadecimal token of fixed width — the shape class AWS identifies a Device Defender
+/// audit task in — unique per audit, and the audit is readable back under it.
 #[tokio::test]
-async fn a_started_audit_is_identified_by_an_opaque_fixed_width_token() {
+async fn a_started_audit_is_identified_by_a_lowercase_hexadecimal_token() {
     let emulator = Emulator::new();
     let enabled = [
         LOGGING_DISABLED_CHECK,
@@ -422,56 +421,52 @@ async fn a_started_audit_is_identified_by_an_opaque_fixed_width_token() {
     emulator.enable_checks("minted ids", &enabled).await;
 
     // The rows differ along what the audit targeted, which nothing about the id depends
-    // on; each row is started repeatedly, so the uniqueness and the character class are
-    // read over many minted ids rather than one.
+    // on; each row is started repeatedly, so the uniqueness and the shape are read over
+    // many minted ids rather than one.
     let targets: &[(&str, &[&str])] = &[
         ("one check", &enabled[..1]),
         ("two checks", &enabled[..2]),
         ("every enabled check", &enabled),
     ];
     let mut minted: BTreeSet<String> = BTreeSet::new();
-    let mut characters: BTreeSet<char> = BTreeSet::new();
     for (targeted, check_names) in targets {
         for attempt in 0..8 {
             let case = format!("an audit over {targeted} (attempt {attempt})");
             let task_id = emulator.started_audit(&case, check_names).await;
 
-            // The WIDTH AWS's own audit task ids are observed at, written out rather than
-            // read off the implementation's constant, so a change to that constant cannot
-            // leave this row green.
+            // The SHAPE CLASS, written out rather than read off the implementation, so a
+            // change to how the id is minted cannot leave this row green: 32 characters of
+            // lowercase hexadecimal, with no hyphen in them.
             assert_eq!(
                 task_id.chars().count(),
-                20,
-                "case {case}: expected an id of 20 characters, got {task_id:?}"
-            );
-            assert_eq!(
-                task_id.chars().count(),
-                AUDIT_TASK_ID_LENGTH,
-                "case {case}: expected an id of {AUDIT_TASK_ID_LENGTH} characters, got {task_id:?}"
-            );
-            // Every character is an ASCII letter or digit — the class the ids are observed
-            // in — which is also what the emulator's alphabet holds.
-            assert!(
-                task_id.chars().all(|character| character.is_ascii_alphanumeric()),
-                "case {case}: expected a mixed-case alphanumeric id, got {task_id:?}"
+                32,
+                "case {case}: expected an id of 32 characters, got {task_id:?}"
             );
             assert!(
-                task_id
-                    .bytes()
-                    .all(|byte| AUDIT_TASK_ID_ALPHABET.contains(&byte)),
-                "case {case}: expected every character drawn from the id's alphabet, got \
-                 {task_id:?}"
+                task_id.chars().all(|character| character.is_ascii_digit()
+                    || ('a'..='f').contains(&character)),
+                "case {case}: expected a lowercase hexadecimal id, got {task_id:?}"
             );
             assert!(
                 !task_id.contains('-'),
-                "case {case}: an audit task id carries no hyphen, got {task_id:?}"
+                "case {case}: expected an id with no hyphen in it, got {task_id:?}"
+            );
+            // Inside `AuditTaskId`'s modelled bound
+            // (`smithy_query(query="shape",shape="AuditTaskId")`: len 1..40,
+            // pattern ^[a-zA-Z0-9\-]+$).
+            assert!(
+                (1..=40).contains(&task_id.chars().count())
+                    && task_id
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+                "case {case}: expected an id inside AuditTaskId's length and pattern, got \
+                 {task_id:?}"
             );
             assert!(
                 minted.insert(task_id.clone()),
                 "case {case}: expected an id no earlier audit was started under, got the \
                  already-issued {task_id:?}"
             );
-            characters.extend(task_id.chars());
 
             // ROUND TRIP: the audit is readable back under exactly the id it answered.
             let report = emulator.reported_audit(&case, &task_id).await;
@@ -481,20 +476,6 @@ async fn a_started_audit_is_identified_by_an_opaque_fixed_width_token() {
                 "case {case}: expected the audit started on demand, got {report}"
             );
         }
-    }
-
-    // The CLASS the ids are drawn from, read over every character of every id above:
-    // upper-case letters, lower-case letters and digits all occur.
-    for (class, present) in [
-        ("an upper-case letter", char::is_ascii_uppercase as fn(&char) -> bool),
-        ("a lower-case letter", char::is_ascii_lowercase as fn(&char) -> bool),
-        ("a digit", char::is_ascii_digit as fn(&char) -> bool),
-    ] {
-        assert!(
-            characters.iter().any(present),
-            "case {class}: expected the minted ids to draw on it, got the characters \
-             {characters:?}"
-        );
     }
 }
 

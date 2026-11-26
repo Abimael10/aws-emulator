@@ -76,21 +76,21 @@ pub const CHECK_CANCELED: &str = "CANCELED";
 /// [`super::MAX_TOPIC_RULES`]).
 pub const MAX_AUDIT_TASKS: usize = 1_000;
 
-/// How many characters an audit task id has.
+/// How many bytes of randomness an audit task id carries.
 ///
-/// `AuditTaskId` is modelled `length 1..40, pattern ^[a-zA-Z0-9\-]+$`
-/// (`smithy_query(query="shape",shape="AuditTaskId")`), and AWS IoT Device Defender hands
-/// an audit task an OPAQUE token of this width, not an identifier of another family: 20
-/// characters drawn from [`AUDIT_TASK_ID_ALPHABET`], so a client that stores or validates
-/// audit task ids against the width and character class it observes reads one of them
-/// here too.
-pub const AUDIT_TASK_ID_LENGTH: usize = 20;
+/// Hex-encoded, so the id is [`AUDIT_TASK_ID_LENGTH`] characters wide.
+pub const AUDIT_TASK_ID_BYTES: usize = 16;
 
-/// The characters an audit task id is drawn from: mixed-case ASCII letters and digits,
-/// the character class of the id AWS answers an audit with — a subset of what the modelled
-/// `AuditTaskId` pattern admits, with no hyphen in it.
-pub const AUDIT_TASK_ID_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/// How many characters an audit task id has: twice [`AUDIT_TASK_ID_BYTES`], the width of
+/// its hex encoding.
+///
+/// An audit task is identified by a single-cased hexadecimal token of this width — the
+/// form AWS IoT Device Defender's own `taskId` examples take, and not an identifier of
+/// another family — which `AuditTaskId`'s modelled `length 1..40, pattern
+/// ^[a-zA-Z0-9\-]+$` (`smithy_query(query="shape",shape="AuditTaskId")`) admits, so a
+/// client that sizes, parses or regex-validates the audit task ids it observes reads one
+/// of them here too.
+pub const AUDIT_TASK_ID_LENGTH: usize = 2 * AUDIT_TASK_ID_BYTES;
 
 /// The audit check whose rule is about the account's logging configuration.
 pub const LOGGING_DISABLED_CHECK: &str = "LOGGING_DISABLED_CHECK";
@@ -450,8 +450,7 @@ impl AuditTask {
 }
 
 /// Mint an audit task id no audit of this account is recorded under, or `None` when the
-/// system random source this service draws every secret and every opaque token from
-/// cannot be read.
+/// system random source this service draws every opaque token from cannot be read.
 ///
 /// The loop re-mints on the (astronomically unlikely) collision, so two
 /// `StartOnDemandAuditTask` calls can never be handed the same id.
@@ -464,33 +463,16 @@ pub fn mint_audit_task_id(store: &ComAmazonawsIotAwsiotserviceState) -> Option<S
     }
 }
 
-/// A fresh audit task id: [`AUDIT_TASK_ID_LENGTH`] characters of
-/// [`AUDIT_TASK_ID_ALPHABET`], drawn from the system random source.
+/// A fresh audit task id: [`AUDIT_TASK_ID_BYTES`] bytes of the system random source,
+/// hex-encoded, so the id is [`AUDIT_TASK_ID_LENGTH`] characters of lowercase hexadecimal.
 ///
-/// The alphabet does not divide the 256 values a byte holds, so a byte at or above the
-/// largest multiple of it a byte reaches is DROPPED rather than folded onto the first few
-/// characters, and the next draw tops the id up: every character is uniform over the
-/// alphabet. `None` when the random source cannot be read at all — the id is never
-/// completed from anything less, which is the same answer certificate material gives
+/// `None` when the random source cannot be read at all — the id is never completed from
+/// anything less, which is the same answer certificate material gives
 /// ([`super::certificates`]).
 fn fresh_audit_task_id() -> Option<String> {
-    /// The byte values that map onto the alphabet without bias.
-    const UNBIASED: usize = 256 - 256 % AUDIT_TASK_ID_ALPHABET.len();
-
-    let mut id = String::with_capacity(AUDIT_TASK_ID_LENGTH);
-    while id.len() < AUDIT_TASK_ID_LENGTH {
-        let mut drawn = [0u8; AUDIT_TASK_ID_LENGTH];
-        ::aws_lc_rs::rand::fill(&mut drawn).ok()?;
-        for byte in drawn.into_iter().map(usize::from).filter(|b| *b < UNBIASED) {
-            if id.len() == AUDIT_TASK_ID_LENGTH {
-                break;
-            }
-            id.push(char::from(
-                AUDIT_TASK_ID_ALPHABET[byte % AUDIT_TASK_ID_ALPHABET.len()],
-            ));
-        }
-    }
-    Some(id)
+    let mut drawn = [0u8; AUDIT_TASK_ID_BYTES];
+    ::aws_lc_rs::rand::fill(&mut drawn).ok()?;
+    Some(::hex::encode(drawn))
 }
 
 /// Check that every name in `target_check_names` is an audit check this account has
