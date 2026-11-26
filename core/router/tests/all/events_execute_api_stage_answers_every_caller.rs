@@ -65,8 +65,15 @@ const SERVED_DEADLINE: Duration = Duration::from_secs(30);
 const SERVED_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Where a client dials one method of the deployed stage.
+///
+/// `pub(crate)` with [`signing_user`], [`served_within`], [`wired`] and [`body_of`] for the reason
+/// the header gives: a sibling suite that dials this same stage as a client before it publishes
+/// anything ([`crate::events_execute_api_denial_is_observable_for_every_event`]) makes that
+/// request, wires its own rules and reads what the sink holds through them, so there is ONE
+/// wording of a client's own signed dial, of a target of this method and of a sink message for
+/// both.
 #[derive(Clone, Copy, Debug)]
-enum Address {
+pub(crate) enum Address {
     /// The api's own invoke host, which is how a client outside this process addresses it.
     InvokeHost,
     /// The address this emulator serves every stage at, which is what its endpoint publishes.
@@ -127,7 +134,11 @@ fn credential_scope(access_key_id: &str) -> String {
 /// One IAM user of this account holding a long-term access key and, when it carries one,
 /// `document` as its one inline policy — answering the key id a request of that user signs with.
 /// `None` is a user carrying no identity-based document at all.
-async fn signing_user(router: &MultiServiceRouter, name: &str, document: Option<&str>) -> String {
+pub(crate) async fn signing_user(
+    router: &MultiServiceRouter,
+    name: &str,
+    document: Option<&str>,
+) -> String {
     iam(
         router,
         &format!("CreateUser({name})"),
@@ -195,7 +206,7 @@ async fn signed_post(
 
 /// Dial the stage until it answers `200`, or [`SERVED_DEADLINE`] passes — the one condition this
 /// suite waits on at the stage, so a row never depends on how fast the host runs.
-async fn served_within(
+pub(crate) async fn served_within(
     router: &MultiServiceRouter,
     api: &str,
     address: Address,
@@ -227,7 +238,7 @@ fn message_of(text: &str) -> String {
 
 /// The document a message carries as its body, which for a message at the sink is the one the
 /// method's integration template wrote out of the request the method served.
-fn body_of(case: &str, message: &Value) -> Value {
+pub(crate) fn body_of(case: &str, message: &Value) -> Value {
     message["Body"]
         .as_str()
         .and_then(|text| serde_json::from_str(text).ok())
@@ -236,7 +247,7 @@ fn body_of(case: &str, message: &Value) -> Value {
 
 /// Wire one rule of the custom bus to the stage's method as `role_arn`, contributing `header` and
 /// dead-lettering to the stage's own queue, and answer the rule's ARN.
-async fn wired(
+pub(crate) async fn wired(
     router: &MultiServiceRouter,
     case: &str,
     stage: &Deployed,

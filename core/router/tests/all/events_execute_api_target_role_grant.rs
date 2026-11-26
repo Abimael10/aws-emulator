@@ -333,6 +333,87 @@ pub(crate) fn assert_forbidden_sentence(case: &str, message: &str, path: &str) -
     request_id
 }
 
+/// Another action of the same service, which is a document that grants a role everything except
+/// the one action a delivery performs — the scoping every suite of this span withholds the invoke
+/// by, spelled once here.
+pub(crate) const OTHER_ACTION: &str = "execute-api:InvalidateCache";
+
+/// Assert that the queue at `dead_letter_url` holds exactly the ONE dead letter a refused delivery
+/// of the event addressing `id` leaves — the permission condition, the sentence the answer the
+/// invoke endpoint gave such an identity is worded in, the target's own ARN, the ARN of the rule
+/// that invoked it and the event itself as the parked body — then empty it and answer the request
+/// id that sentence names the answered request by.
+pub(crate) async fn assert_refused_dead_letter(
+    router: &MultiServiceRouter,
+    case: &str,
+    stage: &Deployed,
+    dead_letter_url: &str,
+    rule_arn: &str,
+    id: &str,
+) -> String {
+    let dead = messages(router, case, dead_letter_url, 1).await;
+    assert_eq!(
+        dead.len(),
+        1,
+        "case {case:?}: expected the one dead letter this refused delivery produced, got {dead:?}"
+    );
+    assert_eq!(
+        attribute(&dead[0], "ERROR_CODE").as_deref(),
+        Some(NO_PERMISSIONS),
+        "case {case:?}: expected the {NO_PERMISSIONS:?} condition, got {}",
+        dead[0]
+    );
+    let request_id = assert_forbidden_sentence(
+        case,
+        &attribute(&dead[0], "ERROR_MESSAGE").unwrap_or_default(),
+        &format!("/_aws/execute-api/{}/{STAGE}/orders/{id}", stage.api),
+    );
+    assert_eq!(
+        attribute(&dead[0], "TARGET_ARN").as_deref(),
+        Some(stage.target_arn().as_str()),
+        "case {case:?}: expected the target's own ARN on the dead letter, got {}",
+        dead[0]
+    );
+    assert_eq!(
+        attribute(&dead[0], "RULE_ARN").as_deref(),
+        Some(rule_arn),
+        "case {case:?}: expected the invoking rule's ARN on the dead letter, got {}",
+        dead[0]
+    );
+    // The event itself is what is parked, so a consumer of the queue has the delivery that failed
+    // beside why it failed — and knows WHICH event it was.
+    let parked: Value = dead[0]["Body"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the published event as the dead letter's body, got {}",
+                dead[0]
+            )
+        });
+    assert_eq!(
+        parked["detail"]["id"].as_str(),
+        Some(id),
+        "case {case:?}: expected the parked event to be the one published, got {parked}"
+    );
+    drained(router, case, dead_letter_url).await;
+    request_id
+}
+
+/// Assert that no two of the `request_ids` collected from a run of refused deliveries are the
+/// same: each attempt is answered on its own, so each sentence names the id of its own answer.
+pub(crate) fn assert_distinct_request_ids(case: &str, request_ids: &[String]) {
+    for (first, id_of_first) in request_ids.iter().enumerate() {
+        for id_of_second in &request_ids[first + 1..] {
+            assert_ne!(
+                id_of_first, id_of_second,
+                "case {case:?}: expected each refused delivery to name the id of its own answer, \
+                 got {id_of_first:?} twice"
+            );
+        }
+    }
+}
+
 /// One row of the grant table: which document is in force on the target's role, and whether the
 /// stage then serves the delivery.
 struct Grant {
