@@ -752,21 +752,21 @@ impl StoredDbms {
         });
     }
 
-    /// The `DatabaseStatus` a database of an application whose `ApplicationStatus` is
-    /// `application_status` reports.
+    /// The `DatabaseStatus` a database of an application reports, given the
+    /// `ApplicationStatus` that application's running state follows from
+    /// ([`StoredApplication::established_status`]) — `None` where the service has
+    /// established none.
     ///
     /// A database lives in the connected DBMS, so the status it reports is that DBMS's —
-    /// but only from a status in which the service has established what the application
-    /// runs at all. For any other application status (its registration is still under way,
-    /// or discovery never succeeded) nothing is known about its databases, which is what
-    /// the model's `UNKNOWN` states.
-    pub fn status_for(&self, application_status: &str) -> &str {
-        match application_status {
-            APPLICATION_STATUS_ACTIVATED
-            | APPLICATION_STATUS_STARTING
-            | APPLICATION_STATUS_STOPPING
-            | APPLICATION_STATUS_STOPPED => self.status.as_str(),
-            _ => DATABASE_STATUS_UNKNOWN,
+    /// but only where the service has established what the application runs at all. Where
+    /// it has not (the registration is still under way, or its discovery never succeeded)
+    /// nothing is known about that application's databases, whatever this record says the
+    /// DBMS is, which is what the model's `UNKNOWN` states.
+    pub fn status_for(&self, established_status: Option<&str>) -> &str {
+        if established_status.is_some() {
+            self.status.as_str()
+        } else {
+            DATABASE_STATUS_UNKNOWN
         }
     }
 }
@@ -1006,6 +1006,37 @@ impl StoredApplication {
     /// rather than that work is in flight ([`failed_registration_message`]).
     pub fn registration_failed(&self) -> bool {
         self.discovery_status == DISCOVERY_STATUS_REGISTRATION_FAILED
+    }
+
+    /// The `ApplicationStatus` the running state of this application's SAP system follows
+    /// from, and `None` where the service has established none.
+    ///
+    /// Two things have to hold for the status to state what the application runs. The
+    /// service has to have DISCOVERED the application ([`Self::registered_successfully`]):
+    /// a registration still under way has found nothing yet and one that ended without
+    /// completing never will, so in neither case is there a system whose running state
+    /// anything could be reported from. And the status itself has to state a running state
+    /// at all — the application is up, or on its way up or down.
+    ///
+    /// The status ALONE is not that evidence, which is why both conditions are asked here:
+    /// a control call of this service is served against an application whose registration
+    /// is still under way or has failed ([`application_control_available`] gates work in
+    /// flight, not the registration outcome), so a never-discovered application also
+    /// reaches the transient and settled statuses of a stop while carrying its failed
+    /// discovery forward. Every reading of something INSIDE the application goes through
+    /// this ([`StoredDbms::status_for`], [`component_status_for`]), so none of them reports
+    /// a running state the service never established.
+    pub fn established_status(&self) -> Option<&str> {
+        if !self.registered_successfully() {
+            return None;
+        }
+        match self.status.as_str() {
+            status @ (APPLICATION_STATUS_ACTIVATED
+            | APPLICATION_STATUS_STARTING
+            | APPLICATION_STATUS_STOPPING
+            | APPLICATION_STATUS_STOPPED) => Some(status),
+            _ => None,
+        }
     }
 
     /// The `ApplicationDiscoveryStatus` this application is GOING to report: the one the
@@ -1288,7 +1319,7 @@ impl StoredApplication {
             child_components: None,
             application_id: Some(self.id.clone()),
             component_type: Some(component.component_type.clone()),
-            status: Some(component_status_for(&self.status).to_string()),
+            status: Some(component_status_for(self.established_status()).to_string()),
             // Discovered on the instance; see this method's docs.
             sap_hostname: None,
             sap_feature: None,
@@ -1398,7 +1429,7 @@ impl StoredApplication {
             database_name: Some(database.database_name.clone()),
             database_type: Some(database.database_type.clone()),
             arn: Some(database.arn.clone()),
-            status: Some(self.dbms.status_for(&self.status).to_string()),
+            status: Some(self.dbms.status_for(self.established_status()).to_string()),
             // Discovered on the HANA instance; see this method's docs.
             primary_host: None,
             sql_port: None,
@@ -2991,22 +3022,23 @@ pub fn component_arn(region: &str, application_id: &str, component_id: &str) -> 
     )
 }
 
-/// The `ComponentStatus` of a component of an application whose `ApplicationStatus` is
-/// `application_status`.
+/// The `ComponentStatus` of a component of an application, given the `ApplicationStatus`
+/// that application's running state follows from
+/// ([`StoredApplication::established_status`]) — `None` where the service has established
+/// none.
 ///
-/// A component runs as part of its application: starting, stopping and stopping an
-/// application is what starts and stops its components, so a component is up exactly
-/// while the application is up and is in the same transition while the application is in
-/// one. For any other application status — one where the service has not established what
-/// the application is running (its registration is still under way, or discovery never
-/// succeeded) — no component status follows from it, which is what the model's
-/// `UNDEFINED` states.
-pub fn component_status_for(application_status: &str) -> &'static str {
-    match application_status {
-        APPLICATION_STATUS_ACTIVATED => COMPONENT_STATUS_RUNNING,
-        APPLICATION_STATUS_STARTING => COMPONENT_STATUS_STARTING,
-        APPLICATION_STATUS_STOPPING => COMPONENT_STATUS_STOPPING,
-        APPLICATION_STATUS_STOPPED => COMPONENT_STATUS_STOPPED,
+/// A component runs as part of its application: starting and stopping an application is
+/// what starts and stops its components, so a component is up exactly while the
+/// application is up and is in the same transition while the application is in one. Where
+/// the service has not established what the application is running (its registration is
+/// still under way, or its discovery never succeeded) no component status follows from it,
+/// which is what the model's `UNDEFINED` states.
+pub fn component_status_for(established_status: Option<&str>) -> &'static str {
+    match established_status {
+        Some(APPLICATION_STATUS_ACTIVATED) => COMPONENT_STATUS_RUNNING,
+        Some(APPLICATION_STATUS_STARTING) => COMPONENT_STATUS_STARTING,
+        Some(APPLICATION_STATUS_STOPPING) => COMPONENT_STATUS_STOPPING,
+        Some(APPLICATION_STATUS_STOPPED) => COMPONENT_STATUS_STOPPED,
         _ => COMPONENT_STATUS_UNDEFINED,
     }
 }
