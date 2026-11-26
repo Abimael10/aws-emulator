@@ -39,3 +39,37 @@ Actual: the first forwarded message never appears, so the check is cut off with 
 5. SendMessage to the source queue and poll the results queue: AWS forwards the body within seconds; the emulator forwards nothing and the check is killed at its cap.
 6. Then UpdateEventSourceMapping(UUID, Enabled=False) -> State "Disabled", SendMessage again, confirm no invocation and that ReceiveMessage on the source queue still returns the message; UpdateEventSourceMapping(UUID, Enabled=True) and confirm that message is delivered.
 7. Re-replay lambda__pipes__sqs.sqs-esm-disabled-mapping-no-invocation-negative to confirm the fix.
+
+## Resolution
+
+Cause 1 is DECLINED as a per-run value: the whole of this report's evidence is one wall-clock
+duration — "Error: Check timed out after 60.0s", with no assertion reached — and no status,
+error code, message or member of the create/warm-up/disable/re-enable sequence differs. Every
+modelled observation the cause calls impossible is served, in the configuration the report
+describes, and now asserted end to end by
+`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/queue_mapping_name_form_delivery_gate.rs`:
+the execution role written through IAM's own `CreateRole`/`AttachRolePolicy`/`PutRolePolicy`
+carrying `AWSLambdaBasicExecutionRole` and `AWSLambdaSQSQueueExecutionRole` beside one inline
+`sqs:SendMessage` grant, a real `python3.12` package whose handler forwards each record it is
+handed to a second queue with its own AWS SDK, a source queue whose `VisibilityTimeout` is 30
+against a function `Timeout` of 10, and `CreateEventSourceMapping(BatchSize=1, Enabled=true)`
+— driven once per documented `FunctionName` form (name, function ARN, partial ARN), because
+the recorded request names its function by ARN and no suite drove that form through the data
+plane.
+
+Measured on this code base, as the legs the report lists: the mapping settles into `Enabled`
+in about half a second, the warm-up `SendMessage` is forwarded in under two seconds (its first
+invocation standing a `python3.12` environment up), `Enabled=false` settles in about half a
+second with the message sent afterwards left WAITING on the source queue — still handed over
+to a client's own `ReceiveMessage`, with nothing invoked — and `Enabled=true` hands exactly
+that withheld message over. The whole sequence converges in about six seconds, so what is left
+of the harness's one-minute budget is spent by the check's own host-side sequence (its
+long-polling drains and its sleep-driven poll loops), not inside the emulator.
+
+Audited and found already correct while tracing it, so no code changed: the poller's wake-up
+on a send (`service-com-amazonaws-sqs-amazonsqs/src/state/message_arrivals.rs`), the role the
+poller reads the queue as, including an AWS-managed attachment's document
+(`src/state/event_source_authorization.rs`), a mapping's `FunctionName` resolving to the stored
+function whichever documented form named it (`src/ops/create_event_source_mapping.rs`), and the
+release of a long-polling `ReceiveMessage` as soon as the queue has a message
+(`service-com-amazonaws-sqs-amazonsqs/src/ops/receive_message.rs`).
