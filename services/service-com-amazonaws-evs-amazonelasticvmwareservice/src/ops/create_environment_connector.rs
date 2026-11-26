@@ -7,6 +7,12 @@
 //! service holds no live environment for in the request's Region is a
 //! `ResourceNotFoundException`, and nothing is stored for it.
 //!
+//! Nothing of this service's own is minted until every refusal is behind the request: the
+//! `connectorId` is drawn from the store's shared id seed, which every id this service
+//! hands out draws from, so a create this service refuses leaves the seed where it was and
+//! the next id minted is the one the store would have minted anyway — the rule
+//! [`crate::ops::create_environment`] states for its own minting.
+//!
 //! The connector starts `CREATING` and the clock owes it the move to `ACTIVE`: "A
 //! connector allows the Amazon EVS control plane to interface with VCF appliances
 //! using a fully qualified domain name", which is a connection to establish rather
@@ -271,15 +277,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the re-stamp of the environment below is not dropped by the guard that keeps
         // a stamp from going backwards.
         let created_at_ms = crate::state::now_ms();
-        let connector_id = state.mint_connector_id();
 
         // The environment this create addresses, resolved through the rule every handler
-        // that acts on an environment shares (`live_environment_in_region_mut`): an
+        // that acts on an environment shares (`live_environment_in_region`): an
         // environment exists at the endpoint of the Region it was created in, so a
         // connector can only be created in one from that Region, and an environment that
         // has reached DELETED is gone.
+        //
+        // Resolved as a READ, because every refusal of this create is evaluated before
+        // anything of this service's own is minted: the id seed `mint_connector_id` draws
+        // from is shared by every id this service hands out, so a request that cannot be
+        // served must leave it where it was.
         let environment = state
-            .live_environment_in_region_mut(&region, &input.environment_id)
+            .live_environment_in_region(&region, &input.environment_id)
             .ok_or_else(|| {
                 CreateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
                     crate::state::environment_not_found(&input.environment_id),
@@ -352,6 +362,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pending =
             crate::state::PendingConnectorState::starting_now(crate::state::CONNECTOR_ACTIVE);
         let due_at = pending.due_at;
+        // Every refusal of this create is behind us, so this is where the connector id is
+        // minted: the mint advances the store's shared id seed, and a request this service
+        // refuses consumes none of it — the next id this service mints is the one it would
+        // have minted had the refused call never arrived.
+        let connector_id = state.mint_connector_id();
         let connector = crate::state::StoredConnector::creating(
             connector_id.clone(),
             &input.r#type,
@@ -360,6 +375,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at_ms,
             pending,
         );
+        // The environment resolved above, now for writing: the store's guard has been held
+        // without interruption since that read, so this is the same record and it resolves.
+        // Answering the modelled refusal rather than panicking if it somehow does not is
+        // the honest answer, and nothing has been stored for it.
+        let environment = state
+            .live_environment_in_region_mut(&region, &input.environment_id)
+            .ok_or_else(|| {
+                CreateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
         let created = match environment.connectors.entry(connector_id) {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(connector).to_wire(&environment_id)

@@ -3097,6 +3097,16 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         self.next_id_seed
     }
 
+    /// How many ids this store has minted so far.
+    ///
+    /// A READ, and the one this store offers of its id seed: every mint below draws from
+    /// that counter, so this is what says whether a call consumed an id. A request this
+    /// service refuses consumes none — ids are minted only once every refusal of the
+    /// request is behind it — so this value is unchanged by a refused create.
+    pub fn minted_id_count(&self) -> u64 {
+        self.next_id_seed
+    }
+
     /// Mint an `environmentId`: `env-` + exactly ten lowercase hex characters, which
     /// satisfies the modelled `^(env-[a-zA-Z0-9]{10})$`. Distinct seeds XOR to
     /// distinct 40-bit values, so no two environments can collide.
