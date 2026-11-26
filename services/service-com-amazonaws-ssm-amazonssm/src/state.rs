@@ -401,6 +401,10 @@ pub mod compliance_items;
 /// with.
 pub mod compliance_summaries;
 
+/// The roll-up of the same items by the RESOURCE each is about, which
+/// `ListResourceComplianceSummaries` answers with.
+pub mod resource_compliance_summaries;
+
 /// The patch-baseline run Patch Manager performs on a managed node when the document it
 /// publishes for that is sent to one, and the compliance that run reports.
 pub mod patch_runs;

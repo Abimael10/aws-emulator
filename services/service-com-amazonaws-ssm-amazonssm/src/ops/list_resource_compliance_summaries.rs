@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceComplianceSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceComplianceSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceComplianceSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Returns a resource-level summary count. The summary includes information about compliant and
+//! non-compliant statuses and detailed compliance-item severity counts, according to the filter
+//! criteria you specify."
+//!
+//! WHAT THIS READS. The compliance items this service holds for the Region the request was
+//! signed for ([`crate::state::compliance_items`]: the ones Patch Manager gathered and the ones
+//! a `PutComplianceItems` wrote alike), rolled up by the RESOURCE each is about rather than by
+//! the compliance type ([`crate::state::resource_compliance_summaries`], where what each
+//! reported member counts is written) — so a put that changes a resource's items changes its
+//! summary on the next read, and nothing is kept beside the items.
+//!
+//! WHAT IT REFUSES: a `Filters` entry this read cannot narrow by is `InvalidFilter`, the same
+//! reading of a compliance filter the item read takes, and a `NextToken` this endpoint did not
+//! mint is `InvalidNextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +158,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceComplianceSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceComplianceSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceComplianceSummaries"))
+        use crate::state::compliance_items as compliance;
+        use crate::state::request_region;
+        use crate::state::resource_compliance_summaries as resource_summaries;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListResourceComplianceSummariesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the compliance store is unavailable".to_string()),
+            })
+        })?;
+
+        // A filter compares one member of a compliance item against the values it carries, under
+        // the comparison it names — the SAME reading of a compliance filter the item read and the
+        // type-level roll-up take (`compliance::compliance_filter_rejection`), so the three
+        // cannot differ about which filters a compliance read serves. A filter that names neither
+        // a member nor a value cannot be served, and the request is refused before an item is
+        // read.
+        let mut filters: Vec<(String, Vec<String>, String)> = Vec::new();
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            let values = filter.values.clone().unwrap_or_default();
+            if let Some(why) = compliance::compliance_filter_rejection(
+                filter.key.as_deref(),
+                &values,
+                filter.r#type.as_deref(),
+            ) {
+                return Err(ListResourceComplianceSummariesErrorModeled::InvalidFilter(
+                    InvalidFilter { message: Some(why) },
+                )
+                .into());
+            }
+            let Some(key) = filter.key.clone().filter(|key| !key.is_empty()) else {
+                continue;
+            };
+            let operator = filter
+                .r#type
+                .clone()
+                .filter(|operator| !operator.is_empty())
+                .unwrap_or_else(|| compliance::OPERATOR_EQUAL.to_string());
+            filters.push((key, values, operator));
+        }
+
+        let page_size = compliance::compliance_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // Systems Manager is regional: the compliance of a node is reached through the endpoint
+        // of the Region that node is registered with, which is the Region this request was signed
+        // for. The compliance a finished State Manager association run owes the nodes it applied
+        // the patch-baseline document on is materialised first, together with the managed-node
+        // registrations that application is derived from — each write was owed at the same instant
+        // whether or not anybody called — exactly as the item read takes them, and each with no
+        // guard of this store held.
+        let region = request_region(ctx.parts());
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        crate::state::association_patch_runs::settle_association_patch_runs(
+            &*self.engine,
+            &region,
+        );
+        let store = state.lock();
+
+        // The token names the summary this read stopped at, authenticated under this store's own
+        // key and minted for THIS read: a value it did not mint is refused rather than served a
+        // page it never offered.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match resource_summaries::page_cursor(&store.page_token_key(), token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(
+                        ListResourceComplianceSummariesErrorModeled::InvalidNextToken(
+                            InvalidNextToken {
+                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // The aggregate itself: every compliance item of the Region the filters admit, rolled up
+        // by the resource and compliance type it was reported about
+        // (`crate::state::resource_compliance_summaries::summarize_by_resource`). The items come
+        // from the one place this service holds them, so what a summary counts is what the item
+        // read reports.
+        let summaries = resource_summaries::summarize_by_resource(
+            store.compliance_items(&region, &[]).iter().filter(|item| {
+                filters
+                    .iter()
+                    .all(|(key, values, operator)| item.matches_filter(key, values, operator))
+            }),
+        );
+
+        let mut resource_compliance_summary_items = Vec::new();
+        let mut next_token = None;
+        let mut last_served: Option<String> = None;
+        for (key, summary) in &summaries {
+            let position = resource_summaries::summary_position(key);
+            // The page resumes STRICTLY after the summary the previous page's token named, so
+            // nothing it reported is reported twice.
+            if crate::state::parameter_pagination::already_served(
+                resume_after.as_deref(),
+                position.as_str(),
+            ) {
+                continue;
+            }
+            if resource_compliance_summary_items.len() == page_size {
+                // The page is full and a summary is still waiting: hand the caller the one this
+                // page stopped at, so the next request continues where it left off.
+                next_token = last_served
+                    .as_deref()
+                    .map(|served| resource_summaries::page_token(&store.page_token_key(), served));
+                break;
+            }
+            resource_compliance_summary_items
+                .push(summary.to_resource_compliance_summary_item(key));
+            last_served = Some(position);
+        }
+
+        Ok(ListResourceComplianceSummariesOutput {
+            resource_compliance_summary_items: Some(resource_compliance_summary_items),
+            next_token,
+        })
     }
 }

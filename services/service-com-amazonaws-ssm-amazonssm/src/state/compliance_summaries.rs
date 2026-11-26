@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 
-use super::compliance_items::{ComplianceItemRecord, STATUS_COMPLIANT};
+use super::compliance_items::{ComplianceItemRecord, SEVERITY_UNSPECIFIED, STATUS_COMPLIANT};
 use crate::ops::types::{ComplianceSummaryItem, CompliantSummary, NonCompliantSummary, SeveritySummary};
 
 /// The severity values a summary has a count for, each with the member of a
@@ -37,6 +37,9 @@ use crate::ops::types::{ComplianceSummaryItem, CompliantSummary, NonCompliantSum
 /// (`crate::ops::types::COMPLIANCE_SEVERITY_VALUES`), compared the way the service compares a
 /// severity — a value outside it is counted as unspecified, since the summary has no member
 /// for it.
+///
+/// Written MOST SEVERE FIRST, with the unspecified level LAST, so a position in it is both
+/// which member counts a severity and how severe that severity is ([`severity_rank`]).
 const SEVERITY_MEMBERS: &[(&str, Severity)] = &[
     ("CRITICAL", Severity::Critical),
     ("HIGH", Severity::High),
@@ -57,9 +60,32 @@ enum Severity {
     Unspecified,
 }
 
+/// The severity a summary counts `severity` under, as the modelled `ComplianceSeverity`
+/// vocabulary spells it ([`SEVERITY_MEMBERS`]): a value the vocabulary does not name is counted
+/// as unspecified, the one level the summary has for a severity it has no member for.
+#[must_use]
+pub fn counted_severity(severity: &str) -> &'static str {
+    SEVERITY_MEMBERS
+        .get(severity_rank(severity))
+        .map_or(SEVERITY_UNSPECIFIED, |(value, _)| *value)
+}
+
+/// Where `severity` sits in the order the severities are written in, MOST SEVERE FIRST — so the
+/// lower rank is the higher severity, which is what "the highest severity item found for the
+/// resource" (`ResourceComplianceSummaryItem$OverallSeverity`) picks by. A value the vocabulary
+/// does not name ranks as the LAST entry, which is the unspecified level the summary counts it
+/// under.
+#[must_use]
+pub fn severity_rank(severity: &str) -> usize {
+    SEVERITY_MEMBERS
+        .iter()
+        .position(|(value, _)| value.eq_ignore_ascii_case(severity))
+        .unwrap_or(SEVERITY_MEMBERS.len() - 1)
+}
+
 /// The counts of one `SeveritySummary`, as the roll-up builds it.
 #[derive(Debug, Clone, Default)]
-struct SeverityCounts {
+pub struct SeverityCounts {
     critical: i32,
     high: i32,
     medium: i32,
@@ -70,10 +96,9 @@ struct SeverityCounts {
 
 impl SeverityCounts {
     /// Count one item of `severity`.
-    fn count(&mut self, severity: &str) {
+    pub fn count(&mut self, severity: &str) {
         let member = SEVERITY_MEMBERS
-            .iter()
-            .find(|(value, _)| value.eq_ignore_ascii_case(severity))
+            .get(severity_rank(severity))
             .map_or(Severity::Unspecified, |(_, member)| *member);
         let counted = match member {
             Severity::Critical => &mut self.critical,
@@ -86,8 +111,19 @@ impl SeverityCounts {
         *counted = counted.saturating_add(1);
     }
 
+    /// How many items these counts have counted, whatever severity each carried: every item
+    /// is counted in exactly one member, so their sum is the item count.
+    pub fn counted(&self) -> i32 {
+        self.critical
+            .saturating_add(self.high)
+            .saturating_add(self.medium)
+            .saturating_add(self.low)
+            .saturating_add(self.informational)
+            .saturating_add(self.unspecified)
+    }
+
     /// The modelled summary these counts are.
-    fn to_severity_summary(&self) -> SeveritySummary {
+    pub fn to_severity_summary(&self) -> SeveritySummary {
         SeveritySummary {
             critical_count: self.critical,
             high_count: self.high,
