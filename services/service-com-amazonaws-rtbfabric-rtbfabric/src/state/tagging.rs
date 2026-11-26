@@ -9,6 +9,12 @@
 //! about exactly the same set of resources, and cannot drift apart about which ARN
 //! names what.
 //!
+//! Which records this surface can address is whatever the store holds once the clock
+//! has been settled, so each of the three handlers calls
+//! [`settle_all`](super::ComAmazonawsRtbfabricRtbfabricState::settle_all) before it
+//! resolves the ARN: a record whose release the clock has already completed is gone
+//! for this surface exactly as it is for the resource's own read.
+//!
 //! Tags are not a store of their own — every taggable record already carries its own
 //! `tags` map, written by the create that minted it — so this module only addresses
 //! them. That is also what keeps the surface bounded: a tag map lives and dies with

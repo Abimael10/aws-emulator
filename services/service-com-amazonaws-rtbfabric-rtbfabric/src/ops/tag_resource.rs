@@ -144,6 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -151,6 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut store = state.lock();
+        // Settled BEFORE the ARN is resolved, exactly as every other handler that
+        // resolves a record does: a record the clock has already released is gone for
+        // this surface too, so no tag is ever written to a record the rest of the
+        // crate no longer holds.
+        store.settle_all(now);
 
         let resource = crate::state::tagged_resource(&input.resource_arn, &region)
             .ok_or_else(crate::state::tagging_unresolved)?;

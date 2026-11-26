@@ -147,16 +147,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting only: nothing is written, so a later caller sees exactly what this
-        // one saw.
+        // Reporting only: the sole write is the set of status transitions the clock
+        // had already made due at this instant, owed whether or not anybody read.
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the rtbfabric emulator has no state store for this request".to_string(),
             })
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // Settled BEFORE the ARN is resolved, exactly as every other handler that
+        // resolves a record does: a record the clock has already released is gone for
+        // this surface too, so the tags reported here and the resource's own read
+        // answer about one set of records.
+        store.settle_all(now);
 
         let resource = crate::state::tagged_resource(&input.resource_arn, &region)
             .ok_or_else(crate::state::tagging_unresolved)?;
