@@ -199,6 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a list naming one key twice are both an "invalid … value … supplied for an
         // input parameter".
         if let Some(refusal) = crate::state::supplied_tag_refusal(
+            crate::state::TagListTarget::Principal,
             input.tags.iter().flatten().map(|tag| tag.key.as_str()),
         ) {
             return Err(CreateUserErrorModeled::InvalidInputException(

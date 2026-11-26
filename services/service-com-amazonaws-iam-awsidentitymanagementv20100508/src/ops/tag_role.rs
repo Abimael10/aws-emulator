@@ -202,9 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every operation taking a `Tags` list shares with `CreateRole` — a key carrying
         // the prefix AWS reserves and a list naming one key twice are both an "invalid …
         // value … supplied for an input parameter".
-        if let Some(refusal) =
-            crate::state::supplied_tag_refusal(input.tags.iter().map(|tag| tag.key.as_str()))
-        {
+        if let Some(refusal) = crate::state::supplied_tag_refusal(
+            crate::state::TagListTarget::Principal,
+            input.tags.iter().map(|tag| tag.key.as_str()),
+        ) {
             return Err(TagRoleErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(refusal.to_string()),

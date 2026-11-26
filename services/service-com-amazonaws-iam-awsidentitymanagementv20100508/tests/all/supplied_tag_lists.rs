@@ -7,10 +7,12 @@
 //!
 //! 1. a tag list naming one key MORE THAN ONCE is ambiguous — a tag is a key and ONE value
 //!    ("a tag consists of a key name and an associated value", `TagRole`) — so the whole
-//!    request is refused HTTP 400 `InvalidInput` with the fixed sentence `Duplicate tag keys
-//!    found.` before anything is read or written, and nothing of it is stored. Keys compare
-//!    exactly, because "tag keys and values are case sensitive" ("Tagging IAM resources",
-//!    IAM User Guide), so two spellings of one word are two keys and such a list is taken;
+//!    request is refused HTTP 400 `InvalidInput` with the fixed sentence the operation words
+//!    that class with (`tests/all/duplicate_tag_key_wording_by_operation.rs` pins which
+//!    sentence that is) before anything is read or written, and nothing of it is stored. Keys
+//!    compare exactly, because "tag keys and values are case sensitive" ("Tagging
+//!    IAM resources", IAM User Guide), so two spellings of one word are two keys and such a
+//!    list is taken;
 //! 2. a tag call that would carry a resource past the published per-resource tag quota is
 //!    refused HTTP 409 `LimitExceeded` with the fixed sentence `The number of tags has
 //!    reached the maximum limit.`, which names neither the resource nor the figure — and the
@@ -42,7 +44,7 @@ use std::collections::BTreeMap;
 
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
     DUPLICATE_TAG_KEY_MESSAGE, MAX_TAGS_PER_ENTITY, POLICY_TAGS_UNSUPPORTED_DOMAIN,
-    TAG_LIMIT_EXCEEDED_MESSAGE,
+    PRINCIPAL_DUPLICATE_TAG_KEY_MESSAGE, TAG_LIMIT_EXCEEDED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -96,6 +98,20 @@ impl SuppliedTo {
             Self::CreateRole => "CreateRole",
             Self::CreatePolicy => "CreatePolicy",
             Self::CreateInstanceProfile => "CreateInstanceProfile",
+        }
+    }
+
+    /// The sentence this operation words the repeated-key refusal with: IAM words that class
+    /// per operation, with the case-insensitivity note for a principal's tags only.
+    fn duplicate_message(self) -> &'static str {
+        match self {
+            Self::TagUser | Self::TagRole | Self::CreateUser | Self::CreateRole => {
+                PRINCIPAL_DUPLICATE_TAG_KEY_MESSAGE
+            }
+            Self::TagPolicy
+            | Self::TagInstanceProfile
+            | Self::CreatePolicy
+            | Self::CreateInstanceProfile => DUPLICATE_TAG_KEY_MESSAGE,
         }
     }
 
@@ -362,10 +378,11 @@ async fn a_tag_list_naming_one_key_twice_is_refused_and_stores_nothing() {
             "InvalidInput",
             "case {case:?}: expected the modelled awsQuery code, got {refused}"
         );
+        let expected_message = supplied_to.duplicate_message();
         assert_eq!(
             element(&refused, "Message"),
-            DUPLICATE_TAG_KEY_MESSAGE,
-            "case {case:?}: expected {DUPLICATE_TAG_KEY_MESSAGE:?}, got {:?}",
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {:?}",
             element(&refused, "Message")
         );
 

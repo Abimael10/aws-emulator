@@ -248,9 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // validation of a tag list this crate holds (`crate::state::supplied_tags`), which
         // every `Tag*` and `Create*` call shares.
         let supplied_tags = input.tags.unwrap_or_default();
-        if let Some(refusal) =
-            crate::state::supplied_tag_refusal(supplied_tags.iter().map(|tag| tag.key.as_str()))
-        {
+        if let Some(refusal) = crate::state::supplied_tag_refusal(
+            crate::state::TagListTarget::Resource,
+            supplied_tags.iter().map(|tag| tag.key.as_str()),
+        ) {
             return Err(CreateSAMLProviderErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(refusal.to_string()),

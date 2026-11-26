@@ -3,9 +3,12 @@
 //! The WORDING of the refusal a tag list naming one key twice answers with, end to end over
 //! the awsQuery wire.
 //!
-//! RULE: the sentence IAM states for that class is fixed text — "Duplicate tag keys found.
-//! Please note that Tag keys are case insensitive." — whichever operation the list was
-//! supplied to, and it quotes nothing of the request back.
+//! RULE: the sentence IAM states for that class is fixed text and belongs to the OPERATION
+//! the list was supplied to — "Duplicate tag keys found. Please note that Tag keys are case
+//! insensitive." for a principal's tags (a user's or a role's), "Duplicate tag keys found."
+//! for any other IAM resource's — and it quotes nothing of the request back.
+//! `tests/all/duplicate_tag_key_wording_by_operation.rs` tables that rule over both halves;
+//! the rows here pin the sentence each of these four operations answers with.
 //!
 //! WHY a suite of its own: `tests/all/supplied_tag_lists.rs` states the RULE (which lists are
 //! refused, with which code, across every operation that takes one) and compares the message
@@ -22,10 +25,14 @@ use crate::role_lifecycle::{borrowed, param};
 use crate::role_tags::{tags, with_tag_params, TRUST_POLICY};
 use crate::user_lifecycle::{call, element, error_code, router};
 
-/// The sentence AWS answers a tag list naming one key twice with, written out rather than
-/// read from the service's own constant.
-const DUPLICATE_TAG_KEYS_SENTENCE: &str =
+/// The sentence AWS answers a tag list naming one key twice with when the list was supplied
+/// for a PRINCIPAL's tags, written out rather than read from the service's own constant.
+const PRINCIPAL_DUPLICATE_TAG_KEYS_SENTENCE: &str =
     "Duplicate tag keys found. Please note that Tag keys are case insensitive.";
+
+/// The sentence it answers the same list with when the list was supplied for any other IAM
+/// resource's tags.
+const RESOURCE_DUPLICATE_TAG_KEYS_SENTENCE: &str = "Duplicate tag keys found.";
 
 /// A managed policy document, for the row that creates a policy.
 const POLICY_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:GetCallerIdentity","Resource":"*"}]}"#;
@@ -36,10 +43,12 @@ struct WordingCase {
     action: &'static str,
     addressing: Vec<(String, String)>,
     list: Vec<(String, String)>,
+    /// The sentence this operation words the class with.
+    expected: &'static str,
 }
 
-/// RULE: every operation taking a `Tags` list answers the repeated key with that one
-/// sentence, under `InvalidInput` (HTTP 400), and writes nothing.
+/// RULE: every operation taking a `Tags` list answers the repeated key with the sentence it
+/// words that class with, under `InvalidInput` (HTTP 400), and writes nothing.
 #[tokio::test]
 async fn the_repeated_key_refusal_carries_iam_s_sentence_verbatim() {
     let router = router();
@@ -49,11 +58,13 @@ async fn the_repeated_key_refusal_carries_iam_s_sentence_verbatim() {
             action: "TagUser",
             addressing: vec![param("UserName", "wording-user")],
             list: tags(&[("Team", "a"), ("Team", "b")]),
+            expected: PRINCIPAL_DUPLICATE_TAG_KEYS_SENTENCE,
         },
         WordingCase {
             action: "TagRole",
             addressing: vec![param("RoleName", "wording-role")],
             list: tags(&[("env", "prod"), ("owner", "iam"), ("env", "dev")]),
+            expected: PRINCIPAL_DUPLICATE_TAG_KEYS_SENTENCE,
         },
         WordingCase {
             action: "CreatePolicy",
@@ -62,11 +73,13 @@ async fn the_repeated_key_refusal_carries_iam_s_sentence_verbatim() {
                 param("PolicyDocument", POLICY_DOCUMENT),
             ],
             list: tags(&[("a", "1"), ("b", "2"), ("b", "3"), ("c", "4")]),
+            expected: RESOURCE_DUPLICATE_TAG_KEYS_SENTENCE,
         },
         WordingCase {
             action: "CreateUser",
             addressing: vec![param("UserName", "wording-created-user")],
             list: tags(&[("thrice", "1"), ("thrice", "2"), ("thrice", "3")]),
+            expected: PRINCIPAL_DUPLICATE_TAG_KEYS_SENTENCE,
         },
     ];
 
@@ -88,6 +101,7 @@ async fn the_repeated_key_refusal_carries_iam_s_sentence_verbatim() {
         action,
         addressing,
         list,
+        expected,
     } in &rows
     {
         let params = with_tag_params(addressing.clone(), list);
@@ -105,8 +119,8 @@ async fn the_repeated_key_refusal_carries_iam_s_sentence_verbatim() {
         );
         assert_eq!(
             element(&body, "Message"),
-            DUPLICATE_TAG_KEYS_SENTENCE,
-            "case {action:?}: expected IAM's sentence, got {:?}",
+            *expected,
+            "case {action:?}: expected IAM's sentence {expected:?}, got {:?}",
             element(&body, "Message")
         );
     }
