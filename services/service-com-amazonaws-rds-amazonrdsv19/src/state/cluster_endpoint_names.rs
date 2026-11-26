@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The DNS HOST NAMES a DB cluster MINTS for its endpoints, for the members that publish one.
+//! The DNS HOST NAMES a DB cluster MINTS for its endpoints, for the clusters that publish one.
 //!
 //! `DBCluster$Endpoint` is "the connection endpoint for the primary instance of the DB
 //! cluster" and `DBCluster$ReaderEndpoint` "the reader endpoint for the DB cluster … [which]
@@ -12,42 +12,27 @@
 //! A name composed here is minted by the CLUSTER, from its own identifier and the one
 //! server-assigned label it was created with:
 //!
-//! * `<identifier>.cluster-<label>.<region>.<suffix>` for the writer, and
-//! * `<identifier>.cluster-ro-<label>.<region>.<suffix>` for the reader,
+//! * `<identifier>.cluster-<label>.<region>.<endpoint domain>` for the writer, and
+//! * `<identifier>.cluster-ro-<label>.<region>.<endpoint domain>` for the reader,
 //!
-//! over the SAME suffix. Neither is read off a member instance, so a cluster with no members
-//! at all publishes its own — a serverless cluster nobody has created an instance in is
-//! reached at it — and the discriminating `cluster-`/`cluster-ro-` label is what tells a read
-//! path from a write path.
+//! over the SAME domain — that of the control plane which owns the cluster's engine
+//! ([`super::endpoint_domain`]). Neither is read off a member instance, so a cluster with no
+//! members at all publishes its own, and the discriminating `cluster-`/`cluster-ro-` label is
+//! what tells a read path from a write path.
 //!
-//! BOTH members carry a minted name, in the ZONE a client of that cluster resolves it in,
-//! because the member a client COMPOSES ITS CONNECTION FROM has to lead back to the plane
-//! that answers the session:
-//!
-//! * a cluster whose engine wire this emulator serves is reached on listeners of its own
-//!   ([`super::data_plane::cluster_endpoint`]), so both names sit in the zone that interface
-//!   is named in ([`served_endpoint_suffix`]) — the loopback zone, whose names RFC 6761
-//!   reserves for the loopback interface, so a resolver answers a name minted there with the
-//!   address the core bound and the one published `Port` completes the address a session is
-//!   opened on. A minted name leads there only while that zone names the interface the
-//!   listener was bound on, which is what [`minted_name_reaches_listener`] asks: a listener an
-//!   operator bound on another interface is named as the core reports it
-//!   ([`super::DbClusterRecord::endpoint`]), because no zone this emulator may announce in
-//!   resolves to that address;
-//! * a cluster this emulator serves no data plane for publishes the AWS form for BOTH, under
-//!   the DNS domain of the control plane that owns its engine ([`super::endpoint_domain`]):
-//!   there is no local plane for such a cluster to lead a client to.
-//!
-//! A cluster whose data plane is an AWS API served at this emulator's own endpoint
-//! ([`super::engine_data_plane_is_an_api`] — an Amazon Neptune graph cluster) publishes no
-//! minted name at all, for either member, nor for a CUSTOM endpoint created in front of it
-//! ([`CLUSTER_CUSTOM_LABEL`]): that plane is HTTP on this emulator's own front door, which
-//! admits a request only when its `Host` names the interface the core bound
-//! (`emulator_server::is_loopback_host`, the DNS-rebinding guard), so a name of this
-//! emulator's own — in any zone — is refused there and would be no connection endpoint at
-//! all. Such a cluster therefore publishes the HOST this process is reached at for every one
-//! of its endpoints, which is the only address its plane answers on
-//! ([`super::api_plane_address`]).
+//! WHICH clusters publish a name composed here: only those this emulator serves NO data plane
+//! for. An endpoint member a client DIALS has to be a host that leads back to the plane
+//! answering the session, and the only hosts that reach this process are its OWN — the
+//! interface the core bound a listener on, and the endpoint this emulator is served at. A name
+//! this service announced beneath one of them is a host of nobody's: a client that resolves it
+//! reaches no listener, and a client that checks what it was handed is being given an address
+//! outside this emulator. So a cluster whose engine wire this emulator serves on a listener of
+//! its own ([`super::data_plane::cluster_endpoint`]), and one whose data plane it serves as an
+//! AWS API at its own front door ([`super::engine_data_plane_is_an_api`] — an Amazon Neptune
+//! graph cluster), publish that address for every endpoint in front of that plane — the two
+//! cluster endpoints and each CUSTOM endpoint ([`CLUSTER_CUSTOM_LABEL`]) — which is what
+//! [`super::DbClusterRecord::endpoint`] reads. A cluster with no local plane at all has nothing
+//! to lead a client to and keeps the published AWS form composed here.
 
 /// The label a cluster's WRITER endpoint carries in front of its server-assigned one:
 /// `<identifier>.cluster-<label>.…`, the published form of "the connection endpoint for the
@@ -81,68 +66,6 @@ pub fn cluster_endpoint_host(
     format!("{identifier}.{role}{label}.{region}.{suffix}")
 }
 
-/// The DNS suffix a name MINTED for a cluster whose data plane this emulator SERVES sits in
-/// (its reader endpoint, and a custom endpoint with no listener of its own): the service
-/// label of the control plane that owns the cluster's engine, in the zone a resolver answers
-/// with the interface the cluster's listener is bound on.
-///
-/// `endpoint_domain` is that control plane's own endpoint domain
-/// (`rds.amazonaws.com`, `docdb.amazonaws.com`, `neptune.amazonaws.com`): its FIRST label is
-/// the service, which is what keeps a database endpoint recognisable as one, and the zone AWS
-/// publishes its endpoints in is replaced by the zone this emulator may announce a name of its
-/// own in (`service_common::data_plane_addressing::announced_zone_of_authority`, the tree's
-/// one reading of that question, read off the address the listener is bound to). A name in a
-/// zone AWS serves resolves nowhere near this process or, worse, at genuine AWS
-/// infrastructure, so this never announces one; a name in the loopback zone resolves to the
-/// interface the listener was opened on.
-///
-/// Who resolves it: the HOST's resolver, not this emulator, which runs no name server. The
-/// loopback zone is the one zone that needs none — RFC 6761 reserves `localhost` and the names
-/// under it for the loopback interface, and a resolver that honours that reservation answers
-/// every name minted here with the address the listener accepts on. A client of a host whose
-/// resolver answers only the bare name would have to be pointed at the interface itself, which
-/// is an environment prerequisite of the published pair rather than a property of the record:
-/// what this service decides is the NAME, and what the name has to name is the interface the
-/// listener was bound on ([`minted_name_reaches_listener`]).
-#[must_use]
-pub fn served_endpoint_suffix(endpoint_domain: &str, served_host: &str) -> String {
-    let service = endpoint_domain
-        .split('.')
-        .next()
-        .unwrap_or(endpoint_domain);
-    let zone = ::service_common::data_plane_addressing::announced_zone_of_authority(served_host);
-    format!("{service}.{zone}")
-}
-
-/// Whether a name MINTED for a cluster whose listeners are bound on `served_host` LEADS a
-/// client back to those listeners — the question that decides whether a served cluster
-/// publishes its minted names or the address the core reports.
-///
-/// An endpoint member is a name a client RESOLVES and then dials, so a minted one is an
-/// address only where the zone it sits in ([`served_endpoint_suffix`]) resolves to the
-/// interface the listener was bound on. That holds for the interface the core binds by
-/// default: the zone is then the loopback zone, and RFC 6761 reserves `localhost` and the
-/// names under it for the loopback interface, so a resolver answers every name minted there
-/// with the address those listeners accept on — a wildcard bind included, which accepts on
-/// loopback too.
-///
-/// An interface an OPERATOR bound instead has no zone this emulator may announce a name in
-/// that resolves to it: a name under the loopback zone would lead past that interface, and a
-/// sub-name of the operator's own host is one nothing answers for. Such a cluster therefore
-/// names the interface as the core reports it ([`super::DbClusterRecord::endpoint`]).
-///
-/// The names under the loopback zone are answered by the HOST's own resolver, which is where
-/// RFC 6761's reservation is honoured; see [`served_endpoint_suffix`] for what that means for
-/// a client of this emulator.
-#[must_use]
-pub fn minted_name_reaches_listener(served_host: &str) -> bool {
-    let unspecified = served_host
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|address| address.is_unspecified());
-    ::service_common::data_plane_addressing::names_the_loopback_interface(served_host)
-        || unspecified
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,11 +76,13 @@ mod tests {
     #[test]
     fn the_two_endpoint_names_share_a_suffix_and_differ_in_their_role_label() {
         // The rows span what the composition generalises over: the identifier (short, long,
-        // hyphenated), the region, and the suffix (a served one and the published AWS form).
+        // hyphenated), the region, and the endpoint domain of each control plane that owns an
+        // engine `CreateDBCluster` accepts.
         let rows: &[(&str, &str, &str, &str, &str)] = &[
-            ("a serverless cluster", "sim2real-aur-1757", "abcdefghijkl", "us-west-2", "rds.localhost"),
-            ("a one-label identifier", "db", "mnopqrstuvwx", "us-east-1", "rds.localhost"),
-            ("the published AWS form", "emu-docdb", "yz0123456789", "eu-central-1", "docdb.amazonaws.com"),
+            ("an Aurora cluster", "sim2real-aur-1757", "abcdefghijkl", "us-west-2", "rds.amazonaws.com"),
+            ("a one-label identifier", "db", "mnopqrstuvwx", "us-east-1", "rds.amazonaws.com"),
+            ("another control plane's domain", "emu-docdb", "yz0123456789", "eu-central-1", "docdb.amazonaws.com"),
+            ("the graph control plane's domain", "emu-neptune", "0123456789ab", "ap-south-1", "neptune.amazonaws.com"),
         ];
         for (case, identifier, label, region, suffix) in rows {
             let writer =
@@ -189,66 +114,6 @@ mod tests {
                     "case {case:?}: an endpoint member carries no port, got {name:?}"
                 );
             }
-        }
-    }
-
-    /// RULE: the suffix of a SERVED cluster's endpoints is the engine's service label in the
-    /// zone the address its listener is bound on names — never a zone AWS serves.
-    #[test]
-    fn a_served_clusters_suffix_names_the_zone_its_listener_is_reached_in() {
-        // The rows span the endpoint domains the front door publishes and the addresses a
-        // listener can be bound to: the loopback literals the core binds by default, a
-        // routable address an operator bound, and a name the emulator is served under.
-        let rows: &[(&str, &str, &str, &str)] = &[
-            ("the default loopback bind", "rds.amazonaws.com", "127.0.0.1", "rds.localhost"),
-            ("an IPv6 loopback bind", "rds.amazonaws.com", "::1", "rds.localhost"),
-            ("a routable bind", "rds.amazonaws.com", "192.168.1.10", "rds.localhost"),
-            ("a name the emulator is served under", "rds.amazonaws.com", "emulator.internal", "rds.emulator.internal"),
-            ("another control plane's domain", "docdb.amazonaws.com", "127.0.0.1", "docdb.localhost"),
-            ("the graph control plane's domain", "neptune.amazonaws.com", "127.0.0.1", "neptune.localhost"),
-        ];
-        for (case, endpoint_domain, served_host, expected) in rows {
-            let suffix = served_endpoint_suffix(endpoint_domain, served_host);
-            assert_eq!(
-                suffix, *expected,
-                "case {case:?}: expected the suffix {expected:?}, got {suffix:?}"
-            );
-            for aws_zone in ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
-                assert!(
-                    !suffix.ends_with(aws_zone),
-                    "case {case:?}: a served cluster must announce no zone of AWS's own \
-                     ({aws_zone}), got {suffix:?}"
-                );
-            }
-        }
-    }
-
-    /// RULE: a minted name leads a client back to the cluster's listeners exactly when the
-    /// zone it sits in names the interface those listeners are bound on — the interface the
-    /// core binds by default, in either address family, and the wildcard address, which
-    /// accepts on it too — and not when an operator bound another interface.
-    #[test]
-    fn a_minted_name_reaches_a_listener_the_loopback_zone_names() {
-        // The rows span the addresses the core can report a listener on: both loopback
-        // literals, another address of the loopback block, the loopback zone's own name, the
-        // wildcard addresses of both families, a routable address an operator bound, and a
-        // name an operator serves this emulator at.
-        let rows: &[(&str, &str, bool)] = &[
-            ("the default loopback bind", "127.0.0.1", true),
-            ("another address of the loopback block", "127.0.0.42", true),
-            ("an IPv6 loopback bind", "::1", true),
-            ("the loopback zone's own name", "localhost", true),
-            ("a wildcard bind", "0.0.0.0", true),
-            ("an IPv6 wildcard bind", "::", true),
-            ("a routable bind", "192.168.1.10", false),
-            ("a name an operator serves this emulator at", "emulator.internal", false),
-        ];
-        for (case, served_host, expected) in rows {
-            let reaches = minted_name_reaches_listener(served_host);
-            assert_eq!(
-                reaches, *expected,
-                "case {case:?}: expected minted_name_reaches_listener {expected}, got {reaches}"
-            );
         }
     }
 }

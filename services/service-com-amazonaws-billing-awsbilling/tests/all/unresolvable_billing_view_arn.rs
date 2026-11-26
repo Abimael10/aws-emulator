@@ -11,16 +11,20 @@
 //! operations was asked cannot change the answer to the same ARN.
 //!
 //! Sources (the model, not a recording): `smithy_query(query="operation",
-//! operation="GetBillingView,ListSourceViewsForBillingView,ListBillingViewSegments,AssociateSourceViews,DisassociateSourceViews,UpdateBillingView")`
-//! — those are every operation whose input carries a `BillingViewArn` member
-//! named `arn` for the view it acts on AND declares
-//! `ResourceNotFoundException`: "The specified ARN in the request doesn't
-//! exist." (`DeleteBillingView` carries the same member and declares no such
-//! error, so it is not one of them.) The ARN forms the rows use come from that
+//! operation="GetBillingView,ListSourceViewsForBillingView,ListBillingViewSegments,AssociateSourceViews,DisassociateSourceViews")`
+//! — those are the operations whose input carries a `BillingViewArn` member
+//! named `arn` for the view it acts on, declares
+//! `ResourceNotFoundException` ("The specified ARN in the request doesn't
+//! exist.") and resolves that ARN to act on the record it names.
+//! (`DeleteBillingView` and `UpdateBillingView` carry the same member and decide
+//! ELIGIBILITY before existence instead, so both answer the one
+//! `ValidationException` saying which views may be edited or deleted — the
+//! subject of `absent_billing_view_arn_refusal`.) The ARN forms the rows use come
+//! from that
 //! member's modeled pattern,
 //! `^arn:aws[a-z-]*:(billing)::[0-9]{12}:billingview/[a-zA-Z0-9/:_\+=\.\-@]{0,75}[a-zA-Z0-9]$`.
 //!
-//! The rows cross every such operation (three reads and three writers) with the
+//! The rows cross every such operation (three reads and two writers) with the
 //! forms an unresolvable ARN of this account can take: the shortest and the
 //! longest resource id the pattern admits, a nested id, one spelling every
 //! punctuation character the pattern allows, a partition other than `aws`, and
@@ -120,7 +124,6 @@ fn requests(arn: &str, source: &str) -> Vec<(&'static str, Value)> {
             "DisassociateSourceViews",
             json!({ "arn": arn, "sourceViews": [source] }),
         ),
-        ("UpdateBillingView", json!({ "arn": arn, "name": "renamed" })),
     ]
 }
 

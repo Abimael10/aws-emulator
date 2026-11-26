@@ -17,10 +17,9 @@
 //!   endpoints, the resolved engine version, the defaults, the timestamps, the tags and the
 //!   zones) in one assertion, so a member computed at response time instead of being stored
 //!   fails here whether or not any suite names it.
-//! * An identity RDS mints is the resource's own: the `DbClusterResourceId` and — for a
-//!   cluster that publishes minted endpoint NAMES at all — the server-assigned endpoint label
-//!   are of their published forms, no two clusters share
-//!   them, and no later read changes them.
+//! * An identity RDS mints is the resource's own: the `DbClusterResourceId` is of its
+//!   published form, no two clusters share the coordinates a client dials them at, and no
+//!   later read changes either.
 //!
 //! The table spans what those rules generalise over: both cluster TYPES `CreateDBCluster`
 //! documents (Aurora DB clusters and Multi-AZ DB clusters), three engine families
@@ -31,7 +30,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_clusters::{describe_one, the_cluster, SERVED_SUFFIX};
+use crate::db_clusters::{describe_one, the_cluster};
 use crate::db_instances::{call, emulator, expect_ok, text, texts, wait_for_settle, REGION};
 
 /// One cluster of the round trip.
@@ -292,10 +291,10 @@ async fn the_record_a_create_acknowledges_is_the_record_describe_reports() {
 struct IdentityCase {
     identifier: &'static str,
     engine: &'static str,
-    /// The DNS suffix this row's endpoint names sit in: the zone this emulator announces a
-    /// name of its own in for an engine whose wire it SERVES, and the engine's own control
-    /// plane domain for one it serves no wire for.
-    suffix: &'static str,
+    /// The DNS suffix this row's endpoint NAMES sit in — the endpoint domain of the control
+    /// plane that owns the engine — or `None` for an engine whose data plane this emulator
+    /// SERVES, whose cluster publishes the address that plane is answered at instead of a name.
+    suffix: Option<&'static str>,
     /// The parameters this row adds beyond `DBClusterIdentifier` and `Engine`.
     extra: &'static [(&'static str, &'static str)],
 }
@@ -304,31 +303,31 @@ struct IdentityCase {
 ///
 /// Two of them share an engine, so an identity that varied only with the engine would not
 /// pass; one is a Multi-AZ DB cluster, whose identity is minted the same way; and the last
-/// is an engine this emulator serves no wire for, whose endpoints sit in its own control
-/// plane's DNS domain rather than in the zone a served cluster is reached in.
+/// is an engine this emulator serves no wire for, which publishes the names its own control
+/// plane's DNS domain carries rather than the address of a plane served here.
 const IDENTITY_CASES: &[IdentityCase] = &[
     IdentityCase {
         identifier: "emu-identity-one",
         engine: "aurora-mysql",
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         extra: &[],
     },
     IdentityCase {
         identifier: "emu-identity-two",
         engine: "aurora-mysql",
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         extra: &[],
     },
     IdentityCase {
         identifier: "emu-identity-three",
         engine: "aurora-postgresql",
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         extra: &[],
     },
     IdentityCase {
         identifier: "emu-identity-four",
         engine: "postgres",
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         extra: &[
             ("AllocatedStorage", "100"),
             ("DBClusterInstanceClass", "db.m6gd.xlarge"),
@@ -339,9 +338,9 @@ const IDENTITY_CASES: &[IdentityCase] = &[
     IdentityCase {
         identifier: "emu-identity-five",
         // An engine whose wire this emulator serves no data plane for, so its cluster's
-        // endpoints sit in its own control plane's DNS domain.
+        // endpoints are the names its own control plane's DNS domain carries.
         engine: "docdb",
-        suffix: "docdb.amazonaws.com",
+        suffix: Some("docdb.amazonaws.com"),
         extra: &[],
     },
 ];
@@ -351,9 +350,9 @@ const IDENTITY_CASES: &[IdentityCase] = &[
 #[derive(Debug, PartialEq, Eq)]
 struct Identity {
     resource_id: String,
-    /// The DNS name the cluster MINTS for its reader endpoint, which carries the
-    /// server-assigned label minted per cluster.
-    reader_endpoint: String,
+    /// The coordinates a client reaches this cluster's READ path at: the reader endpoint
+    /// member with the one `Port` published beside it, which is the pair a client composes.
+    reader_coordinates: String,
     arn: String,
 }
 
@@ -393,7 +392,7 @@ fn endpoint_name(case: &str, identifier: &str, role: &str, suffix: &str, endpoin
 
 /// The identity one cluster envelope reports, asserting the published form of each member
 /// on the way.
-fn identity_of(case: &str, identifier: &str, suffix: &str, cluster: &str) -> Identity {
+fn identity_of(case: &str, identifier: &str, suffix: Option<&str>, cluster: &str) -> Identity {
     let resource_id = text(cluster, "DbClusterResourceId");
     // "The Amazon Web Services Region-unique, immutable identifier for the DB cluster",
     // written `cluster-` plus server-minted characters.
@@ -408,25 +407,28 @@ fn identity_of(case: &str, identifier: &str, suffix: &str, cluster: &str) -> Ide
         "case {case:?}: expected 26 server-minted characters, got {resource_id:?}"
     );
 
-    // EVERY cluster publishes, for both of its endpoint members, the name the CLUSTER mints
-    // from its own identifier — the writer under `cluster-` and the reader under `cluster-ro-`
-    // — in which the server-assigned label this test reads is visible. The suffix is the zone
-    // the pair sits in: the one the interface its own listeners are bound on is named in for a
-    // cluster whose engine wire this emulator SERVES, where both members also have to stay
-    // hosts this emulator answers on, and the control plane's endpoint domain for every other.
+    // What the two endpoint members carry: a cluster whose data plane this emulator SERVES
+    // publishes, for both of them, the address that plane is answered at, which is the only
+    // host a client of this emulator reaches it at; a cluster it serves no plane for publishes
+    // the names the CLUSTER mints from its own identifier — the writer under `cluster-` and the
+    // reader under `cluster-ro-` — under the endpoint domain of the control plane that owns its
+    // engine, in which the server-assigned label this test reads is visible.
     let endpoint = text(cluster, "Endpoint");
     let reader = text(cluster, "ReaderEndpoint");
-    endpoint_name(case, identifier, "cluster-", suffix, &endpoint);
-    let minted = endpoint_name(case, identifier, "cluster-ro-", suffix, &reader);
-    if suffix == SERVED_SUFFIX {
-        crate::db_clusters::assert_served_endpoint_pair(
-            case, identifier, REGION, &endpoint, &reader,
-        );
+    match suffix {
+        Some(domain) => {
+            endpoint_name(case, identifier, "cluster-", domain, &endpoint);
+            endpoint_name(case, identifier, "cluster-ro-", domain, &reader);
+        }
+        None => crate::db_clusters::assert_served_endpoint_pair(case, &endpoint, &reader),
     }
 
+    // The pair a client composes from the read path's member and the one `Port` beside it:
+    // each cluster is reached on a plane of its own, so no two clusters share it.
+    let port = text(cluster, "Port");
     Identity {
         resource_id,
-        reader_endpoint: minted,
+        reader_coordinates: format!("{reader}:{port}"),
         arn: text(cluster, "DBClusterArn"),
     }
 }
@@ -467,12 +469,12 @@ async fn every_cluster_is_minted_an_identity_of_its_own() {
                 "clusters {left} and {right} were minted the same DbClusterResourceId {:?}",
                 left_identity.resource_id
             );
-            // A DNS name a cluster MINTS carries a label minted for that cluster, so no two of
-            // them are the same.
+            // Each cluster is reached on a plane of its own, so no two of them publish the
+            // same coordinates for their read path.
             assert_ne!(
-                left_identity.reader_endpoint, right_identity.reader_endpoint,
-                "clusters {left} and {right} publish the same reader endpoint {:?}",
-                left_identity.reader_endpoint
+                left_identity.reader_coordinates, right_identity.reader_coordinates,
+                "clusters {left} and {right} publish the same reader coordinates {:?}",
+                left_identity.reader_coordinates
             );
             assert_ne!(
                 left_identity.arn, right_identity.arn,

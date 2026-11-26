@@ -2,13 +2,12 @@
 
 //! WHERE a client opens a session on a DB cluster whose engine wire this emulator serves.
 //!
-//! The rule under test: the endpoint member a client DIALS carries a host that RESOLVES to the
-//! address the listener the core opened for that cluster is answered at — the name the cluster
-//! mints from its own identifier, announced in the zone RFC 6761 reserves for that interface —
-//! beside that listener's port in the one `DBCluster$Port` ("the port that the database engine
+//! The rule under test: the endpoint member a client DIALS carries the host the listener the
+//! core opened for that cluster is answered at — the address this emulator serves that plane on
+//! — beside that listener's port in the one `DBCluster$Port` ("the port that the database engine
 //! is listening on"), so the pair the client composes reaches the plane that serves it, which a
-//! name in a zone AWS serves would not. The name the cluster publishes beside it under its
-//! `cluster-ro-` label is the read path, which is what a client that splits its traffic reads.
+//! name in a zone AWS serves, or one this service announced beneath a host of its own, would
+//! not. The member the cluster publishes for its read path carries that same address.
 //!
 //! A cluster this emulator serves NO data plane for keeps the minted form under the published
 //! AWS domain — there is no local plane for such a cluster to lead a client to — which is the
@@ -189,17 +188,21 @@ async fn a_served_clusters_published_endpoint_is_the_address_its_engine_listener
             row.case
         );
 
-        // And that address leads to the listener's own: the published name resolves to the
-        // host the core bound the cluster's listener on, with that listener's port beside it —
-        // so what the client dials is the interface the plane answers on. The name beside it
-        // under the cluster's `cluster-ro-` label is the read path.
+        // And that address IS the listener's own: the published host is the host the core bound
+        // the cluster's listener on, with that listener's port beside it — so what the client
+        // dials is the interface the plane answers on. The member beside it carries the same
+        // address, that being where the cluster's read path is answered too.
         let reader = text(&settled, "ReaderEndpoint");
-        assert_served_endpoint_pair(row.case, row.identifier, REGION, &endpoint, &reader);
+        assert_served_endpoint_pair(row.case, &endpoint, &reader);
         let listener = listener_address(&engine, row.case, row.identifier);
         assert_eq!(
-            port, listener.1,
-            "case {:?}: expected the port the cluster's own listener answers on ({}), got {port}",
-            row.case, listener.1
+            (endpoint.as_str(), port),
+            (listener.0.as_str(), listener.1),
+            "case {:?}: expected the address the cluster's own listener answers on ({}:{}), got \
+             {endpoint}:{port}",
+            row.case,
+            listener.0,
+            listener.1
         );
         let resolved: Vec<std::net::SocketAddr> =
             tokio::net::lookup_host((endpoint.as_str(), port))

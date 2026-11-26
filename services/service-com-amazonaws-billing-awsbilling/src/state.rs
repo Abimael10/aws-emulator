@@ -1782,10 +1782,12 @@ pub fn invalid_billing_view_arn(arn: &str) -> String {
 /// view under that ARN — "The specified ARN in the request doesn't exist".
 ///
 /// ONE form for that case, stated once, so an unresolvable ARN of the caller's
-/// own account draws the same refusal whichever operation resolved it, read or
-/// write: the message is this service's ARN-validation sentence
+/// own account draws the same refusal whichever operation resolved it to act on
+/// that view's own record: the message is this service's ARN-validation sentence
 /// ([`invalid_billing_view_arn`]), and the modeled members report the ARN that
-/// resolved to nothing and the billing-view resource type. A billing-view ARN a
+/// resolved to nothing and the billing-view resource type. The two operations
+/// that EDIT or END the view's life answer [`not_a_custom_view`] for the same
+/// ARN instead, deciding eligibility first. A billing-view ARN a
 /// request names BESIDE that view — a source the view draws from — is a
 /// different refusal, which names the member it arrived in
 /// ([`billing_view_not_found`]).
@@ -1803,6 +1805,14 @@ pub fn unresolved_billing_view_arn(arn: &str) -> ResourceNotFoundException {
 /// `action` is the past participle of what the refused request would have done
 /// to the view (`"edited"`, `"deleted"`), so the sentence names the action the
 /// caller asked for rather than a fixed one.
+///
+/// It answers for an ARN that resolves to a view of another type AND for one
+/// that resolves to nothing at all, because the two operations that share it —
+/// the edit and the delete — decide ELIGIBILITY before existence: what such a
+/// caller asked for is a change only a custom view admits, so the refusal names
+/// the views that admit it rather than reporting whether the ARN resolves. Every
+/// other operation resolves the same member the other way round and answers
+/// [`unresolved_billing_view_arn`] for an ARN nothing is stored under.
 ///
 /// This two-sentence wording belongs to the view-lifecycle writers that share
 /// it; an operation whose own refusal text differs builds its own message
@@ -2060,9 +2070,16 @@ pub fn epoch_millis(at: SystemTime) -> i64 {
 ///
 /// The scale carries no instant before the epoch — a promotional credit code
 /// is issued and expires after it — so a negative figure is not one of this
-/// store's instants and reads as the epoch itself.
+/// store's instants and reads as the epoch itself. It SATURATES at both ends,
+/// as [`epoch_millis`] does: a figure the platform's instant cannot be advanced
+/// by reads as the epoch rather than ending the request, so no value a request
+/// carries on this member can stop the operation serving it.
 pub fn instant_from_millis(millis: i64) -> SystemTime {
-    UNIX_EPOCH + std::time::Duration::from_millis(u64::try_from(millis).unwrap_or(0))
+    UNIX_EPOCH
+        .checked_add(std::time::Duration::from_millis(
+            u64::try_from(millis).unwrap_or(0),
+        ))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 /// A request `Timestamp` as seconds since the epoch, on the same scale as

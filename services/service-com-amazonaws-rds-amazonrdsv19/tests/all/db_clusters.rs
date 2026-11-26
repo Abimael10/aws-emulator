@@ -312,26 +312,16 @@ pub(crate) async fn describe_one(
 /// The query parameters of one call, owned so a table row can hold them.
 type Params = Vec<(&'static str, String)>;
 
-/// The DNS suffix a name MINTED for a cluster whose engine WIRE this emulator serves sits in:
-/// the service label of the control plane that owns the engine, in the loopback zone RFC 6761
-/// reserves for the interface the core binds its listeners on.
+/// RULE: the two endpoint names a DB cluster this emulator serves NO data plane for publishes
+/// are minted by the CLUSTER from its own identifier — the writer under `cluster-`, the reader
+/// under `cluster-ro-` — with one server-assigned label and ONE shared suffix behind them, and
+/// neither carries a port. They are therefore non-empty and distinct whatever the cluster's
+/// membership is.
 ///
-/// Both of such a cluster's endpoint members sit in this zone
-/// ([`assert_served_endpoint_pair`]), as does the name a CUSTOM endpoint with no listener of
-/// its own carries. A cluster this emulator serves no data plane for keeps the published AWS
-/// form for both members, so a row for such a cluster passes its own control plane's endpoint
-/// domain.
-pub(crate) const SERVED_SUFFIX: &str = "rds.localhost";
-
-/// RULE: the two endpoint names a DB cluster publishes are minted by the CLUSTER from its own
-/// identifier — the writer under `cluster-`, the reader under `cluster-ro-` — with one
-/// server-assigned label and ONE shared suffix behind them, and neither carries a port. They
-/// are therefore non-empty and distinct whatever the cluster's membership is.
-///
-/// `suffix` is the zone the pair sits in: the endpoint domain of the control plane that owns
-/// the engine for a cluster this emulator serves no data plane for, and [`SERVED_SUFFIX`] — the
-/// zone a resolver answers with the interface the cluster's own listeners are bound on — for a
-/// cluster whose engine wire it serves ([`assert_served_endpoint_pair`]).
+/// `suffix` is the endpoint domain of the control plane that owns the cluster's engine, which
+/// is the zone such a pair sits in. A cluster whose data plane this emulator DOES serve
+/// publishes the address that plane is answered at for both members instead
+/// ([`assert_served_endpoint_pair`]).
 ///
 /// `pub(crate)` so every suite that reads a cluster's endpoints asserts the one rule rather
 /// than a copy of it.
@@ -368,42 +358,41 @@ pub(crate) fn assert_endpoint_name_pair(
     );
 }
 
-/// RULE: a cluster whose engine wire this emulator SERVES publishes, for BOTH of its endpoint
-/// members, the name the CLUSTER mints from its own identifier — the writer under `cluster-`
-/// and the reader under `cluster-ro-`, over one server-assigned label and the ONE shared suffix
-/// [`SERVED_SUFFIX`] — so the two stay DISTINCT, which is what tells a read path from a write
-/// path. The suffix is the zone a resolver answers with the interface the cluster's own
-/// listeners are bound on, which is what makes each name with the one published `Port` an
-/// address a client resolves and dials; neither carries a port of its own.
+/// RULE: a cluster whose data plane this emulator SERVES publishes, for BOTH of its endpoint
+/// members, the ADDRESS that plane is answered at — the host the core reports the cluster's own
+/// listener on — because a client resolves and dials exactly what the control plane published
+/// and the only hosts that reach this process are its own. Both members therefore name that one
+/// host, beside the one published `Port`, and neither carries a port of its own.
 ///
 /// `pub(crate)` so every suite that reads a served cluster's endpoints asserts the one rule
 /// rather than a copy of it.
-pub(crate) fn assert_served_endpoint_pair(
-    case: &str,
-    identifier: &str,
-    region: &str,
-    writer: &str,
-    reader: &str,
-) {
-    assert_endpoint_name_pair(case, identifier, region, SERVED_SUFFIX, writer, reader);
+pub(crate) fn assert_served_endpoint_pair(case: &str, writer: &str, reader: &str) {
     for (which, host) in [("writer", writer), ("reader", reader)] {
         assert_own_endpoint_host(case, which, host);
     }
+    assert_eq!(
+        writer, reader,
+        "case {case:?}: both endpoints in front of one served data plane must name the address \
+         it is answered at, got {writer:?} and {reader:?}"
+    );
 }
 
 /// RULE: an endpoint member of a SERVED cluster is a host a client of this emulator can
-/// resolve and dial — a name in the zone RFC 6761 reserves for the interface the core bound,
-/// or an address of that interface — and never a name in a zone AWS itself serves, which
-/// resolves nowhere near this process. It carries no port of its own either: the cluster's one
-/// `Port` member carries it.
+/// resolve and dial — an address of the interface the core bound its listeners on, or the name
+/// RFC 6761 reserves for it — and never a name in a zone AWS itself serves, which resolves
+/// nowhere near this process. It carries no port of its own either: the cluster's one `Port`
+/// member carries it.
 ///
 /// `pub(crate)` so the suites that read ONE of the two members assert the same rule.
 pub(crate) fn assert_own_endpoint_host(case: &str, which: &str, host: &str) {
+    let bare = host.trim_matches(['[', ']']);
     assert!(
-        service_common::data_plane_addressing::names_the_loopback_interface(host),
-        "case {case:?}: expected the {which} endpoint to be a host this emulator answers on — a \
-         name in the zone reserved for the interface its listeners are bound on, or an address \
-         of that interface — got {host:?}"
+        bare.parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+            || bare == service_common::data_plane_addressing::LOOPBACK_ZONE,
+        "case {case:?}: expected the {which} endpoint to be the host this emulator answers the \
+         cluster's data plane on — an address of the interface its listeners are bound on, or \
+         the name reserved for it — got {host:?}"
     );
     for aws_zone in service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
         assert!(
@@ -494,14 +483,13 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
             "case {case:?}: expected <{element}> {expected:?}, got {actual:?} in {xml}"
         );
     }
-    // The cluster's two endpoint members are the names it mints from its own identifier: the
-    // WRITER under `cluster-` and the READER under `cluster-ro-`, over one shared suffix, in
-    // the zone a resolver answers with the interface its listeners are bound on. A client
-    // dials one of them with the one `Port` beside them, so neither carries a port of its own,
-    // and the labels are what tell the read path from the write path.
+    // The cluster's two endpoint members name the address this emulator answers its data plane
+    // at: the host the core reports the cluster's own listener on, which is the only host a
+    // client of this emulator reaches it at. A client dials it with the one `Port` beside them,
+    // so neither carries a port of its own.
     let endpoint = text(xml, "Endpoint");
     let reader = text(xml, "ReaderEndpoint");
-    assert_served_endpoint_pair(&case, row.stored_identifier, REGION, &endpoint, &reader);
+    assert_served_endpoint_pair(&case, &endpoint, &reader);
     let port = text(xml, "Port");
     assert!(
         port.parse::<u16>().is_ok_and(|port| port != 0),

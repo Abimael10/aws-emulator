@@ -288,10 +288,9 @@ async fn every_published_connection_address_is_one_this_emulator_answers_on() {
     for row in RESOURCES {
         let (host, port) = published_address(&router, row).await;
 
-        // What the rule says: the host is one this emulator answers on — an address of the
-        // interface the core bound its listeners on, or a name in the zone that interface is
-        // named in, which is what a DB cluster publishes — and the port is the one that
-        // resource's own listener landed on.
+        // What the rule says: the host is one this emulator answers on — the address of the
+        // interface the core bound that resource's own listener on — and the port is the one
+        // that listener landed on.
         crate::db_clusters::assert_own_endpoint_host(row.case, "published", &host);
         let resolved: Vec<std::net::SocketAddr> =
             tokio::net::lookup_host((host.as_str(), port))
@@ -362,29 +361,16 @@ async fn every_published_connection_address_is_one_this_emulator_answers_on() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clusters_reader_endpoint_names_the_interface_its_read_only_listener_is_reached_on() {
     let (router, _engine) = emulator_with_engine();
-    // The reader member is the name the CLUSTER mints under its `cluster-ro-` label, which is
-    // what tells a read path from a write path, in the zone a resolver answers with the
-    // interface the cluster's listeners are bound on — so it stays an address a client of this
-    // emulator resolves.
+    // The read path of a cluster whose wire this emulator serves is a listener of the same
+    // plane, so the member a client reads for it carries the address that plane is answered at
+    // — the one host of this process's a client of the emulator reaches it at.
     let row = &RESOURCES[0];
     let identifier = "emu-pca-reader";
     create_cluster(&router, row, identifier).await;
     let settled = available_cluster(&router, row.case, identifier).await;
     let writer = text(&settled, "Endpoint");
     let reader = text(&settled, "ReaderEndpoint");
-    assert_ne!(
-        writer, reader,
-        "case {:?}: a cluster's two connection endpoints must be distinct, got {writer:?} for \
-         both",
-        row.case
-    );
-    crate::db_clusters::assert_own_endpoint_host(row.case, "reader", &reader);
-    assert!(
-        reader.starts_with(&format!("{identifier}.cluster-ro-")),
-        "case {:?}: expected a reader endpoint of the form <identifier>.cluster-ro-<label>…, \
-         got {reader:?}",
-        row.case
-    );
+    crate::db_clusters::assert_served_endpoint_pair(row.case, &writer, &reader);
     // A spelling of the loopback interface and nothing of AWS's own: a name in a zone AWS
     // serves would send the client out of the emulated environment.
     assert!(

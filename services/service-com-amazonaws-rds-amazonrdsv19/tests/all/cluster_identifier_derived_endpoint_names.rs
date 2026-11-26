@@ -2,24 +2,24 @@
 
 //! The two endpoint names a DB CLUSTER mints from its own `DBClusterIdentifier`.
 //!
-//! The rule under test: a DB cluster publishes its write path and its read path as the two DNS
-//! host NAMES it mints from its own identifier — `<DBClusterIdentifier>.cluster-<label>` in
-//! `DBCluster$Endpoint` and `<DBClusterIdentifier>.cluster-ro-<label>` in
-//! `DBCluster$ReaderEndpoint` — over ONE server-assigned label and ONE shared DNS suffix, with
-//! the port reported only in the Integer `DBCluster$Port` and the zone only in
-//! `DBCluster$HostedZoneId` (`smithy_query(query="shape",shape="DBCluster")`). Both are minted
-//! by the CLUSTER, so both exist, keep that form and stay DISTINCT whatever the cluster's
-//! membership is — a cluster with no Aurora Replica at all has no reader instance any name
-//! could be read off — and the `cluster-`/`cluster-ro-` label is the only thing that tells a
-//! read path from a write path. Neither member is ever a `host:port` authority: a client
-//! composes the target itself from one name and the one `Port`, and a port glued into the host
-//! would appear twice in every DSN it builds.
+//! The rule under test: a DB cluster this emulator serves no data plane for publishes its
+//! write path and its read path as the two DNS host NAMES it mints from its own identifier —
+//! `<DBClusterIdentifier>.cluster-<label>` in `DBCluster$Endpoint` and
+//! `<DBClusterIdentifier>.cluster-ro-<label>` in `DBCluster$ReaderEndpoint` — over ONE
+//! server-assigned label and ONE shared DNS suffix, with the port reported only in the Integer
+//! `DBCluster$Port` and the zone only in `DBCluster$HostedZoneId`
+//! (`smithy_query(query="shape",shape="DBCluster")`). Both are minted by the CLUSTER, so both
+//! exist, keep that form and stay DISTINCT whatever the cluster's membership is — a cluster with
+//! no Aurora Replica at all has no reader instance any name could be read off — and the
+//! `cluster-`/`cluster-ro-` label is the only thing that tells a read path from a write path.
+//! Neither member is ever a `host:port` authority: a client composes the target itself from one
+//! name and the one `Port`, and a port glued into the host would appear twice in every DSN it
+//! builds.
 //!
-//! The suffix is the zone the pair is REACHED in, not part of the rule: the zone the interface
-//! this emulator answers the cluster's engine wire on is named in for a cluster whose data
-//! plane it serves, and the endpoint domain of the control plane that owns the engine for a
-//! cluster it serves none for. Either way the two names share it, and for a served cluster the
-//! published pair is really dialled below, so a name that led nowhere could not pass.
+//! A cluster whose data plane this emulator DOES serve publishes, for both members, the ADDRESS
+//! that plane is answered at instead: a client resolves and dials exactly what the control plane
+//! published, and the only hosts that reach this process are its own. The published pair of such
+//! a cluster is really dialled below, so an address that led nowhere could not pass.
 //!
 //! The rows span what the rule generalises over: the MEMBERSHIP the cluster has (no instance at
 //! all, one member, a writer beside a replica), the engines and wires (Aurora PostgreSQL,
@@ -31,7 +31,7 @@
 //! report that publishes the same two addresses under their own entries.
 
 use crate::db_clusters::{
-    assert_endpoint_name_pair, assert_own_endpoint_host, the_cluster, SERVED_SUFFIX,
+    assert_endpoint_name_pair, assert_served_endpoint_pair, the_cluster,
 };
 use crate::db_instance_engine_endpoint::{
     wire_login, Wire, DATABASE, MASTER_PASSWORD, MASTER_USER,
@@ -63,9 +63,10 @@ struct Row {
     /// The wire a client opens a session on, for a row whose engine this emulator serves one
     /// for — `None` for the row it serves none for, which has no plane to dial.
     wire: Option<Wire>,
-    /// The DNS suffix the pair shares: the zone a served cluster's listeners are named in, or
-    /// the endpoint domain of the control plane that owns the engine.
-    suffix: &'static str,
+    /// The DNS suffix the pair of minted names shares — the endpoint domain of the control
+    /// plane that owns the engine — or `None` for a cluster whose data plane this emulator
+    /// SERVES, which publishes that plane's own address instead of a name.
+    suffix: Option<&'static str>,
     /// How many DB instances the row creates in the cluster.
     members: usize,
     /// What the create sends beyond the identity, the engine, the database and the master user.
@@ -74,14 +75,14 @@ struct Row {
 
 const ROWS: &[Row] = &[
     Row {
-        // The shape the reader name has to exist for: no DB instance in the cluster at all, so
-        // `DBClusterMembers` is empty and no member instance could be read for a name.
+        // The shape the reader endpoint has to exist for: no DB instance in the cluster at all,
+        // so `DBClusterMembers` is empty and no member instance could be read for an address.
         case: "an Aurora PostgreSQL Serverless v2 cluster with no member instance at all",
         identifier: "emu-cidn-zero-members",
         stored: "emu-cidn-zero-members",
         engine: "aurora-postgresql",
         wire: Some(Wire::Postgres),
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         members: 0,
         extra: &[
             ("ServerlessV2ScalingConfiguration.MinCapacity", "0.5"),
@@ -94,7 +95,7 @@ const ROWS: &[Row] = &[
         stored: "emu-cidn-one-member",
         engine: "aurora-mysql",
         wire: Some(Wire::MySql),
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         members: 1,
         extra: &[],
     },
@@ -104,7 +105,7 @@ const ROWS: &[Row] = &[
         stored: "emu-cidn-two-members",
         engine: "aurora-postgresql",
         wire: Some(Wire::Postgres),
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         members: 2,
         extra: &[],
     },
@@ -114,19 +115,44 @@ const ROWS: &[Row] = &[
         stored: "emu-cidn-multiaz",
         engine: "postgres",
         wire: Some(Wire::Postgres),
-        suffix: SERVED_SUFFIX,
+        suffix: None,
         members: 0,
         extra: MULTI_AZ_SETTINGS,
     },
     Row {
-        // `DBClusterIdentifier` is 1..63 characters: the shortest identifier a request can
-        // name, which leaves the labels nothing to lean on.
+        // The shortest identifier a request can name, on an engine whose wire this emulator
+        // serves: `DBClusterIdentifier` is 1..63 characters.
         case: "the shortest identifier a request can name",
         identifier: "d",
         stored: "d",
         engine: "aurora-postgresql",
         wire: Some(Wire::Postgres),
-        suffix: SERVED_SUFFIX,
+        suffix: None,
+        members: 0,
+        extra: &[],
+    },
+    // The contrast rows: an engine whose wire this emulator serves no data plane for keeps the
+    // published AWS form, so the minted names are read on these \u2014 over the identifier SHAPES a
+    // request can name.
+    Row {
+        case: "a cluster of an engine this emulator serves no data plane for",
+        identifier: "emu-cidn-docdb",
+        stored: "emu-cidn-docdb",
+        engine: "docdb",
+        wire: None,
+        suffix: Some("docdb.amazonaws.com"),
+        members: 0,
+        extra: &[],
+    },
+    Row {
+        // One bound of `DBClusterIdentifier`: the shortest a request can name, which leaves the
+        // labels nothing to lean on.
+        case: "the shortest identifier, on a cluster that publishes minted names",
+        identifier: "e",
+        stored: "e",
+        engine: "docdb",
+        wire: None,
+        suffix: Some("docdb.amazonaws.com"),
         members: 0,
         extra: &[],
     },
@@ -134,23 +160,11 @@ const ROWS: &[Row] = &[
         // The other bound: 63 characters, hyphenated, and written in another case, which is
         // stored lowercased — so the minted names follow the STORED spelling.
         case: "an identifier of the published maximum length, written in another case",
-        identifier: "EMU-CIDN-Aurora-Cluster-With-A-Very-Long-Identifier-00000000001",
-        stored: "emu-cidn-aurora-cluster-with-a-very-long-identifier-00000000001",
-        engine: "aurora-postgresql",
-        wire: Some(Wire::Postgres),
-        suffix: SERVED_SUFFIX,
-        members: 0,
-        extra: &[],
-    },
-    Row {
-        // The contrast row: an engine whose wire this emulator serves no data plane for keeps
-        // the published AWS suffix, and the rule holds over it unchanged.
-        case: "a cluster of an engine this emulator serves no data plane for",
-        identifier: "emu-cidn-docdb",
-        stored: "emu-cidn-docdb",
+        identifier: "EMU-CIDN-DocDB-Cluster-With-A-Very-Long-Identifier-000000000001",
+        stored: "emu-cidn-docdb-cluster-with-a-very-long-identifier-000000000001",
         engine: "docdb",
         wire: None,
-        suffix: "docdb.amazonaws.com",
+        suffix: Some("docdb.amazonaws.com"),
         members: 0,
         extra: &[],
     },
@@ -232,19 +246,19 @@ fn assert_published_pair(row: &Row, which: &str, cluster: &str) -> (String, Stri
         "case {case:?}: expected a port a client can dial, got {port}"
     );
 
-    // The two names the CLUSTER mints: its stored identifier, the role label, one shared
-    // server-assigned label and one shared suffix — and no port in either.
-    assert_endpoint_name_pair(&case, row.stored, REGION, row.suffix, &writer, &reader);
+    // What the pair carries: the two names the CLUSTER mints — its stored identifier, the role
+    // label, one shared server-assigned label and one shared suffix — for a cluster with no
+    // plane of this emulator's, and the address that plane is answered at for a cluster it
+    // serves one for. No port in either, whichever it is.
+    match row.suffix {
+        Some(domain) => assert_endpoint_name_pair(&case, row.stored, REGION, domain, &writer, &reader),
+        None => assert_served_endpoint_pair(&case, &writer, &reader),
+    }
     for (member, name) in [("Endpoint", &writer), ("ReaderEndpoint", &reader)] {
         assert!(
             !name.ends_with(&format!(":{port}")) && !name.ends_with(&published_port),
             "case {case:?}: <{member}> leaves the port to <Port>, got {name:?}"
         );
-        // A served cluster's names have to stay hosts this emulator answers on, which is what
-        // makes the pair an address rather than a shape.
-        if row.wire.is_some() {
-            assert_own_endpoint_host(&case, member, name);
-        }
     }
     // The zone the names live in is reported beside them rather than glued onto either.
     let zone = text(cluster, "HostedZoneId");
@@ -256,7 +270,7 @@ fn assert_published_pair(row: &Row, which: &str, cluster: &str) -> (String, Stri
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_cluster_publishes_the_two_names_it_mints_from_its_identifier() {
+async fn every_cluster_publishes_the_endpoint_pair_its_own_plane_decides() {
     let router = emulator();
     for row in ROWS {
         let created = create_cluster(&router, row).await;
@@ -270,7 +284,7 @@ async fn every_cluster_publishes_the_two_names_it_mints_from_its_identifier() {
             row.case
         );
 
-        // The membership the row stood up, which the rule holds ACROSS: both names are the
+        // The membership the row stood up, which the rule holds ACROSS: both members are the
         // cluster's own whether or not an instance was ever created in it.
         let members = subtrees(&settled, "DBClusterMember").len();
         assert_eq!(
@@ -279,7 +293,7 @@ async fn every_cluster_publishes_the_two_names_it_mints_from_its_identifier() {
             row.case, row.members
         );
 
-        // A MUTATION answers with the same envelope, and the pair is minted ONCE: a
+        // A MUTATION answers with the same envelope, and the pair is decided ONCE: a
         // modification that touches no endpoint leaves it as it stood.
         let modified = the_cluster(
             row.case,
@@ -339,18 +353,18 @@ async fn every_cluster_publishes_the_two_names_it_mints_from_its_identifier() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_published_name_leads_to_the_plane_it_names() {
+async fn a_published_endpoint_leads_to_the_plane_it_addresses() {
     let router = emulator();
     // One row per wire this emulator serves, the first of them the cluster with no member
-    // instance at all: what the name has to do beyond carrying the right labels is lead a
-    // client to the plane that answers the session.
+    // instance at all: what the published member has to do beyond carrying the right form is
+    // lead a client to the plane that answers the session.
     for row in ROWS.iter().filter(|row| row.wire.is_some()) {
         let wire = row.wire.expect("the row names a wire");
         create_cluster(&router, row).await;
         let settled = available_cluster(&router, row.case, row.identifier).await;
         let (writer, reader, port) = assert_published_pair(row, "DescribeDBClusters", &settled);
 
-        // Both names resolve, and to the interface the cluster's own listeners are bound on.
+        // Both members resolve, and to the interface the cluster's own listeners are bound on.
         for (member, name) in [("Endpoint", &writer), ("ReaderEndpoint", &reader)] {
             let resolved: Vec<std::net::SocketAddr> =
                 tokio::net::lookup_host((name.as_str(), port))
@@ -370,28 +384,28 @@ async fn a_published_name_leads_to_the_plane_it_names() {
             );
         }
 
-        // And the WRITER pair a client composes — the published name with the published `Port`
-        // — is an address a session really opens on: the master user is admitted and the row
-        // the session writes is the row it reads back.
+        // And the WRITER pair a client composes — the published member with the published
+        // `Port` — is an address a session really opens on: the master user is admitted and the
+        // row the session writes is the row it reads back.
         let mut session = wire_login(row.case, wire, &writer, port, DATABASE).await;
         session
             .run(
                 row.case,
-                "CREATE TABLE minted_name (id integer PRIMARY KEY, note varchar(64))",
+                "CREATE TABLE published_pair (id integer PRIMARY KEY, note varchar(64))",
             )
             .await;
         session
             .run(
                 row.case,
-                "INSERT INTO minted_name (id, note) VALUES (1, 'dialled the minted name')",
+                "INSERT INTO published_pair (id, note) VALUES (1, 'dialled the published pair')",
             )
             .await;
         let read = session
-            .run(row.case, "SELECT note FROM minted_name WHERE id = 1")
+            .run(row.case, "SELECT note FROM published_pair WHERE id = 1")
             .await;
         assert_eq!(
             read.only(),
-            Some("dialled the minted name"),
+            Some("dialled the published pair"),
             "case {:?}: expected the row the session wrote, got {read:?}",
             row.case
         );

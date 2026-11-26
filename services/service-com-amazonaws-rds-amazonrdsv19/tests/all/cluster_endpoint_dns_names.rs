@@ -3,18 +3,14 @@
 //! End-to-end tests for the two HOSTS a DB cluster publishes as its endpoints.
 //!
 //! The rule under test: `DBCluster$Endpoint` and `DBCluster$ReaderEndpoint` are hosts, with
-//! the port reported only in `DBCluster$Port` and the zone in `DBCluster$HostedZoneId`, and
-//! both are the names the CLUSTER mints from its own `DBClusterIdentifier` — the writer under
-//! the `cluster-` label and the reader under `cluster-ro-`, over one server-assigned label and
-//! ONE shared suffix — so they are non-empty and DISTINCT whatever the cluster's membership is.
-//! For a cluster whose engine wire this emulator SERVES that shared suffix is the zone RFC 6761
-//! reserves for the interface its own listeners are bound on, because an address a service
-//! hands a client is one the client resolves and dials: a name announced there resolves to
-//! exactly that interface, while a name in a zone AWS serves resolves nowhere near this
-//! process. The `cluster-`/`cluster-ro-` labels are what let a read/write-splitting client, a
-//! DSN builder or a production-readiness audit tell a read path from a write path. Neither
-//! member is read off a member instance: a cluster with no DB instance in it at all publishes
-//! both.
+//! the port reported only in `DBCluster$Port` and the zone in `DBCluster$HostedZoneId`. For a
+//! cluster whose engine wire this emulator SERVES, both are the ADDRESS this emulator answers
+//! that cluster's data plane at — the host the core reports its own listener on — because an
+//! address a service hands a client is one the client resolves and dials, and the only hosts
+//! that reach this process are its own: a name this service announced beneath one of them
+//! resolves to no listener, and a name in a zone AWS serves resolves nowhere near this process.
+//! Neither member is read off a member instance: a cluster with no DB instance in it at all
+//! publishes both.
 //!
 //! Both published members therefore lead to the interface the cluster's own listeners are bound
 //! on, and the pair `<endpoint>` + `<Port>` is an address a session really opens on — asserted
@@ -28,13 +24,13 @@
 //! MySQL) and the other cluster type (a Multi-AZ DB cluster), the identifier shapes a request
 //! can name (short, long and hyphenated, and one written in another case, which is "stored as
 //! a lowercase string"), every operation that answers with a cluster envelope (the create,
-//! the describe and `DescribeDBClusterEndpoints`), and the cluster a RESTORE mints, whose
-//! names follow the identifier the restore gave it rather than the source's.
+//! the describe and `DescribeDBClusterEndpoints`), and the cluster a RESTORE mints, which
+//! publishes a plane of its own rather than the source's.
 
 use std::net::SocketAddr;
 
 use crate::db_cluster_snapshot_restore::cluster_endpoint;
-use crate::db_clusters::{assert_served_endpoint_pair, the_cluster, SERVED_SUFFIX};
+use crate::db_clusters::{assert_served_endpoint_pair, the_cluster};
 use crate::db_instance_engine_endpoint::{
     postgres_login, Transport, DATABASE, MASTER_PASSWORD, MASTER_USER,
 };
@@ -217,7 +213,7 @@ async fn resolved_to_loopback(case: &str, which: &str, host: &str, port: u16) ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_cluster_publishes_two_distinct_endpoint_members_whatever_its_membership() {
+async fn every_cluster_publishes_the_address_of_its_plane_whatever_its_membership() {
     let router = emulator();
     for row in CLUSTERS {
         let created = create_cluster(&router, row).await;
@@ -225,9 +221,9 @@ async fn every_cluster_publishes_two_distinct_endpoint_members_whatever_its_memb
 
         let writer = text(&settled, "Endpoint");
         let reader = text(&settled, "ReaderEndpoint");
-        assert_served_endpoint_pair(row.case, row.stored_identifier, REGION, &writer, &reader);
-        // The membership the row stood up, which the rule holds ACROSS: the two names are
-        // the cluster's own either way.
+        assert_served_endpoint_pair(row.case, &writer, &reader);
+        // The membership the row stood up, which the rule holds ACROSS: the two members name
+        // the cluster's own plane either way.
         let members = subtrees(&settled, "DBClusterMember").len();
         assert_eq!(
             members, row.members,
@@ -249,7 +245,7 @@ async fn every_cluster_publishes_two_distinct_endpoint_members_whatever_its_memb
             row.case
         );
 
-        // Minted ONCE: the create published the names the describe reports.
+        // Published ONCE: the create published the members the describe reports.
         for member in ["Endpoint", "ReaderEndpoint", "Port", "HostedZoneId"] {
             assert_eq!(
                 text(&created, member),
@@ -294,7 +290,7 @@ async fn every_cluster_publishes_two_distinct_endpoint_members_whatever_its_memb
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_clusters_endpoint_names_follow_the_identifier_the_restore_gave_it() {
+async fn a_restored_cluster_publishes_the_address_of_its_own_data_plane() {
     let router = emulator();
     let case = "a cluster restored from a snapshot of another";
     let source = "emu-cen-restore-source";
@@ -314,7 +310,11 @@ async fn a_restored_clusters_endpoint_names_follow_the_identifier_the_restore_ga
         )
         .await,
     );
-    available_cluster(&router, case, source).await;
+    let source_settled = available_cluster(&router, case, source).await;
+    let source_pair = (
+        text(&source_settled, "Endpoint"),
+        text(&source_settled, "Port"),
+    );
     let snapshot = format!("{source}-snap");
     expect_ok(
         case,
@@ -354,8 +354,8 @@ async fn a_restored_clusters_endpoint_names_follow_the_identifier_the_restore_ga
             .await,
         ),
     );
-    // The restored cluster is a cluster of its own: the name it mints carries ITS identifier
-    // and neither published member names the source's.
+    // The restored cluster is a cluster of its own: it publishes the address of the plane this
+    // emulator opened for IT, which is not the pair the source is reached at.
     let settled = available_cluster(&router, case, restored).await;
     for (which, envelope) in [
         ("RestoreDBClusterFromSnapshot", &answered),
@@ -363,20 +363,13 @@ async fn a_restored_clusters_endpoint_names_follow_the_identifier_the_restore_ga
     ] {
         let writer = text(envelope, "Endpoint");
         let reader = text(envelope, "ReaderEndpoint");
-        assert_served_endpoint_pair(
-            &format!("{case} ({which})"),
-            restored,
-            REGION,
-            &writer,
-            &reader,
+        assert_served_endpoint_pair(&format!("{case} ({which})"), &writer, &reader);
+        let pair = (writer, text(envelope, "Port"));
+        assert_ne!(
+            pair, source_pair,
+            "case {case:?} ({which}): the restored cluster must publish the address of its own \
+             plane, got the source's {source_pair:?}"
         );
-        for (member, name) in [("Endpoint", &writer), ("ReaderEndpoint", &reader)] {
-            assert!(
-                !name.contains(source),
-                "case {case:?} ({which}): the restored cluster's {member} must not name the \
-                 source cluster, got {name:?}"
-            );
-        }
     }
 }
 
@@ -405,9 +398,9 @@ async fn both_published_endpoint_names_lead_to_the_plane_they_name() {
     let settled = available_cluster(&router, case, identifier).await;
     let (writer, port) = cluster_endpoint(case, &settled);
     let reader = text(&settled, "ReaderEndpoint");
-    assert_served_endpoint_pair(case, identifier, REGION, &writer, &reader);
+    assert_served_endpoint_pair(case, &writer, &reader);
 
-    // Both names resolve to the interface the cluster's own listeners are bound on.
+    // Both members resolve to the interface the cluster's own listeners are bound on.
     for (which, name) in [("writer", &writer), ("reader", &reader)] {
         resolved_to_loopback(case, which, name, port).await;
     }
@@ -462,12 +455,12 @@ async fn both_published_endpoint_names_lead_to_the_plane_they_name() {
              emulator serves, got {dialed:?}"
         );
     }
-    // The names this emulator did NOT publish resolve to nothing, so the register answers
-    // for the addresses the control plane reports and not for any name in the zone.
-    let unpublished = format!("emu-cen-nothing.cluster-abcdefghijkl.{REGION}.{SERVED_SUFFIX}");
+    // A host this emulator did NOT publish resolves to nothing, so the register answers for
+    // the addresses the control plane reports and not for any host a client might compose.
+    let unpublished = format!("emu-cen-nothing.cluster-abcdefghijkl.{REGION}.rds.amazonaws.com");
     assert!(
-        planes.dialable(&unpublished, port + 1).is_none(),
-        "case {case:?}: no plane answers at a port nothing was opened on"
+        planes.dialable(&unpublished, port).is_none(),
+        "case {case:?}: no plane answers at a host nothing was published at"
     );
     assert!(
         texts(&settled, "ReadReplicaIdentifier").is_empty(),

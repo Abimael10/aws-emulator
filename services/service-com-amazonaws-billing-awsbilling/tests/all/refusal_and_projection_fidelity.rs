@@ -131,8 +131,8 @@ async fn the_default_primary_view_carries_every_documented_member() {
         (
             "an update of an ARN no view is stored under",
             json!({ "arn": ABSENT_ARN, "description": "mine now" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
     for (case, request, expected_status, expected_code) in refused {

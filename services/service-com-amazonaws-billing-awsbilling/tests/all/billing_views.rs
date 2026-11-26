@@ -979,19 +979,19 @@ async fn an_arn_no_view_was_stored_under_is_refused_with_the_modeled_error() {
             "ResourceNotFoundException",
         ),
         (
-            // UpdateBillingView declares ResourceNotFoundException, so an ARN of
-            // the caller's own account that no view is stored under is the same
-            // 404 every other operation resolving that member answers.
+            // UpdateBillingView decides eligibility before existence, so an ARN
+            // of the caller's own account that no CUSTOM view answers to draws
+            // the refusal that says which views may be edited.
             "update an absent view",
             "UpdateBillingView",
             json!({ "arn": ABSENT_ARN, "name": "whatever" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
-            // DeleteBillingView declares no ResourceNotFoundException, so the
-            // eligibility refusal is the only one it can make.
-            "delete an absent view, which declares no 404",
+            // DeleteBillingView decides the same way, so the eligibility refusal
+            // is the only one it can make either.
+            "delete an absent view",
             "DeleteBillingView",
             json!({ "arn": ABSENT_ARN }),
             400,

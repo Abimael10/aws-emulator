@@ -3,12 +3,13 @@
 //! Which refusal an `UpdateBillingView` earns for the view it identifies by its
 //! own `arn`, end to end over the awsJson1_0 wire.
 //!
-//! One rule, over two tables: a request naming a resource by ARN that the
-//! caller's own account holds nothing under is refused with the modelled
-//! `ResourceNotFoundException` (404) wherever the operation declares one, in the
-//! single form this crate answers for that member, while an eligibility refusal
-//! — a `ValidationException` (400) — is reserved for a resource the account DOES
-//! hold and may not act on. The rows vary the ARN's resource id, the update's
+//! One rule, over two tables: the edit decides ELIGIBILITY before existence, so
+//! an own-account ARN that does not name a `CUSTOM` billing view is refused with
+//! one `ValidationException` (400) stating which views may be edited — whether
+//! the account holds a view of another type under it or holds nothing there at
+//! all — while the READ of the same ARN, which resolves it to report the view,
+//! answers the modelled `ResourceNotFoundException` (404) in the single form this
+//! crate keeps for that member. The rows vary the ARN's resource id, the update's
 //! member set and the stored view's `BillingViewType`, so neither answer is
 //! keyed to one recorded request.
 //!
@@ -119,19 +120,32 @@ async fn create_custom_view(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn an_absent_own_account_arn_is_the_modeled_not_found_whatever_the_update_asks() {
+async fn an_absent_own_account_arn_is_refused_for_eligibility_whatever_the_update_asks() {
     let (router, _engine) = emulator_with_engine();
     let before = listed_arns(&router, "before the refusals").await;
 
     for resource_id in absent_resource_ids() {
         let arn = format!("arn:aws:billing::{ACCOUNT_ID}:billingview/{resource_id}");
-        // The read that resolves the same member is the reference answer: the
-        // refusal has ONE form, so the writer's payload is the reader's.
+        // The READ of the same member resolves the ARN to report the view, so it
+        // answers this crate's one not-found form — the contrast the edit's own
+        // refusal is read against.
         let (status, read) = call(&router, "GetBillingView", &json!({ "arn": arn })).await;
         assert_eq!(
             (status, error_code(&read).as_str()),
             (404, "ResourceNotFoundException"),
             "case {arn:?}: the reference read must be refused 404, got {status} {read:?}"
+        );
+        assert_eq!(
+            message(&read),
+            format!("[{arn}] is an invalid billing view arn"),
+            "case {arn:?}: the read states this service's ARN-validation sentence, got {:?}",
+            message(&read)
+        );
+        assert_eq!(
+            (read["resourceId"].as_str(), read["resourceType"].as_str()),
+            (Some(arn.as_str()), Some(BILLING_VIEW_RESOURCE_TYPE)),
+            "case {arn:?}: the read's payload reports the unresolved ARN and its \
+             resource type, got {read:?}"
         );
 
         for (members_case, members) in update_member_sets() {
@@ -140,29 +154,15 @@ async fn an_absent_own_account_arn_is_the_modeled_not_found_whatever_the_update_
             let (status, body) = call(&router, "UpdateBillingView", &body).await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: expected 404 ResourceNotFoundException, got {status} {body:?}"
+                (400, "ValidationException"),
+                "case {case:?}: expected 400 ValidationException, got {status} {body:?}"
             );
             assert_eq!(
                 message(&body),
-                format!("[{arn}] is an invalid billing view arn"),
-                "case {case:?}: expected this service's ARN-validation sentence, got {:?}",
+                ELIGIBILITY_SENTENCE,
+                "case {case:?}: expected the eligibility sentence, got {:?}",
                 message(&body)
             );
-            assert_eq!(
-                (body["resourceId"].as_str(), body["resourceType"].as_str()),
-                (Some(arn.as_str()), Some(BILLING_VIEW_RESOURCE_TYPE)),
-                "case {case:?}: the payload reports the unresolved ARN and its \
-                 resource type, got {body:?}"
-            );
-            for member in ["message", "resourceId", "resourceType"] {
-                assert_eq!(
-                    body[member], read[member],
-                    "case {case:?}: the writer's refusal is the reader's for {member}, \
-                     expected {:?}, got {:?}",
-                    read[member], body[member]
-                );
-            }
         }
     }
 
@@ -173,8 +173,14 @@ async fn an_absent_own_account_arn_is_the_modeled_not_found_whatever_the_update_
     );
 }
 
+/// The one sentence `UpdateBillingView` refuses an ARN that names no `CUSTOM`
+/// view of this account with (`state::not_a_custom_view`, with the edit's own
+/// past participle).
+const ELIGIBILITY_SENTENCE: &str = "The Billing View ARN does not correspond to a Custom Billing \
+                                   View. Only Custom Billing Views may be edited.";
+
 #[tokio::test]
-async fn a_stored_view_the_account_may_not_edit_is_ineligible_rather_than_absent() {
+async fn a_stored_view_the_account_may_not_edit_draws_the_same_eligibility_refusal() {
     let (router, engine) = emulator_with_engine();
 
     // Every `BillingViewType` the model declares beside `CUSTOM` names a view the
@@ -215,8 +221,9 @@ async fn a_stored_view_the_account_may_not_edit_is_ineligible_rather_than_absent
                 (400, "ValidationException"),
                 "case {case:?}: expected 400 ValidationException, got {status} {body:?}"
             );
-            assert!(
-                message(&body).contains("Custom Billing View"),
+            assert_eq!(
+                message(&body),
+                ELIGIBILITY_SENTENCE,
                 "case {case:?}: the refusal states the eligibility rule, got {:?}",
                 message(&body)
             );

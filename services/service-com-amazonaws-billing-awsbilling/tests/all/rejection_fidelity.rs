@@ -564,18 +564,18 @@ async fn only_a_custom_view_may_be_edited_or_deleted() {
     let router = emulator();
 
     // (case, operation, the ARN, the request members beside `arn`, expected
-    // status, expected code). A STORED view that is not CUSTOM is refused for
-    // what it is; `UpdateBillingView` declares `ResourceNotFoundException`, so
-    // an ARN nothing is stored under is that 404 instead, while
-    // `DeleteBillingView` declares no such error and has only this refusal.
+    // status, expected code). Both writers of a view's own lifecycle decide
+    // ELIGIBILITY before existence, so a STORED view that is not CUSTOM and an
+    // ARN nothing is stored under draw the one refusal that says which views may
+    // be edited or deleted.
     let rows: Vec<(&str, &str, String, Value, u16, &str)> = vec![
         (
             "update an absent ARN",
             "UpdateBillingView",
             ABSENT_ARN.to_string(),
             json!({ "name": "renamed" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "update the PRIMARY view",

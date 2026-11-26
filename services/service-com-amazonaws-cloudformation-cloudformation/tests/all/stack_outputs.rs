@@ -304,17 +304,17 @@ fn is_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
     )
 }
 
-/// [`is_endpoint_name`] in the zone the interface this emulator's listeners are bound on is
-/// named in, which is where the endpoints of a resource whose engine wire it SERVES sit: the
-/// names such a resource mints resolve to that interface, while a name in a zone AWS serves
+/// Whether `value` is the ADDRESS this emulator answers a served database data plane at: a
+/// spelling of the interface the core bound its listeners on, which is where the endpoint of a
+/// resource whose engine wire this emulator SERVES is reached. A client resolves and dials
+/// exactly what the control plane published, and the only hosts that reach this process are its
+/// own, so a published member in a zone AWS serves — or a name announced beneath an own host —
 /// resolves nowhere near this process.
-fn is_served_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
-    is_endpoint_name(
-        value,
-        identifier,
-        infix,
-        &format!(".{REGION}.rds.localhost"),
-    )
+fn is_served_data_plane_address(value: &str) -> bool {
+    let bare = value.trim_matches(['[', ']']);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+        || bare == "localhost"
 }
 
 /// Whether `value` is an Amazon RDS immutable resource id: `prefix-` and 26 UPPERCASE
@@ -1104,27 +1104,23 @@ fn output_cases() -> Vec<OutputCase> {
                 ),
                 (
                     // The cluster's engine is one this emulator SERVES a native wire for, so
-                    // the endpoint names Amazon RDS publishes — and so the stack's outputs
-                    // carry — are the ones the CLUSTER mints from its identifier, in the zone
-                    // the interface those listeners are bound on is named in, beside the port
-                    // the core assigned that listener.
+                    // the endpoint members Amazon RDS publishes — and so the stack's outputs
+                    // carry — are the ADDRESS that data plane is answered at: the host the
+                    // core bound the cluster's own listener on, beside the port it assigned
+                    // that listener.
                     "ClusterEndpoint",
                     Expected::Form {
-                        described: "the name the cluster mints for its writer endpoint, in the \
-                                    zone this emulator answers its engine wire in",
-                        check: |value| {
-                            is_served_rds_endpoint(value, "probe-app-cluster", ".cluster-")
-                        },
+                        described: "the address this emulator answers the cluster's data plane \
+                                    at",
+                        check: |value| is_served_data_plane_address(value),
                     },
                 ),
                 (
                     "ClusterReaderEndpoint",
                     Expected::Form {
-                        described: "the name the cluster mints for its read path, in that same \
-                                    zone",
-                        check: |value| {
-                            is_served_rds_endpoint(value, "probe-app-cluster", ".cluster-ro-")
-                        },
+                        described: "that same address, which is where the cluster's read path \
+                                    is answered too",
+                        check: |value| is_served_data_plane_address(value),
                     },
                 ),
                 (

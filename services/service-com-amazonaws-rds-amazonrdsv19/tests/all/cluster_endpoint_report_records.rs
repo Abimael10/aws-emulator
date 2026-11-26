@@ -16,13 +16,12 @@
 //! 2. Each entry publishes the address of its OWN endpoint kind, the same address the
 //!    cluster's own report publishes for that kind: the connection endpoint's for the
 //!    `WRITER` entry, the reader endpoint's for the `READER` entry, and the custom endpoint's
-//!    own address for each `CUSTOM` entry — so no two of a cluster's endpoints collapse onto
-//!    one value. For a cluster whose wire this emulator serves, the two the CLUSTER mints are
-//!    announced in the zone the interface its listeners are bound on is named in, while a
-//!    `CUSTOM` entry publishes the address of the listener opened for it, which carries that
-//!    listener's own port. The one cluster class whose endpoints share an address is the one
-//!    whose whole data plane is served at this emulator's own endpoint, where that address is
-//!    where every one of its endpoints is reached.
+//!    own address for each `CUSTOM` entry — so no two endpoints reached in different places
+//!    collapse onto one value. For a cluster whose wire this emulator serves, the cluster's own
+//!    two entries publish the address its engine listener is answered at, while a `CUSTOM`
+//!    entry publishes the address of the listener opened for it, which carries that listener's
+//!    own port. A cluster whose whole data plane is served at this emulator's own endpoint is
+//!    reached there for every one of its endpoints.
 //! 3. `DBClusterEndpointResourceIdentifier` is a server-minted id of the form
 //!    `cluster-endpoint-<token>`, whose token is of the width every server-assigned id of a
 //!    regional resource of this service carries, and it is the SAME value on the create, on
@@ -266,12 +265,11 @@ async fn the_report_lists_the_custom_endpoints_of_a_cluster_before_its_own_two()
 /// address a client reaches that endpoint at.
 #[derive(Debug, PartialEq, Eq)]
 enum Published {
-    /// A cluster whose own engine LISTENER serves its data plane: the writer entry publishes
-    /// the address that listener answers on, the reader entry the other own spelling of the
-    /// interface it is bound on, and the custom endpoint
-    /// the address of the listener OPENED FOR IT — a client dials the members that endpoint
+    /// A cluster whose own engine LISTENER serves its data plane: the writer and reader
+    /// entries publish the address that listener answers on, and the custom endpoint the
+    /// address of the listener OPENED FOR IT — a client dials the members that endpoint
     /// selects there.
-    NamesWithCustomListener,
+    ServedAddressWithCustomListener,
     /// A cluster whose data plane is an AWS API this emulator serves at its OWN endpoint:
     /// every endpoint of such a cluster is reached at that one address, because its plane
     /// answers there and nowhere else.
@@ -300,7 +298,7 @@ const ADDRESS_CASES: &[AddressCase] = &[
         endpoint_identifier: "emu-cea-wire-ep",
         engine: "aurora-postgresql",
         addressed_to: "https://127.0.0.1:9297/",
-        expected: Published::NamesWithCustomListener,
+        expected: Published::ServedAddressWithCustomListener,
     },
     AddressCase {
         case: "a graph cluster whose data plane this emulator serves as an API",
@@ -372,11 +370,10 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
             row.case
         );
 
-        // No two of the three names a cluster MINTS collapse onto one address: a client that
-        // resolves what it was given tells the write path, the read path and the custom path
-        // apart. A cluster whose plane this emulator serves as an API is the one exception,
-        // and it is one by the rule rather than beside it: every endpoint of such a cluster
-        // is reached at the one address that plane answers on.
+        // No two kinds of endpoint collapse onto one address where each is reached somewhere
+        // else: a client that dials what it was given tells the paths apart. Where one plane
+        // answers them all, every entry names that one address — by the rule rather than beside
+        // it.
         match row.expected {
             Published::OneServedAddress => {
                 for (which, address) in [(CUSTOM, &custom), (READER, &reader)] {
@@ -389,7 +386,48 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                     );
                 }
             }
-            Published::NamesWithCustomListener | Published::NamePerKind => {
+            Published::ServedAddressWithCustomListener => {
+                // The cluster's own two entries publish the address its engine listener is
+                // answered at, which is the only host a client of this emulator reaches that
+                // plane at.
+                crate::db_clusters::assert_served_endpoint_pair(row.case, &writer, &reader);
+                // A CUSTOM endpoint of such a cluster has a LISTENER OF ITS OWN, which is what
+                // routes a session to the members that endpoint selects, so it publishes that
+                // listener's address — carrying its port, the modelled endpoint shape having no
+                // port member of its own — and no client reaches it at the cluster's pair.
+                assert_ne!(
+                    custom, writer,
+                    "case {:?}: a custom endpoint with a listener of its own publishes that \
+                     listener's address, got the cluster's own {writer:?}",
+                    row.case
+                );
+                let (host, port) = custom.rsplit_once(':').unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: expected the custom endpoint's own listener address \
+                         <host>:<port>, got {custom:?}",
+                        row.case
+                    )
+                });
+                assert!(
+                    host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok(),
+                    "case {:?}: expected the address the custom endpoint's own listener \
+                     answers on, got the name {host:?}",
+                    row.case
+                );
+                let port = port.parse::<u16>().unwrap_or_else(|error| {
+                    panic!(
+                        "case {:?}: expected the port that listener was assigned, got \
+                         {port:?}: {error}",
+                        row.case
+                    )
+                });
+                assert!(
+                    port > 0,
+                    "case {:?}: expected a port a client can dial, got {port}",
+                    row.case
+                );
+            }
+            Published::NamePerKind => {
                 for (left, left_name, right, right_name) in [
                     (&custom, CUSTOM, &writer, WRITER),
                     (&custom, CUSTOM, &reader, READER),
@@ -403,51 +441,13 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                     );
                 }
                 // Each minted name carries the label its kind is published under, in front of
-                // the resource it belongs to — for the endpoints that publish a NAME. A CUSTOM
-                // endpoint of a cluster whose wire this emulator serves publishes its OWN
-                // listener's address instead, which is what routes a session to the members
-                // that endpoint selects and which carries that listener's port because the
-                // modelled endpoint shape has no port member of its own.
-                match row.expected {
-                    Published::NamesWithCustomListener => {
-                        let (host, port) = custom.rsplit_once(':').unwrap_or_else(|| {
-                            panic!(
-                                "case {:?}: expected the custom endpoint's own listener address \
-                                 <host>:<port>, got {custom:?}",
-                                row.case
-                            )
-                        });
-                        assert!(
-                            host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok(),
-                            "case {:?}: expected the address the custom endpoint's own listener \
-                             answers on, got the name {host:?}",
-                            row.case
-                        );
-                        let port = port.parse::<u16>().unwrap_or_else(|error| {
-                            panic!(
-                                "case {:?}: expected the port that listener was assigned, got \
-                                 {port:?}: {error}",
-                                row.case
-                            )
-                        });
-                        assert!(
-                            port > 0,
-                            "case {:?}: expected a port a client can dial, got {port}",
-                            row.case
-                        );
-                    }
-                    _ => assert!(
-                        custom.starts_with(&format!("{}.cluster-custom-", row.endpoint_identifier)),
-                        "case {:?}: expected a custom endpoint of the form \
-                         <identifier>.cluster-custom-<label>…, got {custom:?}",
-                        row.case
-                    ),
-                }
-                // The READER and WRITER entries are the two names the CLUSTER mints, whichever
-                // way its plane is served: the write path under the `cluster-` label and the
-                // read path under `cluster-ro-`. For a cluster whose engine wire this emulator
-                // serves, both sit in the zone the interface its listeners are bound on is
-                // named in, so each stays a host this emulator answers on.
+                // the resource it belongs to.
+                assert!(
+                    custom.starts_with(&format!("{}.cluster-custom-", row.endpoint_identifier)),
+                    "case {:?}: expected a custom endpoint of the form \
+                     <identifier>.cluster-custom-<label>…, got {custom:?}",
+                    row.case
+                );
                 for (which, address, label) in [
                     (READER, &reader, "cluster-ro-"),
                     (WRITER, &writer, "cluster-"),
@@ -458,9 +458,6 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                          <cluster>.{label}<label>…, got {address:?}",
                         row.case
                     );
-                    if matches!(row.expected, Published::NamesWithCustomListener) {
-                        crate::db_clusters::assert_own_endpoint_host(row.case, which, address);
-                    }
                 }
             }
         }
@@ -471,7 +468,9 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
         // one first — an IPv6 literal carries colons of its own — so only a trailing `:<port>`
         // on a value that is NOT an address is the violation.
         let bare: Vec<(&str, &String)> = match row.expected {
-            Published::NamesWithCustomListener => vec![(WRITER, &writer), (READER, &reader)],
+            Published::ServedAddressWithCustomListener => {
+                vec![(WRITER, &writer), (READER, &reader)]
+            }
             _ => vec![(CUSTOM, &custom), (WRITER, &writer), (READER, &reader)],
         };
         for (which, address) in bare {

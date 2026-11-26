@@ -272,15 +272,14 @@ async fn available_cluster(
         )
     });
     // Both endpoint members are HOSTS: the model gives a DB cluster ONE `Port` for the pair,
-    // so neither carries a port of its own. Each is a name the cluster minted from its own
-    // identifier — the writer under `cluster-` and the reader under `cluster-ro-` — announced
-    // in the zone the interface this emulator answers the cluster's engine wire on is named
-    // in, and the labels are what tell the read path from the write path.
+    // so neither carries a port of its own. Each is the address this emulator answers the
+    // cluster's data plane at — the host the core bound its listeners on — which is the only
+    // host a client of this emulator reaches that plane at; the read-only listener's own port
+    // is no member of the control plane, so a suite that opens a session on it reads that port
+    // where the listener lives.
     let reader_host = text(&settled, "ReaderEndpoint");
     crate::db_clusters::assert_served_endpoint_pair(
         row.case,
-        row.identifier,
-        REGION,
         &text(&settled, "Endpoint"),
         &reader_host,
     );
@@ -328,10 +327,11 @@ async fn a_clusters_reader_endpoint_serves_the_writers_rows_and_refuses_every_wr
     let (router, engine) = emulator_with_engine();
     for row in CLUSTERS {
         let (writer, reader) = available_cluster(&router, &engine, row).await;
-        assert_ne!(
+        assert_eq!(
             reader.0, writer.0,
-            "case {:?}: a cluster's reader endpoint is a name of its own, got {:?} for both",
-            row.case, writer.0
+            "case {:?}: both endpoints in front of one served plane name the address it is \
+             answered at, got {:?} and {:?}",
+            row.case, writer.0, reader.0
         );
         assert_ne!(
             reader.1, writer.1,

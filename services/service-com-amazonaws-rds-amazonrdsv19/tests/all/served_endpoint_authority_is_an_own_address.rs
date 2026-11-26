@@ -5,13 +5,11 @@
 //!
 //! The rule under test: an endpoint member a client dials names a host the responding service
 //! ANSWERS on. Where this emulator serves a resource's own data-plane listener, that is the
-//! listener's own address — the host the core bound it on, with the port it assigned — or a
-//! name that RESOLVES to it: a DB cluster announces the pair it mints from its own identifier
-//! in the zone RFC 6761 reserves for that interface, and every other member publishes the host
-//! as the core reports it. No member names a host in a zone AWS serves, which is no address a
-//! client of this emulator can reach the resource at: a client on this machine resolves and
-//! dials what the control plane published, and the only interfaces this process answers on are
-//! the one the core bound and the one this emulator's own endpoint is served at.
+//! listener's own address — the host the core bound it on, with the port it assigned — because a
+//! client resolves and dials exactly what the control plane published and the only hosts that
+//! reach this process are its own. No member names a host in a zone AWS serves, and none names
+//! one this service announced beneath a host of its own: neither is an address a client of this
+//! emulator can reach the resource at.
 //!
 //! A resource this emulator serves NO data plane for keeps the AWS DNS form, because there is
 //! no local plane for it to lead a client to; those are the contrast rows at the end.
@@ -55,13 +53,8 @@ struct Published {
     /// member itself carries for a shape with no port member of its own.
     port: u16,
     /// The host the listener serving that resource is bound on, read from this service's own
-    /// store — the address the published host has to lead to.
+    /// store — the address the published host has to be.
     listener_host: String,
-    /// Whether the member publishes the NAME the resource MINTS rather than that address: a DB
-    /// cluster announces the pair it mints from its own identifier in the zone the interface
-    /// its listeners are bound on is named in, and every other member names the host as the
-    /// core reports it.
-    minted: bool,
     /// The wire a session on it speaks.
     wire: Wire,
 }
@@ -324,7 +317,6 @@ async fn every_served_resource_publishes_the_address_its_own_listener_answers_on
             host,
             port,
             listener_host: cluster_listener_host(&engine, case, identifier),
-            minted: true,
             wire,
         });
     }
@@ -342,7 +334,6 @@ async fn every_served_resource_publishes_the_address_its_own_listener_answers_on
         // Its own listener is bound on the same interface the cluster's is: the one the core
         // binds every listener on.
         listener_host: cluster_listener_host(&engine, case, pg_cluster),
-        minted: false,
         wire: Wire::Postgres,
     });
 
@@ -369,7 +360,6 @@ async fn every_served_resource_publishes_the_address_its_own_listener_answers_on
             host,
             port,
             listener_host: instance_listener_host(&engine, case, identifier),
-            minted: false,
             wire,
         });
     }
@@ -383,55 +373,25 @@ async fn every_served_resource_publishes_the_address_its_own_listener_answers_on
             host,
             port,
             listener_host,
-            minted,
             wire,
         } = row;
-        // The published host leads to the listener behind it: the name the resource minted in
-        // the zone that interface is named in, which RESOLVES to the address the listener is
-        // bound on, or that address as the core reports it.
-        match minted {
-            true => {
-                crate::db_clusters::assert_own_endpoint_host(case, member, host);
-                let resolved: Vec<std::net::SocketAddr> =
-                    tokio::net::lookup_host((host.as_str(), *port))
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "case {case:?}: the host <{member}> published ({host:?}) must \
-                                 resolve, got {error}"
-                            )
-                        })
-                        .collect();
-                let bound: IpAddr = listener_host.trim_matches(['[', ']']).parse().unwrap_or_else(
-                    |_| panic!("case {case:?}: the listener is bound on an address"),
-                );
-                assert!(
-                    resolved.contains(&std::net::SocketAddr::new(bound, *port)),
-                    "case {case:?}: <{member}> must publish a name that resolves to the address \
-                     that resource's own listener is bound on ({bound}:{port}), got {host:?} -> \
-                     {resolved:?}"
-                );
-            }
-            false => {
-                let address: IpAddr =
-                    host.trim_matches(['[', ']']).parse().unwrap_or_else(|_| {
-                        panic!(
-                            "case {case:?}: <{member}> must publish the address this emulator \
-                             answers the resource's data plane at, got the name {host:?}"
-                        )
-                    });
-                assert!(
-                    address.is_loopback(),
-                    "case {case:?}: <{member}> must publish an address of the interface the core \
-                     bound its listeners on, got {address}"
-                );
-                assert_eq!(
-                    host, listener_host,
-                    "case {case:?}: <{member}> must publish the host that resource's own \
-                     listener is bound on ({listener_host}), got {host}"
-                );
-            }
-        }
+        // The published host IS the listener's own address, as the core reports it.
+        let address: IpAddr = host.trim_matches(['[', ']']).parse().unwrap_or_else(|_| {
+            panic!(
+                "case {case:?}: <{member}> must publish the address this emulator answers the \
+                 resource's data plane at, got the name {host:?}"
+            )
+        });
+        assert!(
+            address.is_loopback(),
+            "case {case:?}: <{member}> must publish an address of the interface the core bound \
+             its listeners on, got {address}"
+        );
+        assert_eq!(
+            host, listener_host,
+            "case {case:?}: <{member}> must publish the host that resource's own listener is \
+             bound on ({listener_host}), got {host}"
+        );
 
         // It is an address a session really opens on: a client dials the published pair over
         // TCP, is admitted, and reads back the row it wrote.

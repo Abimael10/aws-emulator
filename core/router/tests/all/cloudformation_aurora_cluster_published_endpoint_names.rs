@@ -5,17 +5,16 @@
 //!
 //! The rule under test: a DB cluster's endpoint members are HOSTS and nothing else — the
 //! port is reported only in the Integer member `Port` and the zone only in `HostedZoneId`
-//! (`smithy_query(query="shape", shape="DBCluster")`) — and both are the names the CLUSTER
-//! mints from its own identifier, `<DBClusterIdentifier>.cluster-<label>` and
-//! `<DBClusterIdentifier>.cluster-ro-<label>`, over one shared DNS suffix. The two stay
-//! DISTINCT, and that distinction is the only thing that tells a read path from a write path,
-//! so a consumer that derives read/write splitting from the pair — a DSN or JDBC URL builder, a
-//! driver, a production-readiness audit — needs both members there and needs the port NOT glued
-//! onto the host, or it composes a target carrying the port twice. For a cluster whose engine
-//! wire this emulator SERVES the shared suffix is the zone the interface its own listeners are
-//! bound on is named in, because an address a service hands a client is one the client resolves
-//! and then dials; a cluster it serves no plane for keeps the published AWS suffix, there being
-//! no local plane for it to lead a client to.
+//! (`smithy_query(query="shape", shape="DBCluster")`) — so a consumer that composes a target
+//! from the pair (a DSN or JDBC URL builder, a driver, a production-readiness audit) needs the
+//! port NOT glued onto the host, or it composes a target carrying the port twice. For a cluster
+//! whose engine wire this emulator SERVES, both members carry the ADDRESS this emulator answers
+//! that cluster's data plane at, because an address a service hands a client is one the client
+//! resolves and then dials and the only hosts that reach this process are its own; a cluster it
+//! serves no plane for keeps the names the CLUSTER mints from its own identifier under the
+//! published AWS suffix, there being no local plane for it to lead a client to.
+//!
+//! Both hold whatever the cluster's membership is and whoever created it.
 //!
 //! Both hold whatever the cluster's membership is and whoever created it.
 //!
@@ -46,8 +45,7 @@ use crate::query_wire::{
     blocks_of, element, elements, form_encode, opt_element, outputs_of, physical_ids_of,
 };
 
-/// The Region every request here is signed for, and so the Region the estate lives in — and
-/// the Region label a cluster's minted endpoint names carry.
+/// The Region every request here is signed for, and so the Region the estate lives in.
 const REGION: &str = "us-west-2";
 
 /// The master user the declared clusters are created with: the username the stack's secret
@@ -372,70 +370,37 @@ async fn cluster_identifier(router: &MultiServiceRouter, case: &str, stack: &str
         .unwrap_or_else(|| panic!("case {case:?}: expected the cluster's physical id in {body}"))
 }
 
-/// RULE: the READER member is the name the CLUSTER mints from its own identifier, the
-/// `cluster-ro-` label and one server-assigned label over the region and the DNS suffix its
-/// endpoints share — a bare host, never an address with a port glued on.
-fn assert_reader_host(case: &str, identifier: &str, port: u16, reader: &str) {
-    // A HOST and nothing else: no port and no authority — the port is the cluster's one `Port`
-    // member, so a client composes the target itself.
-    assert!(
-        !reader.ends_with(&format!(":{port}")),
-        "case {case:?}: an endpoint member carries no port of its own, got {reader:?}"
-    );
-    assert!(
-        !reader.contains(':'),
-        "case {case:?}: an endpoint member carries no port of its own, got {reader:?}"
-    );
-    let prefix = format!("{identifier}.cluster-ro-");
-    assert!(
-        reader.starts_with(&prefix),
-        "case {case:?}: expected the reader endpoint to be a name of the form \
-         {prefix}<label>.{REGION}.<suffix>, got {reader:?}"
-    );
-    let rest = &reader[prefix.len()..];
-    let (label, zone) = rest.split_once('.').unwrap_or_else(|| {
-        panic!("case {case:?}: expected a server-assigned label and a DNS suffix, got {reader:?}")
-    });
-    assert!(
-        !label.is_empty() && label.chars().all(|character| character.is_ascii_alphanumeric()),
-        "case {case:?}: expected a server-assigned label behind the cluster-ro- label, got \
-         {reader:?}"
-    );
-    let suffix = zone
-        .strip_prefix(&format!("{REGION}."))
-        .unwrap_or_else(|| panic!("case {case:?}: expected the Region label in {reader:?}"));
-    assert!(
-        !suffix.is_empty() && suffix.contains('.'),
-        "case {case:?}: expected a non-empty DNS suffix behind the Region, got {reader:?}"
-    );
-}
-
-/// RULE: the WRITER member is the one a client composes its connection from, and it is the
-/// `<identifier>.cluster-<label>` name the cluster mints — a bare host carrying no port, and
-/// distinct from the reader member.
-fn assert_writer_host(case: &str, identifier: &str, port: u16, writer: &str, reader: &str) {
-    assert!(
-        writer.starts_with(&format!("{identifier}.cluster-")),
-        "case {case:?}: expected the writer endpoint to be the name the cluster mints from its \
-         identifier, got {writer:?}"
-    );
-    assert!(
-        !writer.ends_with(&format!(":{port}")),
-        "case {case:?}: an endpoint member carries no port of its own, got {writer:?}"
-    );
-    assert!(
-        !writer.contains(':'),
-        "case {case:?}: expected a bare host, got {writer:?}"
-    );
-    assert_ne!(
+/// RULE: each endpoint member of a cluster whose data plane this emulator SERVES carries the
+/// ADDRESS that plane is answered at — a bare host of this emulator's own, never an address
+/// with a port glued on and never a name in a zone AWS serves — so both members carry that one
+/// address and a client composes its target from it and the cluster's one `Port`.
+fn assert_published_pair(case: &str, port: u16, writer: &str, reader: &str) {
+    for (member, value) in [("Endpoint", writer), ("ReaderEndpoint", reader)] {
+        // A HOST and nothing else: no port and no authority — the port is the cluster's one
+        // `Port` member, so a client composes the target itself.
+        assert!(
+            !value.ends_with(&format!(":{port}")) && !value.contains(':'),
+            "case {case:?}: <{member}> carries no port of its own, got {value:?}"
+        );
+        // An address of the interface the core bound this emulator's listeners on, which is the
+        // only host a client of the emulator reaches that plane at. A name in a zone AWS serves
+        // would send the client out of the emulated environment.
+        let address = value.trim_matches(['[', ']']).parse::<std::net::IpAddr>();
+        assert!(
+            address.is_ok_and(|address| address.is_loopback()),
+            "case {case:?}: <{member}> must publish the address this emulator answers the \
+             cluster's data plane at, got {value:?}"
+        );
+    }
+    assert_eq!(
         writer, reader,
-        "case {case:?}: a cluster's reader endpoint must be distinct from its writer endpoint, \
-         got {writer:?} for both"
+        "case {case:?}: both members in front of one served data plane name the address it is \
+         answered at, got {writer:?} and {reader:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stack_deployed_aurora_cluster_publishes_the_reader_name_it_mints() {
+async fn a_stack_deployed_aurora_cluster_publishes_the_address_of_its_plane() {
     for row in ROWS {
         let case = row.case;
         let router = build_router();
@@ -487,8 +452,7 @@ async fn a_stack_deployed_aurora_cluster_publishes_the_reader_name_it_mints() {
 
         let writer = element(&body, "Endpoint");
         let reader = element(&body, "ReaderEndpoint");
-        assert_reader_host(case, &identifier, port, &reader);
-        assert_writer_host(case, &identifier, port, &writer, &reader);
+        assert_published_pair(case, port, &writer, &reader);
         // The membership the row declared, which the rule holds ACROSS: the reader member is the
         // cluster's own whether or not there is an instance in it.
         let members = blocks_of(&body, "DBClusterMember").len();

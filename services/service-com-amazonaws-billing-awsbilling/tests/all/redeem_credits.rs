@@ -987,3 +987,72 @@ async fn a_redemption_the_ledger_has_no_room_for_consumes_nothing() {
         "case \"a full ledger\": a refused redemption must leave the code redeemable"
     );
 }
+
+/// RULE: the millisecond scale a promotional credit code is issued and expires on reads as an
+/// instant of this store for EVERY figure it can carry — the scale is `i64`, and a figure this
+/// platform's instant cannot be advanced to saturates rather than ending the request — so no
+/// figure a code carries can stop the redemption that reads it from being served.
+///
+/// The rows span the scale: both of its bounds, the epoch itself, the figures either side of it,
+/// and an ordinary instant, which is the one the conversion round-trips.
+#[tokio::test]
+async fn every_figure_the_millisecond_scale_carries_reads_as_an_instant() {
+    let day: i64 = DAY_MILLIS;
+    // The figures whose instant the scale fixes exactly: the epoch, the millisecond after it,
+    // an ordinary instant, and the figures before the epoch — which name no instant of this
+    // store and read as the epoch itself.
+    let rows: &[(&str, i64, SystemTime)] = &[
+        ("the epoch", 0, UNIX_EPOCH),
+        ("one millisecond after the epoch", 1, UNIX_EPOCH + Duration::from_millis(1)),
+        ("an ordinary instant", 30 * day, UNIX_EPOCH + Duration::from_millis(30 * day as u64)),
+        ("one millisecond before the epoch", -1, UNIX_EPOCH),
+        ("the lower bound of the scale", i64::MIN, UNIX_EPOCH),
+    ];
+    for (case, millis, expected) in rows {
+        let read = billing_state::instant_from_millis(*millis);
+        assert_eq!(
+            read, *expected,
+            "case {case:?}: expected {expected:?} for {millis}, got {read:?}"
+        );
+    }
+    // And at the top of the scale, where the figure may be past what this platform's instant
+    // can hold: every one of them still READS as an instant of this store — at or after the
+    // epoch — rather than ending the call.
+    for (case, millis) in [
+        ("the upper bound of the scale", i64::MAX),
+        ("a figure a thousand years of milliseconds past it", i64::MAX / 1_000),
+        ("the largest whole second of the scale", i64::MAX - (i64::MAX % 1_000)),
+    ] {
+        let read = billing_state::instant_from_millis(millis);
+        assert!(
+            read >= UNIX_EPOCH,
+            "case {case:?}: expected an instant at or after the epoch for {millis}, got {read:?}"
+        );
+    }
+
+    // And a code carrying such a figure is REDEEMED rather than ending the call: the credit it
+    // mints is in the ledger afterwards.
+    let emulator = Emulator::new();
+    let promotion = emulator.issue_code(
+        "AWS",
+        0,
+        "PROMOUNBOUNDEDEXPIRY",
+        ACCOUNT_ID,
+        100_000,
+        i64::MAX,
+    );
+    let before = emulator.credits("an unbounded expiry").await;
+    let (status, body) = emulator.redeem(&promotion.code).await;
+    assert_eq!(
+        status, 200,
+        "case \"an unbounded expiry\": expected the redemption to be served, got {status} with \
+         {body:?}"
+    );
+    let after = emulator.credits("an unbounded expiry").await;
+    assert_eq!(
+        credit_ids(&after).len(),
+        credit_ids(&before).len() + 1,
+        "case \"an unbounded expiry\": the redemption must add the credit it answered with, got \
+         {after:?}"
+    );
+}

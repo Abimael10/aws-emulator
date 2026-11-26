@@ -69,16 +69,13 @@ pub struct DbClusterRecord {
     /// ([`crate::state::api_plane_endpoint`]); `None` for a cluster whose data plane this
     /// emulator does not serve at all.
     ///
-    /// The two endpoint members are MINTED names rather than this address: each is
-    /// `<identifier>.cluster-`/`cluster-ro-<label>.<region>.<suffix>` ([`Self::endpoint`],
-    /// [`Self::reader_endpoint`]), and this address decides the zone they are announced in
-    /// ([`Self::endpoint_dns_suffix`]) — the one a resolver answers with the interface the
-    /// listener is bound on — and the `Port` published beside both
-    /// ([`Self::published_port`]). Where no zone this emulator may announce resolves to that
-    /// interface ([`minted_name_reaches_listener`]) both members name this host instead, since
-    /// a name that reaches nothing is no endpoint at all. A cluster whose plane is served as an
-    /// API is addressed at this host for every one of its endpoints — the two members and each
-    /// CUSTOM endpoint in front of it — because that plane answers HTTP there and nowhere else.
+    /// Every endpoint member in front of that plane publishes THIS host — the two cluster
+    /// endpoints ([`Self::endpoint`], [`Self::reader_endpoint`]) and each CUSTOM endpoint
+    /// ([`Self::custom_endpoint_host`]) — beside the `Port` published with them
+    /// ([`Self::published_port`]), because a client resolves and dials exactly what the control
+    /// plane published and this is the address the plane answers on. A cluster this emulator
+    /// serves no plane for publishes the AWS DNS form instead, there being no local plane for
+    /// such a cluster to lead a client to.
     pub served_endpoint: Option<ServedEndpoint>,
     /// `Status`.
     pub status: String,
@@ -562,24 +559,22 @@ impl DbClusterRecord {
     /// The cluster endpoint: "the connection endpoint for the primary instance of the DB
     /// cluster".
     ///
-    /// The name the CLUSTER mints from its own identifier under the published `cluster-` label,
-    /// `<identifier>.cluster-<server-assigned label>.<region>.<suffix>` (Amazon Aurora User
-    /// Guide, "Amazon Aurora connection management"), over the suffix
-    /// [`Self::endpoint_dns_suffix`] answers — the zone the cluster's own engine listener is
-    /// named in for a cluster whose data plane this emulator serves
-    /// ([`data_plane::cluster_endpoint`]), and the endpoint domain of the control plane that
-    /// owns the engine for a cluster it serves none for. It is the one member a client
-    /// COMPOSES ITS CONNECTION FROM, beside the single [`Self::published_port`], so the name is
-    /// published only where it leads back to the plane that answers the session
-    /// ([`minted_name_reaches_listener`]): a listener an operator bound on an interface no zone
-    /// this emulator may announce resolves to is named as the core reports it instead.
+    /// The ADDRESS this emulator answers the cluster's data plane at, for a cluster it serves
+    /// one for ([`Self::serves_at_its_own_host`]): the host the core reports the cluster's own
+    /// engine listener on ([`data_plane::cluster_endpoint`]), or this process's own host for a
+    /// cluster whose plane is served as an AWS API ([`crate::state::api_plane_endpoint`]). It is
+    /// the one member a client COMPOSES ITS CONNECTION FROM, beside the single
+    /// [`Self::published_port`], and a client resolves and dials exactly what is published here,
+    /// so what is published is the address the plane answers on and never a name minted beneath
+    /// it: the only hosts that reach this process are its own, and a name this emulator
+    /// announces under one of them is no host of its own ([`cluster_endpoint_names`]).
     ///
-    /// A cluster whose data plane this emulator serves as an API
-    /// ([`engine_data_plane_is_an_api`]) publishes this process's own endpoint
-    /// ([`crate::state::api_plane_endpoint`]) for every one of its endpoints: that plane
-    /// answers HTTP there, and the front door admits a request only when its `Host` names the
-    /// interface the core bound, so a minted name would reach it nowhere — see
-    /// [`cluster_endpoint_names`].
+    /// A cluster this emulator serves NO data plane for keeps the name the CLUSTER mints from
+    /// its own identifier under the published `cluster-` label,
+    /// `<identifier>.cluster-<server-assigned label>.<region>.<endpoint domain>` (Amazon Aurora
+    /// User Guide, "Amazon Aurora connection management"), under the DNS domain of the control
+    /// plane that owns its engine ([`endpoint_domain`]): there is no local plane for such a
+    /// cluster to lead a client to.
     ///
     /// A HOST and nothing else: the cluster has one `Port` member for both of its endpoints,
     /// so neither carries a port of its own.
@@ -592,65 +587,45 @@ impl DbClusterRecord {
 
     /// The host this cluster publishes INSTEAD of a name it minted, for every endpoint in
     /// front of its data plane ([`Self::endpoint`], [`Self::reader_endpoint`] and
-    /// [`Self::custom_endpoint_host`]) — `None` for a cluster that publishes its minted names.
+    /// [`Self::custom_endpoint_host`]) — `None` for a cluster this emulator serves no data
+    /// plane for, which publishes its minted names.
     ///
     /// One reading for all three, because the question is about the PLANE rather than about
-    /// which endpoint fronts it: a minted name is published only where it leads a client back
-    /// to that plane. It does not where the plane is an AWS API this emulator serves at its own
-    /// endpoint ([`engine_data_plane_is_an_api`]), whose front door admits a request only when
-    /// its `Host` names the interface the core bound, nor where no zone this emulator may
-    /// announce resolves to the interface the cluster's listeners were bound on
-    /// ([`minted_name_reaches_listener`]).
+    /// which endpoint fronts it: every one of them fronts the same plane, so every one of them
+    /// publishes the address that plane is answered at.
     fn serves_at_its_own_host(&self) -> Option<String> {
-        let served = self.served_endpoint.as_ref()?;
-        let own_host = engine_data_plane_is_an_api(&self.engine)
-            || !minted_name_reaches_listener(&served.host);
-        own_host.then(|| served.host.clone())
+        self.served_endpoint
+            .as_ref()
+            .map(|served| served.host.clone())
     }
 
     /// One of the two names the cluster MINTS for its endpoints: its identifier, the `role`
     /// label ([`CLUSTER_WRITER_LABEL`] or [`CLUSTER_READER_LABEL`]) with the server-assigned
-    /// label behind it, the region, and the suffix both names share
-    /// ([`Self::endpoint_dns_suffix`]).
+    /// label behind it, the region, and the endpoint domain of the control plane that owns its
+    /// engine ([`endpoint_domain`]), which both names share.
     fn minted_endpoint_name(&self, role: &str) -> String {
         cluster_endpoint_host(
             &self.identifier,
             role,
             &self.endpoint_host,
             &self.region,
-            &self.endpoint_dns_suffix(),
+            endpoint_domain(&self.engine),
         )
     }
 
-    /// The DNS suffix every name this cluster MINTS sits in ([`Self::minted_endpoint_name`],
-    /// [`Self::custom_endpoint_host`]).
-    ///
-    /// A cluster whose engine wire this emulator serves is reached on a listener of its own,
-    /// so a name it mints sits in the zone that listener's address names
-    /// ([`served_endpoint_suffix`]) — the loopback zone for the interface the core binds on —
-    /// and a cluster this emulator serves no plane for keeps the published AWS form, under the
-    /// endpoint domain of the control plane that owns its engine ([`endpoint_domain`]).
-    fn endpoint_dns_suffix(&self) -> String {
-        match &self.served_endpoint {
-            Some(served) => served_endpoint_suffix(endpoint_domain(&self.engine), &served.host),
-            None => endpoint_domain(&self.engine).to_string(),
-        }
-    }
-
     /// The host a CUSTOM endpoint of this cluster publishes: `named`, the cluster's
-    /// `cluster-custom-` label and the cluster's own label, region and suffix — one name in
-    /// front of the same data plane the cluster's two endpoints name
+    /// `cluster-custom-` label and the cluster's own label, region and endpoint domain — one
+    /// name in front of the same data plane the cluster's two endpoints name
     /// ([`DbClusterEndpointRecord::to_wire`]).
     ///
     /// Composed here, from the cluster's own fields, so a custom endpoint cannot sit in
     /// another zone than the cluster it fronts.
     ///
-    /// A cluster that publishes a host of its own rather than a minted name
-    /// ([`Self::serves_at_its_own_host`]) is read here the same way, for the same reason: a
-    /// custom endpoint fronts the SAME data plane as the cluster's two endpoints, so it is
-    /// reached wherever that plane is. A custom endpoint this emulator opened a LISTENER for
-    /// publishes that listener's own address instead of the name composed here
-    /// ([`DbClusterEndpointRecord::to_wire`]).
+    /// A cluster whose data plane this emulator SERVES publishes the address that plane is
+    /// answered at ([`Self::serves_at_its_own_host`]), exactly as its own two endpoints do: a
+    /// custom endpoint fronts the SAME data plane, so it is reached wherever that plane is. A
+    /// custom endpoint this emulator opened a LISTENER for publishes that listener's own
+    /// address instead of either ([`DbClusterEndpointRecord::to_wire`]).
     pub fn custom_endpoint_host(&self, named: &str) -> String {
         if let Some(served) = self.serves_at_its_own_host() {
             return served;
@@ -660,7 +635,7 @@ impl DbClusterRecord {
             CLUSTER_CUSTOM_LABEL,
             &self.endpoint_host,
             &self.region,
-            &self.endpoint_dns_suffix(),
+            endpoint_domain(&self.engine),
         )
     }
 
@@ -691,34 +666,29 @@ impl DbClusterRecord {
     }
 
     /// The reader endpoint, which "load-balances connections across the Aurora Replicas
-    /// that are available in a DB cluster": the name the CLUSTER mints from its own identifier
-    /// under the published `cluster-ro-` label, over the SAME suffix
-    /// ([`Self::endpoint_dns_suffix`]) and beside the same `Port` as [`Self::endpoint`], so the
-    /// two names differ in that label and in nothing else.
+    /// that are available in a DB cluster".
+    ///
+    /// The address this emulator answers the cluster's data plane at for a cluster it serves
+    /// one for, exactly as [`Self::endpoint`] publishes it ([`Self::serves_at_its_own_host`]):
+    /// the read path and the write path of one cluster are two listeners of one plane, and the
+    /// host a client dials to reach that plane is the host the core answers it on. The read-only
+    /// listener has a port of its own ([`data_plane::DbEngineEndpoint::reader`]) and the one
+    /// `Port` the model gives the pair is the WRITER listener's, so a client that reaches the
+    /// read-only plane on a port does it on a custom endpoint, whose own shape carries the port
+    /// the core assigned it ([`DbClusterEndpointRecord::to_wire`]); publishing the read-only
+    /// listener's port beside this member needs a second `Port` member the model does not have.
+    ///
+    /// A cluster this emulator serves NO data plane for keeps the name the CLUSTER mints from
+    /// its own identifier under the published `cluster-ro-` label, over the same endpoint domain
+    /// as [`Self::endpoint`], so the two names differ in that label and in nothing else. Such a
+    /// cluster is reached at it whatever its membership is — a cluster with no Aurora Replica at
+    /// all is still reported one, there being no reader instance to read a name off.
     ///
     /// A HOST, exactly as [`Self::endpoint`] is: the model gives a DB cluster ONE port
     /// member for both of its endpoints (`DBCluster$Port`, "the port that the database
     /// engine is listening on"), so neither endpoint member carries a port of its own and
     /// neither is ever written as a `host:port` authority — a client composes the address it
     /// dials from the endpoint and that one `Port`.
-    ///
-    /// It is minted by the CLUSTER, so it is non-empty and DISTINCT from the writer endpoint
-    /// whatever the cluster's membership is — a cluster with no Aurora Replica at all is still
-    /// reached at it, there being no reader instance to read a name off — and that distinction
-    /// is what tells a read path from a write path. The read-only plane behind it is a listener
-    /// of its own ([`data_plane::DbEngineEndpoint::reader`]) with a port of its own, and the one
-    /// `Port` the model gives the pair is the WRITER listener's, so a client that reaches the
-    /// read-only plane on a port does it on a custom endpoint, whose own shape carries the port
-    /// the core assigned it ([`DbClusterEndpointRecord::to_wire`]); publishing the read-only
-    /// listener's port beside this name needs a second `Port` member the model does not have.
-    ///
-    /// Where the minted name would lead a client nowhere it is the served host instead, exactly
-    /// as [`Self::endpoint`] reads it ([`Self::serves_at_its_own_host`]): a listener an operator
-    /// bound on an interface no zone this emulator may announce resolves to, and a cluster whose
-    /// data plane is an AWS API this emulator serves at its OWN endpoint — a graph cluster's
-    /// plane answers HTTP there, and the front door admits a request only when its `Host` names
-    /// the interface the core bound, so that host is the only address that reaches it (see
-    /// [`cluster_endpoint_names`]).
     pub fn reader_endpoint(&self) -> String {
         if let Some(served) = self.serves_at_its_own_host() {
             return served;

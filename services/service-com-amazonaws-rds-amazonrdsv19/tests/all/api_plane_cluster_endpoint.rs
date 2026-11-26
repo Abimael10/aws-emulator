@@ -162,15 +162,9 @@ fn assert_published_address(case: &str, label: &str, cluster: &str, row: &Addres
             );
         }
         Expected::OwnListener => {
-            // A cluster whose own engine listener serves its data plane announces the pair it
-            // minted in the zone the interface that listener is bound on is named in.
-            crate::db_clusters::assert_served_endpoint_pair(
-                &case,
-                &text(cluster, "DBClusterIdentifier"),
-                REGION,
-                &endpoint,
-                &reader,
-            );
+            // A cluster whose own engine listener serves its data plane publishes the address
+            // that listener is answered at, for both of its members.
+            crate::db_clusters::assert_served_endpoint_pair(&case, &endpoint, &reader);
             assert!(
                 port.parse::<u16>().is_ok_and(|port| port != 0),
                 "case {case:?}: expected the port the cluster's listener answers on, got \

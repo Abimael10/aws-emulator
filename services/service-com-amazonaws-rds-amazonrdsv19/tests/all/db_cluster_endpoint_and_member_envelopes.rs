@@ -10,12 +10,11 @@
 //!    `DBCluster$Port` ("the port that the database engine is listening on") beside its two
 //!    endpoint members, so neither `Endpoint` nor `ReaderEndpoint` carries a port of its own
 //!    and neither is ever written as a `host:port` authority; a client composes the address
-//!    it dials from an endpoint and that one port. Every cluster publishes the documented DNS
-//!    names the CLUSTER mints from its identifier for both,
-//!    `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>`, over one shared
-//!    suffix: the zone the interface its own listeners are bound on is named in for a cluster
-//!    whose data plane this emulator SERVES, and the endpoint domain of the control plane that
-//!    owns its engine for every other.
+//!    it dials from an endpoint and that one port. A cluster whose data plane this emulator
+//!    SERVES publishes, for both members, the ADDRESS that plane is answered at; every other
+//!    cluster publishes the documented DNS names the CLUSTER mints from its identifier,
+//!    `<identifier>.cluster-<label>` and `<identifier>.cluster-ro-<label>`, under the endpoint
+//!    domain of the control plane that owns its engine.
 //!
 //! 2. `DBClusterMember$PromotionTier` is "the order in which an Aurora Replica is promoted
 //!    to the primary instance": a property of the MEMBER instance — the value its request
@@ -36,7 +35,7 @@
 //! and two clusters whose managed secrets must not share a name.
 
 use crate::db_clusters::{describe_one, the_cluster};
-use crate::db_instances::{call, emulator, expect_ok, optional_text, subtrees, text, REGION};
+use crate::db_instances::{call, emulator, expect_ok, optional_text, subtrees, text};
 use crate::lifecycle_poll_loops::poll_until;
 use crate::managed_master_user_password::{
     emulator as emulator_with_secrets, master_user_secret, the_resource,
@@ -171,12 +170,10 @@ fn the_published_address(case: &str, row: &EndpointCase, which: &str, cluster: &
         );
     }
     if row.served {
-        // A cluster whose engine wire this emulator serves announces the pair it minted in the
-        // zone the interface that wire is answered on is named in.
+        // A cluster whose engine wire this emulator serves publishes, for both members, the
+        // address that wire is answered on.
         crate::db_clusters::assert_served_endpoint_pair(
             &format!("{case} ({which})"),
-            row.identifier,
-            REGION,
             &endpoint,
             &reader,
         );
