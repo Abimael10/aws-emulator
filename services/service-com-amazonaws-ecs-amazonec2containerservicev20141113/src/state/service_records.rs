@@ -47,6 +47,18 @@ pub struct ServiceRecord {
     /// task.
     pub task_definition: Option<(String, String, i32)>,
     pub launch_type: Option<String>,
+    /// The launch type this service ran on before a capacity-provider strategy was put on
+    /// it, kept while that strategy places its tasks and `None` for a service that never
+    /// came off a launch type.
+    ///
+    /// A service reports either a strategy or a launch type, so moving it onto a strategy
+    /// takes the launch type off [`Self::launch_type`] — but it is not gone, because the
+    /// strategy can be taken off again: `UpdateService$capacityProviderStrategy` lists
+    /// "Update the Auto Scaling group or Fargate capacity provider back to the launch type.
+    /// Pass an empty list in the `capacityProviderStrategy` parameter" among the valid
+    /// transitions, and the launch type that empty list takes the service back to is the one
+    /// it held here ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::launch_type_off_strategy`]).
+    pub launch_type_before_strategy: Option<String>,
     pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
     pub platform_version: Option<String>,
     /// The IAM role the CREATE named, resolved to an ARN, and `None` when it named none

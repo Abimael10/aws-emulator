@@ -1206,6 +1206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .map(|found| (region.clone(), found.family.clone(), found.revision)),
             launch_type,
+            // The service comes out of its create on whichever of the two it states, so
+            // there is no launch type a strategy was put on top of yet.
+            launch_type_before_strategy: None,
             capacity_provider_strategy,
             platform_version: input.platform_version.clone(),
             // "The name or full Amazon Resource Name (ARN) of the IAM role" the request

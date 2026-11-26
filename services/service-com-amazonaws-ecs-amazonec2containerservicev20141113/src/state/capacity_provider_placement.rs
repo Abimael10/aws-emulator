@@ -198,4 +198,40 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 && provider.status != CAPACITY_PROVIDER_INACTIVE
         })
     }
+
+    /// The launch type an update that takes `service` OFF its capacity-provider strategy
+    /// leaves it running on, or `None` for a service that reports a launch type already and
+    /// so has no strategy to come off.
+    ///
+    /// `UpdateService$capacityProviderStrategy` lists, among the valid transitions, "Update
+    /// the Auto Scaling group or Fargate capacity provider back to the launch type. Pass an
+    /// empty list in the `capacityProviderStrategy` parameter": an empty strategy is the way
+    /// BACK to a launch type, so the service ends up on one. Which one is read off the
+    /// service rather than asserted: the launch type the strategy was put on top of
+    /// ([`super::ServiceRecord::launch_type_before_strategy`]), and for a service that never
+    /// held one, the class of capacity the strategy it comes off was placing its tasks on
+    /// ([`Self::capacity_provider_launch_type`], the same resolution
+    /// [`Self::placement_launch_type`] reports those tasks under) — else the capacity
+    /// registered to the cluster, which is what a service that states neither runs on
+    /// ([`DEFAULT_LAUNCH_TYPE`]).
+    pub fn launch_type_off_strategy(&self, service: &super::ServiceRecord) -> Option<String> {
+        if service.launch_type.is_some() {
+            return None;
+        }
+        Some(
+            service
+                .launch_type_before_strategy
+                .clone()
+                .or_else(|| {
+                    service
+                        .capacity_provider_strategy
+                        .iter()
+                        .find_map(|item| {
+                            self.capacity_provider_launch_type(&item.capacity_provider)
+                        })
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| DEFAULT_LAUNCH_TYPE.to_string()),
+        )
+    }
 }

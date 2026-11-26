@@ -884,10 +884,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a capacity-provider strategy takes the launch type off it, and the strategy it
         // moves to is where the tasks then run
         // ([`crate::state::validate_placement_launch_type`]).
+        //
+        // An EMPTY `capacityProviderStrategy` is the other direction:
+        // `UpdateService$capacityProviderStrategy` lists "Update the Auto Scaling group or
+        // Fargate capacity provider back to the launch type. Pass an empty list in the
+        // `capacityProviderStrategy` parameter" among the valid transitions, so such a
+        // request takes the service off its strategy and back onto a launch type
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::launch_type_off_strategy`]).
+        // That launch type is where the service's tasks then run, so every rule below that
+        // weighs the placement this update LEAVES the service with reads it, and the write
+        // further down puts it back on the record.
+        let restored_launch_type = match input.capacity_provider_strategy.as_deref() {
+            Some([]) => guard.launch_type_off_strategy(&snapshot),
+            _ => None,
+        };
         let (effective_launch_type, effective_strategy) =
             match input.capacity_provider_strategy.as_deref() {
                 Some(strategy) if !strategy.is_empty() => (None, strategy),
-                _ => (snapshot.launch_type.as_deref(), [].as_slice()),
+                _ => (
+                    restored_launch_type
+                        .as_deref()
+                        .or(snapshot.launch_type.as_deref()),
+                    [].as_slice(),
+                ),
             };
         if let Some(definition) = definition.as_ref() {
             if let Err(message) = crate::state::validate_placement_launch_type(
@@ -991,11 +1010,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A public IP is attached to the task's OWN elastic network interface, which only
         // the Fargate infrastructure does, so an update that sets one is held to the same
         // rule the create was — against the placement the service will have once this
-        // update lands: the strategy the request names, else the one the service already
-        // holds ([`crate::state::assign_public_ip_violation`]).
+        // update lands: the strategy the request names, which is NONE when it names the
+        // empty list that takes the service back to its launch type, else the one the
+        // service already holds ([`crate::state::assign_public_ip_violation`]).
         let effective_capacity_strategy = match input.capacity_provider_strategy.as_deref() {
-            Some(strategy) if !strategy.is_empty() => strategy,
-            _ => &snapshot.capacity_provider_strategy,
+            Some(strategy) => strategy,
+            None => &snapshot.capacity_provider_strategy,
         };
         if let Some(message) = crate::state::assign_public_ip_violation(
             input.network_configuration.as_ref(),
@@ -1228,12 +1248,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service.task_definition =
                 Some((region.clone(), found.family.clone(), found.revision));
         }
-        // A service reports either a capacity-provider strategy or a launch type, so
-        // moving it onto a strategy takes the launch type off it.
+        // A service reports either a capacity-provider strategy or a launch type, so moving
+        // it onto a strategy takes the launch type off it — kept beside the strategy, since
+        // the documented way back off a strategy is an EMPTY list, which puts the service
+        // on that launch type again (`restored_launch_type` above resolves which one).
         if let Some(strategy) = input.capacity_provider_strategy.clone() {
-            if !strategy.is_empty() {
+            if strategy.is_empty() {
+                if let Some(launch_type) = restored_launch_type {
+                    service.launch_type = Some(launch_type);
+                    service.launch_type_before_strategy = None;
+                }
+                service.capacity_provider_strategy.clear();
+            } else {
+                if let Some(launch_type) = service.launch_type.take() {
+                    service.launch_type_before_strategy = Some(launch_type);
+                }
                 service.capacity_provider_strategy = strategy;
-                service.launch_type = None;
             }
         }
         if let Some(configuration) = input.deployment_configuration.clone() {
