@@ -78,6 +78,27 @@ pub fn reported_role(role: Role) -> Role {
     }
 }
 
+/// One role as the CREATE that minted it answers: its trust policy as the REQUEST wrote it,
+/// percent-encoded ([`reported_policy_document`]) like every reported document, and every other
+/// member as the created record holds it ([`reported_role`]).
+///
+/// A create answers with the document it was HANDED, not with the rendering the account keeps
+/// for it ([`super::trust_policy::stored_trust_policy`]): the two differ wherever the caller
+/// wrote a document IAM renders differently — whitespace between the JSON tokens, a one-element
+/// string-or-array element, an account principal named by its id alone — and the create's answer
+/// restates the caller's own text, so a client that compares what it sent with what came back
+/// sees the policy it sent. What the account HOLDS is the rendering, which is what every later
+/// read of the role reports ([`reported_role`], and so `GetRole`, `ListRoles`, the
+/// instance-profile readers and `UpdateRoleDescription`), so a client reads the rendering from
+/// the moment it asks the store rather than the request back.
+#[must_use]
+pub fn created_role_report(role: Role, submitted_document: &str) -> Role {
+    Role {
+        assume_role_policy_document: Some(reported_policy_document(submitted_document)),
+        ..reported_role(role)
+    }
+}
+
 /// One role as the report of ANOTHER entity carries it: its trust policy encoded
 /// ([`reported_policy_document`]) and every other member as the account holds it.
 ///

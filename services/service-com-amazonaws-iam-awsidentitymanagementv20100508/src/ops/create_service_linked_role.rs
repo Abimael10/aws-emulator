@@ -306,7 +306,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateServiceLinkedRoleOutput {
             // The record that was stored, with its trust policy in the form every IAM
-            // response carries a policy document in (`crate::state::reported_role`).
+            // response carries a policy document in (`crate::state::reported_role`). The
+            // document is the one the linked service's registration states, which IAM — not
+            // the caller — wrote, so there is no submitted text for this create to restate
+            // (`crate::state::created_role_report`, which `CreateRole` answers through).
             role: Some(crate::state::reported_role(role)),
         })
     }

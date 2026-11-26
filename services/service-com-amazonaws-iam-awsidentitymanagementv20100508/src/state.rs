@@ -2401,16 +2401,21 @@ pub fn service_linked_role_path(service_principal: &str) -> String {
 ///
 /// Computed from the principal, so the document a read returns says which service
 /// controls the role rather than being a fixed blob.
+///
+/// Written in the order a policy document states a statement in — the language version, then
+/// the statement's effect, the principal it names and the action it allows. Building it out of
+/// a JSON map instead would answer with the members sorted by name (the order a map holds them
+/// in), which is not the order any policy document AWS serves carries, and a client that diffs
+/// or hashes the document it read to detect drift reads the order as part of it. The PRINCIPAL
+/// is written by the JSON serializer, so a value carrying a quote or a backslash is escaped
+/// rather than breaking the document.
 pub fn service_linked_role_trust_policy(service_principal: &str) -> String {
-    ::serde_json::json!({
-        "Version": POLICY_LANGUAGE_VERSION,
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "Service": service_principal },
-            "Action": ["sts:AssumeRole"],
-        }],
-    })
-    .to_string()
+    let principal = ::serde_json::Value::String(service_principal.to_string()).to_string();
+    format!(
+        "{{\"Version\":\"{POLICY_LANGUAGE_VERSION}\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Principal\":{{\"Service\":{principal}}},\
+         \"Action\":\"sts:AssumeRole\"}}]}}"
+    )
 }
 
 /// Write the service-linked role `role_name`, linked to `service_principal`, into this

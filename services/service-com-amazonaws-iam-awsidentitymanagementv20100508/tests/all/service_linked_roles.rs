@@ -235,7 +235,7 @@ async fn create_service_linked_role_persists_the_role_and_get_role_returns_it() 
         );
         assert_eq!(
             statement["Action"],
-            serde_json::json!(["sts:AssumeRole"]),
+            serde_json::json!("sts:AssumeRole"),
             "case {label:?}: expected sts:AssumeRole to be granted, got {:?}",
             statement["Action"]
         );

@@ -187,7 +187,7 @@ async fn get_role_resolves_the_role_every_service_keeps_provisioned() {
         );
         assert_eq!(
             statement["Action"],
-            serde_json::json!(["sts:AssumeRole"]),
+            serde_json::json!("sts:AssumeRole"),
             "case {case:?}: expected sts:AssumeRole to be granted, got {:?}",
             statement["Action"]
         );

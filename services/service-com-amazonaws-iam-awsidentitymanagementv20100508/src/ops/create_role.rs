@@ -463,13 +463,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role_name: input.role_name,
         };
 
-        // The response is the record that was stored, with its trust policy written out in
-        // the form every IAM response carries a policy document in
-        // (`crate::state::reported_role`), so a caller sees exactly what a later `GetRole`
-        // reports.
+        // The record that was stored, with ONE member answered from the request rather than
+        // from the store: a create restates the trust policy document the request carried,
+        // while the account holds the rendering of it that every later read reports
+        // (`crate::state::created_role_report`). Both are percent-encoded, the form every IAM
+        // response carries a policy document in.
         store.roles.insert(key, role.clone());
         Ok(CreateRoleOutput {
-            role: crate::state::reported_role(role),
+            role: crate::state::created_role_report(role, &input.assume_role_policy_document),
         })
     }
 }

@@ -190,14 +190,9 @@ fn assert_reported_documents(case: &str, body: &str, tag: &str, stored: &str, ex
 const FIXTURE_ROLE_PATH: &str = "/probe/";
 
 /// Create a role whose trust policy is `submitted`, asserting the fixture create succeeded
-/// and that the create's own answer already reports the STORED document, encoded.
-async fn create_role(
-    router: &MultiServiceRouter,
-    case: &str,
-    name: &str,
-    submitted: &str,
-    stored: &str,
-) {
+/// and that the create's own answer restates the SUBMITTED document, encoded — what the
+/// account holds for it is the rendering, which every later READ reports.
+async fn create_role(router: &MultiServiceRouter, case: &str, name: &str, submitted: &str) {
     let (status, body) = call(
         router,
         "CreateRole",
@@ -215,21 +210,14 @@ async fn create_role(
         status, 200,
         "case {case:?}: the fixture CreateRole must succeed, got {status}: {body}"
     );
-    assert_reported_documents(case, &body, "AssumeRolePolicyDocument", stored, 1);
+    assert_reported_documents(case, &body, "AssumeRolePolicyDocument", submitted, 1);
 }
 
 /// The fixture of the paginated suite: one role whose trust policy is
 /// [`CANONICAL_TRUST_POLICY`], and `profiles` instance profiles all holding it.
 async fn with_bound_profiles(role: &str, profiles: &[&str]) -> MultiServiceRouter {
     let router = router();
-    create_role(
-        &router,
-        "fixture",
-        role,
-        CANONICAL_TRUST_POLICY,
-        CANONICAL_TRUST_POLICY,
-    )
-    .await;
+    create_role(&router, "fixture", role, CANONICAL_TRUST_POLICY).await;
     for profile in profiles {
         let (status, body) = call(
             &router,
@@ -368,7 +356,7 @@ async fn a_trust_policy_is_reported_encoded_whatever_characters_it_carries() {
     let documents = trust_policies();
     for (index, row) in documents.iter().enumerate() {
         let role = format!("trust-{index}");
-        create_role(&router, row.case, &role, row.submitted, row.stored).await;
+        create_role(&router, row.case, &role, row.submitted).await;
         let profile = format!("trust-profile-{index}");
         let (status, body) = call(
             &router,
@@ -444,14 +432,7 @@ async fn a_trust_policy_is_reported_encoded_whatever_characters_it_carries() {
 #[tokio::test]
 async fn every_reader_of_an_inline_or_managed_policy_document_reports_it_encoded() {
     let router = router();
-    create_role(
-        &router,
-        "fixture",
-        "doc-role",
-        CANONICAL_TRUST_POLICY,
-        CANONICAL_TRUST_POLICY,
-    )
-    .await;
+    create_role(&router, "fixture", "doc-role", CANONICAL_TRUST_POLICY).await;
     for (operation, params) in [
         ("CreateUser", vec![param("UserName", "doc-user")]),
         ("CreateGroup", vec![param("GroupName", "doc-group")]),

@@ -204,10 +204,10 @@ async fn create_role(
     .await
 }
 
-/// RULE: `CreateRole` stores the trust policy it was handed RENDERED — the whitespace between
-/// its JSON tokens gone, a one-element string-or-array element written as its string, and every
-/// account principal named by an id alone written as that account's root-user ARN — and every
-/// read of the role reports that one stored text.
+/// RULE: `CreateRole` stores the trust policy it was handed with every account principal named
+/// by an id alone written as that account's root-user ARN, and every READ of the role reports
+/// that one stored text — while the create's own answer restates the document the request
+/// carried.
 #[tokio::test]
 async fn create_role_stores_an_account_principal_as_the_account_root_arn() {
     let router = router();
@@ -220,12 +220,13 @@ async fn create_role_stores_an_account_principal_as_the_account_root_arn() {
             row.case
         );
 
-        // The create's own answer and the later read report the ONE stored document.
+        // The create restates the document the REQUEST carried; the read reports the one the
+        // account holds for it.
         let created = crate::user_lifecycle::document_element(&body, "AssumeRolePolicyDocument");
         assert_eq!(
-            created, row.stored,
-            "case {:?}: expected CreateRole to report {:?}, got {created:?}",
-            row.case, row.stored
+            created, row.submitted,
+            "case {:?}: expected CreateRole to restate {:?}, got {created:?}",
+            row.case, row.submitted
         );
         let reported = reported_trust_policy(&router, &role_name).await;
         assert_eq!(
