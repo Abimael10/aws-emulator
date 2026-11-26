@@ -246,6 +246,21 @@ fn published_instant(text: &str) -> Option<::aws_smithy_types::DateTime> {
 /// for a read ([`is_published_aws_managed_policy_arn`]). Adding an entry therefore adds
 /// both facts: that AWS publishes the policy, and that it publishes it there.
 pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
+    // The policy AWS publishes to take every permission away: one statement, `Deny` on
+    // every action and every resource. It is the only grant a principal can carry whose
+    // whole point is that the principal may do NOTHING, so the document has to be held
+    // here — an attachment whose document this emulator cannot read is a grant it cannot
+    // judge, and reading this one as unknown would serve exactly the calls it forbids.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AWSDenyAll",
+        policy_id: "ANPAIX3YKGWMV2PMTPNHL",
+        default_version_id: "v1",
+        published: "2019-05-01T19:18:31Z",
+        revised: "2019-05-01T19:18:31Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}"#,
+    },
     AwsManagedPolicy {
         path: "/",
         policy_name: "AWSLakeFormationDataAdmin",

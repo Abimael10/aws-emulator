@@ -112,15 +112,19 @@
 //!   AWS account root credentials are in, so such a request is allowed rather than refused
 //!   on evidence that does not exist. The same holds for a role
 //!   session whose role has since been deleted.
-//! * **A principal holding a grant this emulator cannot read.** An AWS-managed policy is
-//!   owned by AWS, so the account's store holds no document for it and
-//!   `principal_policies` reports it as uncarried. A principal with such an attachment is
-//!   allowed where the documents that ARE held neither grant nor deny: what that document
-//!   grants is unknown here, and refusing on evidence this emulator does not have would
-//!   deny access AWS permits. An explicit `Deny` in a document that is held still
-//!   refuses, because no grant overturns one. A boundary whose document is not held is
-//!   read the same way: it is a ceiling this emulator cannot measure a call against, so
-//!   it caps nothing rather than refusing what AWS would permit.
+//! * **A principal holding a grant this emulator cannot read.** A policy AWS owns is not
+//!   account state, so its document is AWS's published one, read out of the catalog of
+//!   them this crate carries ([`super::AWS_MANAGED_POLICIES`]) — an attachment of a
+//!   published entry therefore decides a call exactly as an inline document does, in
+//!   either direction. The catalog is a SUBSET of AWS's, and an attachment it does not
+//!   carry resolves to no document at all, which is what `principal_policies` reports as
+//!   uncarried. A principal holding one of those is allowed where the documents that ARE
+//!   held neither grant nor deny: what that document grants is unknown here, and refusing
+//!   on evidence this emulator does not have would deny access AWS permits. An explicit
+//!   `Deny` in a document that is held still refuses, because no grant overturns one. A
+//!   boundary whose document is not held is read the same way: it is a ceiling this
+//!   emulator cannot measure a call against, so it caps nothing rather than refusing what
+//!   AWS would permit.
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 use ::service_common::temporary_credential_classes::{
@@ -1018,12 +1022,17 @@ fn authorize_request(
     // policies where the identity's did and the scope the credential was minted with did
     // not, and the identity-based policies where nothing allowed it at all. They are
     // different facts about the policies in force, and AWS words each of them differently,
-    // because they need different fixes. The boundary's explicit deny is the one that also
-    // names the policy the deciding statement came from, because in an account carrying
-    // several boundaries that ARN is the only thing in the message identifying which
-    // ceiling refused the call.
+    // because they need different fixes. An explicit deny also NAMES the policy the
+    // deciding statement came from wherever that policy has an ARN to name — the managed
+    // policy whose document denied the call ([`denying_managed_policy`]) and the boundary
+    // that capped it — because in an identity carrying several documents that ARN is the
+    // only thing in the message saying which one has to be changed. An inline policy has
+    // no ARN, so the clause ends where the document it came from cannot be addressed.
     let reason = if decided == Decision::Denied {
-        "with an explicit deny in an identity-based policy".to_string()
+        match denying_managed_policy(store, &identity, &request) {
+            Some(arn) => format!("with an explicit deny in an identity-based policy: {arn}"),
+            None => "with an explicit deny in an identity-based policy".to_string(),
+        }
     } else if scoped == Decision::Denied {
         "with an explicit deny in a session policy".to_string()
     } else if capped == Decision::Denied {
@@ -1081,6 +1090,47 @@ fn authorize_request(
         named_as,
         &reason,
     ))
+}
+
+/// The ARN of the MANAGED policy whose statement denied `request` for the identity `arn`
+/// names, or `None` when the deny came from an inline policy — which has no ARN — or when
+/// these documents state no deny at all.
+///
+/// Read on the refusal path only, so the decision itself pays nothing for it: the same
+/// documents the decision was made from are collected again with their PROVENANCE kept
+/// ([`super::ComAmazonawsIamAwsidentitymanagementv20100508State::principal_sourced_policies`],
+/// whose documents are the ones the decision read, in that order), and the statements the
+/// evaluation matched say which of them denied the call — "the deny statement is the only
+/// entry included in the result". The first denying document that is a managed policy is
+/// the one named, since that is the policy a caller has to change for the call to be
+/// decided differently.
+fn denying_managed_policy(
+    store: &IamState,
+    arn: &str,
+    request: &iam::Request<'_>,
+) -> Option<String> {
+    let carried = store.principal_sourced_policies(arn)?;
+    // The documents in force, in the order the decision read them: an attachment whose
+    // document this emulator does not hold contributed none, so it takes no position here
+    // either.
+    let sourced: Vec<&super::SourcedPolicy> = carried
+        .iter()
+        .filter(|policy| policy.document.is_some())
+        .collect();
+    let documents: Vec<String> = sourced
+        .iter()
+        .filter_map(|policy| policy.document.clone())
+        .collect();
+    let outcome = iam::identity_outcome_prepared(&iam::prepare_documents(&documents), request);
+    if outcome.decision != Decision::Denied {
+        return None;
+    }
+    outcome.matched.iter().find_map(|matched| {
+        match &sourced.get(matched.document)?.source {
+            super::PolicySource::Managed { policy_arn, .. } => Some(policy_arn.clone()),
+            super::PolicySource::Inline { .. } => None,
+        }
+    })
 }
 
 /// Whether a document in force on the principal states an `Allow` NAMING `action`: one of the

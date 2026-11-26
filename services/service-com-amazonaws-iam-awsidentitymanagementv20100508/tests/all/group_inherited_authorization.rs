@@ -39,8 +39,13 @@ use crate::user_lifecycle::{
 enum Expect {
     /// HTTP 200: the union of the documents in force permits the call.
     Served,
-    /// HTTP 403 `AccessDenied` because a statement in that union says `Deny`.
+    /// HTTP 403 `AccessDenied` because a statement in that union says `Deny`, stated by
+    /// an INLINE policy — which has no ARN, so the refusal names no document.
     ExplicitDeny,
+    /// HTTP 403 `AccessDenied` because a statement in that union says `Deny`, stated by
+    /// the MANAGED policy of this friendly name — which the refusal names by ARN, the
+    /// only thing in the message saying which document has to be changed.
+    ExplicitDenyBy(&'static str),
     /// HTTP 403 `AccessDenied` because nothing in that union says `Allow`.
     NoAllow,
 }
@@ -264,7 +269,7 @@ const CASES: &[Case] = &[
         names_caller: false,
         iam_action: "iam:ListGroups",
         resource: Resource::GroupCollection,
-        expect: Expect::ExplicitDeny,
+        expect: Expect::ExplicitDenyBy("DenyListGroups"),
     },
     // And a managed policy attached to the group can be the only grant.
     Case {
@@ -341,7 +346,7 @@ async fn a_groups_policies_decide_its_members_signed_calls() {
                     case.case
                 );
             }
-            Expect::ExplicitDeny | Expect::NoAllow => {
+            Expect::ExplicitDeny | Expect::ExplicitDenyBy(_) | Expect::NoAllow => {
                 assert_eq!(
                     status, 403,
                     "case {:?}: expected HTTP 403, got {status}: {body}",
@@ -354,13 +359,19 @@ async fn a_groups_policies_decide_its_members_signed_calls() {
                     case.case,
                     error_code(&body)
                 );
-                let reason = if case.expect == Expect::ExplicitDeny {
-                    "with an explicit deny in an identity-based policy".to_string()
-                } else {
-                    format!(
+                let reason = match case.expect {
+                    Expect::ExplicitDenyBy(policy_name) => format!(
+                        "with an explicit deny in an identity-based policy: \
+                         arn:aws:iam::{}:policy/{policy_name}",
+                        account_id()
+                    ),
+                    Expect::ExplicitDeny => {
+                        "with an explicit deny in an identity-based policy".to_string()
+                    }
+                    _ => format!(
                         "because no identity-based policy allows the {} action",
                         case.iam_action
-                    )
+                    ),
                 };
                 let named_as = match case.resource {
                     Resource::Caller => format!("user {user_name}"),
