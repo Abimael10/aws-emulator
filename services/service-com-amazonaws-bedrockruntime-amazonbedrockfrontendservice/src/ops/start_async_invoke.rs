@@ -20,6 +20,12 @@
 //! the same payload under the same token returns the invocation already
 //! minted, and the same token with a different payload is a `ConflictException`.
 //!
+//! The output location the record carries is DERIVED from the configured one when
+//! the invocation id is minted — the submitted prefix extended by that id
+//! ([`crate::state::async_invoke_output::invocation_output_data_config`]) — so the
+//! location `GetAsyncInvoke` and `ListAsyncInvokes` report is the invocation's own,
+//! and is where its artifacts are delivered.
+//!
 //! The submitted record starts in `InProgress` and leaves it only when the clock
 //! makes that transition due; the invocation then writes its output to the
 //! location the request configured and reaches the modelled `Completed` status,
@@ -339,7 +345,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: Some(submit_time),
             end_time: None,
             failure_message: None,
-            output_data_config: input.output_data_config.clone(),
+            // WHERE this invocation delivers, which is the configured prefix extended by
+            // the id just minted for it rather than that prefix itself — so the location
+            // every read reports is this invocation's own and names the artifacts it
+            // writes
+            // (`crate::state::async_invoke_output::invocation_output_data_config`).
+            output_data_config: crate::state::async_invoke_output::invocation_output_data_config(
+                &input.output_data_config,
+                &invocation_id,
+            ),
             model_input: input.model_input.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             settles_at: submit_time + crate::state::ASYNC_INVOKE_SETTLE_MILLIS,

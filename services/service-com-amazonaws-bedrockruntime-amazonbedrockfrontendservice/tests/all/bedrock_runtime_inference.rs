@@ -2298,10 +2298,21 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
             "case {case:?}: expected a freshly submitted invocation to be InProgress, got {:?}",
             record["status"]
         );
+        // The location reported is this invocation's OWN: the configured prefix
+        // extended by the minted invocation id, with every other member of the
+        // configured destination carried over as submitted.
+        let mut expected_output = request["outputDataConfig"].clone();
+        expected_output["s3OutputDataConfig"]["s3Uri"] = serde_json::Value::String(format!(
+            "{}/{}",
+            request["outputDataConfig"]["s3OutputDataConfig"]["s3Uri"]
+                .as_str()
+                .unwrap_or_default()
+                .trim_end_matches('/'),
+            arn.rsplit('/').next().unwrap_or_default()
+        ));
         assert_eq!(
-            record["outputDataConfig"],
-            request["outputDataConfig"],
-            "case {case:?}: expected the stored outputDataConfig, got {:?}",
+            record["outputDataConfig"], expected_output,
+            "case {case:?}: expected this invocation's own output location, got {:?}",
             record["outputDataConfig"]
         );
         assert_eq!(

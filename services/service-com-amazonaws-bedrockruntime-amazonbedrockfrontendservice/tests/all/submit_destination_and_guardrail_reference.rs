@@ -178,7 +178,7 @@ async fn an_output_location_that_cannot_be_written_is_refused_before_a_job_is_mi
                 .unwrap_or_else(|| panic!("case {case:?}: no invocationArn in {}", call.json()))
                 .to_string();
             // Backed by state: the accepted job reads back through the implemented
-            // reader, under the location it was submitted against.
+            // reader, under its own location inside the one it was submitted against.
             let read_back = get(&router, &format!("/async-invoke/{}", encode_path(&arn))).await;
             assert_eq!(
                 read_back.status,
@@ -187,10 +187,16 @@ async fn an_output_location_that_cannot_be_written_is_refused_before_a_job_is_mi
                 read_back.status,
                 String::from_utf8_lossy(&read_back.body)
             );
+            let reported = format!(
+                "{}/{}",
+                row.s3_uri.trim_end_matches('/'),
+                arn.rsplit('/').next().unwrap_or_default()
+            );
             assert_eq!(
                 read_back.json()["outputDataConfig"]["s3OutputDataConfig"]["s3Uri"].as_str(),
-                Some(row.s3_uri.as_str()),
-                "case {case:?}: expected the submitted location reported back, got {}",
+                Some(reported.as_str()),
+                "case {case:?}: expected the submitted location extended by the minted \
+                 invocation id, got {}",
                 read_back.json()
             );
             accepted.push(arn);

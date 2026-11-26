@@ -13,9 +13,16 @@
 //!   indexes it — and that object is a real video file of the geometry and the length the
 //!   submitted `modelInput` configured, which the maintained MP4 reader decodes.
 //! * **It stays there.** A terminal invocation is a point read: repeated `GetAsyncInvoke`
-//!   calls keep reporting the same record with an UNCHANGED
+//!   calls keep reporting the same record with the same per-invocation
 //!   `outputDataConfig.s3OutputDataConfig.s3Uri`, and the artifact stays present and
 //!   byte-identical, however many times a client comes back for it.
+//! * **The location it reports is the one the artifact is under.** The output location an
+//!   invocation is reported at is DERIVED from the location its submission configured,
+//!   never echoed: that prefix extended by the invocation id the service minted, as one
+//!   further key segment, with every other member of the configured destination carried
+//!   over as submitted. `GetAsyncInvoke` and `ListAsyncInvokes` report that one value, and
+//!   a client that reads it and then lists under it finds this invocation's own output and
+//!   nothing else.
 //!
 //! The rows span the two providers' published request members — `dimension` and
 //! `durationSeconds` for Amazon Nova Reel, `resolution`, `aspect_ratio` and `duration` for
@@ -32,7 +39,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state;
 
-use crate::bedrock_runtime_inference::{encode_path, get, Call};
+use crate::bedrock_runtime_inference::{encode_path, get, is_invocation_arn, post_json, Call};
 use crate::inference_input_limits::{
     create_bucket, emulator_with_object_store, poll_to_terminal, s3_call, submit,
 };
@@ -301,8 +308,9 @@ async fn a_completed_invocation_and_its_artifact_stay_readable_and_unchanged() {
             );
             assert_eq!(
                 record["outputDataConfig"]["s3OutputDataConfig"]["s3Uri"].as_str(),
-                Some(row.s3_uri.as_str()),
-                "case {case:?} look {look}: expected the configured location, got {record}"
+                Some(format!("{}/{invocation_id}", row.s3_uri.trim_end_matches('/')).as_str()),
+                "case {case:?} look {look}: expected this invocation's own location, got \
+                 {record}"
             );
             let keys = listed_keys(&router, &segment).await;
             assert!(
@@ -326,8 +334,337 @@ async fn a_completed_invocation_and_its_artifact_stay_readable_and_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
+// Where the output location an invocation reports comes from
+// ---------------------------------------------------------------------------
+
+/// One submission of the location rule below: the location it configures, and the rest of
+/// the destination it carries.
+struct LocationRow {
+    case: &'static str,
+    s3_uri: String,
+    /// `bucketOwner` as submitted, when the row carries it: a member the derivation does
+    /// not touch.
+    bucket_owner: Option<&'static str>,
+    /// `kmsKeyId` as submitted, when the row carries it.
+    kms_key_id: Option<&'static str>,
+}
+
+/// The location rows: every SHAPE of a configured location — the bucket root, one prefix
+/// segment, a deep prefix, each written with and without a trailing key separator — plus
+/// the destination members beside the URI, because the derivation is about the prefix and
+/// leaves the rest alone.
+fn location_rows() -> Vec<LocationRow> {
+    let plain = |case, s3_uri| LocationRow {
+        case,
+        s3_uri,
+        bucket_owner: None,
+        kms_key_id: None,
+    };
+    vec![
+        plain("the bucket root", format!("s3://{BUCKET}")),
+        plain(
+            "the bucket root written with a trailing key separator",
+            format!("s3://{BUCKET}/"),
+        ),
+        plain("one prefix segment", format!("s3://{BUCKET}/video")),
+        plain(
+            "one prefix segment written with a trailing key separator",
+            format!("s3://{BUCKET}/video/"),
+        ),
+        plain("a deep prefix", format!("s3://{BUCKET}/renders/2026/january")),
+        plain(
+            "a deep prefix written with a trailing key separator",
+            format!("s3://{BUCKET}/renders/2026/january/"),
+        ),
+        LocationRow {
+            case: "a prefix beside the other destination members",
+            s3_uri: format!("s3://{BUCKET}/owned.and-encrypted/out"),
+            bucket_owner: Some("000000000000"),
+            kms_key_id: Some(
+                "arn:aws:kms:us-east-1:000000000000:key/\
+                 11111111-2222-3333-4444-555555555555",
+            ),
+        },
+    ]
+}
+
+/// RULE: the output location an invocation is reported at is the location its submission
+/// configured extended by the minted invocation id, as one further key segment — so two
+/// invocations submitted into one prefix report two distinct locations — and both readers
+/// report that same value from the moment the invocation is accepted.
+#[tokio::test]
+async fn the_reported_output_location_is_the_submitted_prefix_extended_by_the_invocation_id() {
+    let router = emulator_with_object_store();
+    create_bucket(&router, BUCKET).await;
+
+    let mut reported: Vec<String> = Vec::new();
+    for row in location_rows() {
+        let case = row.case;
+        let arn = submit_destination(&router, &row).await;
+        assert!(
+            is_invocation_arn(&arn),
+            "case {case:?}: expected an invocationArn matching the modelled pattern, got {arn:?}"
+        );
+        let invocation_id = invocation_id_of(&arn);
+
+        // The rule: the configured prefix, then this invocation's id as one further key
+        // segment — one separator between them whether or not the submitted value ended in
+        // one, and none after it.
+        let expected = format!("{}/{invocation_id}", row.s3_uri.trim_end_matches('/'));
+
+        let answer = get(&router, &format!("/async-invoke/{}", encode_path(&arn))).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: expected 200 from GetAsyncInvoke, got {} / {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        let config = answer.json()["outputDataConfig"]["s3OutputDataConfig"].clone();
+        let stated = config["s3Uri"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+        // Read as the derivation rather than as one formatted string: the submitted prefix
+        // is still there, and the value's last segment is the minted id.
+        assert!(
+            stated.starts_with(row.s3_uri.trim_end_matches('/')),
+            "case {case:?}: expected the submitted prefix to be kept, got {stated:?}"
+        );
+        assert_eq!(
+            stated.rsplit('/').next(),
+            Some(invocation_id.as_str()),
+            "case {case:?}: expected the minted invocation id as the last segment, got \
+             {stated:?}"
+        );
+
+        // The derivation touches the URI alone: every other member of the destination is
+        // reported as submitted.
+        assert_eq!(
+            config["bucketOwner"].as_str(),
+            row.bucket_owner,
+            "case {case:?}: expected the submitted bucketOwner, got {config}"
+        );
+        assert_eq!(
+            config["kmsKeyId"].as_str(),
+            row.kms_key_id,
+            "case {case:?}: expected the submitted kmsKeyId, got {config}"
+        );
+
+        // The listing agrees with the point read: one location per invocation, reported
+        // the same way by both readers.
+        let summarised = listed_location(&router, case, &arn).await;
+        assert_eq!(
+            summarised, stated,
+            "case {case:?}: expected ListAsyncInvokes to report the same location as \
+             GetAsyncInvoke ({stated:?}), got {summarised:?}"
+        );
+
+        assert!(
+            !reported.contains(&stated),
+            "case {case:?}: expected a location of its own, got {stated:?} again in \
+             {reported:?}"
+        );
+        reported.push(stated);
+    }
+}
+
+/// RULE: the reported location is where the artifacts ARE. Two invocations submitted
+/// against one configured prefix each deliver under their own reported location, so the
+/// per-invocation output can be addressed from the record the service returns and neither
+/// invocation writes over the other.
+#[tokio::test]
+async fn each_invocations_reported_location_holds_its_own_artifacts_and_no_others() {
+    let router = emulator_with_object_store();
+    create_bucket(&router, BUCKET).await;
+
+    // Two submissions against ONE configured prefix, so what distinguishes their locations
+    // can only be the minted id, plus one at the bucket root.
+    let shared = format!("s3://{BUCKET}/shared/prefix/");
+    let cases: [(&str, String); 3] = [
+        ("the first invocation under a shared prefix", shared.clone()),
+        ("the second invocation under the same prefix", shared),
+        ("an invocation at the bucket root", format!("s3://{BUCKET}")),
+    ];
+
+    let mut locations: Vec<String> = Vec::new();
+    for (case, s3_uri) in cases {
+        let model_input = json!({"prompt": "A cube under a shared prefix.", "duration": "5s"});
+        let arn = submit(&router, case, "luma.ray-v2:0", &model_input, &s3_uri).await;
+        let invocation_id = invocation_id_of(&arn);
+        let settled = poll_to_terminal(&router, case, &arn).await;
+        assert_eq!(
+            settled["status"].as_str(),
+            Some("Completed"),
+            "case {case:?}: expected Completed, got {settled}"
+        );
+        let location = settled["outputDataConfig"]["s3OutputDataConfig"]["s3Uri"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            location,
+            format!("{}/{invocation_id}", s3_uri.trim_end_matches('/')),
+            "case {case:?}: expected this invocation's own location, got {settled}"
+        );
+        assert!(
+            !locations.contains(&location),
+            "case {case:?}: expected a location of its own, got {location:?} again in \
+             {locations:?}"
+        );
+
+        // What a client does with the record it was handed: read `s3Uri`, then list under
+        // it. What it finds is this invocation's output and nothing else.
+        let (bucket, prefix) = address_of(case, &location);
+        assert_eq!(
+            bucket, BUCKET,
+            "case {case:?}: expected the configured bucket, got {bucket:?}"
+        );
+        let mut keys = listed_keys(&router, &format!("{prefix}/")).await;
+        keys.sort();
+        let media = format!("{prefix}/{}", state::async_invoke_video::MEDIA_OBJECT);
+        let manifest = format!("{prefix}/{}", state::async_invoke_output::MANIFEST_OBJECT);
+        let mut expected = vec![manifest.clone(), media.clone()];
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "case {case:?}: expected exactly this invocation's output under {location:?}, \
+             got {keys:?}"
+        );
+
+        // The media under it is a real ISO base media file, read back through Amazon S3's
+        // own GetObject.
+        let object = s3_call(&router, "GET", &format!("/{BUCKET}/{media}"), &[]).await;
+        assert_eq!(
+            object.status,
+            200,
+            "case {case:?}: expected {media:?} to be readable, got {} / {}",
+            object.status,
+            String::from_utf8_lossy(&object.body)
+        );
+        assert_eq!(
+            object.body.get(4..8),
+            Some(&b"ftyp"[..]),
+            "case {case:?}: expected an ISO base media file at {media:?}, got {} bytes \
+             starting {:?}",
+            object.body.len(),
+            object.body.get(..8)
+        );
+
+        // The manifest beside it indexes that output at the same location the record
+        // reports, and names the call that submitted the invocation.
+        let indexed = s3_call(&router, "GET", &format!("/{BUCKET}/{manifest}"), &[]).await;
+        let document: Value = serde_json::from_slice(&indexed.body).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: the manifest must be JSON ({error}): {}",
+                String::from_utf8_lossy(&indexed.body)
+            )
+        });
+        assert_eq!(
+            document["s3Uri"].as_str(),
+            Some(location.as_str()),
+            "case {case:?}: expected the manifest to state the reported location, got \
+             {document}"
+        );
+        assert_eq!(
+            document["jobId"].as_str(),
+            Some(invocation_id.as_str()),
+            "case {case:?}: expected the manifest to name this invocation, got {document}"
+        );
+        assert!(
+            !document["requestId"].as_str().unwrap_or_default().is_empty(),
+            "case {case:?}: expected the manifest to name its submitting call, got {document}"
+        );
+
+        locations.push(location);
+    }
+
+    // The shared prefix holds both of its invocations' outputs, each under its own
+    // segment: nothing was written over.
+    let under_shared = listed_keys(&router, "shared/prefix/").await;
+    assert_eq!(
+        under_shared.len(),
+        4,
+        "case \"the shared prefix\": expected both invocations' output to survive beside \
+         each other, got {under_shared:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Submit one invocation against `row`'s destination and return its `invocationArn`.
+///
+/// The shared `submit` helper configures the URI alone, so the rows carrying the other
+/// destination members post their own `outputDataConfig`.
+async fn submit_destination(router: &MultiServiceRouter, row: &LocationRow) -> String {
+    let mut destination = json!({"s3Uri": row.s3_uri});
+    if let Some(owner) = row.bucket_owner {
+        destination["bucketOwner"] = Value::String(owner.to_string());
+    }
+    if let Some(key) = row.kms_key_id {
+        destination["kmsKeyId"] = Value::String(key.to_string());
+    }
+    let case = row.case;
+    let call = post_json(
+        router,
+        "/async-invoke",
+        &json!({
+            "modelId": "luma.ray-v2:0",
+            "modelInput": {"prompt": case, "resolution": "540p", "duration": "5s"},
+            "outputDataConfig": {"s3OutputDataConfig": destination},
+        }),
+    )
+    .await;
+    assert_eq!(
+        call.status,
+        200,
+        "case {case:?}: expected StartAsyncInvoke to accept the submission, got {} / {}",
+        call.status,
+        String::from_utf8_lossy(&call.body)
+    );
+    call.json()["invocationArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no invocationArn in {}", call.json()))
+        .to_string()
+}
+
+/// The bucket and the key prefix an `s3://` location addresses — what a client lists under
+/// once it has read `s3Uri` off the record.
+fn address_of(case: &str, uri: &str) -> (String, String) {
+    let rest = uri
+        .strip_prefix("s3://")
+        .unwrap_or_else(|| panic!("case {case:?}: {uri:?} is not an s3 location"));
+    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+    (bucket.to_string(), key.to_string())
+}
+
+/// The location `ListAsyncInvokes` reports for the invocation `arn` names.
+async fn listed_location(router: &MultiServiceRouter, case: &str, arn: &str) -> String {
+    let call = get(router, "/async-invoke?maxResults=100").await;
+    assert_eq!(
+        call.status,
+        200,
+        "case {case:?}: expected 200 from ListAsyncInvokes, got {} / {}",
+        call.status,
+        String::from_utf8_lossy(&call.body)
+    );
+    let body = call.json();
+    let summaries = body["asyncInvokeSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let summary = summaries
+        .iter()
+        .find(|summary| summary["invocationArn"].as_str() == Some(arn))
+        .unwrap_or_else(|| panic!("case {case:?}: {arn:?} is not among {body}"));
+    summary["outputDataConfig"]["s3OutputDataConfig"]["s3Uri"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
 
 /// The invocation id inside an `invocationArn`: its last path segment, which is the
 /// segment the invocation's output lives under.

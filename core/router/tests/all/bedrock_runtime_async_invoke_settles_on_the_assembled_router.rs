@@ -343,19 +343,30 @@ async fn an_accepted_async_invocation_reaches_completed_with_its_output_in_the_b
             record["failureMessage"].is_null(),
             "case {case:?}: a completed invocation carries no failure message, got {record}"
         );
+        // The location the record reports is this invocation's OWN: the location the
+        // submission configured, extended by the minted invocation id as one further key
+        // segment, which is where the output is.
+        let invocation_id = arn.rsplit('/').next().unwrap_or_default();
+        let reported = format!("{}/{invocation_id}", row.s3_uri.trim_end_matches('/'));
         assert_eq!(
             record["outputDataConfig"]["s3OutputDataConfig"]["s3Uri"].as_str(),
-            Some(row.s3_uri.as_str()),
-            "case {case:?}: expected the configured location unchanged, got {record}"
+            Some(reported.as_str()),
+            "case {case:?}: expected the configured location extended by the minted \
+             invocation id, got {record}"
         );
 
         // What the client then reads: a non-empty object under the key prefix of the
-        // location it configured, listed through Amazon S3's own operation.
-        let objects = listed_objects(&router, row.bucket, row.prefix).await;
+        // location the RECORD reports, listed through Amazon S3's own operation — so what
+        // the service says it wrote is where a client collecting the output looks.
+        let segment = if row.prefix.is_empty() {
+            invocation_id.to_string()
+        } else {
+            format!("{}/{invocation_id}", row.prefix)
+        };
+        let objects = listed_objects(&router, row.bucket, &segment).await;
         assert!(
             objects.iter().any(|(_, size)| *size > 0),
-            "case {case:?}: expected a non-empty object under {:?}, got {objects:?}",
-            row.prefix
+            "case {case:?}: expected a non-empty object under {segment:?}, got {objects:?}"
         );
     }
 }

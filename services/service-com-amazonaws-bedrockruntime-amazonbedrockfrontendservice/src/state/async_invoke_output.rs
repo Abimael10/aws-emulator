@@ -15,9 +15,15 @@
 //! ([`super::ASYNC_INVOKE_FAILURE_MESSAGE`]) rather than reporting a success no read of the
 //! object store would confirm.
 //!
+//! The location a submission configures is a prefix every invocation submitted against it
+//! shares, so the location an invocation is REPORTED at is derived from it rather than
+//! echoed: that prefix extended by the minted invocation id
+//! ([`invocation_output_data_config`]), which is the one location the artifacts are written
+//! under and every read of the invocation reports.
+//!
 //! # What it writes and what it will not claim
 //!
-//! Two objects per finished invocation, both under `<prefix>/<invocationId>/`:
+//! Two objects per finished invocation, both under that per-invocation location:
 //!
 //! * the generated MEDIA object of the requested modality
 //!   ([`super::async_invoke_video::MEDIA_OBJECT`]), which is what a client polls the
@@ -46,7 +52,7 @@
 
 use ::service_com_amazonaws_s3_amazons3 as s3;
 
-use crate::ops::types::AsyncInvokeOutputDataConfig;
+use crate::ops::types::{AsyncInvokeOutputDataConfig, AsyncInvokeS3OutputDataConfig};
 
 use super::AsyncInvokeRecord;
 
@@ -71,7 +77,8 @@ pub struct DueInvocation {
     pub request_id: String,
     /// The model the invocation was submitted against.
     pub model_id: String,
-    /// `outputDataConfig` as submitted: where the output goes.
+    /// The invocation's OWN output location ([`invocation_output_data_config`]): where the
+    /// output goes, which is also what every read reports for it.
     pub output_data_config: AsyncInvokeOutputDataConfig,
     /// `modelInput` as submitted, as JSON: what the generated artifact is rendered from —
     /// the geometry and the length the invoked model's own request schema states
@@ -160,44 +167,77 @@ pub fn destination_is_writable<Eng: Send + Sync + 'static>(
     held.bucket(bucket).is_some()
 }
 
+/// One key under `prefix`: the prefix, then `segment`.
+///
+/// The ONE separator rule the layout of an invocation's output is cut with — the location
+/// it reports and the keys it writes are both this join — so a prefix addressing the bucket
+/// root contributes no segment of its own and nothing doubles a separator.
+fn join_key(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}/{segment}")
+    }
+}
+
 /// One invocation's own segment of the submitted prefix: the prefix, then the invocation
 /// id.
 ///
 /// The prefix a submission names is shared by every invocation submitted against it, so
-/// one invocation's output lives under a segment of its OWN id. A prefix that addresses
-/// the bucket root contributes no segment of its own.
+/// one invocation's output lives under a segment of its OWN id.
 fn invocation_prefix(prefix: &str, invocation_id: &str) -> String {
-    if prefix.is_empty() {
-        invocation_id.to_string()
-    } else {
-        format!("{prefix}/{invocation_id}")
-    }
+    join_key(prefix, invocation_id)
 }
 
-/// The key of the manifest of the invocation `invocation_id` names, under `prefix`.
-pub fn manifest_key(prefix: &str, invocation_id: &str) -> String {
-    format!(
-        "{}/{MANIFEST_OBJECT}",
-        invocation_prefix(prefix, invocation_id)
-    )
+/// One invocation's OWN output location, DERIVED from the location its submission
+/// configured when its id is minted.
+///
+/// The location a submission configures is a prefix every invocation submitted against it
+/// shares, so what an invocation delivers under — and what every read of it reports — is
+/// that prefix extended by the invocation's own id as one further key segment
+/// ([`invocation_prefix`]): joined by exactly one key separator whether or not the
+/// submitted value ended in one, and carrying none after it, so the value addresses the
+/// invocation's own prefix. Two invocations submitted against one location therefore report
+/// two distinct locations, each naming the invocation that writes it, and the location a
+/// read reports is the one the artifacts are under. Every other member of the configured
+/// destination is carried over exactly as submitted.
+///
+/// A value that addresses no bucket at all ([`output_location`]) has no prefix to extend
+/// and is left as submitted; a submission configuring one is refused before an invocation
+/// is minted ([`destination_is_writable`]).
+pub fn invocation_output_data_config(
+    submitted: &AsyncInvokeOutputDataConfig,
+    invocation_id: &str,
+) -> AsyncInvokeOutputDataConfig {
+    let AsyncInvokeOutputDataConfig::s3OutputDataConfig(s3_config) = submitted;
+    let Some((bucket, prefix)) = output_location(submitted) else {
+        return submitted.clone();
+    };
+    AsyncInvokeOutputDataConfig::s3OutputDataConfig(AsyncInvokeS3OutputDataConfig {
+        s3_uri: format!("s3://{bucket}/{}", invocation_prefix(prefix, invocation_id)),
+        ..s3_config.clone()
+    })
 }
 
-/// The key of the generated media object of the invocation `invocation_id` names, under
-/// `prefix`.
-pub fn media_key(prefix: &str, invocation_id: &str) -> String {
-    format!(
-        "{}/{}",
-        invocation_prefix(prefix, invocation_id),
-        super::async_invoke_video::MEDIA_OBJECT
-    )
+/// The key of the manifest of the invocation whose own output location addresses `prefix`.
+pub fn manifest_key(prefix: &str) -> String {
+    join_key(prefix, MANIFEST_OBJECT)
+}
+
+/// The key of the generated media object of the invocation whose own output location
+/// addresses `prefix`.
+pub fn media_key(prefix: &str) -> String {
+    join_key(prefix, super::async_invoke_video::MEDIA_OBJECT)
 }
 
 /// The manifest document: which invocation this is, which call submitted it, what it was
 /// invoked against, when it ran, and where its own segment of the output location is.
 ///
 /// What it states is exactly what it is the index of — every member comes off the stored
-/// record.
-fn manifest_body(invocation: &DueInvocation, bucket: &str, prefix: &str) -> ::serde_json::Value {
+/// record, the location included, so the manifest beside an artifact names the same
+/// location every read of the invocation reports.
+fn manifest_body(invocation: &DueInvocation) -> ::serde_json::Value {
+    let AsyncInvokeOutputDataConfig::s3OutputDataConfig(config) = &invocation.output_data_config;
     ::serde_json::json!({
         "version": MANIFEST_VERSION,
         "jobId": invocation.invocation_id,
@@ -209,10 +249,7 @@ fn manifest_body(invocation: &DueInvocation, bucket: &str, prefix: &str) -> ::se
         "endTime": super::datetime_of_millis(invocation.settles_at)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_default(),
-        "s3Uri": format!(
-            "s3://{bucket}/{}",
-            invocation_prefix(prefix, &invocation.invocation_id)
-        ),
+        "s3Uri": config.s3_uri,
     })
 }
 
@@ -319,7 +356,7 @@ async fn deliver<Eng: Send + Sync + 'static>(
     let mut objects: Vec<(String, Vec<u8>, &str)> = Vec::new();
     match media(invocation).await {
         Ok(Some(body)) => objects.push((
-            media_key(prefix, &invocation.invocation_id),
+            media_key(prefix),
             body,
             super::async_invoke_video::MEDIA_MIME,
         )),
@@ -335,9 +372,9 @@ async fn deliver<Eng: Send + Sync + 'static>(
             return failed();
         }
     }
-    match ::serde_json::to_vec(&manifest_body(invocation, bucket, prefix)) {
+    match ::serde_json::to_vec(&manifest_body(invocation)) {
         Ok(body) => objects.push((
-            manifest_key(prefix, &invocation.invocation_id),
+            manifest_key(prefix),
             body,
             super::JSON_MIME,
         )),
