@@ -24,10 +24,10 @@
 //!   stay the generated table's; `GetNetwork` alone is served through
 //!   [`network_ownership::OwnershipFirst`], because this API resolves ownership of a
 //!   `networkId` path label before it validates the label's shape (see "Why this file
-//!   denies a network id" below), and `GetBot` alone through
-//!   [`untyped_bot_refusal::UntypedBotRefusalOperation`], because the refusal it states
-//!   for a bot it cannot report names no error shape on this API's wire (see "Why a gone
-//!   bot names no error shape" below).
+//!   denies a network id" below), and `GetBot` and `GetSecurityGroup` each through an
+//!   [`untyped_refusal::UntypedRefusalOperation`], because the refusal each states for the
+//!   resource it cannot report names no error shape on this API's wire (see "Why two
+//!   refusals name no error shape" below).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -70,21 +70,27 @@
 //! denial it answers, and everything it delegates, carry the same response envelope as
 //! every other response.
 //!
-//! ## Why a gone bot names no error shape
+//! ## Why two refusals name no error shape
 //!
 //! `override_operation`'s third half. This API names the error shape of most of what it
 //! refuses — a network read of a deleted network is a typed `ForbiddenError`, a refused
 //! member a typed `ValidationError` — but not the refusal a bot read states for a bot it
-//! cannot report: that one carries the status and the sentence alone, so a client
-//! classifies it by status. [`untyped_bot_refusal`] states that wire form for `GetBot`, and
-//! only for it; the status, the sentence and the whole walk stay the framework's and the
-//! handler's.
+//! cannot report, nor the one a security-group read states for a group it cannot report:
+//! those carry the status and the sentence alone, so a client classifies them by status.
+//! [`untyped_refusal`] states that wire form, [`untyped_bot_refusal`] and
+//! [`untyped_security_group_refusal`] state the status each of those two refusals travels
+//! at, and each wrapper fronts its own operation and no other; the status, the sentence and
+//! the whole walk stay the framework's and the handler's.
 
 pub mod network_ownership;
 
 pub mod response_envelope;
 
 pub mod untyped_bot_refusal;
+
+pub mod untyped_refusal;
+
+pub mod untyped_security_group_refusal;
 
 use response_envelope::ResponseEnvelopeOperation;
 use smithy_server_runtime::{
@@ -114,10 +120,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     >,
     /// The untyped answer for `GetBot`, built once here and never per request. It holds no
     /// operation and no store: it runs the very routing-table entry every other request is
-    /// served through and states the wire form of the one refusal this API names no error
+    /// served through and states the wire form of the one refusal that read names no error
     /// shape in (see [`untyped_bot_refusal`]), finishing it in the same response envelope as
     /// every other response.
-    get_bot: untyped_bot_refusal::UntypedBotRefusalOperation,
+    get_bot: untyped_refusal::UntypedRefusalOperation,
+    /// The untyped answer for `GetSecurityGroup`, built the same way and for the same
+    /// reason, at the status that read's own refusal travels at (see
+    /// [`untyped_security_group_refusal`]).
+    get_security_group: untyped_refusal::UntypedRefusalOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -129,7 +139,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             envelope: ResponseEnvelopeOperation::new(),
             get_network: network_ownership::OwnershipFirst::new(ResponseEnvelopeOperation::new()),
-            get_bot: untyped_bot_refusal::UntypedBotRefusalOperation::new(),
+            get_bot: untyped_refusal::UntypedRefusalOperation::new(
+                untyped_bot_refusal::GONE_BOT_STATUS,
+            ),
+            get_security_group: untyped_refusal::UntypedRefusalOperation::new(
+                untyped_security_group_refusal::REFUSED_SECURITY_GROUP_READ_STATUS,
+            ),
         }
     }
 }
@@ -176,12 +191,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.get_network as _);
         }
         // `GetBot` is served through the untyped answer, because the refusal it states for a
-        // bot it cannot report names no error shape on this API's wire — the one refusal of
-        // this service that does not. It delegates to the same wrapper everything else
-        // reaches, so the walk, the status and the sentence stay the framework's and the
-        // handler's.
+        // bot it cannot report names no error shape on this API's wire. It delegates to the
+        // same wrapper everything else reaches, so the walk, the status and the sentence stay
+        // the framework's and the handler's.
         if key == <crate::ops::get_bot::GetBot<Eng> as Operation>::NAME {
             return Some(&self.get_bot as _);
+        }
+        // `GetSecurityGroup` is served through the untyped answer for the same reason, at its
+        // own status: the refusal it states for a group it cannot report names no error shape
+        // either.
+        if key == <crate::ops::get_security_group::GetSecurityGroup<Eng> as Operation>::NAME {
+            return Some(&self.get_security_group as _);
         }
         Some(&self.envelope as _)
     }

@@ -6,6 +6,12 @@
 //! network's default group, when it was last written, the settings it carries and how
 //! many members it holds. A read, so it writes nothing.
 //!
+//! A read it cannot answer is refused at the resource the request named: a `groupId` this
+//! store resolves to no security group under that `networkId` is refused as THAT group,
+//! whatever became of the network around it, with HTTP 401 and this API's fixed sentence for
+//! such a read, and no error-shape discriminator beside it (see
+//! [`crate::service::untyped_security_group_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -168,22 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        if !store.networks.contains_key(&input.network_id) {
-            return Err(not_found(format!(
-                "network {} does not exist",
-                input.network_id
-            )));
-        }
+        // The request names ONE security group, and that is the resource this read reports
+        // on: a `groupId` this store resolves to no group under the `networkId` the request
+        // named — because no group of that network ever carried it, because it names a group
+        // of a different network, or because the network that held it has been deleted and
+        // its groups went with it — is refused as THAT group, never as its parent network.
+        // So the refusal a client reads always answers the resource it asked about, whatever
+        // became of the network around it.
         let record = store
-            .security_groups
-            .get(&input.network_id)
-            .and_then(|groups| groups.get(&input.group_id))
-            .ok_or_else(|| {
-                not_found(format!(
-                    "security group {} does not exist in network {}",
-                    input.group_id, input.network_id
-                ))
-            })?;
+            .security_group_of(&input.network_id, &input.group_id)
+            .ok_or_else(|| refused(crate::state::SECURITY_GROUP_READ_REFUSED_MESSAGE))?;
 
         Ok(GetSecurityGroupOutput {
             security_group: store.security_group_view(&input.network_id, record),
@@ -191,12 +191,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled refusal for a resource this store does not hold: a network, user,
-/// bot or security group "that doesn't exist or has been deleted"
-/// (`ResourceNotFoundError`).
-fn not_found(message: String) -> GetSecurityGroupError {
-    GetSecurityGroupErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
-        message: Some(message),
+/// This read's refusal for a `groupId` it cannot resolve to a security group, stated in this
+/// API's fixed sentence for it — which names no id, so it says nothing about what else the
+/// store holds.
+///
+/// It travels as the modelled `UnauthorizedError` (HTTP 401), and UNTYPED on the wire: the
+/// status and the sentence are all a client gets, with no error-shape discriminator beside
+/// them. The status, the sentence and every member stay this handler's; the wire form of that
+/// one refusal is stated once in [`crate::service::untyped_security_group_refusal`].
+fn refused(message: &str) -> GetSecurityGroupError {
+    GetSecurityGroupErrorModeled::UnauthorizedError(UnauthorizedError {
+        message: Some(message.to_string()),
     })
     .into()
 }

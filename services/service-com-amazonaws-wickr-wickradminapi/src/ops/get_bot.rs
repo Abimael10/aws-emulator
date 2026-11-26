@@ -221,8 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// The 404 this read answers travels UNTYPED on the wire: the status and the sentence
 /// are all a client gets, with no error-shape discriminator beside them. The status,
-/// the sentence and every member stay this handler's; the wire form of that one
-/// refusal is stated once in [`crate::service::untyped_bot_refusal`].
+/// the sentence and every member stay this handler's; which status of this read travels
+/// untyped is stated once in [`crate::service::untyped_bot_refusal`], and the wire form
+/// itself in [`crate::service::untyped_refusal`].
 fn gone(message: &str) -> GetBotError {
     GetBotErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
         message: Some(message.to_string()),

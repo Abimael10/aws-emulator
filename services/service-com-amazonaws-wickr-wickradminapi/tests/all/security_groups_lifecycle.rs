@@ -32,7 +32,10 @@
 //!   number of bot members currently in the security group", so both counts follow
 //!   the users the store holds.
 //! * A network, user, bot or security group "that doesn't exist or has been
-//!   deleted" answers `ResourceNotFoundError` (HTTP 404).
+//!   deleted" answers `ResourceNotFoundError` (HTTP 404) for the operations that
+//!   create or modify one; a READ of one security group this store cannot resolve
+//!   is refused as that group in the form
+//!   `tests/all/security_group_read_refusals.rs` pins.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -42,7 +45,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_wickr_wickradminapi::state::{
     DEFAULT_SECURITY_GROUP_ID, DEFAULT_SECURITY_GROUP_NAME, FEDERATION_MODES,
+    SECURITY_GROUP_READ_REFUSED_MESSAGE,
 };
+
+/// The status a READ of a security group this store cannot resolve is refused with:
+/// the one the model declares for `UnauthorizedError` (`@httpError(401)`).
+const REFUSED_READ_STATUS: u16 = 401;
 
 /// A fresh emulator holding only this service, over its own engine, so one test's
 /// networks are invisible to another's.
@@ -417,10 +425,10 @@ async fn a_security_group_setting_the_service_does_not_accept_is_refused() {
 
     // A refused create persisted nothing: `0` is the id of the group a network is
     // seeded with, so `1` is the first id a created group can carry and it is still
-    // unused.
+    // unused, and a read of it is refused as the group it names.
     let (status, body) = get_group(&router, &network_id, "1").await;
     assert_eq!(
-        status, 404,
+        status, REFUSED_READ_STATUS,
         "after the refusals: no group may have been stored, got {status} with {body}"
     );
 
@@ -660,7 +668,7 @@ async fn security_group_member_counts_follow_the_stored_users() {
 }
 
 #[tokio::test]
-async fn a_security_group_whose_network_or_id_is_unknown_is_not_found() {
+async fn a_security_group_whose_network_or_id_is_unknown_is_refused() {
     let router = emulator();
     let network_id = create_network(&router, "missing-net").await;
     // Well formed per `NetworkId` (`^[0-9]{8}$`) and never minted by this store.
@@ -691,13 +699,13 @@ async fn a_security_group_whose_network_or_id_is_unknown_is_not_found() {
     ] {
         let (status, body) = get_group(&router, network, group).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} with {body}"
+            status, REFUSED_READ_STATUS,
+            "case {case:?}: expected {REFUSED_READ_STATUS}, got {status} with {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "ResourceNotFoundError",
-            "case {case:?}: expected ResourceNotFoundError, got {body}"
+            body["message"].as_str(),
+            Some(SECURITY_GROUP_READ_REFUSED_MESSAGE),
+            "case {case:?}: expected the fixed refusal sentence, got {body}"
         );
     }
 
@@ -710,8 +718,9 @@ async fn a_security_group_whose_network_or_id_is_unknown_is_not_found() {
     );
     let (status, body) = get_group(&router, &network_id, DEFAULT_SECURITY_GROUP_ID).await;
     assert_eq!(
-        status, 404,
-        "case \"read after the network was deleted\": expected 404, got {status} with {body}"
+        status, REFUSED_READ_STATUS,
+        "case \"read after the network was deleted\": expected {REFUSED_READ_STATUS}, got {status} \
+         with {body}"
     );
     let (status, body) = create_group(&router, &network_id, "late", json!({}), None).await;
     assert_eq!(

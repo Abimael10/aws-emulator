@@ -238,6 +238,17 @@ pub const NETWORK_GONE_MESSAGE: &str = "Network not found";
 /// the network the request named. It names no id either.
 pub const SECURITY_GROUP_GONE_MESSAGE: &str = "Security group not found";
 
+/// The fixed text this API refuses a READ of one security group it cannot
+/// resolve to a group with — whatever became of the network around it.
+///
+/// RECORDED behaviour, the model stating no sentence for it: like
+/// [`NETWORK_GONE_MESSAGE`] it is ENTIRELY fixed text, naming neither the
+/// `groupId` nor the `networkId` the request carried nor the state of the network
+/// behind it, so the refusal discloses nothing about what the account holds or
+/// used to hold. Shared, so no operation reporting one security group can word it
+/// differently.
+pub const SECURITY_GROUP_READ_REFUSED_MESSAGE: &str = "invalid security group request";
+
 /// The fixed text this API answers for a `botId` naming no bot of the network the
 /// request named.
 pub const BOT_GONE_MESSAGE: &str = "Bot not found";
@@ -682,7 +693,7 @@ impl ComAmazonawsWickrWickradminapiState {
         client_token: &str,
     ) -> Option<&SecurityGroupRecord> {
         let group_id = self.security_group_tokens.get(network_id)?.get(client_token)?;
-        self.security_groups.get(network_id)?.get(group_id)
+        self.security_group_of(network_id, group_id)
     }
 
     /// Store `record` under `network_id`, remembering `client_token` as the token
@@ -735,6 +746,20 @@ impl ComAmazonawsWickrWickradminapiState {
             .get(network_id)
             .map(|users| users.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// The security group `group_id` names under `network_id`, if this store holds
+    /// one.
+    ///
+    /// Nothing stands in for it: a network that is gone holds no group map, so an
+    /// id under it resolves to no group here, exactly as an id no group of a live
+    /// network ever carried does. Reporting only — a lookup, never a write.
+    pub fn security_group_of(
+        &self,
+        network_id: &str,
+        group_id: &str,
+    ) -> Option<&SecurityGroupRecord> {
+        self.security_groups.get(network_id)?.get(group_id)
     }
 
     /// The security groups of `network_id`, in group id order.
