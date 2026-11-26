@@ -122,14 +122,7 @@ impl Client {
     /// paths — the wire the core terminates.
     pub(crate) async fn tls(case: &str, authority: &str) -> Self {
         let conn = dial(case, authority).await;
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .expect("the provider supports the default protocol versions")
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptTheEmulatorsCertificate(provider)))
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let connector = emulator_tls_connector();
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
             .expect("localhost is a server name");
         let stream = connector
@@ -515,6 +508,20 @@ async fn dial(case: &str, authority: &str) -> TcpStream {
     conn.set_nodelay(true)
         .unwrap_or_else(|error| panic!("case {case:?}: the connection must take TCP_NODELAY: {error}"));
     conn
+}
+
+/// The TLS client a connection to one of this emulator's own encrypted endpoints runs: the
+/// provider this workspace builds, with the verifier below — so every suite that opens a TLS
+/// session on a published address runs the same client rather than building one of its own.
+pub(crate) fn emulator_tls_connector() -> tokio_rustls::TlsConnector {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("the provider supports the default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptTheEmulatorsCertificate(provider)))
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
 }
 
 /// The verifier a client of the emulator's OWN socket uses: the certificate is the one
