@@ -33,7 +33,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::state::policy_principals;
 
-use crate::harness::{xml_text, Dsql};
+use crate::harness::{policy_document, xml_text, Dsql};
 
 /// The Region every call below is signed for.
 const REGION: &str = "us-east-1";
@@ -391,8 +391,16 @@ async fn a_cluster_policy_is_attached_only_when_iam_resolves_every_identity_it_g
 
         let read = dsql.get_policy(identifier).await;
         assert_eq!(
-            (read.status, read.str("policy"), read.str("policyVersion")),
-            (200, expected_document.clone(), expected_version.clone()),
+            (
+                read.status,
+                policy_document(&read.str("policy")),
+                read.str("policyVersion")
+            ),
+            (
+                200,
+                policy_document(&expected_document),
+                expected_version.clone()
+            ),
             "case {:?}: the cluster must hold {expected_document} at version \
              {expected_version}, got {} {:?}",
             case.name,
@@ -451,9 +459,9 @@ async fn create_cluster_resolves_an_inline_documents_identities_the_same_way() {
             held += 1;
             let read = dsql.get_policy(&created.str("identifier")).await;
             assert_eq!(
-                read.str("policy"),
-                case.document,
-                "case {:?}: the inline document must read back verbatim, got {:?}",
+                policy_document(&read.str("policy")),
+                policy_document(&case.document),
+                "case {:?}: the inline document must read back, got {:?}",
                 case.name,
                 read.body
             );
@@ -618,8 +626,8 @@ async fn the_lockout_bypass_does_not_accept_an_unresolved_identity() {
         );
         let read = dsql.get_policy(&cluster).await;
         assert_eq!(
-            (read.str("policy"), read.str("policyVersion")),
-            (held.clone(), version.clone()),
+            (policy_document(&read.str("policy")), read.str("policyVersion")),
+            (policy_document(&held), version.clone()),
             "case {case:?}: the refusal must leave the attached document and its version alone, \
              got {:?}",
             read.body
@@ -652,8 +660,8 @@ async fn the_lockout_bypass_does_not_accept_an_unresolved_identity() {
     );
     let read = dsql.get_policy(&cluster).await;
     assert_eq!(
-        read.str("policy"),
-        absent,
+        policy_document(&read.str("policy")),
+        policy_document(&absent),
         "case the identity now exists: the cluster must hold the document, got {:?}",
         read.body
     );
@@ -677,8 +685,8 @@ async fn with_no_iam_to_ask_a_document_is_attached_as_submitted() {
     );
     let read = dsql.get_policy(&cluster).await;
     assert_eq!(
-        read.str("policy"),
-        document,
+        policy_document(&read.str("policy")),
+        policy_document(&document),
         "with no IAM to ask the cluster must hold the submitted document, got {:?}",
         read.body
     );

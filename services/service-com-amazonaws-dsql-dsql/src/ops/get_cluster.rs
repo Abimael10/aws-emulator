@@ -204,15 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
             deletion_protection_enabled: cluster.deletion_protection_enabled,
             multi_region_properties: cluster.multi_region_properties.clone(),
-            // `tags` is modelled as an optional map, and a cluster created without
-            // tags has none to report; a tagged cluster reports exactly what it holds.
-            tags: (!cluster.tags.is_empty()).then(|| {
-                cluster
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            // The resource's own tag set, which a read always REPORTS — the empty
+            // map for a cluster holding no tags
+            // ([`crate::state::reported_tags`]).
+            tags: Some(crate::state::reported_tags(&cluster.tags)),
             encryption_details: cluster.encryption_details.clone(),
             // The connection endpoint is where THIS emulator answers, which is a
             // property of the process and not of the stored cluster, so it is

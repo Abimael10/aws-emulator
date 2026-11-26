@@ -247,13 +247,17 @@ async fn both_policy_writers_answer_a_retry_from_the_one_recorded_version() {
 fn the_recorded_policy_write_codec_round_trips_the_answered_version() {
     // The cluster a record is keyed by: `ClusterId`'s `^[a-z0-9]{26}$`.
     let cluster = "aaaaaaaaaaaaaaaaaaaaaaaaaa";
-    // Versions spanning what a policy write answers: the first version a cluster
-    // issues, one several writes deep, and one past a 32-bit counter
-    // (`state::Cluster::next_policy_version` counts in `u64`).
+    // Versions spanning what a policy write answers: a token of the form a version is
+    // minted in (`state::new_policy_version`), one written as a bare number, and a long
+    // one — the codec keeps the token whatever its form, because `PolicyVersion` is
+    // opaque (`smithy_query(query="shape", shape="PolicyVersion")`).
     let versions = [
-        ("the first version a cluster issues", "1"),
-        ("a version several writes deep", "42"),
-        ("a version past a 32-bit counter", "4294967296"),
+        (
+            "a token of the form a version is minted in",
+            "4f6b8c2e-0a1d-4e7f-9b35-2c6d8e1f4a70",
+        ),
+        ("a token written as a bare number", "42"),
+        ("a long token", "4294967296-4294967296-4294967296"),
     ];
 
     for (what, version) in versions {

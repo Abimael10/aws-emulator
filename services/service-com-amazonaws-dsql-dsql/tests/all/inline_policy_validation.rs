@@ -30,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_arn, Dsql};
+use crate::harness::{expected_arn, policy_document, Dsql};
 
 /// The action a principal needs to replace a cluster's policy, which is what the
 /// lockout safety check is about. Source: the operations' own documentation for
@@ -438,9 +438,9 @@ async fn create_cluster_validates_its_inline_policy_before_it_mints_a_cluster() 
                     case.name, read.status, read.body
                 );
                 assert_eq!(
-                    read.str("policy"),
-                    case.document,
-                    "case {:?}: the reader must report the document verbatim, got {:?}",
+                    policy_document(&read.str("policy")),
+                    policy_document(&case.document),
+                    "case {:?}: the reader must report the document, got {:?}",
                     case.name,
                     read.str("policy")
                 );
@@ -577,17 +577,17 @@ async fn the_bypass_flag_waives_only_the_lockout_check() {
         );
         let inline = fresh.get_policy(&created.str("identifier")).await;
         assert_eq!(
-            inline.str("policy"),
-            case.document,
-            "case {:?}: the bypassed inline document must read back verbatim, got {:?}",
+            policy_document(&inline.str("policy")),
+            policy_document(&case.document),
+            "case {:?}: the bypassed inline document must read back, got {:?}",
             case.name,
             inline.str("policy")
         );
         let put = dsql.get_policy(identifier).await;
         assert_eq!(
-            put.str("policy"),
-            case.document,
-            "case {:?}: the bypassed attached document must read back verbatim, got {:?}",
+            policy_document(&put.str("policy")),
+            policy_document(&case.document),
+            "case {:?}: the bypassed attached document must read back, got {:?}",
             case.name,
             put.str("policy")
         );

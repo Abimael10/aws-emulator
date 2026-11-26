@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 use crate::error_contract::stream_request;
-use crate::harness::{Answer, Dsql};
+use crate::harness::{policy_document, Answer, Dsql};
 
 /// The operations whose input check and token ledger are both in play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,8 +400,8 @@ async fn both_policy_entry_points_refuse_the_same_document_alike_under_a_spent_t
         // serving put attached, and the refused create minted no second cluster.
         let read = dsql.get_policy(cluster).await;
         assert_eq!(
-            read.str("policy"),
-            acceptable_document(),
+            policy_document(&read.str("policy")),
+            policy_document(&acceptable_document()),
             "case {name:?}: the refused put must leave the attached document alone, got {:?}",
             read.str("policy")
         );

@@ -42,8 +42,8 @@ const REGION: &str = "us-east-1";
 /// The token the ledger is seeded with, so the retry is recognised.
 const TOKEN: &str = "a-token-the-ledger-already-holds";
 
-/// The `policyVersion` a seeded policy record answers: a version the live
-/// cluster has not issued, since a cluster issues them from 1 upwards
+/// The `policyVersion` a seeded policy record answers: a token the live cluster has
+/// not issued, since a version is drawn per attach
 /// (`state::Cluster::next_policy_version`).
 const SEEDED_POLICY_VERSION: &str = "7";
 

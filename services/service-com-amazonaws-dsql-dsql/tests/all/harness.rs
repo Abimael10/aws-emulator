@@ -532,6 +532,27 @@ pub fn absent_identifier() -> String {
     "0zzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
 }
 
+/// The policy document a reply carries, read as the DOCUMENT it is rather than as the
+/// bytes it is written in.
+///
+/// A read of a cluster's policy renders the attached document in the canonical layout
+/// a service reports an attached policy in
+/// (`service_common::iam_policy::canonical_document_keeping_value_lists`), so the bytes
+/// a reply carries are not the bytes a caller submitted. What a round trip is asserted
+/// on is therefore the document — every element of it, in the document's own order —
+/// which is this reading of the member. A value that is no JSON document at all, the
+/// absent member included, reads as `Value::Null`, which no document equals.
+pub fn policy_document(written: &str) -> Value {
+    serde_json::from_str(written).unwrap_or(Value::Null)
+}
+
+/// The status a tagging MUTATION answers on success: `TagResource` and
+/// `UntagResource` both have a `smithy.api#Unit` output
+/// (`smithy_query(query="operation", operation="TagResource,UntagResource")`), so a
+/// success carries no body at all and the status alone reports it — 204 No Content.
+/// Every suite that asserts a served tag write reads the status from here.
+pub const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
 /// The published bounds of this service's tag shapes, shared by every suite that
 /// asserts on tags. Source: `smithy_query(query="shape",
 /// shape="TagKey,TagValue,TagMap")` — key `@length(1..128)`, value

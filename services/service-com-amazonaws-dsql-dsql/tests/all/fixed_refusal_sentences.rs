@@ -33,7 +33,8 @@
 use serde_json::json;
 
 use crate::harness::{
-    absent_identifier, expected_arn, expected_stream_arn, wait_for_the_clock, Answer, Dsql,
+    absent_identifier, expected_arn, expected_stream_arn, policy_document, wait_for_the_clock,
+    Answer, Dsql,
 };
 use crate::resource_tags::untag;
 
@@ -221,9 +222,9 @@ async fn a_document_that_is_not_a_policy_is_refused_with_the_fixed_sentence() {
     );
     let read_back = dsql.get_policy(&cluster).await;
     assert_eq!(
-        read_back.str("policy"),
-        "{\"Statement\":[]}",
-        "case a valid document: GetClusterPolicy must report it verbatim, got {:?}",
+        policy_document(&read_back.str("policy")),
+        policy_document("{\"Statement\":[]}"),
+        "case a valid document: GetClusterPolicy must report it, got {:?}",
         read_back.body
     );
 }

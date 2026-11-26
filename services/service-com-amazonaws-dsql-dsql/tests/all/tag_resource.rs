@@ -28,7 +28,7 @@ use serde_json::{json, Map, Value};
 
 use crate::harness::{
     absent_identifier, expected_arn, expected_stream_arn, wait_for_the_clock, Answer, Dsql,
-    TAG_KEY_MAX, TAG_MAP_MAX, TAG_VALUE_MAX,
+    TAG_KEY_MAX, TAG_MAP_MAX, TAG_MUTATION_SUCCESS_STATUS, TAG_VALUE_MAX,
 };
 
 /// `POST /tags/{resourceArn}` with `tags`.
@@ -66,8 +66,10 @@ fn numbered_tags(prefix: &str, count: usize) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The tag map an answer reports, as an absent map and an empty one are the same tag
-/// set (`GetCluster` omits the member for an untagged cluster).
+/// The tag map an answer reports: every reader of a resource's tags reports the set
+/// itself — the empty map for a resource holding none — and a reply that carries no
+/// `tags` member at all reads as the empty set here, which is what lets a refusal be
+/// compared against a served read.
 fn reported_tags(answer: &Answer) -> BTreeMap<String, String> {
     answer
         .get("tags")
@@ -210,8 +212,8 @@ async fn tag_merges_the_requested_pairs_into_the_persisted_tag_set() {
 
         let tagged = tag_resource(&dsql, &arn, &case.request).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {:?}: TagResource must answer 200, got {} {:?}",
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {:?}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
             case.name, tagged.status, tagged.body
         );
 
@@ -238,8 +240,9 @@ async fn tag_merges_the_requested_pairs_into_the_persisted_tag_set() {
         // `@idempotent`: repeating the same call leaves the same tag set.
         let again = tag_resource(&dsql, &arn, &case.request).await;
         assert_eq!(
-            again.status, 200,
-            "case {:?}: a repeated TagResource must answer 200, got {} {:?}",
+            again.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {:?}: a repeated TagResource must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
             case.name, again.status, again.body
         );
         let after_repeat = dsql.get(&identifier).await;
@@ -265,8 +268,8 @@ async fn tagging_is_accepted_before_the_clock_settles_and_changes_no_status() {
 
     let tagged = tag_resource(&dsql, &arn, &tags(&[("phase", "creating")])).await;
     assert_eq!(
-        tagged.status, 200,
-        "case {case:?}: TagResource must answer 200, got {} {:?}",
+        tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
         tagged.status, tagged.body
     );
 
@@ -397,8 +400,8 @@ async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
     // ARN naming no resource, not about the route or the body.
     let accepted = tag_resource(&dsql, &live_arn, &tags(&[("env", "dev")])).await;
     assert_eq!(
-        accepted.status, 200,
-        "case {:?}: the resource's own ARN must answer 200, got {} {:?}",
+        accepted.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {:?}: the resource's own ARN must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
         "the live cluster's own ARN", accepted.status, accepted.body
     );
     assert_eq!(
@@ -477,8 +480,9 @@ async fn tagging_past_the_per_resource_ceiling_is_refused_in_full() {
     // Exactly on the published bound: the resource ends holding TAG_MAP_MAX tags.
     let at_bound = tag_resource(&dsql, &arn, &numbered_tags("added", 50)).await;
     assert_eq!(
-        at_bound.status, 200,
-        "case {:?}: a call landing on the ceiling must answer 200, got {} {:?}",
+        at_bound.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {:?}: a call landing on the ceiling must answer \
+         {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
         "exactly at the ceiling", at_bound.status, at_bound.body
     );
     let full = reported_tags(&dsql.get(&identifier).await);
@@ -524,8 +528,9 @@ async fn tagging_past_the_per_resource_ceiling_is_refused_in_full() {
     let overwrite = BTreeMap::from([("kept-0".to_string(), "rewritten".to_string())]);
     let accepted = tag_resource(&dsql, &arn, &overwrite).await;
     assert_eq!(
-        accepted.status, 200,
-        "case {:?}: overwriting a key at the ceiling must answer 200, got {} {:?}",
+        accepted.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {:?}: overwriting a key at the ceiling must answer \
+         {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
         "overwrite at the ceiling", accepted.status, accepted.body
     );
     let after_overwrite = reported_tags(&dsql.get(&identifier).await);
@@ -709,8 +714,9 @@ async fn tagging_resolves_every_tagged_resource_by_its_own_arn() {
 
         let tagged = tag_resource(&dsql, &target_arn, &case.request).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {:?}: TagResource on {target_arn:?} must answer 200, got {} {:?}",
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {:?}: TagResource on {target_arn:?} must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
             case.name, tagged.status, tagged.body
         );
 
@@ -752,8 +758,9 @@ async fn tagging_resolves_every_tagged_resource_by_its_own_arn() {
         // `@idempotent`: the same call again leaves the same tag set.
         let again = tag_resource(&dsql, &target_arn, &case.request).await;
         assert_eq!(
-            again.status, 200,
-            "case {:?}: a repeated TagResource must answer 200, got {} {:?}",
+            again.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {:?}: a repeated TagResource must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
             case.name, again.status, again.body
         );
         let after_repeat = list_tags(&dsql, &target_arn).await;

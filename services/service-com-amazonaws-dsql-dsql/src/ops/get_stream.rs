@@ -231,15 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // delivery target produced, and nothing for a stream in any other
             // status ([`crate::state::Stream::status_reason`]).
             status_reason: stream.status_reason(),
-            // `tags` is modelled as an optional map, and a stream created
-            // without tags has none to report.
-            tags: (!stream.tags.is_empty()).then(|| {
-                stream
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            // The stream's own tag set, which a read always REPORTS — the empty map
+            // for a stream holding no tags ([`crate::state::reported_tags`]), exactly
+            // as `GetCluster` reports a cluster's.
+            tags: Some(crate::state::reported_tags(&stream.tags)),
         })
     }
 }

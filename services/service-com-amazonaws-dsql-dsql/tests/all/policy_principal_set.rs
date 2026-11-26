@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_arn, Dsql};
+use crate::harness::{expected_arn, policy_document, Dsql};
 
 /// The action a principal needs to replace a cluster's policy, which is what the
 /// lockout safety check is about. Source: `bypassPolicyLockoutSafetyCheck`'s own
@@ -390,9 +390,9 @@ async fn the_lockout_check_reads_notprincipal_as_the_complement_of_the_principal
                 case.name, bypassed.status, bypassed.body
             );
             assert_eq!(
-                dsql.get_policy(identifier).await.str("policy"),
-                document,
-                "case {:?}: the bypassed document must read back verbatim, got {:?}",
+                policy_document(&dsql.get_policy(identifier).await.str("policy")),
+                policy_document(&document),
+                "case {:?}: the bypassed document must read back, got {:?}",
                 case.name,
                 dsql.get_policy(identifier).await.str("policy")
             );
@@ -405,9 +405,9 @@ async fn the_lockout_check_reads_notprincipal_as_the_complement_of_the_principal
             );
             let read = dsql.get_policy(identifier).await;
             assert_eq!(
-                read.str("policy"),
-                document,
-                "case {:?}: the attached document must read back verbatim, got {:?}",
+                policy_document(&read.str("policy")),
+                policy_document(&document),
+                "case {:?}: the attached document must read back, got {:?}",
                 case.name,
                 read.str("policy")
             );
@@ -471,9 +471,9 @@ async fn create_cluster_reads_the_principal_set_the_same_way() {
             );
             let read = dsql.get_policy(&created.str("identifier")).await;
             assert_eq!(
-                read.str("policy"),
-                document,
-                "case {:?}: the inline document must read back verbatim, got {:?}",
+                policy_document(&read.str("policy")),
+                policy_document(&document),
+                "case {:?}: the inline document must read back, got {:?}",
                 case.name,
                 read.str("policy")
             );

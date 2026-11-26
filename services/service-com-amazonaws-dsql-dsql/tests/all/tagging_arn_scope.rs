@@ -40,7 +40,10 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_arn, expected_stream_arn, wait_for_the_clock, Answer, Dsql};
+use crate::harness::{
+    expected_arn, expected_stream_arn, wait_for_the_clock, Answer, Dsql,
+    TAG_MUTATION_SUCCESS_STATUS,
+};
 use crate::resource_tags::untag;
 
 /// The region this suite's endpoint is signed for, and therefore the region every
@@ -354,8 +357,9 @@ async fn an_arn_outside_the_endpoints_scope_is_not_found() {
             .tag_resource(local_arn, json!({"tags": {"owner": "team-a"}}))
             .await;
         assert_eq!(
-            tagged.status, 200,
-            "case {kind:?}: TagResource on the resource's own ARN must answer 200, got {} {:?}",
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {kind:?}: TagResource on the resource's own ARN must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
             tagged.status, tagged.body
         );
         let own = match *kind {
@@ -371,8 +375,9 @@ async fn an_arn_outside_the_endpoints_scope_is_not_found() {
 
         let removed = untag(&dsql, local_arn, &["owner".to_string()]).await;
         assert_eq!(
-            removed.status, 200,
-            "case {kind:?}: UntagResource on the resource's own ARN must answer 200, got {} {:?}",
+            removed.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {kind:?}: UntagResource on the resource's own ARN must answer \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
             removed.status, removed.body
         );
         assert_tags_unchanged(

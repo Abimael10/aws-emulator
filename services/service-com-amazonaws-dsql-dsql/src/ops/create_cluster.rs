@@ -479,7 +479,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             multi_region_properties: input.multi_region_properties.clone(),
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
             policy: None,
-            policy_versions_issued: 0,
             streams: std::collections::BTreeMap::new(),
             pending: None,
             identifier: identifier.clone(),
@@ -495,11 +494,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             due_at: now + crate::state::SETTLE_AFTER,
             next_status: settles_to,
         });
-        // A policy supplied at creation is attached with its first version, so
+        // A policy supplied at creation is attached with a version of its own, so
         // `GetClusterPolicy` reports it exactly as it reports one `PutClusterPolicy`
         // attached.
         if let Some(document) = input.policy.clone() {
-            let version = cluster.next_policy_version();
+            let version = state.mint_policy_version();
             cluster.policy = Some(crate::state::ClusterPolicy { document, version });
         }
 

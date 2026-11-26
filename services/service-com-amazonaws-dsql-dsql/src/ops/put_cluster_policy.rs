@@ -285,46 +285,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
+        // The cluster is resolved and the claim its `expectedPolicyVersion` carries
+        // decided while the store is read; the version the document is stored under
+        // is minted from the store's own sequence afterwards, so a refused call
+        // consumes none.
+        {
+            let Some(cluster) = state.clusters.get(&input.identifier) else {
+                return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::cluster_not_found(&region, &input.identifier),
+                )
+                .into());
+            };
+
+            // Attaching a policy writes the cluster's own record, so it is held to the
+            // same rule as every other mutation of a cluster: a cluster the clock
+            // still owes a transition, or one on its way out, takes no new policy.
+            if let Some(conflict) = cluster.mutation_conflict("take a policy") {
+                return Err(PutClusterPolicyErrorModeled::ConflictException(conflict).into());
+            }
+
+            // `expectedPolicyVersion` is the caller's claim about what it is
+            // replacing: a claim about a policy that is not there is a 404, and one
+            // about a version that is no longer current is a conflict.
+            if let Some(expected) = input.expected_policy_version.as_deref() {
+                match cluster.policy.as_ref() {
+                    None => {
+                        return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
+                            crate::state::cluster_policy_version_not_found(
+                                &input.identifier,
+                                expected,
+                            ),
+                        )
+                        .into());
+                    }
+                    Some(policy) if policy.version != expected => {
+                        return Err(PutClusterPolicyErrorModeled::ConflictException(
+                            crate::state::cluster_policy_version_conflict(
+                                &input.identifier,
+                                expected,
+                            ),
+                        )
+                        .into());
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        let Some(version) =
+            state.attach_cluster_policy(&input.identifier, input.policy.clone())
+        else {
             return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&region, &input.identifier),
             )
             .into());
         };
-
-        // Attaching a policy writes the cluster's own record, so it is held to the
-        // same rule as every other mutation of a cluster: a cluster the clock
-        // still owes a transition, or one on its way out, takes no new policy.
-        if let Some(conflict) = cluster.mutation_conflict("take a policy") {
-            return Err(PutClusterPolicyErrorModeled::ConflictException(conflict).into());
-        }
-
-        // `expectedPolicyVersion` is the caller's claim about what it is
-        // replacing: a claim about a policy that is not there is a 404, and one
-        // about a version that is no longer current is a conflict.
-        if let Some(expected) = input.expected_policy_version.as_deref() {
-            match cluster.policy.as_ref() {
-                None => {
-                    return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
-                        crate::state::cluster_policy_version_not_found(&input.identifier, expected),
-                    )
-                    .into());
-                }
-                Some(policy) if policy.version != expected => {
-                    return Err(PutClusterPolicyErrorModeled::ConflictException(
-                        crate::state::cluster_policy_version_conflict(&input.identifier, expected),
-                    )
-                    .into());
-                }
-                Some(_) => {}
-            }
-        }
-
-        let version = cluster.next_policy_version();
-        cluster.policy = Some(crate::state::ClusterPolicy {
-            document: input.policy.clone(),
-            version: version.clone(),
-        });
 
         if let Some(token) = input.client_token {
             state.tokens(crate::state::TokenScope::PutClusterPolicy).record(

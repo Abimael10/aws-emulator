@@ -43,7 +43,9 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::ops::types::VALIDATION_EXCEPTION_REASON_VALUES;
 
-use crate::harness::{absent_identifier, expected_arn, Answer, Dsql};
+use crate::harness::{
+    absent_identifier, expected_arn, Answer, Dsql, TAG_MUTATION_SUCCESS_STATUS,
+};
 use crate::resource_tags::untag;
 
 /// The `ValidationExceptionReason` a refusal about one member's value carries, from
@@ -148,6 +150,17 @@ async fn every_tagging_operation(dsql: &Dsql, arn: &str) -> Vec<(&'static str, A
             untag(dsql, arn, &["env".to_string()]).await,
         ),
     ]
+}
+
+/// The status each operation bound to `/tags/{resourceArn}` answers a SERVED call
+/// with: the reader reports a tag map in a body (200), while the two mutations have a
+/// `smithy.api#Unit` output and so report the write in the status alone
+/// ([`TAG_MUTATION_SUCCESS_STATUS`]).
+fn served_status(operation: &str) -> u16 {
+    match operation {
+        "ListTagsForResource" => 200,
+        _ => TAG_MUTATION_SUCCESS_STATUS,
+    }
 }
 
 /// The members a body carries, so a body can be compared against the modelled set.
@@ -319,9 +332,11 @@ async fn an_arn_this_service_reads_is_resolved_rather_than_refused() {
 
     for (operation, answer) in every_tagging_operation(&dsql, &live).await {
         assert_eq!(
-            answer.status, 200,
+            answer.status,
+            served_status(operation),
             "case {operation:?} with the live cluster's own ARN: got {} {:?}",
-            answer.status, answer.body
+            answer.status,
+            answer.body
         );
     }
 

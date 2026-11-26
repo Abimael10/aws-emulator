@@ -27,7 +27,7 @@
 use serde_json::json;
 
 use crate::error_contract::stream_request;
-use crate::harness::{wait_for_the_clock, Dsql};
+use crate::harness::{policy_document, wait_for_the_clock, Dsql};
 use crate::policy_version_conflict_and_lockout::benign_document;
 
 /// What happens to a cluster's policy between the first `PutClusterPolicy` and
@@ -191,8 +191,8 @@ async fn assert_attached(dsql: &Dsql, case: &str, identifier: &str, expected: &A
                 read.status, read.body
             );
             assert_eq!(
-                read.str("policy"),
-                *document,
+                policy_document(&read.str("policy")),
+                policy_document(document),
                 "case {case:?}: the stored document must be the one the intervening calls left, \
                  got {:?}",
                 read.str("policy")

@@ -32,7 +32,7 @@ use service_com_amazonaws_dsql_dsql::state::{
 
 use crate::harness::{
     account_of, expected_arn, expected_stream_arn, is_cluster_id, names_a_resource_of_its_own_type,
-    wait_for_the_clock, Answer, Dsql, TAG_MAP_MAX,
+    wait_for_the_clock, Answer, Dsql, TAG_MAP_MAX, TAG_MUTATION_SUCCESS_STATUS,
 };
 use crate::stream_lifecycle::kinesis_target;
 
@@ -146,7 +146,7 @@ async fn drive(dsql: &Dsql, ceiling: Ceiling, case: &str) -> Refused {
                 .tag_resource(&arn, json!({"tags": tag_object("kept", TAG_MAP_MAX)}))
                 .await;
             assert_eq!(
-                filled.status, 200,
+                filled.status, TAG_MUTATION_SUCCESS_STATUS,
                 "case {case:?}: filling the tag map to its ceiling must succeed, got {} {:?}",
                 filled.status, filled.body
             );
@@ -189,7 +189,7 @@ async fn drive(dsql: &Dsql, ceiling: Ceiling, case: &str) -> Refused {
                 .tag_resource(&arn, json!({"tags": tag_object("kept", TAG_MAP_MAX)}))
                 .await;
             assert_eq!(
-                filled.status, 200,
+                filled.status, TAG_MUTATION_SUCCESS_STATUS,
                 "case {case:?}: filling the tag map to its ceiling must succeed, got {} {:?}",
                 filled.status, filled.body
             );

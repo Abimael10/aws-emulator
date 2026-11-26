@@ -42,6 +42,7 @@ use serde_json::{json, Map, Value};
 
 use crate::harness::{
     absent_identifier, expected_arn, wait_for_the_clock, Answer, Dsql, TAG_KEY_MAX,
+    TAG_MUTATION_SUCCESS_STATUS,
 };
 use crate::resource_tags::untag;
 
@@ -449,7 +450,7 @@ async fn a_key_that_only_resembles_the_reserved_prefix_is_served() {
             .tag_resource(&arn, json!({"tags": tag_object(&tags(&[(key.as_str(), "merged")]))}))
             .await;
         assert_eq!(
-            tagged.status, 200,
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: TagResource must accept it, got {} {:?}",
             tagged.status, tagged.body
         );
@@ -463,7 +464,7 @@ async fn a_key_that_only_resembles_the_reserved_prefix_is_served() {
 
         let removed = untag(&dsql, &arn, std::slice::from_ref(&key)).await;
         assert_eq!(
-            removed.status, 200,
+            removed.status, TAG_MUTATION_SUCCESS_STATUS,
             "case {case:?}: UntagResource must accept it, got {} {:?}",
             removed.status, removed.body
         );
@@ -699,7 +700,7 @@ async fn a_tag_outside_its_character_set_is_refused_and_nothing_is_written() {
         .tag_resource(&targets[0].arn, json!({"tags": tag_object(&allowed)}))
         .await;
     assert_eq!(
-        tagged.status, 200,
+        tagged.status, TAG_MUTATION_SUCCESS_STATUS,
         "case every allowed character: TagResource must accept it, got {} {:?}",
         tagged.status, tagged.body
     );

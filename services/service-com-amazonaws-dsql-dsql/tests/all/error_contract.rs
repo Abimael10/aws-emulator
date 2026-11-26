@@ -15,8 +15,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    absent_identifier, arn_not_found_message, expected_arn, is_cluster_id, wait_for_the_clock, Dsql,
-    TAG_MAP_MAX,
+    absent_identifier, arn_not_found_message, expected_arn, is_cluster_id, policy_document,
+    wait_for_the_clock, Dsql, TAG_MAP_MAX,
 };
 
 /// `TagMap`'s modelled maximum entry count, from the one place the suites spell
@@ -350,7 +350,7 @@ async fn a_tag_map_over_its_modelled_maximum_is_a_bad_request_body() {
     );
     assert_eq!(
         dsql.get(&cluster).await.get("tags"),
-        Value::Null,
+        json!({}),
         "an oversized tag batch must leave the addressed cluster untagged"
     );
 
@@ -707,9 +707,10 @@ async fn the_cluster_policy_round_trips_and_reports_its_absence() {
             got.status, got.body
         );
         assert_eq!(
-            got.str("policy"),
-            serialized,
-            "case document #{round}: GetClusterPolicy must report the document verbatim"
+            policy_document(&got.str("policy")),
+            policy_document(&serialized),
+            "case document #{round}: GetClusterPolicy must report the attached document, got {:?}",
+            got.str("policy")
         );
         assert_eq!(
             got.str("policyVersion"),
@@ -923,9 +924,9 @@ async fn a_policy_that_denies_every_principal_the_policy_action_is_refused() {
                 answer.status, answer.body
             );
             assert_eq!(
-                dsql.get_policy(&identifier).await.str("policy"),
-                document,
-                "case {name:?}: the attached document must read back verbatim"
+                policy_document(&dsql.get_policy(&identifier).await.str("policy")),
+                policy_document(&document),
+                "case {name:?}: the attached document must read back"
             );
         }
     }

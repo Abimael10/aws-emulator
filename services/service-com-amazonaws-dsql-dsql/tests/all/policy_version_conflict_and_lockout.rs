@@ -30,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_arn, Dsql};
+use crate::harness::{expected_arn, policy_document, Dsql};
 
 /// A policy document the lockout safety check has no reason to refuse: one named
 /// principal, one action, on every resource. `round` varies the action so two
@@ -315,8 +315,8 @@ async fn a_claim_naming_the_attached_version_is_applied() {
         "the replacement must carry a version other than {first:?}"
     );
     assert_eq!(
-        dsql.get_policy(put_cluster).await.str("policy"),
-        benign_document(1),
+        policy_document(&dsql.get_policy(put_cluster).await.str("policy")),
+        policy_document(&benign_document(1)),
         "the replacement must be the stored document"
     );
 
@@ -587,9 +587,9 @@ async fn the_lockout_check_reads_resource_against_the_clusters_own_arn() {
                 case.name, bypassed.status, bypassed.body
             );
             assert_eq!(
-                dsql.get_policy(identifier).await.str("policy"),
-                document,
-                "case {:?}: the bypassed document must read back verbatim",
+                policy_document(&dsql.get_policy(identifier).await.str("policy")),
+                policy_document(&document),
+                "case {:?}: the bypassed document must read back",
                 case.name
             );
         } else {
@@ -600,9 +600,9 @@ async fn the_lockout_check_reads_resource_against_the_clusters_own_arn() {
                 case.name, answer.status, answer.body
             );
             assert_eq!(
-                dsql.get_policy(identifier).await.str("policy"),
-                document,
-                "case {:?}: the attached document must read back verbatim",
+                policy_document(&dsql.get_policy(identifier).await.str("policy")),
+                policy_document(&document),
+                "case {:?}: the attached document must read back",
                 case.name
             );
         }

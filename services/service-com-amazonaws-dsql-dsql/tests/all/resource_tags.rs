@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::harness::{
     absent_identifier, expected_arn, percent_encode_label, wait_for_the_clock, Answer, Dsql,
-    TAG_KEY_MAX, TAG_MAP_MAX, TAG_VALUE_MAX,
+    TAG_KEY_MAX, TAG_MAP_MAX, TAG_MUTATION_SUCCESS_STATUS, TAG_VALUE_MAX,
 };
 
 /// `TagKeyList`'s published maximum. Source: `smithy_query(query="shape",
@@ -208,18 +208,13 @@ async fn list_tags_reports_exactly_the_tags_persisted_on_the_resource() {
             listed.get("tags")
         );
 
-        // The same state read through the other reader of it: GetCluster omits the
-        // member when the cluster carries no tags, and otherwise reports the map
+        // The same state read through the other reader of it: GetCluster reports the
+        // tag set itself — the empty map included — which is the map
         // ListTagsForResource just reported.
         let fetched = dsql.get(&identifier).await;
         let from_get = fetched.get("tags");
-        let expected_from_get = if case.expected == json!({}) {
-            Value::Null
-        } else {
-            case.expected.clone()
-        };
         assert_eq!(
-            from_get, expected_from_get,
+            from_get, case.expected,
             "case {:?}: GetCluster must agree with ListTagsForResource, got {from_get:?}",
             case.name
         );
@@ -600,8 +595,9 @@ async fn untagging_removes_exactly_the_named_keys_and_is_idempotent() {
         for attempt in 1..=2 {
             let answer = untag(&dsql, &cluster.arn, &case.removed).await;
             assert_eq!(
-                answer.status, 200,
-                "case {:?} (attempt {attempt}): UntagResource must answer 200, got {} {:?}",
+                answer.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {:?} (attempt {attempt}): UntagResource must answer \
+                 {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
                 case.name, answer.status, answer.body
             );
             assert!(
@@ -621,17 +617,12 @@ async fn untagging_removes_exactly_the_named_keys_and_is_idempotent() {
                 listed.get("tags")
             );
 
-            // The other reader of the same state must agree: GetCluster omits the
-            // member when nothing is left.
+            // The other reader of the same state must agree: GetCluster reports the
+            // tag set itself, the empty map included.
             let fetched = dsql.get(&cluster.identifier).await;
-            let expected_from_get = if case.remaining == json!({}) {
-                Value::Null
-            } else {
-                case.remaining.clone()
-            };
             assert_eq!(
                 fetched.get("tags"),
-                expected_from_get,
+                case.remaining,
                 "case {:?} (attempt {attempt}): GetCluster must agree, got {:?}",
                 case.name,
                 fetched.get("tags")
@@ -651,8 +642,8 @@ async fn untagging_touches_only_the_resource_the_arn_names() {
     let before = dsql.get(&first.identifier).await;
     let answer = untag(&dsql, &first.arn, &keys(&["env"])).await;
     assert_eq!(
-        answer.status, 200,
-        "UntagResource must answer 200, got {} {:?}",
+        answer.status, TAG_MUTATION_SUCCESS_STATUS,
+        "UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
         answer.status, answer.body
     );
 
@@ -691,9 +682,17 @@ async fn the_published_tag_keys_bound_is_enforced() {
 
     // (case, how many keys the call names, the status it must answer)
     let rows: &[(&str, usize, u16)] = &[
-        ("the fewest a request can express", 1, 200),
-        ("a handful", 5, 200),
-        ("the published maximum", TAG_KEYS_MAX, 200),
+        (
+            "the fewest a request can express",
+            1,
+            TAG_MUTATION_SUCCESS_STATUS,
+        ),
+        ("a handful", 5, TAG_MUTATION_SUCCESS_STATUS),
+        (
+            "the published maximum",
+            TAG_KEYS_MAX,
+            TAG_MUTATION_SUCCESS_STATUS,
+        ),
         ("one past the published maximum", TAG_KEYS_MAX + 1, 400),
     ];
 
@@ -767,8 +766,9 @@ async fn a_stream_arn_addresses_the_streams_own_tags() {
 
     let removed = untag(&dsql, &stream_arn, &keys(&["env", "never-set"])).await;
     assert_eq!(
-        removed.status, 200,
-        "case \"a stream ARN\": UntagResource must answer 200, got {} {:?}",
+        removed.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case \"a stream ARN\": UntagResource must answer \
+         {TAG_MUTATION_SUCCESS_STATUS}, got {} {:?}",
         removed.status, removed.body
     );
     let after = list_tags(&dsql, &stream_arn).await;

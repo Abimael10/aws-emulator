@@ -27,7 +27,7 @@ use service_com_amazonaws_dsql_dsql::state::{
 
 use crate::cluster_lifecycle::{cluster_id_for, retiring_cluster};
 use crate::cluster_policy::allow;
-use crate::harness::{expected_stream_arn, wait_for_the_clock, Answer, Dsql};
+use crate::harness::{expected_stream_arn, policy_document, wait_for_the_clock, Answer, Dsql};
 use crate::stream_lifecycle::kinesis_target;
 
 /// A `StreamId`-shaped identifier for case `n`. `StreamId` and `ClusterId` have
@@ -366,8 +366,8 @@ async fn a_token_of_a_retired_clusters_resource_serves_a_fresh_request() {
                 served(&case, "the reused PutClusterPolicy", &again);
                 let fetched = dsql.get_policy(&live).await;
                 assert_eq!(
-                    fetched.str("policy"),
-                    document,
+                    policy_document(&fetched.str("policy")),
+                    policy_document(&document),
                     "case {case:?}: the fresh write's document must be the one stored, got {:?}",
                     fetched.str("policy")
                 );

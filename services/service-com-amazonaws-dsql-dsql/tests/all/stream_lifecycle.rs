@@ -93,8 +93,8 @@ struct CreateCase {
     target: Value,
     /// The `tags` the request carries, or `Value::Null` to omit the member.
     tags: Value,
-    /// The `tags` a read must report back: an omitted or empty map is reported
-    /// as no map at all.
+    /// The `tags` a read must report back: the tag set itself, which is the empty map
+    /// for a stream created with no tags.
     expected_tags: Value,
 }
 
@@ -107,7 +107,7 @@ fn create_cases() -> Vec<CreateCase> {
             ordering: "UNORDERED",
             target: kinesis_target("us-east-1", "changes", "dsql-cdc"),
             tags: Value::Null,
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
         CreateCase {
             name: "one tag, a role with a path prefix",
@@ -137,13 +137,13 @@ fn create_cases() -> Vec<CreateCase> {
             expected_tags: json!({"solo": ""}),
         },
         CreateCase {
-            name: "an empty tag map, which is reported as no tags",
+            name: "an empty tag map, which is reported as the empty map",
             region: "us-east-2",
             format: "JSON",
             ordering: "UNORDERED",
             target: kinesis_target("us-east-2", "changes", "dsql-cdc"),
             tags: json!({}),
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
     ]
 }

@@ -35,15 +35,16 @@ use service_com_amazonaws_dsql_dsql::state::{
 
 use crate::cluster_lifecycle::cluster_id_for;
 use crate::cluster_policy::allow;
-use crate::harness::{expected_arn, wait_for_the_clock, Answer, Dsql};
+use crate::harness::{expected_arn, policy_document, wait_for_the_clock, Answer, Dsql};
 use crate::stream_lifecycle::kinesis_target;
 
 /// The region every case in this suite signs for.
 const REGION: &str = "us-east-1";
 
-/// The `PolicyVersion` the seeded cluster's attached policy carries, and the count
-/// of versions it has issued: a refused write must bump neither.
-const SEEDED_POLICY_VERSION: &str = "1";
+/// The `PolicyVersion` the seeded cluster's attached policy carries: a token of the
+/// form the service mints one in (`state::new_policy_version`), which a refused write
+/// must leave attached as it is.
+const SEEDED_POLICY_VERSION: &str = "4f6b8c2e-0a1d-4e7f-9b35-2c6d8e1f4a70";
 
 /// Far enough ahead that no case in this suite reaches it: a seeded cluster in a
 /// transient status carries the transition the clock owes it, and the gate has to
@@ -131,7 +132,6 @@ fn stored_cluster(identifier: &str, status: &str) -> Cluster {
             document: allow("dsql:DbConnect"),
             version: SEEDED_POLICY_VERSION.to_string(),
         }),
-        policy_versions_issued: 1,
         streams: Default::default(),
         pending: settles_to.map(|next_status| PendingTransition {
             due_at: SystemTime::now() + NOT_DUE_YET,
@@ -226,11 +226,6 @@ async fn every_cluster_write_passes_the_same_status_gate() {
                 "case {case:?}: a refused write must leave the attached policy alone, got {:?}",
                 stored.policy
             );
-            assert_eq!(
-                stored.policy_versions_issued, 1,
-                "case {case:?}: a refused write must issue no policy version, got {}",
-                stored.policy_versions_issued
-            );
             assert!(
                 stored.streams.is_empty(),
                 "case {case:?}: a refused write must mint no stream, got {:?}",
@@ -290,8 +285,8 @@ async fn the_policy_operations_answer_the_gate_the_clock_opens() {
     );
     let read = dsql.get_policy(&identifier).await;
     assert_eq!(
-        (read.status, read.str("policy")),
-        (200, allow("dsql:DbConnect")),
+        (read.status, policy_document(&read.str("policy"))),
+        (200, policy_document(&allow("dsql:DbConnect"))),
         "the attached document must read back, got {} {:?}",
         read.status,
         read.body

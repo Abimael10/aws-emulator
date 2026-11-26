@@ -395,10 +395,6 @@ pub struct Cluster {
     pub tags: BTreeMap<String, String>,
     /// The resource-based policy currently attached, if any.
     pub policy: Option<ClusterPolicy>,
-    /// How many policy versions this cluster has ever issued, so a version token
-    /// is never reused after a policy is deleted and another attached — an
-    /// `expectedPolicyVersion` from the first policy cannot match the second.
-    pub policy_versions_issued: u64,
     /// The cluster's CDC streams, keyed by `StreamId`. Bounded by
     /// [`MAX_STREAMS_PER_CLUSTER`], which `CreateStream` checks before it
     /// inserts.
@@ -520,13 +516,6 @@ impl Cluster {
     pub fn removed_identifiers(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.identifier.as_str())
             .chain(self.streams.keys().map(String::as_str))
-    }
-
-    /// Mint the next unused `PolicyVersion` token for this cluster and record
-    /// that it was issued.
-    pub fn next_policy_version(&mut self) -> String {
-        self.policy_versions_issued += 1;
-        self.policy_versions_issued.to_string()
     }
 }
 
@@ -999,6 +988,9 @@ pub struct ComAmazonawsDsqlDsqlState {
     /// One `clientToken` ledger per [`TokenScope`], reached through
     /// [`Self::tokens`] / [`Self::tokens_of`].
     tokens: [TokenLedger; TokenScope::ALL.len()],
+    /// How many `PolicyVersion` tokens this store has issued, which is what the
+    /// next one is drawn from ([`Self::mint_policy_version`]).
+    policy_versions_issued: u64,
 }
 
 impl ComAmazonawsDsqlDsqlState {
@@ -1010,6 +1002,47 @@ impl ComAmazonawsDsqlDsqlState {
     /// The `clientToken` ledger of `scope`, for reading.
     pub fn tokens_of(&self, scope: TokenScope) -> &TokenLedger {
         &self.tokens[scope.index()]
+    }
+
+    /// Mint the `PolicyVersion` token the policy document being attached is stored
+    /// under: the next value of this store's own version sequence.
+    ///
+    /// The sequence is the STORE's and not one cluster's, so a version names ONE
+    /// stored policy document of this account: a version that has been issued is
+    /// never issued again — neither by the cluster that held it, after its policy
+    /// was removed and another attached, nor by any other cluster — so an
+    /// `expectedPolicyVersion` held from an earlier policy selects nothing
+    /// anywhere.
+    ///
+    /// `CreateCluster` mints the version of a policy supplied INLINE through here,
+    /// because the cluster it attaches to is not in this store yet; every other
+    /// attach goes through [`Self::attach_cluster_policy`].
+    pub fn mint_policy_version(&mut self) -> String {
+        self.policy_versions_issued += 1;
+        self.policy_versions_issued.to_string()
+    }
+
+    /// Attach `document` to the cluster `identifier` names, under a freshly minted
+    /// version ([`Self::mint_policy_version`]), and answer that version — or `None`
+    /// when this store holds no such cluster, which is that surface's own
+    /// not-found.
+    ///
+    /// The one place a cluster's policy is REPLACED, so the version a document is
+    /// stored under is minted in the same step that stores it: a call that never
+    /// reaches here — one refused on the cluster's status, on its
+    /// `expectedPolicyVersion` claim or on the document itself — consumes no
+    /// version at all.
+    pub fn attach_cluster_policy(&mut self, identifier: &str, document: String) -> Option<String> {
+        if !self.clusters.contains_key(identifier) {
+            return None;
+        }
+        let version = self.mint_policy_version();
+        let cluster = self.clusters.get_mut(identifier)?;
+        cluster.policy = Some(ClusterPolicy {
+            document,
+            version: version.clone(),
+        });
+        Some(version)
     }
 
     /// Materialise every status change the clock already owes at `now`.
@@ -1785,6 +1818,24 @@ pub fn new_vpc_endpoint_service_suffix() -> String {
 /// inside `ServiceName`'s `@length(1, 128)`.
 pub fn vpc_endpoint_service_name(region: &str, suffix: &str) -> String {
     format!("com.amazonaws.{region}.dsql-{suffix}")
+}
+
+/// The tag set a read of one resource REPORTS: every pair the resource holds, and
+/// the EMPTY map for a resource holding none.
+///
+/// `TagMap` is `@length(0, 200)` (`smithy_query(query="shape", shape="TagMap")`),
+/// so the empty map is a value the member carries rather than an absence: a reader
+/// that left the member out would leave a client unable to tell a resource with no
+/// tags from one whose tags this reply does not report, and would disagree with
+/// `ListTagsForResource`, which reports the same set for the same resource.
+///
+/// Every reader of a resource's tags builds the reported map here, so a cluster's
+/// and a stream's tags are reported on the same terms.
+#[must_use]
+pub fn reported_tags(held: &BTreeMap<String, String>) -> HashMap<String, String> {
+    held.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// The customer-managed key a `kmsEncryptionKey` names, if it names one at all.

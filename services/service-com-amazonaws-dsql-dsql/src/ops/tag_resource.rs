@@ -98,8 +98,8 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 pub struct TagResourceOutput;
 
 impl TagResourceOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's method and URI; the status a success
+    // answers is an operation fact and is carried on `SUCCESS_STATUS` below.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -186,7 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A tagging mutation has nothing to report: its output is `smithy.api#Unit`, so
+    // the reply carries no body and the status alone says the tags were written —
+    // 204 No Content. The model's `@http` code is DEFAULTED (`http {code: 200,
+    // codeDefaulted: true}`, `smithy_query(query="operation",
+    // operation="TagResource")`), so that 200 is the protocol's placeholder for an
+    // operation whose code the model never states rather than the code the service
+    // sends, and `UntagResource` answers the same way.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

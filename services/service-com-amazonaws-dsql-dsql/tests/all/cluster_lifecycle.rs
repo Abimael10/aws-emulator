@@ -61,6 +61,9 @@ struct CreateCase {
     region: &'static str,
     request: Value,
     deletion_protection: bool,
+    /// The tag set `GetCluster` must then REPORT: the empty map for a cluster created
+    /// with no tags, since a read reports the set itself rather than leaving the member
+    /// out.
     tags: Value,
     encryption_type: &'static str,
     kms_key_arn: Option<String>,
@@ -78,7 +81,7 @@ fn create_cases() -> Vec<CreateCase> {
             region: "us-east-1",
             request: json!({}),
             deletion_protection: true,
-            tags: Value::Null,
+            tags: json!({}),
             encryption_type: "AWS_OWNED_KMS_KEY",
             kms_key_arn: None,
             multi_region_properties: Value::Null,
@@ -111,7 +114,7 @@ fn create_cases() -> Vec<CreateCase> {
             region: "us-east-2",
             request: json!({"deletionProtectionEnabled": false, "kmsEncryptionKey": "1234abcd-12ab-34cd-56ef"}),
             deletion_protection: false,
-            tags: Value::Null,
+            tags: json!({}),
             encryption_type: "CUSTOMER_MANAGED_KMS_KEY",
             kms_key_arn: Some(format!(
                 "arn:aws:kms:us-east-2:{}:key/1234abcd-12ab-34cd-56ef",
@@ -124,7 +127,7 @@ fn create_cases() -> Vec<CreateCase> {
             region: "us-west-1",
             request: json!({"deletionProtectionEnabled": false, "kmsEncryptionKey": "alias/my-dsql-key"}),
             deletion_protection: false,
-            tags: Value::Null,
+            tags: json!({}),
             encryption_type: "CUSTOMER_MANAGED_KMS_KEY",
             kms_key_arn: Some(format!(
                 "arn:aws:kms:us-west-1:{}:alias/my-dsql-key",
@@ -140,7 +143,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "kmsEncryptionKey": format!("arn:aws:kms:us-east-1:{}:key/abcd", engine::EMULATOR_ACCOUNT_ID)
             }),
             deletion_protection: false,
-            tags: Value::Null,
+            tags: json!({}),
             encryption_type: "CUSTOMER_MANAGED_KMS_KEY",
             kms_key_arn: Some(format!(
                 "arn:aws:kms:us-east-1:{}:key/abcd",
@@ -156,7 +159,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "multiRegionProperties": {"witnessRegion": "us-west-2", "clusters": [peer.clone()]}
             }),
             deletion_protection: false,
-            tags: Value::Null,
+            tags: json!({}),
             encryption_type: "AWS_OWNED_KMS_KEY",
             kms_key_arn: None,
             multi_region_properties: json!({"witnessRegion": "us-west-2", "clusters": [peer]}),
@@ -1171,7 +1174,6 @@ pub fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
         multi_region_properties: None,
         tags: Default::default(),
         policy: None,
-        policy_versions_issued: 0,
         streams: Default::default(),
         pending: Some(PendingTransition {
             due_at,

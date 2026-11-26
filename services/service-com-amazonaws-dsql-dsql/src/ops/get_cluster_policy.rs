@@ -7,6 +7,12 @@
 //! cluster with no policy attached is `ResourceNotFoundException`, which is how a
 //! caller probes whether a policy is attached at all.
 //!
+//! The document comes back in the LAYOUT a service that attaches a policy reports one
+//! in ([`::service_common::iam_policy::canonical_document_keeping_value_lists`]) rather
+//! than in the bytes the caller submitted, so two reads of one attached policy answer
+//! the same document and a client that diffs or hashes what it last read sees a change
+//! only when the policy changed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,7 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetClusterPolicyOutput {
-            policy: policy.document.clone(),
+            // The document is handed back in the canonical layout the tree states once
+            // for every service that reports an attached policy, rather than in the
+            // bytes it was submitted in, so two reads of one attached policy answer the
+            // same document however it was written. This surface keeps a VALUE LIST as
+            // it was written — the recorded reads of this service show no collapse of a
+            // one-value list — which is the `keeping_value_lists` flavour of that one
+            // walk.
+            policy: ::service_common::iam_policy::canonical_document_keeping_value_lists(
+                &policy.document,
+            ),
             policy_version: policy.version.clone(),
         })
     }

@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{wait_for_the_clock, Dsql};
+use crate::harness::{policy_document, wait_for_the_clock, Dsql};
 
 /// A policy document as the wire carries it: `policy` is a STRING member holding a
 /// JSON document, so the document is serialized into it.
@@ -145,8 +145,8 @@ async fn a_put_policy_client_token_serves_one_request() {
         // Either way exactly one document is attached, at the first version.
         let read = dsql.get_policy(identifier).await;
         assert_eq!(
-            read.str("policy"),
-            first_document,
+            policy_document(&read.str("policy")),
+            policy_document(&first_document),
             "case {:?}: the stored document must still be the first one, got {:?}",
             case.name,
             read.str("policy")
@@ -350,8 +350,8 @@ async fn an_inline_policy_from_create_is_the_same_record_the_policy_operations_r
         read.status, read.body
     );
     assert_eq!(
-        read.str("policy"),
-        inline,
+        policy_document(&read.str("policy")),
+        policy_document(&inline),
         "case inline: the reader must report the document CreateCluster was given, got {:?}",
         read.str("policy")
     );
@@ -379,8 +379,8 @@ async fn an_inline_policy_from_create_is_the_same_record_the_policy_operations_r
         "case inline: the replacement must carry a version other than {version:?}"
     );
     assert_eq!(
-        dsql.get_policy(&identifier).await.str("policy"),
-        replacement,
+        policy_document(&dsql.get_policy(&identifier).await.str("policy")),
+        policy_document(&replacement),
         "case inline: the replacement must be the stored document"
     );
 

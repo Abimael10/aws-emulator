@@ -14,8 +14,11 @@
 //! the RULE over a class of policy documents — differing in size (from the shortest
 //! well-formed document to `PolicyDocument`'s published maximum of 20480
 //! characters), in nesting, in member count, in whitespace and in character set —
-//! not over one recorded document: the read reports back exactly the bytes that
-//! were persisted, never a re-serialised or normalised rendering of them. Every row
+//! not over one recorded document: the read reports back the document that was
+//! persisted, every element of it, rendered in the canonical layout a service reports
+//! an attached policy in rather than in
+//! the bytes it happened to be submitted in (which `success_reply_contract.rs` pins).
+//! Every row
 //! is a parseable JSON document, which is what both entry points accept, so no
 //! row pins either entry point's answer to an unparseable one; the create each row
 //! drives sets `bypassPolicyLockoutSafetyCheck`, so the class is not narrowed to
@@ -24,7 +27,7 @@
 
 use serde_json::json;
 
-use crate::harness::{absent_identifier, wait_for_the_clock, Dsql};
+use crate::harness::{absent_identifier, policy_document, wait_for_the_clock, Dsql};
 
 /// `PolicyDocument`'s published length bounds. Source: the service's own model,
 /// `smithy_query(query="shape", shape="PolicyDocument")` — `@length(min: 1, max:
@@ -45,7 +48,7 @@ fn policy_of_length(len: usize) -> String {
     format!("{prefix}{}{suffix}", "s".repeat(len - fixed))
 }
 
-/// One persisted policy document the read has to report back verbatim.
+/// One persisted policy document the read has to report back.
 struct PolicyCase {
     name: &'static str,
     policy: String,
@@ -58,7 +61,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             // minimum is POLICY_MIN_LEN character, but no one-character string
             // parses, and `PutClusterPolicy` refuses an unparseable document (pinned
             // by `error_contract.rs`), so a one-character document is not a case the
-            // verbatim round trip should freeze.
+            // round trip should freeze.
             name: "the shortest well-formed document: an empty JSON object",
             policy: "{}".to_string(),
         },
@@ -100,7 +103,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             .to_string(),
         },
         PolicyCase {
-            name: "pretty-printed, so the stored whitespace must survive the read",
+            name: "pretty-printed, which the read renders in the canonical layout",
             policy: "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \
                      \"Effect\": \"Allow\",\n      \"Principal\": \"*\",\n      \
                      \"Action\": \"dsql:DbConnect\",\n      \"Resource\": \"*\"\n    }\n  ]\n}"
@@ -132,11 +135,11 @@ fn policy_cases() -> Vec<PolicyCase> {
 }
 
 /// RULE: `GetClusterPolicy` reports back the resource-based policy document
-/// persisted against the named cluster, byte for byte, together with the version
-/// that stored document carries — for every document the `PolicyDocument`
+/// persisted against the named cluster — every element of it — together with the
+/// version that stored document carries, for every document the `PolicyDocument`
 /// constraint admits.
 #[tokio::test]
-async fn get_cluster_policy_reports_the_persisted_document_verbatim() {
+async fn get_cluster_policy_reports_the_persisted_document() {
     for case in policy_cases() {
         let dsql = Dsql::new();
         let created = dsql
@@ -163,9 +166,9 @@ async fn get_cluster_policy_reports_the_persisted_document_verbatim() {
             case.name, answer.status, answer.body
         );
         assert_eq!(
-            answer.str("policy"),
-            case.policy,
-            "case {:?}: the reported policy must be the persisted document verbatim, got {:?}",
+            policy_document(&answer.str("policy")),
+            policy_document(&case.policy),
+            "case {:?}: the reported policy must be the persisted document, got {:?}",
             case.name,
             answer.str("policy")
         );
@@ -183,7 +186,7 @@ async fn get_cluster_policy_reports_the_persisted_document_verbatim() {
         let again = dsql.get_policy(&identifier).await;
         assert_eq!(
             (again.status, again.str("policy"), again.str("policyVersion")),
-            (200, case.policy.clone(), version),
+            (200, answer.str("policy"), version),
             "case {:?}: a repeated read must answer identically, got {} {:?}",
             case.name,
             again.status,
@@ -226,8 +229,8 @@ async fn the_policy_is_readable_while_the_cluster_is_still_creating() {
     // Straight after the create, while the clock still owes CREATING -> ACTIVE.
     let creating = dsql.get_policy(&identifier).await;
     assert_eq!(
-        (creating.status, creating.str("policy")),
-        (200, policy.to_string()),
+        (creating.status, policy_document(&creating.str("policy"))),
+        (200, policy_document(policy)),
         "case CREATING: the policy must be readable, got {} {:?}",
         creating.status,
         creating.body
@@ -236,8 +239,8 @@ async fn the_policy_is_readable_while_the_cluster_is_still_creating() {
     wait_for_the_clock().await;
     let settled = dsql.get_policy(&identifier).await;
     assert_eq!(
-        (settled.status, settled.str("policy")),
-        (200, policy.to_string()),
+        (settled.status, policy_document(&settled.str("policy"))),
+        (200, policy_document(policy)),
         "case ACTIVE: the policy must still be readable, got {} {:?}",
         settled.status,
         settled.body
