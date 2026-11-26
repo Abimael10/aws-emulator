@@ -233,11 +233,13 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
 ///
 /// The member targets `GlueResourceArn`, whose modelled constraint is a length bound and
 /// the prefix every Glue ARN shares and NOTHING else — it names no resource type. So a
-/// value is either not a Glue resource ARN at all ([`is_glue_resource_arn`]), in which case
-/// the member itself is what is refused, or it is an ARN this surface looks an entity up
-/// BY: the ARN's GRAMMAR is what the operation's `InvalidInputException` answers, and
-/// whether an entity is THERE is what its `EntityNotFoundException` answers. A legal ARN
-/// that resolves to nothing is an absence, never a bad parameter.
+/// value either ADDRESSES a Glue resource — a Glue resource ARN whose resource portion
+/// names a Glue resource TYPE ([`is_glue_resource_address`]) — or it addresses nothing at
+/// all, in which case the member itself is what is refused: the ARN's GRAMMAR, down to the
+/// resource type it has to name, is what the operation's `InvalidInputException` answers,
+/// and whether an entity is THERE is what its `EntityNotFoundException` answers. An ARN
+/// that addresses a resource type and resolves to nothing is an absence, never a bad
+/// parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggedResourceAddress {
     /// The ARN names one resource of one taggable kind ([`parse_tagged_resource`]).
@@ -246,18 +248,20 @@ pub enum TaggedResourceAddress {
     /// through the surface that owns the kind ([`tag_read_not_found_message`]) and the
     /// WRITES through their own fixed sentence ([`messages::TAGGED_RESOURCE_NOT_FOUND`]).
     Resource(TaggedResource),
-    /// A Glue resource ARN under which this service places no entity at all: a resource
-    /// type it dispatches no lookup for — a catalog table, a table version, a user defined
-    /// function, a partition, each of which carries no tag set of its own — or a resource
-    /// portion that names no single resource of the kind it spells. There is nothing there,
+    /// A Glue resource ARN that names a resource TYPE under which this service places no
+    /// entity at all: a type it dispatches no lookup for — a catalog table, a table
+    /// version, a user defined function, a partition, each of which carries no tag set of
+    /// its own — or a resource portion that names the type of a taggable kind but no single
+    /// resource of it. There is nothing there,
     /// which is an absence and not a bad parameter
     /// ([`messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND`]).
     NoEntity,
-    /// A value that is no Glue resource ARN ([`is_glue_resource_arn`]) — a bare resource
-    /// name, an ARN of another service, an ARN missing a field, a value that is no ARN at
-    /// all. There is no address to look anything up by, so the member is refused
-    /// ([`INVALID_RESOURCE_ARN_MESSAGE`]).
-    NotGlueResourceArn,
+    /// A value that addresses no Glue resource at all ([`is_glue_resource_address`]) — a
+    /// bare resource name, an ARN of another service, an ARN missing a field, a value that
+    /// is no ARN at all, or a Glue resource ARN whose resource portion names no Glue
+    /// resource TYPE ([`names_glue_resource_type`]). There is no address to look anything
+    /// up by, so the member is refused ([`INVALID_RESOURCE_ARN_MESSAGE`]).
+    NotGlueResourceAddress,
 }
 
 /// How many characters a `ResourceArn` may carry: the modelled `@length` bound of
@@ -305,12 +309,84 @@ pub fn is_glue_resource_arn(value: &str) -> bool {
             .any(|partition| fields[1] == *partition)
 }
 
+/// The ARN resource-type segments of the Glue resource types this service recognises but
+/// holds NO tag set of: the kinds addressed by a Glue ARN of their own whose create models
+/// no `Tags` map, so a tagging call's ARN can name one and still place no entity.
+///
+/// Source: the resource types this crate already reads or mints a Glue ARN of beside the
+/// taggable kinds — the catalog table, addressed under its database
+/// (`table/<database>/<name>`, the form an integration's table properties and a catalog
+/// resource policy name a table by), a table's versions and partitions, the user defined
+/// functions of a database, the development endpoint whose create is a scaffold here, the
+/// zero-ETL integration, and the record of one resource's integration properties, whose
+/// segment the model spells and this crate mints
+/// ([`INTEGRATION_RESOURCE_PROPERTY_ARN_SEGMENT`], named here rather than respelled so the
+/// two cannot drift) — each camel-cased exactly as the resource portion of a Glue ARN spells
+/// the type, as [`TAGGED_RESOURCE_TYPES`] is. They are listed beside that table so one
+/// reading answers whether a resource portion names a Glue resource type at all
+/// ([`names_glue_resource_type`]).
+///
+/// It grows with every further Glue ARN form this crate learns to mint or resolve: a type
+/// segment named by NEITHER table is read as naming no Glue resource type, so leaving a new
+/// one out moves its ARNs from the tagging surface's absence to its refusal of the member.
+pub const UNTAGGED_RESOURCE_TYPES: [&str; 7] = [
+    "devEndpoint",
+    "integration",
+    INTEGRATION_RESOURCE_PROPERTY_ARN_SEGMENT,
+    "partition",
+    "table",
+    "tableVersion",
+    "userDefinedFunction",
+];
+
+/// The whole resource portion of the ARN of the account's own Data Catalog: the type segment
+/// alone, with no name after it, which is the one Glue resource ARN form that carries none
+/// (a catalog registered INSIDE it carries its name — [`TaggedResourceKind::Catalog`]).
+pub const DATA_CATALOG_RESOURCE: &str = "catalog";
+
+/// Whether `resource` — the resource portion of a Glue resource ARN, its sixth field and
+/// everything after it ([`GlueArn::resource`]) — names a Glue resource TYPE, which is what
+/// makes the ARN an ADDRESS a lookup can be dispatched from.
+///
+/// A Glue resource ARN's resource portion is a resource-type segment followed by the name of
+/// one resource of that type (`database/<name>`, `table/<database>/<name>`), the account's
+/// own Data Catalog ([`DATA_CATALOG_RESOURCE`]) being the one form that is a type segment
+/// alone. So a portion that spells no type segment at all — a bare token, a colon-joined
+/// value, the empty portion — and one whose segment is no Glue resource type name the type
+/// of nothing: there is no resource of any kind for them to address, whatever follows.
+/// Whether the type is one that carries a tag set, and whether the resource is THERE, are
+/// separate answers ([`parse_tagged_resource`]).
+pub fn names_glue_resource_type(resource: &str) -> bool {
+    if resource == DATA_CATALOG_RESOURCE {
+        return true;
+    }
+    let Some((segment, _)) = resource.split_once('/') else {
+        return false;
+    };
+    TAGGED_RESOURCE_TYPES
+        .iter()
+        .any(|(candidate, _)| *candidate == segment)
+        || UNTAGGED_RESOURCE_TYPES.contains(&segment)
+}
+
+/// Whether `value` ADDRESSES a Glue resource: it is spelled as a Glue resource ARN
+/// ([`is_glue_resource_arn`]) AND its resource portion names a Glue resource type
+/// ([`names_glue_resource_type`]).
+///
+/// This is the whole of what a tagging call's `ResourceArn` has to be for the surface to look
+/// anything up by it; a value that is not one addresses no resource of any type, so it is the
+/// member that is refused rather than an entity reported absent.
+pub fn is_glue_resource_address(value: &str) -> bool {
+    is_glue_resource_arn(value)
+        && parse_glue_arn(value).is_some_and(|arn| names_glue_resource_type(&arn.resource))
+}
+
 /// What the tagging surface's `ResourceArn` addresses: the Glue resource it names, the
-/// absence of any entity under a Glue ARN that names none, or a value that is no Glue
-/// resource ARN at all. See [`TaggedResourceAddress`].
+/// absence of any entity under a Glue ARN whose resource type this service places none of,
+/// or a value that addresses no Glue resource at all. See [`TaggedResourceAddress`].
 pub fn resolve_tagged_resource(resource_arn: &str) -> TaggedResourceAddress {
-    if !is_glue_resource_arn(resource_arn) {
-        return TaggedResourceAddress::NotGlueResourceArn;
+    if !is_glue_resource_address(resource_arn) {
+        return TaggedResourceAddress::NotGlueResourceAddress;
     }
     match parse_tagged_resource(resource_arn) {
         Some(resource) => TaggedResourceAddress::Resource(resource),
@@ -373,15 +449,16 @@ pub fn tag_read_not_found_message(resource: &TaggedResource) -> String {
     }
 }
 
-/// Whether the refusal of a `ResourceArn` that is not the ARN of a taggable Glue resource
-/// ([`parse_tagged_resource`] answers `None`) states any prose at all: it does NOT.
+/// Whether the refusal of a `ResourceArn` that addresses no Glue resource at all
+/// ([`is_glue_resource_address`] answers `false`) states any prose at all: it does NOT.
 ///
 /// RECORDED behaviour of the tagging surface: such a request is answered with the
 /// operation's modelled `InvalidInputException` carrying its CODE and no message member at
-/// all — the refusal says that the ARN is not one of this service's, and states neither the
-/// value it was handed nor the resource types the member admits. One copy, shared by the
-/// three tagging operations that resolve a `ResourceArn` through [`parse_tagged_resource`],
-/// so none of them invents prose for a refusal the service words silently.
+/// all — the refusal says that the ARN addresses none of this service's resources, and
+/// states neither the value it was handed nor the resource types the member admits. One
+/// copy, shared by the three tagging operations that resolve a `ResourceArn` through
+/// [`resolve_tagged_resource`], so none of them invents prose for a refusal the service
+/// words silently.
 pub const INVALID_RESOURCE_ARN_MESSAGE: Option<String> = None;
 
 /// The message a refusal carries for a tag write that would leave the resource holding

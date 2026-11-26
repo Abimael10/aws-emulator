@@ -1197,11 +1197,11 @@ fn glue<Eng: Send + Sync + 'static>(
     let Some(state) = owner_glue::state::service_state(engine) else {
         return Resolution::Unowned;
     };
-    // A `glue` ARN is an address Glue looks an entity up BY, so what it places is that
-    // service's answer: an ARN naming no entity of it at all is a per-resource MISS in
-    // Glue's own generic wording, and only a value that is no Glue resource ARN is the
-    // request Glue refuses — the code its tag write models for a bad input, with the prose
-    // it states, which for that refusal is none
+    // A `glue` ARN that names one of Glue's resource types is an address Glue looks an
+    // entity up BY, so what it places is that service's answer: an ARN naming no entity of
+    // it at all is a per-resource MISS in Glue's own generic wording, and only a value that
+    // addresses no Glue resource is the request Glue refuses — the code its tag write models
+    // for a bad input, with the prose it states, which for that refusal is none
     // ([`owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE`]).
     let resource = match owner_glue::state::resolve_tagged_resource(&arn.arn) {
         owner_glue::state::TaggedResourceAddress::Resource(resource) => resource,
@@ -1211,7 +1211,7 @@ fn glue<Eng: Send + Sync + 'static>(
                 owner_glue::state::messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND.to_string(),
             );
         }
-        owner_glue::state::TaggedResourceAddress::NotGlueResourceArn => {
+        owner_glue::state::TaggedResourceAddress::NotGlueResourceAddress => {
             return absent_stating(
                 "InvalidInputException",
                 owner_glue::state::INVALID_RESOURCE_ARN_MESSAGE,

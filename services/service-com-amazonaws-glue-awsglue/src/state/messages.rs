@@ -785,12 +785,11 @@ pub const DASHBOARD_URL_RESOURCE_NOT_FOUND: &str = "Entity not found";
 /// ([`UNPLACEABLE_RESOURCE_ARN_NOT_FOUND`], recorded in a different case).
 pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Entity not found";
 
-/// The miss a tagging call answers for a `ResourceArn` that IS a Glue resource ARN
-/// ([`crate::state::is_glue_resource_arn`]) under which this service places no entity at
-/// all: a resource type it dispatches no lookup for (a catalog table, a table version, a
-/// user defined function, a partition — none of which carries a tag set), a resource type
-/// Glue has none of, and a resource portion that names no one resource of the kind it
-/// spells.
+/// The miss a tagging call answers for a `ResourceArn` that ADDRESSES a Glue resource
+/// ([`crate::state::is_glue_resource_address`]) whose resource TYPE this service places no
+/// entity under at all: a resource type it dispatches no lookup for (a catalog table, a table
+/// version, a user defined function, a partition — none of which carries a tag set), and a
+/// resource portion that names a type but no one resource of it.
 ///
 /// RECORDED constant, and the whole message: the surface answers its modelled
 /// `EntityNotFoundException` with this fixed sentence — it names neither the ARN it was
@@ -800,7 +799,8 @@ pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Entity not found";
 /// does place ([`TAGGED_RESOURCE_NOT_FOUND`]): the two are recorded independently and the
 /// recordings differ in case.
 ///
-/// A value that is no Glue resource ARN at all is no entity lookup to begin with: it earns
+/// A value that addresses no Glue resource at all — no Glue resource ARN, or one whose
+/// resource portion names no Glue resource type — is no entity lookup to begin with: it earns
 /// the operation's `InvalidInputException`, which carries no prose
 /// ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
 ///

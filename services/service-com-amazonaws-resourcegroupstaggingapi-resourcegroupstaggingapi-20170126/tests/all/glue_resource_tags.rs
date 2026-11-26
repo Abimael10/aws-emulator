@@ -467,15 +467,17 @@ async fn glue_tags_live_in_glues_own_records() {
 }
 
 /// A Glue ARN this API cannot resolve is answered per RESOURCE, with Glue's own refusal:
-/// a Glue ARN that names nothing — a resource of a taggable kind that was never created, a
-/// Glue resource type that carries no tag set, or a resource portion with no type at all —
-/// gets that service's `EntityNotFoundException` with `StatusCode` 400, and the other ARNs
-/// of the same batch are tagged. A Glue ARN is an address Glue looks an entity up by, so
-/// everything it fails to place is an absence rather than a bad parameter.
+/// a Glue ARN that names a resource TYPE but nothing under it — a resource of a taggable
+/// kind that was never created, a Glue resource type that carries no tag set, or the
+/// account's own Data Catalog — gets that service's `EntityNotFoundException` with
+/// `StatusCode` 400, and the other ARNs of the same batch are tagged. Such an ARN is an
+/// address Glue looks an entity up by, so everything it fails to place is an absence rather
+/// than a bad parameter.
 ///
 /// The rows differ along the kind named and along WHY the ARN resolves to nothing: a
 /// missing resource of each kind, another account's catalog, a Glue resource type that
-/// carries no tag set, and a Glue ARN with no resource type at all.
+/// carries no tag set, and the Data Catalog's own ARN, whose resource portion is the type
+/// segment alone.
 #[tokio::test]
 async fn an_unresolvable_glue_arn_fails_with_glues_own_refusal() {
     let router = emulator();
@@ -521,7 +523,7 @@ async fn an_unresolvable_glue_arn_fails_with_glues_own_refusal() {
             "EntityNotFoundException",
         ),
         (
-            "a Glue ARN with no resource type",
+            "the account's own Data Catalog, a type segment with no name",
             glue_arn("catalog"),
             "EntityNotFoundException",
         ),

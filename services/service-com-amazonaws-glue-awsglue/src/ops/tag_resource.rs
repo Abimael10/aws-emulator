@@ -22,17 +22,18 @@
 //! that condition); an ARN of a kind this store holds no resource for earns the modelled
 //! `EntityNotFoundException` carrying this write's own recorded fixed sentence
 //! ([`crate::state::messages::TAGGED_RESOURCE_NOT_FOUND`]), as does one naming another
-//! account's estate; and a Glue resource ARN this service places no entity under at all is
-//! an absence too, carrying the sentence recorded for that ARN form
+//! account's estate; and a Glue resource ARN naming a resource type this service places no
+//! entity under at all is an absence too, carrying the sentence recorded for that ARN form
 //! ([`crate::state::messages::UNPLACEABLE_RESOURCE_ARN_NOT_FOUND`]). A refused write stores
 //! nothing.
 //!
 //! The client-input refusal of the member itself is this handler's, not the framework
 //! boundary's (`skip_validation` on `TagResourceRequest` in `src/ops/types/`), and it is
-//! reserved for the member's GRAMMAR: a `ResourceArn` that is no Glue resource ARN — one
+//! reserved for the member's GRAMMAR: a `ResourceArn` that addresses no Glue resource — one
 //! outside `GlueResourceArn`'s modelled `@pattern` or `@length`, an ARN of another service,
-//! an ARN missing a field — is no address to look anything up by
-//! ([`crate::state::is_glue_resource_arn`]), so it is answered by the
+//! an ARN missing a field, or a Glue ARN whose resource portion names no Glue resource TYPE
+//! — is no address to look anything up by
+//! ([`crate::state::is_glue_resource_address`]), so it is answered by the
 //! one resolution above with this operation's own `InvalidInputException` and never with the
 //! cross-service `ValidationException`. That refusal carries NO prose at all, which is how
 //! the tagging surface words it ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
@@ -177,14 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Whether the value is a Glue resource ARN at all is this member's whole GRAMMAR, so
-        // a value that is none is the one thing that is a bad parameter here; a value that IS
-        // one is an ARN this surface looks an entity up BY, so anything it fails to place is
+        // Whether the value ADDRESSES a Glue resource — a Glue resource ARN whose resource
+        // portion names a Glue resource type — is this member's whole GRAMMAR, so a value
+        // that addresses none is the one thing that is a bad parameter here; a value that
+        // does is an ARN this surface looks an entity up BY, so a type it fails to place is
         // an absence.
         let resource = match crate::state::resolve_tagged_resource(&input.resource_arn) {
             crate::state::TaggedResourceAddress::Resource(resource) => resource,
-            // A Glue resource ARN this service places no entity under at all: an absence,
-            // not a refusal of the member, and one no owning surface words.
+            // A Glue resource ARN naming a resource type this service places no entity
+            // under at all: an absence, not a refusal of the member, and one no owning
+            // surface words.
             crate::state::TaggedResourceAddress::NoEntity => {
                 return Err(TagResourceErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
@@ -196,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::TaggedResourceAddress::NotGlueResourceArn => {
+            crate::state::TaggedResourceAddress::NotGlueResourceAddress => {
                 return Err(TagResourceErrorModeled::InvalidInputException(
                     InvalidInputException {
                         message: crate::state::INVALID_RESOURCE_ARN_MESSAGE,
