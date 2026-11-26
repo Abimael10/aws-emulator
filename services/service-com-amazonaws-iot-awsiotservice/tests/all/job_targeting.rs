@@ -150,6 +150,12 @@ impl Emulator {
             .await
     }
 
+    /// `DescribeJob`: `GET /jobs/{jobId}` — the reader that says whether a job exists.
+    async fn describe_job(&self, job_id: &str) -> Reply {
+        self.call("GET", &format!("/jobs/{job_id}"), None, REGION)
+            .await
+    }
+
     /// What the SHARED store holds for `thing_name`, in enqueue order.
     fn executions_for(&self, thing_name: &str) -> Vec<StoredExecution> {
         let store = self.engine.state::<JobExecutionStore>();
@@ -382,8 +388,8 @@ struct RefusalCase {
 
 /// RULE: a `CreateJob` this operation refuses writes NOTHING — no job and no
 /// execution for the targets that did resolve. A target that cannot be RESOLVED to
-/// devices is refused; one that merely names a device the registry does not hold is
-/// not (an execution is keyed by the thing name).
+/// devices of this account is refused, whether it is no target ARN at all, names a
+/// resource no job runs on, or names a thing or thing group the registry does not hold.
 #[tokio::test]
 async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
     let emulator = Emulator::new();
@@ -474,6 +480,24 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             message_carries: "is not a thing name a job may target",
         },
         RefusalCase {
+            case: "a thing ARN naming a device the registry does not hold",
+            targets: vec![thing_arn("laser-unregistered")],
+            document: Some(document.clone()),
+            status: 404,
+            code: "ResourceNotFoundException",
+            // The jobs plane's sentence for a target that names no device, built from
+            // the name the ARN carried.
+            message_carries: "Thing laser-unregistered cannot be found.",
+        },
+        RefusalCase {
+            case: "a registered device beside one the registry does not hold",
+            targets: vec![thing_arn("laser-known"), thing_arn("laser-absent")],
+            document: Some(document.clone()),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message_carries: "Thing laser-absent cannot be found.",
+        },
+        RefusalCase {
             case: "one target past the per-job maximum",
             targets: (0..=MAX_JOB_TARGETS)
                 .map(|index| thing_arn(&format!("laser-fanout-{index}")))
@@ -481,7 +505,7 @@ async fn a_refused_create_job_writes_neither_the_job_nor_an_execution() {
             document: Some(document.clone()),
             status: 410,
             code: "LimitExceededException",
-            message_carries: "targets",
+            message_carries: "Target list exceeds size limit",
         },
     ];
 
@@ -610,27 +634,72 @@ async fn a_second_job_under_a_live_id_is_a_conflict() {
     }
 }
 
-/// RULE: a thing target names a DEVICE BY NAME, so a job may target a thing the
-/// registry does not hold: the execution is created under that name and the data
-/// plane answers that name's queue reads from it.
+/// RULE: a thing target names a DEVICE OF THIS ACCOUNT, so a `thingName` the registry
+/// holds is accepted and given that job's execution, while one it does not hold is the
+/// modelled `ResourceNotFoundException` (404) stating the jobs plane's sentence for it
+/// — and no job is created, so a later read of the id finds nothing.
 #[tokio::test]
-async fn a_job_may_target_a_device_the_registry_does_not_hold() {
+async fn a_thing_target_must_name_a_device_the_registry_holds() {
     let emulator = Emulator::new();
-    let registered = "laser-registered";
-    let created = emulator.create_thing(registered).await;
-    assert_eq!(
-        created.status, 200,
-        "the registered device must be registrable, got {} {:?}",
-        created.status, created.body
-    );
 
-    // (case, thing name, registered)
-    for (case, thing_name, is_registered) in [
-        ("a registered device", registered, true),
-        ("a device that was never registered", "laser-unregistered", false),
-        ("a name carrying the colon its pattern allows", "laser:probe-2", false),
-    ] {
-        let job_id = format!("job-permissive-{}", thing_name.replace(':', "-"));
+    // The rows span the forms a `ThingName` takes — a plain name, one carrying the colon
+    // its pattern allows, one at the modelled maximum length
+    // (`service_common::iot_job_executions::MAX_THING_NAME_LEN`) — each tried both as a
+    // registered device and as one the registry does not hold.
+    let long_name = "n".repeat(MAX_THING_NAME_LEN);
+    let names: [(&str, &str); 3] = [
+        ("a plain name", "laser-registered"),
+        ("a name carrying the colon its pattern allows", "laser:probe-2"),
+        ("a name at the modelled maximum length", &long_name),
+    ];
+
+    for (index, (case, thing_name)) in names.into_iter().enumerate() {
+        // `JobId` is `len 1..64`, so the job's id is keyed by the row rather than by the
+        // device's name, which a row may take to the thing-name maximum.
+        let slug = index;
+
+        // The device the registry does not hold: refused, and nothing is written.
+        let absent_job = format!("job-absent-{slug}");
+        let refused = emulator
+            .create_job(
+                &absent_job,
+                &json!({"targets": [thing_arn(thing_name)], "document": "{}"}),
+            )
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {case:?} (unregistered): expected a 404 ResourceNotFoundException, \
+             got {} {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            format!("Thing {thing_name} cannot be found."),
+            "case {case:?} (unregistered): expected the refusal to name the thing, got {:?}",
+            refused.body
+        );
+        let read = emulator.describe_job(&absent_job).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?} (unregistered): a refused create must write no job, got {} {:?}",
+            read.status, read.body
+        );
+        assert!(
+            emulator.executions_for(thing_name).is_empty(),
+            "case {case:?} (unregistered): a refused create must queue nothing, got {:?}",
+            emulator.executions_for(thing_name)
+        );
+
+        // The same name, now registered: accepted, and the device holds that job.
+        let registered = emulator.create_thing(thing_name).await;
+        assert_eq!(
+            registered.status, 200,
+            "case {case:?}: the device must be registrable, got {} {:?}",
+            registered.status, registered.body
+        );
+        let job_id = format!("job-registered-{slug}");
         let reply = emulator
             .create_job(
                 &job_id,
@@ -639,15 +708,14 @@ async fn a_job_may_target_a_device_the_registry_does_not_hold() {
             .await;
         assert_eq!(
             reply.status, 200,
-            "case {case:?}: expected 200 whether or not the device is registered \
-             (registered={is_registered}), got {} {:?}",
+            "case {case:?} (registered): expected 200, got {} {:?}",
             reply.status, reply.body
         );
         let held = emulator.executions_for(thing_name);
         assert_eq!(
             held.iter().map(|e| e.job_id.as_str()).collect::<Vec<&str>>(),
             vec![job_id.as_str()],
-            "case {case:?}: expected the job queued for {thing_name}, got {held:?}"
+            "case {case:?} (registered): expected the job queued for {thing_name}, got {held:?}"
         );
     }
 }
@@ -768,10 +836,19 @@ async fn deleting_a_job_deletes_its_executions() {
 async fn the_per_job_fan_out_is_bounded_and_an_unschedulable_job_is_refused() {
     let emulator = Emulator::new();
 
-    // At the bound: accepted, and every target holds exactly its own execution.
+    // At the bound: accepted, and every target holds exactly its own execution. Every
+    // device the job names is registered first — a job targets devices of this account.
     let targets: Vec<String> = (0..MAX_JOB_TARGETS)
         .map(|index| thing_arn(&format!("laser-bound-{index}")))
         .collect();
+    for index in 0..MAX_JOB_TARGETS {
+        let registered = emulator.create_thing(&format!("laser-bound-{index}")).await;
+        assert_eq!(
+            registered.status, 200,
+            "case at the target bound: device {index} must be registrable, got {} {:?}",
+            registered.status, registered.body
+        );
+    }
     let reply = emulator
         .create_job(
             "job-at-the-bound",
@@ -794,6 +871,7 @@ async fn the_per_job_fan_out_is_bounded_and_an_unschedulable_job_is_refused() {
     }
 
     // A member this handler cannot honour: refused, and nothing is written.
+    emulator.create_thing("laser-scheduled").await;
     for (case, scheduling) in [
         (
             "an end-behaviour-only schedule",

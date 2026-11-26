@@ -282,16 +282,22 @@ const QUEUED: &str = "QUEUED";
 /// one.
 ///
 /// The GROUP targets name registered groups, because a group is expanded into the devices
-/// it holds and one the registry does not hold names none. The DEVICE targets are
-/// deliberately not registered: an execution is keyed by the thing NAME, so this surface
-/// takes a device target whether or not the registry holds it, and the data plane then
-/// answers that name's queue reads from the execution this call creates.
+/// it holds and one the registry does not hold names none. The DEVICE targets name
+/// registered things for the same reason: a job's execution is work handed to a device of
+/// this account.
 #[tokio::test]
 async fn thing_group_targets_are_expanded_into_their_member_devices() {
     let emulator = Emulator::new();
     // Three groups spanning what the expansion generalises over: how many devices a
     // group holds (two, one, none).
-    for thing_name in ["laser-1", "laser-2", "laser-3"] {
+    for thing_name in [
+        "laser-1",
+        "laser-2",
+        "laser-3",
+        "gateway-0",
+        "gateway-1",
+        "gateway-2",
+    ] {
         emulator.create_thing("setup", thing_name).await;
     }
     emulator.create_thing_group("setup", "north").await;
@@ -458,6 +464,7 @@ async fn thing_group_targets_are_expanded_into_their_member_devices() {
 #[tokio::test]
 async fn a_group_target_whose_devices_are_unknown_is_refused() {
     let emulator = Emulator::new();
+    emulator.create_thing("setup", "gateway-0").await;
     // A dynamic group's members are the things its query selects, so the account's thing
     // index has to be on before one can be created at all.
     emulator.enable_thing_indexing("setup").await;
@@ -544,6 +551,7 @@ async fn a_group_target_whose_devices_are_unknown_is_refused() {
 #[tokio::test]
 async fn a_target_that_is_no_addressable_iot_resource_is_refused() {
     let emulator = Emulator::new();
+    emulator.create_thing("setup", "gateway-0").await;
     let gateway = thing_arn("gateway-0");
     emulator
         .create_continuous_job("setup", "rolling", std::slice::from_ref(&gateway))
@@ -646,6 +654,12 @@ async fn a_target_that_is_no_addressable_iot_resource_is_refused() {
 #[tokio::test]
 async fn one_request_may_name_at_most_the_target_ceiling() {
     let emulator = Emulator::new();
+    emulator.create_thing("ceiling", "gateway-0").await;
+    for index in 1..MAX_JOB_TARGETS {
+        emulator
+            .create_thing("ceiling", &format!("laser-{index}"))
+            .await;
+    }
     let gateway = thing_arn("gateway-0");
     emulator
         .create_continuous_job("ceiling", "rolling", std::slice::from_ref(&gateway))

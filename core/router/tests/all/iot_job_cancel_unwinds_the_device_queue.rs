@@ -523,44 +523,20 @@ fn cancelling_a_job_ends_the_executions_its_force_flag_reaches_for_every_device(
                     );
                 }
 
-                // And the unwind completes: `DeleteJob` needs `force` exactly while an
-                // execution of the job is still pending, and afterwards neither plane
-                // holds the job or its executions.
-                let any_pending = case
-                    .devices
-                    .iter()
-                    .any(|target| {
-                        target.status_after_cancel(case.force) == EXECUTION_IN_PROGRESS
-                    });
+                // And the unwind completes: `force` on `DeleteJob` is read against the
+                // JOB's own status, and a cancelled job has reached a status it never
+                // leaves — so the unforced delete is served whatever its executions are
+                // still doing, and afterwards neither plane holds the job or them.
                 let (status, error_code, rendered, _) = control(
                     "DELETE",
                     format!("/jobs/{}", case.job_id),
                     String::new(),
                 );
-                if any_pending {
-                    assert_eq!(
-                        (status, error_code.as_str()),
-                        (409, "InvalidStateTransitionException"),
-                        "case {label:?}: deleting a job with a pending execution needs force, \
-                         got {status} {error_code} with {rendered}"
-                    );
-                    let (status, _, rendered, _) = control(
-                        "DELETE",
-                        format!("/jobs/{}?force=true", case.job_id),
-                        String::new(),
-                    );
-                    assert_eq!(
-                        status, 200,
-                        "case {label:?}: a forced delete must answer 200, got {status} \
-                         with {rendered}"
-                    );
-                } else {
-                    assert_eq!(
-                        status, 200,
-                        "case {label:?}: deleting a fully cancelled job must answer 200, \
-                         got {status} {error_code} with {rendered}"
-                    );
-                }
+                assert_eq!(
+                    status, 200,
+                    "case {label:?}: deleting a cancelled job needs no force, got {status} \
+                     {error_code} with {rendered}"
+                );
 
                 let (status, error_code, rendered, _) =
                     control("GET", format!("/jobs/{}", case.job_id), String::new());

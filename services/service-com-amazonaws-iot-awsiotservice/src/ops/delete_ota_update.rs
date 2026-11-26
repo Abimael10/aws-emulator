@@ -2,22 +2,22 @@
 
 //! @op DeleteOTAUpdate
 //!
-//! Removes the OTA update the request names, together with the AWS IoT job the OTA
-//! Update Manager deployed it through ([`crate::state::ota_update_job_id`]) and that
-//! job's per-thing executions in the shared store the IoT Jobs data plane serves — the
-//! three records `CreateOTAUpdate` wrote. Afterwards no reader of any of them finds
-//! anything: `GetOTAUpdate` and `GetJobDocument` both answer the modelled 404, and a
-//! targeted device polls no execution of the deleted job.
+//! Removes the OTA update the request names. `forceDeleteAWSJob` decides whether the
+//! AWS IoT job the OTA Update Manager deployed it through
+//! ([`crate::state::ota_update_job_id`]) goes with it: "when true, deletes the IoT job
+//! created by the OTAUpdate process even if it is `IN_PROGRESS`", so that call removes
+//! the update, the job and the job's per-thing executions in the shared store the IoT
+//! Jobs data plane serves — the three records `CreateOTAUpdate` wrote — and afterwards
+//! no reader of any of them finds anything: `GetOTAUpdate` and `GetJobDocument` both
+//! answer the modelled 404, and a targeted device polls no execution of the deleted job.
+//!
+//! WITHOUT the flag the OTA record alone is removed, whatever the job's status: the job
+//! and every execution it handed a device are left exactly as they were, so `GetOTAUpdate`
+//! answers the modelled 404 while the orphaned job is still read, waited on and deleted
+//! through the jobs plane on its own.
 //!
 //! An `otaUpdateId` the account holds no update under is the modelled 404 rather than
 //! an empty 200, so a caller learns the id named nothing.
-//!
-//! `forceDeleteAWSJob` is what the documented refusal turns on: "deletes the IoT job
-//! created by the OTAUpdate process even if it is `IN_PROGRESS`. Otherwise, if the job
-//! is not in a terminal state … an exception will occur". A job is still running
-//! exactly while one of its executions has not finished, which is the same test
-//! `DeleteJob`'s own `force` is read against, so without the flag such a request is
-//! refused with the modelled `InvalidRequestException` and NOTHING is removed.
 //!
 //! `deleteStream` deletes "the stream created by the OTAUpdate process … Ignored if the
 //! stream specified in the OTAUpdate is supplied by the user": the only stream an
@@ -203,28 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let job_id = ota_update.aws_iot_job_id.clone();
 
         let mut pending = executions.lock();
-        // "if the job is not in a terminal state ("COMPLETED" or "CANCELED") an
-        // exception will occur": the deployed job is still running exactly while one of
-        // its executions has not finished, and `forceDeleteAWSJob` is what waives that.
-        let still_running = pending.pending_executions_of_job(&job_id);
-        if still_running > 0 && !input.force_delete_aws_job {
-            return Err(DeleteOTAUpdateErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "OTA update {} is deployed by the job {job_id}, which has \
-                         {still_running} job execution(s) that have not finished; delete \
-                         it with forceDeleteAWSJob to delete the job too",
-                        input.ota_update_id
-                    )),
-                },
-            )
-            .into());
+        // `forceDeleteAWSJob` decides whether the job the OTA Update Manager deployed
+        // this update through is deleted WITH it: "when true, deletes the IoT job created
+        // by the OTAUpdate process". Without it the OTA record alone is removed and that
+        // job — with every execution it handed a device — is left exactly as it was, so a
+        // device already running the deployment keeps its work and the job is reaped on
+        // its own (`DeleteJob`).
+        if input.force_delete_aws_job {
+            pending.remove_job_executions(&job_id);
+            registry.remove(&job_id);
         }
-
-        // Nothing was removed until here, so a refused delete leaves the update, its
-        // job and every execution exactly as they were.
-        pending.remove_job_executions(&job_id);
-        registry.remove(&job_id);
         store.ota_updates.remove(&input.ota_update_id);
         Ok(DeleteOTAUpdateOutput {})
     }

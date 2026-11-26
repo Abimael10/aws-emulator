@@ -513,15 +513,19 @@ async fn a_jobs_progress_is_counted_from_the_executions_its_devices_report() {
             JOB_IN_PROGRESS,
         ),
         (
+            // A create that names no selection creates the snapshot job that selection
+            // defaults to, so its one target finishing completes it.
             "a job whose create named no selection",
             "unselected-job",
             None,
-            JOB_IN_PROGRESS,
+            JOB_COMPLETED,
         ),
     ];
 
     for (case, job_id, target_selection, expected_after) in rows {
         let thing = format!("device-for-{job_id}");
+        // A job targets a DEVICE of this account, so the thing is registered first.
+        emulator.ensure_target(&thing_arn(&thing)).await;
         let mut request = json!({
             "targets": [thing_arn(&thing)],
             "document": r#"{"operation":"reboot"}"#,

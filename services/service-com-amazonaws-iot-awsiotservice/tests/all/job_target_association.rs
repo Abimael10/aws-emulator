@@ -17,6 +17,8 @@
 //!   target list is left as it was, not truncated;
 //! * a target that joins the job gets that device's job execution, and a device already
 //!   targeted gets no second one;
+//! * a target naming a thing the registry does not hold is `ResourceNotFoundException`
+//!   (404) and the job keeps the targets it had;
 //! * a job the account does not hold is `ResourceNotFoundException` (404).
 
 use std::sync::Arc;
@@ -66,6 +68,21 @@ impl Emulator {
             .body(payload)
             .expect("the job request is well formed");
         Reply::of(self.router.dispatch(request).await)
+    }
+
+    /// `CreateThing`: `POST /things/{thingName}`. A job targets DEVICES of this account,
+    /// so every targeted thing is registered before the job that names it.
+    async fn create_thing(&self, thing_name: &str) {
+        let reply = self
+            .dispatch("POST", &format!("/things/{thing_name}"), Some(&json!({})))
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "registering {thing_name}: expected 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
     }
 
     /// Create one job over `targets`, with the `targetSelection` given.
@@ -217,6 +234,9 @@ async fn targets_join_a_continuous_job_and_get_its_executions() {
     ];
 
     let emulator = Emulator::new();
+    for index in 1..=4 {
+        emulator.create_thing(&format!("laser-{index}")).await;
+    }
     emulator
         .create_job(
             "rolling",
@@ -270,6 +290,11 @@ async fn targets_join_a_continuous_job_and_get_its_executions() {
 #[tokio::test]
 async fn the_total_number_of_targets_is_capped() {
     let emulator = Emulator::new();
+    // Every device the case names, including the ones the over-cap rows ask for: a job
+    // targets devices of this account.
+    for index in 0..MAX_JOB_TARGETS + 10 {
+        emulator.create_thing(&format!("laser-{index}")).await;
+    }
     let first = thing_arn("laser-0");
     emulator
         .create_job("cap", "capped", std::slice::from_ref(&first), Some("CONTINUOUS"))
@@ -354,12 +379,15 @@ async fn the_total_number_of_targets_is_capped() {
 #[tokio::test]
 async fn a_job_that_takes_no_further_targets_is_refused() {
     let emulator = Emulator::new();
+    for index in 1..=2 {
+        emulator.create_thing(&format!("laser-{index}")).await;
+    }
     let target = thing_arn("laser-1");
     let joining = vec![thing_arn("laser-2")];
 
     // A SNAPSHOT job is complete once the things it was created for are done, so nothing
-    // joins it later; a job whose creator named no selection says neither, and is
-    // refused for the same reason.
+    // joins it later; a job whose creator named no selection is such a snapshot job, and
+    // is refused for the same reason.
     emulator
         .create_job(
             "snapshot",
@@ -427,5 +455,108 @@ async fn a_job_that_takes_no_further_targets_is_refused() {
         "ResourceNotFoundException",
         "case a job the account does not hold: got {}",
         missing.text()
+    );
+}
+
+/// RULE: a thing target names a DEVICE OF THIS ACCOUNT, so an entry naming a `thingName`
+/// the registry does not hold is the modelled `ResourceNotFoundException` (404) stating
+/// the jobs plane's sentence for it, and the job keeps the targets it had. A list past
+/// the ceiling is still the `LimitExceededException`, since the size of the request is
+/// decided before any name is looked up.
+#[tokio::test]
+async fn a_target_naming_a_device_the_registry_does_not_hold_is_refused() {
+    let emulator = Emulator::new();
+    emulator.create_thing("laser-1").await;
+    let target = thing_arn("laser-1");
+    emulator
+        .create_job(
+            "registry",
+            "rolling",
+            std::slice::from_ref(&target),
+            Some("CONTINUOUS"),
+        )
+        .await;
+
+    // The rows span what the refused entry is: one unregistered device, a registered
+    // device beside an unregistered one, and the device the job already carries beside
+    // an unregistered one.
+    let rows: Vec<(&str, Vec<String>, &str)> = vec![
+        (
+            "one device the registry does not hold",
+            vec![thing_arn("laser-absent")],
+            "laser-absent",
+        ),
+        (
+            "a device the registry does not hold beside a registered one",
+            vec![thing_arn("laser-1"), thing_arn("laser-second-absent")],
+            "laser-second-absent",
+        ),
+        (
+            "two devices the registry does not hold",
+            vec![thing_arn("laser-absent-a"), thing_arn("laser-absent-b")],
+            // The walk refuses the FIRST entry that names no device.
+            "laser-absent-a",
+        ),
+    ];
+
+    for (label, add, named) in &rows {
+        let refused = emulator.associate("rolling", add).await;
+        assert_eq!(
+            refused.status,
+            404,
+            "case {label}: expected 404, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ResourceNotFoundException",
+            "case {label}: got {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.json()["message"],
+            json!(format!("Thing {named} cannot be found.")),
+            "case {label}: expected the refusal to name the thing, got {}",
+            refused.text()
+        );
+        // Nothing was written: not the job's targets, and not one device's execution.
+        let reported = emulator.describe_job("rolling").await.job_targets();
+        assert_eq!(
+            reported,
+            vec![target.clone()],
+            "case {label}: expected the job's targets unchanged, got {reported:?}"
+        );
+        for entry in add {
+            let thing_name = entry.rsplit('/').next().unwrap_or_default();
+            let expected = usize::from(thing_name == "laser-1");
+            assert_eq!(
+                emulator.executions_of("rolling", thing_name),
+                expected,
+                "case {label}: a refused association must queue nothing new for \
+                 {thing_name}"
+            );
+        }
+    }
+
+    // One target past the ceiling, every one of them a device the registry does not
+    // hold: the size of the list decides, so the answer is the 410 and not the 404.
+    let past_the_ceiling: Vec<String> = (0..=MAX_JOB_TARGETS)
+        .map(|index| thing_arn(&format!("laser-absent-{index}")))
+        .collect();
+    let refused = emulator.associate("rolling", &past_the_ceiling).await;
+    assert_eq!(
+        refused.status,
+        410,
+        "case a list past the ceiling of devices the registry does not hold: expected \
+         the modelled 410, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_code(),
+        "LimitExceededException",
+        "case a list past the ceiling of devices the registry does not hold: got {}",
+        refused.text()
     );
 }

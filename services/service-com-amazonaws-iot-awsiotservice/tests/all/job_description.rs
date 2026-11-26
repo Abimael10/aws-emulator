@@ -146,6 +146,13 @@ impl Emulator {
             .await
     }
 
+    /// `CreateThing`: `POST /things/{thingName}`. A job targets DEVICES of this account,
+    /// so every targeted thing is registered before the job that names it.
+    async fn create_thing(&self, thing_name: &str) -> Reply {
+        self.call("POST", &format!("/things/{thing_name}"), Some(&json!({})))
+            .await
+    }
+
     async fn describe_job(&self, job_id: &str) -> Reply {
         self.call("GET", &format!("/jobs/{job_id}"), None).await
     }
@@ -268,6 +275,14 @@ async fn a_created_job_reads_back_member_for_member() {
     ];
 
     for case in &cases {
+        for thing_name in &case.things {
+            let registered = emulator.create_thing(thing_name).await;
+            assert_eq!(
+                registered.status, 200,
+                "case {:?}: the targeted device {thing_name} must be registrable, got {} {:?}",
+                case.case, registered.status, registered.body
+            );
+        }
         let targets: Vec<String> = case.things.iter().map(|thing| thing_arn(thing)).collect();
         let mut request = json!({ "targets": targets });
         if let Some(description) = case.description {
@@ -354,9 +369,13 @@ async fn a_created_job_reads_back_member_for_member() {
             case.case,
             read.job()
         );
+        // "Specifies whether the job will continue to run (CONTINUOUS), or will be
+        // complete after all those things specified as targets have completed the job
+        // (SNAPSHOT)": a job is one or the other, so a create that named no selection
+        // reads back as the snapshot job it is.
         assert_eq!(
             read.text("/job/targetSelection").as_deref(),
-            case.target_selection,
+            Some(case.target_selection.unwrap_or("SNAPSHOT")),
             "case {:?}: expected the created targetSelection, got {:?}",
             case.case,
             read.job()
@@ -443,6 +462,7 @@ async fn a_created_job_reads_back_member_for_member() {
 async fn an_unknown_job_id_is_a_404() {
     let emulator = Emulator::new();
 
+    emulator.create_thing("device-a").await;
     let created = emulator
         .create_job(
             "job-that-exists",
@@ -657,6 +677,7 @@ async fn a_created_job_template_reads_back_member_for_member() {
                     document,
                     timeout_minutes,
                 } => {
+                    emulator.create_thing(thing_name).await;
                     let created = emulator
                         .create_job(
                             job_id,

@@ -118,6 +118,13 @@ impl Emulator {
             .await
     }
 
+    /// `CreateThing`: `POST /things/{thingName}`. A job targets DEVICES of this account,
+    /// so every targeted thing is registered before the job that names it.
+    async fn create_thing(&self, thing_name: &str) -> Reply {
+        self.call("POST", &format!("/things/{thing_name}"), Some(&json!({})))
+            .await
+    }
+
     /// `GetJobDocument` with the `beforeSubstitution` query parameter left out, which
     /// is the modelled default (`false`).
     async fn job_document(&self, job_id: &str) -> Reply {
@@ -291,6 +298,7 @@ async fn a_job_document_is_reported_in_the_view_the_request_selects() {
 
     for case in &cases {
         let thing_name = format!("device-for-{}", case.job_id);
+        emulator.create_thing(&thing_name).await;
         let mut request = json!({ "targets": [thing_arn(&thing_name)] });
         if let Some(document) = &case.document {
             request["document"] = json!(document);
@@ -360,6 +368,7 @@ async fn a_job_document_is_reported_in_the_view_the_request_selects() {
 async fn an_unknown_job_id_is_a_404_in_either_view() {
     let emulator = Emulator::new();
 
+    emulator.create_thing("device-a").await;
     let created = emulator
         .create_job(
             "job-that-exists",

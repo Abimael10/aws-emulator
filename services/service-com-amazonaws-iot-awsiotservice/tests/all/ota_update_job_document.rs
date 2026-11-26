@@ -1016,6 +1016,12 @@ async fn the_code_signing_material_a_file_carries_is_in_its_document_entry() {
     ];
 
     for case in &cases {
+        assert_eq!(
+            emulator.create_thing("doc-signing-sensor").await.status,
+            200,
+            "case {:?}: the targeted device must be registrable",
+            case.case
+        );
         let mut file = s3_file("firmware.bin", "firmware.bin");
         file["codeSigning"] = case.code_signing.clone();
         let request = json!({
@@ -1080,6 +1086,14 @@ async fn the_code_signing_material_a_file_carries_is_in_its_document_entry() {
 #[tokio::test]
 async fn a_generated_document_past_what_a_job_document_may_hold_is_refused() {
     let emulator = Emulator::new();
+
+    for thing_name in ["doc-sensor-large", "doc-sensor-oversized"] {
+        assert_eq!(
+            emulator.create_thing(thing_name).await.status,
+            200,
+            "the targeted device {thing_name} must be registrable"
+        );
+    }
 
     // `S3Key` is modelled with a minimum of 1 and NO maximum, so the key alone decides
     // how large the generated document grows.

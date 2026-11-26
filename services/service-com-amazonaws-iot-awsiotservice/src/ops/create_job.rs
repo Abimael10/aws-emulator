@@ -7,13 +7,17 @@
 //! Jobs data plane serves — so a device targeted by a job sees it on its very next
 //! `GetPendingJobExecutions` / `StartNextPendingJobExecution` poll. A target ARN that
 //! names another resource type (or a name outside the model's `ThingName`) is the
-//! modelled 400, a thing group the modelled 404 when the registry does not hold it
-//! and the modelled 400 when it does (a group's executions are its MEMBERS', and no
-//! membership is recorded while `AddThingToThingGroup` is a scaffold, so the group
-//! cannot be expanded and is never answered with a hollow 200), and a `jobId` already
-//! in use the modelled 409; nothing is written on any of them. A thing target is NOT
-//! resolved against the registry: an execution is keyed by the thing name, and this
-//! surface accepts a target that is not registered.
+//! modelled 400, a `thingName` or a thing group the registry does not hold the modelled
+//! 404, a dynamic thing group — whose devices are the things its query selects, which
+//! nothing here evaluates — the modelled 400, and a `jobId` already in use the modelled
+//! 409; nothing is written on any of them. A thing GROUP that holds no device is a
+//! target like any other: the job is created, and a continuous one reaches a device that
+//! joins the group later.
+//!
+//! `targetSelection` decides whether a job "will continue to run (CONTINUOUS), or will
+//! be complete after all those things specified as targets have completed the job
+//! (SNAPSHOT)" — a job is one or the other, so a create that names none records the
+//! snapshot selection and every reader of the job reports it.
 //!
 //! `targets` is modelled with a minimum and NO maximum, so the FAN-OUT of one request
 //! — the targets parsed, the execution records created and the copy of the document
@@ -307,8 +311,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // records it creates and the document each record carries — is capped before
         // any work proportional to it.
         let fanout = crate::state::resolve_job_targets(&input.targets).map_err(refused)?;
-        let mut targeted_things = fanout.things;
-        let targeted_groups = fanout.groups;
 
         // "The package version Amazon Resource Names (ARNs) that are installed on the
         // device when the job successfully completes": the association is what the
@@ -366,7 +368,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             document: input.document.clone(),
             document_source: input.document_source.clone(),
             targets: input.targets.clone(),
-            target_selection: input.target_selection.clone(),
+            // "Specifies whether the job will continue to run (CONTINUOUS), or will be
+            // complete after all those things specified as targets have completed the
+            // job (SNAPSHOT)": a job is one or the other, so a create that names no
+            // selection records the one a job that is complete when its targets are
+            // done carries — which is what every reader of the job then reports.
+            target_selection: Some(
+                input
+                    .target_selection
+                    .clone()
+                    .unwrap_or_else(|| crate::state::iot_jobs::TARGET_SELECTION_SNAPSHOT.to_string()),
+            ),
             in_progress_timeout_minutes: input
                 .timeout_config
                 .as_ref()
@@ -438,35 +450,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_JOBS
             )));
         }
-        // A group's executions are its MEMBERS' executions, so a group target is
-        // EXPANDED into the things the group holds
-        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::things_in_thing_group`]):
-        // one execution per member, and a member also named directly by the request
-        // still gets one execution. A group whose devices are not known — one the
-        // registry does not hold, or a dynamic group whose members are the things its
-        // query selects — is refused instead
-        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::thing_group_target_refusal`]),
-        // never answered with a 200 that reports a group-targeted job as dispatched
-        // while queueing nothing.
-        for group_name in &targeted_groups {
-            if let Some(refusal) = store.thing_group_target_refusal(group_name) {
-                return Err(refused(refusal));
-            }
-            for thing_name in store.things_in_thing_group(group_name) {
-                if !targeted_things.contains(&thing_name) {
-                    targeted_things.push(thing_name);
-                }
-            }
-        }
-        // The fan-out a group target adds is bounded by the same ceiling the request's
-        // own targets are: a job's executions are what one request may create.
-        if targeted_things.len() > crate::state::MAX_JOB_TARGETS {
-            return Err(over_limit(format!(
-                "a job may name at most {} targets, got {}",
-                crate::state::MAX_JOB_TARGETS,
-                targeted_things.len()
-            )));
-        }
+        // WHICH DEVICES the job runs on, resolved against the registry
+        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::job_target_devices`]): a
+        // thing target names one device of this account and a `thingName` the registry
+        // does not hold is the modelled 404, while a group target names the things the
+        // group holds — however many, including none. The fan-out a group adds is
+        // bounded by the same ceiling the request's own target list is.
+        let targeted_things = store.job_target_devices(&fanout).map_err(refused)?;
 
         // Targeting a thing with a job IS creating that thing's job execution: it is
         // QUEUED, at version 1, and carries the job's document and in-progress

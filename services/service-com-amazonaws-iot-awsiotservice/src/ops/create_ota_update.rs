@@ -318,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which DEVICES this update runs on: a thing target names one, a thing-group
         // target names its members. Resolved BEFORE any lock is taken, so a malformed
         // request never reaches the stores at all, and bounded before the walk.
-        let mut fanout = crate::state::resolve_job_targets(&input.targets).map_err(refused)?;
+        let fanout = crate::state::resolve_job_targets(&input.targets).map_err(refused)?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
@@ -416,33 +416,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_JOBS
             )));
         }
-        // A group's executions are its MEMBERS' executions, so a group target is
-        // EXPANDED into the things the group holds, exactly as `CreateJob` expands one:
-        // one execution per member, and a group whose devices are not known — one the
-        // registry does not hold, or a dynamic group whose members are the things its
-        // query selects — is refused instead
-        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::thing_group_target_refusal`]),
-        // never answered with a 200 that reports a group-targeted update as deployed
-        // while queueing nothing.
-        for group_name in &fanout.groups {
-            if let Some(refusal) = store.thing_group_target_refusal(group_name) {
-                return Err(refused(refusal));
-            }
-            for thing_name in store.things_in_thing_group(group_name) {
-                if !fanout.things.contains(&thing_name) {
-                    fanout.things.push(thing_name);
-                }
-            }
-        }
-        // The fan-out a group target adds is bounded by the same ceiling the request's
-        // own targets are: a deployment's executions are what one request may create.
-        if fanout.things.len() > crate::state::MAX_JOB_TARGETS {
-            return Err(over_limit(format!(
-                "an OTA update may name at most {} targets, got {}",
-                crate::state::MAX_JOB_TARGETS,
-                fanout.things.len()
-            )));
-        }
+        // WHICH DEVICES the deployment runs on, resolved against the registry exactly as
+        // `CreateJob` resolves one: a `thingName` the registry does not hold is the
+        // modelled 404, and a group target names the things the group holds — however
+        // many, including none. The fan-out a group adds is bounded by the same ceiling
+        // the request's own target list is.
+        let targeted_things = store.job_target_devices(&fanout).map_err(refused)?;
 
         let job = crate::state::RegisteredJob {
             description: ota_update.description.clone(),
@@ -452,7 +431,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             document: Some(job_document),
             document_source: None,
             targets: ota_update.targets.clone(),
-            target_selection: ota_update.target_selection.clone(),
+            // The selection the update was created with, or — for one that named none —
+            // the selection a job that is complete when its targets are done carries,
+            // the same default `CreateJob` records. This is the JOB's member: the update
+            // RECORD keeps `targetSelection` as the request supplied it, since what
+            // `GetOTAUpdate` reports of its own members is the update as written.
+            target_selection: Some(ota_update.target_selection.clone().unwrap_or_else(|| {
+                crate::state::iot_jobs::TARGET_SELECTION_SNAPSHOT.to_string()
+            })),
             in_progress_timeout_minutes,
             // An OTA update names no substitution parameters: `CreateOTAUpdate` models
             // no `documentParameters`, so the job it deploys carries none.
@@ -469,7 +455,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &job.job_id,
             job.document.as_deref(),
             in_progress_timeout_minutes,
-            &fanout.things,
+            &targeted_things,
             now_seconds,
         ) {
             return Err(over_limit(quota));

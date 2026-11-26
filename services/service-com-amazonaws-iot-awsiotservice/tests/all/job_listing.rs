@@ -20,8 +20,8 @@
 //! * `status` selects the jobs the listing reports in that status — the status its targets
 //!   have made of it and not only the one its own record carries — and a status no job is
 //!   in is an EMPTY list, not a refusal;
-//! * `targetSelection` selects the jobs created with that selection, and a job whose
-//!   creator named none is selected by neither value;
+//! * `targetSelection` selects the jobs reported with that selection, and a job whose
+//!   creator named none is selected as the snapshot job it was created as;
 //! * `thingGroupName` and `thingGroupId` each limit the listing to the jobs whose targets
 //!   name that group, and a group no job targets — or that the registry does not hold at
 //!   all — selects none;
@@ -420,7 +420,7 @@ async fn every_job_the_store_holds_is_listed_as_a_summary() {
         );
         assert_eq!(
             summary.get("targetSelection").and_then(Value::as_str),
-            row.target_selection,
+            Some(row.target_selection.unwrap_or("SNAPSHOT")),
             "case {:?}: expected the selection the create named, got {summary:?}",
             row.case
         );
@@ -591,8 +591,8 @@ async fn the_status_filter_selects_the_status_each_job_is_in() {
     );
 }
 
-/// RULE: `targetSelection` selects the jobs created with that selection, and a job whose
-/// creator named none is selected by neither value.
+/// RULE: `targetSelection` selects the jobs reported with that selection — including a
+/// job whose creator named none, which is the snapshot job it was created as.
 #[tokio::test]
 async fn the_target_selection_filter_selects_the_jobs_created_with_it() {
     let emulator = Emulator::new();
@@ -615,11 +615,13 @@ async fn the_target_selection_filter_selects_the_jobs_created_with_it() {
         let listed = emulator
             .list_with_query(&format!("?targetSelection={selection}"))
             .await;
-        let wanted: Vec<String> = jobs
+        let mut wanted: Vec<String> = jobs
             .iter()
-            .filter(|(_, created_with)| *created_with == Some(*selection))
+            .filter(|(_, created_with)| created_with.unwrap_or("SNAPSHOT") == *selection)
             .map(|(job_id, _)| (*job_id).to_string())
             .collect();
+        // The listing is in the store's `jobId` order, whatever order the creates were in.
+        wanted.sort();
         assert_eq!(
             (listed.status, listed.job_ids()),
             (200, wanted.clone()),

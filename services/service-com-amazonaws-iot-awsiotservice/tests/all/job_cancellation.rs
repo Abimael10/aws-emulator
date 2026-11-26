@@ -146,6 +146,13 @@ impl Emulator {
             .await
     }
 
+    /// `CreateThing`: `POST /things/{thingName}`. A job targets DEVICES of this account,
+    /// so every targeted thing is registered before the job that names it.
+    async fn create_thing(&self, thing_name: &str) -> Reply {
+        self.call("POST", &format!("/things/{thing_name}"), Some(&json!({})))
+            .await
+    }
+
     /// `CancelJob` for one job, with the `force` query and the body members the row asks
     /// for.
     async fn cancel_job(&self, job_id: &str, force: bool, body: &Value) -> Reply {
@@ -216,6 +223,14 @@ struct CancelCase {
 /// Create `job_id` targeting every device of `case`, then put each device's execution in
 /// the status the row says it is in when the cancel arrives.
 async fn seed(emulator: &Emulator, case: &CancelCase) {
+    for device in &case.devices {
+        let registered = emulator.create_thing(device.thing_name).await;
+        assert_eq!(
+            registered.status, 200,
+            "case {:?}: the targeted device {} must be registrable, got {} {:?}",
+            case.case, device.thing_name, registered.status, registered.body
+        );
+    }
     let targets: Vec<String> = case
         .devices
         .iter()

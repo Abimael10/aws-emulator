@@ -245,26 +245,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // A group target is EXPANDED into the things the group holds, exactly as the
-        // create expands one: a group the registry does not hold, or a dynamic group whose
-        // members are the things its query selects, is refused rather than answered with a
-        // 200 that reports group-targeted work as rolled out while queueing nothing.
-        let mut targeted_things = fanout.things.clone();
-        for group_name in &fanout.groups {
-            if let Some(refusal) = store.thing_group_target_refusal(group_name) {
-                return Err(refused(refusal));
-            }
-            for thing_name in store.things_in_thing_group(group_name) {
-                if !targeted_things.contains(&thing_name) {
-                    targeted_things.push(thing_name);
-                }
-            }
-        }
-
         // "The total number of targets associated with a job must not exceed 100": the
         // ceiling is on the targets the job ends up with, so a target it already carries
         // costs nothing and the refusal past the limit leaves the job's existing target
-        // list exactly as it was rather than truncating it.
+        // list exactly as it was rather than truncating it. It is decided from the
+        // request's own entries, before anything is looked up, so how much work the
+        // request asks for is bounded first.
         let mut targets = job.targets.clone();
         for target in &input.targets {
             if !targets.contains(target) {
@@ -272,11 +258,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if targets.len() > crate::state::MAX_JOB_TARGETS {
-            return Err(over_limit(format!(
-                "Target list exceeds size limit {}.",
-                crate::state::MAX_JOB_TARGETS
-            )));
+            return Err(over_limit(
+                crate::state::target_list_over_limit_message(),
+            ));
         }
+
+        // WHICH DEVICES the request points the job at, resolved against the registry
+        // exactly as the create resolves one: a `thingName` the registry does not hold is
+        // the modelled 404, and a group target names the things the group holds — however
+        // many, including none.
+        let targeted_things = store.job_target_devices(&fanout).map_err(refused)?;
 
         // Targeting a thing with a job IS creating that thing's job execution, so the
         // things newly named by this call get one — QUEUED, carrying the job's document

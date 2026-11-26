@@ -85,6 +85,22 @@ fn thing_arn(thing_name: &str) -> String {
 async fn the_refusal_names_the_job_and_its_target_selection() {
     let router = emulator();
 
+    // A job targets DEVICES of this account, so every device a case names is registered
+    // before the job that names it.
+    for index in 1..=4 {
+        let (status, answered) = call(
+            &router,
+            "POST",
+            &format!("/things/laser-{index}"),
+            Some(&json!({})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "registering laser-{index}: CreateThing must succeed, got {status} ({answered})"
+        );
+    }
+
     // (case, job id, the selection its create named, the selection the refusal must state)
     let refusing: [(&str, &str, Option<&str>, &str); 3] = [
         (

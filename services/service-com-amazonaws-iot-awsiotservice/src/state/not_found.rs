@@ -106,6 +106,17 @@ pub fn thing_write_not_found_message(thing_name: &str) -> String {
     format!("Thing {thing_name} not found.")
 }
 
+/// How the JOBS plane states that a `targets` entry names no thing this account holds.
+///
+/// A target is resolved by the plane that runs work on devices, so the miss is stated the
+/// way that plane states every other one ([`plane_not_found`]): the family noun, the name
+/// the target ARN carried, and the clause ` cannot be found.` — not the registry
+/// families' account-qualified sentence ([`missing_thing_message`]), which is what a READ
+/// of the thing record answers with.
+pub fn missing_job_target_thing_message(thing_name: &str) -> String {
+    plane_not_found("Thing", thing_name)
+}
+
 /// How this service states that a `thingGroupName` names no thing group this account
 /// holds — for a reader of one, a writer of one, and for a job whose target named it.
 pub fn missing_thing_group_message(thing_group_name: &str) -> String {

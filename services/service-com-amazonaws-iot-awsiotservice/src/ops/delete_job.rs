@@ -5,10 +5,12 @@
 //! Deletes the job and, with it, "its related job executions" — the records in the
 //! shared store the IoT Jobs data plane serves, so a device polling for a deleted job
 //! is told the execution is not found rather than being handed work that no longer
-//! exists. A job id the account does not hold is the modelled 404, and a job that
-//! still has an unfinished execution is the modelled 409 unless `force` is set, as
-//! `InvalidStateTransitionException` itself documents ("deleting a job or a job
-//! execution which is IN_PROGRESS without setting the force parameter").
+//! exists. A job id the account does not hold is the modelled 404, and a job that has
+//! not reached a terminal status ("COMPLETED" or "CANCELED") is the modelled 409 unless
+//! `force` is set, as `InvalidStateTransitionException` itself documents ("deleting a
+//! job or a job execution which is IN_PROGRESS without setting the force parameter").
+//! The refusal names the status the job is reported in, which is the reason it was
+//! refused.
 //!
 //! The documented "DELETION_IN_PROGRESS" window is not modelled: this emulator's
 //! delete is complete when it answers, so no later call can observe a job mid-delete
@@ -214,30 +216,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // LOCK ORDER: the shared jobs store first, the shared execution store second,
         // as `crate::state::job_store` documents.
         let mut registry = jobs.lock();
-        if !registry.contains(&input.job_id) {
-            return Err(DeleteJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::missing_job_message(&input.job_id)),
-                },
-            )
-            .into());
-        }
-
         let mut pending = executions.lock();
         // `force`: "When true, you can delete a job which is IN_PROGRESS. Otherwise,
-        // you can only delete a job which is in a terminal state ... or an exception
-        // will occur" — and `InvalidStateTransitionException` (409) is the exception
-        // the model names for "deleting a job ... which is IN_PROGRESS without
-        // setting the force parameter". A job is still running exactly while one of
-        // its executions has not finished.
-        let still_running = pending.pending_executions_of_job(&input.job_id);
-        if still_running > 0 && !input.force {
+        // you can only delete a job which is in a terminal state ("COMPLETED" or
+        // "CANCELED") or an exception will occur" — and
+        // `InvalidStateTransitionException` (409) is the exception the model names for
+        // "deleting a job ... which is IN_PROGRESS without setting the force
+        // parameter". What decides is the status the job is REPORTED in
+        // (`crate::state::job_progress`, which is what a reader of the job answers), so
+        // the refusal states that status and a client reads it out of the sentence.
+        let reported_status = {
+            let Some(job) = registry.job(&input.job_id) else {
+                return Err(DeleteJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_job_message(&input.job_id)),
+                    },
+                )
+                .into());
+            };
+            crate::state::job_progress(job, &pending).status
+        };
+        if !::service_common::iot_jobs::is_terminal_job_status(&reported_status) && !input.force {
             return Err(DeleteJobErrorModeled::InvalidStateTransitionException(
                 InvalidStateTransitionException {
-                    message: Some(format!(
-                        "Job {} has {still_running} job execution(s) that have not finished; \
-                         delete it with force to delete them too",
-                        input.job_id
+                    message: Some(crate::state::undeletable_job_status_message(
+                        &input.job_id,
+                        &reported_status,
                     )),
                 },
             )

@@ -1769,17 +1769,19 @@ pub struct JobTargetFanout {
 /// Resolve a request's `targets` into the devices and groups they name, or the reason
 /// they are no targets at all.
 ///
-/// A thing target is NOT resolved against the thing registry: an execution is keyed by
-/// the thing NAME, and this surface accepts a target that is not registered — the data
-/// plane then answers that name's queue reads from the execution the request creates.
+/// This is the registry-FREE half of the rule: it reads the ARNs the request carried
+/// and nothing of the account's state, so a malformed target is refused before any
+/// store is reached. Whether the names it yields are a thing and a thing group this
+/// account HOLDS is the other half
+/// ([`ComAmazonawsIotAwsiotserviceState::job_target_devices`]), which needs the store.
 /// The fan-out is bounded by [`MAX_JOB_TARGETS`] FIRST, before the parse walks the
 /// list, so the request cannot choose how much work the handler does.
 pub fn resolve_job_targets(targets: &[String]) -> Result<JobTargetFanout, JobTargetsRefusal> {
     let target_count = targets.len();
     if target_count > MAX_JOB_TARGETS {
-        return Err(JobTargetsRefusal::OverLimit(format!(
-            "a job may name at most {MAX_JOB_TARGETS} targets, got {target_count}"
-        )));
+        return Err(JobTargetsRefusal::OverLimit(
+            target_list_over_limit_message(),
+        ));
     }
 
     let mut fanout = JobTargetFanout::default();
@@ -1880,6 +1882,15 @@ pub const MAX_JOB_DOCUMENT_BYTES: usize = 32_768;
 /// the document a reader reports post-substitution and a device is handed.
 pub mod job_document;
 pub use job_document::{job_package_attributes, resolve_job_document};
+
+/// Which DEVICES a request's `targets` name once they are resolved against this
+/// account's registry, and how a target naming none is refused.
+pub mod job_targets;
+pub use job_targets::target_list_over_limit_message;
+
+/// When a job may be DELETED, and how a delete of one that may not be is refused.
+pub mod job_deletion;
+pub use job_deletion::undeletable_job_status_message;
 
 /// The ARN of a thing group: `arn:aws:iot:<region>:<account>:thinggroup/<thingGroupName>`.
 ///
@@ -3636,7 +3647,8 @@ pub use not_found::{
     missing_authorizer_message, missing_billing_group_message, missing_command_execution_message,
     missing_command_message, missing_fleet_metric_message, missing_job_execution_job_message,
     missing_job_execution_message, missing_job_message, missing_job_template_message,
-    missing_thing_group_message, missing_thing_message, missing_thing_type_message,
+    missing_job_target_thing_message, missing_thing_group_message, missing_thing_message,
+    missing_thing_type_message,
     tagged_thing_group_not_found_message, thing_write_not_found_message,
     unauthorized_topic_rule_message,
     unrecognized_index_name_message, unresolved_resource_message,

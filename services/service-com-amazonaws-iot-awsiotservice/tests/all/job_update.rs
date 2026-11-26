@@ -270,6 +270,13 @@ struct UpdateCase {
 
 /// Create the row's job with one targeted device, as a creator records it.
 async fn create(emulator: &Emulator, case: &UpdateCase) {
+    // A job targets a DEVICE of this account, so the thing is registered first.
+    let registered = emulator.create_thing(case.thing_name).await;
+    assert_eq!(
+        registered.status, 200,
+        "case {:?}: the targeted device must be registrable, got {} {:?}",
+        case.case, registered.status, registered.body
+    );
     let mut request = json!({
         "targets": [thing_arn(case.thing_name)],
         "document": r#"{"operation":"reboot"}"#,
@@ -700,6 +707,14 @@ async fn an_update_moves_only_the_members_it_names() {
     ];
 
     for form in &forms {
+        for thing_name in form.things {
+            let registered = emulator.create_thing(thing_name).await;
+            assert_eq!(
+                registered.status, 200,
+                "case {:?}: the targeted device {thing_name} must be registrable, got {} {:?}",
+                form.case, registered.status, registered.body
+            );
+        }
         let targets: Vec<String> = form.things.iter().map(|thing| thing_arn(thing)).collect();
         let mut request = json!({ "targets": targets });
         if let Some(target_selection) = form.target_selection {
@@ -874,6 +889,13 @@ async fn an_updated_timeout_reaches_every_unstarted_execution_of_that_job_alone(
     // The job under update: three devices named directly plus the group's two members,
     // so five executions nobody has started.
     let direct = ["timeout-device-1", "timeout-device-2", "timeout-device-3"];
+    for thing_name in direct {
+        assert_eq!(
+            emulator.create_thing(thing_name).await.status,
+            200,
+            "the thing {thing_name} must be creatable"
+        );
+    }
     let carrier_devices: Vec<String> = direct
         .iter()
         .map(|thing| (*thing).to_string())
@@ -1025,6 +1047,11 @@ async fn an_updated_timeout_reaches_every_unstarted_execution_of_that_job_alone(
 async fn successive_updates_accumulate_on_the_record() {
     let emulator = Emulator::new();
 
+    assert_eq!(
+        emulator.create_thing("sequence-device").await.status,
+        200,
+        "the targeted device must be creatable"
+    );
     assert_eq!(
         emulator
             .create_job(
