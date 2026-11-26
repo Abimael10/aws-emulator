@@ -16,25 +16,30 @@
 //!    constraint the framework cannot evaluate — else `InvalidArgsException`. Decided from
 //!    the request ALONE, so it is answered before this service reads any state and before
 //!    the owner of the instance is asked anything;
-//! 2. the request's credential is one the identity store holds as valid, else the modelled
+//! 2. the `AvailabilityZone`, when the request names one, NAMES an Availability Zone — a
+//!    zone name is `<region><letter>`, so the Region the name begins with either publishes
+//!    a zone with that letter or does not — else `InvalidArgsException` naming the zone
+//!    alone ([`crate::state::unrecognized_zone_message`]). Also decided from the request
+//!    ALONE, so it too is answered before anything about an instance is consulted;
+//! 3. the request's credential is one the identity store holds as valid, else the modelled
 //!    `AuthException` — a credential that is not valid speaks for no principal, so no policy
 //!    is consulted at all, and nothing is looked up for it either
 //!    ([`crate::state::authorization::authenticate`]);
-//! 3. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//! 4. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
 //!    no EC2 can be asked), resolved HERE rather than later because the instance's tags are
 //!    part of the condition context the next decision is taken in;
-//! 4. the caller's IAM identity-based policies allow
+//! 5. the caller's IAM identity-based policies allow
 //!    `ec2-instance-connect:SendSSHPublicKey` on the instance's ARN, else
 //!    `AccessDeniedException` (HTTP 403) — taken before anything about the instance is
 //!    REPORTED and before any key is stored, so a caller holding no grant learns nothing
 //!    about what the account holds ([`crate::state::authorization::withheld`]);
-//! 5. the instance EC2 was asked about exists, else `EC2InstanceNotFoundException`;
-//! 6. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//! 6. the instance EC2 was asked about exists, else `EC2InstanceNotFoundException`;
+//! 7. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 7. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
-//!    `InvalidArgsException`;
-//! 8. the key is stored against (instance id, OS user), replacing whatever was there and
+//! 8. the `AvailabilityZone` the caller named, which by then names a zone, is the
+//!    instance's, else `InvalidArgsException`;
+//! 9. the key is stored against (instance id, OS user), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
 //!
@@ -245,6 +250,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `AvailabilityZone` the caller named, when it names one, must NAME a zone: a
+        // zone name is `<region><letter>`, so whether it names a zone at all is decided from
+        // the REQUEST alone, like the OS user's pattern above, and the refusal names the
+        // zone alone — nothing about any instance is consulted to take it
+        // (`crate::state::unrecognized_zone_message`).
+        if let Some(message) = input
+            .availability_zone
+            .as_deref()
+            .and_then(crate::state::unrecognized_zone_message)
+        {
+            return Err(SendSSHPublicKeyErrorModeled::InvalidArgsException(
+                InvalidArgsException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SendSSHPublicKeyErrorModeled::ServiceException(ServiceException {
                 message: Some(
@@ -348,8 +371,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `AvailabilityZone` is optional (the service resolves the zone itself when it is
-        // absent), but a zone that is not the instance's is a parameter that is not valid:
-        // `InvalidArgsException`, HTTP 400.
+        // absent), and a value naming no zone at all was already refused for its name above.
+        // A value that DOES name a zone, but not the instance's, is likewise a parameter
+        // that is not valid: `InvalidArgsException`, HTTP 400.
         if let Some(zone) = input.availability_zone.as_deref() {
             if zone != instance.availability_zone {
                 return Err(SendSSHPublicKeyErrorModeled::InvalidArgsException(

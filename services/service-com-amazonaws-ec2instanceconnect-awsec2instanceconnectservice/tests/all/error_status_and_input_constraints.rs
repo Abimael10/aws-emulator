@@ -3,7 +3,7 @@
 //! How EC2 Instance Connect answers a FAILING call: with which HTTP status, with which
 //! modelled error type, and which requests it refuses before it looks at any state.
 //!
-//! Three rules are pinned here, each over a set of inputs rather than one request:
+//! Four rules are pinned here, each over a set of inputs rather than one request:
 //!
 //! 1. a client-side modelled error is served with HTTP 400 whatever `@httpError` its shape
 //!    carries, while a server-side one keeps the status the model gives it
@@ -14,7 +14,11 @@
 //!    validator cannot evaluate;
 //! 3. serial-console access is an account-level grant that starts absent, so a fresh
 //!    account's serial-console push is refused with `SerialConsoleAccessDisabledException`
-//!    before anything about the instance is reported.
+//!    before anything about the instance is reported;
+//! 4. an `AvailabilityZone` naming no Availability Zone — a letter the Region its name
+//!    begins with does not publish — is refused for the NAME, carrying the value and
+//!    nothing else, and only a value that does name a zone is compared with the zone the
+//!    instance was launched in (`state::unrecognized_zone_message`).
 //!
 //! Rule 2 is pinned twice: once on the ANSWER (the error type and the clause it carries) and
 //! once on the ORDER — `a_request_refused_from_its_own_values_asks_the_owner_of_the_instance_nothing`
@@ -832,5 +836,180 @@ async fn a_request_refused_from_its_own_values_asks_the_owner_of_the_instance_no
             "case {case:?}: expected {expected_stored} stored key(s), state holds {}",
             emulator.stored_key_count()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4: an `AvailabilityZone` that names no Availability Zone
+// ---------------------------------------------------------------------------
+//
+// A zone name is `<region><letter>`, so whether a value names a zone at all is decided from
+// the name: the Region it begins with either publishes a zone with that letter or does not.
+// A value that names none is refused for the NAME — the refusal carries that value and
+// nothing else, and nothing about any instance is consulted to take it. Only a value that
+// does name a zone is compared with the zone the instance was launched in.
+
+/// The `Message` of an error body, or `""` for a success.
+fn message_of(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A `SendSSHPublicKey` body naming `zone`.
+fn push_with_zone(zone: &str, key: &str) -> Value {
+    json!({
+        "InstanceId": INSTANCE_ID,
+        "InstanceOSUser": "ec2-user",
+        "SSHPublicKey": key,
+        "AvailabilityZone": zone,
+    })
+}
+
+#[tokio::test]
+async fn an_availability_zone_naming_no_zone_is_refused_for_the_name_alone() {
+    let key = ssh_key("unknown-zone");
+    // (the zone the request names, what the registry holds). Every zone here satisfies the
+    // modelled `AvailabilityZone` length and pattern, so the boundary validator admits it:
+    // what refuses it is that its Region publishes no zone with that letter. The published
+    // letters are `service_common::aws_availability_zones` (the `DescribeAvailabilityZones`
+    // answer for the Region): us-east-1 a–f, us-west-2 a–d, ap-northeast-1 a, c and d, every
+    // other Region a, b and c. Rows differ along what the rule generalises over: a letter
+    // past the end of a Region's list, a letter the Region skips, a letter beyond the default
+    // three, a two-letter suffix, a Region in another partition — and, because the refusal is
+    // taken from the request alone, what the registry holds for the id (a running instance, a
+    // stopped one, one still launching, nothing at all).
+    let rows: [(&str, Fixture); 9] = [
+        // Past the end of the four letters us-west-2 publishes.
+        ("us-west-2z", Fixture::RunningNitro),
+        ("us-west-2e", Fixture::RunningNitro),
+        // Past the end of the six us-east-1 publishes — the Region the instance sits in.
+        ("us-east-1g", Fixture::RunningNitro),
+        ("us-east-1z", Fixture::Stopped),
+        // The letter ap-northeast-1 skips: its zones are 1a, 1c and 1d.
+        ("ap-northeast-1b", Fixture::RunningNitro),
+        // Past the default three of a Region with no published list of its own.
+        ("eu-west-1d", Fixture::Pending),
+        ("ap-southeast-4f", Fixture::RunningNitro),
+        // A two-letter suffix, which no Region publishes.
+        ("us-east-1az", Fixture::RunningNitro),
+        // Another partition, past its three zones, for an id nothing is registered under.
+        ("us-gov-west-1d", Fixture::Unregistered),
+    ];
+
+    for (zone, fixture) in rows {
+        let case = format!("AvailabilityZone {zone:?} against {fixture:?}");
+        let emulator = Emulator::new();
+        fixture.register(&emulator);
+
+        let (capture, guard) = capture_events();
+        let (status, response) = emulator.call(SEND_SSH, &push_with_zone(zone, &key)).await;
+        drop(guard);
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} ({response})"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidArgsException",
+            "case {case:?}: expected InvalidArgsException, got {response}"
+        );
+        let message = message_of(&response);
+        assert_eq!(
+            message,
+            format!("Unrecognized zone {zone}"),
+            "case {case:?}: expected the refusal to name the zone alone, got {message:?}"
+        );
+        assert!(
+            !message.contains(INSTANCE_ID) && !message.contains("launched"),
+            "case {case:?}: the refusal is about the zone name, so it must report neither \
+             the instance nor the zone the instance was launched in, got {message:?}"
+        );
+        assert!(
+            !capture.asked_about(INSTANCE_ID),
+            "case {case:?}: a value that names no zone is decided from the request alone, so \
+             the owner of the instance must not be asked about {INSTANCE_ID}"
+        );
+        assert_eq!(
+            emulator.stored_key_count(),
+            0,
+            "case {case:?}: a refused push must store nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_availability_zone_that_names_a_zone_is_compared_with_the_instances_own() {
+    let key = ssh_key("known-zone");
+    // (the zone the request names, does it succeed). Every row names a zone its Region does
+    // publish, so none of them can earn the refusal above: the only question left is whether
+    // it is the zone the instance was launched in (us-east-1a). Rows differ along the Region
+    // the zone belongs to, its distance from the instance's own letter, a Region whose list
+    // skips a letter, and another partition.
+    let rows: [(&str, bool); 7] = [
+        ("us-east-1a", true),
+        ("us-east-1b", false),
+        ("us-east-1f", false),
+        ("us-west-2d", false),
+        ("ap-northeast-1c", false),
+        ("eu-west-1c", false),
+        ("us-gov-west-1a", false),
+    ];
+
+    for (zone, should_succeed) in rows {
+        let case = format!("AvailabilityZone {zone:?} against an instance in us-east-1a");
+        let emulator = Emulator::new();
+        Fixture::RunningNitro.register(&emulator);
+
+        let (status, response) = emulator.call(SEND_SSH, &push_with_zone(zone, &key)).await;
+        let message = message_of(&response);
+
+        if should_succeed {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the instance's own zone must be accepted, got {status} \
+                 ({response})"
+            );
+            let state = emulator.state();
+            let guard = state.lock();
+            let stored = guard
+                .active_ssh_key(INSTANCE_ID, "ec2-user", Instant::now())
+                .map(|stored| stored.public_key.clone());
+            assert_eq!(
+                stored.as_deref(),
+                Some(key.as_str()),
+                "case {case:?}: expected the key stored against the instance, got {stored:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} ({response})"
+            );
+            assert_eq!(
+                error_code(&response),
+                "InvalidArgsException",
+                "case {case:?}: expected InvalidArgsException, got {response}"
+            );
+            assert_ne!(
+                message,
+                format!("Unrecognized zone {zone}"),
+                "case {case:?}: the Region publishes this zone, so the refusal must be the \
+                 one for a zone that is not the instance's, got {message:?}"
+            );
+            assert!(
+                message.contains(INSTANCE_ID) && message.contains("us-east-1a"),
+                "case {case:?}: a zone that exists but is not the instance's is refused \
+                 against the instance, so the refusal names it and the zone it was launched \
+                 in, got {message:?}"
+            );
+            assert_eq!(
+                emulator.stored_key_count(),
+                0,
+                "case {case:?}: a refused push must store nothing"
+            );
+        }
     }
 }

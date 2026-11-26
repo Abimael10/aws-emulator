@@ -230,6 +230,28 @@ pub fn invalid_args_message(violations: &[Violation]) -> Option<String> {
     aws_smithy_schema_server::envelope(&stated)
 }
 
+/// The refusal text for an `AvailabilityZone` that names no Availability Zone, or `None`
+/// when the value does name one.
+///
+/// A zone name is `<region><letter>`, so whether a value names a zone at all is decided from
+/// the name itself: the Region it begins with either publishes a zone with that letter or
+/// does not ([`::service_common::aws_availability_zones::is_availability_zone`], the one
+/// published zone list the services in this workspace read). A value that names no zone is
+/// a parameter that is not valid, and the refusal is about the NAME — it says nothing about
+/// any instance, because nothing about an instance is consulted to take it. Only a value
+/// that does name a zone is then compared with the zone an instance was launched in.
+///
+/// The value is echoed verbatim; the member's `@length` (6..32) and `@pattern` are the
+/// model's and the boundary validator has already applied them, so what reaches here is a
+/// zone-shaped value of bounded length.
+pub fn unrecognized_zone_message(zone: &str) -> Option<String> {
+    if ::service_common::aws_availability_zones::is_availability_zone(zone) {
+        None
+    } else {
+        Some(format!("Unrecognized zone {zone}"))
+    }
+}
+
 /// A violation as this service states it: the framework's clause, with a `@pattern` named
 /// without the anchors that bracket it.
 ///
