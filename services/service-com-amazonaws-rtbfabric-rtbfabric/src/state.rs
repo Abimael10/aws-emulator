@@ -812,6 +812,24 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         Some(released)
     }
 
+    /// Release the inbound external link `link_id` on the responder gateway
+    /// `gateway_id`, exactly as
+    /// [`release_outbound_external_link`](Self::release_outbound_external_link)
+    /// releases the other direction's: the two directions are separate records of the
+    /// same kind, and what a link with one end outside the fabric holds does not
+    /// depend on which way its traffic flows.
+    pub fn release_inbound_external_link(
+        &mut self,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> Option<InboundExternalLink> {
+        let released = self
+            .inbound_external_links
+            .remove(&(gateway_id.to_string(), link_id.to_string()))?;
+        self.forget_released_client_tokens();
+        Some(released)
+    }
+
     /// Whether a LIVE link already joins these two gateways, in either
     /// orientation: a link is one record with two ends, readable and deletable
     /// from both, so the reverse create would be a second record for the same
