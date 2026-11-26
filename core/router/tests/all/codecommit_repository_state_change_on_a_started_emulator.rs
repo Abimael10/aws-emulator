@@ -25,6 +25,12 @@
 //! the accepted fast-forward that moves it, each read off the queue, and then the write
 //! refused for a parent the branch has moved past, whose silence is read against the
 //! accepted write that follows it.
+//!
+//! The whole scenario is one routine ([`reference_writes_reach_their_queue`]) parameterised
+//! over WHERE a client addresses its calls ([`Reached`]) and how long its receives wait, so
+//! a second addressing is a second row rather than a second copy: the sibling suite
+//! [`crate::codecommit_reference_event_reaches_a_client_pointed_at_the_emulator`] drives the
+//! same legs from the position an SDK configured with this emulator's `endpoint_url` is in.
 
 use std::time::{Duration, Instant};
 
@@ -46,46 +52,115 @@ const REFERENCE_UPDATED: &str = "referenceUpdated";
 const REFERENCE_TYPE_BRANCH: &str = "branch";
 const REFS_HEADS: &str = "refs/heads/";
 
+/// The instant no delivered envelope names: an envelope whose `time` opens with this is one
+/// whose publication instant was lost rather than carried, which a consumer filtering the
+/// events of its own run by `time` reads as an event from another era.
+const EPOCH_YEAR: &str = "1970";
+
 /// The service principal EventBridge delivers to a queue target as, which is what the
 /// queue's own resource policy has to allow.
 const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
 
-/// The repository, the branch and the file every leg writes.
+/// The repository, the branch and the file every leg writes, and the queue and rule the
+/// envelopes are read off.
 const REPOSITORY: &str = "started-emulator-reference-events";
 const BRANCH: &str = "main";
 const FILE: &str = "README.md";
+const QUEUE: &str = "started-emulator-codecommit-events";
+const RULE: &str = "started-emulator-codecommit-events";
 
-/// How long a leg waits for an envelope to arrive, and how often it looks.
-///
-/// Generous on purpose: the wait is on the ENVELOPE, looked for again until it is there, so
-/// a fast machine never waits the whole span and a loaded one is given room to spend.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(120);
+/// The two spans a receive may wait: "the duration (in seconds) for which the call waits for
+/// a message to arrive in the queue before returning. If a message is available, the call
+/// returns sooner" (`ReceiveMessageRequest$WaitTimeSeconds`, an integer from 0 to 20). A
+/// short poll answers with what the queue holds at that instant; a long poll is the wait a
+/// consumer of an event queue makes.
+pub(crate) const SHORT_POLL_SECONDS: u32 = 0;
+/// See [`SHORT_POLL_SECONDS`].
+pub(crate) const LONG_POLL_SECONDS: u32 = 5;
+
+/// The window a published envelope must ARRIVE inside, which is the limit these legs test:
+/// the published ceiling of the wait a consumer's own receive may ask for
+/// (`ReceiveMessageRequest$WaitTimeSeconds`, "an integer from 0 to 20"). An envelope that
+/// takes longer than one such poll is one a consumer polling the queue never sees, so a
+/// delivery that is merely SLOW fails these legs rather than passing them — while the wait
+/// is still on the ENVELOPE, looked for again until it is there, so a fast machine never
+/// spends the window and nothing here is asserted about how long a delivery took.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(20);
+/// How often a leg looks again inside [`DELIVERY_DEADLINE`].
 const LOOK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// WHERE a client addresses the emulator, which is the one thing the two suites driving
+/// these legs differ in.
+///
+/// A stock SDK resolving AWS's own names carries a service host; one configured with this
+/// emulator's `endpoint_url` carries the authority this process answers on, so every Region
+/// such a call decides comes from its SigV4 credential scope alone and every address the
+/// emulator mints for it — a queue url among them — is minted from that authority.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Reached {
+    /// `<signing name>.<region>.amazonaws.com`, as a client resolving AWS's names carries.
+    ServiceHost,
+    /// `127.0.0.1:<port>`, as a client handed this emulator's endpoint url carries.
+    EmulatorAuthority,
+}
 
 /// One `X-Amz-Target` RPC call over the started emulator's signed-call plumbing, with
 /// whatever status it answered.
 fn rpc(
     emulator: &Started,
+    reached: Reached,
     signing_name: &str,
     target: &str,
     content_type: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let (status, text) = emulator.rpc(signing_name, target, content_type, body);
+    let headers = [("content-type", content_type), ("x-amz-target", target)];
+    let sent = body.to_string().into_bytes();
+    let (status, text) = call(emulator, reached, signing_name, &headers, sent);
     let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     (status, parsed)
+}
+
+/// One signed call, addressed as `reached` says.
+fn call(
+    emulator: &Started,
+    reached: Reached,
+    signing_name: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> (u16, String) {
+    match reached {
+        Reached::ServiceHost => emulator.call(signing_name, "POST", "/", headers, body),
+        Reached::EmulatorAuthority => emulator
+            .call_at(
+                &emulator.authority(),
+                signing_name,
+                "POST",
+                "/",
+                headers,
+                body,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the emulator must answer {signing_name} at its own authority: {error}; \
+                     its log:\n{}",
+                    emulator.log()
+                )
+            }),
+    }
 }
 
 /// The same call, which must answer 200.
 fn ok(
     emulator: &Started,
     case: &str,
+    reached: Reached,
     signing_name: &str,
     target: &str,
     content_type: &str,
     body: &Value,
 ) -> Value {
-    let (status, parsed) = rpc(emulator, signing_name, target, content_type, body);
+    let (status, parsed) = rpc(emulator, reached, signing_name, target, content_type, body);
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from {target}, got {status} with {parsed}; the \
@@ -96,10 +171,17 @@ fn ok(
 }
 
 /// One CodeCommit call that must answer 200.
-fn codecommit(emulator: &Started, case: &str, operation: &str, body: &Value) -> Value {
+fn codecommit(
+    emulator: &Started,
+    case: &str,
+    reached: Reached,
+    operation: &str,
+    body: &Value,
+) -> Value {
     ok(
         emulator,
         case,
+        reached,
         "codecommit",
         &format!("CodeCommit_20150413.{operation}"),
         "application/x-amz-json-1.1",
@@ -108,10 +190,17 @@ fn codecommit(emulator: &Started, case: &str, operation: &str, body: &Value) -> 
 }
 
 /// One EventBridge call that must answer 200.
-fn events(emulator: &Started, case: &str, operation: &str, body: &Value) -> Value {
+fn events(
+    emulator: &Started,
+    case: &str,
+    reached: Reached,
+    operation: &str,
+    body: &Value,
+) -> Value {
     ok(
         emulator,
         case,
+        reached,
         "events",
         &format!("AWSEvents.{operation}"),
         "application/x-amz-json-1.1",
@@ -120,10 +209,17 @@ fn events(emulator: &Started, case: &str, operation: &str, body: &Value) -> Valu
 }
 
 /// One Amazon SQS call that must answer 200.
-fn sqs(emulator: &Started, case: &str, operation: &str, body: &Value) -> Value {
+fn sqs(
+    emulator: &Started,
+    case: &str,
+    reached: Reached,
+    operation: &str,
+    body: &Value,
+) -> Value {
     ok(
         emulator,
         case,
+        reached,
         "sqs",
         &format!("AmazonSQS.{operation}"),
         "application/x-amz-json-1.0",
@@ -134,6 +230,7 @@ fn sqs(emulator: &Started, case: &str, operation: &str, body: &Value) -> Value {
 /// A `PutFile` on `BRANCH`, with whatever status it answered.
 fn put_file(
     emulator: &Started,
+    reached: Reached,
     parent: Option<&str>,
     content: &str,
 ) -> (u16, Value) {
@@ -149,6 +246,7 @@ fn put_file(
     }
     rpc(
         emulator,
+        reached,
         "codecommit",
         "CodeCommit_20150413.PutFile",
         "application/x-amz-json-1.1",
@@ -160,10 +258,11 @@ fn put_file(
 fn accepted_put_file(
     emulator: &Started,
     case: &str,
+    reached: Reached,
     parent: Option<&str>,
     content: &str,
 ) -> String {
-    let (status, written) = put_file(emulator, parent, content);
+    let (status, written) = put_file(emulator, reached, parent, content);
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from PutFile, got {status} with {written}; the \
@@ -176,13 +275,15 @@ fn accepted_put_file(
         .to_string()
 }
 
-/// Every envelope waiting on the queue at `url`, deleting what it hands over.
-fn drain(emulator: &Started, case: &str, url: &str) -> Vec<Value> {
+/// Every envelope waiting on the queue at `url`, deleting what it hands over so a later look
+/// reads only what arrived since. The receive waits `wait` seconds for one to arrive.
+fn drain(emulator: &Started, case: &str, reached: Reached, url: &str, wait: u32) -> Vec<Value> {
     let received = sqs(
         emulator,
         case,
+        reached,
         "ReceiveMessage",
-        &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
+        &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10, "WaitTimeSeconds": wait }),
     );
     let messages = received["Messages"].as_array().cloned().unwrap_or_default();
     let mut envelopes = Vec::with_capacity(messages.len());
@@ -195,6 +296,7 @@ fn drain(emulator: &Started, case: &str, url: &str) -> Vec<Value> {
             sqs(
                 emulator,
                 case,
+                reached,
                 "DeleteMessage",
                 &json!({ "QueueUrl": url, "ReceiptHandle": handle }),
             );
@@ -203,11 +305,19 @@ fn drain(emulator: &Started, case: &str, url: &str) -> Vec<Value> {
     envelopes
 }
 
-/// Poll the queue at `url` until one envelope has arrived, failing the case at the deadline.
-fn delivered_one(emulator: &Started, case: &str, url: &str) -> Value {
+/// Poll the queue at `url` until ONE envelope has arrived, failing the case at the deadline —
+/// and failing it too when more than one did, since a write publishes exactly one event and
+/// every envelope a look hands over is deleted: a second one in the same batch is a
+/// publication this leg would otherwise discard unexamined.
+fn delivered_one(emulator: &Started, case: &str, reached: Reached, url: &str, wait: u32) -> Value {
     let giving_up_at = Instant::now() + DELIVERY_DEADLINE;
     loop {
-        let envelopes = drain(emulator, case, url);
+        let envelopes = drain(emulator, case, reached, url, wait);
+        assert!(
+            envelopes.len() <= 1,
+            "case {case:?}: expected one envelope on {url:?}, got {}: {envelopes:?}",
+            envelopes.len()
+        );
         if let Some(envelope) = envelopes.into_iter().next() {
             return envelope;
         }
@@ -221,41 +331,67 @@ fn delivered_one(emulator: &Started, case: &str, url: &str) -> Value {
     }
 }
 
+/// What the envelope of one write must say, read off this run's own calls.
+struct Published<'a> {
+    /// The ARN and the id `CreateRepository` reported for the repository the write was on.
+    repository_arn: &'a str,
+    repository_id: &'a str,
+    /// The account `sts:GetCallerIdentity` reported, and the ARN of the identity the writes
+    /// are signed with.
+    account: &'a str,
+    caller_arn: &'a str,
+    /// The class of the write, the commit the reference now points at, and the commit it
+    /// pointed at before where it had one.
+    event: &'a str,
+    commit_id: &'a str,
+    old_commit_id: Option<&'a str>,
+}
+
 /// Assert the envelope's own members and the `detail` members this suite reads.
-fn assert_envelope(
-    case: &str,
-    envelope: &Value,
-    repository_arn: &str,
-    event: &str,
-    commit_id: &str,
-    old_commit_id: Option<&str>,
-    caller_arn: &str,
-) {
+///
+/// Every expected value is one this run's own control-plane calls reported — the commit ids
+/// from each write's answer, the repository's ARN and id from `CreateRepository`, the account
+/// and caller from `sts:GetCallerIdentity` — so nothing here is asserted against a value the
+/// suite put there.
+fn assert_envelope(case: &str, envelope: &Value, published: &Published<'_>) {
     for (member, expected) in [
-        ("source", EVENT_SOURCE.to_string()),
-        ("detail-type", REPOSITORY_STATE_CHANGE.to_string()),
-        ("region", REGION.to_string()),
+        ("source", EVENT_SOURCE),
+        ("detail-type", REPOSITORY_STATE_CHANGE),
+        ("region", REGION),
+        ("account", published.account),
     ] {
         assert_eq!(
             envelope[member].as_str(),
-            Some(expected.as_str()),
+            Some(expected),
             "case {case:?}: {member} must be {expected:?}, got {envelope}"
         );
     }
+    // The envelope members a consumer reads to tell one delivery from another: the id the
+    // bus minted for this event, and the instant the write happened in.
+    assert!(
+        envelope["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "case {case:?}: the envelope must carry the id the bus minted, got {envelope}"
+    );
+    let time = envelope["time"].as_str().unwrap_or_default();
+    assert!(
+        !time.is_empty() && !time.starts_with(EPOCH_YEAR),
+        "case {case:?}: time must be the instant of the write, got {time:?} in {envelope}"
+    );
     assert_eq!(
         envelope["resources"],
-        json!([repository_arn]),
+        json!([published.repository_arn]),
         "case {case:?}: the repository ARN must be the one resource, got {envelope}"
     );
     let detail = &envelope["detail"];
     for (member, expected) in [
-        ("event", event.to_string()),
+        ("event", published.event.to_string()),
         ("referenceType", REFERENCE_TYPE_BRANCH.to_string()),
         ("referenceName", BRANCH.to_string()),
         ("referenceFullName", format!("{REFS_HEADS}{BRANCH}")),
-        ("commitId", commit_id.to_string()),
+        ("commitId", published.commit_id.to_string()),
         ("repositoryName", REPOSITORY.to_string()),
-        ("callerUserArn", caller_arn.to_string()),
+        ("repositoryId", published.repository_id.to_string()),
+        ("callerUserArn", published.caller_arn.to_string()),
     ] {
         assert_eq!(
             detail[member].as_str(),
@@ -265,22 +401,25 @@ fn assert_envelope(
     }
     assert_eq!(
         detail["oldCommitId"].as_str(),
-        old_commit_id,
-        "case {case:?}: detail.oldCommitId must be {old_commit_id:?}, got {envelope}"
+        published.old_commit_id,
+        "case {case:?}: detail.oldCommitId must be {:?}, got {envelope}",
+        published.old_commit_id
     );
 }
 
-/// RULE: on the emulator a client starts, an accepted CodeCommit write that moves a
-/// reference is published onto the default bus and delivered to the SQS target of a rule
-/// matching it, and a write refused for a stale parent publishes nothing.
-#[test]
-fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts() {
+/// Drive every leg of the rule on a freshly started emulator, with each call addressed as
+/// `reached` says and each receive waiting `wait` seconds.
+///
+/// The ONE place these legs are written, for the reason the module docs give: the two
+/// addressings a client can take are two rows of one scenario, not two suites.
+pub(crate) fn reference_writes_reach_their_queue(reached: Reached, wait: u32) {
     let setup = "the wiring on a started emulator";
     let emulator = Started::start();
 
     let created = codecommit(
         &emulator,
         setup,
+        reached,
         "CreateRepository",
         &json!({ "repositoryName": REPOSITORY }),
     );
@@ -288,12 +427,20 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
         .as_str()
         .unwrap_or_else(|| panic!("case {setup:?}: no repositoryMetadata.Arn in {created}"))
         .to_string();
+    let repository_id = created["repositoryMetadata"]["repositoryId"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {setup:?}: no repositoryMetadata.repositoryId in {created}")
+        })
+        .to_string();
 
+    // The queue url this client is HANDED is the one it then polls.
     let queue = sqs(
         &emulator,
         setup,
+        reached,
         "CreateQueue",
-        &json!({ "QueueName": "started-emulator-codecommit-events" }),
+        &json!({ "QueueName": QUEUE }),
     );
     let queue_url = queue["QueueUrl"]
         .as_str()
@@ -302,6 +449,7 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
     let attributes = sqs(
         &emulator,
         setup,
+        reached,
         "GetQueueAttributes",
         &json!({ "QueueUrl": &queue_url, "AttributeNames": ["QueueArn"] }),
     );
@@ -322,6 +470,7 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
     sqs(
         &emulator,
         setup,
+        reached,
         "SetQueueAttributes",
         &json!({ "QueueUrl": &queue_url, "Attributes": { "Policy": policy } }),
     );
@@ -334,9 +483,10 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
     events(
         &emulator,
         setup,
+        reached,
         "PutRule",
         &json!({
-            "Name": "started-emulator-codecommit-events",
+            "Name": RULE,
             "State": "ENABLED",
             "EventPattern": pattern.to_string(),
         }),
@@ -344,9 +494,10 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
     let targets = events(
         &emulator,
         setup,
+        reached,
         "PutTargets",
         &json!({
-            "Rule": "started-emulator-codecommit-events",
+            "Rule": RULE,
             "Targets": [{ "Id": "sqs-target", "Arn": &queue_arn }],
         }),
     );
@@ -356,46 +507,68 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
         "case {setup:?}: PutTargets reported a failed entry: {targets}"
     );
 
-    // The identity the events must name as the one whose call moved the reference.
-    let (status, identity) = emulator.form_call("sts", "2011-06-15", "GetCallerIdentity", &[]);
+    // The identity the events must name as the one whose call moved the reference, and the
+    // account the envelope must name as the one it was published in.
+    let (status, identity) = call(
+        &emulator,
+        reached,
+        "sts",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        b"Action=GetCallerIdentity&Version=2011-06-15".to_vec(),
+    );
     assert_eq!(
         status, 200,
         "case {setup:?}: expected HTTP 200 from STS GetCallerIdentity, got {status} with \
          {identity}"
     );
     let caller = element(&identity, "Arn");
+    let account = element(&identity, "Account");
 
     // The branch-creating write: the positive control for the whole chain.
     let created_case = "the write that creates the branch";
-    let seed = accepted_put_file(&emulator, created_case, None, "seed\n");
-    let envelope = delivered_one(&emulator, created_case, &queue_url);
+    let seed = accepted_put_file(&emulator, created_case, reached, None, "seed\n");
+    let envelope = delivered_one(&emulator, created_case, reached, &queue_url, wait);
     assert_envelope(
         created_case,
         &envelope,
-        &repository_arn,
-        REFERENCE_CREATED,
-        &seed,
-        None,
-        &caller,
+        &Published {
+            repository_arn: &repository_arn,
+            repository_id: &repository_id,
+            account: &account,
+            caller_arn: &caller,
+            event: REFERENCE_CREATED,
+            commit_id: &seed,
+            old_commit_id: None,
+        },
     );
 
     // A fast-forward write, which moves the reference it already held.
     let updated_case = "a fast-forward write that moves the branch";
-    let tip = accepted_put_file(&emulator, updated_case, Some(&seed), "the current tip\n");
-    let envelope = delivered_one(&emulator, updated_case, &queue_url);
+    let tip = accepted_put_file(
+        &emulator,
+        updated_case,
+        reached,
+        Some(&seed),
+        "the current tip\n",
+    );
+    let envelope = delivered_one(&emulator, updated_case, reached, &queue_url, wait);
     assert_envelope(
         updated_case,
         &envelope,
-        &repository_arn,
-        REFERENCE_UPDATED,
-        &tip,
-        Some(&seed),
-        &caller,
+        &Published {
+            repository_arn: &repository_arn,
+            repository_id: &repository_id,
+            account: &account,
+            caller_arn: &caller,
+            event: REFERENCE_UPDATED,
+            commit_id: &tip,
+            old_commit_id: Some(&seed),
+        },
     );
 
     // A write naming the parent the branch has already left behind is refused.
     let refused_case = "a write naming a parent the branch has moved past";
-    let (status, refused) = put_file(&emulator, Some(&seed), "content offered twice\n");
+    let (status, refused) = put_file(&emulator, reached, Some(&seed), "content offered twice\n");
     assert_eq!(
         status, 400,
         "case {refused_case:?}: a stale parentCommitId must be refused, got {status} with \
@@ -415,22 +588,35 @@ fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts(
     let released = accepted_put_file(
         &emulator,
         released_case,
+        reached,
         Some(&tip),
         "content offered twice\n",
     );
-    let envelope = delivered_one(&emulator, released_case, &queue_url);
+    let envelope = delivered_one(&emulator, released_case, reached, &queue_url, wait);
     assert_envelope(
         released_case,
         &envelope,
-        &repository_arn,
-        REFERENCE_UPDATED,
-        &released,
-        Some(&tip),
-        &caller,
+        &Published {
+            repository_arn: &repository_arn,
+            repository_id: &repository_id,
+            account: &account,
+            caller_arn: &caller,
+            event: REFERENCE_UPDATED,
+            commit_id: &released,
+            old_commit_id: Some(&tip),
+        },
     );
-    let nothing = drain(&emulator, refused_case, &queue_url);
+    let nothing = drain(&emulator, refused_case, reached, &queue_url, wait);
     assert!(
         nothing.is_empty(),
         "case {refused_case:?}: the refused write must publish nothing, got {nothing:?}"
     );
+}
+
+/// RULE: on the emulator a client starts, an accepted CodeCommit write that moves a
+/// reference is published onto the default bus and delivered to the SQS target of a rule
+/// matching it, and a write refused for a stale parent publishes nothing.
+#[test]
+fn a_reference_write_publishes_its_state_change_on_the_emulator_a_client_starts() {
+    reference_writes_reach_their_queue(Reached::ServiceHost, SHORT_POLL_SECONDS);
 }
