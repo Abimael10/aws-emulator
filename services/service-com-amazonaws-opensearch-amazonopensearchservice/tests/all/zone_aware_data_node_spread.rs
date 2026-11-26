@@ -13,12 +13,13 @@
 //! Availability Zones are enabled" and `ClusterConfig$InstanceCount` is the "number of data
 //! nodes in the cluster" (`smithy_query(query="shape",shape="ClusterConfig")`), with
 //! `ZoneAwarenessConfig$AvailabilityZoneCount` publishing "valid values are `2` and `3`" —
-//! so a zone-aware cluster runs a WHOLE NUMBER of data nodes per zone, and one that does not
-//! is refused with the modelled `ValidationException` (HTTP 400) stating the STEP such a
-//! deployment's node count goes up in — the one requirement every admissible count satisfies,
-//! whether the count sent is below one node per zone or between two steps — except for a
-//! cluster asking for a standby zone, which is held to the requirement that deployment is
-//! published with, stating the rule and interpolating nothing.
+//! so a zone-aware cluster runs at least one data node in EACH of its zones and a WHOLE
+//! NUMBER of them per zone, and one that does not is refused with the modelled
+//! `ValidationException` (HTTP 400) stating the requirement the count breaks: the FLOOR,
+//! for a count below one node per zone (a minimum of as many data nodes as zones), and
+//! otherwise the STEP such a deployment's node count goes up in — except for a cluster
+//! asking for a standby zone, which is held to the requirement that deployment is published
+//! with, stating the rule and interpolating nothing.
 //!
 //! So the assertions span a SET of inputs rather than one: both supported zone counts, named
 //! and defaulted, at counts below one node per zone and off the step, with and without a
@@ -52,10 +53,13 @@ fn domain_name(prefix: &str, row: usize) -> String {
 /// requirement it breaks is stated in.
 ///
 /// Spans both supported zone counts (named, and the smaller one left to the service's
-/// default), counts below one node per zone and counts off the step, and a standby
-/// deployment — whose own published requirement states the rule rather than the zone count.
+/// default), counts below one node per zone and counts off the step — the two requirements
+/// the service words separately — and a standby deployment, whose own published requirement
+/// states the rule rather than the zone count.
 fn refused_clusters() -> Vec<(&'static str, Value, String)> {
-    let step = |requirement: &str, zones_word: &str| {
+    // The two sentences: `requirement` is the floor one deployment's count broke ("a minimum
+    // of <zones>") or the step it is off ("an even number of" / "a multiple of three").
+    let sentence = |requirement: &str, zones_word: &str| {
         format!(
             "You must choose {requirement} data nodes for a {zones_word} Availability Zone \
              deployment"
@@ -81,37 +85,37 @@ fn refused_clusters() -> Vec<(&'static str, Value, String)> {
         (
             "two named zones, one node — below one node per zone",
             two_zones(1),
-            step("an even number of", "two"),
+            sentence("a minimum of two", "two"),
         ),
         (
             "two named zones, three nodes — off the step",
             two_zones(3),
-            step("an even number of", "two"),
+            sentence("an even number of", "two"),
         ),
         (
             "two named zones, nine nodes — off the step",
             two_zones(9),
-            step("an even number of", "two"),
+            sentence("an even number of", "two"),
         ),
         (
             "three zones, one node — below one node per zone",
             three_zones(1),
-            step("a multiple of three", "three"),
+            sentence("a minimum of three", "three"),
         ),
         (
             "three zones, two nodes — below one node per zone",
             three_zones(2),
-            step("a multiple of three", "three"),
+            sentence("a minimum of three", "three"),
         ),
         (
             "three zones, four nodes — off the step",
             three_zones(4),
-            step("a multiple of three", "three"),
+            sentence("a multiple of three", "three"),
         ),
         (
             "three zones, eight nodes — off the step",
             three_zones(8),
-            step("a multiple of three", "three"),
+            sentence("a multiple of three", "three"),
         ),
         (
             "zone awareness with no zone count named, one node",
@@ -120,7 +124,7 @@ fn refused_clusters() -> Vec<(&'static str, Value, String)> {
                 "InstanceCount": 1,
                 "ZoneAwarenessEnabled": true,
             }),
-            step("an even number of", "two"),
+            sentence("a minimum of two", "two"),
         ),
         (
             "zone awareness with no zone count named, seven nodes",
@@ -129,7 +133,7 @@ fn refused_clusters() -> Vec<(&'static str, Value, String)> {
                 "InstanceCount": 7,
                 "ZoneAwarenessEnabled": true,
             }),
-            step("an even number of", "two"),
+            sentence("an even number of", "two"),
         ),
         (
             "a standby deployment with a single data node",
@@ -303,8 +307,8 @@ async fn an_update_is_held_to_the_same_rules_and_keeps_the_stored_cluster() {
         // judged on the MERGED record, which keeps the zone count the domain already
         // carries, so such a row would be judged against that stored count rather than
         // against the service's default. The rows that name their zone count state the
-        // whole placement the update would leave behind, and each of the two sentences is
-        // represented among them.
+        // whole placement the update would leave behind, and each of the sentences this
+        // class states is represented among them.
         .filter(|(_, cluster, _)| cluster.get("ZoneAwarenessConfig").is_some())
         .enumerate()
     {

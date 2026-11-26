@@ -1747,10 +1747,9 @@ pub fn data_node_count_refusal(cluster: Option<&ClusterConfig>) -> Option<Valida
 /// such a deployment takes.
 ///
 /// Each entry carries the count, that count as a word, and the STEP the node count of a
-/// deployment in that many zones goes up in — the ONE requirement every node count such a
-/// deployment admits satisfies, which is what a count outside it is refused with
-/// ([`zone_awareness_refusal`]), whether that count is below one node per zone or between
-/// two steps.
+/// deployment in that many zones goes up in — the requirement a count BETWEEN two steps
+/// breaks ([`zone_awareness_refusal`]), which the service words separately from the FLOOR a
+/// count below one node per zone breaks.
 const ZONE_COUNT_WORDS: [(i32, &str, &str); 2] =
     [(2, "two", "an even number of"), (3, "three", "a multiple of three")];
 
@@ -1821,14 +1820,15 @@ pub fn zone_count_refusal(cluster: Option<&ClusterConfig>) -> Option<ValidationE
 ///
 /// `ClusterConfig$ZoneAwarenessEnabled` "indicates whether multiple Availability Zones are
 /// enabled", and the service spreads the cluster's data nodes EVENLY across those zones
-/// ([`super::nodes_per_zone`]) — so a zone-aware cluster runs a whole number of data nodes
-/// per zone, and one that does not describes a deployment the service cannot provision. The
-/// request is refused rather than stored, stating the ONE requirement such a count is
-/// outside of: the STEP the node count of a deployment in that many zones goes up in
-/// ([`ZONE_COUNT_WORDS`]), which a count below one node per zone misses exactly as a count
-/// between two steps does — the sentence tells the caller what any admissible count is, and
-/// there is no second rule to state. It names the zone count in words, as the service states
-/// it.
+/// ([`super::nodes_per_zone`]) — so a zone-aware cluster runs at least ONE data node in each
+/// of its zones and a whole number of them per zone, and one that does not describes a
+/// deployment the service cannot provision. The request is refused rather than stored,
+/// stating the requirement the count breaks, which the service words as TWO requirements:
+/// a count below one node per zone misses the FLOOR such a deployment has (a minimum of as
+/// many data nodes as it has zones), and a count at or above that floor which does not
+/// divide by the zone count is off the STEP it goes up in ([`ZONE_COUNT_WORDS`]). Either
+/// sentence names the zone count in words, as the service states it, and interpolates
+/// nothing of the request.
 ///
 /// `InstanceCount` is "number of data nodes in the cluster", so it is the count judged.
 /// `None` for a cluster that asks for no zone awareness (one zone holds any number of
@@ -1851,9 +1851,16 @@ pub fn zone_awareness_refusal(cluster: Option<&ClusterConfig>) -> Option<Validat
     let (_, zones_word, step) = ZONE_COUNT_WORDS
         .into_iter()
         .find(|(count, _, _)| *count == zones)?;
+    // Which of the two requirements this count breaks: the floor, for a deployment asked
+    // for with fewer data nodes than it has zones, and otherwise the step.
+    let requirement = if nodes < zones {
+        format!("a minimum of {zones_word}")
+    } else {
+        step.to_string()
+    };
     Some(ValidationException {
         message: Some(format!(
-            "You must choose {step} data nodes for a {zones_word} Availability Zone \
+            "You must choose {requirement} data nodes for a {zones_word} Availability Zone \
              deployment"
         )),
     })

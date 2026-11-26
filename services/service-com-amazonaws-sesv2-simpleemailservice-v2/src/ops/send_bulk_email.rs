@@ -283,9 +283,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against anything the account holds: the addresses the request names, the headers,
         // the tags and the attachments the one template states for every message of this
         // call ([`crate::state::send_validation`]). What ONE ENTRY states for itself — the
-        // headers and the tags of its own message — is read AFTER the gates on sending below
-        // ([`entry_members_defect`]), because the identity a call sends from is weighed before
-        // anything an individual entry carries.
+        // headers and the tags of its own message — is read the same way, once the call is
+        // known to have a message to compose at all ([`validate_entry_members`]).
         validate_request(&input, template)?;
 
         if template
@@ -352,6 +351,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             });
         }
+
+        // The headers and the tags ONE entry states for its own message: part of the
+        // request's own FORM, refused whole rather than reported as that entry's result
+        // ([`validate_entry_members`]) — and read before anything the account holds, like
+        // every other reading of the request's form, so a call stating a header SES writes
+        // itself is told so whatever state the account and its identities are in. A call
+        // with no message to compose at all was already settled on its entries above, so
+        // nothing is read for one.
+        validate_entry_members(&input)?;
 
         // The recipients the messages of this call address, read BEFORE the store is locked
         // and BOUNDED by what the request may send: only an entry that has a message to
@@ -483,11 +491,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
-
-            // The headers and the tags ONE entry states for its own message: part of the
-            // request's own form, refused whole rather than reported as that entry's result
-            // ([`entry_members_defect`]), and read once the call has an identity to send as.
-            validate_entry_members(&input)?;
 
             // The template every message of this call is rendered from, read back out of
             // the account's template store: a resource of the account, resolved for the
@@ -1034,9 +1037,10 @@ fn entry_tags(entry: &BulkEmailEntry, default_tags: &[MessageTag]) -> Vec<(Strin
 /// The same stage a single send runs ([`crate::state::send_validation`]), over what this
 /// request states for EVERY message it sends: the addresses it names, and the headers, the
 /// tags and the attachments its one template carries. What ONE ENTRY states for its own
-/// message is read after the gates on sending ([`validate_entry_members`]), and the
-/// DESTINATION one addresses is read per entry instead ([`entry_defect`]), because a defect
-/// there is reported in that destination's own result rather than failing the call.
+/// message is read by [`validate_entry_members`], once the call is known to have a message
+/// to compose, and the DESTINATION one addresses is read per entry instead ([`entry_defect`]),
+/// because a defect there is reported in that destination's own result rather than failing
+/// the call.
 fn validate_request(
     input: &SendBulkEmailInput,
     template: &Template,
@@ -1097,11 +1101,12 @@ fn validate_request(
 /// reporting it as that entry's result. What is read per entry is the DESTINATION it addresses
 /// ([`entry_defect`]).
 ///
-/// Read AFTER the gates on sending (the handler): a call that has a message to compose is
-/// weighed against the account's ability to send and against the identity it sends from
-/// before anything one of its entries carries is read, which is the order Amazon SES is
-/// recorded answering in. A call with no message to compose at all never reaches this stage:
-/// it is settled on its entries' own destinations ([`entry_defect`]).
+/// Read BEFORE anything the account holds, as every other reading of the request's form is:
+/// SES is recorded refusing a call whose entry states a header it writes itself with that
+/// header's own refusal even where the identity the call would send from is not one the
+/// account has verified, so the form is settled ahead of the gates on sending. A call with no
+/// message to compose at all never reaches this stage: it is settled on its entries' own
+/// destinations ([`entry_defect`]).
 fn validate_entry_members(input: &SendBulkEmailInput) -> Result<(), SendBulkEmailError> {
     for entry in &input.bulk_email_entries {
         if let Some(defect) = crate::state::send_validation::headers_defect(

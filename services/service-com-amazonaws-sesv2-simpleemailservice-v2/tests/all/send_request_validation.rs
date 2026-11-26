@@ -1119,21 +1119,27 @@ async fn a_bulk_entry_that_addresses_nobody_is_reported_in_its_own_result() {
 }
 
 #[tokio::test]
-async fn the_identity_a_bulk_send_sends_from_is_weighed_before_an_entrys_own_members() {
-    // The gates on the REQUEST — the account's ability to send, the configuration set it
-    // names and the identity every message of the call is sent FROM — are weighed for every
-    // call that HAS a message to compose, whatever else its entries carry: such a call is
-    // refused WHOLE, rather than reported entry by entry, even when what the entries state
-    // for their own messages could not have been sent either. The rows span what the entries
-    // of such a call can be: one carrying a header the service writes itself, one carrying a
-    // tag name no tag may take, a well-formed entry, and a well-formed entry beside one that
-    // addresses nobody — and a template name the account holds nothing under, so no row is
-    // answered by a lookup instead. Every recipient here is the mailbox simulator's, which
-    // belongs to no account and needs no identity, so the one identity the refusal names is
-    // the sender the call states. A call whose EVERY entry addresses nobody has no message to
-    // compose at all and is settled on its entries instead
+async fn what_a_bulk_entry_states_for_its_own_message_is_read_before_the_identity_gate() {
+    // What an ENTRY states for its own message — the headers and the tags of that message —
+    // is part of the request's own FORM, so it is read before anything the account holds,
+    // like every other reading of the request's form: a call stating a header the service
+    // writes itself is told so even though the identity it would have sent from is not one
+    // this account has verified. A call whose entries state nothing of the kind reaches the
+    // gates on sending and is refused WHOLE for the identity instead, rather than reported
+    // entry by entry. The rows span both: an entry carrying a header the service writes
+    // itself, one carrying a tag name no tag may take, a well-formed entry, a well-formed
+    // entry beside one that addresses nobody, and a template name the account holds nothing
+    // under — so no row is answered by a lookup instead. Every recipient here is the mailbox
+    // simulator's, which belongs to no account and needs no identity, so the one identity a
+    // refusal names is the sender the call states. A call whose EVERY entry addresses nobody
+    // has no message to compose at all and is settled on its entries instead
     // (`tests/all/bulk_send_settled_on_its_entries.rs`).
-    let rows: Vec<(&str, Value, Vec<Value>)> = vec![
+    let unverified_sender = format!(
+        "Email address is not verified. The following identities failed the check in \
+         region {}: {UNVERIFIED}",
+        HOME.to_uppercase()
+    );
+    let rows: Vec<(&str, Value, Vec<Value>, &str, String)> = vec![
         (
             "an entry stating a header the service writes itself",
             json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
@@ -1141,6 +1147,8 @@ async fn the_identity_a_bulk_send_sends_from_is_weighed_before_an_entrys_own_mem
                 "Destination": {"ToAddresses": [SIMULATOR]},
                 "ReplacementHeaders": [{"Name": "From", "Value": "someone@example.net"}],
             })],
+            "BadRequestException",
+            "Header <From> is not supported".to_string(),
         ),
         (
             "an entry stating a tag name no tag may take",
@@ -1149,11 +1157,17 @@ async fn the_identity_a_bulk_send_sends_from_is_weighed_before_an_entrys_own_mem
                 "Destination": {"ToAddresses": [SIMULATOR]},
                 "ReplacementTags": [{"Name": "not a tag", "Value": "v"}],
             })],
+            "BadRequestException",
+            "Invalid tag name <not a tag>: only alphanumeric ASCII characters, '_',  '-' \
+             are allowed."
+                .to_string(),
         ),
         (
             "a well-formed entry",
             json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
             vec![json!({"Destination": {"ToAddresses": [SIMULATOR]}})],
+            "MessageRejected",
+            unverified_sender.clone(),
         ),
         (
             "a well-formed entry beside one that addresses nobody",
@@ -1162,15 +1176,19 @@ async fn the_identity_a_bulk_send_sends_from_is_weighed_before_an_entrys_own_mem
                 json!({"Destination": {}}),
                 json!({"Destination": {"ToAddresses": [SIMULATOR]}}),
             ],
+            "MessageRejected",
+            unverified_sender.clone(),
         ),
         (
             "a well-formed entry through a template the account holds nothing under",
             json!({"TemplateName": "no-such-template", "TemplateData": DATA}),
             vec![json!({"Destination": {"ToAddresses": [SIMULATOR]}})],
+            "MessageRejected",
+            unverified_sender.clone(),
         ),
     ];
 
-    for (case, template, entries) in rows {
+    for (case, template, entries, code, message) in rows {
         let ses = verified().await;
         let created = ses.create_template().await;
         assert_eq!(
@@ -1181,20 +1199,15 @@ async fn the_identity_a_bulk_send_sends_from_is_weighed_before_an_entrys_own_mem
         let reply = ses.send_bulk(bulk(UNVERIFIED, template, entries)).await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
-            (400, "MessageRejected"),
-            "case {case:?}: expected the identity gate to refuse the whole call, got {} {:?}",
+            (400, code),
+            "case {case:?}: expected the call to be refused {code}, got {} {:?}",
             reply.status,
             reply.body
         );
-        let expected = format!(
-            "Email address is not verified. The following identities failed the check in \
-             region {}: {UNVERIFIED}",
-            HOME.to_uppercase()
-        );
         assert_eq!(
             reply.message(),
-            expected,
-            "case {case:?}: expected the message {expected:?}, got {:?}",
+            message,
+            "case {case:?}: expected the message {message:?}, got {:?}",
             reply.message()
         );
     }

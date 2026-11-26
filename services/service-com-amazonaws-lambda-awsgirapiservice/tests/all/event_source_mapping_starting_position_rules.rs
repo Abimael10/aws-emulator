@@ -6,13 +6,13 @@
 //!
 //! Two rules under test:
 //!
-//! 1. The operation is ACCEPTED rather than applied — it answers 202 — so the mapping it
-//!    answers with is the one being stood up: `State` is `Creating` whichever polling
-//!    setting the request stated, and the move to the terminal state that setting asks for
-//!    ("When true, the event source mapping is active. When false, Lambda pauses polling
-//!    and invocation. Default: True") is owed by the clock afterwards. The rows differ
-//!    along how `Enabled` is stated (omitted, `true`, `false`) and which event source the
-//!    mapping polls.
+//! 1. The operation is ACCEPTED rather than applied — it answers 202 — so a mapping asked
+//!    to be ACTIVE is the one being stood up: `State` is `Creating`, and the move to
+//!    `Enabled` ("When true, the event source mapping is active. When false, Lambda pauses
+//!    polling and invocation. Default: True") is owed by the clock afterwards. A mapping
+//!    asked for with polling PAUSED polls nothing, so nothing is stood up for it and it is
+//!    created in the terminal `Disabled` at once. The rows differ along how `Enabled` is
+//!    stated (omitted, `true`, `false`) and which event source the mapping polls.
 //! 2. A `StartingPosition` the request states has to be one the event source can be READ
 //!    from — "the position in a stream from which to start reading", with `AT_TIMESTAMP`
 //!    "supported only for Amazon Kinesis streams, Amazon DocumentDB, Amazon MSK, and

@@ -148,7 +148,7 @@ fn state_before_settle_is_admissible(row: &Row, state: Option<&str>) -> bool {
 }
 
 #[tokio::test]
-async fn every_mapping_is_created_transitional_and_reports_its_response_types() {
+async fn every_mapping_is_created_in_the_state_its_polling_setting_asks_for() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
 
