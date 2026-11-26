@@ -200,23 +200,31 @@ pub struct BlueprintSpec {
     /// Linux entry, whose software is offered under its own open terms. That is
     /// why every entry of [`BLUEPRINTS`] publishes one.
     ///
-    /// WHICH form the link takes is the catalog's, and both forms a recorded
-    /// answer reports are [`BlueprintLicense`]'s: an agreement document on AWS's
-    /// licence host, or the usage terms carried on the image's own Marketplace
-    /// listing. As with [`BlueprintSpec::product_page`], the identifiers in an
-    /// agreement path are the recorded ones on the rows a recorded answer names
-    /// them for and CHOSEN on the rest.
+    /// WHICH form the link takes is published PER IMAGE, and every form a
+    /// recorded answer reports is [`BlueprintLicense`]'s: an agreement document
+    /// on AWS's licence host, or the image's own Marketplace listing — its usage
+    /// section, or the listing page itself. A recorded answer reports the document
+    /// form for the Windows Server releases, for one of the two SQL Server
+    /// editions published on them and for the current Amazon Linux release, and a
+    /// listing form for every other image it serves — the Marketplace-listed
+    /// operating systems and the application stacks — so neither `type`, nor
+    /// `platform`, nor the family decides it.
+    ///
+    /// Every agreement path this catalog names is therefore a recorded one; an
+    /// image whose terms AWS publishes on its listing names no path at all, since
+    /// the link is built from that image's own
+    /// [`BlueprintSpec::product_page`].
     pub license: BlueprintLicense,
 }
 
 /// Where AWS publishes the end-user licence agreement of one catalog entry.
 ///
-/// A recorded `GetBlueprints` answer reports two forms, and which one an entry
+/// A recorded `GetBlueprints` answer reports three forms, and which one an entry
 /// carries is what AWS publishes for that image: an image whose agreement AWS
 /// serves as a document of its own links that document on the licence host
 /// ([`BLUEPRINT_LICENSE_AGREEMENT_URL_PREFIX`]), while an image offered through a
-/// Marketplace listing that carries its terms links the usage section of THAT
-/// listing ([`MARKETPLACE_USAGE_TERMS_FRAGMENT`]).
+/// Marketplace listing that carries its terms links THAT listing — its usage
+/// section ([`MARKETPLACE_USAGE_TERMS_FRAGMENT`]) or the listing page itself.
 ///
 /// Either way the link is the ENTRY's own: it leads to the agreement accepted by
 /// launching this image, never to another image's.
@@ -233,6 +241,16 @@ pub enum BlueprintLicense {
     /// entry's [`BlueprintSpec::product_page`] with
     /// [`MARKETPLACE_USAGE_TERMS_FRAGMENT`].
     ListingUsageTerms,
+    /// The image's own Marketplace listing itself, where AWS publishes the terms
+    /// as that page rather than as a section of it: the entry's
+    /// [`BlueprintSpec::product_page`], unchanged.
+    ///
+    /// SOURCE: a recorded `GetBlueprints` answer reports a Marketplace-listed
+    /// operating system whose licence link is its listing page, where it reports
+    /// the usage section of the listing for the releases published before it —
+    /// the link is the image's own down to which part of the listing carries its
+    /// terms, which is why it cannot be derived from the row.
+    Listing,
 }
 
 /// One value of the modelled `BlueprintType` enum: an operating-system image.
@@ -273,9 +291,11 @@ pub const BLUEPRINT_LICENSE_AGREEMENT_URL_PREFIX: &str =
 /// terms, which `Blueprint$licenseUrl` names where AWS publishes those terms on
 /// the listing itself rather than as an agreement document of its own.
 ///
-/// SOURCE: the recorded `GetBlueprints` answer, which reports a Windows SQL
-/// Server application image's licence as that image's own Marketplace listing
-/// with this fragment.
+/// SOURCE: the recorded `GetBlueprints` answer, which reports this fragment on
+/// the listing of every image it offers through a Marketplace listing that
+/// carries the terms: the Marketplace-listed operating systems — the Linux/Unix
+/// releases and the previous Amazon Linux one — the application stacks, and the
+/// SQL Server 2022 Express image.
 pub const MARKETPLACE_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
 
 /// The end-user licence agreement AWS publishes for the Windows Server
@@ -288,6 +308,18 @@ pub const MARKETPLACE_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
 /// every release links that document rather than one agreement per row.
 pub const WINDOWS_SERVER_LICENSE_AGREEMENT: &str =
     "b0e459f5-2c38-4939-ad2a-d9784ecab690/0e7c7387-f24a-45b5-9206-e5ab5ff5fd9c.txt";
+
+/// The end-user licence agreement AWS publishes for the SQL Server 2019 Express
+/// application image, as the `<product>/<agreement>.txt` path it is served at
+/// under [`BLUEPRINT_LICENSE_AGREEMENT_URL_PREFIX`].
+///
+/// SOURCE: the recorded `GetBlueprints` answer, which reports this image's
+/// licence as an agreement document of its own where it reports the other SQL
+/// Server edition on the same operating system with the terms on that image's
+/// listing: the FORM is published per image, so two editions of one product do
+/// not share it.
+pub const WINDOWS_SQL_2019_EXPRESS_LICENSE_AGREEMENT: &str =
+    "5c071384-f68c-4519-9040-342072d7e3de/1402cd01-4590-4cf4-bd59-092f727456ca.txt";
 
 /// `Blueprint$versionCode` — "The version code" — of every entry of
 /// [`BLUEPRINTS`]: Lightsail's own revision counter for the image it publishes
@@ -332,12 +364,12 @@ pub const BLUEPRINT_MIN_POWER_ANY_SIZE: i32 = 0;
 /// release it serves that copy for, as a template naming the `$release` the image
 /// installs.
 ///
-/// SOURCE: a recorded `GetBlueprints` answer reports this copy for the releases
-/// whose own listing carries it, rather than the paragraph it reports for the
-/// newest release: the copy opens on what Windows Server is an environment for
-/// and closes by naming THAT release on the Marketplace. Those two sentences are
-/// the recorded ones; the sentence between them is this catalog's own prose,
-/// since AWS publishes no machine-readable index of these paragraphs.
+/// SOURCE: a recorded `GetBlueprints` answer, which reports this copy — all three
+/// sentences of it — for the release whose own listing carries it, rather than
+/// the family paragraph ([`windows_family_copy`]) it reports for the other
+/// releases: the copy opens on what Windows Server is an environment for, states
+/// what the blueprint lets a caller run on AWS, and closes by naming THAT release
+/// on the Marketplace.
 ///
 /// It is ONE template because it is one published copy: a release that carries it
 /// carries it WHOLE with its own release named in it — the same way the releases
@@ -347,12 +379,35 @@ macro_rules! windows_listing_copy {
     ($release:literal) => {
         concat!(
             "Windows Server is an environment for deploying applications using the Microsoft Web \
-             Platform. The image carries the Internet Information Services web server, ASP.NET \
-             and the .NET Framework, so a Windows application, its services and its management \
-             tooling run on a Lightsail instance as they do on a server of your own. Learn more \
-             about Windows Server ",
+             Platform. This blueprint allows you to run compatible solutions that are based on \
+             Windows on Amazon Web Services (AWS), providing high-performance, reliable, and \
+             cost-effective cloud computing. Learn more about Windows Server ",
             $release,
             " on the AWS Marketplace."
+        )
+    };
+}
+
+/// The catalog copy AWS publishes for the Windows Server releases it serves the
+/// Lightsail family paragraph for, as a template naming the `$release` the image
+/// installs.
+///
+/// SOURCE: a recorded `GetBlueprints` answer, which reports this paragraph — what
+/// Lightsail does for Microsoft applications on that release, what it runs them
+/// in, and the use cases it is for — on the releases AWS publishes the family
+/// copy for, each naming its own release in the first sentence. A release whose
+/// own listing copy AWS serves instead carries [`windows_listing_copy`].
+macro_rules! windows_family_copy {
+    ($release:literal) => {
+        concat!(
+            "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft applications \
+             quickly, easily, and cost effectively with Windows Server ",
+            $release,
+            ". For business IT applications, Lightsail runs Windows-based solutions in a secure, \
+             easily managed, and performant cloud environment. Common Windows use cases include \
+             Enterprise Windows-based application hosting, website and web-service hosting, data \
+             processing, distributed testing, ASP.NET application hosting, and running any other \
+             application requiring Windows software."
         )
     };
 }
@@ -389,6 +444,13 @@ macro_rules! windows_listing_copy {
 /// order the recorded answer reports, whose first two entries are
 /// `windows_server_2025` and `windows_server_2022` and whose Windows SQL entries
 /// precede every Linux/Unix one.
+///
+/// The ROW SET is the rows a recorded answer names. A recorded answer serves
+/// further rows after the last application stack here, whose ids, names, catalog
+/// text, versions, groups, links and plan floors are named nowhere this crate can
+/// read; writing them from guesswork would publish images `CreateInstances` has
+/// no business creating an instance from, so they wait for a recording that
+/// reports their contents.
 pub const BLUEPRINTS: &[BlueprintSpec] = &[
     // Windows Server operating systems, newest release first.
     BlueprintSpec {
@@ -398,14 +460,8 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
         group: "windows_2025",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
-        description: "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft \
-                      applications quickly, easily, and cost effectively with Windows Server \
-                      2025. For business IT applications, Lightsail runs \
-                      Windows-based solutions in a secure, easily managed, and performant \
-                      cloud environment. Common Windows use cases include \
-                      Enterprise Windows-based application hosting, website and web-service \
-                      hosting, data processing, distributed testing, ASP.NET application \
-                      hosting, and running any other application requiring Windows software.",
+        // A recorded answer reports this release with the family paragraph.
+        description: windows_family_copy!("2025"),
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-g76csvka4r3by",
         license: BlueprintLicense::Agreement(WINDOWS_SERVER_LICENSE_AGREEMENT),
@@ -433,9 +489,10 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
         group: "windows_2019",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
-        // A recorded answer reports this release the same way it reports the 2022
-        // one: with the copy of its own listing, naming the release it installs.
-        description: windows_listing_copy!("2019"),
+        // A recorded answer reports this release with the family paragraph,
+        // naming the release it installs — not the copy of its own listing the
+        // 2022 release carries: the copy is published per image.
+        description: windows_family_copy!("2019"),
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         // A listing AWS publishes at its Marketplace PRODUCT CODE rather than a
         // `prodview-` product view: the page path is the listing's own, so the
@@ -450,14 +507,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
         group: "windows_2016",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
-        description: "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft \
-                      applications quickly, easily, and cost effectively with Windows Server \
-                      2016. For business IT applications, Lightsail runs \
-                      Windows-based solutions in a secure, easily managed, and performant \
-                      cloud environment. Common Windows use cases include \
-                      Enterprise Windows-based application hosting, website and web-service \
-                      hosting, data processing, distributed testing, ASP.NET application \
-                      hosting, and running any other application requiring Windows software.",
+        description: windows_family_copy!("2016"),
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/B01M7SJEU7",
         license: BlueprintLicense::Agreement(WINDOWS_SERVER_LICENSE_AGREEMENT),
@@ -499,7 +549,10 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       2019 Express on the AWS Marketplace.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-xbikutlmywslu",
-        license: BlueprintLicense::ListingUsageTerms,
+        // AWS publishes this edition's agreement as a document of its own, where
+        // the other edition on the same operating system carries its terms on its
+        // listing: a recorded answer reports both forms inside one product tier.
+        license: BlueprintLicense::Agreement(WINDOWS_SQL_2019_EXPRESS_LICENSE_AGREEMENT),
     },
     // Linux/Unix operating systems.
     BlueprintSpec {
@@ -551,9 +604,12 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       web applications, APIs and development environments on a Lightsail \
                       instance.",
         version: "24.04",
-        product_page: "marketplace/pp/prodview-2jmwz6bqxkd4t",
-        license: BlueprintLicense::Agreement("e81c5a3f-24d9-4b76-95e0-7ad31cf6082b/\
-                                              3b92d4e7-50a1-4c68-8f73-19ca05be7d42.txt"),
+        // A recorded answer reports this release's own listing, and its terms on
+        // that listing rather than as an agreement document — which is the form
+        // it reports for every Marketplace-listed Linux/Unix release and
+        // application stack this catalog offers.
+        product_page: "marketplace/pp/prodview-f2if34z3a4e3i",
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "ubuntu_22_04",
@@ -567,9 +623,8 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       application is already qualified against the 22.04 package set and its \
                       language runtimes.",
         version: "22.04",
-        product_page: "marketplace/pp/prodview-kd8vqz3mwbtx5",
-        license: BlueprintLicense::Agreement("7a24f9b1-6c80-4d35-92ea-58bd03cf1e76/\
-                                              9d01c7a5-2b63-4f94-85d8-47ea16bc0938.txt"),
+        product_page: "marketplace/pp/prodview-goqtn6wuqa2sc",
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "ubuntu_20_04",
@@ -582,9 +637,8 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       to its package set and runtimes. Newer long-term support releases are \
                       published in this catalog for a new deployment.",
         version: "20.04",
-        product_page: "marketplace/pp/prodview-9wmtb4kzqvxd2",
-        license: BlueprintLicense::Agreement("2f6b81d4-9a07-4e52-83c6-71da45bf0e29/\
-                                              6c38a2f9-0d71-4b85-94e3-52ac18db6704.txt"),
+        product_page: "marketplace/pp/prodview-g5rooj5oqzrw4",
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "ubuntu_18_04",
@@ -600,8 +654,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       for a new instance.",
         version: "18.04",
         product_page: "marketplace/pp/prodview-bq6zktmwx3vd8",
-        license: BlueprintLicense::Agreement("5d09c4b7-1e38-4a96-87f2-40cb92de5107/\
-                                              8a67f3d2-5c94-4e01-93b8-16de70ca4f85.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "debian_12",
@@ -615,9 +668,12 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       package set and small default install make it a predictable base for \
                       servers and self-managed application stacks.",
         version: "12",
-        product_page: "marketplace/pp/prodview-x4ktqzm9wbvd3",
-        license: BlueprintLicense::Agreement("9b45e0c8-7d12-4f63-95a7-28cb41df6e03/\
-                                              4e18a7b3-0f52-4c96-8d71-63ca29be5017.txt"),
+        // A recorded answer reports this release's own listing as the licence
+        // link, where it reports the usage SECTION of the listing for the
+        // releases above: which part of a listing carries an image's terms is
+        // published per image.
+        product_page: "marketplace/pp/prodview-kweb77e4ra73a",
+        license: BlueprintLicense::Listing,
     },
     BlueprintSpec {
         blueprint_id: "debian_11",
@@ -631,8 +687,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       maintained with long-term security updates by the Debian project.",
         version: "11",
         product_page: "marketplace/pp/prodview-m2wvqz7ktbxd5",
-        license: BlueprintLicense::Agreement("3c71d9a6-4b58-4e02-96f8-15da87cb0e34/\
-                                              7f02b6d1-8c43-4a95-92e7-50bd31ca6f08.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "debian_10",
@@ -647,8 +702,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       Debian stable release for a new instance.",
         version: "10",
         product_page: "marketplace/pp/prodview-7bkzqvm4twxd9",
-        license: BlueprintLicense::Agreement("6e83f1c4-2d97-4b50-85a9-71cb04de3f26/\
-                                              1a54c8b7-6f03-4d92-97e1-28da60bc5917.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "almalinux_9",
@@ -663,8 +717,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       and maintenance updates from the AlmaLinux OS Foundation.",
         version: "9",
         product_page: "marketplace/pp/prodview-vz3mqkt8wbxd6",
-        license: BlueprintLicense::Agreement("8f27b3d0-5a61-4c94-93e2-07da18cb6f45/\
-                                              2d60a9f4-7b18-4e53-86c1-49bd03ca7e26.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "centos_stream_9",
@@ -678,8 +731,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       test RPM-based software against the next minor release.",
         version: "9",
         product_page: "marketplace/pp/prodview-q8wmzkt2vbxd4",
-        license: BlueprintLicense::Agreement("4a96c7f2-0b53-4d18-95e7-62da31bc0948/\
-                                              9e13b5a8-4c70-4f26-83d9-50ca17de6b02.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "freebsd_14",
@@ -694,8 +746,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       FreeBSD stack.",
         version: "14",
         product_page: "marketplace/pp/prodview-t5zqmkw9vbxd7",
-        license: BlueprintLicense::Agreement("1b58d0a7-9f42-4e63-87c5-30da26bc5917/\
-                                              6f94c2b1-3d07-4a85-92e6-18db40ca7f23.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "opensuse_15",
@@ -710,8 +761,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       under community maintenance.",
         version: "15",
         product_page: "marketplace/pp/prodview-z9qmkt3wvbxd8",
-        license: BlueprintLicense::Agreement("7d02a9c5-6b31-4f84-93e7-45ca18bd0e26/\
-                                              3a71f6d9-0c54-4b92-85d8-27de61ca4f03.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     // Application stacks.
     BlueprintSpec {
@@ -728,8 +778,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       components up to date.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-c3thaabbmnmfy",
-        license: BlueprintLicense::Agreement("2a7f85c1-4b63-4d09-9e87-06c15df2b3a8/\
-                                              4d19c7e6-85b2-4f71-9a03-27be6cd81f54.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "wordpress_multisite",
@@ -744,8 +793,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       enabled on Apache, PHP and MySQL.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-g4jkpwqz2mvxb",
-        license: BlueprintLicense::Agreement("6b3d09f5-7c12-4a84-95e0-3f87ba6d41c2/\
-                                              8f27a1b4-0d96-4e53-87ca-5b19de402f76.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "lamp_8_bitnami",
@@ -759,8 +807,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       tools a PHP application expects, ready to take your own code.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-n7qzmkw4tvbx9",
-        license: BlueprintLicense::Agreement("0c54e8a7-3b19-4f62-8d05-9ae71c24b6f3/\
-                                              2b96d7f0-5c84-4a19-93e7-61fd08ac527b.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "nodejs",
@@ -775,8 +822,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       first.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-d2kmqzw8tvbx5",
-        license: BlueprintLicense::Agreement("7e28b1d4-6f05-4c93-85a1-2d9b70fe4a86/\
-                                              9a51c3e8-7b26-4d80-96f4-38ce15b7024d.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "joomla",
@@ -790,8 +836,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       PHP and MySQL and configured to serve as soon as the instance starts.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-j6wzqmk3tvbx7",
-        license: BlueprintLicense::Agreement("4f91a6c3-0e78-4b25-9d6f-83a21cb7e504/\
-                                              6c38f9a1-2d47-4e96-8b50-71de94a2c3f8.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "drupal",
@@ -806,8 +851,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       MySQL.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-r8kzqmw2tvbx4",
-        license: BlueprintLicense::Agreement("1d86c4f9-5a03-4e71-92b8-4f7c06ad3e25/\
-                                              3f70b2d5-8c91-4a67-85de-029ab6f41c73.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "magento",
@@ -821,8 +865,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       Elasticsearch and configured for the catalogue indexing a store needs.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-y3mzqkw7tvbx6",
-        license: BlueprintLicense::Agreement("8a23f7b6-1c94-4d58-90e2-6b5d31ca847f/\
-                                              5d81e6c0-4a37-4b92-87f1-93ce20b74da6.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "mean",
@@ -836,8 +879,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       tooling to develop and run a single-page application on one instance.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-e5kzqmw9tvbx2",
-        license: BlueprintLicense::Agreement("3c67d0a8-9b41-4f26-85d7-1e2fa9c70b53/\
-                                              7b14a8f2-0d63-4c95-9e28-46bd17ca3e80.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "ghost_bitnami",
@@ -851,8 +893,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       Apache and configured for the Ghost admin client.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-h4mzqkw5tvbx8",
-        license: BlueprintLicense::Agreement("9f05b8e2-6d37-4a14-93c8-57ba02fd6c91/\
-                                              1c48d7b9-3f20-4e86-85a7-62fd90ce413b.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "redmine",
@@ -866,8 +907,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       integration, preinstalled with Ruby, Apache and MySQL.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-u9kzqmw6tvbx3",
-        license: BlueprintLicense::Agreement("5b94c1f7-8a26-4d03-97e5-30bc74af2d68/\
-                                              8e26f1a3-5b47-4c09-92d8-74ac03be5f17.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "nginx",
@@ -882,8 +922,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       application.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-k2mzqwt7vbxd4",
-        license: BlueprintLicense::Agreement("2e71a4d8-0b95-4f37-86c1-49fd25ba7e03/\
-                                              4a09c6b5-7d18-4e42-95f3-80be61da2c97.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "django",
@@ -898,8 +937,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       the environment by hand.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-b6kzqmw8tvbx5",
-        license: BlueprintLicense::Agreement("7d38b0c5-4f61-4a29-98e7-15ca82bd6f40/\
-                                              9b57e2d1-6c03-4f84-87a9-23df05bc714e.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "gitlab",
@@ -913,8 +951,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       preinstalled with its PostgreSQL database, Redis and web server.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-w3mzqkt9vbxd7",
-        license: BlueprintLicense::Agreement("0a92f5b3-7c48-4d16-95e0-68ba13cf7d24/\
-                                              6f81b3a7-2e95-4c60-89d4-37ca58e012bf.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "prestashop",
@@ -928,8 +965,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       the store's back office ready to use.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-p7kzqmw2tvbx6",
-        license: BlueprintLicense::Agreement("4c18d9e6-3b70-4a52-96f8-27bd50ac1e93/\
-                                              2d95f7c0-8a14-4b63-97e1-50bc39da648f.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "cpanel_whm_almalinux",
@@ -944,8 +980,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       licence is required once the trial period ends.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-a8mzqkw3tvbx9",
-        license: BlueprintLicense::Agreement("8b60a3f1-5d29-4e74-93c6-01fa78bd5e42/\
-                                              3a74c8d2-9f51-4b06-85e7-16bd42af903c.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "plesk_ubuntu_18_0_35",
@@ -961,8 +996,7 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       trial period ends.",
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         product_page: "marketplace/pp/prodview-l5kzqmw7tvbx2",
-        license: BlueprintLicense::Agreement("1f47e8b0-2a63-4c95-87d1-54ca09bf6e37/\
-                                              7e03d5a9-6b18-4f72-94c0-29bd81ea453f.txt"),
+        license: BlueprintLicense::ListingUsageTerms,
     },
 ];
 
@@ -1059,9 +1093,9 @@ impl BlueprintSpec {
     /// `Blueprint$licenseUrl` — "The end-user license agreement URL for the
     /// image or blueprint": the agreement AWS publishes for THIS image, in
     /// whichever form it publishes it ([`BlueprintLicense`]) — the agreement
-    /// document on AWS's licence host, or the usage terms on the image's own
-    /// Marketplace listing — and `None` where the image is offered under no
-    /// agreement of its own.
+    /// document on AWS's licence host, or the image's own Marketplace listing,
+    /// whole or at its usage section — and `None` where the image is offered
+    /// under no agreement of its own.
     pub fn license_url(&self) -> Option<String> {
         match self.license {
             BlueprintLicense::NotPublished => None,
@@ -1075,6 +1109,8 @@ impl BlueprintSpec {
                 "{}{MARKETPLACE_USAGE_TERMS_FRAGMENT}",
                 self.product_url()?
             )),
+            // The terms are the listing page itself, so the link is that page.
+            BlueprintLicense::Listing => self.product_url(),
         }
     }
 

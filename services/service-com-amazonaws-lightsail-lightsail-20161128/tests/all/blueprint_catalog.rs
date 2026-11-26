@@ -548,20 +548,20 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             );
         }
         // The licence link leads to the agreement AWS publishes for the image, in
-        // whichever of the two published forms carries it: the agreement document
-        // on the AWS licence host, or the usage section of THIS image's own
-        // Marketplace listing.
+        // whichever of the published forms carries it: the agreement document on
+        // the AWS licence host, or THIS image's own Marketplace listing — whole,
+        // or at its usage section.
         if let Some(url) = blueprint["licenseUrl"].as_str() {
             let on_license_host = url.starts_with(LICENSE_AGREEMENT_PREFIX)
                 && url.len() > LICENSE_AGREEMENT_PREFIX.len();
-            let own_listing_terms = blueprint["productUrl"]
-                .as_str()
-                .is_some_and(|page| url == format!("{page}{LISTING_USAGE_TERMS_FRAGMENT}"));
+            let own_listing = blueprint["productUrl"].as_str().is_some_and(|page| {
+                url == page || url == format!("{page}{LISTING_USAGE_TERMS_FRAGMENT}")
+            });
             assert!(
-                on_license_host || own_listing_terms,
+                on_license_host || own_listing,
                 "case {case:?}: licenseUrl must be the agreement AWS publishes for this image \
-                 — a document under {LICENSE_AGREEMENT_PREFIX}… or this image's own listing \
-                 with {LISTING_USAGE_TERMS_FRAGMENT} — got {url:?}"
+                 — a document under {LICENSE_AGREEMENT_PREFIX}… or this image's own listing, \
+                 whole or with {LISTING_USAGE_TERMS_FRAGMENT} — got {url:?}"
             );
         }
         assert!(

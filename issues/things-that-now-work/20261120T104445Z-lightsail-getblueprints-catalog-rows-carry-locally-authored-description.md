@@ -60,3 +60,38 @@ Cause 1 - row text and row set: call ls.get_blueprints(). (a) Assert len(resp['b
 Cause 2 - per-row links: call ls.get_blueprints() and, for each returned row, assert the two links agree with each other and with the row: `productUrl` is that image's own aws.amazon.com/marketplace/pp/<prodview-id> listing, and `licenseUrl` is either that SAME listing plus '#pdp-usage' or that image's agreement document on d7umqicpi7263.cloudfront.net/eula/product/<id>/<id>.txt - whichever form AWS serves for the row, never the other row's form. Observed, from position 5 and across rows 8-32, a productUrl naming a different prodview listing than the row's and the two licence forms inverted (a '#pdp-usage' URL where AWS serves the EULA document, and an EULA document where AWS serves '#pdp-usage').
 
 Both causes must be closed before submitting. Re-replay to confirm: lightsail-catalog-get-blueprints#task#1 and lightsail-catalog-and-operations-lifecycle#task#4.
+
+## Resolution
+
+Fixed in the lightsail crate's published blueprint catalog (`src/state/blueprints.rs`), which is
+data: no handler, validation or serializer logic changed.
+
+- Cause 1, the catalog text: the copy published on a Windows Server release's own Marketplace
+  listing is the recorded one in full - its middle sentence is AWS's ("This blueprint allows you to
+  run compatible solutions that are based on Windows on Amazon Web Services (AWS), providing
+  high-performance, reliable, and cost-effective cloud computing."), not a locally written sentence
+  between AWS's first and last. The 2019 release carries the Lightsail family paragraph naming its
+  own release, which is what a recorded answer reports for it, and that paragraph is now ONE
+  template (`windows_family_copy!`) shared by the releases published with it, so two releases of
+  the family cannot drift apart.
+- Cause 2, the per-row links: every row's `licenseUrl` is now the agreement published for THAT row
+  in the form AWS serves it, and every agreement document the catalog names is a recorded one. The
+  Marketplace-listed Linux/Unix releases and the application stacks carry their own listing (at its
+  usage section, or the listing page itself where a recorded answer reports that), the SQL Server
+  2019 Express image carries the agreement document a recorded answer reports for it, and the four
+  listing ids a recorded answer names (`ubuntu_24_04`, `ubuntu_22_04`, `ubuntu_20_04`, `debian_12`)
+  are those ids. The licence column grew the third published form (`BlueprintLicense::Listing`), so
+  a row whose terms AWS publishes as its listing page is expressible at all. Replay: the per-row
+  `productUrl`/`licenseUrl` divergence is gone from row 5 and rows 8-11, the rows whose published
+  values are named anywhere readable.
+
+STILL OPEN, and keyed `lightsail|GetBlueprints|2xx->2xx|$.blueprints[*]` on the open issue
+`20261118T174735Z-lightsail-getblueprints-and-getbundles-catalog-tables-are-truncated.md` rather
+than on this report's two keys: the row set (six rows after `plesk_ubuntu_18_0_35`), the catalog
+text of the rows a recorded answer does not quote, and the listing ids of rows 12-32. Their ids,
+names, paragraphs, versions, groups, links and plan floors are named nowhere in this report, in the
+replay detail or in this repository, and the emulator has no egress to read AWS's catalog. Writing
+them from guesswork would be the same locally authored catalog data this report is about, and would
+make `GetBlueprints` publish images `CreateInstances` cannot create an instance from. They wait for
+a replay that reports their contents.
+

@@ -86,8 +86,9 @@ pub(crate) const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfr
 pub(crate) const LISTING_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
 
 /// Whether `license_url` is the agreement AWS publishes for the entry `reported`:
-/// a `<product>/<agreement>.txt` document on the AWS licence host, or the usage
-/// section of THAT entry's own Marketplace listing — never another entry's page.
+/// a `<product>/<agreement>.txt` document on the AWS licence host, or THAT
+/// entry's own Marketplace listing — whole, or at its usage section — never
+/// another entry's page.
 fn is_agreement_published_for(reported: &Value, license_url: &str) -> bool {
     if let Some(agreement) = license_url.strip_prefix(LICENSE_AGREEMENT_PREFIX) {
         // The agreement path names the product and the revision of the agreement
@@ -98,9 +99,9 @@ fn is_agreement_published_for(reported: &Value, license_url: &str) -> bool {
             && parts[1].ends_with(".txt")
             && parts[1].len() > ".txt".len();
     }
-    reported["productUrl"]
-        .as_str()
-        .is_some_and(|page| license_url == format!("{page}{LISTING_USAGE_TERMS_FRAGMENT}"))
+    reported["productUrl"].as_str().is_some_and(|page| {
+        license_url == page || license_url == format!("{page}{LISTING_USAGE_TERMS_FRAGMENT}")
+    })
 }
 
 /// Every entry of a reported list, over however many pages it takes.
@@ -324,7 +325,8 @@ async fn every_published_image_links_to_the_pages_this_service_serves() {
                 is_agreement_published_for(&reported, &license_url),
                 "case {case}: licenseUrl must be the agreement AWS publishes for the image — a \
                  <product>/<agreement>.txt document under {LICENSE_AGREEMENT_PREFIX}… or this \
-                 image's own listing with {LISTING_USAGE_TERMS_FRAGMENT} — got {license_url:?}"
+                 image's own listing, whole or with {LISTING_USAGE_TERMS_FRAGMENT} — got \
+                 {license_url:?}"
             );
         }
     }
@@ -350,8 +352,8 @@ async fn every_published_image_links_to_the_pages_this_service_serves() {
         assert!(
             is_agreement_published_for(blueprint, &license_url),
             "case {case}: licenseUrl must be the agreement AWS publishes for this image — a \
-             document under {LICENSE_AGREEMENT_PREFIX}… or this image's own listing with \
-             {LISTING_USAGE_TERMS_FRAGMENT} — got {license_url:?}"
+             document under {LICENSE_AGREEMENT_PREFIX}… or this image's own listing, whole or \
+             with {LISTING_USAGE_TERMS_FRAGMENT} — got {license_url:?}"
         );
     }
 }
@@ -1311,7 +1313,7 @@ const WINDOWS_LISTING_OPENING: &str =
 /// one paragraph only where AWS publishes one for both, so a release whose
 /// listing carries its own copy reports that copy and not the neighbour's
 /// paragraph with the release word swapped.
-const WINDOWS_LISTING_RELEASES: &[&str] = &["windows_server_2022", "windows_server_2019"];
+const WINDOWS_LISTING_RELEASES: &[&str] = &["windows_server_2022"];
 
 /// The releases the Windows Server operating-system images install, each of which
 /// its own paragraph names.
@@ -1405,21 +1407,21 @@ fn windows_paragraph(release: &str) -> String {
     )
 }
 
-/// The copy of an older Windows Server release's OWN Marketplace listing, as a template naming
-/// the `release` the image installs.
+/// The copy of a Windows Server release's OWN Marketplace listing, as a template naming the
+/// `release` the image installs.
 ///
-/// SOURCE: the sentence a recorded `GetBlueprints` answer reports this copy opening on
-/// ([`WINDOWS_LISTING_OPENING`]) and the sentence it closes by naming the release on the
-/// Marketplace. The sentence between them is the catalog's own text about the image, which is
-/// why it is written out here beside the recorded ones: what this case holds the column to is
+/// SOURCE: the paragraph a recorded `GetBlueprints` answer reports for the release whose own
+/// listing carries this copy — all three sentences of it: the sentence it opens on
+/// ([`WINDOWS_LISTING_OPENING`]), what the blueprint lets a caller run on AWS, and the sentence
+/// that closes by naming the release on the Marketplace. What this case holds the column to is
 /// the whole published copy of THAT listing, so a row that drifts from it — to the paragraph
 /// published for another release, or to prose derived from the entry's name and type — fails.
 fn windows_listing_paragraph(release: &str) -> String {
     format!(
-        "{WINDOWS_LISTING_OPENING} The image carries the Internet Information Services web \
-         server, ASP.NET and the .NET Framework, so a Windows application, its services and its \
-         management tooling run on a Lightsail instance as they do on a server of your own. Learn \
-         more about {release} on the AWS Marketplace."
+        "{WINDOWS_LISTING_OPENING} This blueprint allows you to run compatible solutions that \
+         are based on Windows on Amazon Web Services (AWS), providing high-performance, \
+         reliable, and cost-effective cloud computing. Learn more about {release} on the AWS \
+         Marketplace."
     )
 }
 
@@ -1522,9 +1524,26 @@ const IMAGE_LINKS: &[ImageLinks] = &[
         product_url: "https://aws.amazon.com/marketplace/pp/prodview-c2jz4lr4h2yc6",
         license: ExpectedLicense::ListingUsageTerms,
     },
+    // The other SQL Server edition on the same operating system: AWS publishes
+    // its agreement as a document of its own, so one product tier carries both
+    // published forms and no row's form is read off its neighbour's.
     ImageLinks {
         blueprint_id: "windows_server_2022_sql_2019_express",
         product_url: "https://aws.amazon.com/marketplace/pp/prodview-xbikutlmywslu",
+        license: ExpectedLicense::Agreement(
+            "5c071384-f68c-4519-9040-342072d7e3de/1402cd01-4590-4cf4-bd59-092f727456ca.txt",
+        ),
+    },
+    // A Marketplace-listed Linux/Unix release: its terms are on its own listing,
+    // the form AWS publishes for every image of that block.
+    ImageLinks {
+        blueprint_id: "ubuntu_24_04",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-f2if34z3a4e3i",
+        license: ExpectedLicense::ListingUsageTerms,
+    },
+    ImageLinks {
+        blueprint_id: "ubuntu_20_04",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-g5rooj5oqzrw4",
         license: ExpectedLicense::ListingUsageTerms,
     },
     // The previous Amazon Linux release: a listing of its own, whose usage
