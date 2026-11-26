@@ -76,7 +76,10 @@ pub struct MediaStream {
     /// captured before the newest fragment the log already holds is refused rather than
     /// appended, across sessions as within one.
     pub fragments: Vec<Fragment>,
-    /// The number the next fragment written to this stream gets.
+    /// The number the next fragment written to this stream gets: the stream's minting
+    /// high-water mark, which counts over the stream's whole lifetime and not over what
+    /// this log currently holds — dropping fragments off either end does not lower it, so
+    /// no number ever names two chunks of one stream.
     pub next_fragment_number: u64,
     /// A short, stable id used to build this stream's continuation tokens. The stream
     /// NAME cannot be used for that: a name is up to 256 characters while a
@@ -127,7 +130,23 @@ pub const MAX_STORED_MEDIA_BYTES_PER_STREAM: usize = 25_000_000;
 /// produced to, which is a state every client already handles (a created stream reads empty)
 /// and never a missing resource — the stream itself is the control plane's record, which
 /// this store neither holds nor removes.
+///
+/// What goes is the MEDIA. Where the stream's fragment numbering had got to is kept
+/// ([`MAX_REMEMBERED_FRAGMENT_NUMBER_MARKS`]), because that number identifies media the
+/// stream's other read plane still holds.
 pub const MAX_STORED_STREAM_LOGS: usize = 64;
+
+/// The most dropped logs' fragment-number marks this store remembers at once.
+///
+/// A mark is a stream's ARN and two integers rather than any of its media, so this ceiling
+/// sits far above [`MAX_STORED_STREAM_LOGS`]: it is the most streams the Kinesis Video
+/// Streams control plane holds at once (that service's own `MAX_STREAMS`), hence the most
+/// streams a producer can still be addressing, so every stream that can be produced to
+/// again keeps its numbering. Past it the mark whose log was dropped longest ago goes,
+/// which is the one likeliest to belong to a stream the control plane no longer holds — a
+/// stream nothing can address any more, since its ARN carries the creation instant of an
+/// incarnation that is gone.
+pub const MAX_REMEMBERED_FRAGMENT_NUMBER_MARKS: usize = control_plane::MAX_STREAMS;
 
 /// One fragment as a producer submitted it: the bytes and the facts an ingest records
 /// about them, which the two read planes then report.
@@ -146,6 +165,25 @@ pub struct ProducedFragment {
     /// The playback span the fragment covers, which only the archive read plane reports
     /// (`Fragment$FragmentLengthInMilliseconds`).
     pub duration_millis: u64,
+}
+
+/// Where a stream's fragment numbering had got to when this store dropped its media log.
+///
+/// A fragment number is STREAM-scoped and increases with write order over the stream's
+/// whole lifetime, so a number minted for a stream must never be minted for it again: the
+/// stream is the control plane's record, which a dropped log neither removes nor
+/// re-creates, and the stream's archive read plane still holds the fragments that took the
+/// earlier numbers. Dropping a log therefore gives up the media — what the ceiling is for
+/// — and keeps these two numbers.
+#[derive(Debug, Clone)]
+struct RetiredLog {
+    /// The number the next fragment written to the stream gets: the dropped log's
+    /// [`MediaStream::next_fragment_number`].
+    next_fragment_number: u64,
+    /// The write sequence the dropped log carried, so the mark whose log was dropped
+    /// longest ago is the first to be forgotten when the store is remembering as many as
+    /// [`MAX_REMEMBERED_FRAGMENT_NUMBER_MARKS`] allows.
+    retired_at: u64,
 }
 
 /// Where a continuation token resumes: the stream it was minted for, and the position of
@@ -182,6 +220,14 @@ pub struct ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
     /// Continuation token -> cursor, so a token this service minted is resolved from
     /// persisted state rather than parsed back out of the token text.
     pub continuations: HashMap<String, Continuation>,
+    /// The fragment-number mark of every stream whose media log this store has dropped
+    /// ([`MAX_STORED_STREAM_LOGS`]), keyed by the `StreamARN` that log was held under: the
+    /// numbering a log of that stream created again resumes from, so a dropped log costs
+    /// the stream its media and never its numbering ([`RetiredLog`]).
+    ///
+    /// Bounded by [`MAX_REMEMBERED_FRAGMENT_NUMBER_MARKS`], as every other thing this
+    /// store grows per stream is bounded.
+    retired_logs: HashMap<String, RetiredLog>,
     /// The last log id handed out; `0` means none has been, so an id is always at least
     /// `1` and never collides with the "no log yet" id a log-less stream reports.
     next_stream_id: u64,
@@ -202,11 +248,24 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         // Ids are handed out from 1, so the `0` a stream with no log reports can never
         // be a live log's id, and two streams never share a continuation-token prefix.
         let fresh_id = self.next_stream_id.saturating_add(1);
+        // The numbering a log created here starts from. A live log carries its own, so the
+        // mark is read only where one is being created, which is also the only place a
+        // mark can be held: a log this store dropped gave up the stream's MEDIA, never the
+        // point its numbering had reached, so the next fragment of a stream whose log went
+        // carries the number AFTER the last one minted for that stream and one number
+        // never names two of its chunks. A stream no mark is held for has had nothing
+        // produced to it, and its numbering starts at 1.
+        let mut next_fragment_number = 1;
         if !self.streams.contains_key(stream_arn) {
             self.next_stream_id = fresh_id;
             // A log this store does not hold yet is one more log, so the global ceiling is
             // enforced here — the one place the number of logs grows.
             self.drop_logs_beyond_the_ceiling();
+            // Spent as the log is created, since that log carries the numbering from here.
+            next_fragment_number = self
+                .retired_logs
+                .remove(stream_arn)
+                .map_or(1, |retired| retired.next_fragment_number);
         }
         // Stamped on every write, so the log dropped when the ceiling is reached is the one
         // whose producer stopped writing longest ago.
@@ -220,7 +279,7 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
                 name: stream_name.to_string(),
                 content_type: DEFAULT_CONTENT_TYPE.to_string(),
                 fragments: Vec::new(),
-                next_fragment_number: 1,
+                next_fragment_number,
                 id: fresh_id,
                 dropped: 0,
                 written_at,
@@ -239,6 +298,11 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
     /// ([`forget_cursors_behind_the_log`](Self::forget_cursors_behind_the_log)): a cursor
     /// into media that is gone resolves to no position, and the next call presenting it is
     /// answered as the bad argument it is.
+    ///
+    /// The dropped log's fragment NUMBERING is kept
+    /// ([`remember_fragment_numbering`](Self::remember_fragment_numbering)): the media goes,
+    /// but the numbers it used already name media, so the stream's next fragment takes the
+    /// number after them.
     fn drop_logs_beyond_the_ceiling(&mut self) {
         while self.streams.len() >= MAX_STORED_STREAM_LOGS {
             let Some(oldest) = self
@@ -249,9 +313,38 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
             else {
                 return;
             };
-            self.streams.remove(&oldest);
+            let Some(dropped) = self.streams.remove(&oldest) else {
+                return;
+            };
             self.continuations
                 .retain(|_, held| held.stream_arn != oldest);
+            self.remember_fragment_numbering(&dropped);
+        }
+    }
+
+    /// Remember where `dropped`'s fragment numbering had got to, so a producer addressing
+    /// that stream again is minted the number after the last one the stream used instead of
+    /// one that already names a chunk of it.
+    fn remember_fragment_numbering(&mut self, dropped: &MediaStream) {
+        self.retired_logs.insert(
+            dropped.arn.clone(),
+            RetiredLog {
+                next_fragment_number: dropped.next_fragment_number,
+                retired_at: dropped.written_at,
+            },
+        );
+        // One more remembered mark, so the ceiling on them is enforced here — the one place
+        // their number grows.
+        while self.retired_logs.len() > MAX_REMEMBERED_FRAGMENT_NUMBER_MARKS {
+            let Some(stalest) = self
+                .retired_logs
+                .iter()
+                .min_by_key(|(_, retired)| retired.retired_at)
+                .map(|(arn, _)| arn.clone())
+            else {
+                return;
+            };
+            self.retired_logs.remove(&stalest);
         }
     }
 
@@ -373,6 +466,10 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
     /// fragment it was found in. Reading it mints nothing and consumes nothing: the next
     /// fragment stored still takes this number, and a stream nothing has been produced to
     /// yet is not created by the read.
+    ///
+    /// A stream whose log this store dropped reports the numbering that log had reached,
+    /// not `1`: the drop took the media, and the numbers it used still name media on the
+    /// stream's archive read plane.
     pub fn received_fragment_number<Eng: Send + Sync + 'static>(
         &self,
         engine: &Eng,
@@ -380,12 +477,22 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         stream_arn: Option<&str>,
     ) -> Option<String> {
         let registered = registered_stream_record(engine, stream_name, stream_arn)?;
-        Some(
-            self.streams
-                .get(&registered.arn)
-                .map_or(1, |stream| stream.next_fragment_number)
-                .to_string(),
-        )
+        Some(self.next_fragment_number(&registered.arn).to_string())
+    }
+
+    /// The number the next fragment of the stream `stream_arn` names will be minted under:
+    /// its live log's mark, the mark kept for a log this store dropped, or `1` for a stream
+    /// nothing has been produced to.
+    fn next_fragment_number(&self, stream_arn: &str) -> u64 {
+        self.streams
+            .get(stream_arn)
+            .map(|stream| stream.next_fragment_number)
+            .or_else(|| {
+                self.retired_logs
+                    .get(stream_arn)
+                    .map(|retired| retired.next_fragment_number)
+            })
+            .unwrap_or(1)
     }
 
     /// Forget every continuation token of the stream `stream_arn` names whose fragment
