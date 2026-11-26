@@ -17,8 +17,8 @@
 //! ([`super::serverless_capacity`]), reported as a CloudWatch series rather than as this
 //! member, and a Multi-AZ DB cluster runs on the instance class it was created with. So the
 //! member is reported for a Serverless v1 cluster and for one only, and the operation that
-//! sets it refuses every other cluster on its own published precondition
-//! ([`SERVERLESS_V1_ONLY_MESSAGE`]).
+//! sets it refuses every other cluster on the cluster's TYPE
+//! ([`CAPACITY_NOT_MODIFIABLE_MESSAGE`]).
 //!
 //! # The scaling the clock owes
 //!
@@ -52,14 +52,14 @@ pub fn is_serverless_v1_cluster(engine: &str, engine_mode: &str) -> bool {
 /// What a call that acts on an Aurora Serverless v1 cluster's capacity refuses a cluster that
 /// is not one with.
 ///
-/// It is the operation's OWN published precondition — "This operation only applies to Aurora
-/// Serverless v1 DB clusters" — and has no variable part: the refusal states which clusters
-/// the operation serves, which is what tells a caller that no amount of waiting will change
-/// the answer and that a `provisioned` cluster's serverless capacity is rescaled through
-/// `ModifyDBCluster$ServerlessV2ScalingConfiguration` instead. The identifier the request
-/// named is not in it, so the sentence a caller matches on is the same for every cluster.
-pub const SERVERLESS_V1_ONLY_MESSAGE: &str =
-    "This operation only applies to Aurora Serverless v1 DB clusters.";
+/// The refusal states which clusters can have their capacity modified at all, which is what
+/// tells a caller that no amount of waiting will change the answer and that a `provisioned`
+/// cluster's serverless capacity is rescaled through
+/// `ModifyDBCluster$ServerlessV2ScalingConfiguration` instead. The sentence is FIXED: neither
+/// the identifier the request named, nor the capacity it asked for, nor the cluster's engine
+/// appears in it, so the text a caller matches on is the same for every cluster refused.
+pub const CAPACITY_NOT_MODIFIABLE_MESSAGE: &str =
+    "Only Aurora Serverless clusters can have their capacity modified.";
 
 /// The capacity values an AURORA MYSQL Serverless v1 cluster accepts, as
 /// `ModifyCurrentDBClusterCapacityMessage$Capacity` publishes them: "For Aurora MySQL, valid

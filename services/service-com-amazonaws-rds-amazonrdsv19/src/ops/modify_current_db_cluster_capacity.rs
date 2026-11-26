@@ -223,14 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // "This operation only applies to Aurora Serverless v1 DB clusters": a cluster in any
-        // other engine mode has no such capacity to set, which is a VALUE the identifier
-        // carries rather than a state the cluster is in — the `InvalidParameterValue` Query
-        // API error — and it is answered BEFORE the cluster's status, because no amount of
-        // waiting makes a provisioned cluster into a Serverless v1 one.
+        // Only an Aurora Serverless v1 cluster has a capacity for this call to set: a cluster
+        // in any other engine mode has none, which is a VALUE the identifier carries rather
+        // than a state the cluster is in — the `InvalidParameterValue` Query API error, whose
+        // text says which clusters can have their capacity modified at all
+        // (`crate::state::CAPACITY_NOT_MODIFIABLE_MESSAGE`) — and it is answered BEFORE the
+        // cluster's status, because no amount of waiting makes a provisioned cluster into a
+        // Serverless v1 one.
         if !cluster.is_serverless_v1() {
             return Err(ModifyCurrentDBClusterCapacityError::invalid_parameter_value(
-                crate::state::SERVERLESS_V1_ONLY_MESSAGE,
+                crate::state::CAPACITY_NOT_MODIFIABLE_MESSAGE,
             ));
         }
         // `Capacity` is held to the values the cluster's ENGINE publishes, which is the

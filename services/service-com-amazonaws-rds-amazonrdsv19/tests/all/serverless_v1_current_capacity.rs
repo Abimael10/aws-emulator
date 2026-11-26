@@ -39,9 +39,12 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// v1 DB clusters").
 const SERVERLESS_V1_MODE: &str = "serverless";
 
-/// The sentence the operation refuses a cluster it does not apply to with — its own
-/// published precondition, spelled out here rather than read from the code under test.
-const NOT_SERVERLESS_V1: &str = "This operation only applies to Aurora Serverless v1 DB clusters.";
+/// The sentence the operation refuses a cluster it does not apply to with: the fixed text
+/// AWS answers such a call with, spelled out here rather than read from the code under test.
+/// It names no identifier, capacity or engine, so every refused cluster is answered the same
+/// sentence.
+const CAPACITY_NOT_MODIFIABLE: &str =
+    "Only Aurora Serverless clusters can have their capacity modified.";
 
 /// The `TimeoutAction` values the operation publishes, the first of which is its documented
 /// default ("`ForceApplyCapacityChange`, the default").
@@ -315,13 +318,21 @@ const MULTI_AZ_SETTINGS: &[(&str, &str)] = &[
 ];
 
 /// The cluster kinds with no Aurora Serverless v1 capacity to set: a provisioned Aurora
-/// cluster, an Aurora SERVERLESS V2 cluster (which runs the `provisioned` engine mode and
-/// scales inside a capacity range instead), and a non-Aurora Multi-AZ DB cluster.
+/// cluster of either engine, an Aurora SERVERLESS V2 cluster of either engine (which runs
+/// the `provisioned` engine mode and scales inside a capacity range instead), and a
+/// non-Aurora Multi-AZ DB cluster of either engine. Each row is refused the SAME sentence,
+/// which is what makes the refusal text free of the engine, the identifier and the capacity.
 const INELIGIBLE: &[IneligibleRow] = &[
     IneligibleRow {
         case: "a provisioned aurora-mysql cluster",
         identifier: "emu-sv1-prov",
         engine: "aurora-mysql",
+        extra: &[],
+    },
+    IneligibleRow {
+        case: "a provisioned aurora-postgresql cluster",
+        identifier: "emu-sv1-prov-pg",
+        engine: "aurora-postgresql",
         extra: &[],
     },
     IneligibleRow {
@@ -334,9 +345,24 @@ const INELIGIBLE: &[IneligibleRow] = &[
         ],
     },
     IneligibleRow {
+        case: "an Aurora Serverless v2 aurora-mysql cluster",
+        identifier: "emu-sv1-v2-my",
+        engine: "aurora-mysql",
+        extra: &[
+            ("ServerlessV2ScalingConfiguration.MinCapacity", "1.0"),
+            ("ServerlessV2ScalingConfiguration.MaxCapacity", "128.0"),
+        ],
+    },
+    IneligibleRow {
         case: "a non-Aurora Multi-AZ DB cluster",
         identifier: "emu-sv1-multiaz",
         engine: "mysql",
+        extra: MULTI_AZ_SETTINGS,
+    },
+    IneligibleRow {
+        case: "a non-Aurora postgres Multi-AZ DB cluster",
+        identifier: "emu-sv1-multiaz-pg",
+        engine: "postgres",
         extra: MULTI_AZ_SETTINGS,
     },
 ];
@@ -376,9 +402,9 @@ async fn a_cluster_that_is_not_serverless_v1_is_refused_on_its_type() {
             );
             let message = text(&body, "Message");
             assert_eq!(
-                message, NOT_SERVERLESS_V1,
-                "case {case:?}: expected the refusal {NOT_SERVERLESS_V1:?}, got {message:?} \
-                 in {body}"
+                message, CAPACITY_NOT_MODIFIABLE,
+                "case {case:?}: expected the refusal {CAPACITY_NOT_MODIFIABLE:?}, got \
+                 {message:?} in {body}"
             );
         }
 
@@ -390,6 +416,42 @@ async fn a_cluster_that_is_not_serverless_v1_is_refused_on_its_type() {
             "case {:?}: expected no Capacity on a cluster that is not an Aurora Serverless v1 \
              one, got {reported:?}",
             row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_type_refusal_does_not_wait_for_the_cluster_to_come_up() {
+    let router = emulator();
+
+    // No amount of waiting turns a cluster of another kind into an Aurora Serverless v1 one,
+    // so the TYPE is answered before the cluster's status: a call issued while the cluster is
+    // still coming up is refused with the same sentence rather than with a state fault. No
+    // settle is waited out here, which is what makes the point.
+    for row in INELIGIBLE {
+        let extra: Vec<(&str, String)> = row
+            .extra
+            .iter()
+            .map(|(name, value)| (*name, value.to_string()))
+            .collect();
+        let identifier = format!("{}-new", row.identifier);
+        expect_ok(
+            row.case,
+            create_cluster(&router, &identifier, row.engine, &extra).await,
+        );
+
+        let case = format!("{} straight after the create", row.case);
+        let body = expect_error(
+            &case,
+            modify_capacity(&router, &identifier, &[("Capacity", "8".to_string())]).await,
+            400,
+            INVALID_PARAMETER_VALUE,
+        );
+        let message = text(&body, "Message");
+        assert_eq!(
+            message, CAPACITY_NOT_MODIFIABLE,
+            "case {case:?}: expected the refusal {CAPACITY_NOT_MODIFIABLE:?}, got {message:?} \
+             in {body}"
         );
     }
 }
