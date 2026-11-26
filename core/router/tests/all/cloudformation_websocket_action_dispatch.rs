@@ -22,9 +22,15 @@
 //! selects for each message, and the reply that route's selected integration response renders
 //! on the same connection — is driven with a WebSocket client library by the API Gateway V2
 //! crate's own `tests/all/websocket_transport_data_plane.rs`, which owns the whole of that
-//! rule (a `$connect` route bound to a `MOCK` integration included); what this suite adds is
+//! rule; what this suite adds is
 //! the CloudFormation-deployed estate behind it, which is what was missing: the integration
 //! responses and route responses a template declares are what a frame is answered FROM.
+//!
+//! The template declares no `$connect` route, which is what such a MOCK-only estate CAN
+//! deploy: a `$connect` route bound to a loopback integration invokes no backend, so nothing
+//! decides its connection request and the handshake is refused (the API Gateway V2 crate's
+//! `tests/all/websocket_connect_mock_integration.rs` owns that rule), while an api with no
+//! such route has nothing to refuse the connection.
 //!
 //! The rows differ along what the handshake generalises over: the stage the client addresses
 //! — the one the template declared, and one it did not.
@@ -80,8 +86,8 @@ const MODEL_SCHEMA: &str =
     r#"{"$schema":"http://json-schema.org/draft-04/schema#","title":"Action","type":"object"}"#;
 
 /// The template the stack is created from: a WEBSOCKET api selecting routes by
-/// [`SELECTION_EXPRESSION`], a `$connect` route and the two action routes over MOCK
-/// integrations of their own, an integration response and a route response per route (which
+/// [`SELECTION_EXPRESSION`] and the two action routes over MOCK integrations of their own
+/// (plus `$default`), an integration response and a route response per route (which
 /// is what makes a route TWO-WAY and gives its MOCK a reply to render), a deployment of the
 /// lot and the stage that serves it.
 fn template(stack: &str) -> String {
@@ -92,30 +98,6 @@ fn template(stack: &str) -> String {
                 "Name": format!("{stack}-socket"),
                 "ProtocolType": "WEBSOCKET",
                 "RouteSelectionExpression": SELECTION_EXPRESSION
-            }
-        },
-        "ConnectIntegration": {
-            "Type": "AWS::ApiGatewayV2::Integration",
-            "Properties": {
-                "ApiId": { "Ref": "Api" },
-                "IntegrationType": "MOCK",
-                "RequestTemplates": { "$default": "{\"statusCode\": 200}" }
-            }
-        },
-        "ConnectIntegrationResponse": {
-            "Type": "AWS::ApiGatewayV2::IntegrationResponse",
-            "Properties": {
-                "ApiId": { "Ref": "Api" },
-                "IntegrationId": { "Ref": "ConnectIntegration" },
-                "IntegrationResponseKey": "/2\\d\\d/"
-            }
-        },
-        "ConnectRoute": {
-            "Type": "AWS::ApiGatewayV2::Route",
-            "Properties": {
-                "ApiId": { "Ref": "Api" },
-                "RouteKey": "$connect",
-                "Target": { "Fn::Join": ["/", ["integrations", { "Ref": "ConnectIntegration" }]] }
             }
         }
     });
@@ -172,8 +154,6 @@ fn template(stack: &str) -> String {
     resources["Deployment"] = json!({
         "Type": "AWS::ApiGatewayV2::Deployment",
         "DependsOn": [
-            "ConnectRoute",
-            "ConnectIntegrationResponse",
             "EchoRoute",
             "EchoRouteResponse",
             "EchoIntegrationResponse",
@@ -206,7 +186,7 @@ fn template(stack: &str) -> String {
     .to_string()
 }
 
-/// The routes the template declares beside `$connect`: the logical id each is declared
+/// The routes the template declares: the logical id each is declared
 /// under, its `RouteKey`, and the payload its own integration response renders.
 fn declared_routes() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
@@ -274,7 +254,7 @@ async fn a_stack_deployed_websocket_api_serves_the_stage_it_published() {
     // that service's own listing: a stack that reported itself complete created them.
     for (collection, parent, expected) in [
         ("routeresponses", "routes", declared_routes().len()),
-        ("integrationresponses", "integrations", declared_routes().len() + 1),
+        ("integrationresponses", "integrations", declared_routes().len()),
     ] {
         let (status, parents) =
             apigatewayv2(&router, "GET", &format!("/v2/apis/{api_id}/{parent}"), None).await;

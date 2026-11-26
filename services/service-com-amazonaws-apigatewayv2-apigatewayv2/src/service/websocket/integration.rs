@@ -19,7 +19,10 @@
 //!   function's resource-based policy admits that principal for this route's `execute-api`
 //!   ARN ([`lambda::invocation_admitted`]); an invocation it does not admit is never made, and
 //!   the route produced no reply.
-//! * `MOCK` is answered from the integration's own records ([`super::dispatch::mock_reply`]).
+//! * `MOCK` is answered from the integration's own records ([`super::dispatch::mock_reply`]) —
+//!   for the calls of an ESTABLISHED connection. It invokes no backend, so it decides no
+//!   CONNECTION REQUEST ([`super::dispatch::decides_the_connection_request`]): a `$connect`
+//!   route bound to one produced no reply at all, and the handshake is refused.
 //! * `AWS` — the non-proxy integration — relays what its own request template RENDERS to the
 //!   backend, and reads the backend's answer back through the selected integration response's
 //!   template ([`super::non_proxy`]).
@@ -143,6 +146,17 @@ pub async fn perform(
         .integration
         .as_ref()
         .ok_or(Unserved::NoIntegration)?;
+    // The CONNECTION REQUEST is decided by the reply a BACKEND gave, so an integration that
+    // invokes none decides nothing and the handshake is refused before anything is performed
+    // ([`dispatch::decides_the_connection_request`]). Every other call of the connection is
+    // one such an integration does answer, below.
+    if matches!(call, Call::Connect)
+        && !dispatch::decides_the_connection_request(&integration.integration_type)
+    {
+        return Err(Unserved::Unperformable(
+            dispatch::no_connect_decision_reason(&integration.integration_type),
+        ));
+    }
     if integration.integration_type == dispatch::MOCK_INTEGRATION_TYPE {
         // The template is rendered against the CALL: the `$context` the gateway reports
         // about it and the serving stage's own variables, whichever of the three calls it
@@ -155,12 +169,9 @@ pub async fn perform(
                 &connection.stage_variables,
                 Some(body),
             )),
-            // A connection request and a close each carry no frame of their own, so a
-            // template rendered for one reads the call's context and nothing of a payload.
-            // Both are still calls this integration ANSWERS — a `MOCK` is API Gateway's
-            // "loopback" endpoint for a WebSocket route — and for the connection request the
-            // status it answers is what admits or refuses the handshake
-            // ([`dispatch::admission`]).
+            // A close carries no frame of its own, so a template rendered for one reads the
+            // call's context and nothing of a payload. The connection request never reaches
+            // here: a loopback integration decides none (above).
             Call::Connect | Call::Disconnect { .. } => {
                 Some(TemplateCall::new(&context, &connection.stage_variables, None))
             }

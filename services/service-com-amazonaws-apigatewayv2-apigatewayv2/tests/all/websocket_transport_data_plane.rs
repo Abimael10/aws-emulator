@@ -20,6 +20,11 @@
 //! > addresses: a `PostToConnection` to it is DELIVERED over that socket, and once the
 //! > client closes, each of the three `@connections` operations answers `GoneException`.
 //!
+//! Which `$connect` configurations can reply at all is the one slice stated separately, in
+//! `websocket_connect_mock_integration.rs`: a route bound to the loopback integration type
+//! invokes no backend, so it decides no connection request and its handshake is refused,
+//! while the same integration type serves every other route.
+//!
 //! The selection itself is the one slice stated separately, because it is a rule about the
 //! EXPRESSION rather than about the socket:
 //!
@@ -52,11 +57,12 @@
 //! reply.
 //!
 //! The rows span what the rule generalises over: the stage's state (deployed, not deployed,
-//! absent), the `$connect` route's integration (absent, a MOCK that selects a `2xx`, a MOCK
-//! that selects nothing, one fronting a backend), the selecting status (`200`, `404`, a
-//! status no pattern matches, none at all), the integration-response key forms (`/2\d\d/`,
-//! `/4\d{2}/`, `$default`), whether the serving route is two-way, and the message's own
-//! shape (a selected action, an unselected action, no action member, text that is not JSON);
+//! absent), the `$connect` route's integration (absent, a MOCK whose records would reply a
+//! `2xx`, a MOCK whose records reply nothing, one fronting a backend), the selecting status
+//! (`200`, `404`, a status no pattern matches, none at all), the integration-response key
+//! forms (`/2\d\d/`, `/4\d{2}/`, `$default`), whether the serving route is two-way, and the
+//! message's own shape (a selected action, an unselected action, no action member, text that
+//! is not JSON);
 //! and for the connection's lifetime, the message's place in the sequence (first, repeated,
 //! after another route's message, after a push) and the payload's own form (a JSON document,
 //! text that is no JSON document, a document shaped like the gateway's own envelope, no bytes
@@ -91,11 +97,9 @@ const REPLY_DEADLINE: Duration = Duration::from_secs(120);
 const SWITCHING_PROTOCOLS: u16 = 101;
 
 /// The statuses a refused handshake carries: the `403` an `execute-api` endpoint answers for
-/// a stage it does not serve, the `404` a `$connect` integration's own reply refuses a client
-/// with, and the `500` a gateway answers for a connection request its api's configuration
-/// cannot be served from.
+/// a stage it does not serve, and the `500` a gateway answers for a connection request its
+/// api's configuration cannot be served from.
 const FORBIDDEN: u16 = 403;
-const NOT_FOUND: u16 = 404;
 const INTERNAL_SERVER_ERROR: u16 = 500;
 
 /// The expression AWS documents for a WebSocket api whose messages carry an `action`
@@ -424,8 +428,9 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             expected: Ok(()),
         },
         Row {
-            // The recorded case: a MOCK integration on $connect with no integration
-            // response to select, so the connection request has no reply.
+            // The recorded case: a MOCK integration on $connect. A loopback integration
+            // invokes no backend, so nothing decides the connection request and the
+            // handshake is refused — here with no integration response at all.
             case: "a $connect route bound to a MOCK integration with no integration \
                    response fails the handshake",
             connect_integration: Some(json!({ "integrationType": "MOCK" })),
@@ -435,12 +440,13 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             expected: Err(INTERNAL_SERVER_ERROR),
         },
         Row {
-            // A `MOCK` is API Gateway's loopback endpoint for a WebSocket route, so it
-            // ANSWERS the connection request from the integration's own records: the status
-            // its rendered request template names selects an integration response, and a
-            // `2xx` admits the connection exactly as a backend's `2xx` would.
-            case: "a $connect route whose MOCK integration selects a 2xx response completes \
-                   the handshake",
+            // The same refusal for the loopback configuration that WOULD reply to a message:
+            // the status its rendered request template names selects an integration response,
+            // and still no backend decided whether this client may connect at all. The whole
+            // of that rule — and the control that the same integration serves every OTHER
+            // route — is `websocket_connect_mock_integration.rs`'s.
+            case: "a $connect route whose MOCK integration selects a 2xx response still \
+                   fails the handshake",
             connect_integration: Some(json!({
                 "integrationType": "MOCK",
                 "requestTemplates": { "$default": "{\"statusCode\": 200}" }
@@ -448,14 +454,14 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             connect_responses: vec![json!({ "integrationResponseKey": "/2\\d\\d/" })],
             deploy: true,
             handshake_stage: stage,
-            expected: Ok(()),
+            expected: Err(INTERNAL_SERVER_ERROR),
         },
         Row {
-            // The other side of that reading: a reply outside `2xx` refuses the handshake
-            // with the status the integration answered, which for a `MOCK` is the status its
-            // own template named.
-            case: "a $connect route whose MOCK integration selects a 4xx response refuses \
-                   the handshake with that status",
+            // And the same refusal for a loopback whose records name a status outside `2xx`:
+            // what the gateway answers is its own `500` for a connection request nothing
+            // decided, not the status that integration would have replied to a message with.
+            case: "a $connect route whose MOCK integration selects a 4xx response fails the \
+                   handshake with the gateway's own status",
             connect_integration: Some(json!({
                 "integrationType": "MOCK",
                 "requestTemplates": { "$default": "{\"statusCode\": 404}" }
@@ -463,7 +469,7 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             connect_responses: vec![json!({ "integrationResponseKey": "/4\\d{2}/" })],
             deploy: true,
             handshake_stage: stage,
-            expected: Err(NOT_FOUND),
+            expected: Err(INTERNAL_SERVER_ERROR),
         },
         Row {
             // A $connect route whose integration fronts a FUNCTION this emulator does not
@@ -572,15 +578,20 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
     }
 }
 
-/// The whole exchange an api that reaches NO backend at all carries: a `$connect` route bound
-/// to a `MOCK` whose own records admit the connection, and action routes whose `MOCK`
-/// integrations render the reply each frame is answered with on that same socket.
+/// The whole exchange an api that reaches NO backend at all carries: action routes whose
+/// `MOCK` integrations render the reply each frame is answered with, over a connection nothing
+/// refused.
 ///
 /// It is the configuration a client can deploy without any compute service — the one a
 /// CloudFormation template of api, integrations, integration responses, routes, route
 /// responses, a deployment and a stage describes (`core/router/tests/all/
 /// cloudformation_websocket_action_dispatch.rs` deploys exactly that estate) — so the whole
 /// of it has to hold over one connection rather than row by row.
+///
+/// The api holds NO `$connect` route, which is what such an estate CAN deploy: a `$connect`
+/// route bound to a loopback integration decides no connection request and its handshake is
+/// refused (`websocket_connect_mock_integration.rs`), while an api with no such route has
+/// nothing to refuse the connection.
 #[tokio::test]
 async fn a_mock_backed_api_admits_the_connection_and_answers_each_action() {
     /// One row: the message the client sends, and the reply the route it selects renders.
@@ -593,28 +604,6 @@ async fn a_mock_backed_api_admits_the_connection_and_answers_each_action() {
     let case = "an api whose every route is a MOCK loopback";
     let emulator = emulator();
     let api = create_api(&emulator, case, "mock-session-api").await;
-
-    // The `$connect` route's own integration: a MOCK that renders a 2xx and holds the
-    // response that status selects, which is what admits the connection.
-    let connect = create_integration(
-        &emulator,
-        case,
-        &api.api_id,
-        json!({
-            "integrationType": "MOCK",
-            "requestTemplates": { "$default": "{\"statusCode\": 200}" }
-        }),
-    )
-    .await;
-    create_integration_response(
-        &emulator,
-        case,
-        &api.api_id,
-        &connect,
-        json!({ "integrationResponseKey": "/2\\d\\d/" }),
-    )
-    .await;
-    create_route(&emulator, case, &api.api_id, "$connect", &connect, false).await;
 
     // One two-way route per action value the api serves, each with the reply its own
     // integration response renders: the two the expression selects by name, and `$default`.
@@ -652,8 +641,8 @@ async fn a_mock_backed_api_admits_the_connection_and_answers_each_action() {
         .await
         .unwrap_or_else(|status| {
             panic!(
-                "case {case:?}: a MOCK-backed $connect whose records reply 2xx must complete \
-                 the handshake, got {status}"
+                "case {case:?}: an api with no $connect route has nothing to refuse the \
+                 connection, got a handshake refused {status}"
             )
         });
 

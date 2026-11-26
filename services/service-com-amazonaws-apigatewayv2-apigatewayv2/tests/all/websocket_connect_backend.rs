@@ -17,17 +17,19 @@
 //! The rule the LAST table is a slice of: **a WEBSOCKET connection request is admitted or
 //! refused by the REPLY the `$connect` route's integration produced, so a route that fronts a
 //! BACKEND is refused only by the status that backend answered — and with the body it
-//! answered — while a route bound to a `MOCK` is admitted or refused by the reply that
-//! loopback integration computes from its own records; the gateway's own `500`
-//! `{"message":"Internal server error"}` is owed exactly to a `$connect` route that can serve
-//! the connection request no reply at all: one targeting no integration of the api, and a
-//! `MOCK` that selects no integration response to answer from. An api with no `$connect` route
-//! has nothing to refuse the connection.** `MOCK` is "for integrating the route or method
+//! answered; the gateway's own `500` `{"message":"Internal server error"}` is owed exactly to
+//! a `$connect` route that can serve the connection request no reply at all: one targeting no
+//! integration of the api, and one bound to an integration that invokes no backend to decide
+//! the connection with (`MOCK`). An api with no `$connect` route has nothing to refuse the
+//! connection.** `MOCK` is "for integrating the route or method
 //! request with API Gateway as a 'loopback' endpoint without invoking any backend. Supported
 //! only for WebSocket APIs" and `AWS_PROXY` is
 //! "for integrating the route or method request with a Lambda function or other AWS service
 //! action" (`smithy_query(query="shape", shape="Integration")`, member `IntegrationType`),
-//! which is why the two REACH a connection request's decision differently.
+//! which is why the two REACH a connection request's decision differently. The whole of the
+//! loopback half of that rule — every shape such an integration's records take, and the
+//! control that it goes on serving every other route — is
+//! `websocket_connect_mock_integration.rs`'s.
 //!
 //! Nothing in the first table is a value this emulator fills in: the mapping is asserted
 //! through the DECISION of a function that ran, which is why AWS Lambda is mounted beside
@@ -548,12 +550,12 @@ enum Connect {
     /// No `$connect` route at all.
     Absent,
     /// A `MOCK` integration carrying the documented request template, which renders the
-    /// `2xx` a loopback integration answers from its own records, and the `$default`
-    /// integration response that status selects.
+    /// `2xx` a loopback integration answers a MESSAGE from its own records with, and the
+    /// `$default` integration response that status selects. It still invokes no backend, so
+    /// it decides no connection request.
     Mock,
     /// The same `MOCK` request template with NO integration response for the status it
-    /// renders to select: a loopback integration that answers the connection request nothing
-    /// at all.
+    /// renders to select: a loopback integration that answers nothing at all.
     MockWithoutResponse,
     /// An `AWS_PROXY` integration whose function answers this `statusCode` and this `body`
     /// (an empty body being a reply that carries none).
@@ -585,7 +587,7 @@ struct AdmissionRow {
 /// that admits, a function that refuses — and
 /// along the status and body that function answers: a `2xx`, a `4xx` the client is refused
 /// with, and a `5xx`, each of which the gateway relays rather than replacing with one of its
-/// own. The recorded case is the `MOCK` row and the `(200, "")` row, which is the same api's
+/// own. The recorded case is the `MOCK` rows and the `(200, "")` row, which is the same api's
 /// `$connect` route re-pointed onto a Lambda.
 ///
 /// The other configuration the rule refuses — a `$connect` route that targets no integration
@@ -601,7 +603,7 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
     AdmissionRow {
         case: "a $connect route bound to a MOCK loopback that renders a 2xx",
         connect: Connect::Mock,
-        expected: Expected::Admitted,
+        expected: Expected::Unplaceable,
     },
     AdmissionRow {
         case: "a $connect route bound to a MOCK loopback that selects no integration \

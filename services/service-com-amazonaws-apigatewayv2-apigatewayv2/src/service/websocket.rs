@@ -57,13 +57,12 @@
 //!    `{"message":"Internal server error"}`. Past that precondition the authorizer's own
 //!    function decides, and a DENY is `403` ([`connect_authorizer`]);
 //! 5. the CONNECTION REQUEST itself is served by the `$connect` route's integration,
-//!    PERFORMED ([`integration`]) whatever that integration's type is — a `MOCK` answers it
-//!    from the integration's own records, which is what that type is for on a WebSocket api —
-//!    and the handshake completes only on a `2xx` reply: a reply outside `2xx` refuses the
-//!    handshake with the status that integration answered and the body it answered, because
-//!    `$connect` is where a backend admits or refuses a client, while a `$connect` route that
-//!    can serve the connection request no reply AT ALL — one targeting no integration, or a
-//!    `MOCK` that selects no integration response — is `500`
+//!    PERFORMED ([`integration`]), and the handshake completes only on a `2xx` reply: a reply
+//!    outside `2xx` refuses the handshake with the status that integration answered and the
+//!    body it answered, because `$connect` is where a backend admits or refuses a client,
+//!    while a `$connect` route that can serve the connection request no reply AT ALL — one
+//!    targeting no integration, and one bound to an integration that invokes no backend to
+//!    decide with (`MOCK`, the loopback type) — is `500`
 //!    `{"message":"Internal server error"}`
 //!    ([`dispatch::admission`], the same rule the api's own socket applies).
 //!
@@ -544,11 +543,12 @@ fn seam_transport<Eng: Send + Sync + 'static>(
 /// they do not refuse.
 ///
 /// What the records refuse is a `$connect` route that can serve the connection request no
-/// reply at all, and a route whose own records ANSWER it outside `2xx` — see
-/// [`dispatch::admission`]. A route that fronts a BACKEND is not refused here: the decision is
-/// that backend's, and giving the gateway's configuration-fault status to a configuration API
-/// Gateway serves would make a correctly configured Lambda-backed `$connect`
-/// indistinguishable from one this endpoint cannot serve at all.
+/// reply at all: one targeting no integration, and one bound to an integration that invokes no
+/// backend to decide the connection with — see [`dispatch::admission`]. A route that fronts a
+/// BACKEND is not refused here: the decision is that backend's, and giving the gateway's
+/// configuration-fault status to a configuration API Gateway serves would make a correctly
+/// configured Lambda-backed `$connect` indistinguishable from one this endpoint cannot serve
+/// at all.
 fn refused_by_the_records(offered: &OfferedHandshake) -> Option<RtResponse> {
     match &offered.admission {
         dispatch::Admission::Refused(reason) => {
@@ -560,22 +560,6 @@ fn refused_by_the_records(offered: &OfferedHandshake) -> Option<RtResponse> {
                  serve it no reply"
             );
             Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None))
-        }
-        // The `$connect` route's own records answered the connection request, and that answer
-        // is outside `2xx`: the client reads the status and the body that reply carries, which
-        // is what the api's own socket answers it too.
-        dispatch::Admission::RepliedWith(reply) => {
-            tracing::info!(
-                api_id = %offered.connection.api_id,
-                stage = %offered.connection.stage_name,
-                status = ?reply.status_code,
-                "refusing a WebSocket opening handshake: the connection request's \
-                 integration did not reply successfully"
-            );
-            Some(refused_by_the_connection_request(&integration::Answered {
-                status_code: reply.status_code.clone(),
-                payload: reply.payload.clone().map(String::into_bytes),
-            }))
         }
         dispatch::Admission::Admitted | dispatch::Admission::BackendDecides => None,
     }
