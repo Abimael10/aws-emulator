@@ -147,6 +147,20 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // signing name is that service's (the group and its scaling policy,
     // [`provisioner::compute_fleet`] and [`provisioner::auto_scaling_policies`]).
     ("autoscaling", "AutoScaling", SdkDiagnostic::Attempts),
+    // AWS Backup's SDK names it `Backup` — that model's own `sdkId`, which is also the
+    // `cloudFormationName` the type names of its resources carry
+    // (`smithy_query(query="service_info")` on that service's model: `sdkId: "Backup"`,
+    // `cloudFormationName: Backup`). The shape is the ATTEMPT-counting one, as the recorded
+    // `ResourceStatusReason` of an `AWS::Backup::BackupPlan` whose rule declares a
+    // `ScheduleExpression` that service does not parse carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `backup__cloudformation.deploy-backup-plan-invalid-schedule-expression-rejected`, whose
+    // reason reads `Resource handler returned message: "<the service's sentence> (Service:
+    // Backup, Status Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: InvalidRequest)`). The three resource types this emulator provisions
+    // over this signing name are all that service's (the vault, the plan and the selection,
+    // [`crate::state::provisioner::create_backup_vault`] and the arms beside it).
+    ("backup", "Backup", SdkDiagnostic::Attempts),
     // Amazon Braket's SDK names it by that model's own `sdkId` (`Braket`), and words its
     // diagnostic with the refused OPERATION and that service's error code in it, as the
     // recorded `ResourceStatusReason` of a failed `AWS::Braket::SpendingLimit` carries it (in

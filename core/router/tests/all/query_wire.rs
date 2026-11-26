@@ -362,6 +362,25 @@ pub(crate) fn block_contains(block: &str, address: &str) -> bool {
 /// — one of the three copies this replaced accepted upper-case hex digits the pattern does
 /// not allow. The prefix is deliberately not checked for: the pattern is the whole rule.
 pub(crate) fn is_waf_entity_id(id: &str) -> bool {
+    is_lowercase_uuid(id)
+}
+
+/// Whether `id` has the form of an identifier this emulator MINTS per call or per resource: a
+/// uuid rendered 8-4-4-4-12 in lower-case hex (`crate::state::new_request_id`'s own form).
+///
+/// The same reading [`is_waf_entity_id`] performs, named for the other thing it judges, and
+/// delegating to the one implementation below so the two cannot drift: a suite checking the
+/// id of a call the emulator reported — the `Request ID` an SDK diagnostic states, the token
+/// of a resource request — is asking about a minted identifier rather than about a WAFv2
+/// entity, and is asking it of the same form.
+pub(crate) fn is_minted_uuid(id: &str) -> bool {
+    is_lowercase_uuid(id)
+}
+
+/// The ONE reading both of the two above are: five hyphen-separated groups of 8, 4, 4, 4 and
+/// 12 digits, each from `[0-9a-f]` — so the upper-case hex neither form admits is rejected
+/// once rather than in each caller.
+fn is_lowercase_uuid(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.len() == 5
         && [8, 4, 4, 4, 12]
