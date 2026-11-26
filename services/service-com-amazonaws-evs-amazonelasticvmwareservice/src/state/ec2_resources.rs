@@ -531,7 +531,9 @@ pub fn instance_type_cores(instance_type: &str) -> Option<u64> {
 /// `None` — no instance launched, so the host reports neither `ec2InstanceId` nor
 /// `networkInterfaces` rather than naming resources that do not exist — when the EC2
 /// store cannot be read at all (the same "evidence of nothing" answer every function in
-/// this module gives for that case), or when that store is at a ceiling of its own.
+/// this module gives for that case), when that store is at a ceiling of its own, or when
+/// no Availability Zone can be named for the environment ([`environment_zone`]), which is
+/// no zone to place an instance in.
 ///
 /// The caller holds this service's own store while this runs. That nesting is safe in
 /// one direction only, and this is it: Amazon EC2's handlers never read Amazon EVS
@@ -543,22 +545,15 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
     let state = ec2_state(engine)?;
     let mut store = state.lock();
 
-    // The Availability Zone the environment is deployed in: the zone of the service
-    // access subnet the caller gave it, which is a fact about that EC2 subnet rather
-    // than a choice. An account whose store no longer holds that subnet falls back to
-    // the Region's first zone, the way EC2's own placement does — and a Region with no
-    // zone at all leaves nothing to place an instance in, so nothing is launched: a
-    // Region name is not a zone name, and storing one would report a zone no
-    // `DescribeAvailabilityZones` lists.
-    let availability_zone = store
-        .subnets
-        .get(launch.service_access_subnet_id)
-        .and_then(|subnet| subnet.availability_zone.clone())
-        .or_else(|| {
-            ec2::availability_zones_in_region(launch.region)
-                .first()
-                .map(|zone| zone.zone_name.clone())
-        })?;
+    // The Availability Zone the environment is deployed in, read through the one function
+    // that resolves it ([`environment_zone`]): the instance an ESX host IS is placed in the
+    // same single zone the environment's subnets are in, so one answer serves both — and a
+    // zone that cannot be named leaves nothing to place an instance in, so nothing is
+    // launched rather than an instance being stored with a `placement_az` no
+    // `DescribeAvailabilityZones` lists. The zone's ID is a subnet's member and no
+    // instance's, so the launch keeps only the name.
+    let (availability_zone, _zone_id) =
+        environment_zone(&store, launch.region, launch.service_access_subnet_id)?;
 
     // WHERE the launch put the instance, in the members EC2 records a placement on an
     // instance with: the Dedicated Host it is on is `Placement$HostId`
@@ -1052,7 +1047,7 @@ pub fn vlan_placement_failures<Eng: Send + Sync + 'static>(
     failures
 }
 
-/// The single Availability Zone every subnet of the environment's VPC is in — its zone
+/// The single Availability Zone every resource of the environment is placed in — its zone
 /// name and that zone's id.
 ///
 /// "Amazon EVS requires that all VPC subnets exist in a single Availability Zone in a
@@ -1061,6 +1056,11 @@ pub fn vlan_placement_failures<Eng: Send + Sync + 'static>(
 /// are provisioned there. A service access subnet the store holds without a zone leaves
 /// the Region's first zone, which is the zone `CreateSubnet` itself picks for a request
 /// that names none; `None` when neither names one, which is no zone to put a subnet in.
+///
+/// THE one place that rule is stated: [`provision_vlan_subnets`] places the VLAN subnets
+/// in this zone and [`launch_host_instance`] places the instance an ESX host IS in it, so
+/// the two cannot answer a caller two different zones for one environment, and a zone no
+/// `DescribeAvailabilityZones` lists — a nameless one — is refused for both.
 fn environment_zone(
     store: &ec2::ComAmazonawsEc2Amazonec2State,
     region: &str,
