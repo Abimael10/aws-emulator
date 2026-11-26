@@ -152,18 +152,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `actionParams` is optional here, and when it is present it is subject to the
         // same rule the create reads it under: it defines exactly ONE type of change
         // ([`crate::state::action_types_defined`]), since "each mitigation action can
-        // apply only one type of change". Checked BEFORE the record is touched, so a
-        // refused update writes nothing.
+        // apply only one type of change", refused in the one sentence this family states
+        // that rule with ([`crate::state::ONE_ACTION_PARAMETER_MESSAGE`]). Checked BEFORE
+        // the record is touched, so a refused update writes nothing.
         if let Some(action_params) = input.action_params.as_ref() {
-            let defined = crate::state::action_types_defined(action_params);
-            if defined.len() != 1 {
+            if crate::state::action_types_defined(action_params).len() != 1 {
                 return Err(UpdateMitigationActionErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(crate::state::one_action_type_message(&defined)),
+                        message: Some(crate::state::ONE_ACTION_PARAMETER_MESSAGE.to_string()),
                     },
                 )
                 .into());
             }
+        }
+
+        // A `roleArn` the request carries is the role the action is applied with, read for
+        // its FORM the way the create reads it ([`crate::state::unreadable_role_arn`]): the
+        // model bounds that member's length alone, so a value that is no IAM role ARN would
+        // leave a stored action that could never be applied. The modelled
+        // `InvalidRequestException` (HTTP 400), before the record is touched.
+        if let Some(message) = input
+            .role_arn
+            .as_deref()
+            .and_then(crate::state::unreadable_role_arn)
+        {
+            return Err(UpdateMitigationActionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         let now = ::std::time::SystemTime::now();

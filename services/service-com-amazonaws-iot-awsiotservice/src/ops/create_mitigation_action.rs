@@ -159,15 +159,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Each mitigation action can apply only one type of change", and
         // `MitigationActionParams` carries one optional member per type, so parameters
         // that define no type, or more than one, define no action: the modelled
-        // `InvalidRequestException` (HTTP 400), worded with this family's own sentence
-        // ([`crate::state::one_action_type_message`]) so every writer of an action states
-        // that rule the same way. The action's TYPE is then read back out of the stored
-        // parameters rather than recorded beside them.
-        let defined = crate::state::action_types_defined(&input.action_params);
-        if defined.len() != 1 {
+        // `InvalidRequestException` (HTTP 400), worded with this family's one sentence for
+        // that rule ([`crate::state::ONE_ACTION_PARAMETER_MESSAGE`]) so every writer of an
+        // action states it the same way. The action's TYPE is then read back out of the
+        // stored parameters rather than recorded beside them.
+        if crate::state::action_types_defined(&input.action_params).len() != 1 {
             return Err(CreateMitigationActionErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(crate::state::one_action_type_message(&defined)),
+                    message: Some(crate::state::ONE_ACTION_PARAMETER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `roleArn` is "The ARN of the IAM role that is used to apply the mitigation
+        // action" and the model bounds its LENGTH alone, so a value long enough to pass the
+        // request boundary may still be no role ARN at all: an action stored under one
+        // could never be applied, so the form is read here
+        // ([`crate::state::unreadable_role_arn`]) and a value that is not an IAM role ARN
+        // is the modelled `InvalidRequestException` (HTTP 400), before anything is written.
+        if let Some(message) = crate::state::unreadable_role_arn(&input.role_arn) {
+            return Err(CreateMitigationActionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
                 },
             )
             .into());
@@ -196,24 +210,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The name is the action's identity, so a name already taken is a conflict:
-        // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
-        // already-exists sentence ([`crate::state::existing_mitigation_action_message`])
-        // rather than one phrased here, which names the ARN of the action the account
-        // ALREADY holds, and reporting that record.
+        // What the account ALREADY holds under this name decides the call. The collision
+        // this family states is an existing resource "with different attributes"
+        // ([`crate::state::existing_mitigation_action_message`]), so it is what the create
+        // ASKS for — the role the action is applied with and the parameters it applies
+        // ([`crate::state::RegisteredMitigationAction::applies_the_same_change`]) — and not
+        // the name alone that is compared, exactly as the registry families compare a
+        // repeat create.
         if let Some(existing) = store.mitigation_actions.get(&input.action_name) {
-            return Err(
-                CreateMitigationActionErrorModeled::ResourceAlreadyExistsException(
-                    ResourceAlreadyExistsException {
-                        message: Some(crate::state::existing_mitigation_action_message(
-                            &existing.action_arn,
-                        )),
-                        resource_id: Some(existing.action_id.clone()),
-                        resource_arn: Some(existing.action_arn.clone()),
-                    },
-                )
-                .into(),
-            );
+            if !existing.applies_the_same_change(&input.role_arn, &input.action_params) {
+                // A DIFFERENT action under a name the account holds is the conflict:
+                // `ResourceAlreadyExistsException` (HTTP 409) carrying this family's
+                // sentence ALONE — it names the ARN of the action that already exists, and
+                // AWS reports no further identity for it, so `resourceId`/`resourceArn`
+                // stay absent rather than adding members the caller does not expect.
+                return Err(
+                    CreateMitigationActionErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(crate::state::existing_mitigation_action_message(
+                                &existing.action_arn,
+                            )),
+                            resource_id: None,
+                            resource_arn: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The repeat create names the SAME action: it mints no new identity and writes
+            // nothing — the stored record keeps its id, its ARN, its tags and its instants
+            // — and answers from that record, so a client that creates its actions on
+            // every deploy keeps the identity it was handed the first time.
+            return Ok(CreateMitigationActionOutput {
+                action_arn: Some(existing.action_arn.clone()),
+                action_id: Some(existing.action_id.clone()),
+            });
         }
 
         // Past the ceiling nothing is written and the create is refused with the modelled

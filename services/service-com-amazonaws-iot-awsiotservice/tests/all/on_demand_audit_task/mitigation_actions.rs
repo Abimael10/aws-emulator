@@ -17,8 +17,10 @@
 //! parameters, and the creation and last-modified instants — until an update replaces the
 //! members it names (keeping the name, the id and the ARN) or a delete removes it. A name
 //! the account does not hold is `ResourceNotFoundException` (404) to the readers and to
-//! the update, a name it already holds is `ResourceAlreadyExistsException` (409) to the
-//! create, and parameters that define no single type are `InvalidRequestException` (400).
+//! the update, a name it already holds with a DIFFERENT action is
+//! `ResourceAlreadyExistsException` (409) to the create (the repeat create of the same
+//! action is the stored record — see `crate::mitigation_action_write_rules`), and
+//! parameters that define no single type are `InvalidRequestException` (400).
 //! `DeleteMitigationAction` models no not-found error at all, so a repeated delete answers
 //! exactly as the first one did.
 //!
@@ -912,17 +914,15 @@ async fn a_mitigation_action_the_store_cannot_take_is_refused_and_changes_nothin
         "case a name already taken: expected this family's already-exists sentence, got {}",
         duplicate.text()
     );
+    // The sentence already names the action that exists, by its ARN, and AWS reports no
+    // further identity for it: this refusal carries the message alone.
     assert_eq!(
         (
-            duplicate.json()["resourceId"].as_str(),
-            duplicate.json()["resourceArn"].as_str()
+            duplicate.json().get("resourceId").cloned(),
+            duplicate.json().get("resourceArn").cloned()
         ),
-        (
-            created.json()["actionId"].as_str(),
-            Some(expected_arn(action_name).as_str())
-        ),
-        "case a name already taken: expected the refusal to report the record that holds the \
-         name, got {}",
+        (None, None),
+        "case a name already taken: this refusal sends no resourceId or resourceArn, got {}",
         duplicate.text()
     );
     let described = emulator.describe(action_name).await.json();

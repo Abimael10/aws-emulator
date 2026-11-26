@@ -3897,9 +3897,10 @@ pub use command_deletion::{
 // are re-exported here so a handler reaches them as `crate::state::<name>`.
 pub mod mitigation_actions;
 pub use mitigation_actions::{
-    action_types_defined, missing_mitigation_action_message, mitigation_action_arn,
-    one_action_type_message, unresolved_mitigation_action_message, RegisteredMitigationAction,
-    MAX_MITIGATION_ACTIONS, MAX_MITIGATION_ACTION_TAGS,
+    action_types_defined, invalid_role_arn_message, missing_mitigation_action_message,
+    mitigation_action_arn, unreadable_role_arn, unresolved_mitigation_action_message,
+    RegisteredMitigationAction, MAX_MITIGATION_ACTIONS, MAX_MITIGATION_ACTION_TAGS,
+    ONE_ACTION_PARAMETER_MESSAGE,
 };
 
 // Whether the software bill of materials an association names is one the service can READ

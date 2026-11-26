@@ -17,6 +17,15 @@
 //! `CreateMitigationAction` reports the created action member for member: a reader clones
 //! what the writer stored and the two cannot drift.
 //!
+//! What a writer of an action is held to lives here too, so the create and the update read
+//! one rule: the parameters define exactly one type of change
+//! ([`ONE_ACTION_PARAMETER_MESSAGE`]), and the `roleArn` they are applied with is the ARN
+//! of an IAM role ([`unreadable_role_arn`]) — the model bounds that member's LENGTH alone,
+//! so its FORM is read here. A create under a name the account already holds is decided by
+//! what it ASKS for ([`RegisteredMitigationAction::applies_the_same_change`]): the same
+//! action is the record itself, and a different one is the collision this family states
+//! with the ARN of the record that exists ([`super::existing_mitigation_action_message`]).
+//!
 //! The action's TYPE is DERIVED from the parameters it was created with rather than
 //! recorded beside them ([`RegisteredMitigationAction::action_type`]): "Each mitigation
 //! action can apply only one type of change" (`CreateMitigationAction`), and
@@ -99,8 +108,8 @@ const FINDING_ACTION_NAME_MEMBER: &str = "findingActionName";
 ///
 /// A well-formed `MitigationActionParams` defines exactly ONE: "Each mitigation action can
 /// apply only one type of change", so the writers read this and refuse anything else
-/// ([`one_action_type_message`]), and a reader of a stored record takes the single entry
-/// as the record's type.
+/// ([`ONE_ACTION_PARAMETER_MESSAGE`]), and a reader of a stored record takes the single
+/// entry as the record's type.
 pub fn action_types_defined(params: &MitigationActionParams) -> Vec<&'static str> {
     let defined = [
         (
@@ -134,24 +143,41 @@ pub fn action_types_defined(params: &MitigationActionParams) -> Vec<&'static str
         .collect()
 }
 
-/// How this service refuses `actionParams` that do not define exactly one type of change,
-/// where `defined` is what [`action_types_defined`] read out of them.
+/// How this service refuses `actionParams` that do not define exactly one type of change —
+/// parameters defining NONE and parameters defining more than one alike.
 ///
-/// The fixed text states the documented rule — "Each mitigation action can apply only one
-/// type of change" — and the variable part is which types the request's own parameters
-/// defined, so a caller is told what it sent rather than only that it was wrong.
-pub fn one_action_type_message(defined: &[&str]) -> String {
-    if defined.is_empty() {
-        "actionParams must define one type of mitigation action, and defines none: each \
-         mitigation action can apply only one type of change"
-            .to_string()
-    } else {
-        format!(
-            "actionParams must define one type of mitigation action, and defines {}: each \
-             mitigation action can apply only one type of change",
-            defined.join(", ")
-        )
-    }
+/// `MitigationActionParams` documents "You can specify only one type of parameter (in other
+/// words, you can apply only one action for each defined mitigation action)"
+/// (`smithy_query(query="doc",shape="MitigationActionParams")`), and the refusal states
+/// that one rule as ENTIRELY fixed text: it names neither the member nor the types the
+/// request's parameters defined, so one sentence states both sides of the rule and the
+/// create and the update word it one way.
+pub const ONE_ACTION_PARAMETER_MESSAGE: &str = "Expected only one action parameter to be set";
+
+/// The refusal a mitigation action's `roleArn` is answered with when it is not the ARN of
+/// an IAM role at all, or `None` when it names one.
+///
+/// `roleArn` is "The ARN of the IAM role that is used to apply the mitigation action" and
+/// the model constrains it by LENGTH alone — `RoleArn`, 20..2048, with no `@pattern`
+/// (`smithy_query(query="operation",operation="CreateMitigationAction")`) — so a value long
+/// enough to satisfy that bound and yet no role ARN passes the request boundary and has to
+/// be read here: an action stored under it names a role nothing could ever be applied
+/// with. The form required is the one every service reads an IAM role ARN with
+/// ([`::service_common::arn::IAM_ROLE`]), so no two planes disagree about what the ARN of a
+/// role is, and the refusal is the modelled `InvalidRequestException` (HTTP 400) carrying
+/// the sentence [`invalid_role_arn_message`] states.
+pub fn unreadable_role_arn(role_arn: &str) -> Option<String> {
+    (!::service_common::arn::IAM_ROLE.admits(role_arn)).then(|| invalid_role_arn_message(role_arn))
+}
+
+/// How this service states that a `roleArn` holds text that is not the ARN of an IAM role.
+///
+/// The fixed text is `Invalid Role ARN:: ` — the clause's own colon followed by the colon
+/// that opens the value — and the single variable part is the value the request carried,
+/// echoed exactly as it was sent, so a caller reads back what it submitted and nothing of
+/// the account's state.
+pub fn invalid_role_arn_message(role_arn: &str) -> String {
+    format!("Invalid Role ARN:: {role_arn}")
 }
 
 /// One mitigation action in the store, as this service persists it.
@@ -210,6 +236,29 @@ impl RegisteredMitigationAction {
     /// parameters are for.
     pub fn action_type(&self) -> Option<&'static str> {
         action_types_defined(&self.action_params).first().copied()
+    }
+
+    /// Whether this record IS the action a create under its name asks for: the role the
+    /// action is applied with and the parameters it applies — everything a create states
+    /// ABOUT the action rather than naming it.
+    ///
+    /// This is what decides a repeat create, the way it decides one for every other family
+    /// whose collision is stated as an existing resource with DIFFERENT attributes
+    /// ([`super::existing_mitigation_action_message`], and
+    /// [`super::ThingConfiguration`] for the registry's): a second create asking for
+    /// exactly what the record holds is the same action, and one asking for anything else
+    /// is the conflict.
+    ///
+    /// Tags are not part of it, for the reason the other comparing families leave them out:
+    /// "Metadata that can be used to manage the mitigation action" is not what the action
+    /// does, so a repeat create keeps the tags the record already carries, whatever the
+    /// request sent — changing them is what `TagResource`/`UntagResource` are for.
+    pub fn applies_the_same_change(
+        &self,
+        role_arn: &str,
+        action_params: &MitigationActionParams,
+    ) -> bool {
+        self.role_arn == role_arn && self.action_params == *action_params
     }
 
     /// Apply an `UpdateMitigationAction`: the members the request carried replace what the
