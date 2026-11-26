@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use service_com_amazonaws_s3_amazons3::state::VERSION_ID_CHARS;
+use service_com_amazonaws_s3_amazons3::state::{NULL_VERSION_ID, VERSION_ID_CHARS};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, Answer};
@@ -1332,6 +1332,342 @@ async fn an_unresolvable_version_pin_is_one_error_per_entry_whatever_the_batch_a
             held.iter().any(|(key, _)| key == pinned),
             "case {case:?}: the key the refused identifier named must keep its version, the \
              listing reports {held:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The RESOLVABLE side of the partition: WHICH stored version a version-pinned identifier
+// reaches, and the accounting over the whole payload around it.
+// ---------------------------------------------------------------------------------------
+
+/// What kind of STORED version the resolvable identifier of a mixed batch pins.
+///
+/// The rows of [`a_mixed_batch_deletes_every_version_its_identifiers_resolve`] span the kinds a
+/// bucket holds at all: a key's chain is "the current version followed by the noncurrent ones,
+/// delete markers among them", and a version is minted ("all objects added to the bucket
+/// receive a unique version ID") or is the `null` version ([`NULL_VERSION_ID`]) — "all objects
+/// added to the bucket receive the version ID null" while the status is `Suspended`, and
+/// "objects stored in your bucket before you set the versioning state have a version ID of null"
+/// (`PutBucketVersioning`'s own documentation).
+#[derive(Debug)]
+enum Stored {
+    /// The key's current object version, minted by a write into a versioning-enabled bucket.
+    CurrentVersion,
+    /// A noncurrent object version, kept behind a newer write of the same key.
+    NoncurrentVersion,
+    /// The delete marker a simple delete of the key laid.
+    Marker,
+    /// The `null` version of a write made while the bucket's versioning is `Suspended`.
+    NullAfterSuspension,
+    /// The `null` version of a write made before the bucket carried a versioning state at all.
+    NullFromBeforeVersioning,
+}
+
+/// Write `key` and hand back the version id a request names that write's version by: the id the
+/// write minted, or [`NULL_VERSION_ID`] — the id a request names the version of a write made
+/// while the bucket was not versioning-enabled by — when the bucket minted none.
+async fn written_version(router: &MultiServiceRouter, name: &str, key: &str) -> String {
+    let minted = write_keys(router, name, &[key]).await[key].clone();
+    if minted.is_empty() {
+        NULL_VERSION_ID.to_string()
+    } else {
+        minted
+    }
+}
+
+#[tokio::test]
+async fn a_mixed_batch_deletes_every_version_its_identifiers_resolve() {
+    // RULE: `DeleteObjects` is evaluated per identifier, and each one performs exactly what a
+    // `DeleteObject` for its pair would: an identifier pinning a `VersionId` that names a
+    // version the bucket HOLDS of that key removes exactly that version and is reported under
+    // `Deleted`, echoing the `Key` and `VersionId` it named — with `DeleteMarker` true and
+    // `DeleteMarkerVersionId` naming it when the version removed was itself a delete marker
+    // ("indicates whether the specified object version that was permanently deleted was (true)
+    // or was not (false) a delete marker before deletion", `DeletedObject$DeleteMarker`) —
+    // while only an identifier whose `VersionId` resolves to NO version of a key the bucket
+    // still holds versions of is an `Errors` entry, under `NoSuchVersion` and that code's own
+    // fixed sentence. The two lists are disjoint and together report every requested pair
+    // exactly once, and nothing but the versions the resolvable identifiers named leaves the
+    // store.
+    //
+    // The rows differ along the KIND of stored version the resolvable identifier pins (every
+    // kind a bucket holds: a current version, a noncurrent one behind a newer write, a delete
+    // marker, the `null` version of a suspended bucket and the `null` version of a write made
+    // before versioning was ever set), along the FORM of the token the unresolvable identifier
+    // carries (one of the shape this store mints that nothing issued, the published example of
+    // a real S3 version id, a token that is no version id at all) and along the ORDER the two
+    // ride in the payload.
+    let target = "svc-file1.txt";
+    let partner = "svc-file2.txt";
+
+    // (case, the kind the resolvable identifier pins, the unresolvable token, whether the
+    // resolvable identifier comes first).
+    let rows: Vec<(&str, Stored, String, bool)> = vec![
+        (
+            "the current version, resolvable identifier first",
+            Stored::CurrentVersion,
+            "f".repeat(VERSION_ID_CHARS),
+            true,
+        ),
+        (
+            "a noncurrent version behind a newer write, resolvable identifier last",
+            Stored::NoncurrentVersion,
+            // The published example of an issued version id, which is the shape a client's
+            // stale bookkeeping hands back: another width and another alphabet.
+            "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY".to_string(),
+            false,
+        ),
+        (
+            "the delete marker a simple delete laid",
+            Stored::Marker,
+            "not-a-version".to_string(),
+            true,
+        ),
+        (
+            "the null version of a suspended bucket, resolvable identifier last",
+            Stored::NullAfterSuspension,
+            "e3b0c44298fc1c149afbf4c8996fb924".to_string(),
+            false,
+        ),
+        (
+            "the null version of a write made before versioning was set",
+            Stored::NullFromBeforeVersioning,
+            "f".repeat(VERSION_ID_CHARS),
+            true,
+        ),
+    ];
+
+    for (case, stored, stale, resolvable_first) in &rows {
+        // A fresh store per row, so one row's deletes cannot decide another's.
+        let router = router();
+        let name = "batch-delete-partition";
+        bucket(&router, name).await;
+
+        // Each row brings the bucket to the state its kind needs, and reports the version the
+        // resolvable identifier pins, whether removing it removes a delete marker, and every
+        // version the bucket must still hold afterwards. The identifier that must FAIL is
+        // pinned on a key holding a version of its own, which is the one state in which an
+        // unresolvable token is that key's `NoSuchVersion` rather than a confirmed delete.
+        let (pinned, removes_marker, mut survivors): (String, bool, Vec<(String, String)>) =
+            match stored {
+                Stored::CurrentVersion => {
+                    set_versioning(&router, name, "Enabled").await;
+                    let kept = written_version(&router, name, partner).await;
+                    let pinned = written_version(&router, name, target).await;
+                    (pinned, false, vec![(partner.to_string(), kept)])
+                }
+                Stored::NoncurrentVersion => {
+                    set_versioning(&router, name, "Enabled").await;
+                    let kept = written_version(&router, name, partner).await;
+                    let older = written_version(&router, name, target).await;
+                    let newer = written_version(&router, name, target).await;
+                    assert_ne!(
+                        older, newer,
+                        "case {case:?}: two writes of one key must mint two version ids"
+                    );
+                    (
+                        older,
+                        false,
+                        vec![
+                            (partner.to_string(), kept),
+                            (target.to_string(), newer),
+                        ],
+                    )
+                }
+                Stored::Marker => {
+                    set_versioning(&router, name, "Enabled").await;
+                    let kept = written_version(&router, name, partner).await;
+                    let behind = written_version(&router, name, target).await;
+                    let marked = delete_objects(&router, name, &[(target, None)], false).await;
+                    let marker = delete_result_of(&marked)
+                        .deleted_entry(target)
+                        .and_then(|entry| entry.get("DeleteMarkerVersionId").cloned())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {case:?}: the simple delete must report the marker it \
+                                 laid, got body {:?}",
+                                text(&marked)
+                            )
+                        });
+                    (
+                        marker,
+                        true,
+                        vec![
+                            (partner.to_string(), kept),
+                            (target.to_string(), behind),
+                        ],
+                    )
+                }
+                Stored::NullAfterSuspension => {
+                    set_versioning(&router, name, "Enabled").await;
+                    let kept = written_version(&router, name, partner).await;
+                    set_versioning(&router, name, "Suspended").await;
+                    let pinned = written_version(&router, name, target).await;
+                    assert_eq!(
+                        pinned, NULL_VERSION_ID,
+                        "case {case:?}: a write into a suspended bucket is the null version, \
+                         got {pinned:?}"
+                    );
+                    (pinned, false, vec![(partner.to_string(), kept)])
+                }
+                Stored::NullFromBeforeVersioning => {
+                    // Written while the bucket carries no versioning state at all, so the
+                    // version it stores has no id of its own; enabling versioning afterwards
+                    // keeps it, under the id a request names it by.
+                    write_keys(&router, name, &[target]).await;
+                    set_versioning(&router, name, "Enabled").await;
+                    let kept = written_version(&router, name, partner).await;
+                    (
+                        NULL_VERSION_ID.to_string(),
+                        false,
+                        vec![(partner.to_string(), kept)],
+                    )
+                }
+            };
+        assert!(
+            !survivors.iter().any(|(_, id)| id == stale),
+            "case {case:?}: the unresolvable token must name no stored version, the bucket \
+             holds {survivors:?}"
+        );
+
+        let requested: Vec<Identifier> = if *resolvable_first {
+            vec![
+                (target, Some(pinned.as_str())),
+                (partner, Some(stale.as_str())),
+            ]
+        } else {
+            vec![
+                (partner, Some(stale.as_str())),
+                (target, Some(pinned.as_str())),
+            ]
+        };
+        let answer = delete_objects(&router, name, &requested, false).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the mixed batch answers 200, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+
+        let result = delete_result_of(&answer);
+        let confirmed: Vec<(String, String)> = result
+            .deleted
+            .iter()
+            .map(|entry| {
+                (
+                    entry.get("Key").cloned().unwrap_or_default(),
+                    entry.get("VersionId").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            confirmed,
+            vec![(target.to_string(), pinned.clone())],
+            "case {case:?}: the identifier whose version the bucket holds is reported deleted \
+             with its own pair echoed, got {confirmed:?} in body {:?}",
+            text(&answer)
+        );
+        let errored: Vec<(String, String, String, String)> = result
+            .errors
+            .iter()
+            .map(|entry| {
+                let field = |name: &str| entry.get(name).cloned().unwrap_or_default();
+                (
+                    field("Key"),
+                    field("VersionId"),
+                    field("Code"),
+                    field("Message"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            errored,
+            vec![(
+                partner.to_string(),
+                stale.clone(),
+                "NoSuchVersion".to_string(),
+                "The specified version does not exist.".to_string()
+            )],
+            "case {case:?}: only the identifier that resolved to no version fails, under the \
+             absent-version code and its fixed sentence, got {errored:?} in body {:?}",
+            text(&answer)
+        );
+
+        // A version that WAS a delete marker says so, and names the marker the identifier took
+        // away; every other kind reports neither member.
+        let entry = result
+            .deleted_entry(target)
+            .unwrap_or_else(|| panic!("case {case:?}: the pair must be reported deleted"));
+        let marker_members = (
+            entry.get("DeleteMarker").map(String::as_str),
+            entry.get("DeleteMarkerVersionId").map(String::as_str),
+        );
+        assert_eq!(
+            marker_members,
+            if removes_marker {
+                (Some("true"), Some(pinned.as_str()))
+            } else {
+                (None, None)
+            },
+            "case {case:?}: the delete-marker members of the entry must report what the \
+             identifier removed, got {entry:?}"
+        );
+
+        // Every requested pair is reported exactly once over the two lists together, so the
+        // partition covers the payload and the lists are disjoint.
+        let mut reported: Vec<(String, String)> = confirmed.clone();
+        reported.extend(
+            errored
+                .iter()
+                .map(|(key, version_id, _, _)| (key.clone(), version_id.clone())),
+        );
+        reported.sort();
+        let mut asked: Vec<(String, String)> = requested
+            .iter()
+            .map(|(key, version_id)| {
+                ((*key).to_string(), version_id.unwrap_or_default().to_string())
+            })
+            .collect();
+        asked.sort();
+        assert_eq!(
+            reported, asked,
+            "case {case:?}: every requested pair is reported exactly once across the two \
+             lists, got {reported:?} in body {:?}",
+            text(&answer)
+        );
+
+        // What the store holds afterwards: the version the resolvable identifier named is
+        // gone, and every other version the bucket held is still where it was.
+        let mut held: Vec<(String, String)> =
+            version_listing_of(&list_object_versions(&router, name, "").await).entries();
+        held.sort();
+        survivors.sort();
+        assert_eq!(
+            held, survivors,
+            "case {case:?}: only the version the resolvable identifier named may leave the \
+             store, got {held:?}"
+        );
+        // And a reader agrees: the version is no longer addressable, while the version the
+        // refused identifier was pinned beside still answers a read.
+        let gone = get_object(&router, name, target, &format!("?versionId={pinned}"), &[]).await;
+        assert_eq!(
+            gone.status,
+            404,
+            "case {case:?}: the deleted version must no longer be readable, got {} with body \
+             {:?}",
+            gone.status,
+            text(&gone)
+        );
+        let left = get_object(&router, name, partner, "", &[]).await;
+        assert_eq!(
+            (left.status, text(&left)),
+            (200, format!("body of {partner}")),
+            "case {case:?}: the key the refused identifier named must still be readable, got \
+             {} with body {:?}",
+            left.status,
+            text(&left)
         );
     }
 }
