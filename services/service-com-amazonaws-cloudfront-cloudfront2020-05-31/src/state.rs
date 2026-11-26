@@ -4461,7 +4461,7 @@ pub use public_key_material::*;
 /// How much of an identifier bound to the request PATH the operation it addresses reads before
 /// it resolves it against the store — nothing at all for the kinds whose routes report every
 /// identifier they cannot resolve as the resource that is absent, the identifier alphabet for
-/// an origin access control. A SUBMODULE for the same reason [`functions`] is one; `pub use`
+/// a distribution. A SUBMODULE for the same reason [`functions`] is one; `pub use`
 /// keeps every name reachable as `crate::state::<name>`.
 mod path_identifiers;
 pub use path_identifiers::*;

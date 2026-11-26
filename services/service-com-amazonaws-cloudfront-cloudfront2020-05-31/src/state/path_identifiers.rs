@@ -34,51 +34,24 @@
 //! * the PUBLIC KEY routes refuse the form of every value that could never be an identifier
 //!   issued for their kind, the same three ways the field-level encryption documents' routes do
 //!   ([`unresolved_public_key`]);
-//! * the ORIGIN ACCESS CONTROL reads the ALPHABET and nothing more
-//!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
+//! * the ORIGIN ACCESS CONTROL reads NOTHING of the value: every operation addressed by one
+//!   ([`super::no_such_origin_access_control`]) carries the id it was handed straight through
+//!   to the store and reports the control ABSENT for every id the account holds no control
+//!   under, whatever the id is written in.
 //!
 //! The same split, for the kinds whose identifier form IS decided by the value alone, is made
 //! by the free functions beside the refusals they answer with:
 //! [`super::unresolved_distribution_id`], [`super::unresolved_key_group_id`], the public key's
-//! and the two field-level encryption records'. Those need
-//! no store, which is the one reason the one below is a method. A kind whose recorded contract
+//! and the two field-level encryption records'. A kind whose recorded contract
 //! makes NO such split reads nothing of the value at all and reports the absent resource for
-//! every identifier it cannot resolve, which is what the field-level encryption configuration's
-//! RESOURCE read does ([`super::no_such_field_level_encryption_config`]).
+//! every identifier it cannot resolve, which is what the origin access control and the
+//! field-level encryption configuration's RESOURCE read do
+//! ([`super::no_such_origin_access_control`],
+//! [`super::no_such_field_level_encryption_config`]).
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 
 use super::*;
-
-impl ComAmazonawsCloudfrontCloudfront20200531State {
-    /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
-    /// control `Id` answers an identifier it could not resolve.
-    ///
-    /// `Id` is a plain `string` `@httpLabel` with no `@pattern` and no `@length`
-    /// (`smithy_query(query="operation",operation="GetOriginAccessControl")`), so what this
-    /// route reads of the value is the ALPHABET an identifier is written in and nothing more
-    /// ([`is_entity_id_form`]) — this route's own recorded contract, which the clusters of
-    /// `GetOriginAccessControl` own rather than the field-level encryption surface's
-    /// ([`super::unresolved_field_level_encryption_config`]). A control's
-    /// identifier comes from the namespace its four kinds SHARE ([`ENTITY_ID_PREFIX`]), so
-    /// neither the letter a value opens with nor the width of its body says which kind issued
-    /// it, and WHICH identifier of that alphabet was ever issued is a property of the STORE: a
-    /// value of the alphabet the account holds no control under is the control reported
-    /// ABSENT.
-    ///
-    /// A value written outside that alphabet — in lower case, around a separator, as a UUID,
-    /// as a word or as a domain name — was never an identifier CloudFront issued at all, so it
-    /// is the identifier this route reports it cannot READ ([`id_format_invalid_message`]).
-    /// Both sentences are fixed text, so nothing from the request reaches the wire.
-    pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        if is_entity_id_form(id) {
-            return no_such_origin_access_control();
-        }
-        NoSuchOriginAccessControl {
-            message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
-        }
-    }
-}
 
 /// The model's name for the member every operation of the `E`-form family addresses its
 /// resource by, except the ones that address a resource held UNDER a distribution

@@ -22,8 +22,8 @@
 //!
 //! * an origin access control's identifier comes from the namespace its kind SHARES with the
 //!   distributions and the origin access identities, so neither the letter a value opens with
-//!   nor the width of its body says which of them issued it: those routes read the identifier
-//!   ALPHABET (digits and uppercase letters, no separator and no lower case) and nothing more;
+//!   nor the width of its body says which of them issued it: those routes read NOTHING of the
+//!   value and report every identifier they cannot resolve as the control that is ABSENT;
 //! * a field-level encryption configuration's and a profile's identifiers come from namespaces
 //!   of their OWN (`C` and `P`), so those routes read the WIDTH and the NAMESPACE LETTER too: a
 //!   value WIDER than the width this service issues an identifier at could be none of these
@@ -141,11 +141,10 @@ impl Route {
     /// The sentence this route owes `id` when nothing of its kind answers to it.
     ///
     /// How much of the value a route reads is the resource kind's own recorded contract. The
-    /// origin access control's routes read the ALPHABET alone, because its identifiers come
-    /// from the namespace its kind SHARES with the distributions: a value written in it is
-    /// carried through to the store, so the record it holds none under is reported ABSENT, and
-    /// a value outside it is the identifier the route reports it cannot READ. The field-level
-    /// encryption routes read the WIDTH and the NAMESPACE LETTER as well: a value WIDER than an
+    /// origin access control's routes read NOTHING of it, because its identifiers come from
+    /// the namespace its kind SHARES with the distributions: every value is carried through to
+    /// the store, so the record it holds none under is reported ABSENT. The field-level
+    /// encryption routes read the WIDTH and the NAMESPACE LETTER: a value WIDER than an
     /// identifier of this mint is issued could be none of them, and a value written exactly the
     /// way an identifier is ISSUED under another kind's letter IS that kind's identifier, so both
     /// are unreadable, while a value of the alphabet narrower than the issued width, or at that
@@ -153,17 +152,15 @@ impl Route {
     /// store; a value outside the alphabet is no identifier of this mint at all, so it is
     /// unreadable there too.
     fn expected(self, id: &str) -> &'static str {
-        let unreadable = match self.own_namespace() {
-            None => !in_the_identifier_alphabet(id),
-            Some(own) => {
-                !in_the_identifier_alphabet(id)
-                    || id.len() > MINTED_ID_WIDTH
-                    || (id.len() == MINTED_ID_WIDTH
-                        && id.chars().next().is_some_and(|letter| {
-                            letter != own && ISSUED_NAMESPACES.contains(&letter)
-                        }))
-            }
-        };
+        let unreadable = self.own_namespace().is_some_and(|own| {
+            !in_the_identifier_alphabet(id)
+                || id.len() > MINTED_ID_WIDTH
+                || (id.len() == MINTED_ID_WIDTH
+                    && id
+                        .chars()
+                        .next()
+                        .is_some_and(|letter| letter != own && ISSUED_NAMESPACES.contains(&letter)))
+        });
         if unreadable {
             UNREADABLE_IDENTIFIER
         } else {

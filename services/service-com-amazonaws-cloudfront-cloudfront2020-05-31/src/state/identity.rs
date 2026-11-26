@@ -1389,11 +1389,10 @@ pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
 /// the identifier a route reports it cannot READ, and every other value the store holds nothing
 /// under is the resource that is ABSENT.
 ///
-/// `prefix` is the namespace letter the addressed kind mints under; the identifiers of the
-/// family whose four members share ONE namespace letter ([`ENTITY_ID_PREFIX`]) read their own
-/// form instead
-/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]),
-/// since there the letter says nothing about which of the four kinds issued the identifier.
+/// `prefix` is the namespace letter the addressed kind mints under; a kind whose identifiers
+/// come from the namespace its four kinds SHARE ([`ENTITY_ID_PREFIX`]) reads no form of its own
+/// instead ([`super::no_such_origin_access_control`]), since there the letter says nothing about
+/// which of the four kinds issued the identifier.
 pub fn id_format_refused_for(prefix: char, value: &str) -> bool {
     if !is_entity_id_form(value) {
         return true;

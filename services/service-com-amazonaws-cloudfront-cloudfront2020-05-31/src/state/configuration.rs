@@ -2293,9 +2293,8 @@ pub fn no_such_distribution() -> NoSuchDistribution {
 }
 
 /// The modelled `NoSuchDistribution` an operation ADDRESSED by a distribution identifier
-/// answers an identifier it could not resolve — the split
-/// [`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]
-/// makes, under the one error class this family's models bind for both conditions.
+/// answers an identifier it could not resolve — the split this resource kind's recorded
+/// contract makes, under the one error class this family's models bind for both conditions.
 ///
 /// A value written in the alphabet CloudFront writes an entity identifier in
 /// ([`is_entity_id_form`]) is an identifier of that mint, and WHICH one was ever issued is a
@@ -3154,7 +3153,16 @@ pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
     "The specified response headers policy does not exist.";
 
 /// The modelled `NoSuchOriginAccessControl` (HTTP 404) for an origin access control id
-/// the store does not hold.
+/// the store does not hold — the answer EVERY operation addressed by an origin access
+/// control `Id` gives an id it cannot resolve (`GetOriginAccessControl`,
+/// `GetOriginAccessControlConfig`, `UpdateOriginAccessControl`,
+/// `DeleteOriginAccessControl`).
+///
+/// `Id` is a plain `string` `@httpLabel` with no `@pattern` and no `@length`
+/// (`smithy_query(query="operation",operation="GetOriginAccessControlConfig")`), so the FORM
+/// of the value decides nothing on these routes: whether a control answers to an id is a
+/// property of the STORE alone, and every id the account holds no control under is the
+/// control reported ABSENT, whatever alphabet, width or namespace letter it is written in.
 ///
 /// The sentence is a property of the store rather than of the request, so nothing from
 /// the request belongs in the text.

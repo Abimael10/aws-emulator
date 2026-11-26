@@ -195,17 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(::std::time::SystemTime::now());
 
         // The control being updated is looked up first: every refusal below is about the
-        // record this id names, and nothing is minted for an id the store does not hold.
-        // Whether the `Id` could be an identifier of THIS resource kind decides which of the
-        // one code's two sentences the refusal carries
-        // ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
+        // record this id names, and nothing is minted for an id the store does not hold. The
+        // model constrains the `Id` no further than `string`, so the form of the value decides
+        // nothing: an id the account holds no control under is the control that is absent
+        // ([`crate::state::no_such_origin_access_control`]).
         let Some(current_etag) = store
             .origin_access_control(&input.id)
             .map(|stored| stored.etag.clone())
         else {
             return Err(
                 UpdateOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
-                    store.unresolved_origin_access_control(&input.id),
+                    crate::state::no_such_origin_access_control(),
                 )
                 .into(),
             );

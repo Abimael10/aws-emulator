@@ -7,17 +7,13 @@
 //! `DeleteOriginAccessControl` — `smithy_query(query="operation",
 //! operation="GetOriginAccessControl")` reports `Id` as a required `@httpLabel` on a plain
 //! `string`, with no `@pattern` and no `@length`, and `errors: [AccessDenied,
-//! NoSuchOriginAccessControl]`) answers that one code for every `Id` it cannot resolve, and
-//! what decides which of its two sentences is the identifier ALPHABET and nothing more:
-//! every value WRITTEN IN IT (the digits and uppercase letters CloudFront writes an
-//! identifier in, carrying no separator and no lower case) is resolved against the STORE and
-//! reported as the control that is ABSENT — "The specified origin access control does not
-//! exist." — whatever its namespace letter and whatever the width of its body, because a
-//! control's identifier comes from the namespace its kind shares with the distributions and
-//! the origin access identities and so says nothing about which of them issued it, while a
-//! value written OUTSIDE that alphabet was never an identifier CloudFront issued at all and
-//! is the identifier the service reports it cannot READ, "Id format is invalid". Both
-//! sentences are fixed text: neither echoes the value submitted.
+//! NoSuchOriginAccessControl]`) answers that one code for every `Id` it cannot resolve, under
+//! the ONE sentence that condition is stated in — "The specified origin access control does
+//! not exist." Because the model places no constraint on the form of `Id`, nothing about how a
+//! value is WRITTEN is read before the store is asked: whatever its namespace letter, the width
+//! of its body, its alphabet or its separators, an `Id` the account holds no control under is
+//! the control that is ABSENT. The sentence is fixed text: it echoes nothing of the value
+//! submitted.
 //!
 //! The rows span what the rule generalises over: the minted identifiers of TWO other kinds of
 //! the identifier form a distribution, a streaming distribution, an origin access identity and
@@ -43,9 +39,6 @@ use crate::public_key_lifecycle::{create_key, pem, Key};
 /// The sentence a control the store holds nothing for earns, spelled out here rather than taken
 /// from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONTROL: &str = "The specified origin access control does not exist.";
-
-/// The sentence a value written outside the identifier alphabet earns, for the same reason.
-const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// One operation addressed by an origin access control `Id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,9 +267,10 @@ fn no_resource_answers_to(live: &Live) -> Vec<(String, String)> {
     ]
 }
 
-/// The values that are written in no identifier alphabet CloudFront issues one in. No
-/// identifier the service ever issued is written that way, so each of them is the identifier
-/// the route reports it cannot READ: the rows vary HOW the alphabet is broken.
+/// The values that are written in no identifier alphabet CloudFront issues one in. The model
+/// constrains `Id` no further than `string`, so no route reads the way a value is written:
+/// each of them is resolved against the store like any other and reported as the control that
+/// is ABSENT. The rows vary HOW the alphabet is broken.
 fn outside_the_identifier_alphabet(live: &Live) -> Vec<(String, String)> {
     vec![
         (
@@ -331,10 +325,10 @@ async fn another_kinds_identifier_is_the_absent_control() {
 }
 
 /// RULE: a value written in no alphabet CloudFront mints an identifier in names no control
-/// either — and it is no identifier this service could have issued, so this route reports it
-/// as the identifier it cannot READ rather than as a control that is merely absent.
+/// either — and because the model places no constraint on the form of `Id`, it is resolved
+/// against the store like any other value and reported as the control that is ABSENT.
 #[tokio::test]
-async fn a_value_this_service_issues_no_identifier_in_is_reported_unreadable() {
+async fn a_value_this_service_issues_no_identifier_in_is_the_absent_control() {
     let router = emulator();
     let live = live(&router).await;
 
@@ -346,7 +340,7 @@ async fn a_value_this_service_issues_no_identifier_in_is_reported_unreadable() {
             assert_refusal(
                 &answer,
                 &format!("{op:?} with {case} ({id:?})"),
-                UNREADABLE_IDENTIFIER,
+                NO_SUCH_CONTROL,
             );
         }
     }

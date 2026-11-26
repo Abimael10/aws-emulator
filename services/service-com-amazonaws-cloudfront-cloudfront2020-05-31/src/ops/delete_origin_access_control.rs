@@ -181,10 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 DeleteOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
-                    // Whether the `Id` could be an identifier of THIS resource kind decides
-                    // which of the one code's two sentences the refusal carries
-                    // ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
-                    store.unresolved_origin_access_control(&input.id),
+                    // The model constrains the `Id` no further than `string`, so the form of
+                    // the value decides nothing: the id is resolved against the STORE, and
+                    // one the account holds no control under is the control that is absent
+                    // ([`crate::state::no_such_origin_access_control`]).
+                    crate::state::no_such_origin_access_control(),
                 )
                 .into(),
             );
