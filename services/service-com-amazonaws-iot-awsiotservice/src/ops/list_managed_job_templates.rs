@@ -11,9 +11,13 @@
 //!
 //! `templateName` narrows the listing to the versions of the template it names; a
 //! `templateName` that names no template the catalog publishes is refused rather than
-//! answered with an empty page — the modelled `InvalidRequestException` (HTTP 400), the
-//! same way every lookup of a name outside this AWS-published catalog is, because nothing
-//! creates an entry in it and so no such name can ever name a template.
+//! answered with an empty page, classified the way every lookup of a name this
+//! AWS-published catalog does not hold is
+//! (`crate::state::unpublished_managed_job_template`): a name of the reserved namespace
+//! published managed templates are named in is a managed template that is ABSENT (the
+//! modelled `ResourceNotFoundException`, HTTP 404), and a name outside that namespace
+//! names no managed template the service could publish (the modelled
+//! `InvalidRequestException`, HTTP 400).
 //! `maxResults` bounds the page and `nextToken` resumes the SAME listing, in the order
 //! the service publishes the catalog in. A read only: nothing here writes.
 
@@ -194,21 +198,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the versions of the managed job templates that have the specified template
         // name will be returned" — and the catalog is AWS-published data rather than this
         // account's state, which no operation of this service writes, so a name it holds
-        // no template under names no managed template that could exist: the same refusal
-        // a describe of that name earns
-        // ([`crate::state::invalid_managed_job_template_name_message`]).
+        // no template under earns the same refusal a describe of that name does
+        // ([`crate::state::unpublished_managed_job_template`]): a name of the reserved
+        // namespace published managed templates are named in is a managed template that is
+        // absent, and a name outside that namespace is not a managed template name at all.
         if let Some(template_name) = input.template_name.as_deref() {
             if catalog.template(template_name).is_none() {
-                return Err(
-                    ListManagedJobTemplatesErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(crate::state::invalid_managed_job_template_name_message(
-                                template_name,
-                            )),
-                        },
-                    )
-                    .into(),
-                );
+                let refusal = crate::state::unpublished_managed_job_template(template_name);
+                let message = Some(refusal.message(template_name));
+                return Err(match refusal {
+                    crate::state::UnpublishedManagedJobTemplate::NotFound => {
+                        ListManagedJobTemplatesErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException { message },
+                        )
+                    }
+                    crate::state::UnpublishedManagedJobTemplate::InvalidName => {
+                        ListManagedJobTemplatesErrorModeled::InvalidRequestException(
+                            InvalidRequestException { message },
+                        )
+                    }
+                }
+                .into());
             }
         }
 

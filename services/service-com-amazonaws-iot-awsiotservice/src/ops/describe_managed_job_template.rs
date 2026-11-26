@@ -11,10 +11,13 @@
 //! the template's default version, which is the latest version published for it
 //! (`crate::state::ManagedJobTemplate::default_version`). The catalog is AWS-published
 //! reference data rather than account state, and no operation of this service creates an
-//! entry in it, so a `templateName` it does not publish names no managed template that
-//! could exist: it is refused as a value the request got wrong, an
-//! `InvalidRequestException` (HTTP 400) — the same class a version the catalog does not
-//! publish for a template it DOES publish earns. A read only: nothing here writes.
+//! entry in it, so a `templateName` the catalog does not hold is refused as
+//! `crate::state::unpublished_managed_job_template` classifies it: a name of the reserved
+//! namespace published managed templates are named in is a managed template that is
+//! ABSENT (`ResourceNotFoundException`, HTTP 404), and a name outside that namespace is a
+//! value the request got wrong (`InvalidRequestException`, HTTP 400) — the same class a
+//! version the catalog does not publish for a template it DOES publish earns. A read
+//! only: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -184,21 +187,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sees exactly what this one did.
         let store = state.lock();
         // The catalog is AWS-published data rather than this account's state, and nothing
-        // in this service creates an entry in it, so a `templateName` it does not hold
-        // names no managed template that could exist: the value the request sent is the
-        // one it got wrong ([`crate::state::invalid_managed_job_template_name_message`]),
-        // which is the same class an unpublished version earns below.
+        // in this service creates an entry in it, so what a miss means is a property of the
+        // NAME: a name of the reserved namespace published managed templates are named in is
+        // a managed template that is absent, and a name outside that namespace is not a
+        // managed template name at all
+        // ([`crate::state::unpublished_managed_job_template`], which the listing's own filter
+        // classifies a miss with as well).
         let Some(template) = store.managed_job_templates.template(&input.template_name) else {
-            return Err(
-                DescribeManagedJobTemplateErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::invalid_managed_job_template_name_message(
-                            &input.template_name,
-                        )),
-                    },
-                )
-                .into(),
-            );
+            let refusal = crate::state::unpublished_managed_job_template(&input.template_name);
+            let message = Some(refusal.message(&input.template_name));
+            return Err(match refusal {
+                crate::state::UnpublishedManagedJobTemplate::NotFound => {
+                    DescribeManagedJobTemplateErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                crate::state::UnpublishedManagedJobTemplate::InvalidName => {
+                    DescribeManagedJobTemplateErrorModeled::InvalidRequestException(
+                        InvalidRequestException { message },
+                    )
+                }
+            }
+            .into());
         };
 
         // `templateVersion` is "An optional parameter to specify version of a managed

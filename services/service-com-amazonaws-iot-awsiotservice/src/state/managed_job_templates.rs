@@ -609,18 +609,62 @@ pub fn managed_job_template_catalog() -> Vec<ManagedJobTemplate> {
     CATALOG.iter().map(CatalogRow::template).collect()
 }
 
-/// The sentence a `templateName` the catalog does not publish is refused with: fixed text
-/// naming the member that was rejected, then the name the request sent — worded the way
-/// the unpublished-version refusal of the same catalog is
-/// ([`invalid_managed_job_template_version_message`]).
+/// How a `templateName` the published catalog does not hold is refused, which is a
+/// property of the NAME rather than of the operation that looked it up: stated once here,
+/// so a listing's filter and a describe of the same name cannot classify or word one miss
+/// two ways.
 ///
-/// This is the ONE refusal a name the catalog does not publish earns, whichever operation
-/// looked it up, so a listing's filter and a describe cannot classify or word the same miss
-/// two ways. The catalog is AWS-PUBLISHED reference data rather than account state — the
-/// same for every caller on every boot, and nothing in this service creates an entry — so a
-/// name outside it names no resource that could exist and is a value the request got wrong
-/// (`InvalidRequestException`, HTTP 400, "The request is not valid") rather than a resource
-/// that is merely absent; it is the same class an unpublished `templateVersion` earns.
+/// Published managed templates are named in the service's OWN reserved namespace
+/// ([`TEMPLATE_NAME_PREFIX`]: every row of [`CATALOG`] carries it, and the catalog is
+/// AWS-published reference data nothing in this service creates into). So a name inside
+/// that reserved namespace that the catalog does not hold names a managed template that is
+/// simply ABSENT — the modelled `ResourceNotFoundException` (HTTP 404, "The specified
+/// resource does not exist") — while a name OUTSIDE it is not a managed template name at
+/// all and is a value the request got wrong — the modelled `InvalidRequestException` (HTTP
+/// 400, "The request is not valid"), the class an unpublished `templateVersion` of a
+/// published template earns as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnpublishedManagedJobTemplate {
+    /// A name of the reserved managed-template namespace the catalog holds no template
+    /// under: a missing resource.
+    NotFound,
+    /// A name outside that namespace, which names no managed template the service could
+    /// publish: an invalid value.
+    InvalidName,
+}
+
+impl UnpublishedManagedJobTemplate {
+    /// The sentence this refusal states about `template_name` — the ONE place either is
+    /// worded, so the classification above and the wording stay separable.
+    pub fn message(self, template_name: &str) -> String {
+        match self {
+            Self::NotFound => managed_job_template_not_found_message(template_name),
+            Self::InvalidName => invalid_managed_job_template_name_message(template_name),
+        }
+    }
+}
+
+/// Which refusal `template_name` earns from a catalog that holds no template under it
+/// ([`UnpublishedManagedJobTemplate`]).
+pub fn unpublished_managed_job_template(template_name: &str) -> UnpublishedManagedJobTemplate {
+    if template_name.starts_with(TEMPLATE_NAME_PREFIX) {
+        UnpublishedManagedJobTemplate::NotFound
+    } else {
+        UnpublishedManagedJobTemplate::InvalidName
+    }
+}
+
+/// The sentence a managed template the catalog does not hold under a name of its own
+/// reserved namespace is reported missing with: fixed text naming the resource class and
+/// closing with " not found", around the name the request sent.
+pub fn managed_job_template_not_found_message(template_name: &str) -> String {
+    format!("ManagedJobTemplate with name: {template_name} not found")
+}
+
+/// The sentence a `templateName` that is not of the reserved managed-template namespace is
+/// refused with: fixed text naming the member that was rejected, then the name the request
+/// sent — worded the way the unpublished-version refusal of the same catalog is
+/// ([`invalid_managed_job_template_version_message`]).
 pub fn invalid_managed_job_template_name_message(template_name: &str) -> String {
     format!("Invalid ManagedJobTemplate name: {template_name}")
 }

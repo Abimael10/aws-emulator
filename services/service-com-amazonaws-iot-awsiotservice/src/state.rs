@@ -3635,8 +3635,9 @@ pub mod managed_job_templates;
 pub use managed_job_templates::{
     invalid_managed_job_template_name_message, invalid_managed_job_template_version_message,
     is_modeled_managed_job_template_name, is_modeled_managed_template_version,
-    managed_job_template_arn, ManagedJobTemplate, ManagedJobTemplateCatalog,
-    ManagedJobTemplateVersion,
+    managed_job_template_arn, managed_job_template_not_found_message,
+    unpublished_managed_job_template, ManagedJobTemplate, ManagedJobTemplateCatalog,
+    ManagedJobTemplateVersion, UnpublishedManagedJobTemplate,
 };
 
 // What a JOB TEMPLATE this account created is — the record one holds, the ARN it is named

@@ -27,11 +27,14 @@
 //!   for;
 //! * `templateName` narrows the listing to that template's versions, and a `templateName`
 //!   of the modelled shape that names no published template is refused rather than
-//!   answered: the catalog is AWS's own published data that nothing creates into, so such a
-//!   name can never name a template and is an INVALID REQUEST
-//!   (`InvalidRequestException`, 400, "Invalid ManagedJobTemplate name: <name>") whichever
-//!   namespace its text is in; both operations that look a name up classify and word a miss
-//!   the same way;
+//!   answered, classified by the NAMESPACE the name is in: the catalog is AWS's own
+//!   published data, named in the service's reserved `AWS-` managed-template namespace and
+//!   written by no request, so a name of that reserved namespace the catalog does not hold
+//!   is a managed template that is MISSING (`ResourceNotFoundException`, 404,
+//!   "ManagedJobTemplate with name: <name> not found") while a name outside it names no
+//!   managed template the service could publish and is an INVALID REQUEST
+//!   (`InvalidRequestException`, 400, "Invalid ManagedJobTemplate name: <name>"); both
+//!   operations that look a name up classify and word a miss the same way;
 //! * `maxResults` bounds the page and `nextToken` resumes the SAME listing exactly once
 //!   per entry, for EVERY page size from one to past the number of entries;
 //! * every listed entry is DESCRIBABLE: the describe reports the listing's five members
@@ -62,12 +65,18 @@ const REGION: &str = "eu-west-2";
 const QUALIFIED_INVALID_REQUEST: &str =
     "InvalidRequestException:http://iot.amazonaws.com/doc/2015-10-02/";
 
-/// The wire error shape of a `templateName` the catalog does not publish: the qualified
-/// `InvalidRequestException`, as the version refusal of the same catalog carries.
-const UNPUBLISHED_NAME_ERROR_TYPE: &str = QUALIFIED_INVALID_REQUEST;
+/// `ResourceNotFoundException` as this plane NAMES it in `x-amzn-errortype`: the shape
+/// name, a `:`, and the service's API doc namespace, as its `InvalidRequestException`
+/// refusals carry.
+const QUALIFIED_NOT_FOUND: &str =
+    "ResourceNotFoundException:http://iot.amazonaws.com/doc/2015-10-02/";
 
-/// The status a `templateName` the catalog does not publish is refused with.
-const UNPUBLISHED_NAME_STATUS: u16 = 400;
+/// The prefix the service's RESERVED managed-template namespace is: every published
+/// template's name carries it, and a name that does not is in no namespace this catalog
+/// could ever publish a template in. Source: the published catalog's own names, of which
+/// the model names `AWS-Reboot`
+/// (`smithy_query(query="doc",shape="DescribeManagedJobTemplateResponse",member="templateName")`).
+const RESERVED_NAMESPACE_PREFIX: &str = "AWS-";
 
 /// One `documentParameter` the catalog publishes: the pattern a caller replaces and the
 /// guidance published with it, including the `example` AWS publishes for EVERY parameter
@@ -282,12 +291,14 @@ fn signed_for_iot(region: &str) -> String {
     )
 }
 
-/// One response, reduced to what a client branches on.
+/// One response, reduced to what a client branches on. Shared with the sibling suite that
+/// drives the same plane (`crate::managed_job_template_lookup_refusal`), so the wire
+/// harness of this catalog is written once.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -318,7 +329,7 @@ impl Reply {
     }
 
     /// The `message` of an error response.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         member(&self.body, "message")
     }
 }
@@ -334,12 +345,12 @@ fn member(value: &Value, name: &str) -> String {
 
 /// The emulator under test: ONE shared engine with the IoT service mounted on it,
 /// reached the way the production router reaches it.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -377,7 +388,7 @@ impl Emulator {
     }
 
     /// `GET /managed-job-templates` with the already-encoded query string `query`.
-    async fn list(&self, query: &str) -> Reply {
+    pub(crate) async fn list(&self, query: &str) -> Reply {
         let path = if query.is_empty() {
             "/managed-job-templates".to_string()
         } else {
@@ -392,7 +403,7 @@ impl Emulator {
 
     /// `GET /managed-job-templates/{template_name}` with the already-encoded query
     /// string `query`.
-    async fn describe(&self, template_name: &str, query: &str) -> Reply {
+    pub(crate) async fn describe(&self, template_name: &str, query: &str) -> Reply {
         let path = if query.is_empty() {
             format!("/managed-job-templates/{template_name}")
         } else {
@@ -421,37 +432,47 @@ fn expected_pairs() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The sentence a `templateName` the catalog does not publish is refused with.
-fn unpublished_name_message(template_name: &str) -> String {
-    format!("Invalid ManagedJobTemplate name: {template_name}")
-}
-
 /// What a name the catalog does not hold must be refused with: the status, the
 /// `x-amzn-errortype` and the sentence — stated once, so the describe's rows and the
 /// listing filter's rows cannot disagree.
-fn unpublished(template_name: &str) -> (u16, &'static str, String) {
-    (
-        UNPUBLISHED_NAME_STATUS,
-        UNPUBLISHED_NAME_ERROR_TYPE,
-        unpublished_name_message(template_name),
-    )
+///
+/// A name of the service's RESERVED managed-template namespace names a managed template
+/// that is missing, and a name outside that namespace names none the service could publish.
+pub(crate) fn unpublished(template_name: &str) -> (u16, &'static str, String) {
+    if template_name.starts_with(RESERVED_NAMESPACE_PREFIX) {
+        (
+            404,
+            QUALIFIED_NOT_FOUND,
+            format!("ManagedJobTemplate with name: {template_name} not found"),
+        )
+    } else {
+        (
+            400,
+            QUALIFIED_INVALID_REQUEST,
+            format!("Invalid ManagedJobTemplate name: {template_name}"),
+        )
+    }
 }
 
-/// The names the catalog does not hold that every lookup is exercised over: four whose
-/// text is in AWS's published name prefix (a name of the right shape, a prefix of a
-/// published name, a published name with a trailing hyphen, and the longest such name
-/// `@length 1..64` admits) and four outside it (a differently-cased spelling of the prefix,
-/// a name of another vendor's shape, the bare prefix word without its hyphen, and the
-/// longest name the model admits) — the rule is the same for all of them.
-fn unpublished_names() -> Vec<String> {
+/// The names the catalog does not hold that every lookup is exercised over: five whose
+/// text is in the service's reserved managed-template namespace (a name of the right shape,
+/// a prefix of a published name, a published name with a trailing hyphen, the bare reserved
+/// prefix itself — the shortest name in that namespace — and the longest such name
+/// `@length 1..64` admits) and five outside it (a differently-cased spelling of the prefix,
+/// a name of another vendor's shape, the prefix word without its hyphen, a digit-only name
+/// and the longest name the model admits) — a missing template on one side of that boundary
+/// and an invalid name on the other.
+pub(crate) fn unpublished_names() -> Vec<String> {
     vec![
         "AWS-Does-Not-Exist".to_string(),
         "AWS-Rebo".to_string(),
         "AWS-Reboot-".to_string(),
+        "AWS-".to_string(),
         format!("AWS-{}", "n".repeat(60)),
         "aws-reboot".to_string(),
         "Managed-Nothing".to_string(),
         "AWS".to_string(),
+        "0123456789".to_string(),
         "n".repeat(64),
     ]
 }
@@ -631,7 +652,7 @@ async fn listing_narrows_to_one_templates_versions() {
 }
 
 #[tokio::test]
-async fn a_filter_naming_no_published_template_is_refused_as_an_invalid_request() {
+async fn a_filter_naming_no_published_template_is_refused_by_the_names_namespace() {
     let emulator = Emulator::new();
     for name in unpublished_names() {
         let (status, errortype, message) = unpublished(&name);
@@ -994,7 +1015,7 @@ async fn describe_selects_the_version_and_defaults_to_the_published_one() {
 }
 
 #[tokio::test]
-async fn describing_a_template_the_catalog_does_not_publish_is_refused_as_an_invalid_request() {
+async fn describing_a_template_the_catalog_does_not_publish_is_refused_by_the_names_namespace() {
     let emulator = Emulator::new();
     // The same names the listing's filter rows span, so a describe and a listing cannot
     // classify or word one miss two ways.

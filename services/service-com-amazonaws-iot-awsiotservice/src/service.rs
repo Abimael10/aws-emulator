@@ -46,15 +46,19 @@
 //! service's API doc namespace ([`IOT_DOC_NAMESPACE`]) — the shape name, a `:`, and the
 //! namespace — which is the form a restJson1 client resolves an error shape from, and it
 //! names `SqlParseException` the same way. Every OTHER error shape of this service is
-//! named bare, which is what the framework's serializer already writes.
+//! named bare, which is what the framework's serializer already writes, except where the
+//! PLANE an operation belongs to names one of its own that way
+//! ([`plane_namespaced_error_shapes`]): this one endpoint stands in front of several planes,
+//! and the managed-job-template catalog names the not-found shape qualified where the
+//! others name it bare.
 //!
 //! It is the SHAPE that is named that way, not the layer that answered it, so the name is
 //! the same wherever one of those two shapes comes from: the service's own validation
 //! layer refusing a request before any handler ran ([`validation`]), or a handler refusing
 //! one on a precondition only it can see. Every request of this service is therefore served
-//! behind [`ShapeNamespacedErrorType`], which qualifies those two names on the way out and
-//! changes nothing else about the response — a success, a not-found, a conflict and a
-//! server fault answer exactly what they answered without it.
+//! behind [`ShapeNamespacedErrorType`], which qualifies those names on the way out and
+//! changes nothing else about the response — a success, a conflict and a server fault answer
+//! exactly what they answered without it.
 //!
 //! ## The authorization decision in front of every operation
 //!
@@ -106,6 +110,9 @@ const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 /// The error shape AWS IoT refuses a rule whose SQL statement it cannot parse with.
 const SQL_PARSE_EXCEPTION: &str = "SqlParseException";
 
+/// The error shape AWS IoT reports a resource that does not exist with.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
 /// The namespace AWS IoT qualifies an error-shape name with in [`ERROR_TYPE_HEADER`],
 /// appended after a `:`.
 ///
@@ -117,10 +124,11 @@ const IOT_DOC_NAMESPACE: &str = "http://iot.amazonaws.com/doc/2015-10-02/";
 /// named the way AWS IoT names it: a shape of `qualified` carries [`IOT_DOC_NAMESPACE`],
 /// and every other shape keeps the bare name the framework's serializer writes.
 ///
-/// `qualified` is a property of the SHAPE rather than of an operation — the namespace is
-/// the one the shape is declared in — so one wrapper holding the shapes this service
-/// qualifies serves every operation of it, and no operation has to be named here to be
-/// answered correctly.
+/// `qualified` holds the shapes the WHOLE service names that way — the namespace is the one
+/// the shape is declared in — so one wrapper serves every operation of it and no operation
+/// has to be named to be answered correctly. Beside them, the PLANE the request's own
+/// operation belongs to can name a further shape of its own qualified
+/// ([`plane_namespaced_error_shapes`]), which is decided from the request's routing key.
 ///
 /// Nothing else is re-implemented — the request is served by the generated
 /// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
@@ -149,11 +157,21 @@ impl<O: ErasedOperation> ErasedOperation for ShapeNamespacedErrorType<O> {
         req: &'r WireRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, WireResponse> {
+        // Which shapes THIS request's operation names qualified beyond the service-wide ones
+        // is resolved here, BEFORE the await below: the routing key is read off the
+        // definition, and `&dyn ErasedServiceDefinition` is not `Sync`, so nothing borrowed
+        // from it may be held across one. The answer is a `'static` list, so only it crosses.
+        let per_plane = svc
+            .definition()
+            .protocol()
+            .routing_key(req)
+            .map_or(NO_SHAPES, plane_namespaced_error_shapes);
         Box::pin(async move {
             let mut response = self.operation.run(svc, req, ctx).await;
             let named = response.headers().get(ERROR_TYPE_HEADER).map(str::to_owned);
             if let Some(named) = named {
-                if self.qualified.contains(&named.as_str()) {
+                if self.qualified.contains(&named.as_str()) || per_plane.contains(&named.as_str())
+                {
                     response
                         .headers_mut()
                         .insert(ERROR_TYPE_HEADER, qualified_error_shape(&named));
@@ -174,6 +192,43 @@ impl<O: ErasedOperation> ErasedOperation for ShapeNamespacedErrorType<O> {
 /// the service's API doc namespace.
 fn qualified_error_shape(shape: &str) -> String {
     format!("{shape}:{IOT_DOC_NAMESPACE}")
+}
+
+/// No shape beyond the service-wide ones: what every plane that qualifies none answers, and
+/// what a request whose routing key does not resolve gets.
+const NO_SHAPES: &[&str] = &[];
+
+/// The operations of the AWS-MANAGED JOB TEMPLATE catalog plane, read off this service's own
+/// model (`smithy_query(query="list_operations")`): the listing of the published catalog and
+/// the read of one entry of it.
+const MANAGED_JOB_TEMPLATE_OPERATIONS: &[&str] =
+    &["DescribeManagedJobTemplate", "ListManagedJobTemplates"];
+
+/// What the managed-job-template plane names qualified that the service as a whole does not:
+/// the not-found shape, which that plane reports a template the published catalog does not
+/// hold with — the form a client of it resolves the shape from, and the form the plane's own
+/// `InvalidRequestException` refusals already carry.
+const MANAGED_JOB_TEMPLATE_NAMESPACED_SHAPES: &[&str] = &[RESOURCE_NOT_FOUND_EXCEPTION];
+
+/// The error shapes the PLANE `operation` belongs to names qualified with
+/// [`IOT_DOC_NAMESPACE`] beyond [`NAMESPACED_ERROR_SHAPES`], which every operation of this
+/// service names that way.
+///
+/// AWS IoT is ONE endpoint in front of several planes, and they do not all name the
+/// not-found shape alike, so this is not a property of the shape alone. The evidence is the
+/// observed behaviour of the planes themselves: the managed-job-template catalog reports a
+/// template it does not publish with the shape QUALIFIED — the same form its
+/// `InvalidRequestException` refusals carry, which the whole service already writes — while
+/// the planes that are not named here report it BARE, the fleet-metric read among them,
+/// which is what the framework's serializer already writes. An operation therefore has to be
+/// named here only to be answered qualified, and a plane observed to qualify it is added by
+/// naming its operations beside the catalog's.
+fn plane_namespaced_error_shapes(operation: &str) -> &'static [&'static str] {
+    if MANAGED_JOB_TEMPLATE_OPERATIONS.contains(&operation) {
+        MANAGED_JOB_TEMPLATE_NAMESPACED_SHAPES
+    } else {
+        NO_SHAPES
+    }
 }
 
 /// The `com-amazonaws-iot-awsiotservice` emulated service: the generated [`ServiceDefinition`] plus
