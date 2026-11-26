@@ -16,9 +16,14 @@
 //! A private hosted zone is answered only inside its VPCs, so neither recovery feature
 //! applies to it and its single-zone projections carry the empty container.
 //!
-//! The per-guardrail set the container carries beside those statuses is the last two
-//! tests' rule: the SERVICE's published guardrails, one entry per guardrail, each
-//! carrying that guardrail's status on the zone the container belongs to.
+//! The per-guardrail set the container carries beside those statuses is the
+//! guardrail tests' rule: the SERVICE's published guardrails, one entry per guardrail,
+//! each carrying that guardrail's status on the zone the container belongs to.
+//!
+//! The LAST test is the projection's own invariant: the projection belongs to the SHAPE,
+//! so a reader reports the same members of a zone as the create it follows — the container
+//! among them — since a comment update writes the comment and leaves every other member
+//! where it was.
 //!
 //! One zone read by one operation is ONE row of that class, so the tables below
 //! span it: zones differing in label count, in public/private, in whether they
@@ -2329,6 +2334,137 @@ async fn the_status_of_each_guardrail_is_read_off_the_zone_it_is_turned_on_for()
             &format!("the zone beside the one {guardrail:?} is turned on for"),
             &get_zone(&router, &untouched_id).await,
             Some(&[]),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The members a reader keeps
+// ---------------------------------------------------------------------------
+
+/// The one `<HostedZone>` element a reply projecting a single zone carries, as raw XML —
+/// the zone-block analogue of [`features_of`] beside it.
+fn the_one_hosted_zone_block<'a>(case: &str, reply: &'a Reply) -> &'a str {
+    let blocks = hosted_zone_blocks(&reply.body);
+    assert_eq!(
+        blocks.len(),
+        1,
+        "case {case:?}: expected exactly one projected hosted zone, got {}; body {}",
+        blocks.len(),
+        reply.body
+    );
+    blocks[0]
+}
+
+/// The SET of elements one `<HostedZone>` element opens, however deeply nested — the
+/// names [`element_names`] collects, sorted, so two projections of one zone are compared
+/// by what they REPORT rather than by the order the members happen to be serialised in.
+fn projected_members(case: &str, block: &str) -> Vec<String> {
+    let mut members: Vec<String> = element_names(block)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !members.is_empty(),
+        "case {case:?}: a projected hosted zone opens at least one member element; \
+         zone {block:?}"
+    );
+    members.sort();
+    members
+}
+
+/// The members a projection of a zone reports once it holds a comment: the ones it
+/// reported before, plus the `Comment` the update wrote.
+fn members_plus_comment(members: &[String]) -> Vec<String> {
+    let mut all = members.to_vec();
+    if !all.iter().any(|member| member.as_str() == "Comment") {
+        all.push("Comment".to_string());
+    }
+    all.sort();
+    all
+}
+
+#[tokio::test]
+async fn no_reader_of_a_zone_reports_fewer_members_than_the_create_it_follows() {
+    // The rule, along the axis the sibling tests above do not cover: the projection of a
+    // zone belongs to the SHAPE rather than to one operation, so a reader reports the same
+    // members of a zone as the create it follows — the `Features` container among them —
+    // and a comment update writes the comment and leaves every other member of the
+    // projection where it was. The rows span the zones (label count, public/private,
+    // commented or not); each is asserted on the create, on the read, on the update's echo
+    // and on the read after it.
+    let router = router();
+    let rows = zone_rows();
+
+    for (index, row) in rows.iter().enumerate() {
+        let created = create_zone(
+            &router,
+            row.name,
+            &format!("features-member-set-{index}"),
+            row.extra,
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            row.case, created.status, created.body
+        );
+        let zone_id = bare_zone_id(&created);
+        let created_members =
+            projected_members(row.case, the_one_hosted_zone_block(row.case, &created));
+
+        let read = get_zone(&router, &zone_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: expected 200 from GetHostedZone, got {} with body {}",
+            row.case, read.status, read.body
+        );
+        let read_members =
+            projected_members(row.case, the_one_hosted_zone_block(row.case, &read));
+        assert_eq!(
+            read_members, created_members,
+            "case {:?}: a read reports the same members of the zone as the create, expected \
+             {created_members:?}, got {read_members:?}; body {}",
+            row.case, read.body
+        );
+
+        let updated = update_comment(&router, &zone_id, "a later comment").await;
+        assert_eq!(
+            updated.status, 200,
+            "case {:?}: expected 200 from UpdateHostedZoneComment, got {} with body {}",
+            row.case, updated.status, updated.body
+        );
+        let expected = members_plus_comment(&created_members);
+        let after = get_zone(&router, &zone_id).await;
+        assert_eq!(
+            after.status, 200,
+            "case {:?}: expected 200 from GetHostedZone, got {} with body {}",
+            row.case, after.status, after.body
+        );
+        for (reader, reply) in [
+            ("UpdateHostedZoneComment", &updated),
+            ("GetHostedZone after the update", &after),
+        ] {
+            let case = format!("{} projected by {reader}", row.case);
+            let members = projected_members(&case, the_one_hosted_zone_block(&case, reply));
+            assert_eq!(
+                members, expected,
+                "case {case:?}: a comment update writes the comment and leaves every other \
+                 member where it was, expected {expected:?}, got {members:?}; body {}",
+                reply.body
+            );
+        }
+
+        // The comparisons above hold the readers to the create; this names the member the
+        // comparison is here for, so projections that all dropped it alike would still be
+        // caught.
+        assert!(
+            created_members
+                .iter()
+                .any(|member| member.as_str() == "Features"),
+            "case {:?}: every projected hosted zone opens its Features container, got the \
+             members {created_members:?}",
+            row.case
         );
     }
 }
