@@ -13,12 +13,12 @@
 //! anything, so two callers see the same executions whether or not either of them called.
 //!
 //! A run that reached NO node is an execution all the same — State Manager dispatched the
-//! association — but nothing reported a result for it: it has no target to report one, so it
-//! reports no detail and the EMPTY count of targets by status, and its status stays the
-//! `Pending` the association itself reports
-//! ([`associations::AssociationRecord::overview`]). One rule holds
-//! across both reads: a result is reported by the nodes a run reached, and a run that reached
-//! none has no result.
+//! association — and what it reports is the result of a run over no resource: there was
+//! nothing to apply the document on, so the execution is over at the instant it was
+//! dispatched, reporting `Success` with the EMPTY count of targets by status and no date of a
+//! last execution ([`associations::AssociationRunRecord::is_over`]). One rule holds across
+//! both reads: a result is reported over the nodes a run reached, and a result over none is
+//! an empty one rather than an absent one.
 //!
 //! The TARGETS of an execution are the nodes it was dispatched to, each reported with the
 //! kind the node store holds for that node, so a target reports what registering the node
@@ -185,9 +185,11 @@ impl AssociationRunRecord {
     ///
     /// Every member is what the dispatch persisted — the association it ran, the id it was
     /// dispatched under, the version it applied and the instant it started — or is derived
-    /// from that instant: the status it has reached, the date it finished at and the count of
-    /// its targets by status. A run that reached no node reports no detail and no count,
-    /// because a result is reported by the nodes a run reached. `TriggeredAlarms` is unset
+    /// from that instant: the status it has reached, the detail of that status and the count
+    /// of its targets by status. A run that reached no node reports the result of a run over
+    /// no resource — `Success` over the empty count, because there was nothing to apply the
+    /// document on — and no date of a last execution, because the document was executed
+    /// nowhere. `TriggeredAlarms` is unset
     /// because no alarm has been invoked for a run, the reading the association's own
     /// description already takes (`AssociationRecord::to_association_description`).
     pub fn to_association_execution(
@@ -200,13 +202,15 @@ impl AssociationRunRecord {
             association_version: Some(self.association_version.to_string()),
             execution_id: Some(self.execution_id.clone()),
             status: Some(self.status(now).to_string()),
-            detailed_status: (!self.nodes.is_empty())
-                .then(|| self.detailed_status(now).to_string()),
+            // "Detailed status information about the execution"
+            // (`AssociationExecution$DetailedStatus`): the detail of the status this
+            // execution reports, which every execution has one of.
+            detailed_status: Some(self.detailed_status(now).to_string()),
             created_time: Some(crate::state::wire_instant(self.started_at)),
             // "The date of the last execution": this execution ran once, so the date it has
-            // is the instant it finished at — and a run that has not finished has none.
-            last_execution_date: self
-                .has_finished(now)
+            // is the instant it finished at — and a run that has not finished, or that
+            // reached no node to run the document on, has none.
+            last_execution_date: (!self.nodes.is_empty() && self.has_finished(now))
                 .then(|| crate::state::wire_instant(self.finished_at())),
             resource_count_by_status: Some(self.resource_count_by_status(now)),
             // The alarms this execution was dispatched to watch are the ones the version it

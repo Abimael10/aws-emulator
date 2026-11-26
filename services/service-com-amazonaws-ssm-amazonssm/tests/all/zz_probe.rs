@@ -130,7 +130,7 @@ async fn a_start_followed_by_a_stop_answers_the_execution_the_stop_left() {
             400,
             format!(
                 "Failed to complete automation {id}, automation is running in Auto mode. \
-                 Completion request is only supported in Interactive mode"
+                 Completion request is only supported in Interactive mode."
             )
         ),
         "expected the completion to be refused for an automation running itself, got {status} \

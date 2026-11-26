@@ -2179,11 +2179,13 @@ pub const STOP_NOT_VALID_MESSAGE: &str = "The specified update status operation 
 ///
 /// The execution the request named and the `ExecutionMode` it is running in are the variable
 /// parts — the first from the request, the second from this store; the rest is the fixed
-/// text Systems Manager words this refusal with.
+/// text Systems Manager words this refusal with: TWO sentences, each ended by the full stop
+/// that belongs to it, so a caller matching the documented wording exactly — by string
+/// equality or by an anchored pattern — recognises the refusal.
 pub fn complete_not_interactive_message(execution_id: &str, mode: &str) -> String {
     format!(
         "Failed to complete automation {execution_id}, automation is running in {mode} mode. \
-         Completion request is only supported in {EXECUTION_MODE_INTERACTIVE} mode"
+         Completion request is only supported in {EXECUTION_MODE_INTERACTIVE} mode."
     )
 }
 

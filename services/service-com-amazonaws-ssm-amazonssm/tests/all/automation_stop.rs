@@ -453,7 +453,7 @@ async fn a_completion_is_only_supported_for_an_interactive_automation() {
             "InvalidAutomationStatusUpdateException",
             format!(
                 "Failed to complete automation {running}, automation is running in Auto mode. \
-                 Completion request is only supported in Interactive mode"
+                 Completion request is only supported in Interactive mode."
             )
             .as_str()
         ),

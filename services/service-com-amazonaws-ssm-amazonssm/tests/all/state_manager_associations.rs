@@ -14,7 +14,7 @@
 //! rather than the single create the recorded units happened to make.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -225,6 +225,32 @@ pub(crate) fn stored_associations(engine: &Arc<engine::InMemoryEngine>) -> usize
         .lock()
         .associations
         .len()
+}
+
+/// Dispatch the run State Manager owes every association the store holds, and answer how many
+/// associations owed one.
+///
+/// A version applied to an association that was already there asks State Manager for a run,
+/// which is dispatched when the clock makes it due
+/// (`state::ComAmazonawsSsmAmazonssmState::dispatch_due_associations`,
+/// [`associations::ASSOCIATION_DISPATCH_DELAY`]). A case that wants that run brings its due
+/// instant FORWARD through the store — the one place the due instants are read from — rather
+/// than waiting the span out, so nothing rests on how fast the host runs. An association no
+/// version was just applied to owes none and is left alone.
+///
+/// THE one driver of that dispatch across these suites, so no suite drives it its own way.
+pub(crate) fn dispatch_owed_runs(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
+    let mut store = state.lock();
+    let mut owed = 0;
+    for held in store.associations.values_mut() {
+        if let Some(due) = held.dispatch_due {
+            held.dispatch_due = Some(due - associations::ASSOCIATION_DISPATCH_DELAY);
+            owed += 1;
+        }
+    }
+    store.dispatch_due_associations(SystemTime::now());
+    owed
 }
 
 /// Whether `id` is spelled the way the modelled `AssociationId` pattern requires:

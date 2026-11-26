@@ -105,15 +105,66 @@ fn settle_the_create(engine: &Arc<engine::InMemoryEngine>, association_id: &str)
     age_everything(engine, association_id, span);
 }
 
+/// Bring the run State Manager OWES the association — the one the version just applied asked
+/// for ([`associations::ASSOCIATION_DISPATCH_DELAY`]) — and the version itself to their end:
+/// the dispatch comes due, the run it starts has finished [`FINISHED_AGO`], and the version in
+/// force is no longer being put in place.
+///
+/// The same mechanism `crate::state_manager_associations::dispatch_owed_runs` drives, with a
+/// DEEPER backdate: this case needs the run the dispatch starts to have finished as well, so the
+/// due instant is moved back past both spans. Every instant is DRIVEN through the store, which
+/// is the one place they are read from, so nothing here waits for a span to pass. The runs the
+/// association already had are left where they are, so the run this starts is the association's
+/// latest.
+fn settle_the_owed_dispatch(engine: &Arc<engine::InMemoryEngine>, association_id: &str) {
+    let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
+    let mut store = state.lock();
+    {
+        let record = store
+            .association_mut(REGION, association_id)
+            .expect("the create persisted the association");
+        let owed = record
+            .dispatch_due
+            .expect("the call that applied the version owes State Manager a run");
+        record.dispatch_due = Some(
+            owed - (associations::ASSOCIATION_DISPATCH_DELAY
+                + associations::ASSOCIATION_EXECUTION_DELAY
+                + FINISHED_AGO),
+        );
+        settle_the_version_in_force(record);
+    }
+    store.dispatch_due_associations(SystemTime::now());
+}
+
+/// Move the association's version in FORCE back past the span it is reported as being put in
+/// place for ([`associations::ASSOCIATION_CREATION_DELAY`]), leaving its runs where they are.
+fn settle_the_version_in_force(record: &mut associations::AssociationRecord) {
+    let span = associations::ASSOCIATION_CREATION_DELAY + WELL_PAST;
+    if let Some(version) = record.versions.last_mut() {
+        version.created_at -= span;
+    }
+}
+
+/// The same, for an association no further run is owed for.
+fn settle_the_applied_version(engine: &Arc<engine::InMemoryEngine>, association_id: &str) {
+    let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
+    let mut store = state.lock();
+    let record = store
+        .association_mut(REGION, association_id)
+        .expect("the create persisted the association");
+    settle_the_version_in_force(record);
+}
+
 /// Bring the association's LATEST run alone to its end, leaving every earlier run and the
-/// version in force where they are.
+/// version in force where they are — for the call that dispatches a run of its own
+/// (`StartAssociationsOnce`: "runs an association immediately and only one time").
 fn finish_latest_run(engine: &Arc<engine::InMemoryEngine>, association_id: &str) {
     let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
     let mut store = state.lock();
     let run = store
         .association_mut(REGION, association_id)
         .and_then(associations::AssociationRecord::last_run_mut)
-        .expect("the call that applied the version dispatched a run");
+        .expect("the call that dispatched the run persisted it");
     run.started_at -= associations::ASSOCIATION_EXECUTION_DELAY + FINISHED_AGO;
 }
 
@@ -243,9 +294,10 @@ fn rows() -> Vec<Row> {
 }
 
 /// RULE: the update's own 200 reports the association in full — the version it resolved, the
-/// targeting it applied and the execution the association has ALREADY had — and the run it
-/// dispatched does not un-report that execution: the dates stay where the finished run put
-/// them until the new run finishes, at which point they move onto it.
+/// targeting it applied and the execution the association has ALREADY had — and the run that
+/// version owes State Manager does not un-report that execution: the dates stay where the
+/// finished run put them until the owed run has been dispatched and has finished, at which
+/// point they move onto it.
 #[tokio::test]
 async fn an_update_reports_the_execution_the_association_has_already_had() {
     for row in rows() {
@@ -311,31 +363,25 @@ async fn an_update_reports_the_execution_the_association_has_already_had() {
             "case {case:?}: expected the update to report that run as the last successful one, \
              got {applied}"
         );
-        if row.dispatches {
-            assert_eq!(
-                applied["Overview"]["Status"],
-                json!("Pending"),
-                "case {case:?}: the run the update dispatched has reported no result yet, got \
-                 {applied}"
-            );
-            assert_eq!(
-                applied["Overview"]["DetailedStatus"],
-                json!("Creating"),
-                "case {case:?}: expected the detail of a version just applied, got {applied}"
-            );
-        } else {
-            assert_eq!(
-                applied["Overview"]["Status"],
-                json!("Success"),
-                "case {case:?}: an update that dispatched nothing keeps the run the \
-                 association last had, got {applied}"
-            );
-            assert_eq!(
-                applied["Overview"]["DetailedStatus"],
-                json!("Success"),
-                "case {case:?}: expected the detail of that finished run, got {applied}"
-            );
-        }
+        // The configuration the update has just applied is what the association's progress is
+        // about, whatever an earlier run of the configuration before it came out as: it is
+        // being put in place, and nothing has reported a result for it.
+        assert_eq!(
+            applied["Overview"]["Status"],
+            json!("Pending"),
+            "case {case:?}: the version the update applied has reported no result yet, got \
+             {applied}"
+        );
+        assert_eq!(
+            applied["Overview"]["DetailedStatus"],
+            json!("Creating"),
+            "case {case:?}: expected the detail of a version just applied, got {applied}"
+        );
+        assert!(
+            applied["Overview"]["AssociationStatusAggregatedCount"].is_null(),
+            "case {case:?}: a version being put in place has no count of targets by status, \
+             got {applied}"
+        );
 
         // Both read paths report the same execution while the update's run is in flight: a
         // dispatched run un-reports nothing.
@@ -352,11 +398,13 @@ async fn an_update_reports_the_execution_the_association_has_already_had() {
             "case {case:?}: expected the listing to agree with the read, got {entry}"
         );
 
-        // Once the run the update dispatched has finished, the dates move ONTO it. An update
-        // that dispatched nothing has no later run to move them to, so the one execution the
-        // association has had stays its last.
+        // Once the run the update OWED has been dispatched and has finished, the dates move
+        // ONTO it. An update that owes no run has no later run to move them to, so the one
+        // execution the association has had stays its last.
         if row.dispatches {
-            finish_latest_run(&engine, &association_id);
+            settle_the_owed_dispatch(&engine, &association_id);
+        } else {
+            settle_the_applied_version(&engine, &association_id);
         }
         let finished = described(&router, case, &json!({"AssociationId": association_id})).await;
         assert_eq!(

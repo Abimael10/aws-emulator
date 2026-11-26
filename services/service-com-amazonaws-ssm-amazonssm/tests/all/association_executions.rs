@@ -7,7 +7,8 @@
 //! RULE: an association reports one execution per run State Manager has dispatched it in,
 //! most recent first, each carrying the id that dispatch minted, the association version it
 //! applied, the instant it started, the status the clock has brought that run to and the count
-//! of its targets in that status — a run that reached no node reporting no result at all; an
+//! of its targets in that status — a run that reached no node reporting the result of a run over
+//! no resource; an
 //! execution reports one target per node it was dispatched to, carrying that node's id and the
 //! kind the node store holds for it, with the execution's own status; both reads narrow by
 //! every filter the request carries, serve pages of at most `MaxResults` resumed by the id of
@@ -46,8 +47,8 @@ use service_com_amazonaws_ssm_amazonssm::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::state_manager_associations::{
-    call, call_in_region, created, error_code, service, AGENT, NODE, OTHER_NODE, OTHER_REGION,
-    REGION,
+    call, call_in_region, created, dispatch_owed_runs, error_code, service, AGENT, NODE, OTHER_NODE,
+    OTHER_REGION, REGION,
 };
 
 /// A hybrid node of [`REGION`] (`mi-` and 17 characters, as the modelled `InstanceId` pattern
@@ -455,8 +456,8 @@ async fn every_dispatch_is_reported_as_an_execution() {
 
 /// RULE: the association version an execution reports is the one in force when it was
 /// dispatched, so an earlier execution keeps reporting the version it applied after an update
-/// has moved the association on — and an update, which dispatches a run of its own, is one
-/// more execution rather than a rewrite of the first.
+/// has moved the association on — and the run an update asks State Manager for is one more
+/// execution, dispatched when the clock makes it due, rather than a rewrite of the first.
 #[tokio::test]
 async fn an_execution_reports_the_version_the_dispatch_applied() {
     let case = "a dispatch after an update applies the new version";
@@ -479,7 +480,18 @@ async fn an_execution_reports_the_version_the_dispatch_applied() {
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateAssociation, got {status} with {parsed:?}"
     );
+    // The update's own run is State Manager's, owed a span after the call
+    // ([`associations::ASSOCIATION_DISPATCH_DELAY`]): until the clock makes it due the
+    // association reports the executions it already had, so a read right now sees two.
+    assert_eq!(
+        executions(&router, case, &json!({"AssociationId": id}))
+            .await
+            .len(),
+        1,
+        "case {case:?}: expected the update to have added no execution of its own yet"
+    );
     start_once(&router, case, &id).await;
+    dispatch_owed_runs(&engine);
 
     let reported = executions(&router, case, &json!({"AssociationId": id})).await;
     assert_eq!(
@@ -1175,10 +1187,12 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
 }
 
 /// RULE: a dispatch that reached no registered node is an execution of the association all the
-/// same — State Manager dispatched it — reporting no target, no detail and no count of targets
-/// by status, because a result is reported by the nodes a run reached.
+/// same — State Manager dispatched it — and what it reports is the result of a run over no
+/// resource: there was nothing to apply the document on, so the execution is over at the instant
+/// it was dispatched, reporting `Success`, that same detail and the EMPTY count of targets by
+/// status, with no date of a last execution because the document was executed nowhere.
 #[tokio::test]
-async fn a_dispatch_that_reached_no_node_reports_no_result() {
+async fn a_dispatch_that_reached_no_node_reports_a_result_over_nothing() {
     let rows: Vec<(&str, Value)> = vec![
         (
             "a node id target naming no registered node",
@@ -1207,14 +1221,15 @@ async fn a_dispatch_that_reached_no_node_reports_no_result() {
         );
         for entry in &reported {
             assert_eq!(
-                entry["Status"],
-                json!("Pending"),
-                "case {case:?}: a run with no target has no result to report, got {entry:?}"
+                (entry["Status"].clone(), entry["DetailedStatus"].clone()),
+                (json!("Success"), json!("Success")),
+                "case {case:?}: a run with no resource to apply the document on is over, got \
+                 {entry:?}"
             );
             assert!(
-                entry["DetailedStatus"].is_null()
-                    && entry["LastExecutionDate"].is_null(),
-                "case {case:?}: a detail over no resource is none, got {entry:?}"
+                entry["LastExecutionDate"].is_null(),
+                "case {case:?}: the document was executed nowhere, so there is no date of a \
+                 last execution, got {entry:?}"
             );
             assert_eq!(
                 entry["ResourceCountByStatus"],

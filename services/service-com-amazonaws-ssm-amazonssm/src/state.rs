@@ -2800,7 +2800,11 @@ impl ComAmazonawsSsmAmazonssmState {
         // (`ops_items::OPS_ITEM_DELETE_SETTLES_AFTER`).
         self.settle_ops_item_deletions_due(now);
         // And so was the application an association owes a node that has registered since its
-        // current run was dispatched ([`Self::settle_due_association_targets`]).
+        // current run was dispatched ([`Self::settle_due_association_targets`]) — and the run
+        // State Manager owes an association a version was applied to
+        // ([`Self::dispatch_due_associations`]), dispatched first so the run the clock has
+        // just started settles its own targets in the same pass.
+        self.dispatch_due_associations(now);
         self.settle_due_association_targets();
     }
 

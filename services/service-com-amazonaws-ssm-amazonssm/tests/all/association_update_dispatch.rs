@@ -6,10 +6,13 @@
 //! `DescribeInstanceAssociationsStatus` reporting the run that reached them.
 //!
 //! RULE: the call that applies a version of an association — the create that mints it or the
-//! update that replaces it — immediately runs the association against the managed nodes the
-//! targets of THAT version select, unless the applied version asks to be run only on its
-//! schedule (`ApplyOnlyAtCronInterval`), in which case the call dispatches nothing and the
-//! association keeps whatever it last ran.
+//! update that replaces it — runs the association against the managed nodes the targets of
+//! THAT version select, unless the applied version asks to be run only on its schedule
+//! (`ApplyOnlyAtCronInterval`), in which case nothing is run and the association keeps whatever
+//! it last ran. The create's run is the create's own; the run an update asks for is State
+//! Manager's, dispatched once the clock makes it due
+//! ([`associations::ASSOCIATION_DISPATCH_DELAY`]), so a read taken straight after an update
+//! still reports the run the association was in.
 //!
 //! Every case goes through the front door a client uses, over the dispatch
 //! [`crate::state_manager_associations`] publishes, so this suite shares one calling
@@ -37,7 +40,7 @@ use service_com_amazonaws_ssm_amazonssm::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::state_manager_associations::{
-    call, created, described, service, AGENT, NODE, OTHER_NODE, REGION,
+    call, created, described, dispatch_owed_runs, service, AGENT, NODE, OTHER_NODE, REGION,
 };
 
 /// The tag key the seeded nodes carry a value for, so a tag target selects a subset of the
@@ -101,13 +104,17 @@ fn dispatched_nodes(engine: &Arc<engine::InMemoryEngine>, association_id: &str) 
         .unwrap_or_default()
 }
 
-/// Age every run the store holds past the span a run takes to finish, so the result the clock
-/// owes is the one a read reports. The store is aged rather than the clock: what the store
-/// holds is what a read reports, so a run dispatched that long ago is this run.
+/// Age every run the store holds past the span a run takes to finish, and the version in force
+/// past the span it is reported as being put in place for, so the result the clock owes is the
+/// one a read reports. The store is aged rather than the clock: what the store holds is what a
+/// read reports, so a run dispatched that long ago is this run.
 fn age_runs(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
     let mut store = state.lock();
     for held in store.associations.values_mut() {
+        if let Some(version) = held.versions.last_mut() {
+            version.created_at -= associations::ASSOCIATION_CREATION_DELAY + Duration::from_secs(1);
+        }
         if let Some(run) = held.last_run_mut() {
             run.started_at -= associations::ASSOCIATION_EXECUTION_DELAY + Duration::from_secs(1);
         }
@@ -208,9 +215,10 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// RULE: an update runs the association against the nodes the version it applied selects, and
-/// the association then reports that run — unless the applied version leaves the next run to
-/// its schedule, in which case the run the association keeps is the one it last had.
+/// RULE: an update runs the association against the nodes the version it applied selects — the
+/// run State Manager owes it, once the clock makes that dispatch due — and the association then
+/// reports that run; unless the applied version leaves the next run to its schedule, in which
+/// case the run the association keeps is the one it last had.
 #[tokio::test]
 async fn an_update_runs_the_association_against_the_nodes_it_applied() {
     for row in rows() {
@@ -232,6 +240,9 @@ async fn an_update_runs_the_association_against_the_nodes_it_applied() {
             "case {case:?}: expected the update to apply the second version, got {applied:?}"
         );
 
+        // The run the update asked for is State Manager's own, dispatched once the clock makes
+        // it due.
+        dispatch_owed_runs(&engine);
         let reached = dispatched_nodes(&engine, &association_id);
         assert_eq!(
             as_refs(&reached),
@@ -364,6 +375,7 @@ async fn the_schedule_only_flag_decides_the_run_of_whichever_call_applied_it() {
         });
         merge(&mut update_body, &members);
         updated(&router, case, &update_body).await;
+        dispatch_owed_runs(&engine);
         let reached = dispatched_nodes(&engine, &association_id);
         let expected: Vec<&str> = if runs { vec![OTHER_NODE] } else { vec![NODE] };
         assert_eq!(

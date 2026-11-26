@@ -19,7 +19,10 @@
 //! Region, the document it associates, the node it was created for and its tag set.
 //!
 //! An association RUNS against the managed nodes its targets select: State Manager applies
-//! it as soon as it is created, and `StartAssociationsOnce` applies it again on demand.
+//! it as soon as it is created, and `StartAssociationsOnce` applies it again on demand; a
+//! version applied to an association that was already there is re-applied by State Manager
+//! itself, so the run it owes is dispatched when the clock makes it due
+//! ([`ASSOCIATION_DISPATCH_DELAY`]) rather than by the call that applied the version.
 //! What a run is here is [`AssociationRunRecord`] — the id it is reported by, the version it
 //! ran, the instant it started and the nodes it was dispatched to, resolved from the node
 //! store at that instant — and its result is derived from that stored instant
@@ -104,6 +107,19 @@ pub const ASSOCIATION_EXECUTION_DELAY: Duration = Duration::from_secs(3);
 /// is due this long after the version in force was applied, whether or not anybody reads in
 /// between — an update applies a version too, so it is owed the same span the create was.
 pub const ASSOCIATION_CREATION_DELAY: Duration = Duration::from_secs(3);
+
+/// How long after a version is APPLIED to an association that was already there State
+/// Manager takes to have dispatched the run that applies it.
+///
+/// "When you update an association, the association immediately runs against the specified
+/// targets" (`UpdateAssociationRequest$ApplyOnlyAtCronInterval`): the run is State Manager's
+/// own, started off the call that applied the version rather than by it, so the association's
+/// execution history grows when the clock makes that dispatch due — which is why a read taken
+/// straight after an update reports the executions the association had and no new one.
+///
+/// AWS publishes no span for it, so this is the emulator's CHOSEN transient window: three
+/// seconds, the span this emulator gives a transition nobody documents, and never zero.
+pub const ASSOCIATION_DISPATCH_DELAY: Duration = Duration::from_secs(3);
 
 /// How many associations one Region holds: "You can have at most 2,000 active
 /// associations" (`AssociationLimitExceeded`). A create past it is refused with that
@@ -481,6 +497,16 @@ pub struct AssociationRecord {
     /// "is only used for associations created with the InstanceId legacy parameter"
     /// (`UpdateAssociationStatus`), so an association carries at most the one node's report.
     pub reported_status: Option<AssociationStatus>,
+    /// When State Manager is owed the run that applies the version this association holds
+    /// last, or `None` when it owes none.
+    ///
+    /// A version APPLIED to an association that was already there is re-applied by State
+    /// Manager rather than by the call that applied it, so the run it owes is due
+    /// [`ASSOCIATION_DISPATCH_DELAY`] after that call and is dispatched by
+    /// [`ComAmazonawsSsmAmazonssmState::dispatch_due_associations`] whether or not anybody
+    /// reads in between. A create needs none: the application the create itself performs is
+    /// its first run.
+    pub dispatch_due: Option<SystemTime>,
 }
 
 /// One run of an association: when State Manager dispatched it, and to which managed nodes.
@@ -529,25 +555,43 @@ impl AssociationRunRecord {
         now >= self.finished_at()
     }
 
-    /// The status this run reports as of `now`: a run that has finished applied the document
-    /// on every node it was dispatched to, which is `Success`; until then no execution of it
-    /// has reported a result, which is `Pending`.
+    /// Whether the work this run was dispatched to do is OVER as of `now`.
     ///
-    /// THE ONE reading of a run's status across this service, so the association's own
-    /// reads, its per-node status reports and its executions cannot disagree about how far
-    /// one run has got.
+    /// The work of a run is applying the document on the nodes it was dispatched to, so a run
+    /// dispatched to NONE has none: State Manager evaluated the association's targets, found
+    /// no node to apply the document on, and the run is over at the instant it was dispatched
+    /// — there is nothing for the span a node takes to apply it ([`has_finished`]) to be
+    /// waited out on. A run that did reach nodes is over once that span has passed.
+    ///
+    /// [`has_finished`]: AssociationRunRecord::has_finished
+    pub fn is_over(&self, now: SystemTime) -> bool {
+        self.nodes.is_empty() || self.has_finished(now)
+    }
+
+    /// The status this run reports as of `now`: a run whose work is over applied the document
+    /// on every node it was dispatched to — over no node where it reached none — which is
+    /// `Success`; until then no execution of it has reported a result, which is `Pending`.
+    ///
+    /// THE ONE reading of a RUN's status across this service, so the reads that report one run
+    /// — its executions and its per-node status reports — cannot disagree about how far that
+    /// run has got. The ASSOCIATION's own progress ([`AssociationRecord::overview`]) is not
+    /// this: it is what the association has been reported COMPLIANT by, so it reports the
+    /// version in force still being put in place, and nothing until a run of it has run
+    /// somewhere. RECORDED BEHAVIOUR: a create whose targets select no node answers
+    /// `Overview` `Pending`/`Creating` while the execution it dispatched is over, so the two
+    /// readings are of different things rather than of one.
     pub fn status(&self, now: SystemTime) -> &'static str {
-        if self.has_finished(now) {
+        if self.is_over(now) {
             ASSOCIATION_STATUS_SUCCESS
         } else {
             ASSOCIATION_STATUS_PENDING
         }
     }
 
-    /// The detail of that status: the result a finished run finished with, and the work
-    /// still being gone through on its nodes until then.
+    /// The detail of that status: the result a run whose work is over finished with, and the
+    /// work still being gone through on its nodes until then.
     pub fn detailed_status(&self, now: SystemTime) -> &'static str {
-        if self.has_finished(now) {
+        if self.is_over(now) {
             ASSOCIATION_DETAILED_STATUS_SUCCESS
         } else {
             ASSOCIATION_DETAILED_STATUS_IN_PROGRESS
@@ -581,6 +625,9 @@ impl AssociationRecord {
             // `AssociationDescription$Status` is a node's report rather than anything a
             // create states.
             reported_status: None,
+            // The application a create performs is the association's first run, dispatched by
+            // the create itself, so nothing further is owed for the version it minted.
+            dispatch_due: None,
         }
     }
 
@@ -736,10 +783,11 @@ impl AssociationRecord {
     /// run have got.
     ///
     /// The detail `Creating` is reported for the span the version in FORCE is being put in
-    /// place ([`ASSOCIATION_CREATION_DELAY`]), whichever call applied it, where the
-    /// association has no finished run of its own to report instead: an update appends a
+    /// place ([`ASSOCIATION_CREATION_DELAY`]), whichever call applied it: an update appends a
     /// version the same way a create mints one, so the configuration a caller has just
-    /// applied is reported as being created until that span has passed.
+    /// applied is reported as being created until that span has passed — and it is reported
+    /// ahead of the result of any run, because the result of a run of the configuration
+    /// BEFORE it is not the progress of the one being put in place now.
     ///
     /// A run that has FINISHED ([`AssociationRunRecord`]) is the association's result:
     /// `Success`, over the count of nodes it was dispatched to — which for a run dispatched
@@ -763,6 +811,22 @@ impl AssociationRecord {
                 association_status_aggregated_count: Some(
                     [(reported.name.clone(), 1)].into_iter().collect(),
                 ),
+            };
+        }
+        // The association's version in FORCE is what is being put in place: a create mints
+        // the first version and an update appends another, and either way the configuration
+        // just applied is reported as being created until that span has passed — for a create
+        // the two instants are the same one, because its first version is minted by it.
+        let applied_at = self
+            .latest()
+            .map_or(self.created_at, |version| version.created_at);
+        if now < applied_at + ASSOCIATION_CREATION_DELAY {
+            return AssociationOverview {
+                status: Some(ASSOCIATION_STATUS_PENDING.to_string()),
+                detailed_status: Some(ASSOCIATION_DETAILED_STATUS_CREATING.to_string()),
+                // Nothing has reported a result for the configuration being put in place, so
+                // there is no count of targets by status for it.
+                association_status_aggregated_count: None,
             };
         }
         // A run that has finished is what the association reports: every node it was
@@ -789,26 +853,13 @@ impl AssociationRecord {
                 ),
             };
         }
-        // The association's version in FORCE is what is being put in place: a create mints
-        // the first version and an update appends another, and either way the configuration
-        // just applied is reported as being created until that span has passed — for a create
-        // the two instants are the same one, because its first version is minted by it.
-        let applied_at = self
-            .latest()
-            .map_or(self.created_at, |version| version.created_at);
-        let creating = now < applied_at + ASSOCIATION_CREATION_DELAY;
-        let dispatched = self
+        // Neither being put in place nor finished: a run that has been dispatched is still
+        // being worked through on the nodes it reached, and an association no run has
+        // reached a node for has no further detail to report.
+        let detailed_status = self
             .last_run()
-            .is_some_and(|run| !run.nodes.is_empty());
-        let detailed_status = if creating {
-            Some(ASSOCIATION_DETAILED_STATUS_CREATING.to_string())
-        } else if dispatched {
-            Some(ASSOCIATION_DETAILED_STATUS_IN_PROGRESS.to_string())
-        } else {
-            // Neither being created nor working through a run: there is no further detail
-            // to report.
-            None
-        };
+            .is_some_and(|run| !run.nodes.is_empty())
+            .then(|| ASSOCIATION_DETAILED_STATUS_IN_PROGRESS.to_string());
         AssociationOverview {
             status: Some(ASSOCIATION_STATUS_PENDING.to_string()),
             detailed_status,
@@ -1192,33 +1243,68 @@ impl ComAmazonawsSsmAmazonssmState {
         nodes.into_iter().collect()
     }
 
-    /// Dispatch `region`'s association of that id to the managed nodes the version it holds
-    /// last selects, which is what the call that APPLIED that version does: "when you update
-    /// an association, the association immediately runs against the specified targets"
-    /// (`UpdateAssociation`), and State Manager "applies the configuration when the
-    /// association is created" the same way.
+    /// Record that State Manager owes `region`'s association of that id the run that applies
+    /// the version it holds last, which is what the call that APPLIED that version to an
+    /// association already there does: "when you update an association, the association
+    /// immediately runs against the specified targets" (`UpdateAssociation`).
     ///
-    /// The run REPLACES whatever this association last ran
-    /// ([`AssociationRecord::start_run`]), and the nodes are resolved before it is written,
-    /// so the targets the call applied are the ones it reaches. Nothing is dispatched for a
-    /// version that asks to be run only on its schedule
-    /// ([`AssociationRecord::runs_when_applied`]) or for an id this Region holds no
-    /// association of.
+    /// The run is State Manager's own work rather than the call's, so what is written here is
+    /// WHEN it is owed ([`ASSOCIATION_DISPATCH_DELAY`]) and it is dispatched by
+    /// [`Self::dispatch_due_associations`] once the clock reaches that instant, whether or not
+    /// anybody reads in between. A version that asks to be run only on its schedule
+    /// ([`AssociationRecord::runs_when_applied`]) owes no such run — "you can add the
+    /// ApplyOnlyAtCronInterval parameter to run the association during the next schedule run"
+    /// — so applying one cancels whatever an earlier application owed, and an id this Region
+    /// holds no association of owes nothing.
     pub fn dispatch_association_as_applied(
         &mut self,
         region: &str,
         association_id: &str,
         now: SystemTime,
     ) {
-        let Some(held) = self.association(region, association_id) else {
+        let Some(held) = self.association_mut(region, association_id) else {
             return;
         };
-        if !held.runs_when_applied() {
-            return;
-        }
-        let nodes = self.association_run_nodes(held);
-        if let Some(held) = self.association_mut(region, association_id) {
-            held.start_run(nodes, now);
+        held.dispatch_due = held
+            .runs_when_applied()
+            .then(|| now + ASSOCIATION_DISPATCH_DELAY);
+    }
+
+    /// Dispatch every run the clock already owes at `now`
+    /// ([`AssociationRecord::dispatch_due`]).
+    ///
+    /// The run is stamped with the instant it was OWED rather than the instant a caller
+    /// happened to read, so how far it has got follows from when State Manager was due to
+    /// start it; the nodes it reaches are resolved at that dispatch, the way a create's and a
+    /// `StartAssociationsOnce`'s are ([`Self::association_run_nodes`]), so it applies the
+    /// version in force to the nodes its targets select. The write is one the CLOCK made due,
+    /// so two callers see the same executions whether or not either of them read.
+    pub fn dispatch_due_associations(&mut self, now: SystemTime) {
+        let due: Vec<((String, String), SystemTime)> = self
+            .associations
+            .iter()
+            .filter_map(|(key, record)| {
+                let owed = record.dispatch_due?;
+                (now >= owed).then(|| (key.clone(), owed))
+            })
+            .collect();
+        for (key, owed) in due {
+            let Some(record) = self.associations.get(&key) else {
+                continue;
+            };
+            let runs = record.runs_when_applied();
+            let nodes = if runs {
+                self.association_run_nodes(record)
+            } else {
+                Vec::new()
+            };
+            let Some(record) = self.associations.get_mut(&key) else {
+                continue;
+            };
+            record.dispatch_due = None;
+            if runs {
+                record.start_run(nodes, owed);
+            }
         }
     }
 
