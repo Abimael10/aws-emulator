@@ -16,12 +16,14 @@
 //!    `Scope` it was sent with before that precondition: an ARN that does not belong
 //!    to the namespace asked about is the invalid-ARN refusal naming the ARN, because
 //!    the pairing is what the request got wrong.
-//! 3. A value WAF cannot even READ as the kind of ARN a member takes is judged from
-//!    the request alone, so it outranks everything a judgement needs the store for; and a
-//!    REFERENCE the body carries is judged before the TARGET the request acts on, so a put
-//!    naming a rule group that resolves to nothing is the invalid-ARN refusal whether or not
-//!    the set it addresses exists, while the nonexistent-item refusal is what a body WAF can
-//!    use is told about.
+//! 3. The TARGET a request acts on is resolved before anything its BODY carries is
+//!    resolved against the store. Where that target is named by an ARN, a value WAF cannot
+//!    even READ as the kind of ARN the member takes is judged from the request alone and
+//!    outranks every store read. Where it is named by an identity — and the `Scope` is part
+//!    of that identity — a request addressing one no resource of the namespace holds is the
+//!    nonexistent-item refusal whatever reference its body names; only once that target has
+//!    resolved are a reference WAF cannot use, and then the lock token, what the call is
+//!    told about.
 //!
 //! Every call goes through the same front door a real client uses (the `Waf` harness
 //! in [`crate::web_acl_lifecycle`]), so what these tests observe is what an SDK
