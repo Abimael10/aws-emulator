@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAnomalySubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAnomalySubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAnomalySubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +126,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAnomalySubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAnomalySubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAnomalySubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there is nothing to delete and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let mut store = state.lock();
+        // The registry is the only place a subscription exists — the monitors it alerts on,
+        // its subscribers, its threshold and its tag set are all held on that one record —
+        // so the delete is the removal of its entry and nothing else. The monitors it
+        // alerted on are resources of their own and SURVIVE it, which is the mirror of what
+        // a monitor's delete leaves of the subscriptions that alerted on it.
+        let deleted = store.delete_anomaly_subscription(&input.subscription_arn);
+        drop(store);
+
+        if !deleted {
+            // An ARN the account holds no subscription under is the one unknown-subscription
+            // refusal this operation models, whether it never named a subscription or named
+            // one an earlier delete already removed. The subscription is this call's own
+            // resource, so the shared refusal names its id under `resourceId`.
+            return Err(
+                DeleteAnomalySubscriptionErrorModeled::UnknownSubscriptionException(
+                    crate::state::unknown_subscription(&input.subscription_arn),
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteAnomalySubscriptionOutput {})
     }
 }

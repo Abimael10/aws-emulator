@@ -14,6 +14,8 @@ use crate::ops::types::{
     UnknownSubscriptionException,
 };
 
+use super::ComAmazonawsCostexplorerAwsinsightsindexserviceState;
+
 /// How many cost anomaly subscriptions an account may hold.
 ///
 /// This service's model documents no number for it, so the bound is CHOSEN: it is what
@@ -345,10 +347,11 @@ pub fn admitted_subscribers(subscribers: Vec<Subscriber>) -> Vec<Subscriber> {
 /// reference with. The only variable part is the subscription id, which
 /// [`unknown_subscription`] appends.
 ///
-/// The same sentence form the service's unknown-MONITOR refusal carries ("No monitor
-/// present with <member>: <id>"), over the resource this one could not resolve: one
-/// service, one way of saying a reference resolves to nothing.
-const NO_SUBSCRIPTION_PRESENT: &str = "No subscription present with";
+/// The service names the resource kind it could not resolve in the sentence — the cost
+/// anomaly subscription — exactly as its unknown-MONITOR refusal names the monitor ("No
+/// monitor present with <member>: <id>"): one service, one way of saying a reference
+/// resolves to nothing, over the kind of resource the reference was for.
+const NO_SUBSCRIPTION_PRESENT: &str = "No anomaly subscription present with";
 
 /// The member word an unknown-subscription refusal names the id under.
 ///
@@ -371,6 +374,30 @@ pub fn unknown_subscription(subscription_arn: &str) -> UnknownSubscriptionExcept
             "{NO_SUBSCRIPTION_PRESENT} {SUBSCRIPTION_ID_AS_RESOURCE}: {}",
             crate::state::resource_id(subscription_arn)
         )),
+    }
+}
+
+impl ComAmazonawsCostexplorerAwsinsightsindexserviceState {
+    /// Delete the subscription `subscription_arn` names from the account's subscription
+    /// registry.
+    ///
+    /// `false` when the account holds no subscription under that ARN — nothing is written,
+    /// so the caller refuses the request against a registry exactly as it was.
+    ///
+    /// A subscription's record holds everything the subscription IS — the monitors it
+    /// alerts on, its subscribers, its threshold and its tag set — so dropping that one
+    /// entry is the whole delete: the tagging surface stops resolving the ARN by
+    /// construction, and the monitors the subscription alerted on are resources of their
+    /// own that the delete leaves standing. That is the mirror of
+    /// [`delete_anomaly_monitor`](Self::delete_anomaly_monitor), which leaves the
+    /// subscriptions that alerted on a deleted monitor in place.
+    ///
+    /// Lives beside the record it removes rather than in the delete handler, so every
+    /// operation that ends a subscription's life does it one way.
+    pub fn delete_anomaly_subscription(&mut self, subscription_arn: &str) -> bool {
+        self.anomaly_subscriptions
+            .remove(subscription_arn)
+            .is_some()
     }
 }
 

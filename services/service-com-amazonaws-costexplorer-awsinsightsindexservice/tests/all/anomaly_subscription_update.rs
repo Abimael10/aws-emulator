@@ -743,7 +743,7 @@ async fn an_update_against_a_subscription_the_account_does_not_hold_is_refused()
             assert_eq!(
                 error_message(&answered),
                 format!(
-                    "No subscription present with {SUBSCRIPTION_ID_AS_RESOURCE}: {}",
+                    "No anomaly subscription present with {SUBSCRIPTION_ID_AS_RESOURCE}: {}",
                     id_of(arn)
                 ),
                 "case {case:?}: expected the service's own sentence over the bare \

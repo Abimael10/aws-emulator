@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the cost anomaly subscription registry
-//! (`CreateAnomalySubscription`, `GetAnomalySubscriptions`).
+//! (`CreateAnomalySubscription`, `GetAnomalySubscriptions`, `DeleteAnomalySubscription`).
 //!
 //! Every test drives the service over its real wire protocol through the shared
 //! [`crate::harness`], so nothing here reaches past the HTTP surface a client sees.
@@ -9,7 +9,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_costexplorer_awsinsightsindexservice::state::{
     MAX_ANOMALY_SUBSCRIPTIONS, MIN_PAGE_SIZE, MONITOR_TYPE_CUSTOM, SUBSCRIBER_STATUS_CONFIRMED,
-    THRESHOLD_ABSOLUTE_DIMENSION, THRESHOLD_MATCH_OPTION, THRESHOLD_VALUE_MAX,
+    SUBSCRIPTION_ID_AS_RESOURCE, THRESHOLD_ABSOLUTE_DIMENSION, THRESHOLD_MATCH_OPTION,
+    THRESHOLD_VALUE_MAX,
 };
 
 use crate::harness::{error_code, error_message, Emulator};
@@ -951,4 +952,355 @@ async fn a_read_asked_wrongly_is_refused() {
              {answered}"
         );
     }
+}
+
+/// The status Cost Explorer serves an unknown-subscription refusal at, which is the one
+/// `UnknownSubscriptionException` declares (`smithy_query(query="shape",
+/// shape="UnknownSubscriptionException")`: errorKind client, `@httpError 404`).
+const UNKNOWN_SUBSCRIPTION_STATUS: u16 = 404;
+
+/// The bare id an ARN carries: the last segment of its resource portion. Computed here from
+/// the ARN the test sent, so the assertion does not borrow the service's own helper.
+fn id_of(arn: &str) -> &str {
+    match arn.rsplit_once('/') {
+        Some((_, id)) => id,
+        None => arn,
+    }
+}
+
+/// Create one subscription alerting on `monitors`, with `tags` as its `ResourceTags`, and
+/// answer with its ARN.
+///
+/// `DAILY` is one of the `AnomalySubscriptionFrequency` values and the deprecated scalar
+/// `Threshold` is the shorter of the two threshold forms the member documents — which of
+/// them a subscription carries is covered by the create cases above, not by the delete
+/// cases below.
+async fn create_subscription(
+    emulator: &Emulator,
+    name: &str,
+    monitors: &[String],
+    tags: &[(&str, &str)],
+) -> String {
+    let mut body = subscription_body(
+        name,
+        monitors,
+        "DAILY",
+        json!([{"Address": EMAIL_ADDRESS, "Type": "EMAIL"}]),
+        json!({"Threshold": 100.0}),
+    );
+    if !tags.is_empty() {
+        body["ResourceTags"] = tags
+            .iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect();
+    }
+    arn_of(&emulator.ok("CreateAnomalySubscription", &body).await)
+}
+
+/// Every subscription the account holds, paired with the ARN it is reported under.
+async fn subscriptions_by_arn(emulator: &Emulator) -> Vec<(String, Value)> {
+    all_subscriptions(emulator)
+        .await
+        .into_iter()
+        .map(|subscription| {
+            (
+                subscription["SubscriptionArn"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                subscription,
+            )
+        })
+        .collect()
+}
+
+/// Every monitor ARN the account holds, in the order `GetAnomalyMonitors` reports them.
+async fn monitor_arns(emulator: &Emulator) -> Vec<String> {
+    emulator.ok("GetAnomalyMonitors", &json!({})).await["AnomalyMonitors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|monitor| {
+            monitor["MonitorArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// One registry shape a subscription can be deleted out of: how many subscriptions the
+/// account holds, which of them is deleted, and whether the deleted one carries resource
+/// tags.
+struct DeleteCase {
+    label: &'static str,
+    subscriptions: usize,
+    delete: usize,
+    tagged: bool,
+}
+
+/// The registry shapes a delete can be taken against: the only subscription the account
+/// holds, a tagged one, and the first, a middle and the last of several — each subscription
+/// alerting on a different number of monitors, so the delete is exercised on one that
+/// alerts on one monitor and on ones that alert on several.
+const DELETE_CASES: &[DeleteCase] = &[
+    DeleteCase {
+        label: "the only subscription the account holds",
+        subscriptions: 1,
+        delete: 0,
+        tagged: false,
+    },
+    DeleteCase {
+        label: "the only subscription the account holds, carrying resource tags",
+        subscriptions: 1,
+        delete: 0,
+        tagged: true,
+    },
+    DeleteCase {
+        label: "the first of several subscriptions",
+        subscriptions: 3,
+        delete: 0,
+        tagged: false,
+    },
+    DeleteCase {
+        label: "a middle one of several subscriptions",
+        subscriptions: 3,
+        delete: 1,
+        tagged: true,
+    },
+    DeleteCase {
+        label: "the last of several subscriptions",
+        subscriptions: 3,
+        delete: 2,
+        tagged: false,
+    },
+];
+
+/// RULE: `DeleteAnomalySubscription` removes the cost anomaly subscription its
+/// `SubscriptionArn` names from the account's subscription registry — with everything that
+/// record held, so the tagging surface no longer resolves the ARN either — and leaves every
+/// other subscription, and every monitor the deleted subscription alerted on, exactly as it
+/// was. The response carries no members.
+///
+/// The table spans the registry shapes a delete can be taken against: the only subscription
+/// the account holds, one carrying resource tags, and the first, a middle and the last of
+/// several, over subscriptions alerting on one and on several monitors.
+#[tokio::test]
+async fn a_deleted_subscription_is_no_longer_held_by_the_account() {
+    for case in DELETE_CASES {
+        let label = case.label;
+        let emulator = Emulator::start();
+
+        // One monitor per subscription, so subscription `index` can alert on the first
+        // `index + 1` of them: the deleted subscription names one monitor in some cases and
+        // several in others.
+        let mut monitors: Vec<String> = Vec::new();
+        for index in 0..case.subscriptions {
+            monitors.push(create_monitor(&emulator, &format!("delete-monitor-{index}")).await);
+        }
+        let mut subscriptions: Vec<String> = Vec::new();
+        for index in 0..case.subscriptions {
+            let tags: &[(&str, &str)] = if case.tagged && index == case.delete {
+                &[("Team", "cost-ops")]
+            } else {
+                &[]
+            };
+            subscriptions.push(
+                create_subscription(
+                    &emulator,
+                    &format!("delete-subscription-{index}"),
+                    &monitors[..=index],
+                    tags,
+                )
+                .await,
+            );
+        }
+
+        let deleted = subscriptions[case.delete].clone();
+        let before = subscriptions_by_arn(&emulator).await;
+        let expected: Vec<(String, Value)> = before
+            .iter()
+            .filter(|(arn, _)| *arn != deleted)
+            .cloned()
+            .collect();
+
+        let answered = emulator
+            .ok(
+                "DeleteAnomalySubscription",
+                &json!({"SubscriptionArn": deleted}),
+            )
+            .await;
+        assert!(
+            answered.is_null() || answered.as_object().is_some_and(serde_json::Map::is_empty),
+            "case {label:?}: the response carries no members, got {answered}"
+        );
+
+        let reported = subscriptions_by_arn(&emulator).await;
+        assert_eq!(
+            reported, expected,
+            "case {label:?}: exactly the subscriptions other than the deleted one must be \
+             reported, unchanged, got {reported:?}"
+        );
+
+        // The filter reads the same registry from the other side: the deleted ARN selects
+        // nothing, and one naming it beside a survivor still selects the survivor.
+        let by_deleted = emulator
+            .ok(
+                "GetAnomalySubscriptions",
+                &json!({"SubscriptionArnList": [deleted.clone()]}),
+            )
+            .await;
+        assert_eq!(
+            by_deleted["AnomalySubscriptions"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            0,
+            "case {label:?}: the deleted subscription must be selected by nothing, got \
+             {by_deleted}"
+        );
+        if let Some((survivor, _)) = expected.first() {
+            let beside = emulator
+                .ok(
+                    "GetAnomalySubscriptions",
+                    &json!({"SubscriptionArnList": [deleted.clone(), survivor.clone()]}),
+                )
+                .await;
+            assert_eq!(
+                beside["AnomalySubscriptions"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                1,
+                "case {label:?}: a filter naming the deleted subscription beside a survivor \
+                 still selects the survivor, got {beside}"
+            );
+        }
+
+        // The record held the subscription's tag set, so the tagging surface stops resolving
+        // its ARN: the refusal is the one every tagging operation answers an ARN this
+        // account holds no resource under, asserted in full in [`crate::resource_tagging`].
+        let (status, tags) = emulator
+            .call("ListTagsForResource", &json!({"ResourceArn": deleted}))
+            .await;
+        assert_eq!(
+            (status, error_code(&tags).as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: the deleted subscription is no resource the account holds, got \
+             {status}: {tags}"
+        );
+
+        // The monitors the subscription alerted on are resources of their own: the delete
+        // leaves every one of them standing.
+        let mut expected_monitors = monitors.clone();
+        expected_monitors.sort();
+        let reported_monitors = monitor_arns(&emulator).await;
+        assert_eq!(
+            reported_monitors, expected_monitors,
+            "case {label:?}: the delete must leave every monitor in place, got \
+             {reported_monitors:?}"
+        );
+    }
+}
+
+/// RULE: a delete may only be made against a subscription the account holds, so one whose
+/// `SubscriptionArn` resolves to nothing — including an ARN an earlier delete already
+/// removed, which is why the delete is not idempotent — is refused
+/// `UnknownSubscriptionException` at the status the shape declares, carrying the service's
+/// fixed "no subscription present" sentence over the bare id component of the value the
+/// request named, and removes nothing.
+///
+/// The table spans the values `SubscriptionArn` admits (`GenericString`, length 0..1024,
+/// pattern `^[\S\s]*$`, from `smithy_query(query="operation",
+/// operation="DeleteAnomalySubscription")`): a well-formed subscription ARN of this account
+/// naming nothing, one of another account, the ARN of another of this service's resource
+/// kinds, the ARN of a monitor rather than a subscription, a value that is no ARN at all, a
+/// bare id, the empty string, and the ARN of a subscription an earlier delete removed.
+#[tokio::test]
+async fn a_delete_of_a_subscription_the_account_does_not_hold_is_refused() {
+    let emulator = Emulator::start();
+    let monitor = create_monitor(&emulator, "unknown-subscription-delete-monitor").await;
+    let monitors = vec![monitor.clone()];
+    let kept = create_subscription(&emulator, "the-subscription-that-stays", &monitors, &[]).await;
+    let removed = create_subscription(&emulator, "deleted-once", &monitors, &[]).await;
+    emulator
+        .ok(
+            "DeleteAnomalySubscription",
+            &json!({"SubscriptionArn": removed}),
+        )
+        .await;
+    let before = subscriptions_by_arn(&emulator).await;
+
+    let account = engine::emulator_account_id();
+    let unknown: Vec<(&str, String)> = vec![
+        (
+            "a well-formed subscription ARN of this account naming nothing",
+            format!("arn:aws:ce::{account}:anomalysubscription/00000000-0000-8000-8000-000000000000"),
+        ),
+        (
+            "a subscription ARN of another account",
+            "arn:aws:ce::999999999999:anomalysubscription/11111111-1111-8111-8111-111111111111"
+                .to_string(),
+        ),
+        (
+            "the ARN of another of this service's resource kinds",
+            engine::emulator_arn("ce", "", "costcategory/not-a-subscription"),
+        ),
+        (
+            "the ARN of a monitor rather than a subscription",
+            monitor.clone(),
+        ),
+        ("a value that is no ARN at all", "subscription-1".to_string()),
+        (
+            "an id with no ARN around it",
+            "00000000-0000-8000-8000-000000000000".to_string(),
+        ),
+        ("the empty string", String::new()),
+        (
+            "a subscription an earlier delete already removed",
+            removed.clone(),
+        ),
+    ];
+
+    for (label, arn) in &unknown {
+        let (status, answered) = emulator
+            .call(
+                "DeleteAnomalySubscription",
+                &json!({"SubscriptionArn": arn}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (UNKNOWN_SUBSCRIPTION_STATUS, "UnknownSubscriptionException"),
+            "case {label:?}: expected {UNKNOWN_SUBSCRIPTION_STATUS} \
+             UnknownSubscriptionException, got {status}: {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            format!(
+                "No anomaly subscription present with {SUBSCRIPTION_ID_AS_RESOURCE}: {}",
+                id_of(arn)
+            ),
+            "case {label:?}: expected the service's own sentence over the bare subscription \
+             id, got {answered}"
+        );
+    }
+
+    let reported = subscriptions_by_arn(&emulator).await;
+    assert_eq!(
+        reported, before,
+        "a refused delete must remove nothing, got {reported:?}"
+    );
+    assert_eq!(
+        reported.iter().map(|(arn, _)| arn.clone()).collect::<Vec<_>>(),
+        vec![kept],
+        "the account must still hold exactly the subscription no delete removed, got \
+         {reported:?}"
+    );
+    assert_eq!(
+        monitor_arns(&emulator).await,
+        vec![monitor],
+        "a refused delete must leave the monitor registry as it was"
+    );
 }
