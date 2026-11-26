@@ -194,6 +194,24 @@ pub fn blocks_completion(deployment: &Deployment) -> bool {
     deployment.agent.awaits_run
 }
 
+/// Whether `deployment`'s fleet holds a HOST the agent goes round: an instance
+/// target naming an Amazon EC2 instance, whose guest is where the agent of this
+/// emulator performs a deployment ([`due_run_of`] resolves exactly those).
+///
+/// What asks it: an EC2/on-premises revision is a BUNDLE the agent on a target
+/// host downloads and reads, so what this service can report about that bundle
+/// follows from a host having read it ([`super::s3_revision`]). A deployment whose
+/// group resolved no target at all, and one whose targets are registered
+/// on-premises hosts no agent of this emulator reaches, has no such host.
+#[must_use]
+pub fn has_fleet_host(deployment: &Deployment) -> bool {
+    deployment
+        .targets
+        .iter()
+        .filter(|target| target.target_type == DEPLOYMENT_TARGET_TYPE_INSTANCE)
+        .any(|target| target.target_id.as_deref().is_some_and(is_ec2_instance_id))
+}
+
 /// The failure an EC2/on-premises deployment's fleet came to, or `None` when its
 /// hosts took the revision.
 ///

@@ -42,12 +42,26 @@
 use crate::ops::types::RollbackInfo;
 
 use super::{
-    deployment_completion_due, deployment_start_due, lambda_traffic_shift, lifecycle_hook,
-    revision_key, target_waves, termination_wait, traffic_shift,
-    ComAmazonawsCodedeployCodedeploy20141006State, Deployment, DeploymentGroup,
+    lambda_traffic_shift, lifecycle_hook, revision_key, target_waves, termination_wait,
+    traffic_shift, ComAmazonawsCodedeployCodedeploy20141006State, Deployment, DeploymentGroup,
     DEPLOYMENT_CREATOR_ROLLBACK, DEPLOYMENT_STATUS_CREATED, DEPLOYMENT_STATUS_FAILED,
+    DEPLOYMENT_WAVE_MILLIS,
 };
 use crate::ops::types::AutoRollbackConfiguration;
+
+/// How long after the deployment it rolls back reached its outcome the clock owes a
+/// rollback deployment its START.
+///
+/// ONE SPAN of this emulator's own, and deliberately not the shorter lead-in a
+/// client's own `CreateDeployment` is given ([`super::deployment_start_due`]): a
+/// rollback is not a call, it is a deployment the SERVICE creates once the deployment
+/// it rolls back has ended, which then has to be dispatched and fetch the revision it
+/// redeploys before its own Install can replace anything on a host. So what the
+/// deployment that failed installed stays on that host for a span, which is what
+/// makes it readable at all: a client reads a host through another service's own API,
+/// and that answer is itself owed a span, so a state that lived for less than one
+/// could never be read by anybody.
+const ROLLBACK_START_MILLIS: i64 = DEPLOYMENT_WAVE_MILLIS;
 
 /// The `AutoRollbackEvent` that asks for a rollback of a deployment that FAILED
 /// (`smithy_query(query="shape",shape="AutoRollbackEvent")`: DEPLOYMENT_FAILURE |
@@ -298,15 +312,14 @@ pub fn record_rollback(
             create_time_ms: now_ms,
             start_time_ms: None,
             complete_time_ms: None,
-            starts_at_ms: deployment_start_due(now_ms),
+            starts_at_ms: now_ms + ROLLBACK_START_MILLIS,
             // A rollback paces the targets it inherited exactly as the deployment
             // it rolls back paced them — same group, same configuration — so it is
-            // held open for the same one span per wave (`super::target_waves`).
-            completes_at_ms: deployment_completion_due(now_ms).max(
-                target_waves::waves_complete_at_ms(
-                    deployment_start_due(now_ms),
-                    target_waves::wave_count(&targets),
-                ),
+            // held open for the same one span per wave (`super::target_waves`),
+            // counted from the instant it is dispatched.
+            completes_at_ms: target_waves::waves_complete_at_ms(
+                now_ms + ROLLBACK_START_MILLIS,
+                target_waves::wave_count(&targets),
             ) + termination_wait_millis,
             // Nothing has failed, and no lifecycle event hook has reported
             // against the rollback yet.

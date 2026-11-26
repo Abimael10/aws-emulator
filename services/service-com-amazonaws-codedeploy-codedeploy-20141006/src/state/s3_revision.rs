@@ -27,10 +27,14 @@
 //! exactly as they are read out of a revision that carries that document inline.
 //! For an EC2/on-premises deployment the object is a BUNDLE
 //! ([`super::revision_bundle`]) whose AppSpec file says what the agent installs and
-//! runs on each host, so one this emulator cannot read that AppSpec out of — an
-//! object it cannot unpack, a bundle whose root holds no AppSpec file, an AppSpec
-//! that is no document it reads — FAILS the deployment under the same error code
-//! rather than letting it report success for a revision that would install nothing.
+//! runs on each host — and the event that fetches it, `DownloadBundle`, is the
+//! AGENT's, run on the host — so that bundle is reached for only on behalf of a
+//! host the agent goes round ([`this_service_fetches`]), and one this emulator
+//! cannot read that AppSpec out of FAILS that deployment under the same error code
+//! rather than letting it report success for a revision that would install
+//! nothing. A deployment with no such host is answered for its FLEET instead: the
+//! object is never asked about, so a bundle nothing read can neither mask an empty
+//! fleet nor fail a target no agent has reported for.
 //! The revision itself is still held verbatim; nothing fetched is written into it.
 //!
 //! Nothing is refused on evidence this emulator does not have. A bucket the object
@@ -89,7 +93,12 @@ pub fn resolve_due_revisions<Eng: Send + Sync + 'static>(engine: &Eng, now: i64)
         return;
     };
     let pending = {
-        let store = state.lock();
+        let mut store = state.lock();
+        // A deployment whose revision this service does not reach for stops owing
+        // the fetch before anything is asked of the object store
+        // ([`this_service_fetches`]): nothing about the object decides what such a
+        // deployment comes to, so it goes straight on to what its fleet comes to.
+        forget_unread_revisions(&mut store, now);
         due_fetches(&store, now)
     };
     if pending.is_empty() {
@@ -183,11 +192,61 @@ fn is_under_way(deployment: &Deployment, now_ms: i64) -> bool {
         && deployment.starts_at_ms <= now_ms
 }
 
+/// Whether THIS service reaches for `deployment`'s revision at all.
+///
+/// An EC2/on-premises revision is a BUNDLE, and the `DownloadBundle` lifecycle
+/// event that fetches it is the AGENT's, run on each target host — so this service
+/// reaches for the object only to hand it to that agent
+/// ([`super::agent_deployment`] performs the run). A deployment of that platform
+/// with no host for the agent to go round
+/// ([`super::agent_deployment::has_fleet_host`]) has nothing that reads the bundle:
+/// a deployment group that resolved no target, and one whose targets are
+/// registered on-premises hosts no agent of this emulator reaches. Nothing about
+/// the object is asked or answered for such a deployment — what it comes to
+/// follows from its FLEET alone, which for a group that resolved no target is the
+/// `NO_INSTANCES` failure ([`super::deployment_error_information`]) and for a
+/// target nothing has reported for is a target still being deployed to
+/// ([`super::target_waves::target_status`]) — so a bundle no host read can neither
+/// mask an empty fleet nor fail a host that never answered.
+///
+/// Every other compute platform's revision IS the document this service reads, so
+/// it is this service that reaches for it.
+fn this_service_fetches(deployment: &Deployment) -> bool {
+    deployment.compute_platform != super::agent_deployment::COMPUTE_PLATFORM_SERVER
+        || super::agent_deployment::has_fleet_host(deployment)
+}
+
+/// Stop every deployment this service does not fetch the revision of from owing
+/// one, so it is not held in flight waiting for a fetch that never happens; see
+/// [`this_service_fetches`].
+fn forget_unread_revisions(
+    state: &mut ComAmazonawsCodedeployCodedeploy20141006State,
+    now_ms: i64,
+) {
+    let unread: Vec<String> = state
+        .pending_deployments
+        .iter()
+        .filter_map(|id| state.deployments.get(id))
+        .filter(|deployment| {
+            deployment.awaits_revision_fetch
+                && is_under_way(deployment, now_ms)
+                && !this_service_fetches(deployment)
+        })
+        .map(|deployment| deployment.deployment_id.clone())
+        .collect();
+    for deployment_id in unread {
+        if let Some(deployment) = state.deployments.get_mut(&deployment_id) {
+            deployment.awaits_revision_fetch = false;
+        }
+    }
+}
+
 /// The fetch `deployment` owes, or `None` when it owes none — because it has
-/// already been resolved, or because its revision carries its content where this
-/// emulator already read it.
+/// already been resolved, because its revision carries its content where this
+/// emulator already read it, or because this service does not reach for that
+/// revision at all ([`this_service_fetches`]).
 fn fetch_of(deployment: &Deployment) -> Option<Fetch> {
-    if !deployment.awaits_revision_fetch {
+    if !deployment.awaits_revision_fetch || !this_service_fetches(deployment) {
         return None;
     }
     let location = deployment.revision.as_ref()?.s3_location.as_ref()?;
