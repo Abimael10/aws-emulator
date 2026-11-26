@@ -51,9 +51,12 @@
 //! This file also owns the sentences the HANDLERS state for the rules they enforce
 //! themselves (`already_exists_message` and friends), so every operation words the same
 //! refusal the same way instead of spelling its own — and the modelled constraints the
-//! request boundary cannot enforce (`check_tag_keys` / `check_tag_key_list` /
-//! `check_bucket_arns`), so a handler judging one refuses in the words the boundary would
-//! have used.
+//! request boundary cannot enforce (`check_tag_keys` / `check_tag_key_characters` /
+//! `check_tag_key_list` / `check_bucket_arns`), so a handler judging one refuses in the
+//! words the boundary would have used. The namespace a tag key may not open with is BOTH:
+//! a request-shape clause of `TagKey`'s pattern where a request addresses a STORED tag
+//! set, and the service's own tag policy (`RESERVED_TAG_KEYS_MESSAGE` /
+//! `names_reserved_tag_key`) where a request carries a tag set for a resource it creates.
 //!
 //! WHICH of the shared stated value-set orders this service takes, and the evidence for
 //! it, is `enum_value_sets` — which also publishes the order an enumerated type's own set
@@ -523,6 +526,53 @@ where
         Some(message) => Err(message),
         None => Ok(()),
     }
+}
+
+/// Refuse every tag key a request carries that the CHARACTER clause of
+/// [`TAG_KEY_PATTERN`] does not admit — the half of the expression that says what a key may
+/// be WRITTEN with — leaving the reserved namespace its look-ahead excludes to
+/// [`names_reserved_tag_key`].
+///
+/// This is what a request judges its keys by where that namespace is the SERVICE's own tag
+/// policy rather than the request's shape: the characters stay the request-shape fault the
+/// boundary would have stated, and the namespace is answered by the operation's own
+/// modelled error with [`RESERVED_TAG_KEYS_MESSAGE`].
+pub(crate) fn check_tag_key_characters<'a, I>(keys: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (String, &'a str)>,
+{
+    let clauses: Vec<String> = keys
+        .into_iter()
+        .filter(|(_, key)| !admits_tag_key_characters(key))
+        .filter_map(|(path, _)| {
+            constraint_clause(&Violation {
+                path,
+                kind: ViolationKind::Pattern(TAG_KEY_PATTERN.to_string()),
+                // As in `check_tag_keys`: the rejected key is the value, and this service
+                // states no value in a constraint refusal at all.
+                value: None,
+                sensitive: false,
+            })
+        })
+        .collect();
+    match violation_envelope(&clauses) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// How a request asking for a tag key in the namespace Amazon Web Services keeps for the
+/// tags it sets itself is refused where that namespace is the service's own TAG POLICY: the
+/// sentence names the reserved namespace and nothing of the request, so neither the
+/// offending keys nor the resource they were submitted for is quoted back — one request may
+/// carry several such keys and the refusal is one sentence either way.
+pub(crate) const RESERVED_TAG_KEYS_MESSAGE: &str =
+    "Some tag keys in the request started with 'aws:'. System tags cannot be modified.";
+
+/// Whether any of `keys` opens with the namespace [`RESERVED_TAG_KEY_PREFIX`] names — what
+/// a request carrying a tag set of its own asks before it writes anything.
+pub(crate) fn names_reserved_tag_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    keys.into_iter().any(begins_with_reserved_prefix)
 }
 
 /// Refuse a LIST of tag keys under the constraint [`check_tag_keys`] applies to a named

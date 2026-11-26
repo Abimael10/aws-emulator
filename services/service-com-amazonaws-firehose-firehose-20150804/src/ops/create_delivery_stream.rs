@@ -250,21 +250,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A tag the create carries is a tag of the stream it creates, so each of its keys
-        // is judged before anything is written, against the whole modelled `TagKey`
-        // pattern — the characters it lists and the prefix its look-ahead excludes — which
-        // the request boundary would have applied itself had it been able to compile that
-        // look-ahead (`crate::service::check_tag_keys`).
+        // is judged before anything is written — and the two clauses of the modelled
+        // `TagKey` pattern are judged as the two different faults this create answers them
+        // with.
+        //
+        // The namespace Amazon Web Services keeps for the tags it sets itself is this
+        // create's own TAG POLICY: a stream cannot be created carrying a system tag, which
+        // is an argument the service weighed rather than a malformed request, so it is the
+        // modelled `InvalidArgumentException` and the one sentence that states the
+        // namespace (`crate::service::RESERVED_TAG_KEYS_MESSAGE`). It is answered here and
+        // never through the request-shape walk the operations that address a STORED tag set
+        // are refused by.
         if let Some(tags) = input.tags.as_deref() {
-            crate::service::check_tag_keys(tags.iter().enumerate().map(|(index, tag)| {
-                (
-                    path::join(&[
-                        path::member("Tags"),
-                        path::element(index + 1),
-                        path::member("Key"),
-                    ]),
-                    tag.key.as_str(),
-                )
-            }))
+            if crate::service::names_reserved_tag_key(tags.iter().map(|tag| tag.key.as_str())) {
+                return Err(invalid_argument(
+                    crate::service::RESERVED_TAG_KEYS_MESSAGE.to_string(),
+                ));
+            }
+
+            // What a key may be WRITTEN with is still the request's shape: the boundary
+            // would have stated that clause itself had its engine been able to compile the
+            // whole expression, so the refusal is the one it would have worded
+            // (`crate::service::check_tag_key_characters`).
+            crate::service::check_tag_key_characters(tags.iter().enumerate().map(
+                |(index, tag)| {
+                    (
+                        path::join(&[
+                            path::member("Tags"),
+                            path::element(index + 1),
+                            path::member("Key"),
+                        ]),
+                        tag.key.as_str(),
+                    )
+                },
+            ))
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         }
 

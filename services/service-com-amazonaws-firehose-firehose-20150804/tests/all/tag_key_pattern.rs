@@ -4,29 +4,38 @@
 //!
 //! The rule under test: a tag key is admitted exactly by the `@pattern` the modelled
 //! `TagKey` shape carries (`smithy_query(query="shape",shape="TagKey")`:
-//! `^(?!aws:)[\p{L}\p{Z}\p{N}_.:\/=+\-@%]*$`), and that one expression is ONE constraint on
-//! the request's shape however a key breaks it:
+//! `^(?!aws:)[\p{L}\p{Z}\p{N}_.:\/=+\-@%]*$`), whose two clauses are:
 //!
 //! 1. the CHARACTERS a key may be written with — Unicode letters, separators and digits
 //!    plus `_ . : / = + - @ %` — are what its character class lists, and
 //! 2. the reserved `aws:` prefix its look-ahead excludes is a prefix no key may begin with.
 //!
-//! A key breaking either clause is refused with HTTP 400 `ValidationException` naming the
-//! member it was submitted at and the constraint: its own dotted path for a named member,
-//! the LIST member and the whole constraint set its elements carry for an element of a list
-//! of keys. The refused request writes nothing; a key inside the pattern is stored and read
-//! back unchanged.
+//! A key written with a character the class leaves out is refused, on EVERY member that
+//! takes a key, with HTTP 400 `ValidationException` naming the member it was submitted at
+//! and the constraint: its own dotted path for a named member, the LIST member and the
+//! whole constraint set its elements carry for an element of a list of keys.
 //!
-//! The rule is a property of the SHAPE the member targets and not of what the request means
-//! to do with the key, so it holds for every member that targets it —
-//! `TagDeliveryStream`'s `Tags[].Key`, `UntagDeliveryStream`'s `TagKeys[]`,
-//! `CreateDeliveryStream`'s `Tags[].Key` and `ListTagsForDeliveryStream`'s
-//! `ExclusiveStartTagKey` — and each table below spans a SET of keys rather than one
-//! recorded request.
+//! The reserved namespace is answered by WHAT the request asks to do with the key, because
+//! the two things it can ask differ in AWS:
+//!
+//! * a request addressing a stream's STORED tag set — `TagDeliveryStream`'s `Tags[].Key`,
+//!   `UntagDeliveryStream`'s `TagKeys[]` and `ListTagsForDeliveryStream`'s
+//!   `ExclusiveStartTagKey` — is refused as that same request-shape constraint, under
+//!   `ValidationException`; while
+//! * a request CARRYING a tag set for a stream it creates (`CreateDeliveryStream`'s
+//!   `Tags[].Key`) is refused by the service's own tag policy: the modelled
+//!   `InvalidArgumentException` (`smithy_query(query="operation",
+//!   operation="CreateDeliveryStream")`) and one fixed sentence stating the reserved
+//!   namespace, with nothing of the request in it.
+//!
+//! A refused request writes nothing — no tag is added or removed and no stream is created;
+//! a key inside the pattern is stored and read back unchanged.
+//!
+//! Each table below spans a SET of keys rather than one recorded request.
 //!
 //! The harness (`Emulator`, `s3_configuration`, `error_code`, `error_message`) is the
-//! lifecycle suite's and the tag helpers are the listing suite's, so every request here
-//! goes through the same real router.
+//! lifecycle suite's, the tag helpers are the listing suite's and the not-found sentence is
+//! the not-found suite's, so every request here goes through the same real router.
 
 use serde_json::{json, Value};
 
@@ -144,12 +153,63 @@ fn accepted_keys() -> Vec<(&'static str, String)> {
     rows
 }
 
+/// The sentence a create carrying a key in the reserved namespace is refused with: fixed
+/// text stating the namespace and nothing of the request — not the offending keys, not the
+/// stream the create named, and no validation-error count, member path or pattern.
+const RESERVED_TAG_KEYS_MESSAGE: &str =
+    "Some tag keys in the request started with 'aws:'. System tags cannot be modified.";
+
+/// The error code the service's TAG POLICY refuses a reserved key with: the modelled client
+/// argument error (`smithy_query(query="operation", operation="CreateDeliveryStream")`
+/// lists `InvalidArgumentException`, `InvalidKMSResourceException`, `LimitExceededException`
+/// and `ResourceInUseException` — and no `ValidationException`, so an SDK could not map one
+/// of those to a modelled type).
+const TAG_POLICY_CODE: &str = "InvalidArgumentException";
+
+/// The code every request-shape refusal of a tag key answers under.
+const REQUEST_SHAPE_CODE: &str = "ValidationException";
+
+/// What one request carrying a tag key is refused with: the wire error code and the whole
+/// message a client reads.
+struct Refusal {
+    code: &'static str,
+    message: String,
+}
+
+/// The refusal a request-shape constraint on the NAMED member `member` states.
+fn shape_refusal(member: &str) -> Refusal {
+    Refusal {
+        code: REQUEST_SHAPE_CODE,
+        message: pattern_refusal(member),
+    }
+}
+
+/// The refusal a request-shape constraint on an ELEMENT of the list member `member` states.
+fn shape_element_refusal(member: &str) -> Refusal {
+    Refusal {
+        code: REQUEST_SHAPE_CODE,
+        message: element_refusal(member),
+    }
+}
+
+/// What a `CreateDeliveryStream` carrying `key` is refused with: the tag policy for a key in
+/// the reserved namespace, the request's shape for a key outside the character class.
+fn create_refusal(key: &str) -> Refusal {
+    if key.starts_with("aws:") {
+        return Refusal {
+            code: TAG_POLICY_CODE,
+            message: RESERVED_TAG_KEYS_MESSAGE.to_string(),
+        };
+    }
+    shape_refusal("tags.1.member.key")
+}
+
 /// The four requests that carry a tag key, each as `(expected refusal, operation, body)`
 /// for the key `key` on a stream called `stream`.
-fn requests_carrying(stream: &str, key: &str) -> Vec<(String, &'static str, Value)> {
+fn requests_carrying(stream: &str, key: &str) -> Vec<(Refusal, &'static str, Value)> {
     vec![
         (
-            pattern_refusal("tags.1.member.key"),
+            shape_refusal("tags.1.member.key"),
             "TagDeliveryStream",
             json!({
                 "DeliveryStreamName": stream,
@@ -157,12 +217,12 @@ fn requests_carrying(stream: &str, key: &str) -> Vec<(String, &'static str, Valu
             }),
         ),
         (
-            element_refusal("tagKeys"),
+            shape_element_refusal("tagKeys"),
             "UntagDeliveryStream",
             json!({ "DeliveryStreamName": stream, "TagKeys": [key] }),
         ),
         (
-            pattern_refusal("tags.1.member.key"),
+            create_refusal(key),
             "CreateDeliveryStream",
             json!({
                 "DeliveryStreamName": format!("{stream}-created"),
@@ -171,7 +231,7 @@ fn requests_carrying(stream: &str, key: &str) -> Vec<(String, &'static str, Valu
             }),
         ),
         (
-            pattern_refusal("exclusiveStartTagKey"),
+            shape_refusal("exclusiveStartTagKey"),
             "ListTagsForDeliveryStream",
             json!({ "DeliveryStreamName": stream, "ExclusiveStartTagKey": key }),
         ),
@@ -188,15 +248,17 @@ async fn a_key_the_modelled_pattern_rejects_is_refused_on_every_member_that_take
             let case = format!("{operation} with {reason} ({key:?})");
             let (status, refused) = emulator.call(operation, request).await;
             assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+            let code = error_code(&refused);
             assert_eq!(
-                error_code(&refused),
-                "ValidationException",
-                "case {case:?}: got {refused:?}"
+                code, expected.code,
+                "case {case:?}: expected {:?}, got {code:?} in {refused:?}",
+                expected.code
             );
             let message = error_message(&refused);
             assert_eq!(
-                message, expected,
-                "case {case:?}: expected {expected:?}, got {message:?}"
+                message, expected.message,
+                "case {case:?}: expected {:?}, got {message:?}",
+                expected.message
             );
             // The refused key is the caller's own value, and this service states no
             // rejected value in a constraint refusal at all: there is no `Value '…'`
@@ -268,12 +330,11 @@ async fn a_key_the_modelled_pattern_admits_round_trips_through_every_member() {
 }
 
 #[tokio::test]
-async fn a_key_beginning_with_the_reserved_prefix_is_refused_as_that_same_constraint() {
-    // The look-ahead is part of the one modelled expression, so a key beginning with the
-    // prefix it excludes breaks the SAME `@pattern` a key outside the character class
-    // breaks: the refusal is the request-shape one, at the member the key was submitted
-    // at, whatever the request meant to do with the key — write it, remove it, create a
-    // stream carrying it, or name a position in a listing with it.
+async fn a_key_beginning_with_the_reserved_prefix_is_refused_as_the_request_asked_for_it() {
+    // The namespace the look-ahead excludes is refused BY WHAT the request asks: addressing
+    // a stored tag set with such a key is the request-shape constraint the expression
+    // states, while creating a stream that would CARRY it is the service's own tag policy —
+    // the modelled argument error and the one sentence that states the namespace.
     let emulator = Emulator::new();
     create_tagged(&emulator, "reserved-prefix-stream", &owned(&[("env", "prod")])).await;
 
@@ -282,19 +343,19 @@ async fn a_key_beginning_with_the_reserved_prefix_is_refused_as_that_same_constr
             let case = format!("{operation} with {reason} ({key:?})");
             let (status, refused) = emulator.call(operation, request).await;
             assert_eq!(status, 400, "case {case:?}: got {refused:?}");
-            // Not the modelled argument error: a value the model's own constraint
-            // excludes is a malformed request and not an argument the service weighed.
+            let code = error_code(&refused);
             assert_eq!(
-                error_code(&refused),
-                "ValidationException",
-                "case {case:?}: got {refused:?}"
+                code, expected.code,
+                "case {case:?}: expected {:?}, got {code:?} in {refused:?}",
+                expected.code
             );
             let message = error_message(&refused);
             assert_eq!(
-                message, expected,
-                "case {case:?}: expected {expected:?}, got {message:?}"
+                message, expected.message,
+                "case {case:?}: expected {:?}, got {message:?}",
+                expected.message
             );
-            // The refused key is the caller's own value and no part of the sentence is
+            // The refused key is the caller's own value and no part of either sentence is
             // built from it — what follows the prefix reaches the body nowhere.
             let beyond_the_prefix = key.trim_start_matches("aws:");
             assert!(
@@ -318,6 +379,104 @@ async fn a_key_beginning_with_the_reserved_prefix_is_refused_as_that_same_constr
         error_code(&absent),
         "ResourceNotFoundException",
         "a refused create persists no stream, got {absent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_carrying_a_reserved_key_is_refused_by_the_tag_policy_and_creates_nothing() {
+    // The create's own axis, over a SET of tag sets differing in WHERE the reserved key
+    // sits, how many of them there are, what follows the prefix and what ordinary keys
+    // stand beside it: one refusal — the modelled argument error and one fixed sentence —
+    // and no stream, whichever row it is.
+    //
+    // (case, the keys the create carries)
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("the bare prefix as the only key", vec!["aws:"]),
+        ("the only key", vec!["aws:reserved"]),
+        ("a service's own key", vec!["aws:cloudformation:stack-name"]),
+        ("a Unicode key in the namespace", vec!["aws:ключ"]),
+        ("the first of two", vec!["aws:reserved", "env"]),
+        ("the last of three", vec!["env", "team", "aws:reserved"]),
+        ("two of three", vec!["aws:one", "env", "aws:two"]),
+        ("every key", vec!["aws:one", "aws:two"]),
+    ];
+
+    let emulator = Emulator::new();
+    let account = engine::emulator_account_id();
+    let not_found =
+        crate::stream_not_found_message::NotFoundWording::ControlPlaneRead.sentence(account);
+
+    for (index, (case, keys)) in cases.into_iter().enumerate() {
+        let stream = format!("policy-refused-{index}");
+        let (status, refused) = emulator
+            .call(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": stream,
+                    "S3DestinationConfiguration": s3_configuration(),
+                    "Tags": keys
+                        .iter()
+                        .map(|key| json!({ "Key": key, "Value": "v" }))
+                        .collect::<Vec<Value>>(),
+                }),
+            )
+            .await;
+        assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+        let code = error_code(&refused);
+        assert_eq!(
+            code, TAG_POLICY_CODE,
+            "case {case:?}: expected {TAG_POLICY_CODE:?}, got {code:?} in {refused:?}"
+        );
+        // One sentence however many such keys the request carried, and nothing of the
+        // request in it: no key, no stream name, and none of the validation-error envelope
+        // a request-shape refusal carries.
+        let message = error_message(&refused);
+        assert_eq!(
+            message, RESERVED_TAG_KEYS_MESSAGE,
+            "case {case:?}: expected {RESERVED_TAG_KEYS_MESSAGE:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&stream) && !message.contains("validation error"),
+            "case {case:?}: expected nothing of the request in the sentence, got {message:?}"
+        );
+
+        // No stream was created: the read states the account the lookup was scoped to.
+        let (status, listed_now) = emulator
+            .call(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": stream }),
+            )
+            .await;
+        assert_eq!(status, 400, "case {case:?}: the describe got {listed_now:?}");
+        let code = error_code(&listed_now);
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case:?}: expected \"ResourceNotFoundException\", got {code:?}"
+        );
+        let message = error_message(&listed_now);
+        assert_eq!(
+            message, not_found,
+            "case {case:?}: expected {not_found:?}, got {message:?}"
+        );
+    }
+
+    // The positive control: the same create with ordinary keys — one of them CONTAINING
+    // the reserved prefix without opening with it — is accepted, settles at the status the
+    // clock owes it and holds exactly those tags, so the namespace is all the policy
+    // refuses.
+    create_tagged(
+        &emulator,
+        "policy-admitted",
+        &owned(&[("owner", "team"), ("my-aws:key", "y")]),
+    )
+    .await;
+    emulator.await_active("policy-admitted").await;
+    let (status, listed_now) = list_tags(&emulator, "policy-admitted", None, None).await;
+    assert_eq!(status, 200, "the admitted create: got {listed_now:?}");
+    assert_eq!(
+        listed(&listed_now),
+        owned(&[("my-aws:key", "y"), ("owner", "team")]),
+        "the admitted create's tags read back, got {listed_now:?}"
     );
 }
 
@@ -543,18 +702,38 @@ async fn a_request_refused_for_its_tag_key_writes_nothing() {
         "a refused untag removes nothing, got {after_untag:?}"
     );
 
-    // A create carrying an illegal tag key creates no stream at all.
-    let (status, refused) = emulator
-        .call(
-            "CreateDeliveryStream",
-            json!({
-                "DeliveryStreamName": "never-created-stream",
-                "S3DestinationConfiguration": s3_configuration(),
-                "Tags": [{ "Key": "aws:owner", "Value": "x" }],
-            }),
-        )
-        .await;
-    assert_eq!(status, 400, "a create with an illegal tag key: {refused:?}");
+    // A create carrying an illegal tag key creates no stream at all, whichever of the two
+    // faults the key carries: a key in the reserved namespace is the tag policy, a key
+    // outside the character class is the request's shape.
+    for (case, key) in [
+        ("a reserved key", "aws:owner"),
+        ("a key outside the character class", "bad*owner"),
+    ] {
+        let (status, refused) = emulator
+            .call(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "never-created-stream",
+                    "S3DestinationConfiguration": s3_configuration(),
+                    "Tags": [{ "Key": key, "Value": "x" }],
+                }),
+            )
+            .await;
+        assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+        let expected = create_refusal(key);
+        let code = error_code(&refused);
+        assert_eq!(
+            code, expected.code,
+            "case {case:?}: expected {:?}, got {code:?} in {refused:?}",
+            expected.code
+        );
+        let message = error_message(&refused);
+        assert_eq!(
+            message, expected.message,
+            "case {case:?}: expected {:?}, got {message:?}",
+            expected.message
+        );
+    }
     let (status, absent) = list_tags(&emulator, "never-created-stream", None, None).await;
     assert_eq!(status, 400, "the stream was never created: got {absent:?}");
     assert_eq!(
