@@ -41,7 +41,7 @@ use super::delivery_stream_lifecycle::{
 pub(crate) use super::delivery_stream_lifecycle::error_message;
 // The arity sentence is the `destination_arity_refusal` suite's: one wording for one rule,
 // asserted there on the rule itself and here on the several-destination fault.
-use super::destination_arity_refusal::ARITY_REFUSAL;
+use super::destination_arity_refusal::{exclusive_members_refusal, ARITY_REFUSAL};
 
 /// The envelope one constraint violation is reported in.
 fn one_error(clause: String) -> String {
@@ -848,21 +848,14 @@ async fn destinations_that_exclude_each_other_are_refused_with_the_arity_rule() 
 
     // The model declares each destination as its own optional member with no union over
     // them (`smithy_query(query="operation", operation="CreateDeliveryStream")`), and "A
-    // Firehose stream is configured with a single destination": naming several breaks the
-    // same arity rule as naming none, so the refusal is the one fixed sentence that states
-    // it — it names no member, however many the request supplied and in whatever order it
-    // listed them.
+    // Firehose stream is configured with a single destination": naming destinations of
+    // several types breaks the same arity rule as naming none, so the refusal is the one
+    // fixed sentence that states it — it names no member, however many the request
+    // supplied and in whatever order it listed them. Naming ONE destination in both of its
+    // spellings is the separate exclusion asserted at the end of this test.
     //
     // (case, request)
     let rows: Vec<(&str, Value)> = vec![
-        (
-            "the deprecated S3 member beside its replacement",
-            json!({
-                "DeliveryStreamName": "two-s3",
-                "S3DestinationConfiguration": s3_configuration(),
-                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
-            }),
-        ),
         (
             "two unrelated destinations",
             json!({
@@ -885,7 +878,11 @@ async fn destinations_that_exclude_each_other_are_refused_with_the_arity_rule() 
                 "DeliveryStreamName": "three-destinations",
                 "SplunkDestinationConfiguration": splunk_configuration(),
                 "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
-                "S3DestinationConfiguration": s3_configuration(),
+                "HttpEndpointDestinationConfiguration": {
+                    "EndpointConfiguration": { "Url": "https://example.com/firehose" },
+                    "S3Configuration": s3_configuration(),
+                    "RoleARN": ROLE_ARN,
+                },
             }),
         ),
     ];
@@ -904,6 +901,35 @@ async fn destinations_that_exclude_each_other_are_refused_with_the_arity_rule() 
             "case {case:?}: expected {ARITY_REFUSAL:?}, got {message:?}"
         );
     }
+
+    // One destination named in BOTH of its spellings — the member the model marks
+    // `@deprecated` and the member that replaced it — is a different fault and a different
+    // sentence: the two members exclude each other, and the refusal names them.
+    let (status, refused) = emulator
+        .call(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "two-s3",
+                "S3DestinationConfiguration": s3_configuration(),
+                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "both S3 spellings: got {refused:?}");
+    assert_eq!(
+        error_code(&refused),
+        "InvalidArgumentException",
+        "both S3 spellings: got {refused:?}"
+    );
+    let expected = exclusive_members_refusal(
+        "S3DestinationConfiguration",
+        "ExtendedS3DestinationConfiguration",
+    );
+    let message = error_message(&refused);
+    assert_eq!(
+        message, expected,
+        "both S3 spellings: expected {expected:?}, got {message:?}"
+    );
 
     // Nothing was stored for any refused create.
     let (_, listed) = emulator.call("ListDeliveryStreams", json!({})).await;

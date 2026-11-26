@@ -463,7 +463,7 @@ impl SerializableStruct for CheckedString<'_> {
 /// Whether [`TAG_KEY_PATTERN`] admits `key`: it does not begin with the reserved prefix the
 /// look-ahead excludes, and its characters are the ones the rest of the expression lists.
 fn admits_tag_key(key: &str) -> bool {
-    !names_a_system_tag(key) && admits_tag_key_characters(key)
+    !begins_with_reserved_prefix(key) && admits_tag_key_characters(key)
 }
 
 /// Whether the character clause of [`TAG_KEY_PATTERN`] admits `key` — the half of the
@@ -480,92 +480,34 @@ fn admits_tag_key_characters(key: &str) -> bool {
     .is_empty()
 }
 
-/// Whether `key` names a SYSTEM tag: one beginning with the prefix
-/// [`RESERVED_TAG_KEY_PREFIX`] that Amazon Web Services keeps for the tags it sets itself.
-fn names_a_system_tag(key: &str) -> bool {
+/// Whether `key` begins with [`RESERVED_TAG_KEY_PREFIX`] — the clause
+/// [`TAG_KEY_PATTERN`]'s look-ahead states, which is what keeps the prefix Amazon Web
+/// Services reserves for the tags it sets itself out of every member that takes a tag key.
+fn begins_with_reserved_prefix(key: &str) -> bool {
     key.starts_with(RESERVED_TAG_KEY_PREFIX)
-}
-
-/// Why a request's tag keys were refused — the two faults are answered under different
-/// codes, so the check that finds one says WHICH it found and the operation answers it
-/// through its own error channel.
-#[derive(Debug)]
-pub(crate) enum TagKeyRefusal {
-    /// A key outside the characters the modelled pattern lists: a fault of the request's
-    /// SHAPE, worded the way the request boundary words one (HTTP 400
-    /// `ValidationException`).
-    Shape(String),
-    /// A key naming a SYSTEM tag. Not a fault of the request's shape but of what it asks
-    /// for — to write or remove a tag Amazon Web Services owns — so it is answered under
-    /// the operation's modelled argument error with [`system_tag_message`].
-    SystemTag,
-}
-
-/// What Firehose states for a request that would write or remove a system tag: the
-/// reserved prefix such a key begins with, and that those tags cannot be modified.
-///
-/// Fixed text over that prefix — the sentence names NO key, however many of the request's
-/// keys carry it.
-pub fn system_tag_message() -> String {
-    format!(
-        "Some tag keys in the request started with '{RESERVED_TAG_KEY_PREFIX}'. \
-         System tags cannot be modified."
-    )
 }
 
 /// Refuse every tag key of a request that [`TAG_KEY_PATTERN`] does not admit, each named
 /// at the dotted path it was submitted at; `Ok(())` when they all satisfy it.
 ///
-/// For a key submitted at a NAMED member that names no tag to write or remove — a listing
-/// start key — where the whole modelled expression, reserved prefix included, is a
-/// constraint on the value the request boundary would have applied. A key the request
-/// WRITES is judged by [`check_modified_tag_keys`] instead.
-pub(crate) fn check_tag_keys<'a, I>(keys: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = (String, &'a str)>,
-{
-    check_tag_keys_against(keys, admits_tag_key)
-}
-
-/// Refuse the tag keys a request WRITES OR REMOVES, each named at the dotted path it was
-/// submitted at; `Ok(())` when the request may carry them all.
-///
-/// Two rules judge such a key, and they are not the same fault: the characters it is
-/// written with are a constraint on the request's shape, and the reserved prefix is the tag
-/// policy refusing to let a caller modify a tag Amazon Web Services owns. The shape is
-/// judged first — the request boundary would have judged it before any rule of the
-/// service's own — and one refusal states every key that violates it.
-pub(crate) fn check_modified_tag_keys<'a, I>(keys: I) -> Result<(), TagKeyRefusal>
-where
-    I: IntoIterator<Item = (String, &'a str)>,
-{
-    let keys: Vec<(String, &str)> = keys.into_iter().collect();
-    check_tag_keys_against(
-        keys.iter().map(|(path, key)| (path.clone(), *key)),
-        admits_tag_key_characters,
-    )
-    .map_err(TagKeyRefusal::Shape)?;
-    if keys.iter().any(|(_, key)| names_a_system_tag(key)) {
-        return Err(TagKeyRefusal::SystemTag);
-    }
-    Ok(())
-}
-
-/// Refuse every tag key `admits` does not admit, each named at the dotted path it was
-/// submitted at.
+/// The whole modelled expression is ONE constraint on the value: a key written with a
+/// character the class leaves out and a key beginning with the prefix the look-ahead
+/// excludes break the same `@pattern`, so both are the request-shape fault the boundary
+/// would have stated had its engine been able to compile that look-ahead — whatever the
+/// request then meant to do with the key.
 ///
 /// One refusal states every violating key, the way the boundary walk accumulates
 /// violations rather than reporting only the first, and the clause quotes the whole
 /// modelled expression whichever of its clauses the key failed — it is that one constraint
 /// the key did not satisfy. The key's `@length` bounds and the `TagValue` pattern are
 /// separate traits the boundary enforces itself, so they are not re-checked here.
-fn check_tag_keys_against<'a, I>(keys: I, admits: fn(&str) -> bool) -> Result<(), String>
+pub(crate) fn check_tag_keys<'a, I>(keys: I) -> Result<(), String>
 where
     I: IntoIterator<Item = (String, &'a str)>,
 {
     let clauses: Vec<String> = keys
         .into_iter()
-        .filter(|(_, key)| !admits(key))
+        .filter(|(_, key)| !admits_tag_key(key))
         .filter_map(|(path, _)| {
             constraint_clause(&Violation {
                 path,
@@ -583,23 +525,21 @@ where
     }
 }
 
-/// Refuse a LIST of tag keys a request REMOVES, under the two rules
-/// [`check_modified_tag_keys`] applies to a named one and in the same order.
+/// Refuse a LIST of tag keys under the constraint [`check_tag_keys`] applies to a named
+/// one.
 ///
-/// An element has no member name of its own, so a shape refusal names the list ONCE
-/// however many of its elements violate the pattern, and states the whole constraint set
-/// the list's elements carry — see [`element_clause`].
-pub(crate) fn check_modified_tag_key_list(keys: &[String]) -> Result<(), TagKeyRefusal> {
-    if !keys.iter().all(|key| admits_tag_key_characters(key)) {
-        let clauses = vec![element_clause(&tag_keys_member(), &tag_key_constraints())];
-        if let Some(message) = violation_envelope(&clauses) {
-            return Err(TagKeyRefusal::Shape(message));
-        }
+/// An element has no member name of its own, so the refusal names the list ONCE however
+/// many of its elements violate the pattern, and states the whole constraint set the
+/// list's elements carry — see [`element_clause`].
+pub(crate) fn check_tag_key_list(keys: &[String]) -> Result<(), String> {
+    if keys.iter().all(|key| admits_tag_key(key)) {
+        return Ok(());
     }
-    if keys.iter().any(|key| names_a_system_tag(key)) {
-        return Err(TagKeyRefusal::SystemTag);
+    let clauses = vec![element_clause(&tag_keys_member(), &tag_key_constraints())];
+    match violation_envelope(&clauses) {
+        Some(message) => Err(message),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Every constraint the elements of a list of tag keys carry, in the order a refusal
@@ -1134,6 +1074,23 @@ pub fn blocked_delete_message(name: &str, state: &str) -> String {
 /// rule rather than one per combination.
 pub fn sole_destination_message() -> String {
     "Exactly one destination configuration is supported for a Firehose".to_string()
+}
+
+/// A request that supplies BOTH spellings of one destination — the member the model marks
+/// `@deprecated` and the member that replaced it — naming the two that exclude each other.
+///
+/// This is not the arity rule above: the two members configure the SAME destination, one
+/// of them in the superseded form, so the fault is that the request says it twice and the
+/// service cannot tell which it meant. The refusal states the either/or between those two
+/// members, so a caller is told which pair to drop one of, and it is judged before the
+/// count of destinations: the more specific exclusion is what the request broke.
+///
+/// Fixed text over the two member names, which are read from the model
+/// (`smithy_query(query="operation", operation="CreateDeliveryStream")` and
+/// `"UpdateDestination"`, where `S3DestinationConfiguration` and `S3DestinationUpdate`
+/// carry `@deprecated`): nothing in the sentence comes from the request.
+pub fn exclusive_destination_members_message(deprecated: &str, replacement: &str) -> String {
+    format!("Exactly one of {deprecated} or {replacement} must be specified.")
 }
 
 /// Whether a boundary refusal is ABOUT a role ARN: one of its violations is a `@pattern`

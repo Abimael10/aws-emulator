@@ -250,12 +250,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A tag the create carries is a tag of the stream it creates, so each of its keys
-        // is judged before anything is written: the characters it is written with are the
-        // modelled `TagKey` pattern the request boundary would have applied had it been
-        // able to compile it, and a key naming a system tag is the tag policy's own
-        // refusal (`crate::service::check_modified_tag_keys`).
+        // is judged before anything is written, against the whole modelled `TagKey`
+        // pattern — the characters it lists and the prefix its look-ahead excludes — which
+        // the request boundary would have applied itself had it been able to compile that
+        // look-ahead (`crate::service::check_tag_keys`).
         if let Some(tags) = input.tags.as_deref() {
-            crate::service::check_modified_tag_keys(tags.iter().enumerate().map(|(index, tag)| {
+            crate::service::check_tag_keys(tags.iter().enumerate().map(|(index, tag)| {
                 (
                     path::join(&[
                         path::member("Tags"),
@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tag.key.as_str(),
                 )
             }))
-            .map_err(tag_key_refusal)?;
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
         }
 
         // Every member the model constrains to a NON-BLANK value is judged against that
@@ -579,21 +579,6 @@ fn invalid_argument(message: String) -> CreateDeliveryStreamError {
     .into()
 }
 
-/// Answer a refusal of the tag keys this create carries under the code that fault calls
-/// for: a fault of the request's SHAPE in the code the request boundary would have
-/// answered, and a system tag under this operation's modelled `InvalidArgumentException` —
-/// a tag policy refusing what the request ASKS FOR is not a malformed request.
-fn tag_key_refusal(refusal: crate::service::TagKeyRefusal) -> CreateDeliveryStreamError {
-    match refusal {
-        crate::service::TagKeyRefusal::Shape(message) => {
-            crate::scaffolded::Scaffolded::validation(message)
-        }
-        crate::service::TagKeyRefusal::SystemTag => {
-            invalid_argument(crate::service::system_tag_message())
-        }
-    }
-}
-
 /// The member an HTTP endpoint destination is submitted at on this operation, spelled as
 /// the model declares it.
 const HTTP_ENDPOINT_DESTINATION_MEMBER: &str = "HttpEndpointDestinationConfiguration";
@@ -875,6 +860,12 @@ fn bucket_arns<'a>(input: &'a CreateDeliveryStreamInput) -> Vec<(String, &'a str
     found
 }
 
+/// The two members one Amazon S3 destination may be supplied at, as the model spells
+/// them: the `@deprecated` one and the extended one that replaced it
+/// (`smithy_query(query="operation", operation="CreateDeliveryStream")`).
+const S3_DESTINATION_MEMBER: &str = "S3DestinationConfiguration";
+const EXTENDED_S3_DESTINATION_MEMBER: &str = "ExtendedS3DestinationConfiguration";
+
 /// The one destination configuration the request carries, refusing both none and more
 /// than one.
 ///
@@ -890,6 +881,21 @@ fn sole_destination(
     input: &CreateDeliveryStreamInput,
 ) -> Result<crate::state::DestinationConfigKind, CreateDeliveryStreamError> {
     use crate::state::DestinationConfigKind as Kind;
+
+    // One destination supplied in BOTH of its spellings is its own fault, judged before
+    // the count below: the deprecated member and the extended one that replaced it
+    // configure the same Amazon S3 destination, so the refusal names that pair
+    // (`crate::service::exclusive_destination_members_message`).
+    if input.s3_destination_configuration.is_some()
+        && input.extended_s3_destination_configuration.is_some()
+    {
+        return Err(invalid_argument(
+            crate::service::exclusive_destination_members_message(
+                S3_DESTINATION_MEMBER,
+                EXTENDED_S3_DESTINATION_MEMBER,
+            ),
+        ));
+    }
 
     let mut supplied: Vec<Kind> = Vec::new();
     if let Some(config) = input.s3_destination_configuration.clone() {

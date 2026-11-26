@@ -822,6 +822,12 @@ fn stored_fixed_type(config: &crate::state::DestinationConfigKind) -> Option<Fix
     }
 }
 
+/// The two members one Amazon S3 destination's update may be supplied at, as the model
+/// spells them: the `@deprecated` one and the extended one that replaced it
+/// (`smithy_query(query="operation", operation="UpdateDestination")`).
+const S3_DESTINATION_UPDATE_MEMBER: &str = "S3DestinationUpdate";
+const EXTENDED_S3_DESTINATION_UPDATE_MEMBER: &str = "ExtendedS3DestinationUpdate";
+
 /// The one destination update the request carries, refusing both none and more than one.
 ///
 /// Credentials supplied inside an update (a Redshift password, a Snowflake private key or
@@ -833,6 +839,20 @@ fn sole_update(
     input: &UpdateDestinationInput,
 ) -> Result<DestinationUpdateKind, UpdateDestinationError> {
     use DestinationUpdateKind as Kind;
+
+    // One destination's update supplied in BOTH of its spellings is the same fault a
+    // create that supplies both spellings of that destination breaks, and is refused the
+    // same way: the deprecated member and the extended one that replaced it update the
+    // same Amazon S3 destination, so the refusal names that pair of members and is judged
+    // before the count below.
+    if input.s3_destination_update.is_some() && input.extended_s3_destination_update.is_some() {
+        return Err(invalid_argument(
+            crate::service::exclusive_destination_members_message(
+                S3_DESTINATION_UPDATE_MEMBER,
+                EXTENDED_S3_DESTINATION_UPDATE_MEMBER,
+            ),
+        ));
+    }
 
     let mut supplied: Vec<Kind> = Vec::new();
     if let Some(update) = input.s3_destination_update.clone() {

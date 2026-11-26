@@ -4,9 +4,11 @@
 //!
 //! Adds or replaces tags on the named stream's tag register in [`crate::state`]: a key the
 //! stream already carries takes the value this request gives it, every other tag it holds
-//! is left alone, a key the modelled `TagKey` pattern does not admit is refused as a
-//! constraint violation, and a request that would push the stream past the documented
-//! ceiling of fifty tags is refused as `LimitExceededException` without writing anything.
+//! is left alone, a key the modelled `TagKey` pattern does not admit — one written outside
+//! its character class, or one beginning with the prefix its look-ahead excludes — is
+//! refused as a constraint violation, and a request that would push the stream past the
+//! documented ceiling of fifty tags is refused as `LimitExceededException` without writing
+//! anything.
 //!
 //! ## Shape of an operation
 //!
@@ -115,24 +117,6 @@ impl From<TagDeliveryStreamErrorModeled> for TagDeliveryStreamError {
     }
 }
 
-/// Answer a refusal of the tag keys this request carries under the code that fault calls
-/// for: a fault of the request's SHAPE in the code the request boundary would have
-/// answered, and a system tag under this operation's modelled `InvalidArgumentException` —
-/// a tag policy refusing what the request ASKS FOR is not a malformed request.
-fn tag_key_refusal(refusal: crate::service::TagKeyRefusal) -> TagDeliveryStreamError {
-    match refusal {
-        crate::service::TagKeyRefusal::Shape(message) => {
-            crate::scaffolded::Scaffolded::validation(message)
-        }
-        crate::service::TagKeyRefusal::SystemTag => {
-            TagDeliveryStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
-                message: Some(crate::service::system_tag_message()),
-            })
-            .into()
-        }
-    }
-}
-
 /// The `TagDeliveryStream` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,11 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // Every key is judged BEFORE anything is looked up or written: the characters it
-        // is written with are the modelled `TagKey` pattern the request boundary would
-        // have applied had it been able to compile it, and a key naming a system tag is
-        // the tag policy's own refusal (`crate::service::check_modified_tag_keys`).
-        crate::service::check_modified_tag_keys(input.tags.iter().enumerate().map(
+        // Every key is judged BEFORE anything is looked up or written, against the whole
+        // modelled `TagKey` pattern — the characters it lists and the prefix its
+        // look-ahead excludes — which the request boundary would have applied itself had
+        // it been able to compile that look-ahead (`crate::service::check_tag_keys`).
+        crate::service::check_tag_keys(input.tags.iter().enumerate().map(
             |(index, tag)| {
                 (
                     path::join(&[
@@ -195,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             },
         ))
-        .map_err(tag_key_refusal)?;
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

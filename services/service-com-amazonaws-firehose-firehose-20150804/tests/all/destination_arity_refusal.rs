@@ -1,22 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The sentence `CreateDeliveryStream` and `UpdateDestination` refuse a request that does
-//! not name exactly ONE destination with.
+//! not name exactly ONE destination with, and the one they refuse a destination named in
+//! both of its spellings with.
 //!
-//! The rule under test: "A Firehose stream is configured with a single destination" and
-//! "You must specify only one of the following destination configuration parameters", so a
-//! request that carries no destination configuration at all, and one that carries several,
-//! are the same arity fault — refused with HTTP 400 `InvalidArgumentException` and the one
-//! fixed sentence stating that rule. The sentence interpolates nothing — it names no member,
-//! because no one member is at fault, and it is the same whatever else the request carried
-//! — and the refused request changes nothing: a refused create stores no stream and a
+//! The rules under test:
+//!
+//! 1. "A Firehose stream is configured with a single destination" and "You must specify
+//!    only one of the following destination configuration parameters", so a request that
+//!    carries no destination configuration at all, and one that carries destinations of
+//!    several types, are the same arity fault — refused with HTTP 400
+//!    `InvalidArgumentException` and the one fixed sentence stating that rule. The sentence
+//!    interpolates nothing — it names no member, because no one member is at fault, and it
+//!    is the same whatever else the request carried.
+//! 2. The model gives one Amazon S3 destination TWO members, the one it marks
+//!    `@deprecated` and the one that replaced it, so a request supplying both says one
+//!    destination twice; that is refused with the same code and a fixed sentence naming
+//!    those two members, and it is judged before the count of destinations because it is
+//!    the more specific exclusion. The member names come from the model and nothing else
+//!    in the sentence varies.
+//!
+//! Either way the refused request changes nothing: a refused create stores no stream and a
 //! refused update leaves the destination and the version the stream had.
 //!
-//! The rows span what the rule must NOT depend on: the stream name, the declared
+//! The rows span what the rules must NOT depend on: the stream name, the declared
 //! `DeliveryStreamType`, the source configuration that type is fed by, the tags, a
-//! server-side-encryption input, which destination members are named and how many of them.
-//! A create carrying exactly one destination is accepted beside them, so what the rows
-//! isolate is the destination's arity and not the other members.
+//! server-side-encryption input, which destination members are named and how many of them,
+//! and whether two spellings of one destination describe the same bucket. A create carrying
+//! exactly one destination is accepted beside them, so what the rows isolate is the
+//! destination's arity and not the other members.
 //!
 //! The harness (`Emulator`, `error_code`, `error_message`, `s3_configuration`) is the
 //! lifecycle suite's.
@@ -147,6 +159,16 @@ fn http_endpoint_configuration() -> Value {
     })
 }
 
+/// A `SplunkDestinationConfiguration` with its three required members (`HECEndpoint`,
+/// `HECEndpointType`, `S3Configuration`).
+fn splunk_configuration() -> Value {
+    json!({
+        "HECEndpoint": "https://splunk.example.com:8088",
+        "HECEndpointType": "Raw",
+        "S3Configuration": s3_configuration(),
+    })
+}
+
 #[tokio::test]
 async fn a_create_naming_several_destinations_is_refused_with_the_same_arity_rule() {
     let emulator = Emulator::new();
@@ -176,7 +198,7 @@ async fn a_create_naming_several_destinations_is_refused_with_the_same_arity_rul
             json!({
                 "DeliveryStreamName": "arity-three",
                 "HttpEndpointDestinationConfiguration": http_endpoint_configuration(),
-                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
+                "SplunkDestinationConfiguration": splunk_configuration(),
                 "S3DestinationConfiguration": s3_configuration(),
                 "Tags": [{ "Key": "team", "Value": "data" }],
             }),
@@ -268,7 +290,7 @@ async fn an_update_that_does_not_name_exactly_one_destination_is_refused_with_th
             "three updates at once",
             json!({
                 "S3DestinationUpdate": { "BucketARN": BUCKET_ARN },
-                "ExtendedS3DestinationUpdate": { "BucketARN": BUCKET_ARN },
+                "SplunkDestinationUpdate": { "HECEndpointType": "Raw" },
                 "HttpEndpointDestinationUpdate": {
                     "EndpointConfiguration": { "Url": "https://example.com/firehose" },
                 },
@@ -322,4 +344,237 @@ async fn describe(emulator: &Emulator, stream: &str) -> Value {
         .await;
     assert_eq!(status, 200, "describe {stream}: got {described:?}");
     described["DeliveryStreamDescription"].clone()
+}
+
+/// Firehose's sentence for a destination supplied in BOTH of its spellings: fixed text
+/// naming the two members that exclude each other — the one the model marks `@deprecated`
+/// and the one that replaced it — with nothing taken from the request.
+///
+/// `pub(crate)` so the suite that owns this service's refusal wording asserts the same
+/// sentence rather than carrying a second copy of it.
+pub(crate) fn exclusive_members_refusal(deprecated: &str, replacement: &str) -> String {
+    format!("Exactly one of {deprecated} or {replacement} must be specified.")
+}
+
+#[tokio::test]
+async fn a_create_supplying_both_spellings_of_one_s3_destination_names_the_two_members() {
+    // The deprecated `S3DestinationConfiguration` and the `ExtendedS3DestinationConfiguration`
+    // that replaced it configure the SAME destination
+    // (`smithy_query(query="operation",operation="CreateDeliveryStream")` marks the first
+    // `@deprecated`), so a request carrying both is refused as that either/or rather than
+    // as the general arity rule: the refusal names the two members a caller has to drop
+    // one of.
+    let emulator = Emulator::new();
+    let expected = exclusive_members_refusal(
+        "S3DestinationConfiguration",
+        "ExtendedS3DestinationConfiguration",
+    );
+
+    // The rows differ in what stands BESIDE the conflicting pair — nothing, tags, a
+    // declared type with its source configuration, a third destination of another type —
+    // and in whether the two spellings describe the same bucket, because none of that
+    // reaches the sentence.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "the pair and nothing else",
+            json!({
+                "DeliveryStreamName": "pair-only",
+                "S3DestinationConfiguration": s3_configuration(),
+                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
+            }),
+        ),
+        (
+            "the pair with tags beside it",
+            json!({
+                "DeliveryStreamName": "pair-tagged",
+                "S3DestinationConfiguration": s3_configuration(),
+                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
+                "Tags": [{ "Key": "team", "Value": "data" }],
+            }),
+        ),
+        (
+            "the pair naming two different buckets",
+            json!({
+                "DeliveryStreamName": "pair-two-buckets",
+                "S3DestinationConfiguration": s3_configuration(),
+                "ExtendedS3DestinationConfiguration": json!({
+                    "RoleARN": ROLE_ARN,
+                    "BucketARN": "arn:aws:s3:::another-bucket",
+                }),
+            }),
+        ),
+        (
+            "the pair on a stream fed by a source",
+            json!({
+                "DeliveryStreamName": "pair-source-fed",
+                "DeliveryStreamType": "KinesisStreamAsSource",
+                "KinesisStreamSourceConfiguration": {
+                    "KinesisStreamARN":
+                        "arn:aws:kinesis:us-west-2:000000000000:stream/arity-source",
+                    "RoleARN": ROLE_ARN,
+                },
+                "S3DestinationConfiguration": s3_configuration(),
+                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
+            }),
+        ),
+        (
+            "the pair beside a destination of another type",
+            json!({
+                "DeliveryStreamName": "pair-and-http",
+                "S3DestinationConfiguration": s3_configuration(),
+                "ExtendedS3DestinationConfiguration": extended_s3_configuration(),
+                "HttpEndpointDestinationConfiguration": http_endpoint_configuration(),
+            }),
+        ),
+    ];
+
+    let mut refused_names: Vec<String> = Vec::new();
+    for (case, request) in rows {
+        refused_names.push(
+            request["DeliveryStreamName"]
+                .as_str()
+                .expect("every row names a stream")
+                .to_string(),
+        );
+        let (status, refused) = emulator.call("CreateDeliveryStream", request).await;
+        assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+        assert_eq!(
+            error_code(&refused),
+            "InvalidArgumentException",
+            "case {case:?}: got {refused:?}"
+        );
+        let message = error_message(&refused);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // No refused create left a stream behind: each name resolves to nothing and none of
+    // them is listed.
+    for name in &refused_names {
+        let (status, described) = emulator
+            .call(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": name }),
+            )
+            .await;
+        assert_eq!(status, 400, "describe {name}: got {described:?}");
+        assert_eq!(
+            error_code(&described),
+            "ResourceNotFoundException",
+            "describe {name}: got {described:?}"
+        );
+    }
+    let (status, listed) = emulator.call("ListDeliveryStreams", json!({})).await;
+    assert_eq!(status, 200, "list: got {listed:?}");
+    assert_eq!(
+        listed["DeliveryStreamNames"],
+        json!([]),
+        "a refused create stores nothing, got {listed:?}"
+    );
+
+    // Either spelling ON ITS OWN is accepted and the stream it makes settles: what is
+    // refused above is naming both of them, not either member.
+    for (case, member, configuration) in [
+        (
+            "the deprecated spelling alone",
+            "S3DestinationConfiguration",
+            s3_configuration(),
+        ),
+        (
+            "the extended spelling alone",
+            "ExtendedS3DestinationConfiguration",
+            extended_s3_configuration(),
+        ),
+    ] {
+        let name = format!("pair-resolved-{member}");
+        let mut request = json!({ "DeliveryStreamName": name });
+        request[member] = configuration;
+        let (status, created) = emulator.call("CreateDeliveryStream", request).await;
+        assert_eq!(status, 200, "case {case:?}: got {created:?}");
+        emulator.await_active(&name).await;
+    }
+}
+
+#[tokio::test]
+async fn an_update_supplying_both_spellings_of_one_s3_destination_names_the_two_members() {
+    // The same pair of spellings on the update path
+    // (`smithy_query(query="operation",operation="UpdateDestination")` marks
+    // `S3DestinationUpdate` `@deprecated`), refused the same way and naming the update
+    // members: the rule is the pair, not one operation.
+    let emulator = Emulator::new();
+    emulator.create_stream("pair-update-stream", None).await;
+    emulator.await_active("pair-update-stream").await;
+
+    let described = describe(&emulator, "pair-update-stream").await;
+    let version = described["VersionId"].as_str().unwrap_or_default().to_string();
+    let destination_id = described["Destinations"][0]["DestinationId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !version.is_empty() && !destination_id.is_empty(),
+        "expected a version and a destination id, got {described:?}"
+    );
+
+    let expected = exclusive_members_refusal("S3DestinationUpdate", "ExtendedS3DestinationUpdate");
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "the pair and nothing else",
+            json!({
+                "S3DestinationUpdate": { "BucketARN": BUCKET_ARN },
+                "ExtendedS3DestinationUpdate": { "BucketARN": BUCKET_ARN },
+            }),
+        ),
+        (
+            "the pair naming two different buckets",
+            json!({
+                "S3DestinationUpdate": { "BucketARN": BUCKET_ARN },
+                "ExtendedS3DestinationUpdate": { "BucketARN": "arn:aws:s3:::another-bucket" },
+            }),
+        ),
+        (
+            "the pair beside an update of another type",
+            json!({
+                "S3DestinationUpdate": { "BucketARN": BUCKET_ARN },
+                "ExtendedS3DestinationUpdate": { "BucketARN": BUCKET_ARN },
+                "SplunkDestinationUpdate": { "HECEndpointType": "Raw" },
+            }),
+        ),
+    ];
+
+    for (case, updates) in rows {
+        let mut request = json!({
+            "DeliveryStreamName": "pair-update-stream",
+            "CurrentDeliveryStreamVersionId": version,
+            "DestinationId": destination_id,
+        });
+        for (member, update) in updates.as_object().expect("a table of update members") {
+            request[member] = update.clone();
+        }
+        let (status, refused) = emulator.call("UpdateDestination", request).await;
+        assert_eq!(status, 400, "case {case:?}: got {refused:?}");
+        assert_eq!(
+            error_code(&refused),
+            "InvalidArgumentException",
+            "case {case:?}: got {refused:?}"
+        );
+        let message = error_message(&refused);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // The stream kept the destination and the version it had.
+    let after = describe(&emulator, "pair-update-stream").await;
+    assert_eq!(
+        after["VersionId"], described["VersionId"],
+        "a refused update leaves the version alone, got {after:?}"
+    );
+    assert_eq!(
+        after["Destinations"], described["Destinations"],
+        "a refused update leaves the destination alone, got {after:?}"
+    );
 }

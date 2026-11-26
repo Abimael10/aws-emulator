@@ -4,26 +4,21 @@
 //!
 //! The rule under test: a tag key is admitted exactly by the `@pattern` the modelled
 //! `TagKey` shape carries (`smithy_query(query="shape",shape="TagKey")`:
-//! `^(?!aws:)[\p{L}\p{Z}\p{N}_.:\/=+\-@%]*$`), and its two clauses are two different
-//! faults.
+//! `^(?!aws:)[\p{L}\p{Z}\p{N}_.:\/=+\-@%]*$`), and that one expression is ONE constraint on
+//! the request's shape however a key breaks it:
 //!
-//! 1. The CHARACTERS a key may be written with — Unicode letters, separators and digits
-//!    plus `_ . : / = + - @ %` — are a constraint on the request's SHAPE, so a key outside
-//!    them is refused with HTTP 400 `ValidationException` naming the member it was
-//!    submitted at and the constraint: its own dotted path for a named member, the LIST
-//!    member and the whole constraint set its elements carry for an element of a list of
-//!    keys.
-//! 2. The reserved `aws:` prefix the look-ahead excludes names a SYSTEM tag, and a request
-//!    that would WRITE OR REMOVE one is refused by the tag policy — HTTP 400 with the
-//!    modelled `InvalidArgumentException` and one fixed sentence naming no key — on every
-//!    member that carries a tag to be written or removed. A member that writes and removes
-//!    nothing (`ListTagsForDeliveryStream`'s `ExclusiveStartTagKey`, a position in a
-//!    listing) is judged by the modelled pattern alone, so there the prefix is a
-//!    request-shape refusal.
+//! 1. the CHARACTERS a key may be written with — Unicode letters, separators and digits
+//!    plus `_ . : / = + - @ %` — are what its character class lists, and
+//! 2. the reserved `aws:` prefix its look-ahead excludes is a prefix no key may begin with.
 //!
-//! Either way the request writes nothing; a key inside the pattern is stored and read back
-//! unchanged. The rule is a property of the SHAPE and of what the request DOES with the
-//! key, so it holds for every member that targets it —
+//! A key breaking either clause is refused with HTTP 400 `ValidationException` naming the
+//! member it was submitted at and the constraint: its own dotted path for a named member,
+//! the LIST member and the whole constraint set its elements carry for an element of a list
+//! of keys. The refused request writes nothing; a key inside the pattern is stored and read
+//! back unchanged.
+//!
+//! The rule is a property of the SHAPE the member targets and not of what the request means
+//! to do with the key, so it holds for every member that targets it —
 //! `TagDeliveryStream`'s `Tags[].Key`, `UntagDeliveryStream`'s `TagKeys[]`,
 //! `CreateDeliveryStream`'s `Tags[].Key` and `ListTagsForDeliveryStream`'s
 //! `ExclusiveStartTagKey` — and each table below spans a SET of keys rather than one
@@ -82,8 +77,16 @@ pub(crate) fn element_refusal(member: &str) -> String {
     )
 }
 
+/// Every key the modelled pattern does NOT admit, whichever of its clauses the key breaks:
+/// the characters it is written with, and the prefix it begins with.
+fn keys_outside_the_pattern() -> Vec<(&'static str, String)> {
+    let mut rows = keys_outside_the_character_class();
+    rows.extend(keys_carrying_the_reserved_prefix());
+    rows
+}
+
 /// Keys the modelled pattern does NOT admit because of the CHARACTERS they are written
-/// with — the request-shape clause.
+/// with — its character-class clause.
 ///
 /// One row per printable ASCII punctuation mark the character class leaves out, so none of
 /// them is admitted by accident. The class is `[\p{L}\p{Z}\p{N}_.:\/=+\-@%]`, so these are
@@ -99,9 +102,9 @@ fn keys_outside_the_character_class() -> Vec<(&'static str, String)> {
     rows
 }
 
-/// Keys naming a SYSTEM tag: the reserved prefix the look-ahead excludes — alone, and in
-/// front of anything.
-fn system_tag_keys() -> Vec<(&'static str, String)> {
+/// Keys the modelled pattern does not admit because of the PREFIX they begin with: the one
+/// its look-ahead excludes — alone, and in front of anything.
+fn keys_carrying_the_reserved_prefix() -> Vec<(&'static str, String)> {
     vec![
         ("the reserved prefix alone", "aws:".to_string()),
         (
@@ -118,11 +121,6 @@ fn system_tag_keys() -> Vec<(&'static str, String)> {
         ),
     ]
 }
-
-/// The sentence a request that would write or remove a system tag is refused with: fixed
-/// text over the reserved prefix, naming none of the keys that carried it.
-const SYSTEM_TAG_REFUSAL: &str =
-    "Some tag keys in the request started with 'aws:'. System tags cannot be modified.";
 
 /// Keys the modelled pattern DOES admit: one per character the class lists, a Unicode
 /// letter, a separator, a digit, and keys that contain the reserved prefix WITHOUT
@@ -180,22 +178,12 @@ fn requests_carrying(stream: &str, key: &str) -> Vec<(String, &'static str, Valu
     ]
 }
 
-/// The three requests that WRITE OR REMOVE the tag `key` of a stream called `stream`, each
-/// as `(operation, body)` — the members the tag policy judges.
-fn modifying_requests_carrying(stream: &str, key: &str) -> Vec<(&'static str, Value)> {
-    requests_carrying(stream, key)
-        .into_iter()
-        .filter(|(_, operation, _)| *operation != "ListTagsForDeliveryStream")
-        .map(|(_, operation, body)| (operation, body))
-        .collect()
-}
-
 #[tokio::test]
 async fn a_key_the_modelled_pattern_rejects_is_refused_on_every_member_that_takes_one() {
     let emulator = Emulator::new();
     create_tagged(&emulator, "keyed-stream", &owned(&[("env", "prod")])).await;
 
-    for (reason, key) in keys_outside_the_character_class() {
+    for (reason, key) in keys_outside_the_pattern() {
         for (expected, operation, request) in requests_carrying("keyed-stream", &key) {
             let case = format!("{operation} with {reason} ({key:?})");
             let (status, refused) = emulator.call(operation, request).await;
@@ -280,78 +268,57 @@ async fn a_key_the_modelled_pattern_admits_round_trips_through_every_member() {
 }
 
 #[tokio::test]
-async fn a_system_tag_key_is_refused_by_the_tag_policy_wherever_a_tag_is_written() {
+async fn a_key_beginning_with_the_reserved_prefix_is_refused_as_that_same_constraint() {
+    // The look-ahead is part of the one modelled expression, so a key beginning with the
+    // prefix it excludes breaks the SAME `@pattern` a key outside the character class
+    // breaks: the refusal is the request-shape one, at the member the key was submitted
+    // at, whatever the request meant to do with the key — write it, remove it, create a
+    // stream carrying it, or name a position in a listing with it.
     let emulator = Emulator::new();
-    create_tagged(&emulator, "system-tag-stream", &owned(&[("env", "prod")])).await;
+    create_tagged(&emulator, "reserved-prefix-stream", &owned(&[("env", "prod")])).await;
 
-    for (reason, key) in system_tag_keys() {
-        for (operation, request) in modifying_requests_carrying("system-tag-stream", &key) {
+    for (reason, key) in keys_carrying_the_reserved_prefix() {
+        for (expected, operation, request) in requests_carrying("reserved-prefix-stream", &key) {
             let case = format!("{operation} with {reason} ({key:?})");
             let (status, refused) = emulator.call(operation, request).await;
             assert_eq!(status, 400, "case {case:?}: got {refused:?}");
-            // The modelled argument error, not the request-shape one: the request is
-            // well formed and it is what it ASKS FOR that the tag policy refuses.
+            // Not the modelled argument error: a value the model's own constraint
+            // excludes is a malformed request and not an argument the service weighed.
             assert_eq!(
                 error_code(&refused),
-                "InvalidArgumentException",
+                "ValidationException",
                 "case {case:?}: got {refused:?}"
             );
             let message = error_message(&refused);
             assert_eq!(
-                message, SYSTEM_TAG_REFUSAL,
-                "case {case:?}: expected {SYSTEM_TAG_REFUSAL:?}, got {message:?}"
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
             );
-            // Fixed text over the reserved prefix: what follows the prefix is the caller's
-            // own value and the sentence interpolates none of it.
+            // The refused key is the caller's own value and no part of the sentence is
+            // built from it — what follows the prefix reaches the body nowhere.
             let beyond_the_prefix = key.trim_start_matches("aws:");
             assert!(
                 beyond_the_prefix.is_empty() || !message.contains(beyond_the_prefix),
-                "case {case:?}: expected no key in the message, got {message:?}"
+                "case {case:?}: expected no rejected key in the message, got {message:?}"
             );
         }
     }
 
     // Nothing any of them asked for happened: the stream keeps the tags it had, and the
-    // create that named a system tag made no stream.
-    let (_, after) = list_tags(&emulator, "system-tag-stream", None, None).await;
+    // create that carried such a key made no stream.
+    let (_, after) = list_tags(&emulator, "reserved-prefix-stream", None, None).await;
     assert_eq!(
         listed(&after),
         owned(&[("env", "prod")]),
         "a refused request wrote nothing, got {after:?}"
     );
-    let (status, absent) = list_tags(&emulator, "system-tag-stream-created", None, None).await;
+    let (status, absent) = list_tags(&emulator, "reserved-prefix-stream-created", None, None).await;
     assert_eq!(status, 400, "the refused create stored nothing: got {absent:?}");
     assert_eq!(
         error_code(&absent),
         "ResourceNotFoundException",
         "a refused create persists no stream, got {absent:?}"
     );
-}
-
-#[tokio::test]
-async fn a_system_tag_key_naming_a_listing_position_is_the_request_shape_refusal() {
-    // A start key writes and removes no tag, so the tag policy does not judge it: what it
-    // must satisfy is the modelled pattern, reserved prefix included, and the refusal is
-    // the one the request boundary states for a constrained value.
-    let emulator = Emulator::new();
-    create_tagged(&emulator, "start-key-stream", &owned(&[("env", "prod")])).await;
-
-    for (reason, key) in system_tag_keys() {
-        let case = format!("ListTagsForDeliveryStream with {reason} ({key:?})");
-        let (status, refused) = list_tags(&emulator, "start-key-stream", Some(&key), None).await;
-        assert_eq!(status, 400, "case {case:?}: got {refused:?}");
-        assert_eq!(
-            error_code(&refused),
-            "ValidationException",
-            "case {case:?}: got {refused:?}"
-        );
-        let expected = pattern_refusal("exclusiveStartTagKey");
-        let message = error_message(&refused);
-        assert_eq!(
-            message, expected,
-            "case {case:?}: expected {expected:?}, got {message:?}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -414,16 +381,21 @@ async fn a_list_of_tag_keys_is_reported_once_however_many_of_its_elements_are_re
 
     // (case, the keys the untag names)
     //
-    // A key outside the character class is the request's SHAPE, and the shape is judged
-    // before the tag policy: a list carrying both faults is refused as the shape fault,
-    // against the list member.
+    // Whichever clause of the modelled expression an element breaks, and however many
+    // elements break one, the list is reported once — against the list member, with the
+    // whole constraint set its elements carry.
     let cases: Vec<(&str, Vec<&str>)> = vec![
         ("the only key", vec!["bad*one"]),
         ("the second of three", vec!["env", "bad*two", "three"]),
         ("the last of three", vec!["env", "two", "bad*three"]),
         ("two of three", vec!["bad*one", "env", "bad*three"]),
         ("every key", vec!["bad*one", "bad*two"]),
-        ("a system tag beside one outside the class", vec!["aws:one", "bad*two"]),
+        ("a reserved-prefix key alone", vec!["aws:one"]),
+        ("a reserved-prefix key beside a carried one", vec!["env", "aws:two"]),
+        (
+            "a reserved-prefix key beside one outside the class",
+            vec!["aws:one", "bad*two"],
+        ),
     ];
 
     for (case, keys) in cases {
@@ -473,6 +445,16 @@ async fn a_refused_key_is_reported_at_the_position_it_was_submitted_at() {
             "two of three",
             vec!["bad*first", "second", "bad*third"],
             vec!["tags.1.member.key", "tags.3.member.key"],
+        ),
+        (
+            "a reserved-prefix key, second of two",
+            vec!["first", "aws:second"],
+            vec!["tags.2.member.key"],
+        ),
+        (
+            "one key per clause of the expression",
+            vec!["bad*first", "aws:second"],
+            vec!["tags.1.member.key", "tags.2.member.key"],
         ),
     ];
 
