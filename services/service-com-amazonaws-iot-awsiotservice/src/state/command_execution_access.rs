@@ -6,26 +6,27 @@
 //! `GetCommandExecution$targetArn` and `DeleteCommandExecution$targetArn` are "the ARN of
 //! the device on which the command execution is being performed" / "of the target device",
 //! i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`. WHICH device such a request
-//! names is decided by the ARN ([`command_execution_target`] — its form, its service, its
-//! partition, its account and its resource type) and then by the account's THING REGISTRY
-//! ([`super::ComAmazonawsIotAwsiotserviceState::command_execution_device`]), and what a
-//! value that names none is refused as depends on what the value is:
+//! names is decided by the ARN ALONE ([`command_execution_target`] — its form, its service,
+//! its partition, its account and its resource type), and what a value that names none is
+//! refused as depends on what the value is:
 //!
 //! * A value that is not an ARN at all carries no account to read it in, so it is a
 //!   MALFORMED member: the modelled `ValidationException` (HTTP 400) with
 //!   [`INVALID_COMMAND_EXECUTION_TARGET_MESSAGE`].
 //! * A value that IS an ARN but names no device of the CALLER's own account — another
-//!   account's or another partition's ARN, another service's, another IoT resource type's, a
-//!   `thing/` ARN whose name no `/things/{thingName}` request could address, or one naming a
-//!   thing this account's registry does not hold — is refused as an AUTHORIZATION failure:
-//!   HTTP 403 with [`TARGET_NOT_IN_ACCOUNT_MESSAGE`], which states that one condition. It is
-//!   not a constraint violation, so a caller can tell a permissions problem from a malformed
-//!   request instead of retrying a "fixed" ARN forever.
+//!   account's or another partition's ARN, another service's, another IoT resource type's or
+//!   a `thing/` ARN whose name no `/things/{thingName}` request could address — is refused as
+//!   an AUTHORIZATION failure: HTTP 403 with [`TARGET_NOT_IN_ACCOUNT_MESSAGE`], which states
+//!   that one condition. It is not a constraint violation, so a caller can tell a permissions
+//!   problem from a malformed request instead of retrying a "fixed" ARN forever.
 //!
-//! What the target does NOT decide is whether that device HOLDS anything: whether the named
-//! device holds the named execution is the EXECUTION store's question, answered by the reader
-//! as the modelled not-found error rather than as a permissions problem the caller can never
-//! satisfy.
+//! What the target does NOT decide is whether the account's THING REGISTRY holds a device of
+//! that name, nor whether that device HOLDS anything. A command execution is started against
+//! a `targetArn` whatever the registry holds, so the record such a start leaves is addressed
+//! by the very same ARN: whether the named device holds the named execution is the EXECUTION
+//! store's question, answered by the reader as the modelled not-found error rather than as a
+//! permissions problem the caller can never satisfy — nothing ever puts a device the start
+//! never registered into the registry, so a registry-gated refusal would be permanent.
 
 /// How this service refuses a command-execution `targetArn` that is no ARN at all.
 ///
@@ -34,12 +35,12 @@
 /// value is not echoed back.
 pub const INVALID_COMMAND_EXECUTION_TARGET_MESSAGE: &str = "Invalid targetArn";
 
-/// How this service refuses a command-execution `targetArn` that names no device of the
+/// How this service refuses a command-execution `targetArn` that can name no device of the
 /// caller's own account.
 ///
-/// A CONSTANT with no variable part: the refusal states that the ARN was looked for among the
-/// account's devices and found to name none of them, and names neither the ARN nor the account
-/// — an authorization answer tells the caller nothing about what the account holds.
+/// A CONSTANT with no variable part: the refusal states that the ARN names no device of this
+/// account at all, and names neither the ARN nor the account — an authorization answer tells
+/// the caller nothing about what the account holds.
 pub const TARGET_NOT_IN_ACCOUNT_MESSAGE: &str = "targetArn not found in account";
 
 /// Why a command-execution `targetArn` was not accepted.
@@ -65,7 +66,7 @@ fn arn_account(value: &str) -> Option<&str> {
 }
 
 /// The device NAME a command-execution request's ARN names, or why the supplied value names
-/// none — the half of the question the value alone decides.
+/// none — the WHOLE question, since the value alone decides it.
 ///
 /// The ARN is read with [`super::parse_job_target`], the one rule this service reads a
 /// caller-supplied IoT target ARN with, and the ACCOUNT field is then compared with this
@@ -73,9 +74,10 @@ fn arn_account(value: &str) -> Option<&str> {
 /// can name a device of the caller. Everything else is refused, as one of the two classes
 /// [`CommandExecutionTargetRefusal`] names.
 ///
-/// Whether the account's registry HOLDS a device of that name is the other half, taken by
-/// [`super::ComAmazonawsIotAwsiotserviceState::command_execution_device`] — which is what
-/// every command-execution request resolves its target through.
+/// Whether the account's thing REGISTRY holds a device of that name is NOT asked: a start
+/// enqueues an execution against a target the registry does not hold, so requiring membership
+/// here would make the record it left permanently unreadable and undeletable. Whether the
+/// device named here holds the named execution is the execution store's question.
 pub fn command_execution_target(
     target_arn: &str,
 ) -> Result<String, CommandExecutionTargetRefusal> {
@@ -92,40 +94,17 @@ pub fn command_execution_target(
     }
 }
 
-impl super::ComAmazonawsIotAwsiotserviceState {
-    /// The DEVICE a command-execution request names, resolved against the account's THING
-    /// REGISTRY, or why the supplied value names none.
-    ///
-    /// The whole question [`command_execution_target`] answers, and then the one thing an
-    /// ARN cannot answer by itself: whether this account's registry holds a device of that
-    /// name. "targetArn not found in account" ([`TARGET_NOT_IN_ACCOUNT_MESSAGE`]) is the
-    /// answer to exactly that question, so a `thing/` ARN of this account naming a device
-    /// the registry does not hold is refused by it like an ARN of another account's — the
-    /// value names no device of the caller either way, and an authorization answer tells
-    /// the caller nothing further about what the account holds.
-    ///
-    /// What is still NOT decided here is whether that device HOLDS the named execution:
-    /// that is the execution store's question, which the reader answers as the modelled
-    /// not-found error and the deleter as a no-op.
-    pub fn command_execution_device(
-        &self,
-        target_arn: &str,
-    ) -> Result<String, CommandExecutionTargetRefusal> {
-        let thing_name = command_execution_target(target_arn)?;
-        if !self.things.contains_key(&thing_name) {
-            return Err(CommandExecutionTargetRefusal::NotInAccount);
-        }
-        Ok(thing_name)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The longest device name a `/things/{thingName}` request can address — `ThingName` is
+    /// modelled len 1..128 (`smithy_query(query="shape",shape="ThingName")`).
+    const LONGEST_THING_NAME_LENGTH: usize = 128;
+
     /// RULE: only an IoT `thing/` ARN of this emulator's own account can name a device; a
     /// value that is no ARN is malformed, and every other ARN names no device of the account.
-    /// This is the half the VALUE decides, so the registry is no part of it.
+    /// The VALUE decides the whole question, so the registry is no part of it.
     ///
     /// The rows span what the rule generalises over: the resource type the ARN names, its
     /// service, its partition, its account, its region, whether the thing name is one a
@@ -146,8 +125,8 @@ mod tests {
                 Ok("laser-1".to_string()),
             ),
             (
-                // The value alone cannot say whether the registry holds the device: the
-                // ARN's own reading answers the name, and the registry answers the rest.
+                // A start enqueues an execution against a target the registry does not
+                // hold, so the ARN that addresses that record names its device here too.
                 "a thing ARN of this account naming a device the registry does not hold",
                 format!("arn:aws:iot:us-east-1:{account}:thing/laser-never-created"),
                 Ok("laser-never-created".to_string()),
@@ -198,65 +177,34 @@ mod tests {
         }
     }
 
-    /// RULE: a command-execution target is a device the account's REGISTRY holds, so a
-    /// `thing/` ARN of this account naming a thing it does not hold names no device of the
-    /// account either — the same authorization refusal every other unusable ARN earns.
+    /// RULE: what the account's thing registry holds does not enter the reading, so one
+    /// `targetArn` resolves to the same device whether or not the registry holds a thing of
+    /// that name — an ARN naming a thing `CreateThing` made and an ARN naming a name no
+    /// thing has are answered alike.
     ///
-    /// The rows span whether the registry holds the named thing, and the ways a value names
-    /// no device whatever the registry holds.
+    /// The rows span the form of the device name the ARN carries (`ThingName`: len 1..128,
+    /// `^[a-zA-Z0-9:_-]+$`), one of them a name no registry of this emulator ever holds, so a
+    /// registry-gated reading could not pass them. That the readers themselves consult no
+    /// registry is driven end to end in `tests/all/command_execution_read.rs`.
     #[test]
-    fn a_target_is_a_device_the_registry_holds() {
+    fn the_registry_does_not_decide_which_device_a_target_names() {
         let account = ::engine::emulator_account_id();
-        let mut store = super::super::ComAmazonawsIotAwsiotserviceState::default();
-        let registered = super::super::RegisteredThing::new(
-            "laser-registered".to_string(),
-            "thing-id".to_string(),
-            format!("arn:aws:iot:us-east-1:{account}:thing/laser-registered"),
-            super::super::ThingConfiguration::default(),
-        );
-        store
-            .things
-            .insert(registered.thing_name.clone(), registered);
-
-        // (case, targetArn, the device it names or why it names none)
-        let rows: Vec<(&str, String, Result<String, CommandExecutionTargetRefusal>)> = vec![
-            (
-                "a thing ARN naming a registered device",
-                format!("arn:aws:iot:us-east-1:{account}:thing/laser-registered"),
-                Ok("laser-registered".to_string()),
-            ),
-            (
-                "the same device named in another region",
-                format!("arn:aws:iot:eu-west-1:{account}:thing/laser-registered"),
-                Ok("laser-registered".to_string()),
-            ),
-            (
-                "a thing ARN naming a device the registry does not hold",
-                format!("arn:aws:iot:us-east-1:{account}:thing/laser-never-created"),
-                Err(CommandExecutionTargetRefusal::NotInAccount),
-            ),
-            (
-                "a registered device's name under another account",
-                "arn:aws:iot:us-east-1:111122223333:thing/laser-registered".to_string(),
-                Err(CommandExecutionTargetRefusal::NotInAccount),
-            ),
-            (
-                "a registered device's name under another resource type",
-                format!("arn:aws:iot:us-east-1:{account}:thinggroup/laser-registered"),
-                Err(CommandExecutionTargetRefusal::NotInAccount),
-            ),
-            (
-                "a value that is no ARN",
-                "laser-registered".to_string(),
-                Err(CommandExecutionTargetRefusal::Malformed),
-            ),
+        let longest = "a".repeat(LONGEST_THING_NAME_LENGTH);
+        // (case, the device name the ARN carries)
+        let rows: [(&str, &str); 4] = [
+            ("a name a device was created under", "laser-registered"),
+            ("a name no thing was ever created for", "laser-never-created"),
+            ("a name of the modelled character class", "a:b_c-1"),
+            ("a name at the modelled maximum length", longest.as_str()),
         ];
 
-        for (case, target_arn, expected) in rows {
-            let actual = store.command_execution_device(&target_arn);
+        for (case, thing_name) in rows {
+            let target_arn = format!("arn:aws:iot:us-east-1:{account}:thing/{thing_name}");
+            let actual = command_execution_target(&target_arn);
             assert_eq!(
-                actual, expected,
-                "case {case:?}: expected {expected:?} for {target_arn:?}, got {actual:?}"
+                actual,
+                Ok(thing_name.to_string()),
+                "case {case:?}: expected {thing_name:?} for {target_arn:?}, got {actual:?}"
             );
         }
     }

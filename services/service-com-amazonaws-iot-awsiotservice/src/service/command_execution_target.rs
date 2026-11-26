@@ -4,11 +4,11 @@
 //! request's own shape, beside the IAM decision this service takes there.
 //!
 //! `GetCommandExecution` and `DeleteCommandExecution` bind `targetArn` as a query parameter,
-//! and WHICH device the value names is read off the ARN and the account's thing registry
-//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::command_execution_device`]). A value
-//! that names no device of this account is an AUTHORIZATION answer, and AWS answers one at the
-//! layer in front of the service — before the request's own members are constraint-checked —
-//! so a request that names a target outside the account is refused on THAT ground whatever
+//! and WHICH device the value names is read off the ARN alone
+//! ([`crate::state::command_execution_target`]). A value
+//! that can name no device of this account is an AUTHORIZATION answer, and AWS answers one at
+//! the layer in front of the service — before the request's own members are constraint-checked
+//! — so a request that names a target outside the account is refused on THAT ground whatever
 //! else about it is malformed, rather than being told about a member it would also have to
 //! fix.
 //!
@@ -36,25 +36,20 @@ const TARGET_ARN_OPERATIONS: [&str; 2] = ["GetCommandExecution", "DeleteCommandE
 /// The media type this restJson1 service renders an error in.
 const JSON_CONTENT_TYPE: &str = "application/json";
 
-/// The refusal this request is answered with when its `targetArn` names no device of the
+/// The refusal this request is answered with when its `targetArn` can name no device of the
 /// account, or `None` for every request this decision does not refuse — one naming another
 /// operation, one carrying no `targetArn` at all (the framework answers the absent required
-/// member), one whose value is no ARN (the operation words that itself) and one whose ARN
-/// names a device this account's registry holds.
-pub fn refusal<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    operation: &str,
-    req: &WireRequest,
-) -> Option<WireResponse> {
+/// member), one whose value is no ARN (the operation words that itself) and one whose ARN can
+/// name a device of this account, whatever the thing registry holds.
+pub fn refusal(operation: &str, req: &WireRequest) -> Option<WireResponse> {
     if !TARGET_ARN_OPERATIONS.contains(&operation) {
         return None;
     }
     let target_arn = super::request_query::value(req.uri(), TARGET_ARN_MEMBER)?;
-    // The same reading the operation takes, against the same store: the engine is the one
-    // the gate was built from, so the registry this consults is the one the handler reads.
-    let state = crate::state::service_state(engine)?;
+    // The same reading the operation takes: the ARN alone decides which device the value
+    // names, so this gate consults no store and cannot disagree with the handler.
     let refused = matches!(
-        state.lock().command_execution_device(&target_arn),
+        crate::state::command_execution_target(&target_arn),
         Err(crate::state::CommandExecutionTargetRefusal::NotInAccount)
     );
     refused.then(refusal_response)

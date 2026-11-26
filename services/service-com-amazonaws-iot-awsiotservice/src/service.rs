@@ -329,13 +329,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
             {
                 return authorization::refusal_response(&denial);
             }
-            // The OTHER answer this layer owes: a request whose `targetArn` names no device
-            // of this account is refused on that ground before its own members are
+            // The OTHER answer this layer owes: a request whose `targetArn` can name no
+            // device of this account is refused on that ground before its own members are
             // constraint-checked, which is where AWS answers it
             // ([`command_execution_target`]). The operation decides the same thing for
             // itself; what is decided here is only the order.
-            if let Some(refused) = command_execution_target::refusal(&*self.engine, operation, req)
-            {
+            if let Some(refused) = command_execution_target::refusal(operation, req) {
                 return refused;
             }
             match self

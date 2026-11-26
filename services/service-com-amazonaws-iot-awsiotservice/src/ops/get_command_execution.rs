@@ -19,11 +19,12 @@
 //! ([`crate::state::command_execution_access`]): a value that is no ARN at all is refused 400
 //! `ValidationException` naming the member, and an ARN that can name no device of this account
 //! — another account's, another resource type's or another service's — is refused 403 with the
-//! access-denied error code the layer in front of the service frames that answer with. Whether
-//! that device HOLDS the execution is this store's question: an `executionId` it holds no
-//! command execution under is 404 `ResourceNotFoundException` rather than a 200 carrying no
-//! execution, and that is the answer for a target the thing registry does not hold too — a
-//! start admits such a target, so the record it leaves is read back here like any other.
+//! access-denied error code the layer in front of the service frames that answer with. The
+//! account's thing REGISTRY is no part of that reading: a start enqueues an execution against
+//! a target the registry does not hold, so the record it left is addressed by the same ARN
+//! here. Whether that device HOLDS the execution is this store's question: an `executionId` it
+//! holds no command execution under is 404 `ResourceNotFoundException` rather than a 200
+//! carrying no execution.
 //!
 //! ## Shape of an operation
 //!
@@ -126,7 +127,7 @@ use super::types::*;
 /// is a malformed member (the modelled 400), and an ARN that names no device of the caller's
 /// own account is the authorization refusal (403) the layer in front of the service answers
 /// — the same classification the delete of one execution makes
-/// ([`crate::state::ComAmazonawsIotAwsiotserviceState::command_execution_device`]).
+/// ([`crate::state::command_execution_target`]).
 fn refused_target(
     refusal: crate::state::CommandExecutionTargetRefusal,
 ) -> GetCommandExecutionError {
@@ -232,21 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
             return Err(unavailable());
         };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(unavailable());
-        };
 
         // `targetArn` is "The Amazon Resource Number (ARN) of the device on which the
         // command execution is being performed": WHICH device it names is read off the ARN
-        // and then resolved against this account's thing registry
-        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::command_execution_device`]).
-        // A value that is no ARN is the modelled 400; an ARN that names no device of this
-        // account is the authorization refusal, answered before any execution is read.
-        // Whether that device holds the named execution is the execution store's answer
-        // below, not this one's.
-        let thing_name = state
-            .lock()
-            .command_execution_device(&input.target_arn)
+        // alone ([`crate::state::command_execution_target`]). A value that is no ARN is the
+        // modelled 400; an ARN that can name no device of this account is the authorization
+        // refusal, answered before any execution is read. What the thing registry holds is
+        // not asked — a start accepts a target it does not hold — and whether the named
+        // device holds the named execution is the execution store's answer below.
+        let thing_name = crate::state::command_execution_target(&input.target_arn)
             .map_err(refused_target)?;
 
         let region = crate::state::request_region(ctx.parts());
