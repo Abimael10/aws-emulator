@@ -5,20 +5,25 @@
 //!
 //! The rule under test: the ceiling is the ITEM's and does not move with the surface the
 //! change arrived through, so the SENTENCE is the same wherever it was stated — but WHOSE
-//! failure the crossing is follows whether the item the change LEAVES is past the quota in the
-//! bytes it STORES. A SINGLE-ITEM update states a change on its own, so crossing the ceiling
-//! is refused as the request it is: HTTP 400, the validation class, and the sentence the
-//! update path words that quota with. Inside a `TransactWriteItems` transaction, an item that
-//! really became too large is "an item size becomes too large (larger than 400 KB) [...] or a
-//! similar validation error occurs because of changes made by the transaction" — one of the
+//! failure the crossing is follows whether the STATEMENT asks for more than an item can hold.
+//! A SINGLE-ITEM update states a change on its own, so crossing the ceiling is refused as the
+//! request it is: HTTP 400, the validation class, and the sentence the update path words that
+//! quota with. Inside a `TransactWriteItems` transaction the same two classes split by the
+//! bytes the REQUEST states: a statement whose own payload — the key it addresses plus what
+//! its clauses write — cannot fit in an item is unsatisfiable however the store looks, so the
+//! CALL is refused exactly as the single-item update of that statement is, and no action is
+//! graded. A statement that does fit and crosses the ceiling only over bytes the STORED item
+//! already held is "an item size becomes too large (larger than 400 KB) [...] or a similar
+//! validation error occurs because of changes made by the transaction" — one of the
 //! circumstances `TransactionCanceledException` documents — so the transaction is CANCELLED:
 //! HTTP 400, the cancellation class, the top-level sentence over the per-slot codes in request
 //! order, and an ordered reason list naming the crossing action with that same sentence while
-//! every blameless action reports `None`. The CALL is refused where the item still fits the
-//! quota and what crossed is only what the request's own accounting charges on top of it — the
-//! key portion charged at a floor, the frame each clause costs — which is the boundary
-//! `update_item_ceiling_key_portion.rs` and `transactional_update_clause_charge_class.rs`
-//! drive. Nothing of a refused or a cancelled call is applied.
+//! every blameless action reports `None`. The CALL is likewise refused where the item still
+//! fits the quota and what crossed is only what the request's own accounting charges on top of
+//! it — the key portion charged at a floor, the frame each clause costs — which is the
+//! boundary `update_item_ceiling_key_portion.rs` and
+//! `transactional_update_clause_charge_class.rs` drive. Nothing of a refused or a cancelled
+//! call is applied.
 //!
 //! The rows span what the rule generalises over: the surface a change is stated through
 //! (`UpdateItem` and a transaction's `Update` for an `UpdateExpression`, `ExecuteStatement`
@@ -187,13 +192,18 @@ struct Crossing {
     seeded: usize,
     expression: &'static str,
     values: fn() -> Value,
+    /// Whether the STATEMENT itself asks for more than an item can hold — the key it
+    /// addresses plus what its own clauses write — which is what decides whether a
+    /// transaction carrying it is refused or cancelled.
+    asks_for_too_much: bool,
 }
 
 /// The ways an `UpdateExpression` can leave the item past the ceiling. They differ in WHAT
 /// crosses it: one value on its own, a value inside the ceiling over bytes the item already
 /// holds, two clauses that only cross together, and a value the update computes from two
 /// operands neither of which crosses it — and in whether the key addressed holds an item at
-/// all.
+/// all. Each row also differs in whether the crossing is the STATEMENT's own payload or comes
+/// from the bytes the stored item already held, which is the class boundary under test.
 fn crossings() -> Vec<Crossing> {
     vec![
         Crossing {
@@ -202,6 +212,7 @@ fn crossings() -> Vec<Crossing> {
             seeded: 0,
             expression: "SET big = :v",
             values: || json!({":v": {"S": "x".repeat(MAX_ITEM_BYTES)}}),
+            asks_for_too_much: true,
         },
         Crossing {
             case: "a value inside the ceiling over what the item already holds",
@@ -209,6 +220,7 @@ fn crossings() -> Vec<Crossing> {
             seeded: 300 * 1024,
             expression: "SET big = :v",
             values: || json!({":v": {"S": "x".repeat(150 * 1024)}}),
+            asks_for_too_much: false,
         },
         Crossing {
             case: "two clauses that cross the ceiling only together",
@@ -219,6 +231,7 @@ fn crossings() -> Vec<Crossing> {
                 json!({":a": {"S": "x".repeat(210 * 1024)},
                        ":b": {"S": "y".repeat(210 * 1024)}})
             },
+            asks_for_too_much: true,
         },
         Crossing {
             case: "a value the update computes past the ceiling",
@@ -229,6 +242,7 @@ fn crossings() -> Vec<Crossing> {
                 json!({":a": {"L": [{"S": "x".repeat(210 * 1024)}]},
                        ":b": {"L": [{"S": "y".repeat(210 * 1024)}]}})
             },
+            asks_for_too_much: true,
         },
         Crossing {
             case: "a value the update computes from one the item already holds",
@@ -236,6 +250,7 @@ fn crossings() -> Vec<Crossing> {
             seeded: 210 * 1024,
             expression: "SET joined = list_append(:a, :a)",
             values: || json!({":a": {"L": [{"S": "x".repeat(100 * 1024)}]}}),
+            asks_for_too_much: false,
         },
     ]
 }
@@ -274,17 +289,17 @@ async fn an_update_expression_past_the_ceiling_is_refused_on_its_own() {
     }
 }
 
-/// RULE, the transactional half: every one of these crossings leaves an item past the QUOTA in
-/// the bytes it stores, which is the circumstance the cancellation documents — so the
-/// transaction is cancelled and the reason list names that action with the same sentence,
-/// however the bytes got there: carried by one value, computed by the update, or added to what
-/// the stored item already held. Nothing is applied. (The call is refused instead where the
-/// item still FITS the quota and only the charged ceiling was crossed, which is
+/// RULE, the transactional half: WHOSE failure the crossing is follows the bytes the
+/// STATEMENT states. A statement whose own payload cannot fit in an item refuses the CALL,
+/// exactly as the single-item update of it is refused and with no action graded; one that fits
+/// and crosses the ceiling only over bytes the stored item already held is the circumstance
+/// the cancellation documents, so the transaction is cancelled and the reason list names that
+/// action with the same sentence. Nothing is applied either way. (The call is refused as well
+/// where the item still FITS the quota and only the charged ceiling was crossed, which is
 /// `update_item_ceiling_key_portion.rs`'s and
-/// `transactional_update_clause_charge_class.rs`'s boundary, and for an item a `Put` CARRIES
-/// past the quota, which the classes below drive.)
+/// `transactional_update_clause_charge_class.rs`'s boundary.)
 #[tokio::test]
-async fn an_update_past_the_quota_cancels_the_transaction() {
+async fn an_update_past_the_quota_is_refused_or_cancels_by_what_the_statement_asks_for() {
     let router = seeded().await;
 
     for crossing in crossings() {
@@ -299,20 +314,24 @@ async fn an_update_past_the_quota_cancels_the_transaction() {
             json!({"TransactItems": [{"Update": update_of(&crossing, &key)}]}),
         )
         .await;
-        assert_cancelled(
-            &case,
-            status,
-            &body,
-            &[VALIDATION_ERROR_CODE],
-            &[Some(UPDATE_TOO_BIG)],
-        );
+        if crossing.asks_for_too_much {
+            assert_refused(&case, status, &body, UPDATE_TOO_BIG);
+        } else {
+            assert_cancelled(
+                &case,
+                status,
+                &body,
+                &[VALIDATION_ERROR_CODE],
+                &[Some(UPDATE_TOO_BIG)],
+            );
+        }
 
         let held = held_bytes(&router, &key).await;
         let expected = (crossing.seeded > 0).then_some(crossing.seeded);
         assert_eq!(
             held, expected,
-            "case {case:?}: a cancelled transaction leaves the stored item where it \
-             was, expected {expected:?} byte(s) of filler, got {held:?}"
+            "case {case:?}: a refused or cancelled transaction leaves the stored item where \
+             it was, expected {expected:?} byte(s) of filler, got {held:?}"
         );
     }
 }

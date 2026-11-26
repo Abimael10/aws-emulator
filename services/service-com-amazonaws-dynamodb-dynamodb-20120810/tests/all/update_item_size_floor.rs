@@ -29,7 +29,7 @@
 
 use serde_json::{json, Value};
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{call, emulator, message, ok};
 use crate::table_items::create_active_table;
 
 /// The documented item ceiling, 400 KB.
@@ -313,7 +313,7 @@ async fn an_update_tops_out_at_the_floor_bound_item_ceiling() {
                 surface.request(shape, &key, largest + 1),
             )
             .await;
-            assert_refused(&case, surface, &answered, key_bytes >= KEY_PORTION_FLOOR);
+            assert_refused(&case, surface, &answered);
             let stored = stored_length(&router, shape, &key).await;
             assert_eq!(
                 stored,
@@ -368,16 +368,11 @@ fn assert_served(
 
 /// Assert the change one byte past the boundary did not go through, each surface stating it as
 /// that surface does: as the CALL's own refusal with the update path's sentence on the
-/// single-item, standalone PartiQL and PartiQL-TRANSACTIONAL surfaces — and as the slot's own
-/// error in a batch, which answers 200.
-///
-/// `TransactWriteItems` states whichever of the two the crossing is: `past_the_quota` says the
-/// item the change would leave is past the 400 KB quota in the bytes it STORES — which it is
-/// exactly where the key portion FILLS the floor, since below it the charge exceeds what the
-/// key holds — and that is the circumstance the cancellation documents, so the transaction is
-/// cancelled with that action's reason; below the floor the item still fits the quota and what
-/// crossed is the request's own charge, so the CALL is refused.
-fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value), past_the_quota: bool) {
+/// single-item, standalone PartiQL and PartiQL-TRANSACTIONAL surfaces and on
+/// `TransactWriteItems` — each row's change writes its whole non-key payload itself, so what
+/// crossed the ceiling is what the STATEMENT asks for, which is a fact of the request on every
+/// surface — and as the slot's own error in a batch, which answers 200.
+fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
     let (status, body) = answered;
     if surface == Surface::BatchExecuteStatement {
         assert_eq!(
@@ -389,28 +384,6 @@ fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value), past_th
             Some(UPDATE_TOO_BIG),
             "case {case:?}: expected the slot to state the update-path ceiling refusal, got {}",
             body["Responses"][0]
-        );
-        return;
-    }
-    if surface == Surface::TransactWriteItems && past_the_quota {
-        assert_eq!(
-            (*status, error_code(body).as_str(), message(body).as_str()),
-            (
-                400,
-                "TransactionCanceledException",
-                "Transaction cancelled, please refer cancellation reasons for specific reasons \
-                 [ValidationError]"
-            ),
-            "case {case:?}: expected the transaction cancelled over that action, got {status} \
-             with {body}"
-        );
-        assert_eq!(
-            (
-                body["CancellationReasons"][0]["Code"].as_str(),
-                body["CancellationReasons"][0]["Message"].as_str(),
-            ),
-            (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-            "case {case:?}: expected that action's reason to word the ceiling, got {body}"
         );
         return;
     }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a LISTING of permissions reports: the ORDER its entries come in, and who a record
-//! records as having written it.
+//! What a LISTING of permissions reports: the ORDER its entries come in.
 //!
 //! `ListPermissions` answers a PAGE of entries ("`MaxResults` — the maximum number of
 //! results to return", `range 1..1000`, with a `NextToken` continuation), so which entries
@@ -13,11 +12,6 @@
 //! separators order records by the LENGTH of a principal identifier and put a table's
 //! column-level entry ahead of the table's own, neither of which a caller can see or
 //! predict.
-//!
-//! The same module carries the audit every entry reports with it
-//! (`PrincipalResourcePermissions$LastUpdated` / `$LastUpdatedBy`), because what fills it
-//! is the write that made the record: [`permission_record_updater`] is the identity a
-//! grant or a revoke stamps on the record it writes.
 
 use super::*;
 
@@ -163,38 +157,6 @@ pub fn reported_grant_order_key(
     key
 }
 
-/// Who a grant or a revoke records as having written the record it writes —
-/// `PrincipalResourcePermissions$LastUpdatedBy`, "The user who updated the record".
-///
-/// The identity this emulator's own long-term credential speaks for
-/// ([`::service_common::caller_principal::ambient_user_arn`], the tree's one definition of
-/// it), as the ARN this API names a principal by: a request signed with those credentials
-/// is made BY that identity, so it is the identity the write is attributed to. Never taken
-/// from the request — a grantee is who the grant is FOR, not who made it — and never
-/// invented per call: the value is the same on every call and across restarts, exactly as
-/// the IAM identity behind one set of credentials is. It is inside `NameString`'s length
-/// (1..255).
-pub fn permission_record_updater() -> String {
-    ::service_common::caller_principal::ambient_user_arn()
-}
-
-/// A wall-clock instant as a reported record states it: WHOLE MILLISECONDS.
-///
-/// A grant a Data Catalog resource was created carrying reports the instant of that create,
-/// which the catalog itself reports as the resource's own creation (`Table$CreateTime`)
-/// stated to the millisecond — so a client that correlates the two reads ONE value rather
-/// than two renderings of one instant. The host clock reads nanoseconds, which would render
-/// a fractional part neither reader emits, so every instant this service reports on a
-/// permission record is reduced here.
-pub fn reported_instant(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    let since_epoch = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_millis(
-        i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX),
-    )
-}
-
 /// Adds `grant` to the listing being built in `reported`, under the principal it is
 /// REPORTED to be held by: `reported_as` when the listing resolves a group grant onto the
 /// principal it asked about, else the grantee the record names.
@@ -208,8 +170,7 @@ pub fn reported_instant(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// must not open a second entry for a triple that already has one. That union is reported in
 /// the order the `Permission` enum declares its values ([`reported_permissions`]): the
 /// records were granted independently of each other, so the order either of them was granted
-/// in says nothing about the set they together hold. The entry reports the LATEST of their
-/// writes, since what it reports is as new as the newest record behind it.
+/// in says nothing about the set they together hold.
 pub fn merge_reported_grant(
     reported: &mut BTreeMap<String, PermissionGrant>,
     grant: &PermissionGrant,
@@ -235,10 +196,6 @@ pub fn merge_reported_grant(
             held.permissions = reported_permissions(&held.permissions);
             held.permissions_with_grant_option =
                 reported_permissions(&held.permissions_with_grant_option);
-            if grant.last_updated > held.last_updated {
-                held.last_updated = grant.last_updated;
-                held.last_updated_by = grant.last_updated_by.clone();
-            }
         }
         None => {
             reported.insert(key, grant);

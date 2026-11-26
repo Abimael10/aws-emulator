@@ -5,23 +5,20 @@
 //!
 //! RULE: what an update is weighed against is not the 400 KB quota alone — on top of the bytes
 //! the item stores it adds what the REQUEST's own shape costs, the frame each clause of the
-//! expression carries among them — so a crossing of that charged ceiling is one of two
-//! different things, and the bytes the item itself STORES tell them apart:
+//! expression carries among them. Whose failure a crossing of that charged ceiling is follows
+//! the bytes the STATEMENT asks for: the item these rows leave is written entirely by the
+//! statement's own clauses over the key it addresses, so the statement itself asks for more
+//! than an update may land — a fact of the REQUEST, which no stored item can satisfy — and the
+//! CALL is refused on either side of the quota, in the class and the sentence the single-item
+//! `UpdateItem` of the very same expression is refused with. A transaction is CANCELLED where
+//! the crossing comes from bytes the stored item ALREADY held, which is
+//! `transactional_update_ceiling_class.rs`'s boundary.
 //!
-//! * the item the change leaves is past the QUOTA in its own bytes: the change really made the
-//!   item too large, which is "an item size becomes too large (larger than 400 KB), or a local
-//!   secondary index (LSI) becomes too large, or a similar validation error occurs because of
-//!   changes made by the transaction" — a circumstance `TransactionCanceledException`
-//!   documents — so the TRANSACTION is cancelled and the reason list names that action;
-//! * the item FITS the quota and only what the request's own accounting charges on top of it
-//!   crossed the ceiling: nothing became too large, so the CALL is refused, in the class and
-//!   the sentence the single-item `UpdateItem` of the very same expression is refused with.
-//!
-//! The two rows below sit ON that boundary, one byte apart, with everything else — the table,
+//! The two rows below sit ON the quota, one byte apart, with everything else — the table,
 //! the key portion, the expression, the number of clauses — identical: the only difference is
 //! whether the item the change leaves holds 409,600 bytes or one more. Each is driven through
 //! both surfaces, so the byte a transaction stops at is shown to be the byte `UpdateItem` stops
-//! at while the ANSWER differs, and a control inside the ceiling commits and reads back.
+//! at, and a control inside the ceiling commits and reads back.
 //!
 //! `update_item_ceiling_key_portion.rs` drives the same boundary over the other charge an
 //! update carries, the key portion's floor; this suite is about the clauses' own.
@@ -79,11 +76,11 @@ fn two_clause_update(stored: usize) -> Value {
     })
 }
 
-/// RULE: one byte decides WHOSE failure the crossing is — an item that fits the quota refuses
-/// the CALL, and an item one byte past it cancels the TRANSACTION — while the byte the change
-/// stops at is the same on the single-item surface, which refuses both.
+/// RULE: both sides of the quota are the STATEMENT's own ask here — its clauses write the whole
+/// item over the key it addresses — so both refuse the CALL, through the transaction exactly as
+/// through the single-item surface, and neither grades an action.
 #[tokio::test]
-async fn whether_the_item_fits_the_quota_decides_who_answers_for_the_ceiling() {
+async fn what_the_statement_asks_for_decides_who_answers_for_the_ceiling() {
     let router = emulator();
     create_active_table(&router, TABLE, &[(PARTITION, "HASH", "S")]).await;
 
@@ -110,22 +107,17 @@ async fn whether_the_item_fits_the_quota_decides_who_answers_for_the_ceiling() {
          {expected:?} byte(s), got {stored:?}"
     );
 
-    // (case, the bytes the item the change leaves holds, whether that item is past the quota)
-    let rows: [(&str, usize, bool); 2] = [
+    // (case, the bytes the item the change leaves holds)
+    let rows: [(&str, usize); 2] = [
         (
             "an item that fills the quota exactly, over the ceiling only by what its clauses \
              cost",
             MAX_ITEM_BYTES,
-            false,
         ),
-        (
-            "an item one byte past the quota",
-            MAX_ITEM_BYTES + 1,
-            true,
-        ),
+        ("an item one byte past the quota", MAX_ITEM_BYTES + 1),
     ];
 
-    for (case, stored_bytes, past_the_quota) in rows {
+    for (case, stored_bytes) in rows {
         // The single-item surface refuses both: the ceiling it stops at is the charged one,
         // and the sentence is the update path's.
         let (status, body) = call(&router, "UpdateItem", two_clause_update(stored_bytes)).await;
@@ -141,37 +133,16 @@ async fn whether_the_item_fits_the_quota_decides_who_answers_for_the_ceiling() {
             json!({"TransactItems": [{"Update": two_clause_update(stored_bytes)}]}),
         )
         .await;
-        if past_the_quota {
-            assert_eq!(
-                (status, error_code(&body).as_str(), message(&body).as_str()),
-                (
-                    400,
-                    "TransactionCanceledException",
-                    "Transaction cancelled, please refer cancellation reasons for specific \
-                     reasons [ValidationError]"
-                ),
-                "case {case:?}: expected the transaction cancelled, got {status} with {body}"
-            );
-            assert_eq!(
-                (
-                    body["CancellationReasons"][0]["Code"].as_str(),
-                    body["CancellationReasons"][0]["Message"].as_str(),
-                ),
-                (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-                "case {case:?}: expected that action's reason to word the quota, got {body}"
-            );
-        } else {
-            assert_eq!(
-                (status, error_code(&body).as_str(), message(&body).as_str()),
-                (400, "ValidationException", UPDATE_TOO_BIG),
-                "case {case:?}: expected the call refused, got {status} with {body}"
-            );
-            assert!(
-                body.get("CancellationReasons").is_none(),
-                "case {case:?}: a refused call grades no action, so it reports no reason list, \
-                 got {body}"
-            );
-        }
+        assert_eq!(
+            (status, error_code(&body).as_str(), message(&body).as_str()),
+            (400, "ValidationException", UPDATE_TOO_BIG),
+            "case {case:?}: expected the call refused, got {status} with {body}"
+        );
+        assert!(
+            body.get("CancellationReasons").is_none(),
+            "case {case:?}: a refused call grades no action, so it reports no reason list, \
+             got {body}"
+        );
 
         // Neither answer wrote anything: the item is still the control's.
         let read = ok(

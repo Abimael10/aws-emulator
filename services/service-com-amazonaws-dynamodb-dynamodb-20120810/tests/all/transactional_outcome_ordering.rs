@@ -14,9 +14,12 @@
 //! applying its `UpdateExpression` to the very same item would have failed on. The rows
 //! span the runtime defect the update would have earned (an operand the stored value has
 //! the wrong type for, a document path the stored item cannot hold, an attribute it does
-//! not carry, a change past the item ceiling, a key attribute the update moves), and each
+//! not carry, a key attribute the update moves), and each
 //! row is driven twice — once with the condition failing and once with it holding — so what
-//! the rows pin is the ORDER and not one leg of it.
+//! the rows pin is the ORDER and not one leg of it. A statement that asks for more than an
+//! item can hold is the one defect on neither side of that order: it is a fact of the
+//! REQUEST, so the call is refused before any condition is read and the answer is the same
+//! whichever way the condition would have gone.
 //!
 //! RULE 2 — a key that the addressed table's KEY SCHEMA does not admit is found while the
 //! action is bound to its table, before any stored item has been read, so the transaction
@@ -215,52 +218,51 @@ async fn an_actions_condition_is_read_before_the_change_it_states_is_applied() {
         );
     }
 
-    // An item past the documented ceiling is a defect of the applied change like the others —
-    // the change really made the item too large, which is a circumstance the cancellation
-    // documents — and it, too, is only reached once the condition holds.
+    // A statement that asks for more than an item can hold — the key it addresses plus what
+    // its own clauses write — is a fact of the REQUEST, which no stored item can satisfy, so
+    // the CALL is refused before any condition is read: the answer is the same whether the
+    // condition would have held or not, and no action is graded at all.
     let oversize = json!({":v": {"S": "x".repeat(400 * 1024)}});
-    let (reported, said) = cancellation(
-        &router,
-        "a change past the item ceiling with the condition failing",
-        json!({"TransactItems": [guarded_update("SET big = :v", oversize.clone(), "OFF")]}),
-    )
-    .await;
-    assert_eq!(
-        reported,
-        vec![(
-            "ConditionalCheckFailed".to_string(),
-            Some(CONDITION_FAILED.to_string())
-        )],
-        "case a change past the item ceiling with the condition failing: expected only the \
-         condition reported, got {reported:?}"
-    );
-    assert_eq!(
-        said,
-        cancelled_message(&["ConditionalCheckFailed"]),
-        "case a change past the item ceiling with the condition failing: expected the \
-         condition named, got {said:?}"
-    );
-    let (reported, said) = cancellation(
-        &router,
-        "a change past the item ceiling with the condition holding",
-        json!({"TransactItems": [guarded_update("SET big = :v", oversize, "ON")]}),
-    )
-    .await;
-    assert_eq!(
-        reported,
-        vec![(
-            "ValidationError".to_string(),
-            Some("Item size to update has exceeded the maximum allowed size".to_string())
-        )],
-        "case a change past the item ceiling with the condition holding: expected the size \
-         defect reported against the action, got {reported:?}"
-    );
-    assert_eq!(
-        said,
-        cancelled_message(&["ValidationError"]),
-        "case a change past the item ceiling with the condition holding: expected the \
-         validation code named, got {said:?}"
-    );
+    // The two rows differ in the value the action's condition compares against, which is what
+    // makes the condition hold or fail; the stored status is "ON".
+    for (case, condition) in [
+        (
+            "a statement past the item ceiling with the condition failing",
+            "OFF",
+        ),
+        (
+            "a statement past the item ceiling with the condition holding",
+            "ON",
+        ),
+    ] {
+        let (status, answered) = call(
+            &router,
+            "TransactWriteItems",
+            json!({"TransactItems": [
+                guarded_update("SET big = :v", oversize.clone(), condition)
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&answered).as_str(),
+                message(&answered).as_str()
+            ),
+            (
+                400,
+                "ValidationException",
+                "Item size to update has exceeded the maximum allowed size"
+            ),
+            "case {case:?}: expected the call refused for what the statement asks for, got \
+             {status} with {answered}"
+        );
+        assert!(
+            answered.get("CancellationReasons").is_none(),
+            "case {case:?}: a refused call grades no action, so it reports no reason list, got \
+             {answered}"
+        );
+    }
 
     // NOTHING any of those transactions carried was applied: the seeded item is exactly as
     // it was stored.

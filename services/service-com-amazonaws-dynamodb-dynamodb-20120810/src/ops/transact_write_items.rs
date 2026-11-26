@@ -39,7 +39,13 @@
 //! carries past the documented size, a VALUE an action carries that no item could hold —
 //! both are facts of the REQUEST, settled before any table is looked up — and a key that is
 //! not the table's. An `Update` that would leave the item past that size is answered by WHOSE
-//! failure the crossing is ([`crossed_the_item_quota`]): an item the change LEAVES that is
+//! failure the crossing is. The item the statement ASKS FOR — the key it addresses plus what
+//! its own clauses write, which no stored item can make smaller
+//! ([`update_asks_for_an_oversized_item`]) — is a fact of the REQUEST, so a statement that
+//! cannot fit in an item at all refuses the CALL before the transaction is staged, in the
+//! class and the sentence the single-item `UpdateItem` of the same expression is refused with.
+//! Only where the statement itself fits can the crossing be the transaction's own doing, and
+//! then it is answered by [`crossed_the_item_quota`]: an item the change LEAVES that is
 //! past the QUOTA in the bytes it STORES really became too large — "an item size becomes too
 //! large (larger than 400 KB) [...] or a similar validation error occurs because of changes
 //! made by the transaction", one of the circumstances `TransactionCanceledException`
@@ -1296,6 +1302,11 @@ fn refused_key(refusal: crate::state::KeyRefusal) -> ElementRefusal {
 
 /// WHOSE failure a crossing of the item-size quota is, for the item an `Update` LEAVES.
 ///
+/// Reached only where the statement itself fits in an item
+/// ([`update_asks_for_an_oversized_item`] refuses the call before this is asked), so what is
+/// weighed here is the item the change leaves behind over the bytes the STORED item already
+/// held.
+///
 /// What an update is weighed against is not the quota alone: on top of the bytes the item
 /// stores it adds what the REQUEST's own shape costs — the key portion charged at a floor, so
 /// a short key buys no headroom, and the frame each clause of the expression costs
@@ -1334,6 +1345,52 @@ fn crossed_the_item_quota(
     ElementRefusal::Call(crate::scaffolded::Scaffolded::validation(
         crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
     ))
+}
+
+/// Whether the item an `Update` ASKS FOR is already past the item-size quota — which is a
+/// fact of the REQUEST, since no item the addressed key holds can make the statement smaller.
+///
+/// What the statement asks for is the `Key` map it addresses plus what its own clauses write,
+/// which is exactly the item the update builds for a key that holds nothing — the same
+/// starting point [`resolve_element`] uses for an absent item — charged the way every update
+/// surface charges the item it leaves ([`crate::state::update_size_exceeded`]), the key
+/// portion's floor and the frame each clause costs included. A statement whose own payload
+/// cannot fit is unsatisfiable however the store looks, so the CALL is refused in the class
+/// and the sentence the single-item `UpdateItem` of the same expression is refused with, and
+/// nothing of the transaction is staged or graded.
+///
+/// Only what the REQUEST states is read: the clamp the update language applies while it
+/// BUILDS the item says the payload does not fit on its own, and any OTHER failure of this
+/// reading — an operand whose type the absent item cannot satisfy, a document path no item
+/// holds, an attribute nothing carries — is not a fact of the request at all, so it is left
+/// to the pass that reads the stored item and decides this action's own outcome.
+///
+/// Reads the table and the request it is handed and writes nothing.
+fn update_asks_for_an_oversized_item(
+    table: &crate::state::Table,
+    key: &crate::state::Item,
+    applied: &crate::state::ParsedUpdate,
+) -> bool {
+    let mut asked = key.clone();
+    // Applied as the item the statement would ADD at a key that holds none
+    // ([`crate::state::UpdateTarget::NewItem`]): there is no stored image for a document
+    // path to be resolved against, which is exactly the reading this question wants — only
+    // what the request itself states.
+    match applied.apply(&mut asked, crate::state::UpdateTarget::NewItem) {
+        Ok(_) => {
+            // Canonicalized before it is sized, exactly as the single-item path sizes the
+            // item it stores; a form this reading cannot canonicalize is a defect of a value
+            // the request carried, which the request's own pass answers for.
+            if crate::state::canonicalize_item(&mut asked).is_err() {
+                return false;
+            }
+            crate::state::update_size_exceeded(table, &asked, applied.request_shape())
+        }
+        Err(crate::state::RequestError::Validation(message)) => {
+            message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE
+        }
+        Err(_) => false,
+    }
 }
 
 
@@ -1545,6 +1602,17 @@ fn bind_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 .active_table(region, &name, now)
                 .map_err(refused_call)?;
             deny(caller, table, action, now).map_err(ElementRefusal::Call)?;
+            // The item the statement ASKS FOR is a fact of the request — the key it
+            // addresses plus what its own clauses write — so a statement that cannot fit in
+            // an item at all refuses the CALL here, before any stored item is read and
+            // before any action is graded ([`update_asks_for_an_oversized_item`]).
+            if update_asks_for_an_oversized_item(table, &update.key, &applied) {
+                return Err(ElementRefusal::Call(
+                    crate::scaffolded::Scaffolded::validation(
+                        crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+                    ),
+                ));
+            }
             Prepared {
                 key: table
                     .key_of_transact_key_map(&update.key)

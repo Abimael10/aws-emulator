@@ -18,8 +18,10 @@
 //! then the resource it is held on, then the condition
 //! ([`crate::state::reported_grant_order_key`]) — which is the order a `MaxResults`-bounded
 //! page is cut from, so what lands on the first page follows from the values the caller
-//! reads rather than from how a record is stored. Each entry also carries the write that
-//! made the record it reports (`LastUpdated` / `LastUpdatedBy`).
+//! reads rather than from how a record is stored. An entry carries the update PROVENANCE
+//! members (`LastUpdated` / `LastUpdatedBy`) only for a record that holds that provenance,
+//! and no operation of this API supplies it, so they are reported absent
+//! ([`crate::state::PermissionGrant::to_wire`]).
 //!
 //! Two things a client should know. A listing that matches no grant answers an EMPTY
 //! `PrincipalResourcePermissions` list — `PrincipalResourcePermissionsList` carries no

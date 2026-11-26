@@ -5,12 +5,13 @@
 //!
 //! Two rules, each over a table of inputs rather than one request.
 //!
-//! * Every entry reports the write that made the record it describes:
-//!   `PrincipalResourcePermissions$LastUpdated` ("The date and time when the resource was
-//!   last updated") and `$LastUpdatedBy` ("The user who updated the record") — the call that
-//!   granted, added to or trimmed the record for an explicitly granted one, and the create
-//!   of the resource for a grant that resource was created carrying, which is the same
-//!   instant the Data Catalog reports as its `Table$CreateTime`.
+//! * No entry reports update PROVENANCE: `PrincipalResourcePermissions$LastUpdated` ("The
+//!   date and time when the resource was last updated") and `$LastUpdatedBy` ("The user who
+//!   updated the record") are optional members with no default, and no operation of this API
+//!   supplies either, so a listing leaves both absent — for a record `GrantPermissions` wrote,
+//!   for one a later grant added to, for one a revoke trimmed, and for a grant a resource was
+//!   created carrying — while the members the record does carry (the principal it is held by,
+//!   the resource form it is held on and its two permission sets) are reported in full.
 //! * A listing reports its entries ordered by what the ANSWER carries — the principal the
 //!   permissions are held by, then the `Resource` member they are held on and the names that
 //!   address it — and the page `MaxResults` bounds is cut from that order, so a walk over
@@ -31,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::glue_catalog::{
     account_catalog, create_database_with_input, create_table, emulator, lake_formation as call,
-    list_permissions as list, table_created_at, table_created_by,
+    list_permissions as list, table_created_by,
 };
 
 /// The database every row grants on, created handing its tables NO default permissions, so
@@ -99,25 +100,28 @@ async fn grant(
     );
 }
 
-/// The `LastUpdated` of one entry, as the epoch-seconds number the wire form carries.
-fn write_instant(case: &str, entry: &Value) -> f64 {
-    entry
-        .get("LastUpdated")
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: expected the entry to carry a LastUpdated, got {entry:?}")
-        })
+/// The provenance members a listing never reports, asserted absent on one entry: a record
+/// carries that provenance only when something supplied it, and no operation of this API does.
+fn assert_no_provenance(case: &str, entry: &Value) {
+    for member in ["LastUpdated", "LastUpdatedBy"] {
+        assert_eq!(
+            entry.get(member),
+            None,
+            "case {case:?}: expected the entry to report no {member}, got {entry:?}"
+        );
+    }
 }
 
-/// The `LastUpdatedBy` of one entry.
-fn written_by(case: &str, entry: &Value) -> String {
+/// The permissions one entry reports, in the order it reports them.
+fn permissions_of(entry: &Value) -> Vec<String> {
     entry
-        .get("LastUpdatedBy")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: expected the entry to carry a LastUpdatedBy, got {entry:?}")
-        })
-        .to_string()
+        .get("Permissions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+        .collect()
 }
 
 /// The principal one entry is held by.
@@ -153,7 +157,7 @@ fn placed(listed: &[Value]) -> Vec<Placed> {
 }
 
 #[tokio::test]
-async fn every_listed_entry_reports_the_write_that_made_the_record() {
+async fn no_listed_entry_reports_update_provenance() {
     // Rows differ along the resource form granted on and how many scopes the grant lands
     // on: a database (one record), a table whose permissions split across the table and its
     // columns (two records), the table alone, and the table's columns alone.
@@ -173,10 +177,6 @@ async fn every_listed_entry_reports_the_write_that_made_the_record() {
 
     for (case, resource, permissions, records) in cases {
         let router = seeded().await;
-        // The identity this emulator serves every call as, asked of the Data Catalog
-        // (`Table$CreatedBy`) rather than spelled here, so the assertion follows the
-        // emulator's own identity contract.
-        let caller = table_created_by(&router, DATABASE, TABLE).await;
         grant(&router, case, &analyst, &resource, &permissions).await;
 
         let listed = list(
@@ -191,22 +191,23 @@ async fn every_listed_entry_reports_the_write_that_made_the_record() {
             "case {case:?}: expected {records} entries for the grant, got {listed:?}"
         );
         for entry in &listed {
-            let instant = write_instant(case, entry);
-            assert!(
-                instant > 0.0,
-                "case {case:?}: expected the write instant of a granted record, got {entry:?}"
-            );
-            let by = written_by(case, entry);
+            assert_no_provenance(case, entry);
+            // What the record DOES carry is reported: the grantee it was made for, and
+            // permissions out of the set the grant named.
             assert_eq!(
-                by, caller,
-                "case {case:?}: expected the record written by {caller:?}, got {by:?} in \
-                 {entry:?}"
+                held_by(entry),
+                analyst,
+                "case {case:?}: expected the entry held by the grantee, got {entry:?}"
+            );
+            let held = permissions_of(entry);
+            assert!(
+                !held.is_empty() && held.iter().all(|one| permissions.contains(&one.as_str())),
+                "case {case:?}: expected permissions out of {permissions:?}, got {held:?}"
             );
         }
 
-        // A second grant on the same record is another write to it, so what the record
-        // reports as its last update is no older than what the first write left.
-        let first = write_instant(case, &listed[0]);
+        // A second grant on the same record is another write to it, and still nothing to
+        // report provenance from: the records are the same ones, with both members absent.
         grant(&router, case, &analyst, &resource, &permissions).await;
         let relisted = list(
             &router,
@@ -219,24 +220,20 @@ async fn every_listed_entry_reports_the_write_that_made_the_record() {
             records,
             "case {case:?}: a repeated grant is the same records, got {relisted:?}"
         );
-        let second = write_instant(case, &relisted[0]);
-        assert!(
-            second >= first,
-            "case {case:?}: expected the repeated grant's write to be no older than {first}, \
-             got {second}"
-        );
+        for entry in &relisted {
+            assert_no_provenance(case, entry);
+        }
     }
 }
 
 #[tokio::test]
-async fn a_grant_a_table_was_created_carrying_reports_that_create() {
+async fn a_grant_a_table_was_created_carrying_reports_no_provenance_either() {
     // The complement of the rule for a record no `GrantPermissions` call wrote: creating the
-    // table is the write that made it, so the entry reports the instant the Data Catalog
-    // records as the table's own creation and the principal it records as its creator. Rows
-    // differ along which of the table's two creation-time records is read.
+    // table is what made it, and the create supplies no provenance for the permission record
+    // any more than a grant does. Rows differ along which of the table's two creation-time
+    // records is read.
     let router = seeded().await;
     let creator = table_created_by(&router, DATABASE, TABLE).await;
-    let created_at = table_created_at(&router, DATABASE, TABLE).await;
 
     let cases: Vec<(&str, Value, &str)> = vec![
         ("the table's own record", on_table(), "Table"),
@@ -250,37 +247,31 @@ async fn a_grant_a_table_was_created_carrying_reports_that_create() {
             .unwrap_or_else(|| {
                 panic!("case {case:?}: expected a {member} entry for {creator}, got {listed:?}")
             });
-        assert_eq!(
-            write_instant(case, entry),
-            created_at,
-            "case {case:?}: expected the create instant {created_at} the catalog records, got \
+        assert_no_provenance(case, entry);
+        assert!(
+            !permissions_of(entry).is_empty(),
+            "case {case:?}: expected the creation-time record to report what it holds, got \
              {entry:?}"
-        );
-        assert_eq!(
-            written_by(case, entry),
-            creator,
-            "case {case:?}: expected the record written by the table's creator {creator:?}, \
-             got {entry:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn a_revoke_that_trims_a_record_is_a_write_to_it() {
-    // A revoke that leaves a record holding something is a write to that record, so what it
-    // reports as its last update is no older than the grant it trimmed. Rows differ along
-    // which permission of the record the revoke takes away.
+async fn a_revoke_that_trims_a_record_leaves_it_without_provenance() {
+    // A revoke that leaves a record holding something is a write to that record, and the
+    // record it leaves reports no provenance for that write either. Rows differ along which
+    // permission of the record the revoke takes away.
     let catalog = account_catalog();
     let analyst = format!("arn:aws:iam::{catalog}:role/analyst");
-    for (case, revoked) in [
-        ("the first of two permissions", "DESCRIBE"),
-        ("the second of two permissions", "ALTER"),
+    for (case, revoked, left_holding) in [
+        ("the first of two permissions", "DESCRIBE", "ALTER"),
+        ("the second of two permissions", "ALTER", "DESCRIBE"),
     ] {
         let router = seeded().await;
         grant(&router, case, &analyst, &on_table(), &["DESCRIBE", "ALTER"]).await;
         let filter = json!({ "Principal": { "DataLakePrincipalIdentifier": analyst } });
         let granted = list(&router, case, &filter).await;
-        let before = write_instant(case, &granted[0]);
+        assert_no_provenance(case, &granted[0]);
 
         let (status, payload) = call(
             &router,
@@ -304,17 +295,12 @@ async fn a_revoke_that_trims_a_record_is_a_write_to_it() {
             1,
             "case {case:?}: expected the trimmed record to be left, got {left:?}"
         );
-        let after = write_instant(case, &left[0]);
-        assert!(
-            after >= before,
-            "case {case:?}: expected the revoke's write to be no older than {before}, got \
-             {after}"
-        );
         assert_eq!(
-            written_by(case, &left[0]),
-            table_created_by(&router, DATABASE, TABLE).await,
-            "case {case:?}: expected the record written by the revoking caller, got {left:?}"
+            permissions_of(&left[0]),
+            vec![left_holding.to_string()],
+            "case {case:?}: expected the record to be left holding {left_holding}, got {left:?}"
         );
+        assert_no_provenance(case, &left[0]);
     }
 }
 

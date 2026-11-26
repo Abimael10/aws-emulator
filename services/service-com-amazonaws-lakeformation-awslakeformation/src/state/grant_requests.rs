@@ -242,10 +242,6 @@ pub fn plan_grant<Eng: Send + Sync + 'static>(
 /// the record it already has, so a repeated grant is a no-op on state rather than a second
 /// entry.
 ///
-/// `written_at` is the instant of the call, which every record this grant writes or adds to
-/// carries as its `LastUpdated` — "the date and time when the resource was last updated" is
-/// the last write to the record, whether that write created it or added to it.
-///
 /// This is the single site that grows the grant store, so this is where
 /// [`MAX_PERMISSION_GRANTS`] is enforced. The whole grant is weighed BEFORE the first
 /// write, so a refusal leaves no half of a split grant behind.
@@ -254,7 +250,6 @@ pub fn record_grants(
     catalog_id: &str,
     request: &GrantRequest,
     records: &[GrantRecord],
-    written_at: SystemTime,
 ) -> Result<(usize, usize), String> {
     let held = store.permission_grants.len();
     let inserts = records
@@ -270,7 +265,6 @@ pub fn record_grants(
 
     let mut inserted = 0_usize;
     let mut updated = 0_usize;
-    let written_by = permission_record_updater();
     for record in records {
         match store.permission_grants.get_mut(&record.key) {
             // The same principal, resource and condition: one record, whose permission
@@ -281,8 +275,6 @@ pub fn record_grants(
                     &mut grant.permissions_with_grant_option,
                     &record.permissions_with_grant_option,
                 );
-                grant.last_updated = written_at;
-                grant.last_updated_by = written_by.clone();
                 updated += 1;
             }
             None => {
@@ -297,8 +289,6 @@ pub fn record_grants(
                             .permissions_with_grant_option
                             .clone(),
                         condition_expression: request.condition.clone(),
-                        last_updated: written_at,
-                        last_updated_by: written_by.clone(),
                     },
                 );
                 inserted += 1;

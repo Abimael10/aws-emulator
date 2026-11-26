@@ -18,9 +18,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::glue_catalog::{
-    account_catalog, emulator_with_catalog, error_code, lake_formation as call, list_permissions,
-    revoke_default_database_grant, revoke_table_default_grants, invalid_arn_message,
-    without_write_instant,
+    account_catalog, emulator_with_catalog, error_code, invalid_arn_message,
+    lake_formation as call, list_permissions, revoke_default_database_grant,
+    revoke_table_default_grants,
 };
 
 /// A Data Catalog holding the `sales` database with its `orders` table, with the grants
@@ -554,10 +554,10 @@ async fn a_batch_entry_grants_exactly_what_the_single_grant_call_grants() {
         );
 
         let filter = json!({ "Principal": { "DataLakePrincipalIdentifier": principal } });
-        // Compared with each record's write INSTANT taken out: the two paths wrote at two
-        // instants, so that member measures the clock rather than what was left behind.
-        let from_single = without_write_instant(&list_permissions(&single, case, &filter).await);
-        let from_batch = without_write_instant(&list_permissions(&batched, case, &filter).await);
+        // Compared whole: a listed entry carries no record-keeping member either path could
+        // differ on, so what is compared is what each path left behind.
+        let from_single = list_permissions(&single, case, &filter).await;
+        let from_batch = list_permissions(&batched, case, &filter).await;
         assert_eq!(
             from_batch, from_single,
             "case {case:?}: expected the batch to leave what the single grant leaves \

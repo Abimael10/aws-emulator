@@ -182,30 +182,23 @@ pub struct PermissionGrant {
     /// `Condition$Expression`, when the grant carried one: part of the record's identity,
     /// since the same permissions under two conditions are two grants.
     pub condition_expression: Option<String>,
-    /// When this record was last written — `PrincipalResourcePermissions$LastUpdated`,
-    /// "The date and time when the resource was last updated".
-    ///
-    /// The instant of the call that last changed what the record holds: the grant that
-    /// wrote it, a later grant that added to it, or a revoke that trimmed it. A grant a
-    /// resource was created carrying is dated by the create that made it.
-    pub last_updated: SystemTime,
-    /// Who made that write — `PrincipalResourcePermissions$LastUpdatedBy`, "The user who
-    /// updated the record" (`NameString`, len 1..255).
-    ///
-    /// The identity the write was made by, named as this API names a principal: the
-    /// caller for a granted or revoked record ([`permission_record_updater`]), and the
-    /// creating principal the Data Catalog recorded for a grant a resource was created
-    /// carrying.
-    pub last_updated_by: String,
 }
 
 impl PermissionGrant {
     /// This record as the wire shape `ListPermissions` projects it.
     ///
-    /// `AdditionalDetails` carries the RAM resource-share ARNs of a cross-account share;
-    /// this emulator models no cross-account sharing, so it is left absent rather than
-    /// filled with a fabricated share. The record-keeping pair is reported for every entry,
-    /// from what the write that made the record stamped on it.
+    /// Three members of the wire shape are left ABSENT, because this service holds nothing
+    /// to put in them. `AdditionalDetails` carries the RAM resource-share ARNs of a
+    /// cross-account share, and this emulator models no cross-account sharing. The
+    /// record-keeping pair — `LastUpdated` ("The date and time when the resource was last
+    /// updated") and `LastUpdatedBy` ("The user who updated the record") — is the update
+    /// PROVENANCE of a record, and no operation of this API supplies it: neither
+    /// `GrantPermissions` nor `RevokePermissions` carries a member for either, and both are
+    /// optional with no default on `PrincipalResourcePermissions`
+    /// (`smithy_query(query="shape",shape="PrincipalResourcePermissions")`), so a listing
+    /// reports them only for a record that actually carries that provenance. Filling them
+    /// from the clock and from the caller instead would report provenance that was never
+    /// recorded, and would make two reads of one unchanged grant disagree.
     pub fn to_wire(&self) -> PrincipalResourcePermissions {
         PrincipalResourcePermissions {
             principal: Some(DataLakePrincipal {
@@ -221,8 +214,8 @@ impl PermissionGrant {
             permissions: Some(self.permissions.clone()),
             permissions_with_grant_option: Some(self.permissions_with_grant_option.clone()),
             additional_details: None,
-            last_updated: Some(reported_instant(self.last_updated)),
-            last_updated_by: Some(self.last_updated_by.clone()),
+            last_updated: None,
+            last_updated_by: None,
         }
     }
 }
@@ -1064,12 +1057,11 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
     };
 
     // The databases the Data Catalog holds under the addressed catalog id: the one named,
-    // if it is there, else every one of them — each with the instant it was created, which
-    // is when the grant it was created carrying was made.
+    // if it is there, else every one of them.
     let Some(catalog) = glue_state::service_state(engine) else {
         return Vec::new();
     };
-    let names: Vec<(String, SystemTime)> = {
+    let names: Vec<String> = {
         let catalog = catalog.lock();
         let Some(held) = catalog.catalogs.get(&database_catalog) else {
             return Vec::new();
@@ -1078,14 +1070,14 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
             Some(name) => {
                 let stored = glue_state::fold_name(&name);
                 match held.databases.get(&stored) {
-                    Some(database) => vec![(stored, database.create_time)],
+                    Some(_) => vec![stored],
                     None => return Vec::new(),
                 }
             }
             None => held
                 .databases
                 .values()
-                .map(|database| (database.name.clone(), database.create_time))
+                .map(|database| database.name.clone())
                 .collect(),
         }
     };
@@ -1103,9 +1095,7 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
         .filter(|(_, permissions)| !permissions.is_empty())
         .collect();
     let mut grants: Vec<(String, PermissionGrant)> = Vec::new();
-    // Who the default grant is recorded as written by, read once for the whole rendering.
-    let written_by = permission_record_updater();
-    for (name, created_at) in names {
+    for name in names {
         for (principal, permissions) in &granted {
             let resource = Resource {
                 database: Some(DatabaseResource {
@@ -1122,12 +1112,6 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
                 // The default carries no grant option and no condition.
                 permissions_with_grant_option: Vec::new(),
                 condition_expression: None,
-                // Creating the database is what made this grant, so that is when it was
-                // last written and the identity that created it is who wrote it. The
-                // Data Catalog records no creator for a database, so the identity is this
-                // emulator's own, which is the one every call it serves is made by.
-                last_updated: created_at,
-                last_updated_by: written_by.clone(),
             };
             let key = grant_key(catalog_id, &grant.principal, &grant.resource, None);
             grants.push((key, grant));

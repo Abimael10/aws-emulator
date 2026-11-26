@@ -269,14 +269,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(invalid)?;
 
         // One grant can write a record at more than one scope, so the audit line counts
-        // what each scope did rather than collapsing a mixed grant into one word. The
-        // instant of the call is what every record it writes reports as its `LastUpdated`.
+        // what each scope did rather than collapsing a mixed grant into one word.
         let (inserted, updated) = crate::state::record_grants(
             &mut state.lock(),
             &catalog_id,
             &request,
             &records,
-            ::std::time::SystemTime::now(),
         )
         .map_err(invalid)?;
 

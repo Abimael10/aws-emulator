@@ -41,15 +41,18 @@
 //!    SigV4 signature, so there is no client to establish from the body and this layer
 //!    judges nothing.
 //! 2. **The grant.** Which parameters a request requires is a function of its grant, so the
-//!    grant type is read next. On the ANONYMOUS endpoint, whose `grantType` admits a CHOICE
-//!    of grants (`GrantType` is `^(authorization_code|refresh_token)$`), a value outside that
-//!    choice is a grant the authorization server does not implement:
-//!    [`UNSUPPORTED_GRANT_TYPE`], the RFC 6749 §5.2 code for that class. On the IAM form the
-//!    model admits exactly ONE grant (`ClientCredentialsGrantType` is
-//!    `^client_credentials$`, `@required`), so there is no choice of grants to be unsupported
-//!    at all: any other value — and an absent one — is a value that member does not take,
-//!    which is the parameter layer's `invalid_request` ([`malformed_request`]), reported the
-//!    way every other modelled-value refusal of that form is.
+//!    grant type is read next, and a request that supplies NO grant type leaves the
+//!    authorization server with no grant to act on at all: that is the grant-type class on
+//!    BOTH forms, [`UNSUPPORTED_GRANT_TYPE`] with RFC 6749 §5.2's own description of it. A
+//!    grant type the body does supply is judged against what its member admits. On the
+//!    ANONYMOUS endpoint that member admits a CHOICE of grants (`GrantType` is
+//!    `^(authorization_code|refresh_token)$`), so a value outside the choice is one more
+//!    grant the server does not implement and takes the same class. On the IAM form the model
+//!    admits exactly ONE grant (`ClientCredentialsGrantType` is `^client_credentials$`,
+//!    `@required`), so there is no choice of grants there: a supplied value away from it is an
+//!    invalid parameter VALUE, which is the parameter layer's `invalid_request`
+//!    ([`malformed_request`]), reported the way every other modelled-value refusal of that
+//!    form is.
 //! 3. **The parameters** of the grant it named. A parameter EVERY request of that form has
 //!    to carry and the body supplies no value for is reported by name,
 //!    [`MISSING_PARAMETER`] plus its OAuth 2.0 name. One the model requires only for the
@@ -514,15 +517,21 @@ fn refusal_for(endpoint: Endpoint, parameters: &Value) -> Option<OAuth2Error> {
             incomplete.then(malformed_request)
         }
         Endpoint::IamSigned => {
-            if supplied(parameters, &IAM_GRANT_TYPE)
-                != Some(crate::state::GRANT_TYPE_CLIENT_CREDENTIALS)
-            {
-                // `grantType` is `@required` and `ClientCredentialsGrantType` is
-                // `^client_credentials$`: the member admits ONE value, so every other
-                // value — and an absent one — is a value the parameter does not take
-                // rather than one of several grants this form declined to implement (see
-                // the [module docs](self) on the two forms' grant layers).
-                return Some(malformed_request());
+            match supplied(parameters, &IAM_GRANT_TYPE) {
+                // The request names the one grant this form serves, so it is read on as a
+                // client-credentials request.
+                Some(crate::state::GRANT_TYPE_CLIENT_CREDENTIALS) => {}
+                // A grant type the body SUPPLIES that this member does not admit:
+                // `ClientCredentialsGrantType` is `^client_credentials$`, so the member takes
+                // exactly one value and every other one is an invalid parameter value rather
+                // than one of several grants this form declined to implement (see the
+                // [module docs](self) on the two forms' grant layers).
+                Some(_) => return Some(malformed_request()),
+                // The body supplies no grant type at all, so there is no grant for the
+                // authorization server to act on — the same class the anonymous form answers
+                // for a request that names none, and the one RFC 6749 §5.2 words as
+                // `unsupported_grant_type`.
+                None => return Some(unsupported_grant_type()),
             }
             let Some(resource) = supplied(parameters, &RESOURCE) else {
                 // The request does not state the resource this grant scopes a token to, so

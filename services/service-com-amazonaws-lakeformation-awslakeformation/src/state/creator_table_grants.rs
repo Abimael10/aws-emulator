@@ -203,7 +203,6 @@ pub fn created_table_grants<Eng: Send + Sync + 'static>(
                         .created_by
                         .clone()
                         .filter(|creator| !creator.is_empty()),
-                    created_at: table.create_time,
                 })
                 .collect();
             renders += tables.len() * per_table;
@@ -238,14 +237,6 @@ pub fn created_table_grants<Eng: Send + Sync + 'static>(
                 ..Resource::default()
             };
 
-            // Creating the table is what made both grants, so both are dated by the
-            // create and written by the principal that issued it — the Data Catalog's own
-            // record of who that was (`Table$CreatedBy`), never derived from the request.
-            let created_by = table
-                .creator
-                .clone()
-                .unwrap_or_else(permission_record_updater);
-
             // The creator holds Super, so this split yields both the table's own record
             // and its column-wildcard one.
             if let Some(creator) = &table.creator {
@@ -256,8 +247,6 @@ pub fn created_table_grants<Eng: Send + Sync + 'static>(
                     &resource,
                     &creator_permissions,
                     &creator_permissions,
-                    table.created_at,
-                    &created_by,
                 );
             }
 
@@ -271,8 +260,6 @@ pub fn created_table_grants<Eng: Send + Sync + 'static>(
                     &resource,
                     permissions,
                     &[],
-                    table.created_at,
-                    &created_by,
                 );
             }
         }
@@ -300,17 +287,10 @@ struct CreatedTable {
     name: String,
     /// Its `Table$CreatedBy`, when the catalog recorded one.
     creator: Option<String>,
-    /// Its `Table$CreateTime`: when the grants below were made, since creating the table
-    /// is what made them.
-    created_at: SystemTime,
 }
 
 /// Adds the grant of `permissions` to `principal` on `resource` to `grants`, split across
 /// the scopes each permission applies at and merged with whatever is already keyed there.
-///
-/// `made_at` and `made_by` are the write the grant records: the create that made it and the
-/// principal that issued that create.
-#[allow(clippy::too_many_arguments)]
 fn record_implicit_grant(
     grants: &mut BTreeMap<String, PermissionGrant>,
     catalog_id: &str,
@@ -318,8 +298,6 @@ fn record_implicit_grant(
     resource: &Resource,
     permissions: &[String],
     permissions_with_grant_option: &[String],
-    made_at: SystemTime,
-    made_by: &str,
 ) {
     for (scoped_resource, scoped_permissions, scoped_with_grant_option) in
         scoped_grant_records(resource, permissions, permissions_with_grant_option)
@@ -332,8 +310,6 @@ fn record_implicit_grant(
             permissions_with_grant_option: scoped_with_grant_option,
             // A grant a resource was created carrying never has a condition.
             condition_expression: None,
-            last_updated: made_at,
-            last_updated_by: made_by.to_string(),
         };
         let key = grant_key(catalog_id, &grant.principal, &grant.resource, None);
         match grants.get_mut(&key) {

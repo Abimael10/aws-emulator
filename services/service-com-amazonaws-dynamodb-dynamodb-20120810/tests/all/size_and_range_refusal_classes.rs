@@ -391,6 +391,16 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
                    "UpdateExpression": "SET body = :b",
                    "ExpressionAttributeValues": {":b": oversized()}}}]}),
         ),
+        (
+            // The same class one byte finer: the value fits an item on its own, but the item
+            // the statement ASKS FOR — that value beside the key it is written next to — does
+            // not, and no stored item can make it fit, so this too is the request's own defect.
+            "one action of a transaction asking for a value that only crosses beside its key",
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
+                   "UpdateExpression": "SET body = :b",
+                   "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
+        ),
     ] {
         let stated = refusal(&router, case, operation, request).await;
         assert_eq!(
@@ -400,12 +410,10 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
     }
 
     // The TRANSACTIONAL surface states the same sentence as the REASON the crossing action
-    // reports wherever the item the change LEAVES is past the quota in the bytes it stores —
+    // reports where the bytes that cross the quota are the ones the STORED item already held —
     // "an item size becomes too large [...] because of changes made by the transaction", one
     // of the circumstances a cancellation documents — so the transaction is cancelled with
-    // that action named. The rows differ in where those bytes came from: a value the ceiling
-    // admits on its own that only crosses it together with the key it is written beside, and
-    // a small value over an item already near the ceiling.
+    // that action named.
 
     let near_the_ceiling = json!({"pk": {"S": "near-the-ceiling"}, "sk": {"S": "a"}});
     ok(
@@ -416,21 +424,13 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
                "held": {"S": filler(MAX_ITEM_BYTES - 1024)}}}),
     )
     .await;
-    for (case, request) in [
-        (
-            "a value the ceiling admits on its own, one byte past it beside its key",
-            json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
-                   "UpdateExpression": "SET body = :b",
-                   "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
-        ),
-        (
-            "a small value over an item already near the ceiling",
-            json!({"TransactItems": [{"Update": {"TableName": TABLE,
-                   "Key": near_the_ceiling.clone(),
-                   "UpdateExpression": "SET body = :b",
-                   "ExpressionAttributeValues": {":b": {"S": filler(2048)}}}}]}),
-        ),
-    ] {
+    for (case, request) in [(
+        "a small value over an item already near the ceiling",
+        json!({"TransactItems": [{"Update": {"TableName": TABLE,
+               "Key": near_the_ceiling.clone(),
+               "UpdateExpression": "SET body = :b",
+               "ExpressionAttributeValues": {":b": {"S": filler(2048)}}}}]}),
+    )] {
         let (status, answered) = call(&router, "TransactWriteItems", request).await;
         assert_eq!(
             (
