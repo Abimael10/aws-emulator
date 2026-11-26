@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRestoreTestingSelections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRestoreTestingSelections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRestoreTestingSelections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +141,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRestoreTestingSelections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRestoreTestingSelectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRestoreTestingSelections"))
+        // `MaxResults` reaches this operation as a `@httpQuery` parameter, so a
+        // page size outside the model's own `@range(1..1000)` is this service's
+        // `InvalidParameterValueException`, answered before anything is read so
+        // the body is the modelled shape carrying `Code` and `Message`.
+        if let Some(refusal) = crate::state::rejected_max_results(input.max_results) {
+            return Err(
+                ListRestoreTestingSelectionsErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRestoreTestingSelectionsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // The listing is scoped to ONE restore testing plan (the model binds
+        // `RestoreTestingPlanName` to this operation's path), so a name holding
+        // no plan of this account addresses no result set at all: that is the
+        // plan's own not-found condition, resolved through the same step every
+        // call naming a plan shares, rather than an empty page that would claim
+        // the plan exists and holds nothing.
+        store
+            .stored_restore_testing_plan(&input.restore_testing_plan_name)
+            .map_err(ListRestoreTestingSelectionsErrorModeled::ResourceNotFoundException)?;
+
+        // A read, so nothing here writes. This plan's selections are a
+        // contiguous range of the plan-first key, walked in selection-name
+        // order, which is what makes the name-valued cursor below resolve to
+        // the same position on every request.
+        let held: Vec<&crate::state::RestoreTestingSelectionRecord> = store
+            .restore_testing_selections_of_plan(&input.restore_testing_plan_name)
+            .collect();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position =
+                    key.and_then(|key| held.iter().position(|selection| selection.name == key));
+                let Some(position) = position else {
+                    return Err(
+                        ListRestoreTestingSelectionsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "NextToken does not name a page of this result set".to_string(),
+                                ),
+                                ..Default::default()
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                position
+            }
+        };
+        // No `MaxResults` means one page: the model's own maximum. A page size
+        // the model's `@range` refuses was answered above, so the clamp here
+        // only applies the default.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(held.len());
+        let next_token = held
+            .get(end)
+            .map(|selection| crate::state::encode_page_token(&selection.name));
+
+        // Each selection is reported through the one list projection of a
+        // stored selection, so a listing reports nothing the create did not
+        // store.
+        let restore_testing_selections: Vec<RestoreTestingSelectionForList> = held[start..end]
+            .iter()
+            .map(|selection| selection.for_list())
+            .collect();
+
+        Ok(ListRestoreTestingSelectionsOutput {
+            restore_testing_selections,
+            next_token,
+        })
     }
 }

@@ -130,7 +130,10 @@ pub(crate) fn role_arn(name: &str) -> String {
 
 /// A protected resource ARN of this account, `index` of a series, so a list of
 /// them can be sized up to the documented maximum.
-fn protected_resource_arn(index: usize) -> String {
+///
+/// Shared with the sibling suites that drive this surface, for the reason given
+/// on [`create_selection`].
+pub(crate) fn protected_resource_arn(index: usize) -> String {
     format!("arn:aws:ec2:{REGION}:{ACCOUNT}:volume/vol-{index:017x}")
 }
 

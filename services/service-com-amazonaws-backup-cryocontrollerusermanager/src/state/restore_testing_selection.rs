@@ -36,7 +36,7 @@ use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
     AlreadyExistsException, InvalidParameterValueException, LimitExceededException,
     MissingParameterValueException, ProtectedResourceConditions, ResourceNotFoundException,
-    RestoreTestingSelectionForGet,
+    RestoreTestingSelectionForGet, RestoreTestingSelectionForList,
 };
 
 /// The most restore testing selections this emulator keeps for one plan.
@@ -178,6 +178,27 @@ impl RestoreTestingSelectionRecord {
             restore_metadata_overrides: self.restore_metadata_overrides.clone(),
             validation_window_hours: self.validation_window_hours,
             creator_request_id: self.creator_request_id.clone(),
+            creation_time: super::modelled_timestamp(self.creation_time),
+        }
+    }
+
+    /// The selection as a LISTING reports it — the metadata members
+    /// `RestoreTestingSelectionForList` declares, each taken from the same
+    /// stored record [`Self::for_get`] projects, so a listing and a read can
+    /// never report a different plan, role, resource type, validation window or
+    /// creation instant for one selection.
+    ///
+    /// The list projection carries NO collection member: the shape declares
+    /// only the metadata ones (`smithy_query` shape
+    /// `RestoreTestingSelectionForList`), so the resources a selection selects
+    /// are reported by the read alone.
+    pub fn for_list(&self) -> RestoreTestingSelectionForList {
+        RestoreTestingSelectionForList {
+            restore_testing_plan_name: self.plan_name.clone(),
+            restore_testing_selection_name: self.name.clone(),
+            iam_role_arn: self.iam_role_arn.clone(),
+            protected_resource_type: self.protected_resource_type.clone(),
+            validation_window_hours: self.validation_window_hours,
             creation_time: super::modelled_timestamp(self.creation_time),
         }
     }
