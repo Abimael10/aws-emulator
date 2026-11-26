@@ -19,7 +19,8 @@
 //!   metrics, which is the `LastFreshStart` the same reader reports — absent
 //!   until the first such transition;
 //! * a write naming a configuration set the account does not hold is refused
-//!   with `ConfigurationSetDoesNotExist`, whatever the name and whichever flag
+//!   with the service's update-conflict refusal (the retryable `Throttling`
+//!   code, naming the set), whatever the name and whichever flag
 //!   it asked for, and stores nothing.
 
 use crate::harness::{
@@ -375,6 +376,9 @@ async fn a_write_naming_a_set_the_account_does_not_hold_is_refused() {
     ];
     for name in names {
         let expected = format!("Configuration set <{name}> does not exist.");
+        // The WRITE answers the service's update-conflict refusal, under the
+        // retryable query code, naming the set it was asked to update.
+        let conflict = format!("Update conflict when updating configuration set <{name}>.");
         for enabled in [false, true] {
             let (status, body) = update_sending_enabled(&router, &name, enabled).await;
             assert_eq!(
@@ -383,15 +387,14 @@ async fn a_write_naming_a_set_the_account_does_not_hold_is_refused() {
             );
             assert_eq!(
                 refusal(&body),
-                (
-                    Some("ConfigurationSetDoesNotExist".to_string()),
-                    Some(expected.clone())
-                ),
-                "case {name:?} sending {enabled}: expected the not-found refusal, got {body}"
+                (Some("Throttling".to_string()), Some(conflict.clone())),
+                "case {name:?} sending {enabled}: expected the update-conflict refusal, \
+                 got {body}"
             );
         }
 
-        // The refused writes stored nothing: the set is still not there.
+        // The refused writes stored nothing: the set is still not there, and the
+        // READ of that same name keeps the terminal not-found refusal.
         let (status, body) = call(
             &router,
             "DescribeConfigurationSet",

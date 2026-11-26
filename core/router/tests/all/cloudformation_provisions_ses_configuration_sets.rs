@@ -552,7 +552,7 @@ async fn a_configuration_set_ses_refuses_to_create_fails_the_stack() {
         elements(&events, "ResourceStatusReason")
             .iter()
             .any(|reported| reported
-                .contains("The configuration set name must contain only letters")),
+                .contains("Invalid configuration set name <refused.stack.set>")),
         "case {case:?}: expected the failing resource's event to carry the owning service's \
          own refusal, got {events}"
     );

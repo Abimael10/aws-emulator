@@ -18,6 +18,8 @@ Issue-Commit: 2b493b29800d7a854b42f905b4db8bab42375d7a
 
 > _Note: this issue was identified against the code base at commit `2b493b29800d7a854b42f905b4db8bab42375d7a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: causes 2 and 3 (the v1 configuration-set-name charset refusal and the v1 unknown-set refusal of the configuration-set state toggles) are FIXED. Cause 1 (no SMTP front door) is NOT fixed and is split out, with its seven trace ids and Issue-Keys, into `issues/things-that-do-not-work/20261123T000000Z-ses-no-smtp-front-door-is-served-on-the-documented-smtp-ports.md`: the core assigns the port of every listener a service opens (`vendor/server/src/listeners.rs`) and a service may not bind a socket of its own (`vendor/engine/src/lib.rs:27`), so the documented SMTP ports cannot be served from a service fix._
+
 ## Operation
 CreateConfigurationSet
 

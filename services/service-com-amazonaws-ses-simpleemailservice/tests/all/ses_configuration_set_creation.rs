@@ -11,8 +11,12 @@
 //!   reader that names the set finds the same record — for every form of name the
 //!   documented naming rule admits, with the attribute groups a freshly created
 //!   set carries;
-//! * a name the rule does not admit is refused with `InvalidConfigurationSet`,
-//!   and nothing is recorded for it;
+//! * a name carrying a character the documented set does not admit is refused
+//!   with `InvalidParameterValue` and a message naming the submitted name, and
+//!   nothing is recorded for it — whatever the character and wherever it sits;
+//! * a name built only from admitted characters that the REST of the rule does
+//!   not admit (past the published ceiling) is refused with
+//!   `InvalidConfigurationSet`, and nothing is recorded for it either;
 //! * a name the account already holds is refused with
 //!   `ConfigurationSetAlreadyExists`, leaving the stored set — and what hangs off
 //!   it — exactly as it was, so a create is never a replacement;
@@ -123,10 +127,13 @@ fn accepted_names() -> Vec<String> {
     ]
 }
 
-/// Names the rule does not admit: a character outside the set it names (space,
-/// dot, punctuation, slash, a non-ASCII letter, a plus), a name built from no
-/// characters at all, and one character past the published ceiling.
-fn refused_names() -> Vec<String> {
+/// Names carrying a character the documented set does not admit, varying along
+/// everything that fault ranges over: which character it is (space, dot,
+/// punctuation, slash, plus, colon, tab, a non-ASCII letter, an emoji) and where
+/// in the name it sits (first, middle, last). Source: `ConfigurationSet$Name` —
+/// "Contain only letters (a-z, A-Z), numbers (0-9), underscores (_), or dashes
+/// (-)".
+fn charset_refused_names() -> Vec<String> {
     vec![
         "has space".to_string(),
         "dot.name".to_string(),
@@ -134,8 +141,38 @@ fn refused_names() -> Vec<String> {
         "slash/name".to_string(),
         "naïve".to_string(),
         "plus+set".to_string(),
-        "n".repeat(MAX_CONFIGURATION_SET_NAME + 1),
+        "colon:set".to_string(),
+        "tab\tset".to_string(),
+        "+leading".to_string(),
+        "trailing%".to_string(),
+        "emoji-🙂-set".to_string(),
+        // A name carrying the error envelope's own markup: the refusal reflects
+        // the request's text, so it must come back escaped and reflect it whole.
+        "</Message></Error><RequestId>spoofed</RequestId>".to_string(),
+        "amp&set".to_string(),
+        // Every character admitted but the last, in a name otherwise at the
+        // published ceiling.
+        format!("{}*", "n".repeat(MAX_CONFIGURATION_SET_NAME - 1)),
     ]
+}
+
+/// Names built only from admitted characters that the REST of the rule does not
+/// admit: one character past the published ceiling, and well past it. Source:
+/// `ConfigurationSet$Name` — "Contain 64 characters or fewer".
+fn length_refused_names() -> Vec<String> {
+    vec![
+        "n".repeat(MAX_CONFIGURATION_SET_NAME + 1),
+        format!("Set_{}", "9".repeat(MAX_CONFIGURATION_SET_NAME * 2)),
+    ]
+}
+
+/// The sentence Amazon SES refuses a name carrying a character outside the
+/// documented set with, naming the name the request submitted.
+fn charset_refusal_message(name: &str) -> String {
+    format!(
+        "Invalid configuration set name <{name}>: only alphanumeric ASCII characters, '_', and \
+         '-' are allowed."
+    )
 }
 
 #[tokio::test]
@@ -195,27 +232,23 @@ async fn a_create_records_the_set_every_later_reader_finds() {
 }
 
 #[tokio::test]
-async fn a_name_outside_the_rule_is_refused_and_records_nothing() {
+async fn a_name_outside_the_charset_is_refused_naming_the_name_it_submitted() {
     let router = emulator();
-    for name in refused_names() {
+    for name in charset_refused_names() {
         let (status, body) = create_configuration_set(&router, &name).await;
         assert_eq!(
             status, 400,
-            "case create {name:?}: a name outside the rule is refused, got {status} with {body}"
+            "case create {name:?}: a name outside the charset is refused, got {status} \
+             with {body}"
         );
-        let (code, message) = refusal(&body);
         assert_eq!(
-            code.as_deref(),
-            Some("InvalidConfigurationSet"),
-            "case create {name:?}: expected the invalid-name refusal, got {body}"
-        );
-        // "See the error message for details": the details are the rule itself,
-        // both halves of it.
-        let message = message.unwrap_or_default();
-        assert!(
-            message.contains("letters")
-                && message.contains(&format!("{MAX_CONFIGURATION_SET_NAME} characters")),
-            "case create {name:?}: expected a message stating the naming rule, got {message:?}"
+            refusal(&body),
+            (
+                Some("InvalidParameterValue".to_string()),
+                Some(charset_refusal_message(&name))
+            ),
+            "case create {name:?}: expected the parameter refusal naming the submitted name, \
+             got {body}"
         );
 
         // Nothing was recorded for it: the reader that would find a stored set
@@ -232,6 +265,66 @@ async fn a_name_outside_the_rule_is_refused_and_records_nothing() {
                 Some(format!("Configuration set <{name}> does not exist."))
             ),
             "case describe {name:?} after the refusal: expected the not-found refusal, got {body}"
+        );
+    }
+
+    let listed = listed_names(&router).await;
+    assert!(
+        listed.is_empty(),
+        "case listing after only refused creates: expected no stored set, got {listed:?}"
+    );
+
+    // And a name mixing both separators the rule names is accepted beside them,
+    // so the refusals above are about the character and not about the separators.
+    let (status, body) = create_configuration_set(&router, "mixed_separators-set").await;
+    assert_eq!(
+        status, 200,
+        "case create \"mixed_separators-set\": a name mixing '_' and '-' is accepted, got \
+         {status} with {body}"
+    );
+    let listed = listed_names(&router).await;
+    assert_eq!(
+        listed,
+        vec!["mixed_separators-set".to_string()],
+        "case listing after the accepted name: expected only it, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_name_past_the_published_ceiling_is_refused_and_records_nothing() {
+    let router = emulator();
+    for name in length_refused_names() {
+        let (status, body) = create_configuration_set(&router, &name).await;
+        assert_eq!(
+            status, 400,
+            "case create a name of {} characters: refused, got {status} with {body}",
+            name.chars().count()
+        );
+        let (code, message) = refusal(&body);
+        assert_eq!(
+            code.as_deref(),
+            Some("InvalidConfigurationSet"),
+            "case create a name of {} characters: expected the invalid-name refusal, got {body}",
+            name.chars().count()
+        );
+        // "See the error message for details": the details are the rule itself,
+        // both halves of it.
+        let message = message.unwrap_or_default();
+        assert!(
+            message.contains("letters")
+                && message.contains(&format!("{MAX_CONFIGURATION_SET_NAME} characters")),
+            "case create a name of {} characters: expected a message stating the naming rule, \
+             got {message:?}",
+            name.chars().count()
+        );
+
+        // Nothing was recorded for it.
+        let (status, body) = describe_configuration_set(&router, &name, &[]).await;
+        assert_eq!(
+            status, 400,
+            "case describe a name of {} characters after the refusal: expected 400, got \
+             {status} with {body}",
+            name.chars().count()
         );
     }
 
@@ -411,8 +504,21 @@ async fn a_create_past_the_accounts_limit_is_refused() {
     );
     assert_eq!(
         refusal(&body).0.as_deref(),
-        Some("InvalidConfigurationSet"),
+        Some("InvalidParameterValue"),
         "case create \"has space\" at the ceiling: the naming rule is decided first, got {body}"
+    );
+    let over_long = "n".repeat(MAX_CONFIGURATION_SET_NAME + 1);
+    let (status, body) = create_configuration_set(&router, &over_long).await;
+    assert_eq!(
+        status, 400,
+        "case create a name past the ceiling at the ceiling: expected 400, got {status} \
+         with {body}"
+    );
+    assert_eq!(
+        refusal(&body).0.as_deref(),
+        Some("InvalidConfigurationSet"),
+        "case create a name past the ceiling at the ceiling: the naming rule is decided \
+         first, got {body}"
     );
     let (status, body) = create_configuration_set(&router, "seeded-0").await;
     assert_eq!(

@@ -5,9 +5,12 @@
 //! Records a configuration set under the name the request gives it, so every
 //! later caller that names the set — `DescribeConfigurationSet`, the
 //! tracking-options operations, `SendEmail`'s `ConfigurationSetName` — finds the
-//! same stored record. A name the model's own rule does not admit, a name the
-//! account already holds, and a create past the account's limit are each refused
-//! with the modelled error for that case, so nothing is stored for them.
+//! same stored record. A name carrying a character the documented set does not
+//! admit is refused with the code the service answers an unusable parameter value
+//! with, naming the submitted name; a name the rest of that rule does not admit,
+//! a name the account already holds, and a create past the account's limit are
+//! each refused with the modelled error for that case, so nothing is stored for
+//! any of them.
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +106,18 @@ impl From<CreateConfigurationSetErrorModeled> for CreateConfigurationSetError {
     }
 }
 
+/// The sentence Amazon SES refuses a configuration-set name carrying a character
+/// its documented set does not admit with, naming the name the request submitted.
+///
+/// The name is the request's own text, verbatim: a caller validating a
+/// user-supplied name has to see which name was rejected.
+fn invalid_configuration_set_name_message(name: &str) -> String {
+    format!(
+        "Invalid configuration set name <{name}>: only alphanumeric ASCII characters, '_', and \
+         '-' are allowed."
+    )
+}
+
 /// The `CreateConfigurationSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -143,9 +158,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let name = input.configuration_set.name;
         // `ConfigurationSetName` is only a string in the model, so a name outside
-        // the rule `ConfigurationSet$Name` documents reaches here, and this
-        // operation models `InvalidConfigurationSet` for exactly that: "the
-        // configuration set is invalid. See the error message for details."
+        // the rule `ConfigurationSet$Name` documents reaches here. Amazon SES
+        // reads the two halves of that rule as two different faults, and answers
+        // the character half with the code it answers any value it cannot act on
+        // with — `InvalidParameterValue` at HTTP 400 — naming the submitted name,
+        // which is what a caller validating user-supplied names has to report.
+        if crate::state::configuration_set_name_charset_fault(&name).is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                invalid_configuration_set_name_message(&name),
+            ));
+        }
+        // What is left of the rule is its length half — a name longer than
+        // `ConfigurationSet$Name`'s published ceiling, or a name built from no
+        // characters at all, which names nothing. This operation models
+        // `InvalidConfigurationSet` for exactly that: "the configuration set is
+        // invalid. See the error message for details."
         if !crate::state::is_configuration_set_name(&name) {
             return Err(
                 CreateConfigurationSetErrorModeled::InvalidConfigurationSetException(

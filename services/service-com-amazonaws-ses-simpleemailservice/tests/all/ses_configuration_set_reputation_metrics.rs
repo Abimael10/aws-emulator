@@ -15,7 +15,10 @@
 //!   flag where it was;
 //! * a set that was never written to reports the member's documented default;
 //! * a write naming a configuration set the account does not hold is refused
-//!   with `ConfigurationSetDoesNotExist`, whatever the name, and stores nothing.
+//!   with the service's update-conflict refusal — the retryable `Throttling`
+//!   code and a message naming the set the request asked to update — whatever
+//!   the name, and stores nothing, while a READ of the same name keeps the
+//!   terminal not-found refusal.
 
 use crate::harness::{call, element, emulator, field, xml_text, Field};
 use smithy_server_runtime::MultiServiceRouter;
@@ -105,6 +108,12 @@ fn refusal(body: &str) -> (Option<String>, Option<String>) {
         element(body, "Code").map(|code| xml_text(&code)),
         element(body, "Message").map(|message| xml_text(&message)),
     )
+}
+
+/// The sentence the update-conflict refusal reports, naming the set the request
+/// asked to update.
+fn update_conflict_message(name: &str) -> String {
+    format!("Update conflict when updating configuration set <{name}>.")
 }
 
 /// Configuration-set names spanning everything the documented naming rule
@@ -276,14 +285,17 @@ async fn a_write_naming_a_set_the_account_does_not_hold_is_refused() {
             assert_eq!(
                 refusal(&body),
                 (
-                    Some("ConfigurationSetDoesNotExist".to_string()),
-                    Some(format!("Configuration set <{name}> does not exist."))
+                    Some("Throttling".to_string()),
+                    Some(update_conflict_message(&name))
                 ),
-                "case absent {name:?} write {enabled}: expected the not-found refusal, got {body}"
+                "case absent {name:?} write {enabled}: expected the update-conflict refusal, \
+                 got {body}"
             );
         }
 
-        // The refused writes stored nothing: the set is still not there...
+        // The refused writes stored nothing: the set is still not there, and the
+        // READ of that same name answers the not-found refusal — the two
+        // operations answer one absent set differently...
         let (status, body) = describe_configuration_set(&router, &name, &["reputationOptions"]).await;
         assert_eq!(
             status, 400,

@@ -475,19 +475,33 @@ async fn a_configuration_set_name_is_admitted_exactly_when_the_rule_admits_it() 
         );
     }
 
-    let refused = ["has space", "dot.name", "name!", &"a".repeat(65)];
-    for name in refused {
+    // A name carrying a character the documented set does not admit is refused
+    // with the code the service answers an unusable parameter value with; a name
+    // of admitted characters past the published ceiling keeps the modelled
+    // invalid-configuration-set refusal.
+    for name in ["has space", "dot.name", "name!"] {
         let (status, body) = create_configuration_set(&router, name).await;
         assert_eq!(
             status, 400,
-            "case create {name:?}: a name outside the rule is refused, got {status} with {body}"
+            "case create {name:?}: a name outside the charset is refused, got {status} with {body}"
         );
         assert_eq!(
             element(&body, "Code").as_deref(),
-            Some("InvalidConfigurationSet"),
-            "case create {name:?}: expected the invalid-name refusal, got {body}"
+            Some("InvalidParameterValue"),
+            "case create {name:?}: expected the parameter refusal, got {body}"
         );
     }
+    let over_long = "a".repeat(65);
+    let (status, body) = create_configuration_set(&router, &over_long).await;
+    assert_eq!(
+        status, 400,
+        "case create a 65-character name: refused, got {status} with {body}"
+    );
+    assert_eq!(
+        element(&body, "Code").as_deref(),
+        Some("InvalidConfigurationSet"),
+        "case create a 65-character name: expected the invalid-name refusal, got {body}"
+    );
 
     // The name is a key: the second create of one name is a conflict, not a
     // replacement.

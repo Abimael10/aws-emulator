@@ -4,8 +4,9 @@
 //! Stores, on ONE configuration set, whether Amazon SES publishes that set's
 //! reputation metrics to Amazon CloudWatch, so the next
 //! `DescribeConfigurationSet` reports the flag this call wrote and no other
-//! set's flag moves. A set the account does not hold is refused and nothing is
-//! stored.
+//! set's flag moves. A set the account does not hold is refused with the
+//! service's update-conflict refusal — the retryable `Throttling` code, not the
+//! terminal not-found one the read path answers — and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +170,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(configuration_set) = state.configuration_sets.get_mut(&name) else {
-            // "Indicates that the configuration set does not exist", in the
-            // wording every operation of this service uses for a set that is not
-            // there.
-            return Err(
+            // Amazon SES does NOT answer this operation's modelled not-found
+            // error for a set it does not hold: the recorded refusal is the
+            // update-conflict one, under the query error code `Throttling`,
+            // naming the set the request asked to update. The code matters to a
+            // caller — `Throttling` is the retryable class an SDK retry policy
+            // acts on, where not-found is terminal — so the error shape's own
+            // code is replaced by the one the service puts on the wire while the
+            // body stays the modelled shape. `DescribeConfigurationSet` keeps the
+            // not-found refusal for the same name: the two operations differ.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_query_code(
                 UpdateConfigurationSetReputationMetricsEnabledErrorModeled::ConfigurationSetDoesNotExistException(
                     ConfigurationSetDoesNotExistException {
                         configuration_set_name: Some(name.clone()),
-                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                        message: Some(
+                            crate::state::configuration_set_update_conflict_message(&name),
+                        ),
                     },
-                )
-                .into(),
-            );
+                ),
+                crate::state::CONFIGURATION_SET_UPDATE_CONFLICT_CODE,
+            ));
         };
         // The publishing state belongs to THIS set, so the write lands on the
         // named record and leaves every other set's where it was. The request

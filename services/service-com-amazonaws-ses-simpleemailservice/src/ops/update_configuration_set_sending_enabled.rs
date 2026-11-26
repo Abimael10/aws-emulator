@@ -164,18 +164,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(configuration_set) = state.configuration_sets.get_mut(&name) else {
-            // "Indicates that the configuration set does not exist", in the
-            // wording every operation of this service uses for a set that is not
-            // there.
-            return Err(
+            // The same refusal the account's other v1 configuration-set state
+            // write answers an absent set with
+            // ([`crate::state::CONFIGURATION_SET_UPDATE_CONFLICT_CODE`]): the
+            // update-conflict sentence under the retryable query code, not the
+            // terminal not-found code this operation's own model declares, which
+            // is what `DescribeConfigurationSet` keeps for the same name.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_query_code(
                 UpdateConfigurationSetSendingEnabledErrorModeled::ConfigurationSetDoesNotExistException(
                     ConfigurationSetDoesNotExistException {
                         configuration_set_name: Some(name.clone()),
-                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                        message: Some(
+                            crate::state::configuration_set_update_conflict_message(&name),
+                        ),
                     },
-                )
-                .into(),
-            );
+                ),
+                crate::state::CONFIGURATION_SET_UPDATE_CONFLICT_CODE,
+            ));
         };
         // "Enables or disables email sending for messages sent using a specific
         // configuration set": the flag is written on the stored set, so a later

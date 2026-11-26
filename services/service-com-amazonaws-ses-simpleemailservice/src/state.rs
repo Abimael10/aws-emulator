@@ -3110,6 +3110,40 @@ pub fn is_configuration_set_name(name: &str) -> bool {
     is_letters_digits_name(name, MAX_CONFIGURATION_SET_NAME)
 }
 
+/// The first character of `name` that the documented naming rule does not admit,
+/// or `None` when every character is one it names.
+///
+/// The CHARACTER half of the rule ([`is_letters_digits_name_character`]) read on
+/// its own, because Amazon SES answers a name carrying a character outside that
+/// set with its own refusal — naming the submitted name rather than restating the
+/// rule — while a name of admitted characters that is too long, or built from no
+/// characters at all, is a different fault ([`is_configuration_set_name`]).
+pub fn configuration_set_name_charset_fault(name: &str) -> Option<char> {
+    name.chars()
+        .find(|character| !is_letters_digits_name_character(*character))
+}
+
+/// The query `Error.Code` Amazon SES refuses a v1 write of a configuration set's
+/// own sending state with when the account holds no set under the requested name.
+///
+/// Recorded behaviour of `UpdateConfigurationSetReputationMetricsEnabled` and
+/// `UpdateConfigurationSetSendingEnabled`: HTTP 400 with this code and the
+/// update-conflict sentence ([`configuration_set_update_conflict_message`]),
+/// rather than the not-found code those operations' own models declare. It
+/// matters to a caller which one it is — this is the retryable class an SDK retry
+/// policy acts on, where not-found is terminal. The reads of the same set
+/// (`DescribeConfigurationSet`) keep the not-found refusal, so the refusals
+/// deliberately differ by operation.
+pub const CONFIGURATION_SET_UPDATE_CONFLICT_CODE: &str = "Throttling";
+
+/// The sentence that refusal reports, naming the set the request asked to update.
+///
+/// One reading, so the v1 writes that share the refusal cannot word it
+/// differently.
+pub fn configuration_set_update_conflict_message(name: &str) -> String {
+    format!("Update conflict when updating configuration set <{name}>.")
+}
+
 /// Whether `name` is an event destination name of the form the model documents.
 ///
 /// `EventDestination$Name` states the same two halves as a configuration set's
@@ -3131,9 +3165,17 @@ pub fn is_event_destination_name(name: &str) -> bool {
 fn is_letters_digits_name(name: &str, max: usize) -> bool {
     !name.is_empty()
         && name.chars().count() <= max
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        && name.chars().all(is_letters_digits_name_character)
+}
+
+/// Whether `character` is one the names above are built from: an ASCII letter, an
+/// ASCII digit, an underscore or a dash.
+///
+/// The ONE reading of that character set, shared by the whole-name rule
+/// ([`is_letters_digits_name`]) and by the refusal that reports the first
+/// character outside it ([`configuration_set_name_charset_fault`]).
+fn is_letters_digits_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
 }
 
 /// Every recipient of a `Destination`, To: then CC: then BCC:, in request order.
