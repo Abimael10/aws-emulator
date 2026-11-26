@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the AppIntegrations event-integration lifecycle.
+//! End-to-end tests for the AppIntegrations event-integration lifecycle, and for the
+//! listing of the associations an event integration holds.
 //!
 //! Every assertion goes over the wire: a request is built, dispatched through the same
 //! [`MultiServiceRouter`] the production emulator mounts, and only the HTTP status,
 //! `x-amzn-errortype` header and JSON body are inspected. Nothing reaches into the
 //! service's state struct, so a response that is not computed from persisted state
 //! cannot pass.
+//!
+//! The one exception is a case that needs an event integration ASSOCIATION stored:
+//! AppIntegrations publishes no create for one (`smithy_query(query="digest")` binds a
+//! create for every other resource of this service and none for this one), because the
+//! association comes into being on the side of the client that associates the
+//! integration — so such a case puts records in the store the router serves from
+//! (`Emulator::seed_event_integration_associations`) and still reads every assertion off
+//! the wire.
 //!
 //! The tests are tables: each row is one input along the axis the rule under test
 //! generalises over (name form, description presence and length, bus, filter source,
@@ -16,14 +25,16 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_appintegrations_amazonappintegrationservice::state::EventIntegrationAssociationRecord;
 
 // The wire plumbing — router, request building, the reduced `Reply` — is the crate's
 // one harness, so this suite and the data-integration ones cannot drift apart in how
 // they talk to the service.
-use super::harness::{Emulator, Reply, REGION};
+use super::harness::{Emulator, Reply, SeededEventIntegrationAssociation, REGION};
 
-/// `MaxResults` is `range 1..50` on `ListEventIntegrations` (model:
-/// `smithy_query(query="operation", operation="ListEventIntegrations")`).
+/// `MaxResults` is `range 1..50` on `ListEventIntegrations`, and on
+/// `ListEventIntegrationAssociations` (model: `smithy_query(query="operation",
+/// operation="ListEventIntegrations,ListEventIntegrationAssociations")`).
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 50;
 
@@ -771,6 +782,344 @@ async fn delete_removes_the_resource_and_only_that_resource() {
         assert_eq!(
             listed, remaining,
             "case {label:?}: expected the listing to be {remaining:?}, got {listed:?}"
+        );
+    }
+}
+
+/// `ClientId` is `len 1..255, pattern .*` and `EventBridgeRuleName` is `len 1..2048,
+/// pattern ^[a-zA-Z0-9\/\._\-]+$` on `EventIntegrationAssociation` (model:
+/// `smithy_query(query="shape", shape="EventIntegrationAssociation")`).
+const CLIENT_ID_MAX: usize = 255;
+const EVENT_BRIDGE_RULE_NAME_MAX: usize = 2048;
+
+fn association(
+    client_id: Option<&str>,
+    rule_name: Option<&str>,
+    metadata: &[(&str, &str)],
+) -> SeededEventIntegrationAssociation {
+    (
+        client_id.map(str::to_string),
+        rule_name.map(str::to_string),
+        metadata
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+    )
+}
+
+/// `ListEventIntegrationAssociations`:
+/// `GET /eventIntegrations/{EventIntegrationName}/associations`.
+async fn list_associations(emulator: &Emulator, name: &str, query: &str) -> Reply {
+    let base = format!("/eventIntegrations/{name}/associations");
+    let uri = if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{query}")
+    };
+    emulator.send("GET", &uri, REGION, None).await
+}
+
+/// The reported page, as a list (an absent member is an empty page).
+fn associations_page(reply: &Reply) -> Vec<Value> {
+    reply
+        .field("EventIntegrationAssociations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The ARN form an event integration association carries, written out here rather than
+/// taken from the crate's helper so the test pins the format.
+fn expected_association_arn(region: &str, name: &str, association_id: &str) -> String {
+    format!(
+        "arn:aws:app-integrations:{region}:{account}:\
+         event-integration-association/{name}/{association_id}",
+        account = engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
+/// The entry the listing must report for `record`: the members
+/// `EventIntegrationAssociation` carries, each one absent when the association holds no
+/// value for it.
+fn expected_association(record: &EventIntegrationAssociationRecord) -> Value {
+    let mut expected = json!({
+        "EventIntegrationAssociationArn": record.arn,
+        "EventIntegrationAssociationId": record.id,
+        "EventIntegrationName": record.event_integration_name,
+    });
+    if let Some(client_id) = &record.client_id {
+        expected["ClientId"] = json!(client_id);
+    }
+    if let Some(rule_name) = &record.event_bridge_rule_name {
+        expected["EventBridgeRuleName"] = json!(rule_name);
+    }
+    if !record.client_association_metadata.is_empty() {
+        expected["ClientAssociationMetadata"] = json!(record.client_association_metadata);
+    }
+    expected
+}
+
+/// Store one event integration under `name`, so a case lists the associations of an
+/// integration this service really holds.
+async fn create_integration(emulator: &Emulator, name: &str) {
+    let created = emulator
+        .create(
+            REGION,
+            json!({
+                "Name": name,
+                "EventBridgeBus": "default",
+                "EventFilter": { "Source": "aws.partner/demo" },
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "CreateEventIntegration must succeed so a case has an integration, got {} / {}",
+        created.status, created.body
+    );
+}
+
+#[tokio::test]
+async fn the_association_listing_reports_the_stored_associations_of_the_integration_it_names() {
+    let long_client_id = "c".repeat(CLIENT_ID_MAX);
+    let long_rule_name = "r".repeat(EVENT_BRIDGE_RULE_NAME_MAX);
+    // Rows differ in how many associations the integration holds and in which members
+    // each association carries: none (the recorded case), one, and several spanning both
+    // published bounds of `ClientId`, a rule name at its upper bound, client metadata
+    // present and absent, and an association that carries neither optional member.
+    let rows: Vec<(&str, Vec<SeededEventIntegrationAssociation>)> = vec![
+        ("no association", Vec::new()),
+        (
+            "one association",
+            vec![association(
+                Some("connect-instance-1"),
+                Some("AmazonConnect-event-rule"),
+                &[],
+            )],
+        ),
+        (
+            "several associations, at both bounds of ClientId and with metadata",
+            vec![
+                association(Some("c"), Some("rule.one_1-x"), &[("k", "v")]),
+                association(
+                    Some(&long_client_id),
+                    Some(&long_rule_name),
+                    &[("owner", "team-a"), ("purpose", "events")],
+                ),
+                association(
+                    Some("arn:aws:connect:us-east-1:111122223333:instance/abc"),
+                    None,
+                    &[],
+                ),
+                association(None, None, &[]),
+            ],
+        ),
+    ];
+
+    for (label, seeds) in rows {
+        let emulator = Emulator::new();
+        create_integration(&emulator, "target").await;
+        create_integration(&emulator, "neighbour").await;
+        // A neighbour's associations are not this integration's: the listing reports the
+        // ones belonging to the integration the request names.
+        emulator.seed_event_integration_associations(
+            "neighbour",
+            &[association(Some("neighbour-client"), None, &[])],
+        );
+        let stored = emulator.seed_event_integration_associations("target", &seeds);
+        let expected: Vec<Value> = stored.iter().map(expected_association).collect();
+
+        let reply = list_associations(&emulator, "target", "").await;
+        assert_eq!(
+            reply.status, 200,
+            "case {label:?}: expected HTTP 200, got {} / {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            associations_page(&reply),
+            expected,
+            "case {label:?}: expected {expected:?}, got {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.field("NextToken"),
+            None,
+            "case {label:?}: a last page must report no NextToken, got {:?}",
+            reply.field("NextToken")
+        );
+
+        // The ARN the listing reports is the documented form, nested under the event
+        // integration the association belongs to.
+        for record in &stored {
+            assert_eq!(
+                record.arn,
+                expected_association_arn(REGION, "target", &record.id),
+                "case {label:?}: expected the documented association ARN, got {:?}",
+                record.arn
+            );
+        }
+
+        // The listing reports; it changes nothing a later caller sees.
+        let repeated = list_associations(&emulator, "target", "").await;
+        assert_eq!(
+            associations_page(&repeated),
+            expected,
+            "case {label:?}: a repeated listing must report the same page, got {}",
+            repeated.body
+        );
+        assert_eq!(
+            associations_page(&list_associations(&emulator, "neighbour", "").await).len(),
+            1,
+            "case {label:?}: the neighbour must still hold its own association"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_integration_with_no_associations_and_an_unknown_name_report_the_same_empty_page() {
+    let emulator = Emulator::new();
+    create_integration(&emulator, "present-integration").await;
+    create_integration(&emulator, "doomed-integration").await;
+    let deleted = emulator.delete(REGION, "doomed-integration").await;
+    assert_eq!(
+        deleted.status, 200,
+        "DeleteEventIntegration must succeed so a case has a name with no integration, \
+         got {} / {}",
+        deleted.status, deleted.body
+    );
+
+    // Rows differ in the state of the name the request addresses: an integration this
+    // service holds that nothing has associated, one it held and deleted, a name never
+    // created, and names at both published bounds of `Name`'s length. Every one of them
+    // reports the same empty page, because the name is resolved to the associations
+    // stored under it rather than verified against a stored integration.
+    let mut bodies: Vec<(&str, Value)> = Vec::new();
+    for (label, name) in [
+        ("an integration with no associations", "present-integration"),
+        ("an integration that was deleted", "doomed-integration"),
+        ("a name never created", "absent-integration"),
+        ("the shortest legal name", "a"),
+        ("the longest legal name", &"n".repeat(255) as &str),
+    ] {
+        let reply = list_associations(&emulator, name, "").await;
+        assert_eq!(
+            reply.status, 200,
+            "case {label:?}: expected HTTP 200, got {} / {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            associations_page(&reply),
+            Vec::<Value>::new(),
+            "case {label:?}: expected an empty page, got {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.field("NextToken"),
+            None,
+            "case {label:?}: an empty page must report no NextToken, got {:?}",
+            reply.field("NextToken")
+        );
+        bodies.push((label, reply.body));
+    }
+
+    let (first_label, first_body) = bodies.first().cloned().expect("the table has rows");
+    for (label, body) in &bodies {
+        assert_eq!(
+            body, &first_body,
+            "case {label:?}: expected the same page as case {first_label:?} \
+             ({first_body}), got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_page_controls_of_the_association_listing_follow_their_published_bounds() {
+    let emulator = Emulator::new();
+    create_integration(&emulator, "paged-integration").await;
+    let seeds: Vec<SeededEventIntegrationAssociation> = (0..7)
+        .map(|index| association(Some(&format!("client-{index}")), None, &[]))
+        .collect();
+    let stored = emulator.seed_event_integration_associations("paged-integration", &seeds);
+    let all: Vec<Value> = stored.iter().map(expected_association).collect();
+
+    // Rows differ in the page size the walk uses: one per page, a size that divides the
+    // stored count, one that does not, exactly the stored count, and the largest the
+    // model allows. Following the cursors must report every association exactly once, in
+    // the store's order, whatever the page size.
+    for page_size in [1_usize, 3, 4, 7, MAX_RESULTS_MAX as usize] {
+        let mut seen: Vec<Value> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0_usize;
+        loop {
+            let query = match &token {
+                None => format!("maxResults={page_size}"),
+                Some(cursor) => format!("maxResults={page_size}&nextToken={cursor}"),
+            };
+            let reply = list_associations(&emulator, "paged-integration", &query).await;
+            assert_eq!(
+                reply.status, 200,
+                "case maxResults={page_size} page {pages}: expected HTTP 200, got {} / {}",
+                reply.status, reply.body
+            );
+            let page = associations_page(&reply);
+            assert!(
+                page.len() <= page_size,
+                "case maxResults={page_size} page {pages}: a page must not exceed the \
+                 requested size, got {} entries",
+                page.len()
+            );
+            seen.extend(page);
+            pages += 1;
+            assert!(
+                pages <= stored.len() + 1,
+                "case maxResults={page_size}: the walk must terminate, got {pages} pages"
+            );
+            token = reply.string("NextToken");
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, all,
+            "case maxResults={page_size}: expected every stored association once in \
+             order, got {seen:?}"
+        );
+    }
+
+    // One past each published bound of `MaxResults`, then each bound itself.
+    for (max, expected_status) in [
+        (MAX_RESULTS_MIN - 1, 400),
+        (MAX_RESULTS_MAX + 1, 400),
+        (MAX_RESULTS_MIN, 200),
+        (MAX_RESULTS_MAX, 200),
+    ] {
+        let reply =
+            list_associations(&emulator, "paged-integration", &format!("maxResults={max}")).await;
+        assert_eq!(
+            reply.status, expected_status,
+            "case maxResults={max}: expected HTTP {expected_status}, got {} / {}",
+            reply.status, reply.body
+        );
+    }
+
+    // Tokens differing in why they are not cursors this service minted: not hex at all,
+    // odd-length hex, hex that decodes to bytes that are not text.
+    for token in ["not-a-cursor", "abc", "fffe"] {
+        let reply = list_associations(
+            &emulator,
+            "paged-integration",
+            &format!("nextToken={token}"),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {token:?}: expected HTTP 400 for a foreign NextToken, got {} / {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type, "InvalidRequestException",
+            "case {token:?}: expected InvalidRequestException, got {:?}",
+            reply.error_type
         );
     }
 }

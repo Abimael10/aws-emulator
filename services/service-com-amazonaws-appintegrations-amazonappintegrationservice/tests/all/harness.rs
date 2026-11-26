@@ -11,12 +11,14 @@
 //! `CreateDataIntegration` resolves its required `KmsKey` by calling KMS in process,
 //! exactly as the assembled emulator does.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::Value;
 use service_com_amazonaws_appintegrations_amazonappintegrationservice::state::{
-    application_association_arn, ApplicationAssociationRecord,
+    application_association_arn, event_integration_association_arn, ApplicationAssociationRecord,
+    EventIntegrationAssociationRecord,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -56,6 +58,12 @@ impl Reply {
         self.string("message").or_else(|| self.string("Message"))
     }
 }
+
+/// One event integration association a suite seeds: its client id, its EventBridge
+/// rule name and the client's association metadata — the three values that come from
+/// the side of the client that associates the integration.
+pub(crate) type SeededEventIntegrationAssociation =
+    (Option<String>, Option<String>, BTreeMap<String, String>);
 
 /// An emulator with AppIntegrations and KMS mounted on one shared engine, driven
 /// in-process through the production router.
@@ -142,6 +150,42 @@ impl Emulator {
                 client_id: client_id.as_ref().to_string(),
             };
             guard.application_associations.insert(id, record.clone());
+            seeded.push(record);
+        }
+        seeded
+    }
+
+    /// Store one event integration association per entry of `clients` for the event
+    /// integration `name`, answering the records as the store keeps them.
+    ///
+    /// Plumbing rather than an assertion, for the same reason as
+    /// [`Emulator::seed_application_associations`]: AppIntegrations publishes no create
+    /// for an event integration association, so a suite that needs one stored puts it in
+    /// the store the router serves from and then reads every assertion off the wire.
+    /// Each entry is the client id, the EventBridge rule name and the client's
+    /// association metadata of one association; the ids are hex-ordered and continue
+    /// after whatever is already stored, so the store's order is the order they were
+    /// added in and two integrations never share one.
+    pub(crate) fn seed_event_integration_associations(
+        &self,
+        name: &str,
+        clients: &[SeededEventIntegrationAssociation],
+    ) -> Vec<EventIntegrationAssociationRecord> {
+        let state = self.appintegrations_state();
+        let mut guard = state.lock();
+        let first = guard.event_integration_associations.len();
+        let mut seeded = Vec::new();
+        for (offset, (client_id, rule_name, metadata)) in clients.iter().enumerate() {
+            let id = format!("{:08x}-0000-4000-8000-000000000000", first + offset);
+            let record = EventIntegrationAssociationRecord {
+                arn: event_integration_association_arn(REGION, name, &id),
+                id: id.clone(),
+                event_integration_name: name.to_string(),
+                client_id: client_id.clone(),
+                event_bridge_rule_name: rule_name.clone(),
+                client_association_metadata: metadata.clone(),
+            };
+            guard.event_integration_associations.insert(id, record.clone());
             seeded.push(record);
         }
         seeded

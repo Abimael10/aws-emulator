@@ -15,8 +15,8 @@ use std::time::SystemTime;
 use crate::ops::types::{
     ApplicationAssociationSummary, ApplicationConfig, ApplicationSourceConfig, AuthConfig,
     DataIntegrationAssociationSummary, DataIntegrationSummary, EventFilter, EventIntegration,
-    ExecutionConfiguration, FileConfiguration, IframeConfig, Publication, ScheduleConfiguration,
-    Subscription,
+    EventIntegrationAssociation, ExecutionConfiguration, FileConfiguration, IframeConfig,
+    Publication, ScheduleConfiguration, Subscription,
 };
 
 /// The region an emulated request is treated as having been made in when its
@@ -241,6 +241,9 @@ pub const DATA_INTEGRATION_ASSOCIATION_ARN_SEGMENT: &str = "data-integration-ass
 
 /// The ARN resource-type segment of an application association.
 pub const APPLICATION_ARN_ASSOCIATION_SEGMENT: &str = "application-association";
+
+/// The ARN resource-type segment of an event integration association.
+pub const EVENT_INTEGRATION_ASSOCIATION_ARN_SEGMENT: &str = "event-integration-association";
 
 /// The sentence the TAGGING operations give a `ResourceArn` this account holds no
 /// taggable resource under: fixed text, then the ARN the request sent, verbatim.
@@ -512,6 +515,62 @@ impl ApplicationAssociationRecord {
     }
 }
 
+/// One stored event integration association: the client an event integration is
+/// associated with, the EventBridge rule that client's association runs on, and the id
+/// and ARN this service minted for the association — so
+/// `ListEventIntegrationAssociations` reports persisted records rather than a fixed
+/// answer.
+///
+/// Nothing in THIS API creates one: AppIntegrations publishes no create for an event
+/// integration association (`smithy_query(query="digest")` binds a create for every
+/// other resource of this service and none for this one). The association comes into
+/// being on the side of the client that associates the event integration, which is why
+/// the record's `client_id` and `event_bridge_rule_name` are that client's values rather
+/// than anything this service mints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventIntegrationAssociationRecord {
+    /// The identity of the association, and the last segment of
+    /// [`EventIntegrationAssociationRecord::arn`].
+    pub id: String,
+    pub arn: String,
+    /// The name of the event integration this association belongs to, which is how the
+    /// associations of one integration are found (see
+    /// [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::event_integration_associations_of`]).
+    pub event_integration_name: String,
+    pub client_id: Option<String>,
+    pub event_bridge_rule_name: Option<String>,
+    pub client_association_metadata: BTreeMap<String, String>,
+}
+
+impl EventIntegrationAssociationRecord {
+    /// This record as the `EventIntegrationAssociation` a listing reports — the members
+    /// that shape carries (`smithy_query(query="shape",
+    /// shape="EventIntegrationAssociation")`: `EventIntegrationAssociationArn`,
+    /// `EventIntegrationAssociationId`, `EventIntegrationName`, `ClientId`,
+    /// `EventBridgeRuleName`, `ClientAssociationMetadata`).
+    ///
+    /// `ClientAssociationMetadata` is reported only when the association carries any:
+    /// the metadata belongs to the client that made the association, so an association
+    /// stored without it has no map to report rather than an empty one.
+    pub fn to_association(&self) -> EventIntegrationAssociation {
+        EventIntegrationAssociation {
+            event_integration_association_arn: Some(self.arn.clone()),
+            event_integration_association_id: Some(self.id.clone()),
+            event_integration_name: Some(self.event_integration_name.clone()),
+            client_id: self.client_id.clone(),
+            event_bridge_rule_name: self.event_bridge_rule_name.clone(),
+            client_association_metadata: (!self.client_association_metadata.is_empty()).then(
+                || {
+                    self.client_association_metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                },
+            ),
+        }
+    }
+}
+
 /// Why `config` is not a valid `ExecutionConfiguration`, or `None` when it is.
 ///
 /// ONE rule, shared by the create and the update of an association so the two cannot
@@ -696,6 +755,18 @@ pub struct ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
     /// application this service created has no associations until the client side
     /// associates it, and `ListApplicationAssociations` reports whatever is stored here.
     pub application_associations: BTreeMap<String, ApplicationAssociationRecord>,
+    /// Every stored event integration association, keyed by its id. One map for every
+    /// event integration's associations rather than one per integration, so an
+    /// association is stored exactly once and [`Self::event_integration_associations_of`]
+    /// is the one way to find the ones a given integration has. A `BTreeMap` so list
+    /// order, and therefore pagination, is deterministic.
+    ///
+    /// No operation of this API writes it — see [`EventIntegrationAssociationRecord`] —
+    /// so no request path grows it and it needs no stored-resource ceiling of its own: an
+    /// event integration this service created has no associations until the client side
+    /// associates it, and `ListEventIntegrationAssociations` reports whatever is stored
+    /// here.
+    pub event_integration_associations: BTreeMap<String, EventIntegrationAssociationRecord>,
 }
 
 impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
@@ -826,6 +897,21 @@ impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
         self.application_associations
             .iter()
             .filter(move |(_, record)| record.application_id == application_id)
+    }
+
+    /// The associations the event integration `name` has, in the deterministic order of
+    /// the association ids.
+    ///
+    /// The integration is named, not resolved: an event integration is addressed by its
+    /// name throughout this API, so the associations of one are exactly the stored ones
+    /// carrying that name.
+    pub fn event_integration_associations_of<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a EventIntegrationAssociationRecord)> {
+        self.event_integration_associations
+            .iter()
+            .filter(move |(_, record)| record.event_integration_name == name)
     }
 
     /// Whether the application `application_id` is associated with any client, which is
@@ -1066,6 +1152,26 @@ pub fn application_association_arn(
         ARN_NAMESPACE,
         region,
         &format!("{APPLICATION_ARN_ASSOCIATION_SEGMENT}/{application_id}/{association_id}"),
+    )
+}
+
+/// The ARN of an event integration association in `region`:
+/// `arn:aws:app-integrations:<region>:<account>:event-integration-association/<event-integration-name>/<association-id>`.
+///
+/// Nested under the event integration it belongs to, for the same reason as
+/// [`data_integration_association_arn`]: an association exists only as part of one
+/// resource, and an event integration is addressed by its name.
+pub fn event_integration_association_arn(
+    region: &str,
+    event_integration_name: &str,
+    association_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!(
+            "{EVENT_INTEGRATION_ASSOCIATION_ARN_SEGMENT}/{event_integration_name}/{association_id}"
+        ),
     )
 }
 
