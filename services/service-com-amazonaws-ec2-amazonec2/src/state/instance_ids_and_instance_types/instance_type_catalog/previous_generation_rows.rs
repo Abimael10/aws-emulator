@@ -16,7 +16,11 @@
 //! "Amazon EBS optimized instance types" table (the EBS figures of the sizes offered the
 //! option), "Instance volume limits" (the shared attachment total), the "IP addresses per
 //! network interface per instance type" table (the interface and address limits), and the
-//! pages that name the types offered a cluster placement group and Traffic Mirroring.
+//! pages that name the types offered a cluster placement group and Traffic Mirroring. The two
+//! network bandwidth figures beside each family's "Network performance" words are the host
+//! adapter's ([`XEN_ADAPTER_PEAK_GBPS`]) and the size's own step of the published baseline
+//! ladder, held to what one instance of such a host sustains
+//! ([`XEN_SUSTAINED_CEILING_GBPS`]).
 
 use super::*;
 
@@ -46,6 +50,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(1, 4)
         .network("Moderate")
+        .network_bandwidth(0.5, XEN_ADAPTER_PEAK_GBPS)
         .interfaces(2)
         .processor("Intel", 2.5)
         .dedicated_hosts(true)
@@ -57,6 +62,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(1, 32)
         .network("Moderate")
+        .network_bandwidth(0.75, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.5)
         .dedicated_hosts(true)
         .auto_recovery(true)
@@ -67,6 +73,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 40)
         .network("High")
+        .network_bandwidth(1.25, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.5)
         .dedicated_hosts(true)
         .auto_recovery(true)
@@ -77,6 +84,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 80)
         .network("High")
+        .network_bandwidth(2.5, XEN_ADAPTER_PEAK_GBPS)
         .ipv4_per_interface(30)
         .processor("Intel", 2.5)
         .dedicated_hosts(true)
@@ -104,6 +112,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 16)
         .network("Moderate")
+        .network_bandwidth(0.75, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.8)
         .dedicated_hosts(true)
         .auto_recovery(true)
@@ -115,6 +124,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 40)
         .network("Moderate")
+        .network_bandwidth(1.25, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.8)
         .dedicated_hosts(true)
         .auto_recovery(true)
@@ -126,6 +136,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 80)
         .network("High")
+        .network_bandwidth(2.5, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.8)
         .dedicated_hosts(true)
         .auto_recovery(true)
@@ -137,6 +148,7 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 160)
         .network("High")
+        .network_bandwidth(XEN_SUSTAINED_CEILING_GBPS, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.8)
         .dedicated_hosts(true)
         .auto_recovery(true)
@@ -149,9 +161,60 @@ pub(super) static PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS: &[PublishedInstanceTy
         .shared_ebs_attachments(39)
         .instance_store(2, 320)
         .network("10 Gigabit")
+        .network_bandwidth(XEN_SUSTAINED_CEILING_GBPS, XEN_ADAPTER_PEAK_GBPS)
         .processor("Intel", 2.8)
         .dedicated_hosts(true)
         .auto_recovery(true)
         .placement_strategies(EVERY_PLACEMENT_STRATEGY)
         .traffic_mirroring(false),
+    // C1 — compute optimized of the FIRST generation, on the Xen hypervisor with local
+    // magnetic devices: one 350 GB device on the smaller size and four 420 GB ones on the
+    // larger. Its memory is the family's published 1.7 GiB and 7 GiB, neither of which is the
+    // generic ladder's whole number of GiB per vCPU. EBS optimization is an OPTION of the
+    // launch on the larger size, which publishes ONE fixed figure — a pre-Nitro instance has
+    // no baseline it bursts above — and is not offered on the smaller one at all, which
+    // therefore has no EBS-optimized performance to report. The EBS volumes share their 39
+    // attachments with the interfaces and the local devices. The network figures are the
+    // published words of the "Network performance" column, with the sustained share and the
+    // ceiling of the host's adapter beside them, and the smaller size takes TWO interfaces
+    // with six private addresses each where that step of the generic ladder publishes three
+    // interfaces and ten addresses. The packets of a session are copied by Nitro hardware
+    // these hosts do not have, so Traffic Mirroring is not offered; IPv6 reaches none of this
+    // family's sizes, which is already what a previous generation family outside
+    // `IPV6_PREVIOUS_GENERATION_FAMILIES` is answered.
+    PublishedInstanceTypeFacts::of("c1.medium")
+        .memory_mib(1_740)
+        .ebs_optimized(EBS_OPTIMIZED_UNSUPPORTED)
+        .shared_ebs_attachments(39)
+        .instance_store(1, 350)
+        .network("Moderate")
+        .network_bandwidth(0.5, XEN_ADAPTER_PEAK_GBPS)
+        .interfaces(2)
+        .ipv4_per_interface(6)
+        .traffic_mirroring(false),
+    PublishedInstanceTypeFacts::of("c1.xlarge")
+        .memory_mib(7_168)
+        .ebs(1_000, 8_000, 1_000, 8_000)
+        .shared_ebs_attachments(39)
+        .instance_store(4, 420)
+        .network("High")
+        .network_bandwidth(1.25, XEN_ADAPTER_PEAK_GBPS)
+        .interfaces(4)
+        .ipv4_per_interface(15)
+        .traffic_mirroring(false),
 ];
+
+/// The Gigabit the network adapter of a pre-Nitro Xen host carries, which is the figure every
+/// size carved out of one can reach (`NetworkCardInfo$PeakBandwidthInGbps`).
+///
+/// The sustained figure beside it (`$BaselineBandwidthInGbps`) is the size's own step of the
+/// published baseline ladder — half a Gigabit at the smallest size, then 0.75, 1.25, 2.5 and
+/// 5 — held to [`XEN_SUSTAINED_CEILING_GBPS`], which is as much of the adapter as one instance
+/// of such a host sustains. That is why the published words of the "Network performance"
+/// column (`Moderate`, `High`, `10 Gigabit`) and these two figures are all stated per row: no
+/// reading of the size multiplier yields any of them.
+const XEN_ADAPTER_PEAK_GBPS: f64 = 10.0;
+
+/// The most of that adapter one instance sustains, whatever its size: the figure the largest
+/// sizes of these families publish, which the ladder stops at rather than going on doubling.
+const XEN_SUSTAINED_CEILING_GBPS: f64 = 5.0;

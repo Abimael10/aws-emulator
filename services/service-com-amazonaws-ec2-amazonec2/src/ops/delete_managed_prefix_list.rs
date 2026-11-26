@@ -185,10 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // reading of them, which `ModifyManagedPrefixList` answers for such a
                     // list too.
                     if state::region_publishes_prefix_list(&region, &input.prefix_list_id) {
-                        return Err(state::published_prefix_list_unsupported(
-                            &input.prefix_list_id,
-                            "deleted",
-                        ));
+                        return Err(state::published_prefix_list_unsupported());
                     }
                     return Err(prefix_list_does_not_exist(&input.prefix_list_id));
                 }

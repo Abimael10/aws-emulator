@@ -141,6 +141,22 @@ fn published_zone_names(region: &str) -> Vec<String> {
     names
 }
 
+/// The az NUMBER this account maps the `index`th zone NAME of `region` to — the `n` of the
+/// `<prefix>-az<n>` id its zone list reports for that name.
+///
+/// A zone id names one physical zone for every account alike, while a zone NAME is mapped
+/// onto it per account ("we independently map Availability Zones to names for each Amazon Web
+/// Services account", the EC2 User Guide's "Regions and Zones"), so the mapping is a fact of
+/// the account rather than of the letter's position. These are this account's: `us-west-2a`
+/// is its second zone and `us-west-2b` its first, and every other Region here maps its names
+/// in order.
+fn expected_zone_id_number(region: &str, index: usize) -> usize {
+    match region {
+        "us-west-2" => [2, 1, 3, 4][index],
+        _ => index + 1,
+    }
+}
+
 /// One row of a selector table: the case name, the `ZoneNames` and `ZoneIds` the
 /// request carries, and the zone names expected back.
 type SelectorCase<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
@@ -246,7 +262,7 @@ async fn each_region_reports_its_own_availability_zones() {
         for (index, zone) in zones.iter().enumerate() {
             let letter = letters[index];
             let expected_name = format!("{region}{letter}");
-            let expected_id = format!("{prefix}-az{}", index + 1);
+            let expected_id = format!("{prefix}-az{}", expected_zone_id_number(region, index));
             assert_eq!(
                 zone.name, expected_name,
                 "case {region:?}: expected zone {expected_name}, got {zone:?}"
@@ -473,7 +489,7 @@ async fn filters_are_anded_and_their_values_ored() {
             &[],
         ),
         ("zone-name no match", &[("zone-name", &["eu-west-1a"])], &[]),
-        ("zone-id exact", &[("zone-id", &["usw2-az1"])], &["us-west-2a"]),
+        ("zone-id exact", &[("zone-id", &["usw2-az1"])], &["us-west-2b"]),
         ("zone-id wildcard", &[("zone-id", &["usw2-az*"])], all),
         ("state available", &[("state", &["available"])], all),
         ("state unavailable", &[("state", &["unavailable"])], &[]),
@@ -496,7 +512,7 @@ async fn filters_are_anded_and_their_values_ored() {
         ),
         (
             "contradictory filters match nothing",
-            &[("zone-name", &["us-west-2a"]), ("zone-id", &["usw2-az2"])],
+            &[("zone-name", &["us-west-2a"]), ("zone-id", &["usw2-az1"])],
             &[],
         ),
     ];

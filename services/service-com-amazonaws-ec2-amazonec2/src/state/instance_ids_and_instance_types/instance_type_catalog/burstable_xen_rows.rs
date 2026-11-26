@@ -36,6 +36,7 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Low")
+        .network_bandwidth(0.032, BURSTABLE_XEN_PEAK_GBPS)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
         .host_features(true, false),
@@ -43,6 +44,7 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Low to Moderate")
+        .network_bandwidth(0.064, BURSTABLE_XEN_PEAK_GBPS)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
         .host_features(true, false),
@@ -50,6 +52,7 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Low to Moderate")
+        .network_bandwidth(0.128, BURSTABLE_XEN_PEAK_GBPS)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
         .host_features(true, false),
@@ -57,6 +60,7 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Low to Moderate")
+        .network_bandwidth(0.256, BURSTABLE_XEN_PEAK_GBPS)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
         .host_features(true, false),
@@ -64,6 +68,7 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Low to Moderate")
+        .network_bandwidth(0.512, BURSTABLE_XEN_PEAK_GBPS)
         .ipv4_per_interface(12)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
@@ -72,6 +77,7 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Moderate")
+        .network_bandwidth(BURSTABLE_XEN_PEAK_GBPS, BURSTABLE_XEN_PEAK_GBPS)
         .interfaces(3)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
@@ -80,8 +86,18 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
         .threads_per_core(1)
         .shared_ebs_attachments(40)
         .network("Moderate")
+        .network_bandwidth(BURSTABLE_XEN_PEAK_GBPS, BURSTABLE_XEN_PEAK_GBPS)
         .interfaces(3)
         .ena(ENA_UNSUPPORTED)
         .processor("Intel", 3.3)
         .host_features(true, false),
 ];
+
+/// The Gigabit the Xen burstable family's network device carries, which is the figure every
+/// size of it can reach — 1,024 Megabit, the figure of the paravirtual interface its guest is
+/// given rather than of an Elastic Network Adapter it has none of.
+///
+/// The figure a size SUSTAINS is its own step of the family's published baseline ladder, which
+/// doubles at each step from 32 Megabit at the smallest size and reaches the device's own
+/// figure at the two largest, where the column stops reading `up to` anything.
+const BURSTABLE_XEN_PEAK_GBPS: f64 = 1.024;

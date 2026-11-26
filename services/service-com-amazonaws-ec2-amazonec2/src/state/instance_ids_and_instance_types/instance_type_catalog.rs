@@ -36,6 +36,7 @@ mod dense_hdd_storage_rows;
 mod eighth_generation_intel_rows;
 mod fifth_generation_intel_rows;
 mod fifth_generation_network_optimized_rows;
+mod first_generation_graviton_rows;
 mod fourth_generation_xen_rows;
 mod general_purpose_nvme_rows;
 mod gpu_rows;
@@ -4826,6 +4827,9 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
         .chain(eighth_generation_intel_rows::EIGHTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
         .chain(fifth_generation_intel_rows::FIFTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
+        .chain(
+            first_generation_graviton_rows::FIRST_GENERATION_GRAVITON_INSTANCE_TYPE_FACTS,
+        )
         .chain(
             fifth_generation_network_optimized_rows::FIFTH_GENERATION_NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS,
         )

@@ -506,9 +506,15 @@ async fn a_load_balancer_with_zonal_shift_enabled_is_a_managed_resource_of_arc()
             "case {case:?}: turned back on, it is a managed resource again, got {status} \
              {view}"
         );
+        // The zones EC2 put it in, compared as a SET: `weights` is keyed by zone ID, so its
+        // keys come out in ID order while `zone_ids` is in SUBNET order, and this account's
+        // zone names are not mapped onto its zone IDs in alphabetical order.
+        let mut reported_zones: Vec<String> = weights(&view).keys().cloned().collect();
+        reported_zones.sort();
+        let mut created_in: Vec<String> = zone_ids.clone();
+        created_in.sort();
         assert_eq!(
-            weights(&view).keys().cloned().collect::<Vec<_>>(),
-            zone_ids,
+            reported_zones, created_in,
             "case {case:?}: expected the same zones EC2 put it in, got {:?}",
             weights(&view)
         );

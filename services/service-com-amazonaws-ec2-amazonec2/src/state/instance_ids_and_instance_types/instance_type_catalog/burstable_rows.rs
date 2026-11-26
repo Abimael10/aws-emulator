@@ -36,31 +36,38 @@ pub(super) static BURSTABLE_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] =
     PublishedInstanceTypeFacts::of("t4g.nano")
         .ebs(43, 250, 2_085, 11_800)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(0.032, BURSTABLE_GRAVITON_PEAK_GBPS)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     PublishedInstanceTypeFacts::of("t4g.micro")
         .ebs(87, 500, 2_085, 11_800)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(0.064, BURSTABLE_GRAVITON_PEAK_GBPS)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     PublishedInstanceTypeFacts::of("t4g.small")
         .ebs(174, 1_000, 2_085, 11_800)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(0.128, BURSTABLE_GRAVITON_PEAK_GBPS)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     PublishedInstanceTypeFacts::of("t4g.medium")
         .ebs(347, 2_000, 2_085, 11_800)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(0.256, BURSTABLE_GRAVITON_PEAK_GBPS)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     PublishedInstanceTypeFacts::of("t4g.large")
         .ebs(695, 4_000, 2_780, 15_700)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(0.512, BURSTABLE_GRAVITON_PEAK_GBPS)
         .ipv4_per_interface(BURSTABLE_LARGE_IPV4_ADDRESSES)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     PublishedInstanceTypeFacts::of("t4g.xlarge")
         .ebs(1_390, 6_000, 2_780, 15_700)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(1.024, BURSTABLE_GRAVITON_PEAK_GBPS)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     PublishedInstanceTypeFacts::of("t4g.2xlarge")
         .ebs(2_780, 11_800, 2_780, 15_700)
         .network(BURSTABLE_GRAVITON_NETWORK_PERFORMANCE)
+        .network_bandwidth(2.048, BURSTABLE_GRAVITON_PEAK_GBPS)
         .processor("AWS", GRAVITON2_SUSTAINED_GHZ),
     // T8i — burstable performance on the Intel Xeon 6 hardware the eighth generation Intel
     // families are built on, with no local instance store. Like T4g above, every size shares
@@ -124,6 +131,15 @@ pub(super) static BURSTABLE_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] =
 /// "The network performance" every size of the Graviton2 burstable family publishes: the
 /// sizes share one host's adapter, so the figure is the same at every step of the ladder.
 const BURSTABLE_GRAVITON_NETWORK_PERFORMANCE: &str = "Up to 5 Gigabit";
+
+/// The Gigabit that adapter carries, which is the figure every size of the family can reach:
+/// the one ceiling behind the `Up to` of the column above.
+///
+/// The figure a size SUSTAINS is its own step of the family's published baseline ladder,
+/// which doubles at each step from the smallest size — 32 Megabit at the `nano` — and stays
+/// below this ceiling at every size, a burstable instance's network being burstable in the
+/// same way its CPU is.
+const BURSTABLE_GRAVITON_PEAK_GBPS: f64 = 5.0;
 
 /// The same figure for the Intel Xeon 6 burstable family, whose adapter is the one its
 /// hardware generation's compute sizes carry.

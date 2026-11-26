@@ -16,9 +16,9 @@
 //!    it. Each row carries the referencing resource's id and the account that owns THAT
 //!    resource — the owner its own describe reports — and a resource is reported ONCE however
 //!    many references it holds. The table's rows differ along what that generalises over: the
-//!    kind of referencing resource, the direction of a security group rule, how many resources
-//!    reference the list, and whether the list is one the account created or one the Region
-//!    publishes.
+//!    kind of referencing resource, the direction of a security group rule, and how many
+//!    resources reference the list. A list the REGION publishes is not the account's at all,
+//!    so the report of one is refused rather than served.
 //! 2. A reference to ANOTHER prefix list is not an association of this one, and a list nothing
 //!    references reports an empty set rather than a refusal.
 //! 3. A page is `MaxResults` resources long and carries a `NextToken` only while a resource
@@ -430,11 +430,13 @@ async fn the_reported_associations_are_the_resources_that_reference_the_list() {
     }
 }
 
-/// Rule 1: the same report serves a prefix list the Region PUBLISHES for one of its services —
-/// a security group rule may grant one, and the published list is then reported as referenced
-/// by that group.
+/// A prefix list the Region PUBLISHES is not the account's: "the ID of the owner of the prefix
+/// list" (`ManagedPrefixList$OwnerId`) is Amazon Web Services itself, and no action of this
+/// account reaches one — reporting what references it included. So the report of such a list is
+/// refused with `UnsupportedOperation` and EC2's one sentence for it, whether or not a resource
+/// of the account grants the list.
 #[tokio::test]
-async fn a_published_prefix_list_reports_the_resources_that_reference_it() {
+async fn a_published_prefix_list_is_not_the_accounts_to_report_associations_for() {
     let (router, _engine) = super::ec2_query::emulator();
     const CASE: &str = "a published prefix list";
 
@@ -443,21 +445,31 @@ async fn a_published_prefix_list_reports_the_resources_that_reference_it() {
     let published = ok(CASE, &router, "DescribePrefixLists", &[]).await;
     let published_id = member(CASE, &published, "prefixListId");
 
-    let before = associations_of(CASE, &router, &[param("PrefixListId", &published_id)]).await;
-    assert!(
-        before.is_empty(),
-        "case {CASE:?}: nothing references {published_id} yet, got {before:?}"
-    );
-
-    let (group_id, owner) =
-        add_reference(CASE, &router, 1, &published_id, Reference::Ingress).await;
-    let reported = associations_of(CASE, &router, &[param("PrefixListId", &published_id)]).await;
-    assert_eq!(
-        reported,
-        vec![(group_id.clone(), Some(owner))],
-        "case {CASE:?}: expected the group that grants {published_id} to be reported, got \
-         {reported:?}"
-    );
+    for stage in ["before any reference", "after a group grants it"] {
+        let (status, body) = call(
+            &router,
+            "GetManagedPrefixListAssociations",
+            &[param("PrefixListId", &published_id)],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {stage:?}: expected HTTP 400 for {published_id}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "UnsupportedOperation",
+            "case {stage:?}: expected UnsupportedOperation, got {body}"
+        );
+        assert_eq!(
+            super::ec2_query::unescaped(&error_message(&body)),
+            "The action is not supported for an AWS-managed prefix list.",
+            "case {stage:?}: expected EC2's one sentence for a published list, got {body}"
+        );
+        if stage == "before any reference" {
+            add_reference(CASE, &router, 1, &published_id, Reference::Ingress).await;
+        }
+    }
 }
 
 /// The associations a walk of the whole report yields with `max_results` as its page size, and

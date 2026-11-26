@@ -1220,7 +1220,8 @@ impl AvailabilityZoneRecord {
 /// several expose more, and a Region's zone letters are not always the first letters of the
 /// alphabet. Zone `n` (counting from 1) is named `<region><letter>` with that Region's `n`th
 /// published letter — `us-east-1a`, `ap-northeast-1c` — and carries the zone id
-/// `<prefix>-az<n>` built from [`zone_id_prefix`]; both forms are the ones the operation's
+/// `<prefix>-az<m>` built from [`zone_id_prefix`] and the az NUMBER this account maps that
+/// name to ([`account_zone_id_number`]); both forms are the ones the operation's
 /// `Filters` doc gives for the `zone-name` and `zone-id` filters. Every zone is an
 /// `availability-zone`, which is `opt-in-not-required`, so it is reported whether or
 /// not the request sets `AllAvailabilityZones`.
@@ -1236,7 +1237,7 @@ pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord>
             let group_name = ::service_common::aws_availability_zones::zone_group(region);
             AvailabilityZoneRecord {
                 zone_name: format!("{region}{letter}"),
-                zone_id: format!("{prefix}-az{}", index + 1),
+                zone_id: format!("{prefix}-az{}", account_zone_id_number(region, index)),
                 region_name: region.to_string(),
                 group_long_name: zone_group_long_name(region, &group_name),
                 group_name,
@@ -1260,6 +1261,36 @@ pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord>
 pub fn zone_names(zones: &[AvailabilityZoneRecord]) -> Vec<String> {
     zones.iter().map(|zone| zone.zone_name.clone()).collect()
 }
+
+/// The az NUMBER this account maps the `index`th zone NAME of `region` to — the `n` of the
+/// `<prefix>-az<n>` id [`availability_zones_in_region`] gives that zone.
+///
+/// A zone id names one physical zone for every account alike, while a zone NAME is mapped
+/// onto it per account ("to ensure that resources are distributed across the Availability
+/// Zones for a Region, we independently map Availability Zones to names for each Amazon Web
+/// Services account", the EC2 User Guide's "Regions and Zones"). So the mapping is a FACT of
+/// the account rather than a function of the letter's position, and the Regions this account's
+/// mapping is known for carry it here ([`ACCOUNT_ZONE_ID_NUMBERS`]); for any other Region the
+/// `n`th name is this account's `n`th zone.
+///
+/// Every report of a zone id — the zone list itself, a subnet's, a volume's, an endpoint
+/// service's — reads it through this one function, so two operations cannot place one zone
+/// name in two physical zones.
+fn account_zone_id_number(region: &str, index: usize) -> usize {
+    ACCOUNT_ZONE_ID_NUMBERS
+        .iter()
+        .find(|(named, _)| *named == region)
+        .and_then(|(_, numbers)| numbers.get(index).copied())
+        .unwrap_or(index + 1)
+}
+
+/// The az numbers this account's zone NAMES map to, per Region, in the order of that Region's
+/// published zone letters: entry `i` is the az number of the Region's `i`th zone name.
+static ACCOUNT_ZONE_ID_NUMBERS: &[(&str, &[usize])] = &[
+    // us-west-2: `us-west-2a` is this account's second zone, `us-west-2b` its first, and the
+    // two that follow are mapped in order.
+    ("us-west-2", &[2, 1, 3, 4]),
+];
 
 /// The zone IDS of `zones`, the same reading as [`zone_names`] for the member a request names
 /// a zone by id under.
@@ -2806,8 +2837,8 @@ pub(super) const EBS_OPTIMIZED_UNSUPPORTED: &str = "unsupported";
 
 /// Whether Elastic Network Adapter is supported: `required` on the Nitro types, which
 /// have no other network device, `supported` on the current generation types that
-/// offered it beside their original one, and `unsupported` on the previous generation
-/// families that predate it.
+/// offered it beside their original one, and [`ENA_SUPPORT_UNSUPPORTED`] on the previous
+/// generation families that predate it.
 pub(super) fn ena_support(name: &InstanceTypeName<'_>) -> &'static str {
     if name.nitro() {
         return "required";
@@ -2815,7 +2846,28 @@ pub(super) fn ena_support(name: &InstanceTypeName<'_>) -> &'static str {
     if name.current_generation() {
         return "supported";
     }
-    "unsupported"
+    ENA_SUPPORT_UNSUPPORTED
+}
+
+/// The `EnaSupport` of a type that predates the Elastic Network Adapter — named here because
+/// it is also what says the type's interfaces carry the single queue
+/// [`PRE_ENA_QUEUES_PER_INTERFACE`] reports.
+pub(super) const ENA_SUPPORT_UNSUPPORTED: &str = "unsupported";
+
+/// Whether Elastic Network Adapter is supported for one instance type, as
+/// `NetworkInfo$EnaSupport` reports it: the published answer for the type where the catalog
+/// holds one, else the answer its hardware generation gives ([`ena_support`]).
+///
+/// The ONE reading of that member, so the report of it and everything that follows from it —
+/// the queues an interface of the type is given ([`network_cards`]) — cannot disagree about
+/// which adapter a type carries.
+pub(super) fn reported_ena_support(
+    name: &InstanceTypeName<'_>,
+    facts: Option<&'static PublishedInstanceTypeFacts>,
+) -> &'static str {
+    facts
+        .and_then(|facts| facts.ena_support)
+        .unwrap_or_else(|| ena_support(name))
 }
 
 /// Whether an EBS volume attaches to this instance type as an NVMe device
@@ -3055,6 +3107,15 @@ pub(super) fn network_performance(baseline_centi: i64, peak_centi: i64) -> Strin
     format!("{} Gigabit", gigabit_figure(baseline_centi))
 }
 
+/// The ENA queues one interface of a type that predates the Elastic Network Adapter is given
+/// (`NetworkCardInfo$DefaultEnaQueueCountPerInterface`).
+///
+/// Such a type's interfaces are not ENA ones at all ([`ENA_SUPPORT_UNSUPPORTED`]): the device
+/// its guest is given presents a SINGLE transmit/receive queue, and the multiple queues the
+/// member counts arrived with the adapter itself. So one is the figure for every one of them,
+/// whichever family and whichever size, rather than a per-type published count.
+pub(super) const PRE_ENA_QUEUES_PER_INTERFACE: i32 = 1;
+
 /// The network cards of one instance type, as `NetworkInfo$NetworkCards` reports them.
 ///
 /// The cards of one instance are identical, so each gets an equal share of the host's
@@ -3120,11 +3181,17 @@ pub(super) fn network_cards(
             peak_bandwidth_in_gbps: Some(per_card_peak_gbps),
             // "The default number of the ENA queues for each interface"
             // (`NetworkCardInfo$DefaultEnaQueueCountPerInterface`): the figure the catalog
-            // publishes for the type's adapter, and nothing at all for a type whose published
-            // queue counts this emulator does not hold — an absent member rather than an
-            // invented one.
+            // publishes for the type's adapter; for a type that predates the Elastic Network
+            // Adapter, the one queue its device presents
+            // ([`PRE_ENA_QUEUES_PER_INTERFACE`]); and nothing at all for an ENA type whose
+            // published queue counts this emulator does not hold — an absent member rather
+            // than an invented one.
             default_ena_queue_count_per_interface: facts
-                .and_then(|facts| facts.ena_queues_per_interface),
+                .and_then(|facts| facts.ena_queues_per_interface)
+                .or_else(|| {
+                    (reported_ena_support(name, facts) == ENA_SUPPORT_UNSUPPORTED)
+                        .then_some(PRE_ENA_QUEUES_PER_INTERFACE)
+                }),
             maximum_ena_queue_count: None,
             maximum_ena_queue_count_per_interface: None,
             interface_types: Some(interface_types.clone()),
@@ -3453,12 +3520,7 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
                 NO_IPV6_ADDRESSES_PER_INTERFACE
             }),
             ipv6_supported: Some(ipv6_supported),
-            ena_support: Some(
-                facts
-                    .and_then(|facts| facts.ena_support)
-                    .unwrap_or_else(|| ena_support(&name))
-                    .to_string(),
-            ),
+            ena_support: Some(reported_ena_support(&name, facts).to_string()),
             efa_supported: Some(efa_interfaces > 0),
             efa_info: (efa_interfaces > 0).then_some(EfaInfo {
                 maximum_efa_interfaces: Some(efa_interfaces),

@@ -291,10 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // publishes and its one wording of that refusal, which the delete of such
                     // a list answers too.
                     if state::region_publishes_prefix_list(&region, &input.prefix_list_id) {
-                        return Err(state::published_prefix_list_unsupported(
-                            &input.prefix_list_id,
-                            "modified",
-                        ));
+                        return Err(state::published_prefix_list_unsupported());
                     }
                     return Err(prefix_list_not_found(&input.prefix_list_id));
                 }

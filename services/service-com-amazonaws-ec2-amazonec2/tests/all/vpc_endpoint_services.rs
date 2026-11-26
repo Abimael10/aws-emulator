@@ -358,10 +358,24 @@ async fn each_catalogued_service_is_reported_for_the_region_asked_about() {
                      {:?}",
                     service.private_dns_name
                 );
+                // "The private DNS names assigned to the VPC endpoint service"
+                // (`ServiceDetail$PrivateDnsNames`) carries every name the service answers the
+                // API on: the default public one above, and — a name under
+                // `<host>.<region>.amazonaws.com` answering the same API on its dual-stack
+                // name — `<host>.<region>.api.aws` beside it.
+                let expected_published: Vec<String> = expected_private
+                    .iter()
+                    .flat_map(|private| {
+                        vec![
+                            private.clone(),
+                            format!("{}.{region}.api.aws", row.dns_host),
+                        ]
+                    })
+                    .collect();
                 assert_eq!(
-                    service.private_dns_names,
-                    expected_private.iter().cloned().collect::<Vec<_>>(),
-                    "case {case:?}: privateDnsNameSet must carry the same name, got {:?}",
+                    service.private_dns_names, expected_published,
+                    "case {case:?}: privateDnsNameSet must carry every name the service \
+                     publishes, got {:?}",
                     service.private_dns_names
                 );
                 assert_eq!(
@@ -624,12 +638,15 @@ async fn a_regions_report_is_stable_and_its_services_are_distinct() {
         "case {case:?}: an endpoint service is one name and one type, got {names:?}"
     );
     for service in &services {
-        // Every service of the report is a service of the Region asked about, under one of
-        // the prefixes an endpoint service name of Amazon Web Services is published with.
+        // Every service of the report is a service the Region's endpoint offers, under one of
+        // the prefixes an endpoint service name of Amazon Web Services is published with —
+        // scoped to the Region itself, or to the one global estate a service Amazon Web
+        // Services answers from everywhere carries instead.
         let expected_prefixes = [
             format!("com.amazonaws.{REGION}."),
             format!("aws.api.{REGION}."),
             format!("api.aws.{REGION}."),
+            "aws.api.global.".to_string(),
         ];
         assert!(
             expected_prefixes
@@ -796,13 +813,21 @@ async fn service_regions_selects_the_regions_asked_about() {
         ),
     ];
 
-    let per_region = reported("every service", &ok("every service", &router, &[]).await).len();
+    let every = reported("every service", &ok("every service", &router, &[]).await);
+    let per_region = every.len();
+    // A GLOBALLY scoped service is one service, not one per Region: its name carries the
+    // global scope rather than a Region, so asking about several Regions at once reports it
+    // ONCE however many were asked about.
+    let globals = every
+        .iter()
+        .filter(|service| service.name.starts_with("aws.api.global."))
+        .count();
     for (case, asked, expected_regions) in rows {
         let body = ok(case, &router, &indexed("ServiceRegion", &asked)).await;
         let services = reported(case, &body);
         assert_eq!(
             services.len(),
-            per_region * expected_regions.len(),
+            per_region * expected_regions.len() - globals * (expected_regions.len() - 1),
             "case {case:?}: expected one catalogue per Region asked about, got {} services",
             services.len()
         );
@@ -819,13 +844,15 @@ async fn service_regions_selects_the_regions_asked_about() {
             "case {case:?}: expected the services of {wanted:?}, got {regions:?}"
         );
         for service in &services {
-            // A name of any published family carries the Region hosting the service:
-            // `com.amazonaws.<region>.<label>`, `aws.api.<region>.<label>` and
-            // `api.aws.<region>.<label>`.
+            // A name of any published family carries the scope the service belongs to: the
+            // Region hosting it — `com.amazonaws.<region>.<label>`,
+            // `aws.api.<region>.<label>` and `api.aws.<region>.<label>` — or the one global
+            // estate a service Amazon Web Services answers from everywhere carries instead.
             let prefixes = [
                 format!("com.amazonaws.{}.", service.region),
                 format!("aws.api.{}.", service.region),
                 format!("api.aws.{}.", service.region),
+                "aws.api.global.".to_string(),
             ];
             assert!(
                 prefixes

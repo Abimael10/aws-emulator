@@ -235,19 +235,23 @@ pub fn region_publishes_prefix_list(region: &str, prefix_list_id: &str) -> bool 
         .any(|published| published.prefix_list_id == prefix_list_id)
 }
 
-/// Refuse a change to a prefix list the REGION publishes: HTTP 400 `UnsupportedOperation`,
-/// naming the list and the change it cannot take (`modified`, `deleted`).
+/// Refuse an action on a prefix list the REGION publishes: HTTP 400 `UnsupportedOperation`
+/// with [`PUBLISHED_PREFIX_LIST_UNSUPPORTED_MESSAGE`].
 ///
 /// "The ID of the owner of the prefix list" (`ManagedPrefixList$OwnerId`) is Amazon Web Services
 /// itself for such a list, so this is a refusal about the RESOURCE rather than about the id —
 /// which is why it is not the not-found an unresolvable id earns. The ONE wording of it, so the
-/// operations that refuse it cannot word the same refusal differently.
-pub fn published_prefix_list_unsupported<E>(prefix_list_id: &str, change: &str) -> Scaffolded<E> {
-    unsupported_operation(format!(
-        "The prefix list '{prefix_list_id}' is an Amazon Web Services-managed prefix list, \
-         which cannot be {change}"
-    ))
+/// operations that refuse it cannot word the same refusal differently, and the sentence names
+/// neither the list nor the action: it is fixed text with no variable part.
+pub fn published_prefix_list_unsupported<E>() -> Scaffolded<E> {
+    unsupported_operation(PUBLISHED_PREFIX_LIST_UNSUPPORTED_MESSAGE)
 }
+
+/// EC2's sentence for an action asked of an Amazon Web Services-managed prefix list: the
+/// account does not own the list, so no action of its own reaches it, whichever action was
+/// asked and whichever list it named.
+pub const PUBLISHED_PREFIX_LIST_UNSUPPORTED_MESSAGE: &str =
+    "The action is not supported for an AWS-managed prefix list.";
 
 /// What one managed prefix list is created with, beyond everything the service itself derives
 /// ([`ComAmazonawsEc2Amazonec2State::insert_managed_prefix_list`] mints the id, builds the
@@ -2699,7 +2703,8 @@ pub fn private_dns_conflicting_domain<E>(private_dns_name: &str, vpc_id: &str) -
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointServiceName {
     /// "The Region where the service is hosted" (`VpcEndpoint$ServiceRegion`), as the name
-    /// itself carries it.
+    /// itself carries it — or [`GLOBAL_ENDPOINT_SERVICE_SCOPE`] for a name whose service is
+    /// one global estate rather than a Region's.
     pub region: String,
     /// The service's label under that Region — `logs` in `com.amazonaws.us-west-2.logs`.
     /// This is the label the endpoint-specific and private DNS names are built on.
@@ -2731,7 +2736,9 @@ pub fn parse_endpoint_service_name(service_name: &str) -> Option<EndpointService
             .or_else(|| service_name.strip_prefix(API_AWS_ENDPOINT_SERVICE_PREFIX))?,
     };
     let (region, service) = within_region.split_once('.')?;
-    if !region_name_is_well_formed(region) {
+    // The scope component is a Region's name, or the literal a service answering from one
+    // global estate carries instead ([`GLOBAL_ENDPOINT_SERVICE_SCOPE`]).
+    if region != GLOBAL_ENDPOINT_SERVICE_SCOPE && !region_name_is_well_formed(region) {
         return None;
     }
     if service.is_empty()
@@ -3074,6 +3081,29 @@ pub(super) const AWS_ENDPOINT_SERVICES: &[AwsEndpointService] = &[
 pub(super) const AWS_API_ENDPOINT_SERVICES: &[AwsEndpointService] =
     &[AwsEndpointService { label: "emr-service-cell01", types: INTERFACE_ONLY }];
 
+/// The scope an endpoint service name carries for a service Amazon Web Services answers from
+/// ONE global estate rather than per Region: `aws.api.global.<label>`.
+///
+/// A service name's second component says what the service belongs to
+/// ([`parse_endpoint_service_name`]): a Region's name for a service each Region offers of its
+/// own, and this literal for a service that is one estate for all of them — the same split a
+/// published prefix list's name carries ([`GLOBAL_PREFIX_LIST_SCOPE`]). Such a service is
+/// reported, and reachable, from EVERY Region's endpoint under that one name.
+pub const GLOBAL_ENDPOINT_SERVICE_SCOPE: &str = "global";
+
+/// The endpoint services Amazon Web Services offers under the `aws.api` label
+/// ([`AWS_API_ENDPOINT_SERVICE_PREFIX`]) with [`GLOBAL_ENDPOINT_SERVICE_SCOPE`] in place of a
+/// Region: one estate, one name, reported from every Region's endpoint.
+///
+/// Amazon CodeCatalyst is one: it is a global service, and the PrivateLink guide publishes it
+/// as `aws.api.global.codecatalyst` — the name a space's clients reach it through from a VPC
+/// in any Region. Read and reported exactly like the per-Region families, so the zones, the
+/// base endpoint DNS names and the address families a reported entry carries are the asking
+/// Region's; only the name's scope differs. A label nothing publishes is not guessed at, the
+/// way the other catalogues keep theirs.
+pub(super) const AWS_API_GLOBAL_ENDPOINT_SERVICES: &[AwsEndpointService] =
+    &[AwsEndpointService { label: "codecatalyst", types: INTERFACE_ONLY }];
+
 /// The endpoint services Amazon Web Services offers in every Region under the `api.aws`
 /// label ([`API_AWS_ENDPOINT_SERVICE_PREFIX`]).
 ///
@@ -3185,13 +3215,18 @@ impl EndpointServiceRecord {
             base_endpoint_dns_names: Some(self.base_endpoint_dns_names.clone()),
             private_dns_name: self.private_dns_name.clone(),
             // "The private DNS names assigned to the VPC endpoint service"
-            // (`ServiceDetail$PrivateDnsNames`): the same name the member above carries, so a
-            // service with none reports neither rather than an empty list beside an absent
-            // name.
-            private_dns_names: self.private_dns_name.as_ref().map(|private_dns_name| {
-                vec![PrivateDnsDetails {
-                    private_dns_name: Some(private_dns_name.clone()),
-                }]
+            // (`ServiceDetail$PrivateDnsNames`): every name the service publishes for the one
+            // default public DNS name above ([`published_private_dns_names`]) — a service
+            // under `<host>.<region>.amazonaws.com` answers the same API on its dual-stack
+            // `<host>.<region>.api.aws` name — so a service with none reports neither rather
+            // than an empty list beside an absent name.
+            private_dns_names: self.private_dns_name.as_deref().map(|private_dns_name| {
+                published_private_dns_names(private_dns_name)
+                    .into_iter()
+                    .map(|private_dns_name| PrivateDnsDetails {
+                        private_dns_name: Some(private_dns_name),
+                    })
+                    .collect()
             }),
             vpc_endpoint_policy_supported: Some(self.vpc_endpoint_policy_supported),
             acceptance_required: Some(self.acceptance_required),
@@ -3230,10 +3265,15 @@ impl EndpointServiceRecord {
 pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
     let zones = availability_zones_in_region(region);
     let record_of = |prefix: &str,
+                     scope: &str,
                      service: &AwsEndpointService,
                      service_type: &str|
      -> EndpointServiceRecord {
-        let service_name = format!("{prefix}{region}.{}", service.label);
+        // `scope` is the second component of the name: the Region for a service each Region
+        // offers of its own, and [`GLOBAL_ENDPOINT_SERVICE_SCOPE`] for one Amazon Web Services
+        // answers from a single global estate. Everything else a reported entry carries is the
+        // asking Region's, a consumer reaching the service from a VPC of this Region.
+        let service_name = format!("{prefix}{scope}.{}", service.label);
         // The DOMAIN this service's default public DNS name sits under follows the family
         // its name belongs to ([`public_dns_suffix`]): `com.amazonaws.<region>.<label>`
         // answers on `<host>.<region>.amazonaws.com`, and the two families named under the
@@ -3316,16 +3356,21 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
         }
     };
     let mut records: Vec<EndpointServiceRecord> = Vec::new();
-    for (prefix, catalogue) in [
-        (AWS_ENDPOINT_SERVICE_PREFIX, AWS_ENDPOINT_SERVICES),
-        (AWS_API_ENDPOINT_SERVICE_PREFIX, AWS_API_ENDPOINT_SERVICES),
-        (API_AWS_ENDPOINT_SERVICE_PREFIX, API_AWS_ENDPOINT_SERVICES),
+    for (prefix, scope, catalogue) in [
+        (AWS_ENDPOINT_SERVICE_PREFIX, region, AWS_ENDPOINT_SERVICES),
+        (AWS_API_ENDPOINT_SERVICE_PREFIX, region, AWS_API_ENDPOINT_SERVICES),
+        (
+            AWS_API_ENDPOINT_SERVICE_PREFIX,
+            GLOBAL_ENDPOINT_SERVICE_SCOPE,
+            AWS_API_GLOBAL_ENDPOINT_SERVICES,
+        ),
+        (API_AWS_ENDPOINT_SERVICE_PREFIX, region, API_AWS_ENDPOINT_SERVICES),
     ] {
         for service in catalogue {
             // One record per endpoint type the label is reachable through: each is an
             // endpoint service of its own.
             for service_type in service.types {
-                records.push(record_of(prefix, service, service_type));
+                records.push(record_of(prefix, scope, service, service_type));
             }
         }
     }
@@ -3493,8 +3538,11 @@ pub fn endpoint_service_name_is_offered(
         return true;
     }
     // A name whose own Region label is not the Region hosting the service names nothing: the
-    // catalogue of a Region holds the names of that Region.
-    if parsed.region != region {
+    // catalogue of a Region holds the names of that Region. A GLOBALLY scoped name carries no
+    // Region at all ([`GLOBAL_ENDPOINT_SERVICE_SCOPE`]) and names one service every Region's
+    // endpoint offers, so it is held to no Region here and resolved against the catalogue
+    // below like any other published name.
+    if parsed.region != GLOBAL_ENDPOINT_SERVICE_SCOPE && parsed.region != region {
         return false;
     }
     if service_name.starts_with(AWS_ENDPOINT_SERVICE_PREFIX)
@@ -3653,10 +3701,25 @@ pub fn endpoint_service_private_dns_names(
     let Some(private_dns_name) = endpoint_service_private_dns_name(store, service_name) else {
         return Vec::new();
     };
+    published_private_dns_names(&private_dns_name)
+}
+
+/// Every name private DNS resolves for a service whose default public DNS name is
+/// `private_dns_name`, in the order an endpoint to it and the service catalog both report
+/// them.
+///
+/// A service Amazon Web Services publishes under `<host>.<region>.amazonaws.com` answers the
+/// same API on its dual-stack name `<host>.<region>.api.aws`
+/// ([`API_SERVICE_DNS_SUFFIX`]), so BOTH names are the service's own: the catalog reports
+/// them under `ServiceDetail$PrivateDnsNames` and an endpoint with private DNS on intercepts
+/// each. A name already under that domain, or one an OWNER published for a service of its
+/// own, is the one name there is. The ONE derivation of that set, so the service catalog and
+/// the endpoint cannot disagree about which names a service publishes.
+pub fn published_private_dns_names(private_dns_name: &str) -> Vec<String> {
     let dual_stack = private_dns_name
         .strip_suffix(SERVICE_DNS_SUFFIX)
         .map(|host| format!("{host}{API_SERVICE_DNS_SUFFIX}"));
-    ::std::iter::once(private_dns_name)
+    ::std::iter::once(private_dns_name.to_string())
         .chain(dual_stack)
         .collect()
 }

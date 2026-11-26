@@ -200,10 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // id, so it is the crate's one wording of `UnsupportedOperation` for a
                     // published list rather than the not-found an unresolvable id earns.
                     if state::region_publishes_prefix_list(&region, &input.prefix_list_id) {
-                        return Err(state::published_prefix_list_unsupported(
-                            &input.prefix_list_id,
-                            "restored",
-                        ));
+                        return Err(state::published_prefix_list_unsupported());
                     }
                     // This operation RESOLVES one managed prefix list the caller names, the
                     // way the describe, the read of its entries and the delete do, so it

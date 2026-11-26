@@ -218,6 +218,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(state::prefix_list_does_not_exist(&input.prefix_list_id));
         }
+        // A list the REGION publishes for one of its services is visible to this caller but is
+        // not the account's: "the ID of the owner of the prefix list"
+        // (`ManagedPrefixList$OwnerId`) is Amazon Web Services itself, and no action of this
+        // account reaches one — reporting what references it included. That is a refusal about
+        // the resource rather than about the id, so it is the crate's one wording of
+        // `UnsupportedOperation` for a published list, the one the revise, the restore and the
+        // delete of such a list answer.
+        if state::region_publishes_prefix_list(&region, &input.prefix_list_id) {
+            return Err(state::published_prefix_list_unsupported());
+        }
         let associations = prefix_list_associations(&store, &input.prefix_list_id);
         // The store's lock is not held across the paging below: every row is owned by now, and
         // nothing else about the store is read.
