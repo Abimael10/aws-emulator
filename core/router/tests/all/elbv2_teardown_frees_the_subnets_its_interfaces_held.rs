@@ -322,18 +322,22 @@ pub(crate) async fn interfaces_until(
 }
 
 /// One interface of the account, reduced to what the rows assert over.
+///
+/// `pub(crate)`, with [`describe_interface`], for the reason the rest of this harness is:
+/// `service_placed_interfaces_do_not_outlive_their_resource.rs` reads an interface off an id the
+/// same way rather than keeping a second reader that would drift from this one.
 #[derive(Debug)]
-struct Interface {
-    subnet: String,
-    interface_type: String,
-    requester: String,
-    requester_managed: String,
-    description: String,
+pub(crate) struct Interface {
+    pub(crate) subnet: String,
+    pub(crate) interface_type: String,
+    pub(crate) requester: String,
+    pub(crate) requester_managed: String,
+    pub(crate) description: String,
 }
 
 /// One interface as EC2 describes it when asked for exactly it, which is how a client reads an
 /// interface off an id a filter answered with.
-async fn describe_interface(router: &MultiServiceRouter, id: &str) -> Interface {
+pub(crate) async fn describe_interface(router: &MultiServiceRouter, id: &str) -> Interface {
     let body = ec2(
         router,
         "DescribeNetworkInterfaces",
