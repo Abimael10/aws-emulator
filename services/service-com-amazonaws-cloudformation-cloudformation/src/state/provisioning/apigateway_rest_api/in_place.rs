@@ -872,7 +872,10 @@ fn map_patches(
         }
         patches.push(patch(
             REPLACE,
-            &format!("{pointer}/{}", pointer_token(key)),
+            &format!(
+                "{pointer}/{}",
+                ::service_common::json_pointer::escaped_segment(key)
+            ),
             &attribute_text(value),
         ));
     }
@@ -882,7 +885,10 @@ fn map_patches(
         }
         patches.push(patch(
             REMOVE,
-            &format!("{pointer}/{}", pointer_token(key)),
+            &format!(
+                "{pointer}/{}",
+                ::service_common::json_pointer::escaped_segment(key)
+            ),
             "",
         ));
     }
@@ -921,12 +927,6 @@ fn entry_patches(before: Option<&Value>, now: Option<&Value>, pointer: &str) -> 
         }
     }
     patches
-}
-
-/// One token of a JSON Pointer: the key with the two characters a pointer reserves escaped as
-/// it requires (`~` as `~0`, `/` as `~1`).
-fn pointer_token(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
 }
 
 /// Whether the changed declaration states a property DIFFERENTLY that no call here writes —

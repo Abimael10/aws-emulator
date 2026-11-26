@@ -100,6 +100,18 @@ pub fn escaped_segment(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 
+/// The text one pointer segment stands for: [`escaped_segment`] read back, the separator's
+/// escape resolved BEFORE the tilde's (RFC 6901), so a segment that spells a literal `~1`
+/// reads back as that text rather than as a separator.
+///
+/// `pub` for the reason [`escaped_segment`] is: a service that spells a value the way a
+/// pointer segment is spelled also has to READ one a caller spelled that way — the resource
+/// path of a method-setting declaration, for one — and that is the same rule, stated once.
+#[must_use]
+pub fn decoded_segment(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +242,37 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a segment spells the text it was given — the two characters a pointer reserves
+    /// escaped — and reading that segment back answers that same text.
+    #[test]
+    fn a_segment_spells_its_text_and_reads_back_as_it() {
+        // The rows differ along which reserved characters the text carries, where they sit,
+        // and whether the text already READS like an escape.
+        let rows: [(&str, &str, &str); 8] = [
+            ("a plain name", "pets", "pets"),
+            ("a path name", "/pets/{id}", "~1pets~1{id}"),
+            ("a name carrying a tilde", "a~b", "a~0b"),
+            ("the separator escape as literal text", "~1", "~01"),
+            ("the tilde escape as literal text", "~0", "~00"),
+            ("both reserved characters", "~/", "~0~1"),
+            ("nothing at all", "", ""),
+            ("a verb", "GET", "GET"),
+        ];
+
+        for (case, text, expected) in rows {
+            let escaped = escaped_segment(text);
+            assert_eq!(
+                escaped, expected,
+                "case {case:?}: expected the segment {expected:?}, got {escaped:?}"
+            );
+            let read = decoded_segment(&escaped);
+            assert_eq!(
+                read, text,
+                "case {case:?}: expected the segment to read back as {text:?}, got {read:?}"
             );
         }
     }

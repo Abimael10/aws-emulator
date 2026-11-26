@@ -6,14 +6,14 @@
 //!
 //! RULE under test: **a `MethodSettings` entry configures the method its `ResourcePath` and
 //! `HttpMethod` name, and `Stage$methodSettings` keys what it configured by the method path
-//! the patch pointer the stack sends SPELLS — "method paths defined as
-//! {resource_path}/{http_method} for an individual method override, or /\*/\* for overriding
-//! all methods in the stage" with the resource half stated as the path NAME
-//! `MethodSetting$ResourcePath` documents ("the initial slash must include a forward slash",
-//! every separator inside it escaped `~1`). The key is therefore the one API Gateway reports
-//! for that method whichever way the declaration stated the path: `MethodSetting$ResourcePath`
-//! may state it already pointer-encoded, its initial slash included, or with its separators
-//! plain, and both state the one method.**
+//! the entry itself states — "method paths defined as {resource_path}/{http_method} for an
+//! individual method override, or /\*/\* for overriding all methods in the stage" — that is,
+//! the declared `ResourcePath` with its INITIAL separator dropped (the method path a key
+//! spells does not carry it) joined to the declared `HttpMethod`. Each half travels as one
+//! reference token of the patch pointer the stack sends, so a separator INSIDE the path name
+//! rides as the escape `PatchOperation$path` requires of one, and `MethodSetting$ResourcePath`
+//! may state the path already encoded that way or with its separators plain: both state the
+//! ONE method path, and so the one key.**
 //!
 //! Why it matters: a client reading per-method cache or logging settings off a
 //! CloudFormation-provisioned stage looks the method up. A stage that keyed the entry by the
@@ -52,25 +52,42 @@ const ROWS: &[Row] = &[
         case: "a child resource",
         resource_path: "/cached",
         http_method: "GET",
-        key: "~1cached/GET",
+        key: "cached/GET",
+    },
+    Row {
+        case: "a child resource stated with no initial separator",
+        resource_path: "orders",
+        http_method: "POST",
+        key: "orders/POST",
     },
     Row {
         case: "a nested resource path, stated plainly",
         resource_path: "/items/{id}",
         http_method: "PUT",
-        key: "~1items~1{id}/PUT",
+        key: "items~1{id}/PUT",
+    },
+    Row {
+        // The SAME method path as the row above, stated the other way the type documents: one
+        // method path, so one entry under the one key.
+        case: "that same nested resource path, stated encoded as the type documents",
+        resource_path: "/~1items~1{id}",
+        http_method: "PUT",
+        key: "items~1{id}/PUT",
     },
     Row {
         case: "a nested resource path, stated encoded as the type documents",
         resource_path: "/~1orders~1{id}",
         http_method: "DELETE",
-        key: "~1orders~1{id}/DELETE",
+        key: "orders~1{id}/DELETE",
     },
     Row {
+        // The root resource has no path name behind its separator, so the method path's
+        // resource half is empty. No recording states what a declaration of the ROOT resource
+        // is keyed by; this row pins the rule the recorded child case states, applied to it.
         case: "the root resource",
         resource_path: "/",
         http_method: "HEAD",
-        key: "~1/HEAD",
+        key: "/HEAD",
     },
     Row {
         case: "every method of the stage",
@@ -229,6 +246,9 @@ async fn a_declared_method_setting_is_reported_under_its_method_path() {
     reported.sort();
     let mut expected: Vec<String> = ROWS.iter().map(|row| row.key.to_string()).collect();
     expected.sort();
+    // Two declarations of ONE method path are one entry, so the key they share is expected
+    // once.
+    expected.dedup();
     assert_eq!(
         reported, expected,
         "case \"every declared entry\": expected the method paths {expected:?}, got {reported:?}"
