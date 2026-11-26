@@ -380,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                     ClientException {
-                        message: Some(message.to_string()),
+                        message: Some(message),
                     },
                 )
                 .into());
@@ -480,6 +480,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 definition.cpu,
                 definition.memory,
                 definition.memory_reservation,
+            ) {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // The `linuxParameters` values Amazon ECS publishes a closed catalog for: the
+            // Linux capabilities the container adds to or drops from the set Docker gives it,
+            // and the mount options of each tmpfs volume it mounts. The model targets a plain
+            // list for each, so a value outside its catalog reaches the handler and is
+            // refused here ([`crate::state::linux_parameters_violation`]).
+            if let Some(message) = crate::state::linux_parameters_violation(
+                crate::state::DeclaredLinuxParameters::of_linux_parameters(
+                    definition.linux_parameters.as_ref(),
+                ),
             ) {
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                     ClientException {
@@ -630,6 +647,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &credential_views,
             execution_role_arn.as_deref(),
         ) {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // And the STARTUP DEPENDENCIES the list declares, which are about the list as a
+        // whole in the same way: a container's start may wait for another of the list to pass
+        // its health check, and a container that declares no check is never probed, so such a
+        // dependency could never be met ([`crate::state::container_dependency_violation`]).
+        let dependency_views: Vec<crate::state::ContainerStartupDependencies<'_>> = input
+            .container_definitions
+            .iter()
+            .map(crate::state::ContainerStartupDependencies::of_container)
+            .collect();
+        if let Some(message) = crate::state::container_dependency_violation(&dependency_views) {
             return Err(RegisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
                     message: Some(message),

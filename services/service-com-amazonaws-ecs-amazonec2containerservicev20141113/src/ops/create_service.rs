@@ -1091,6 +1091,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = (cluster_name.clone(), name.clone());
         if let Some(existing) = guard.services.get(&key) {
+            // A service a delete is still draining away HOLDS the name until the drain
+            // finishes, and the name is free once it does — which is a different condition
+            // from a name an undeleted service holds, and Amazon ECS words it as the drain it
+            // is ([`crate::state::SERVICE_STILL_DRAINING_MESSAGE`]). Weighed before the
+            // idempotency token, since no create can be answered with a service that is on
+            // its way out.
+            if existing.status == crate::state::SERVICE_DRAINING {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::SERVICE_STILL_DRAINING_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
             if existing.status != crate::state::SERVICE_INACTIVE {
                 // "An identifier that you provide to ensure the idempotency of the
                 // request": the same token on the same service name is the SAME create,

@@ -154,6 +154,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// The changes are queued oldest transition first, so events about several tasks leave
     /// in the order the tasks moved rather than in the order the map happened to be walked.
+    ///
+    /// The same comparison is what tells the SERVICE SCHEDULER which of its tasks have just
+    /// STARTED, so the entry naming them on the service's own event stream is written from
+    /// here too ([`super::service_scheduler_task_reports`]): a task that moved into `RUNNING`
+    /// in this comparison is one the scheduler started at that instant, and one that moved
+    /// into it once is never announced twice.
     pub fn record_task_state_changes(&mut self, now: SystemTime) {
         let tasks = &self.tasks;
         self.published_task_status
@@ -162,6 +168,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // The launches a SERVICE lost in this comparison, as the action the scheduler took by
         // losing them names them: `(serviceArn, clusterArn, the instant it was lost at)`.
         let mut lost_launches: Vec<(String, String, SystemTime)> = Vec::new();
+        // And the tasks a service's scheduler STARTED in it, as the entries that account for
+        // them ([`super::service_scheduler_task_reports::ServiceTaskReport`]).
+        let mut started_tasks: Vec<ServiceTaskReport> = Vec::new();
         for task in self.tasks.values() {
             let reported = (task.last_status.clone(), task.desired_status.clone());
             let published = self.published_task_status.get(&task.task_arn);
@@ -187,6 +196,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }) {
                     lost_launches.push((service.arn.clone(), service.cluster_arn.clone(), at));
                 }
+            }
+            // A task that has reached `RUNNING` since the last comparison is a task the
+            // scheduler that placed it has STARTED, which is what the service's own event
+            // stream names it in.
+            let started = task.last_status == STATUS_RUNNING
+                && published.is_none_or(|(last, _)| last != STATUS_RUNNING);
+            if let Some(name) = task.service_name.as_deref().filter(|_| started) {
+                started_tasks.push(ServiceTaskReport {
+                    service: (task.cluster_name.clone(), name.to_string()),
+                    task_id: task.task_id.clone(),
+                    at,
+                });
             }
             observed.push((
                 task.task_arn.clone(),
@@ -220,6 +241,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
             self.pending_task_events.push_back(change);
         }
+        self.record_service_task_reports(started_tasks, tasks_started_message);
     }
 
     /// Take at most `limit` of the changes not yet published, oldest first.

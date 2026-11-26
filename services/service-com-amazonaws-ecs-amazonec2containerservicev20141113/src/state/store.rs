@@ -3162,9 +3162,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         task_arns.sort();
         let name = service.name.clone();
         let service_arn = service.arn.clone();
+        // The RUNNING tasks this drain is about to stop, which the scheduler names on the
+        // service's own event stream exactly as it names the ones it retires from a task set
+        // ([`super::service_drain`]): the delete is what stops them, so the account of it
+        // belongs to this pass.
+        let stopped = self.draining_task_stops(key, &task_arns, now);
         for arn in &task_arns {
             self.stop_service_task(arn, now, &format!("Service {name} was deleted"));
         }
+        self.record_service_task_reports(stopped, tasks_stopped_message);
         let Some(service) = self.services.get_mut(key) else {
             return;
         };
@@ -3745,34 +3751,34 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
         // A task of a superseded deployment is one the service no longer wants, so the
         // rollout replaces it — unless its caller has taken it out of the scheduler's reach
-        // ([`Self::stop_unprotected_service_tasks`]), or the floor still needs it running.
-        let replacement_reason = format!("Task stopped by deployment {}", service.deployment_id);
-        self.stop_unprotected_service_tasks(
+        // ([`Self::retire_unprotected_service_tasks`]), or the floor still needs it running.
+        // The stop is the SCHEDULER's, so it carries the scheduler's one sentence, built from
+        // the deployment that started each retired task rather than from the one replacing it
+        // ([`super::service_scheduler_task_reports`]).
+        self.retire_unprotected_service_tasks(
             replaced_coming_up.iter().rev().map(String::as_str),
             replaced_coming_up.len(),
+            &service.deployment_id,
             now,
-            &replacement_reason,
         );
         if retirement.retire {
-            self.stop_unprotected_service_tasks(
+            self.retire_unprotected_service_tasks(
                 replaced_running.iter().rev().map(String::as_str),
                 room.running_stops,
+                &service.deployment_id,
                 now,
-                &replacement_reason,
             );
         }
         if live.len() > desired {
             // Scaling in stops the newest tasks of the deployment first: nothing here
             // runs on a container instance or in an Availability Zone, so there is no
-            // placement balance to break the tie, and newest-first is deterministic.
-            self.stop_unprotected_service_tasks(
+            // placement balance to break the tie, and newest-first is deterministic. The
+            // same scheduler stop, so the same sentence.
+            self.retire_unprotected_service_tasks(
                 live.iter().rev().map(String::as_str),
                 live.len() - desired,
+                &service.deployment_id,
                 now,
-                &format!(
-                    "Scaling activity initiated by deployment {}",
-                    service.deployment_id
-                ),
             );
         }
         Ok(())

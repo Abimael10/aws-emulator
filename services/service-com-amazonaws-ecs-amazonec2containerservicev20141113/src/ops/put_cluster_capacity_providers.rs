@@ -320,26 +320,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the capacity provider must already be created." A name that resolves to
         // nothing is refused BEFORE the association is written, so the cluster is never
         // left pointing at a provider that cannot exist. Both lists are checked, in the
-        // order the request declares them.
-        let named_providers = input.capacity_providers.iter().chain(
-            input
-                .default_capacity_provider_strategy
-                .iter()
-                .map(|item| &item.capacity_provider),
-        );
-        for name in named_providers {
-            if guard.capacity_provider(name, &region).is_none() {
-                return Err(
-                    PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(
-                                crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        // order the request declares them, and both earn the one sentence the operation
+        // publishes for a provider it could not resolve.
+        //
+        // `capacityProviders` is "The name of one or more capacity providers to associate
+        // with the cluster": ONE provider is ONE entry of that association, so an entry
+        // naming a provider an earlier entry already associated resolves no further provider
+        // and earns that same refusal. The entries are compared on the provider each one
+        // RESOLVED to — which is what `associating` collects as it walks them — so what is
+        // weighed is the provider and not the spelling.
+        let mut associating = ::std::collections::HashSet::new();
+        let mut unresolved = false;
+        for name in &input.capacity_providers {
+            unresolved |= !guard
+                .capacity_provider(name, &region)
+                .is_some_and(|provider| associating.insert(provider.name));
+        }
+        for item in &input.default_capacity_provider_strategy {
+            unresolved |= guard
+                .capacity_provider(&item.capacity_provider, &region)
+                .is_none();
+        }
+        if unresolved {
+            return Err(
+                PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
 
         // "Any existing capacity providers that are associated with a cluster that are

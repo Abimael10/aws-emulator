@@ -1244,8 +1244,8 @@ async fn disabling_a_setting_the_principal_does_not_hold_is_refused_and_changes_
             setup: vec![(
                 "PutAccountSetting",
                 json!({
-                    "name": "taskLongArnFormat",
-                    "value": "disabled",
+                    "name": "awsvpcTrunking",
+                    "value": "enabled",
                 }),
             )],
             request: json!({ "name": "serviceLongArnFormat" }),

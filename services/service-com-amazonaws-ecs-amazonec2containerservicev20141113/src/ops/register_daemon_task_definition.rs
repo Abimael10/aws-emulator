@@ -286,6 +286,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+            // The `linuxParameters` values held to the catalog each member publishes, exactly
+            // as the plain registration's own containers are: the daemon's `linuxParameters`
+            // is its own shape, and the members these rules read are the same
+            // ([`crate::state::linux_parameters_violation`]).
+            if let Some(message) = crate::state::linux_parameters_violation(
+                crate::state::DeclaredLinuxParameters::of_daemon_linux_parameters(
+                    definition.linux_parameters.as_ref(),
+                ),
+            ) {
+                return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             if !names.insert(name.to_string()) {
                 return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                     ClientException {
@@ -314,6 +330,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &credential_views,
             execution_role_arn.as_deref(),
         ) {
+            return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // And the STARTUP DEPENDENCIES the list declares, shared with the plain registration
+        // for the same reason: a container's start may wait for another of the list to pass
+        // its health check, and a container that declares no check is never probed
+        // ([`crate::state::container_dependency_violation`]).
+        let dependency_views: Vec<crate::state::ContainerStartupDependencies<'_>> = input
+            .container_definitions
+            .iter()
+            .map(crate::state::ContainerStartupDependencies::of_daemon_container)
+            .collect();
+        if let Some(message) = crate::state::container_dependency_violation(&dependency_views) {
             return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                 ClientException {
                     message: Some(message),

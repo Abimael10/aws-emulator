@@ -557,15 +557,26 @@ async fn a_rollout_reaches_its_steady_state_on_the_clock_and_writes_its_events()
             "case {case:?}: expected every placed task RUNNING, got {settled}"
         );
         let messages = event_messages(&settled, case);
+        // The two entries the steady state writes, plus the ONE the scheduler wrote for each
+        // task it started: a rollout of no tasks started none and writes only the two.
         assert_eq!(
             messages.len(),
-            2,
+            2 + desired as usize,
             "case {case:?}: reaching a steady state writes the deployment-completed and \
-             steady-state events, got {messages:?}"
+             steady-state events beside the scheduler's entry per started task, got \
+             {messages:?}"
         );
         assert!(
             messages[0].contains("steady state") && messages[1].contains("deployment completed"),
             "case {case:?}: the event stream reads newest first, got {messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("has started"))
+                .count(),
+            desired as usize,
+            "case {case:?}: the scheduler names each task it started, got {messages:?}"
         );
         let events = list(&settled, "events", case);
         assert!(
@@ -606,26 +617,31 @@ async fn a_rollout_reaches_its_steady_state_on_the_clock_and_writes_its_events()
         "IN_PROGRESS",
         "case {case:?}: a new deployment begins IN_PROGRESS, got {updated}"
     );
+    // The service runs ONE task, so the first rollout left three entries: the scheduler's
+    // start entry for that task and the two the steady state wrote.
     assert_eq!(
         event_messages(&updated, case).len(),
-        2,
+        3,
         "case {case:?}: the service keeps the events it already recorded, got {updated}"
     );
     // The rollout that REPLACES the task set the service already holds takes one step per
-    // task it replaces, so the second steady state is polled for rather than timed.
+    // task it replaces, so the second steady state is polled for rather than timed. It adds
+    // the start entry of the replacement it launched, the entry for the task it retired, and
+    // its own two.
     let settled = poll_until(
         &router,
         "settling",
         "web1",
         case,
         "the second steady state to be reached",
-        |view| event_messages(view, case).len() >= 4,
+        |view| event_messages(view, case).len() >= 7,
     )
     .await;
     assert_eq!(
         event_messages(&settled, case).len(),
-        4,
-        "case {case:?}: the second steady state appends its own two events, got {settled}"
+        7,
+        "case {case:?}: the second steady state appends the replacement's start entry, the \
+         retirement of the task it replaced and its own two events, got {settled}"
     );
 }
 

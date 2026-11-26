@@ -800,7 +800,9 @@ pub fn setting_view(name: &str, value: &str, principal_arn: &str) -> Setting {
 /// Shared by `PutAccountSetting` and `PutAccountSettingDefault`, so the same value is
 /// accepted or refused whichever of them a client calls. The sentence names the MEMBER at
 /// fault and nothing else: neither the value the request carried nor the set of values the
-/// setting accepts, both of which a caller reads out of the API reference.
+/// setting accepts, both of which a caller reads out of the API reference. The one exception
+/// is a setting the account may no longer turn off, which Amazon ECS states in its own
+/// sentence ([`LONG_ARN_FORMAT_PERMANENT_MESSAGE`]).
 pub fn validate_account_setting_value(name: &str, value: &str) -> Result<(), String> {
     let Some(spec) = account_setting_spec(name) else {
         // Unreachable from the wire: `name` targets the closed `SettingName` enum, which
@@ -810,8 +812,43 @@ pub fn validate_account_setting_value(name: &str, value: &str) -> Result<(), Str
     if !spec.accepted_values.contains(&value) {
         return Err(invalid_setting_message("value"));
     }
+    // A value the setting takes can still be one the setting may no longer be put ON: the
+    // long ARN and resource-id format is permanently in effect, so a write that turns one of
+    // those settings off is refused ([`LONG_ARN_FORMAT_SETTINGS`]).
+    if LONG_ARN_FORMAT_SETTINGS.contains(&name) && SETTING_OFF_VALUES.contains(&value) {
+        return Err(LONG_ARN_FORMAT_PERMANENT_MESSAGE.to_string());
+    }
     Ok(())
 }
+
+/// The account settings that choose the ARN and resource-ID FORMAT of a resource type, which
+/// `PutAccountSetting$name` describes with one shared sentence: "When modified, the Amazon
+/// Resource Name (ARN) and resource ID format of the resource type for a specified user,
+/// role, or the root user for an account is affected." They are the members of `SettingName`
+/// whose names end in `LongArnFormat`
+/// (`smithy_query(query="shape",shape="SettingName")`), one per resource type, and each is
+/// `enabled` for every account ([`ACCOUNT_SETTINGS`]).
+pub const LONG_ARN_FORMAT_SETTINGS: [&str; 3] = [
+    "serviceLongArnFormat",
+    "taskLongArnFormat",
+    "containerInstanceLongArnFormat",
+];
+
+/// The values that turn a toggle account setting OFF, of the four `PutAccountSetting$value`
+/// documents for one ("Accepted values are `enabled`, `disabled`, `enhanced`, `on`, and
+/// `off`"): the two that state the feature is not in effect.
+const SETTING_OFF_VALUES: [&str; 2] = ["disabled", "off"];
+
+/// `InvalidParameterException$message` for a write that would turn one of the long ARN and
+/// resource-ID format settings off ([`LONG_ARN_FORMAT_SETTINGS`]).
+///
+/// That format is permanently in effect for every account — "You must turn on this setting to
+/// use Amazon ECS features such as resource tagging", and the features that require it are
+/// no longer optional — so the only value such a setting may be written with is one that
+/// leaves it on, and a write of either off value is refused however it is spelled. ONE fixed
+/// sentence, naming neither the setting nor the value the request carried. RECORDED
+/// behaviour, with no trailing period.
+pub const LONG_ARN_FORMAT_PERMANENT_MESSAGE: &str = "You can no longer disable Long Arn settings";
 
 /// `InvalidParameterException$message` for an account-setting member whose value is not
 /// one the named setting takes: `Invalid setting '<member>'`.
@@ -2108,6 +2145,19 @@ pub fn client_token_violation(token: &str) -> Option<String> {
 /// Shared by every create that takes a `clientToken` BESIDE the service name, so those
 /// operations cannot word the class differently.
 pub const SERVICE_CREATION_NOT_IDEMPOTENT_MESSAGE: &str = "Creation of service was not idempotent.";
+
+/// `InvalidParameterException$message` for a create of a service name whose PREDECESSOR is
+/// still draining away.
+///
+/// `DeleteService` leaves a service that still holds tasks `DRAINING` and only later
+/// `INACTIVE` ("After all tasks have transitioned to either STOPPING or STOPPED status, the
+/// service status moves from DRAINING to INACTIVE"), and the name belongs to that service
+/// until it does: so a create of the same name while it drains is refused for the drain —
+/// the name becomes free on its own — rather than reported as a create that was not
+/// idempotent ([`SERVICE_CREATION_NOT_IDEMPOTENT_MESSAGE`], which is what a name an
+/// undeleted service holds earns). ONE fixed sentence, naming neither the service nor the
+/// cluster. RECORDED behaviour.
+pub const SERVICE_STILL_DRAINING_MESSAGE: &str = "Unable to Start a service that is still Draining.";
 
 /// The refusal a service name the cluster already holds a service under earns from a
 /// create that carries NO idempotency token: `CreateExpressGatewayService` models no

@@ -297,12 +297,14 @@ async fn a_created_service_reports_a_rollout_that_has_taken_nothing_over_yet() {
         );
 
         // Every event the rollout wrote carries an id spelled as a UUID, and no two
-        // events share one.
+        // events share one. The stream holds the two the steady state wrote plus the ONE
+        // the scheduler wrote for each task it started.
         let events = list(&settled, "events", case);
         assert_eq!(
             events.len(),
-            2,
-            "case {case:?}: reaching a steady state writes two events, got {settled}"
+            2 + desired as usize,
+            "case {case:?}: reaching a steady state writes two events, beside the \
+             scheduler's entry per started task, got {settled}"
         );
         for event in &events {
             let id = string(event, "id", case);

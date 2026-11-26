@@ -425,6 +425,25 @@ pub use log_driver_init::*;
 mod container_credentials;
 pub use container_credentials::*;
 
+/// The STARTUP DEPENDENCIES those containers declare: the condition one container waits for
+/// another on, and the one condition that can only be met by a container that is probed.
+mod container_dependencies;
+pub use container_dependencies::*;
+
+/// The Linux KERNEL CAPABILITIES a container definition adds to or drops from the default
+/// set, and the names those two members take.
+mod kernel_capabilities;
+pub use kernel_capabilities::*;
+
+/// The MOUNT OPTIONS of a tmpfs volume such a container mounts.
+mod tmpfs_mount_options;
+pub use tmpfs_mount_options::*;
+
+/// The `linuxParameters` ONE container definition declares, as the rules about those two
+/// members read it — off either of the two container shapes this API declares.
+mod linux_parameters;
+pub use linux_parameters::*;
+
 /// The container data plane: which containers are running, what signal a stop sends them,
 /// and the exit code a run records.
 mod container_runtime;
@@ -498,9 +517,19 @@ pub use exec_sessions::*;
 mod unhealthy_task_replacement;
 pub use unhealthy_task_replacement::*;
 
+/// The DRAIN a delete starts: the tasks it stops, and the account the scheduler gives of
+/// stopping them.
+mod service_drain;
+
 /// The service scheduler's steady state: the replacement a service's stopped task earns,
 /// and the standalone task that earns none.
 mod service_steady_state;
+
+/// What that scheduler REPORTS about the tasks it starts and retires: the entries naming each
+/// started and each retired task on the service's event stream, and the `stoppedReason` of a
+/// task it took out of the set.
+mod service_scheduler_task_reports;
+pub use service_scheduler_task_reports::*;
 
 /// The task sets of a service a controller other than the ECS scheduler deploys through:
 /// the original application task set Amazon ECS creates for a CodeDeploy-controlled

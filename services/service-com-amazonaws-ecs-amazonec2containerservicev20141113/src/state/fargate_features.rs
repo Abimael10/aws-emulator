@@ -3,7 +3,7 @@
 //! The container-definition and volume features FARGATE capacity provides nothing for.
 //!
 //! A Fargate task runs on capacity Amazon ECS owns, so a revision may only declare what
-//! that capacity can present to a container. Two members name something the CALLER's own
+//! that capacity can present to a container. The members below name something the CALLER's own
 //! container instance would have to supply, and each member's own documentation says so:
 //!
 //! * `ResourceRequirement$type` `GPU` is "the number of physical `GPUs` the Amazon ECS
@@ -12,6 +12,8 @@
 //! * `HostVolumeProperties$sourcePath` is "the path on the host container instance that's
 //!   presented to the container", and the member adds "If you're using the Fargate launch
 //!   type, the `sourcePath` parameter is not supported."
+//! * the `linuxParameters` members that configure the HOST the container runs on, each of
+//!   which says the same of itself ([`FARGATE_UNSUPPORTED_LINUX_PARAMETERS`]).
 //!
 //! So the rule is read BOTH ways from here, as one statement of it: a registration that
 //! REQUIRES Fargate and declares one of these is refused before any revision exists
@@ -21,6 +23,7 @@
 //! disagree.
 
 use super::*;
+use crate::ops::types::LinuxParameters;
 
 /// The `ResourceType` naming a physical device the container instance attaches
 /// (`smithy_query(query="shape",shape="ResourceType")`: `GPU`, `InferenceAccelerator`,
@@ -34,9 +37,111 @@ pub const FARGATE_GPU_UNSUPPORTED_MESSAGE: &str =
     "Tasks using the Fargate launch type do not support GPU resource requirements.";
 
 /// `ClientException$message` for a Fargate registration that bind-mounts a path of a
-/// container instance, which Amazon ECS states by naming the one member that asked for it.
+/// container instance, which Amazon ECS states by naming the one member that asked for it
+/// ([`fargate_unsupported_member_message`]).
 pub const FARGATE_SOURCE_PATH_UNSUPPORTED_MESSAGE: &str =
     "Fargate compatible task definitions do not support sourcePath";
+
+/// `ClientException$message` for a Fargate registration that declares a member Fargate
+/// capacity supports nothing for: the one sentence this API states for the class, naming the
+/// MEMBER at fault and nothing else of the request — the member is the one thing the caller
+/// has to take out.
+pub fn fargate_unsupported_member_message(member: &str) -> String {
+    format!("Fargate compatible task definitions do not support {member}")
+}
+
+/// ONE `linuxParameters` member a launch type provides nothing for: the member's name as the
+/// API spells it, and the reading that answers whether a container DECLARED it.
+pub type UnsupportedLinuxParameter = (&'static str, fn(&LinuxParameters) -> bool);
+
+/// The `linuxParameters` members a Fargate task's capacity provides nothing for, in the order
+/// `LinuxParameters` declares them, each with its own doc saying so:
+///
+/// * `devices` — "If you're using tasks that use the Fargate launch type, the `devices`
+///   parameter isn't supported."
+/// * `sharedMemorySize` — "If you are using tasks that use the Fargate launch type, the
+///   `sharedMemorySize` parameter is not supported."
+/// * `maxSwap` — "If you're using tasks that use the Fargate launch type, the `maxSwap`
+///   parameter isn't supported."
+/// * `swappiness` — "If you're using tasks that use the Fargate launch type, the `swappiness`
+///   parameter isn't supported."
+///
+/// Each names something of the HOST a container runs on — a device of the instance, the size
+/// of its shared-memory volume, and how it swaps — which is the instance's own and not the
+/// container's, so a Fargate task has none of it to configure.
+///
+/// Each member is paired with the reading that finds it DECLARED, so a member added here
+/// cannot be read as another one's: the pair is the whole of the rule for that member.
+pub const FARGATE_UNSUPPORTED_LINUX_PARAMETERS: [UnsupportedLinuxParameter; 4] = [
+    ("devices", |parameters: &LinuxParameters| {
+        parameters
+            .devices
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+    }),
+    ("sharedMemorySize", |parameters: &LinuxParameters| {
+        parameters.shared_memory_size.is_some()
+    }),
+    ("maxSwap", |parameters: &LinuxParameters| {
+        parameters.max_swap.is_some()
+    }),
+    ("swappiness", |parameters: &LinuxParameters| {
+        parameters.swappiness.is_some()
+    }),
+];
+
+/// The one Linux capability a Fargate task may ADD to the set Docker gives its containers.
+/// `KernelCapabilities$add`: "Tasks launched on Fargate only support adding the `SYS_PTRACE`
+/// kernel capability." Dropping capabilities is not bounded that way — the member's own doc
+/// bounds only `add` — so `drop` keeps the whole catalog.
+pub const FARGATE_ADDABLE_CAPABILITY: &str = "SYS_PTRACE";
+
+/// `ClientException$message` for a Fargate registration that adds a capability other than
+/// [`FARGATE_ADDABLE_CAPABILITY`], which Amazon ECS states by naming the capability: that name
+/// is the one value the caller has to take out. RECORDED behaviour, trailing period included.
+pub fn fargate_capability_not_allowed_message(capability: &str) -> String {
+    format!("{capability} is not allowed on Fargate.")
+}
+
+/// The first capability any container of `containers` ADDS that a Fargate task may not add, or
+/// `None` when none of them adds one.
+///
+/// Only a name the member's own catalog holds is weighed here
+/// ([`super::KERNEL_CAPABILITY_VALUES`]): a name outside that catalog names no capability at
+/// all, which is the condition the member states for every launch type
+/// ([`super::kernel_capabilities_violation`]), so it is left to that rule rather than reported
+/// as a capability Fargate does not allow.
+pub fn fargate_unsupported_added_capability(containers: &[ContainerDefinition]) -> Option<&str> {
+    containers
+        .iter()
+        .filter_map(|container| container.linux_parameters.as_ref())
+        .filter_map(|parameters| parameters.capabilities.as_ref())
+        .flat_map(|capabilities| capabilities.add.iter().flatten())
+        .map(String::as_str)
+        .find(|name| {
+            *name != FARGATE_ADDABLE_CAPABILITY && super::KERNEL_CAPABILITY_VALUES.contains(name)
+        })
+}
+
+/// The first `linuxParameters` member of `containers` that Fargate capacity provides nothing
+/// for, in the order [`FARGATE_UNSUPPORTED_LINUX_PARAMETERS`] declares them — or `None` when
+/// no container declares one.
+///
+/// A member is DECLARED when the request carried it, whatever value it carried: each of them
+/// configures the host, so naming it at all asks Fargate for something it has none of.
+pub fn fargate_unsupported_linux_parameter(
+    containers: &[ContainerDefinition],
+) -> Option<&'static str> {
+    FARGATE_UNSUPPORTED_LINUX_PARAMETERS
+        .into_iter()
+        .find(|(_, declared)| {
+            containers
+                .iter()
+                .filter_map(|container| container.linux_parameters.as_ref())
+                .any(declared)
+        })
+        .map(|(member, _)| member)
+}
 
 /// Whether any container of the list reserves a GPU — `resourceRequirements` of type
 /// [`RESOURCE_TYPE_GPU`], whatever count it asks for.
@@ -71,16 +176,23 @@ pub fn binds_a_host_path(volumes: &[Volume]) -> bool {
 ///
 /// The members are weighed in the order the operation declares them,
 /// `containerDefinitions` before `volumes`, so the refusal a request earns never depends
-/// on anything but its values.
+/// on anything but its values — and within the container definitions, the reservation before
+/// the `linuxParameters` the shape declares after it.
 pub fn fargate_feature_violation(
     containers: &[ContainerDefinition],
     volumes: &[Volume],
-) -> Option<&'static str> {
+) -> Option<String> {
     if reserves_a_gpu(containers) {
-        return Some(FARGATE_GPU_UNSUPPORTED_MESSAGE);
+        return Some(FARGATE_GPU_UNSUPPORTED_MESSAGE.to_string());
+    }
+    if let Some(member) = fargate_unsupported_linux_parameter(containers) {
+        return Some(fargate_unsupported_member_message(member));
+    }
+    if let Some(capability) = fargate_unsupported_added_capability(containers) {
+        return Some(fargate_capability_not_allowed_message(capability));
     }
     if binds_a_host_path(volumes) {
-        return Some(FARGATE_SOURCE_PATH_UNSUPPORTED_MESSAGE);
+        return Some(FARGATE_SOURCE_PATH_UNSUPPORTED_MESSAGE.to_string());
     }
     None
 }
@@ -148,9 +260,139 @@ mod tests {
         for (case, containers, refused) in rows {
             let answer = fargate_feature_violation(containers, &[]);
             assert_eq!(
-                answer,
+                answer.as_deref(),
                 refused.then_some(FARGATE_GPU_UNSUPPORTED_MESSAGE),
                 "case {case:?}: expected refused == {refused}, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: a Fargate registration is refused for every `linuxParameters` member that
+    /// configures the HOST, naming the member, and accepted for the ones that configure the
+    /// container.
+    #[test]
+    fn a_host_linux_parameter_is_refused_on_fargate() {
+        use crate::ops::types::{Device, LinuxParameters};
+
+        /// A container whose `linuxParameters` are `parameters`.
+        fn declaring(parameters: LinuxParameters) -> ContainerDefinition {
+            ContainerDefinition {
+                linux_parameters: Some(parameters),
+                ..plain("app")
+            }
+        }
+
+        // (case, the parameters one container declares, the member the refusal names)
+        let rows: &[(&str, LinuxParameters, Option<&str>)] = &[
+            (
+                "a device of the instance",
+                LinuxParameters {
+                    devices: Some(vec![Device {
+                        host_path: "/dev/nvidia0".to_string(),
+                        container_path: None,
+                        permissions: None,
+                    }]),
+                    ..LinuxParameters::default()
+                },
+                Some("devices"),
+            ),
+            (
+                "the size of the shared-memory volume",
+                LinuxParameters {
+                    shared_memory_size: Some(64),
+                    ..LinuxParameters::default()
+                },
+                Some("sharedMemorySize"),
+            ),
+            (
+                "swap the instance would provide",
+                LinuxParameters {
+                    max_swap: Some(0),
+                    ..LinuxParameters::default()
+                },
+                Some("maxSwap"),
+            ),
+            (
+                "how the instance swaps",
+                LinuxParameters {
+                    swappiness: Some(60),
+                    ..LinuxParameters::default()
+                },
+                Some("swappiness"),
+            ),
+            (
+                "the members that configure the container itself",
+                LinuxParameters {
+                    init_process_enabled: Some(true),
+                    ..LinuxParameters::default()
+                },
+                None,
+            ),
+            (
+                "no device at all",
+                LinuxParameters {
+                    devices: Some(Vec::new()),
+                    ..LinuxParameters::default()
+                },
+                None,
+            ),
+        ];
+        for (case, parameters, member) in rows {
+            let containers = [declaring(parameters.clone())];
+            let answer = fargate_feature_violation(&containers, &[]);
+            assert_eq!(
+                answer,
+                member.map(fargate_unsupported_member_message),
+                "case {case:?}: expected {member:?} to be named, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: a Fargate registration may ADD only the one capability the member documents for
+    /// it, and may drop any of them.
+    #[test]
+    fn only_one_added_capability_is_allowed_on_fargate() {
+        use crate::ops::types::{KernelCapabilities, LinuxParameters};
+
+        /// A container adding `add` and dropping `drop`.
+        fn configuring(add: &[&str], drop: &[&str]) -> ContainerDefinition {
+            ContainerDefinition {
+                linux_parameters: Some(LinuxParameters {
+                    capabilities: Some(KernelCapabilities {
+                        add: Some(add.iter().map(|name| (*name).to_string()).collect()),
+                        drop: Some(drop.iter().map(|name| (*name).to_string()).collect()),
+                    }),
+                    ..LinuxParameters::default()
+                }),
+                ..plain("app")
+            }
+        }
+
+        /// One row of the table below: the case, the capabilities the container adds, the ones
+        /// it drops, and the capability the refusal names.
+        type Row<'a> = (&'a str, &'a [&'a str], &'a [&'a str], Option<&'a str>);
+
+        let rows: &[Row<'_>] = &[
+            ("the one capability Fargate allows", &[FARGATE_ADDABLE_CAPABILITY], &[], None),
+            ("adding nothing", &[], &["MKNOD", "ALL"], None),
+            ("another capability", &["NET_ADMIN"], &[], Some("NET_ADMIN")),
+            ("the whole default set", &["ALL"], &[], Some("ALL")),
+            (
+                "one Fargate allows beside one it does not",
+                &[FARGATE_ADDABLE_CAPABILITY, "SYS_ADMIN"],
+                &[],
+                Some("SYS_ADMIN"),
+            ),
+            // A name outside the member's own catalog is that rule's, not this one's.
+            ("a name no catalog holds", &["CAP_NET_ADMIN"], &[], None),
+        ];
+        for (case, add, drop, capability) in rows {
+            let containers = [configuring(add, drop)];
+            let answer = fargate_feature_violation(&containers, &[]);
+            assert_eq!(
+                answer,
+                capability.map(fargate_capability_not_allowed_message),
+                "case {case:?}: expected {capability:?} to be named, got {answer:?}"
             );
         }
     }
@@ -201,7 +443,7 @@ mod tests {
         for (case, volumes, refused) in rows {
             let answer = fargate_feature_violation(&[plain("app")], volumes);
             assert_eq!(
-                answer,
+                answer.as_deref(),
                 refused.then_some(FARGATE_SOURCE_PATH_UNSUPPORTED_MESSAGE),
                 "case {case:?}: expected refused == {refused}, got {answer:?}"
             );
