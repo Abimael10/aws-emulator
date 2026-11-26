@@ -1124,7 +1124,8 @@ fn object_rows() -> Vec<ObjectRow> {
         // identified by the object key", so the object is stored with the ACL the action names:
         // one row per value of `CannedAccessControlList`
         // (smithy_query(query="shape",shape="CannedAccessControlList")) that a bucket left at
-        // its own default ownership setting takes, which is the owner's own access.
+        // its own default ownership setting takes, which is an ACL leaving the bucket owner in
+        // full control of the object and granting nobody else anything.
         ObjectRow::new("an action naming the private canned ACL", LITERAL_KEY, LITERAL_KEY)
             .with_acl("private"),
         ObjectRow::new(
@@ -1133,17 +1134,17 @@ fn object_rows() -> Vec<ObjectRow> {
             LITERAL_KEY,
         )
         .with_acl("bucket-owner-full-control"),
+        // A bucket left at its own default ownership setting disables ACLs, and such a bucket
+        // "only accept[s] PUT requests that don't specify an ACL or PUT requests that specify
+        // bucket owner full control ACLs" — this value is one of them: it gives the object
+        // owner FULL_CONTROL and the bucket owner READ, and under that setting those are the
+        // same account, so it reaches nobody else and the object store takes the write.
         ObjectRow::new(
             "an action naming the bucket-owner-read canned ACL",
             LITERAL_KEY,
             LITERAL_KEY,
         )
-        .with_acl("bucket-owner-read")
-        // A bucket left at its own default ownership setting takes no ACL beyond the owner's
-        // own access ("PUT requests that specify bucket owner full control ACLs … are allowed;
-        // requests that contain other ACLs … fail and return a 400 error"), so the object store
-        // REFUSES this write — which is the action failing, and nothing is stored.
-        .storing_nothing(),
+        .with_acl("bucket-owner-read"),
         ObjectRow::new(
             "an action whose role grants another action on the object",
             LITERAL_KEY,

@@ -682,19 +682,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             requested.clone()
         };
         // The ACL this copy asks the DESTINATION object to be stored with is judged against
-        // that bucket's ownership exactly as `PutObject` judges its own: "buckets that use
-        // this setting only accept PUT requests that don't specify an ACL or PUT requests
-        // that specify bucket owner full control ACLs … PUT requests that contain other ACLs
-        // … fail and return a 400 error with the error code AccessControlListNotSupported"
-        // (`CopyObjectRequest$ACL`). A bucket whose ACLs are disabled therefore refuses a
-        // copy that names one, before anything is written, so a request S3 would not serve
-        // cannot leave an object behind here.
-        if destination.acls_disabled() && names_an_acl(&input) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::ACL_NOT_SUPPORTED_CODE,
-                crate::state::ACL_REFUSAL_STATUS,
-                crate::state::ACL_NOT_SUPPORTED_MESSAGE,
-            ));
+        // that bucket's ownership exactly as `PutObject` judges its own, through the one gate
+        // every object write shares
+        // ([`crate::service::object_write::disabled_acl_refusal`] carries the rule): a bucket
+        // whose ACLs are disabled refuses a copy naming an ACL that reaches beyond its owner,
+        // before anything is written, so a request S3 would not serve cannot leave an object
+        // behind here — while an owner-only ACL, which grants nobody but that owner anything,
+        // is accepted and stored.
+        if let Some(refusal) = crate::service::object_write::disabled_acl_refusal(
+            destination,
+            input.acl.as_deref(),
+            requested_acl_grants(&input).as_deref(),
+        ) {
+            return Err(refusal);
         }
 
         // A retention and a legal hold are the two halves of S3 Object Lock, which a bucket
@@ -1527,56 +1527,26 @@ const DIRECTIVE_REPLACE: &str = "REPLACE";
 /// the copy carries over.
 const DIRECTIVE_EXCLUDE: &str = "EXCLUDE";
 
-/// Whether this copy names an access control list the DESTINATION object would carry beyond
-/// the one its owner already has.
-///
-/// "Buckets that use [the bucket-owner-enforced] setting only accept PUT requests that don't
-/// specify an ACL or PUT requests that specify bucket owner full control ACLs"
-/// (`CopyObjectRequest$ACL`), so what decides it is the ACL the request DESCRIBES rather
-/// than the spelling it used: the canned value is expanded through the one expansion every
-/// object ACL in this service is read by ([`crate::state::object_canned_acl_grants`]) and the
-/// explicit grant headers are parsed through the one parse every grant header is read by
-/// ([`crate::state::acl_grants_from_header`]), and the result is compared with the owner's
-/// own ACL ([`crate::state::default_acl_grants`]) — which is the ACL the object already has,
-/// and the one `PutObject` judges its own write by.
-fn names_an_acl(input: &CopyObjectInput) -> bool {
-    requested_acl_grants(input).is_some_and(|grants| grants != crate::state::default_acl_grants())
-}
-
 /// The grants this copy describes for the destination object, or `None` when it names no ACL
 /// at all.
 ///
 /// A canned ACL and the explicit grant headers are the two forms of one member
 /// (`CopyObjectRequest$ACL` against the four `x-amz-grant-*` headers the operation binds),
-/// and a request naming both is refused before this is read. A grant header whose value is
-/// no grantee contributes nothing: the request names an ACL either way, and WHICH grants it
-/// names is only asked of a bucket that accepts none.
+/// and a request naming both is refused before this is read. Each form is read through the
+/// one reading every object write of this service shares — the canned value through
+/// [`crate::state::object_canned_acl_grants`], the headers through
+/// [`crate::service::object_write::grants_from_headers`] — so a copy and a one-shot write
+/// naming the same ACL describe the same grants.
 fn requested_acl_grants(input: &CopyObjectInput) -> Option<Vec<crate::state::AclGrant>> {
     if let Some(canned) = input.acl.as_deref() {
         return crate::state::object_canned_acl_grants(canned);
     }
-    let mut grants: Vec<crate::state::AclGrant> = Vec::new();
-    for (value, permission) in [
-        (
-            input.grant_full_control.as_deref(),
-            crate::state::PERMISSION_FULL_CONTROL,
-        ),
-        (input.grant_read.as_deref(), crate::state::PERMISSION_READ),
-        (
-            input.grant_read_acp.as_deref(),
-            crate::state::PERMISSION_READ_ACP,
-        ),
-        (
-            input.grant_write_acp.as_deref(),
-            crate::state::PERMISSION_WRITE_ACP,
-        ),
-    ] {
-        let Some(value) = value else { continue };
-        grants.extend(
-            crate::state::acl_grants_from_header(value, permission).unwrap_or_default(),
-        );
-    }
-    (!grants.is_empty()).then_some(grants)
+    crate::service::object_write::grants_from_headers(
+        input.grant_full_control.as_deref(),
+        input.grant_read.as_deref(),
+        input.grant_read_acp.as_deref(),
+        input.grant_write_acp.as_deref(),
+    )
 }
 
 /// Whether this copy names explicit GRANTS for the object it writes — any of the four grant

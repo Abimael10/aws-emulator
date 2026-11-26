@@ -371,9 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `x-amz-tagging`, whose tag set is stored on the upload, nor the checksum
         // members, which name the algorithm the upload is configured for and are recorded
         // and reported as exactly that — a configuration, never a checksum value this
-        // handler did not compute. The ACL and `x-amz-grant-*` members are not refused
-        // either, for the same reason `PutObject` does not refuse them: this store keeps
-        // no per-object ACL, so nothing is claimed about them.
+        // handler did not compute. The ACL and `x-amz-grant-*` members are not refused as
+        // unserved either, for the same reason `PutObject` does not refuse them: this store
+        // keeps no per-object ACL, so nothing is claimed about them — what the ACL they name
+        // IS judged against is the addressed bucket's Object Ownership setting, below, the way
+        // every object write of this service judges it.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "CreateMultipartUpload with {unserved}"
@@ -682,6 +684,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::service::object_write::storage_class_refusal(
                     bucket,
                     input.storage_class.as_deref(),
+                )
+            }) {
+                return Err(refusal);
+            }
+        }
+
+        // And the ACL this initiation asks the finished object to be stored with has to be one
+        // the addressed bucket's Object Ownership setting admits — the same rule a one-shot
+        // write of that object is judged by, through the one gate every object write of this
+        // service shares ([`crate::service::object_write::disabled_acl_refusal`] carries it):
+        // "when you initiate a multipart upload, you specify the options you want on the
+        // finished object", and a bucket whose ACLs are disabled accepts only an ACL that
+        // reaches no further than its owner. Asked before the upload is registered, so an
+        // initiation S3 would not serve leaves no upload behind for `ListMultipartUploads` to
+        // report, while an owner-only ACL — which grants nobody but that owner anything — is
+        // admitted. A bucket this emulator does not hold is answered by the initiation below.
+        {
+            let store = state.lock();
+            if let Some(refusal) = store.bucket(&input.bucket).and_then(|bucket| {
+                crate::service::object_write::disabled_acl_refusal(
+                    bucket,
+                    input.acl.as_deref(),
+                    crate::service::object_write::grants_from_headers(
+                        input.grant_full_control.as_deref(),
+                        input.grant_read.as_deref(),
+                        input.grant_read_acp.as_deref(),
+                        input.grant_write_acp.as_deref(),
+                    )
+                    .as_deref(),
                 )
             }) {
                 return Err(refusal);

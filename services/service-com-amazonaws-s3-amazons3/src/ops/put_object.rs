@@ -1031,18 +1031,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // replaces goes with it, exactly as its tag set does.
         let acl = requested_acl(&input)?;
         if let Some(grants) = acl.as_deref() {
-            // "Buckets that use this setting only accept PUT requests that don't specify an
-            // ACL or PUT requests that specify bucket owner full control ACLs … PUT
-            // requests that contain other ACLs … fail and return a 400 error with the error
-            // code AccessControlListNotSupported" (same member documentation), which is the
-            // ACL the bucket owner already has: the owner's `FULL_CONTROL` and nothing
-            // else.
-            if bucket_record.acls_disabled() && grants != crate::state::default_acl_grants() {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::ACL_NOT_SUPPORTED_CODE,
-                    crate::state::ACL_REFUSAL_STATUS,
-                    crate::state::ACL_NOT_SUPPORTED_MESSAGE,
-                ));
+            // A bucket whose Object Ownership setting disables ACLs accepts only an ACL that
+            // reaches no further than its owner, through the one gate every object write of
+            // this service shares
+            // ([`crate::service::object_write::disabled_acl_refusal`] carries the rule).
+            if let Some(refusal) = crate::service::object_write::disabled_acl_refusal(
+                bucket_record,
+                input.acl.as_deref(),
+                Some(grants),
+            ) {
+                return Err(refusal);
             }
             crate::state::validate_acl_grants(grants, &bucket_record.region).map_err(
                 |rejection| {

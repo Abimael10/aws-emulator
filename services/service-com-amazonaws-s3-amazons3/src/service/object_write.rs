@@ -509,6 +509,116 @@ pub fn session_encryption_refusal(
     })
 }
 
+/// The `ObjectCannedACL` values that are a BUCKET OWNER FULL CONTROL ACL: they give the
+/// bucket owner `FULL_CONTROL` of the object and give nobody else anything.
+///
+/// The OBJECT rows of the published *Canned ACL* table (Amazon S3 User Guide, *Canned ACL*),
+/// read for who each row grants to and with what: `private` gives the owner `FULL_CONTROL` and
+/// "no one else has access rights", `bucket-owner-full-control` gives "both the object owner
+/// and the bucket owner" `FULL_CONTROL`, and `bucket-owner-read` gives the bucket owner `READ`
+/// beside the object owner's `FULL_CONTROL` — and under the Object Ownership setting that
+/// disables ACLs the bucket owner IS the object owner, so each of the three leaves that one
+/// grantee in full control and reaches nobody else. Every other value the member's enum
+/// publishes (`smithy_query(query="shape",shape="ObjectCannedACL")`: `public-read`,
+/// `public-read-write`, `authenticated-read`, `aws-exec-read`) grants to a predefined group or
+/// to another AWS service's account, which is a third party.
+///
+/// Classified by the VALUE rather than by this emulator's expansion of it
+/// ([`state::object_canned_acl_grants`]), because one published row's grantee — the Amazon EC2
+/// account `aws-exec-read` grants `READ` to — has no canonical user id to expand to, so the
+/// expansion of that row states fewer grantees than the row does.
+pub const OWNER_FULL_CONTROL_OBJECT_CANNED_ACLS: [&str; 3] =
+    ["private", "bucket-owner-read", "bucket-owner-full-control"];
+
+/// Whether `grants` is a bucket owner full control ACL: it gives the bucket owner
+/// `FULL_CONTROL` and gives nobody else anything.
+///
+/// This emulator serves one account ([`state::canonical_user_id`]), which owns every bucket
+/// and — wherever the ownership setting that disables ACLs is in force — every object in one,
+/// so a grant is the owner's own exactly when its grantee is that canonical user; a grant to a
+/// predefined group, to an email address or to any other canonical user names somebody else.
+/// `FULL_CONTROL` "allows grantee the READ, WRITE, READ_ACP, and WRITE_ACP permissions"
+/// (Amazon S3 User Guide, *Access control list (ACL) overview*), so a further grant to that
+/// same owner adds nothing to it.
+pub fn grants_are_the_owners_full_control(grants: &[state::AclGrant]) -> bool {
+    let owner = state::canonical_user_id();
+    let the_owners = |grant: &state::AclGrant| grant.grantee.id.as_deref() == Some(owner.as_str());
+    grants.iter().all(the_owners)
+        && grants
+            .iter()
+            .any(|grant| the_owners(grant) && grant.permission == state::PERMISSION_FULL_CONTROL)
+}
+
+/// The grants the four explicit `x-amz-grant-*` headers of an object write describe, or `None`
+/// when the write carries none of them.
+///
+/// Each header "specif[ies] access permissions explicitly" for one permission
+/// (`PutObjectRequest$GrantRead` and its three siblings) and names its grantees as the
+/// `type=value` pairs the one parse every grant header of this service is read by takes
+/// ([`state::acl_grants_from_header`]). A header whose value names no grantee still NAMES an
+/// ACL — the empty one, which leaves nobody in control of the object, so a bucket that admits
+/// only a bucket owner full control ACL refuses it too.
+pub fn grants_from_headers(
+    full_control: Option<&str>,
+    read: Option<&str>,
+    read_acp: Option<&str>,
+    write_acp: Option<&str>,
+) -> Option<Vec<state::AclGrant>> {
+    let mut grants: Vec<state::AclGrant> = Vec::new();
+    let mut named = false;
+    for (value, permission) in [
+        (full_control, state::PERMISSION_FULL_CONTROL),
+        (read, state::PERMISSION_READ),
+        (read_acp, state::PERMISSION_READ_ACP),
+        (write_acp, state::PERMISSION_WRITE_ACP),
+    ] {
+        let Some(value) = value else { continue };
+        named = true;
+        grants.extend(state::acl_grants_from_header(value, permission).unwrap_or_default());
+    }
+    named.then_some(grants)
+}
+
+/// The refusal an object write that NAMES an access control list earns on a bucket whose
+/// Object Ownership setting disables ACLs, or `None` when that bucket still accepts the ACL —
+/// and `None` for every bucket whose ACLs are enabled, which accepts any of them.
+///
+/// "Buckets that use this setting only accept PUT requests that don't specify an ACL or PUT
+/// requests that specify bucket owner full control ACLs … PUT requests that contain other ACLs
+/// … fail and return a 400 error with the error code `AccessControlListNotSupported`"
+/// (`PutObjectRequest$ACL`, and `CopyObjectRequest$ACL` says the same of a copy): what such a
+/// bucket admits is an ACL leaving the bucket owner in full control of the object and granting
+/// nobody else anything, and every other ACL is refused. The ACL the request DESCRIBES decides
+/// it, whichever of the member's two forms it was spelled in — a canned value
+/// ([`OWNER_FULL_CONTROL_OBJECT_CANNED_ACLS`]) or the explicit grant headers
+/// ([`grants_are_the_owners_full_control`]) — and a request naming both forms is refused for
+/// that before it reaches here.
+///
+/// The ONE place that gate lives for every write that can carry the member, so `PutObject`,
+/// `CopyObject` and `CreateMultipartUpload` admit and refuse exactly the same ACLs, and each
+/// asks it before anything is stored, so a write S3 would not serve leaves behind neither an
+/// object nor an upload.
+pub fn disabled_acl_refusal<E>(
+    bucket: &Bucket,
+    canned: Option<&str>,
+    grants: Option<&[state::AclGrant]>,
+) -> Option<crate::scaffolded::Scaffolded<E>> {
+    if !bucket.acls_disabled() {
+        return None;
+    }
+    let admitted = match canned {
+        Some(canned) => OWNER_FULL_CONTROL_OBJECT_CANNED_ACLS.contains(&canned),
+        None => grants.is_none_or(grants_are_the_owners_full_control),
+    };
+    (!admitted).then(|| {
+        crate::scaffolded::Scaffolded::unmodeled(
+            state::ACL_NOT_SUPPORTED_CODE,
+            state::ACL_REFUSAL_STATUS,
+            state::ACL_NOT_SUPPORTED_MESSAGE,
+        )
+    })
+}
+
 /// How S3 names a server-side encryption type in that sentence: the published SHORT NAME of
 /// each KMS form — "server-side encryption with KMS keys (SSE-KMS) (`aws:kms`)" and its
 /// dual-layer sibling (`PutObjectRequest$ServerSideEncryption`) — and the model's own
@@ -566,6 +676,37 @@ mod tests {
                  Outposts one is served by no bucket this emulator holds"
             );
         }
+    }
+
+    /// The canned-ACL catalog this module classifies by, so it cannot drift from the model's
+    /// own enum: every value admitted on a bucket that allows no ACLs is a published
+    /// `ObjectCannedACL`, and the published values it leaves out are the ones granting to
+    /// somebody other than the bucket owner, each of which such a bucket refuses.
+    #[test]
+    fn every_owner_full_control_canned_acl_is_one_the_model_publishes() {
+        let published = crate::ops::types::OBJECT_CANNED_A_C_L_VALUES;
+        for canned in OWNER_FULL_CONTROL_OBJECT_CANNED_ACLS {
+            assert!(
+                published.contains(&canned),
+                "case {canned:?}: every admitted canned ACL must be a published \
+                 ObjectCannedACL value, which {published:?} does not hold"
+            );
+        }
+        let refused: Vec<&&str> = published
+            .iter()
+            .filter(|canned| !OWNER_FULL_CONTROL_OBJECT_CANNED_ACLS.contains(canned))
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                &"authenticated-read",
+                &"aws-exec-read",
+                &"public-read",
+                &"public-read-write"
+            ],
+            "the values left over must be exactly the published ones granting beyond the \
+             bucket owner, got {refused:?} of {published:?}"
+        );
     }
 
     /// The key rules, at the ceiling and one byte past it, and over a key carrying the one
