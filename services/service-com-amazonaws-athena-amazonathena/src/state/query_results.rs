@@ -447,6 +447,15 @@ pub(crate) fn text_output_lines(result: &StoredResultSet) -> String {
 /// Athena's own metadata object is an opaque binary encoding of that schema, which no
 /// published format describes, so this emulator saves the same schema in a form a reader
 /// can decode. Nothing is added to it: every member comes off the stored result set.
+///
+/// It is written as a MULTI-RECORD document — indented, one described member per line, with
+/// the last line terminated — the way every other object this service saves holds its
+/// records one per line ([`data_manifest`], [`results_csv`], [`text_output`]). Athena's own
+/// metadata object is a multi-record serialization of that schema too, and the difference is
+/// observable: a results location inside a table's own location makes this object part of
+/// that table's data, so a line-oriented reader over the location reads as many records out
+/// of it as the schema has members, and a table that declares header lines skips that many
+/// of its lines rather than the whole document.
 fn results_metadata(result: &StoredResultSet) -> Vec<u8> {
     let columns: Vec<::serde_json::Value> = result
         .column_info
@@ -469,7 +478,13 @@ fn results_metadata(result: &StoredResultSet) -> Vec<u8> {
     let document = ::serde_json::json!({ "ColumnInfo": columns });
     // The document is built from owned values only, so serialising it cannot fail; an
     // empty object is what a failure would leave rather than a panic in a query's path.
-    ::serde_json::to_vec(&document).unwrap_or_default()
+    let Ok(mut rendered) = ::serde_json::to_vec_pretty(&document) else {
+        return Vec::new();
+    };
+    // Every line of a document this service saves ends with its separator, so a
+    // line-oriented reader of it reads the last record exactly like the ones above it.
+    rendered.push(b'\n');
+    rendered
 }
 
 /// The label a column is written under, which is what a read of the results reports for it
