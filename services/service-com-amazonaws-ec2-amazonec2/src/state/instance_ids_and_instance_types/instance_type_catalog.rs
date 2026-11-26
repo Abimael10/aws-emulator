@@ -34,6 +34,7 @@ mod burstable_rows;
 mod burstable_xen_rows;
 mod dense_hdd_storage_rows;
 mod eighth_generation_intel_rows;
+mod fifth_generation_intel_compute_rows;
 mod fifth_generation_intel_rows;
 mod fifth_generation_network_optimized_rows;
 mod first_generation_graviton_rows;
@@ -1653,87 +1654,6 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ipv4_per_secondary_interface(0)
         .flexible_ena_queues(false)
         .traffic_mirroring(false),
-    // C5 — compute optimized on the AWS Nitro System, Intel Xeon Platinum: the 8124M
-    // (Skylake) at a sustained 3.4 GHz on most of the ladder, and the 8275CL (Cascade Lake) at
-    // a sustained 3.6 GHz on the sizes built on it (`12xlarge`, `24xlarge` and the bare metal
-    // size). The family is NOT the latest generation of its family, and no size carries a
-    // local instance store. Its EBS figures are the family's own rows of "Amazon EBS optimized
-    // instance types": the three smallest sizes publish a baseline they burst above, up to
-    // 4,750 Mbps and 20,000 IOPS, and the family's bandwidth is dedicated from the `4xlarge`
-    // up, two sizes sharing each of the figures above that one. The published core counts go
-    // up in twos from the `xlarge`, the bare metal size publishing every count. Dedicated
-    // Hosts are offered on the family EXCEPT on the two sizes that hold the whole host, and
-    // the bare metal size is offered the legacy BIOS boot mode alone, supports CloudWatch
-    // action based recovery — which the sizes with no instance store already do — and supports
-    // reboot migration, the move to another host being the HOST's to make and not the
-    // hypervisor's that a bare metal instance has none of.
-    PublishedInstanceTypeFacts::of("c5.large")
-        .previous_generation()
-        .ebs(650, 4_000, 4_750, 20_000)
-        .network("Up to 10 Gigabit")
-        .processor("Intel", 3.4)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(1_150, 6_000, 4_750, 20_000)
-        .network("Up to 10 Gigabit")
-        .processor("Intel", 3.4)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.2xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(2_300, 10_000, 4_750, 20_000)
-        .network("Up to 10 Gigabit")
-        .processor("Intel", 3.4)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.4xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(4_750, 20_000, 4_750, 20_000)
-        .network("Up to 10 Gigabit")
-        .processor("Intel", 3.4)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.9xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(9_500, 40_000, 9_500, 40_000)
-        // The two sizes carved out of the same half of the host report the same figure, which
-        // is the one the API publishes for them rather than the round number of the family's
-        // specification page.
-        .network("12 Gigabit")
-        .processor("Intel", 3.4)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.12xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(9_500, 40_000, 9_500, 40_000)
-        .network("12 Gigabit")
-        .processor("Intel", 3.6)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.18xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(19_000, 80_000, 19_000, 80_000)
-        .network("25 Gigabit")
-        .processor("Intel", 3.4)
-        .dedicated_hosts(true),
-    PublishedInstanceTypeFacts::of("c5.24xlarge")
-        .previous_generation()
-        .cores_in_steps_of(2)
-        .ebs(19_000, 80_000, 19_000, 80_000)
-        .network("25 Gigabit")
-        .processor("Intel", 3.6)
-        .dedicated_hosts(false),
-    PublishedInstanceTypeFacts::of("c5.metal")
-        .previous_generation()
-        .ebs(19_000, 80_000, 19_000, 80_000)
-        .network("25 Gigabit")
-        .processor("Intel", 3.6)
-        .dedicated_hosts(false)
-        .auto_recovery(true)
-        .host_features(true, false)
-        .boot_modes(&["legacy-bios"]),
     // C5a — compute optimized on the AMD EPYC 7R32 at a sustained 3.3 GHz, with no local
     // instance store. The family's EBS bandwidth doubles up the ladder and is DEDICATED from
     // the 8xlarge up, the four sizes below that one bursting to the 8xlarge's figure. Its EBS
@@ -4827,6 +4747,9 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
         .chain(eighth_generation_intel_rows::EIGHTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
         .chain(fifth_generation_intel_rows::FIFTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
+        .chain(
+            fifth_generation_intel_compute_rows::FIFTH_GENERATION_INTEL_COMPUTE_INSTANCE_TYPE_FACTS,
+        )
         .chain(
             first_generation_graviton_rows::FIRST_GENERATION_GRAVITON_INSTANCE_TYPE_FACTS,
         )

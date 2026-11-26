@@ -187,12 +187,20 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
     // out of the pool shared with its interfaces and publish 27 attachments at every size. The
     // family is NOT offered on a Dedicated Host, its hardware generation carries no local PTP
     // clock and does not migrate an instance on a user-initiated reboot, and the cores of an
-    // EPYC are configured two at a time, so each size publishes the even core counts alone.
+    // EPYC are configured two at a time, so each size publishes the even core counts alone. Its
+    // network figures are its own published ones rather than a share of the Intel host of the
+    // same generation: the four narrowest sizes sustain the ladder's baseline and burst to
+    // 10 Gigabit, the `8xlarge` sustains the figure published for it and bursts to that same
+    // ceiling, and from the `12xlarge` up the figure is DEDICATED, so each of those sizes
+    // reports it as the bandwidth it sustains and the bandwidth it reaches alike.
+    // Each of its interfaces is given the eight ENA queues its adapter carries, whatever the
+    // size.
     PublishedInstanceTypeFacts::of("r5a.large")
         .cores_in_steps_of(2)
         .ebs(650, 3_600, 2_880, 16_000)
         .ebs_attachments(27)
-        .network("Up to 10 Gigabit")
+        .network_bandwidth(0.75, 10.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -200,7 +208,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(1_085, 6_000, 2_880, 16_000)
         .ebs_attachments(27)
-        .network("Up to 10 Gigabit")
+        .network_bandwidth(1.25, 10.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -208,7 +217,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(1_580, 8_333, 2_880, 16_000)
         .ebs_attachments(27)
-        .network("Up to 10 Gigabit")
+        .network_bandwidth(2.5, 10.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -216,7 +226,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(2_880, 16_000, 2_880, 16_000)
         .ebs_attachments(27)
-        .network("Up to 10 Gigabit")
+        .network_bandwidth(5.0, 10.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -224,7 +235,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(4_750, 20_000, 4_750, 20_000)
         .ebs_attachments(27)
-        .network("Up to 10 Gigabit")
+        .network_bandwidth(7.5, 10.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -232,7 +244,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(6_780, 30_000, 6_780, 30_000)
         .ebs_attachments(27)
-        .network("10 Gigabit")
+        .network_bandwidth(10.0, 10.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -240,7 +253,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(9_500, 40_000, 9_500, 40_000)
         .ebs_attachments(27)
-        .network("12 Gigabit")
+        .network_bandwidth(12.0, 12.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -248,7 +262,8 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .cores_in_steps_of(2)
         .ebs(13_570, 60_000, 13_570, 60_000)
         .ebs_attachments(27)
-        .network("20 Gigabit")
+        .network_bandwidth(20.0, 20.0)
+        .ena_queues(FIRST_EPYC_ENA_QUEUES_PER_INTERFACE)
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
@@ -561,6 +576,12 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .host_features(true, false)
         .boot_modes(LEGACY_BIOS_BOOT_MODE),
 ];
+
+/// The ENA queues each interface of an instance on the 1st generation AMD EPYC host is given
+/// by default (`NetworkCardInfo$DefaultEnaQueueCountPerInterface`): the queue count of the
+/// adapter that host's network card carries, which every size built on it publishes whatever
+/// its vCPUs.
+const FIRST_EPYC_ENA_QUEUES_PER_INTERFACE: i32 = 8;
 
 /// The sustained frequency, in GHz, of the 3rd generation AMD EPYC host: the all-core turbo
 /// its specification page publishes, which is what `ProcessorInfo$SustainedClockSpeedInGhz`
