@@ -43,8 +43,10 @@ pub mod paging;
 pub mod parameter_mapping;
 pub mod patch;
 pub mod portal_transport;
+pub mod route_authorization;
 pub mod route_key;
 pub mod route_request_parameters;
+pub mod route_response_key;
 pub mod route_throttle;
 pub mod routing_rule_action;
 pub mod selection_expression;
@@ -303,17 +305,6 @@ pub const MAX_ROUTES_PER_API: usize = 300;
 /// The most integrations one api may hold, after which CreateIntegration is refused.
 /// AWS's published API Gateway quota is 300 integrations per API.
 pub const MAX_INTEGRATIONS_PER_API: usize = 300;
-
-/// The most route responses one route may hold, after which CreateRouteResponse is
-/// refused.
-///
-/// AWS publishes no separate route-responses-per-route quota, so this is a CHOSEN
-/// bound, set to the per-parent quota this service already enforces for routes
-/// ([`MAX_ROUTES_PER_API`]): what it buys is that no loop of CreateRouteResponse calls
-/// can grow this store without end, and that the per-route duplicate-key scan stays
-/// bounded. `TooManyRequestsException` ("A limit has been exceeded") is the modelled
-/// error the operation refuses with.
-pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
 
 /// The most integration responses one integration may hold, after which
 /// CreateIntegrationResponse is refused.
@@ -788,17 +779,6 @@ pub const AUTHORIZER_TYPE_REQUEST: &str = "REQUEST";
 /// (`CreateAuthorizer$AuthorizerPayloadFormatVersion`: "Supported values are 1.0 and
 /// 2.0").
 pub const AUTHORIZER_PAYLOAD_FORMAT_VERSIONS: &[&str] = &["1.0", "2.0"];
-
-/// The `AuthorizationType` values that hand a route's authorization decision to an
-/// `Authorizer` resource, out of the generated `AUTHORIZATION_TYPE_VALUES` catalog
-/// (`AWS_IAM | CUSTOM | JWT | NONE`).
-///
-/// From `Route$AuthorizationType`: "JWT for using JSON Web Tokens" and "CUSTOM for
-/// using a Lambda authorizer" — both name a resource, and `Route$AuthorizerId` is "the
-/// identifier of the Authorizer resource to be associated with this route". The other
-/// two decide without one: `NONE` is "open access" and `AWS_IAM` uses "AWS IAM
-/// permissions".
-pub const AUTHORIZER_BACKED_AUTHORIZATION_TYPES: &[&str] = &["CUSTOM", "JWT"];
 
 /// The most deployments one api may hold, after which CreateDeployment is refused.
 ///
@@ -1564,7 +1544,7 @@ impl Api {
     /// A route holds the reference (through its `AuthorizerId`), so the authorizer is the
     /// one that cannot be removed while any of them exists: a deleted authorizer would
     /// leave those routes naming nothing. An empty `AuthorizerId` names no authorizer, the
-    /// same reading [`Api::unresolved_route_reference`] gives it.
+    /// same reading [`validate_route_authorization`] gives it.
     ///
     /// The KEY is what identifies a route to a caller — it is the route's name within its
     /// api — so it is what a refusal about the reference names.
@@ -1582,22 +1562,19 @@ impl Api {
             .collect()
     }
 
-    /// The refusal message for a reference of this route that this api cannot resolve,
-    /// or `None` when every reference names a child resource this api holds.
+    /// The refusal message for a route `Target` this api cannot resolve, or `None` when it
+    /// addresses an integration this api holds.
     ///
     /// A route references two resources of its OWN api: the integration its `Target`
     /// addresses (`integrations/{IntegrationId}`) and the authorizer its `AuthorizerId`
-    /// names. Neither may be stored unresolved — a route wired to nothing could never be
-    /// invoked, and the api it belongs to could not be reproduced on AWS — so every
-    /// writer of a route resolves them here before persisting anything. The reference is
+    /// names (resolved by [`validate_route_authorization`], which weighs the authorizer's
+    /// own type as well). Neither may be stored unresolved — a route wired to nothing could
+    /// never be invoked, and the api it belongs to could not be reproduced on AWS — so
+    /// every writer of a route resolves them before persisting anything. The reference is
     /// part of the REQUEST, so a request naming one that does not resolve is "not valid,
-    /// for example, the input is incomplete or incorrect": the message is the
-    /// operation's `BadRequestException`'s.
-    pub fn unresolved_route_reference(
-        &self,
-        target: Option<&str>,
-        authorizer_id: Option<&str>,
-    ) -> Option<String> {
+    /// for example, the input is incomplete or incorrect": the message is the operation's
+    /// `BadRequestException`'s.
+    pub fn unresolved_route_target(&self, target: Option<&str>) -> Option<String> {
         if let Some(integration_id) = target.and_then(target_integration_id) {
             if !self.integrations.contains_key(integration_id) {
                 // The message names the kind of target the key addresses and the id it
@@ -1606,11 +1583,6 @@ impl Api {
                     "Unable to find route target of type {} with ID {integration_id}",
                     INTEGRATION_TARGET_PREFIX.trim_end_matches('/')
                 ));
-            }
-        }
-        if let Some(authorizer_id) = authorizer_id.filter(|id| !id.is_empty()) {
-            if !self.authorizers.contains_key(authorizer_id) {
-                return Some(UNRESOLVED_AUTHORIZER_MESSAGE.to_string());
             }
         }
         None
@@ -1801,21 +1773,30 @@ pub struct RouteResponse {
 
 impl RouteResponse {
     /// Project the record onto the modelled `RouteResponse` shape.
+    ///
+    /// The route response's collection members — `ResponseModels` and `ResponseParameters` —
+    /// are neither `@required` nor given a `@default` by the model, so a member the record
+    /// holds no entries under is reported as ABSENT rather than as an empty map: an absent
+    /// member and an empty one are different facts to a client that branches on a member
+    /// being present to tell "unset" from "set empty", the same reading [`Route::to_wire`]
+    /// gives a route's own collection members. This is the single projection every reader of
+    /// a route response goes through, so the create, the readers, the listing and the patch
+    /// all report one record the same way.
     pub fn to_wire(&self) -> wire::RouteResponse {
         wire::RouteResponse {
             model_selection_expression: self.model_selection_expression.clone(),
-            response_models: Some(
+            response_models: (!self.response_models.is_empty()).then(|| {
                 self.response_models
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
-            response_parameters: Some(
+                    .collect()
+            }),
+            response_parameters: (!self.response_parameters.is_empty()).then(|| {
                 self.response_parameters
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+                    .collect()
+            }),
             route_response_id: Some(self.route_response_id.clone()),
             route_response_key: self.route_response_key.clone(),
         }
@@ -2137,48 +2118,20 @@ pub fn validate_authorizer_config(
     Ok(())
 }
 
-/// `Ok(())`, or why this route's authorization configuration cannot hold together —
-/// the message for the operation's `BadRequestException`.
-///
-/// One rule: a route whose `AuthorizationType` hands the decision to an `Authorizer`
-/// resource ([`AUTHORIZER_BACKED_AUTHORIZATION_TYPES`]) must be associated with one,
-/// because `Route$AuthorizerId` is what names it and nothing else on the route does.
-///
-/// Shared by every writer of a route, so the requirement cannot differ between the
-/// create and a later update; an update validates the MERGED record, so a route that
-/// already names an authorizer may switch type without resending the id.
-pub fn validate_route_authorization(
-    authorization_type: &str,
-    authorizer_id: Option<&str>,
-) -> Result<(), String> {
-    if AUTHORIZER_BACKED_AUTHORIZATION_TYPES.contains(&authorization_type)
-        && authorizer_id.is_none_or(str::is_empty)
-    {
-        return Err(invalid_authorizer_reference_message(authorization_type));
-    }
-    Ok(())
-}
+/// Which `Authorizer` resource a route of each `AuthorizationType` has to be associated
+/// with, and how the service refuses one that is not — see [`route_authorization`].
+pub use route_authorization::{
+    authorizer_type_authorizing, invalid_authorizer_reference_message,
+    validate_route_authorization, CUSTOM_AUTHORIZATION_TYPE, JWT_AUTHORIZATION_TYPE,
+    UNRESOLVED_AUTHORIZER_MESSAGE,
+};
 
-/// The sentence this service refuses a route that does not name a valid authorizer
-/// with, in the form for the `AuthorizationType` the request set.
-///
-/// The refusal is about the authorizer REFERENCE — a route of an authorizer-backed
-/// type that names no authorizer at all is as unauthorizable as one naming an id no
-/// authorizer carries — so the sentence states the requirement the type imposes and
-/// echoes no id back. `JWT` is the one authorizer-backed `AuthorizationType` that names
-/// an authorizer of its own kind (`Route$AuthorizationType`: "JWT for using JSON Web
-/// Tokens", and `AUTHORIZER_TYPE_VALUES` carries `JWT`), so its sentence names that
-/// kind; `CUSTOM` is "for using a Lambda authorizer", whose requirement is the one
-/// [`UNRESOLVED_AUTHORIZER_MESSAGE`] states.
-pub fn invalid_authorizer_reference_message(authorization_type: &str) -> String {
-    if authorization_type == AUTHORIZER_TYPE_JWT {
-        return format!(
-            "Invalid authorizer ID specified. Setting the authorization type to \
-             {AUTHORIZER_TYPE_JWT} requires a valid {AUTHORIZER_TYPE_JWT} authorizer."
-        );
-    }
-    UNRESOLVED_AUTHORIZER_MESSAGE.to_string()
-}
+/// The one `RouteResponseKey` a route response may carry, and the sentence any other is
+/// refused with — see [`route_response_key`].
+pub use route_response_key::{
+    unsupported_route_response_key_message, validate_route_response_key,
+    SUPPORTED_ROUTE_RESPONSE_KEY,
+};
 
 /// The CORS configuration an api carries — the wildcard entry, the protocol gate, the
 /// grammar of an allowed origin and of an allowed method — lives in [`cors`], re-exported
@@ -2402,7 +2355,7 @@ pub fn malformed_route_target_message(route: Option<&str>) -> String {
 /// `CreateRoute$Target` takes and the one every route reader reports back), so a value of
 /// any other FORM names nothing this service could route to. Checked by every writer of a
 /// route before anything is persisted, and before the id it carries is resolved
-/// ([`Api::unresolved_route_reference`]): the form of the reference is a property of the
+/// ([`Api::unresolved_route_target`]): the form of the reference is a property of the
 /// request alone, while resolving it needs the api. A route the request gave no target at
 /// all is not wired to an integration and is not refused — `Target` is an optional member
 /// of the input (`smithy_query(query="operation", operation="CreateRoute")`).
@@ -2486,15 +2439,6 @@ pub fn validate_route_key_variables<'a>(
     }
     Ok(())
 }
-
-/// The sentence this service refuses a route whose `AuthorizerId` names no authorizer of
-/// its api with.
-///
-/// The refusal is about the ASSOCIATION, not about the id — an id a route may not name is
-/// one no authorizer of that api carries — so the sentence states the requirement rather
-/// than echoing the id back.
-pub const UNRESOLVED_AUTHORIZER_MESSAGE: &str = "Invalid authorizer ID specified. Setting \
-    the authorization type to CUSTOM or COGNITO_USER_POOLS requires a valid authorizer.";
 
 /// The sentence this service answers `NotFoundException` with for an identifier that
 /// names no resource of `resource`'s kind.

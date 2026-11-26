@@ -443,14 +443,11 @@ async fn deleting_a_route_takes_the_route_responses_it_owns_with_it() {
     )
     .await;
 
-    // The rows differ in how many route responses hang off the route: none, one, several.
+    // The rows differ in whether the route carries a route response at all: a route holds
+    // at most one, under the single `RouteResponseKey` the service serves.
     for (case, response_keys) in [
         ("a route holding no route response", &[][..]),
         ("a route holding one route response", &["$default"][..]),
-        (
-            "a route holding several route responses",
-            &["$default", "echo", "status"][..],
-        ),
     ] {
         let route_id = create_route(&emulator, case, &api_id, "$connect", None).await;
         let sibling = create_route(&emulator, case, &api_id, "sendMessage", None).await;

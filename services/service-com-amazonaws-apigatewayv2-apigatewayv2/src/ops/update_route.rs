@@ -366,29 +366,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The MERGED record is what has to hold together: a route that already names an
-        // authorizer may switch to an authorizer-backed type without resending the id,
-        // and one that names none cannot.
+        // authorizer able to authorize it may switch to an authorizer-backed type without
+        // resending the id, and one that names none, or names one of the other kind,
+        // cannot.
         if let Err(message) = crate::state::validate_route_authorization(
+            &api.authorizers,
             &updated.authorization_type,
             updated.authorizer_id.as_deref(),
         ) {
             return Err(bad_request(&message));
         }
 
-        // And the merged record's references: a patch cannot move a route onto an
-        // integration or an authorizer its api does not hold, exactly as the create
-        // cannot, nor onto a target that is not a target at all. Checked before anything
-        // is written; the route exists here, so the malformed-target sentence names it.
+        // And the merged record's target: a patch cannot move a route onto an integration
+        // its api does not hold, exactly as the create cannot, nor onto a target that is
+        // not a target at all. Checked before anything is written; the route exists here,
+        // so the malformed-target sentence names it.
         if let Err(message) = crate::state::validate_route_target(
             updated.target.as_deref(),
             ::std::option::Option::Some(input.route_id.as_str()),
         ) {
             return Err(bad_request(&message));
         }
-        if let Some(message) = api.unresolved_route_reference(
-            updated.target.as_deref(),
-            updated.authorizer_id.as_deref(),
-        ) {
+        if let Some(message) = api.unresolved_route_target(updated.target.as_deref()) {
             return Err(bad_request(&message));
         }
 

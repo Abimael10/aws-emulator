@@ -11,9 +11,10 @@
 //!   `RouteResponseId` is identity and never changes.
 //! * What the update answers is what the store holds: a later `GetRouteResponse` reports
 //!   the same record, member for member.
-//! * A route response's key identifies it WITHIN its route, so an update cannot move a
-//!   response onto a key a sibling response of the same route already holds (400), while
-//!   re-sending its own key is accepted.
+//! * A route response's key is held to the rule every writer of one is held to: the
+//!   service serves exactly one `RouteResponseKey`, so a patch that names any other is
+//!   refused 400 and writes nothing, while re-sending the key it already holds is accepted
+//!   (the key rule itself is `tests/all/route_response_key_support.rs`).
 //! * A route response is addressed only through the api and the route that own it: an
 //!   unknown api, route or route-response id is a 404 and writes nothing.
 //! * A route response is a WebSocket-only resource
@@ -21,15 +22,15 @@
 //!   an update against an api of another protocol type is refused 400.
 //!
 //! The rows vary what the rule generalises over: WHICH members the patch carries (none,
-//! one, several, all), the form of the new route response key, and how many entries the
-//! replacement maps hold (none, one, several). The recorded case that filed the issue —
-//! a patch that must preserve the fields it does not name — is the first row.
+//! one, several, all) and how many entries the replacement maps hold (none, one, several).
+//! The recorded case that filed the issue — a patch that must preserve the fields it does
+//! not name — is the first row.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, call, carries_nothing, emulator, error_code};
-use service_com_amazonaws_apigatewayv2_apigatewayv2::state::duplicate_identity::route_response_key_in_use_message;
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::unsupported_route_response_key_message;
 
 /// The route response every row starts from: every member the resource carries is set,
 /// so a row that omits one proves preservation rather than absence.
@@ -62,14 +63,6 @@ fn rows() -> Vec<Row> {
             case: "an empty patch preserves every stored member",
             patch: json!({}),
             expected: || baseline_members(),
-            expect_empty: &[],
-        },
-        Row {
-            case: "only the route response key, a custom selection key",
-            patch: json!({ "routeResponseKey": "echo" }),
-            expected: || {
-                replacing(&[("routeResponseKey", json!("echo"))])
-            },
             expect_empty: &[],
         },
         Row {
@@ -135,14 +128,14 @@ fn rows() -> Vec<Row> {
         Row {
             case: "every member at once",
             patch: json!({
-                "routeResponseKey": "$connect",
+                "routeResponseKey": "$default",
                 "modelSelectionExpression": "$default",
                 "responseModels": { "text/plain": "Empty" },
                 "responseParameters": { "route.response.header.x-only": { "required": true } }
             }),
             expected: || {
                 vec![
-                    ("routeResponseKey", json!("$connect")),
+                    ("routeResponseKey", json!("$default")),
                     ("modelSelectionExpression", json!("$default")),
                     ("responseModels", json!({ "text/plain": "Empty" })),
                     (
@@ -314,34 +307,26 @@ async fn update_route_response_replaces_the_members_it_carries_and_preserves_the
 }
 
 #[tokio::test]
-async fn update_route_response_cannot_take_a_key_a_sibling_response_holds() {
+async fn update_route_response_cannot_move_a_response_onto_a_key_the_service_does_not_serve() {
     let emulator = emulator();
-    let api_id = create_api(&emulator, "the owning api", &websocket_api("conflict-ws-api")).await;
+    let api_id = create_api(&emulator, "the owning api", &websocket_api("key-rule-ws-api")).await;
     let route_id = create_route(&emulator, "the owning route", &api_id, "$connect").await;
 
-    let first = create_route_response(
+    let route_response_id = create_route_response(
         &emulator,
-        "the first response",
+        "the response",
         &api_id,
         &route_id,
         &json!({ "routeResponseKey": "$default" }),
     )
     .await;
-    let second = create_route_response(
-        &emulator,
-        "the sibling response",
-        &api_id,
-        &route_id,
-        &json!({ "routeResponseKey": "echo" }),
-    )
-    .await;
+    let uri = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses/{route_response_id}");
+    let before = call(&emulator, "GET", &uri, None).await.1;
 
-    for (case, target, key) in [
-        ("onto the sibling's key", &second, "$default"),
-        ("onto the first's key", &first, "echo"),
-    ] {
-        let uri = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses/{target}");
-        let before = call(&emulator, "GET", &uri, None).await.1;
+    // The rows span the forms a caller can write a selection key in: a bare word, a route
+    // key of the api's own protocol, another of the reserved `$` keys, and one differing
+    // from the supported key only in case.
+    for key in ["moved", "echo", "sendMessage", "$connect", "$DEFAULT"] {
         let (status, body) = call(
             &emulator,
             "PATCH",
@@ -351,50 +336,43 @@ async fn update_route_response_cannot_take_a_key_a_sibling_response_holds() {
         .await;
         assert_eq!(
             status, 400,
-            "case {case:?}: expected 400 from UpdateRouteResponse, got {status} {body}"
+            "case {key:?}: expected 400 from UpdateRouteResponse, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
             "BadRequestException",
-            "case {case:?}: expected BadRequestException, got {body}"
+            "case {key:?}: expected BadRequestException, got {body}"
         );
         assert_eq!(
             as_str(&body, "message"),
-            route_response_key_in_use_message(key),
-            "case {case:?}: expected the refusal to name the key that collided, got {body}"
+            unsupported_route_response_key_message(),
+            "case {key:?}: expected the unsupported-key refusal, got {body}"
         );
         let after = call(&emulator, "GET", &uri, None).await.1;
         assert_eq!(
             after, before,
-            "case {case:?}: a refused update must leave the route response unchanged, got {after}"
+            "case {key:?}: a refused update must leave the route response unchanged, got \
+             {after}"
         );
     }
 
-    // The key is free on another route of the same api: the bound is per route.
-    let sibling_route = create_route(&emulator, "another route", &api_id, "sendMessage").await;
-    let elsewhere = create_route_response(
-        &emulator,
-        "a response on another route",
-        &api_id,
-        &sibling_route,
-        &json!({ "routeResponseKey": "echo" }),
-    )
-    .await;
+    // And re-sending the key it already holds is accepted, so the refusal is about the key
+    // and not about the member being present.
     let (status, updated) = call(
         &emulator,
         "PATCH",
-        &format!("/v2/apis/{api_id}/routes/{sibling_route}/routeresponses/{elsewhere}"),
+        &uri,
         Some(json!({ "routeResponseKey": "$default" })),
     )
     .await;
     assert_eq!(
         status, 201,
-        "expected 201 for a key another ROUTE holds, got {status} {updated}"
+        "expected 201 for the key the response already holds, got {status} {updated}"
     );
     assert_eq!(
         as_str(&updated, "routeResponseKey"),
         "$default",
-        "expected the sibling route's response to take the key, got {updated}"
+        "expected the response to keep its key, got {updated}"
     );
 }
 
@@ -436,7 +414,7 @@ async fn update_route_response_resolves_only_through_the_api_and_route_that_own_
             &emulator,
             "PATCH",
             &target,
-            Some(json!({ "routeResponseKey": "moved" })),
+            Some(json!({ "routeResponseKey": "$default" })),
         )
         .await;
         assert_eq!(
@@ -472,7 +450,7 @@ async fn update_route_response_is_refused_on_an_api_that_is_not_a_websocket_api(
         ("only the key", json!({ "routeResponseKey": "$default" })),
         (
             "the key with response models",
-            json!({ "routeResponseKey": "echo", "responseModels": { "$default": "Empty" } }),
+            json!({ "routeResponseKey": "$default", "responseModels": { "$default": "Empty" } }),
         ),
         ("an empty patch", json!({})),
     ] {

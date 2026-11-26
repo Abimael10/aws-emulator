@@ -311,7 +311,7 @@ async fn mint_many(emulator: &MultiServiceRouter, member: &str) -> Vec<String> {
     let host_integration_id = as_str(&host_integration, "integrationId");
     // The host route fronts that integration, so this api is deployable: a WEBSOCKET api
     // serves a frame only through the target of the route that matched it.
-    let host_route = created(
+    created(
         emulator,
         &case,
         &format!("/v2/apis/{api_id}/routes"),
@@ -321,7 +321,6 @@ async fn mint_many(emulator: &MultiServiceRouter, member: &str) -> Vec<String> {
         }),
     )
     .await;
-    let host_route_id = as_str(&host_route, "routeId");
 
     let mut ids = Vec::with_capacity(SAMPLE);
     for index in 0..SAMPLE {
@@ -348,10 +347,22 @@ async fn mint_many(emulator: &MultiServiceRouter, member: &str) -> Vec<String> {
                 json!({ "name": format!("Model{index}"), "schema": "{}" }),
             ),
             "deploymentId" => (format!("/v2/apis/{api_id}/deployments"), json!({})),
-            "routeResponseId" => (
-                format!("/v2/apis/{api_id}/routes/{host_route_id}/routeresponses"),
-                json!({ "routeResponseKey": format!("key{index}") }),
-            ),
+            "routeResponseId" => {
+                // A route carries at most one route response — the service serves one
+                // `RouteResponseKey` — so each sample is minted under a route of its own.
+                let host = created(
+                    emulator,
+                    &case,
+                    &format!("/v2/apis/{api_id}/routes"),
+                    json!({ "routeKey": format!("sample{index}") }),
+                )
+                .await;
+                let route_id = as_str(&host, "routeId");
+                (
+                    format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses"),
+                    json!({ "routeResponseKey": "$default" }),
+                )
+            }
             "integrationResponseId" => (
                 format!(
                     "/v2/apis/{api_id}/integrations/{host_integration_id}/integrationresponses"

@@ -430,7 +430,7 @@ async fn a_duplicate_integration_response_key_names_the_key_and_the_integration(
 }
 
 /// RULE: a duplicate route-response key is `BadRequestException` 400 naming the key and
-/// the requirement it breaks — from the create and from the update alike.
+/// the requirement it breaks.
 #[tokio::test]
 async fn a_duplicate_route_response_key_names_the_key_and_the_requirement() {
     let emulator = emulator();
@@ -460,77 +460,44 @@ async fn a_duplicate_route_response_key_names_the_key_and_the_requirement() {
         "routeId",
     );
 
-    // The rows span the forms a route-response key takes: the catch-all and route keys
-    // of the api's own protocol.
-    for key in ["$default", "echo", "sendMessage"] {
-        let uri = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses");
-        let held = as_str(
-            &accepted(
-                &emulator,
-                key,
-                "POST",
-                &uri,
-                Some(json!({ "routeResponseKey": key })),
-                201,
-            )
-            .await,
-            "routeResponseId",
-        );
-        assert_refused(
+    // The one key the service serves: a route carries one response under it, and a second
+    // create on the same route is the duplicate refusal.
+    let key = "$default";
+    let uri = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses");
+    let held = as_str(
+        &accepted(
             &emulator,
             key,
             "POST",
             &uri,
             Some(json!({ "routeResponseKey": key })),
-            bad_request(&route_response_key_taken(key)),
-        )
-        .await;
-
-        // The UPDATE claims the key the same way: a response moved onto a key a sibling
-        // of its own route holds takes the same refusal.
-        let moving = as_str(
-            &accepted(
-                &emulator,
-                key,
-                "POST",
-                &uri,
-                Some(json!({ "routeResponseKey": format!("{key}-elsewhere") })),
-                201,
-            )
-            .await,
-            "routeResponseId",
-        );
-        assert_refused(
-            &emulator,
-            key,
-            "PATCH",
-            &format!("{uri}/{moving}"),
-            Some(json!({ "routeResponseKey": key })),
-            bad_request(&route_response_key_taken(key)),
-        )
-        .await;
-
-        // The key is scoped to its route: the same key on the sibling route is accepted,
-        // and the response that holds it is still readable.
-        accepted(
-            &emulator,
-            key,
-            "POST",
-            &format!("/v2/apis/{api_id}/routes/{sibling_route}/routeresponses"),
-            Some(json!({ "routeResponseKey": key })),
             201,
         )
-        .await;
-        accepted(
-            &emulator,
-            key,
-            "GET",
-            &format!("{uri}/{held}"),
-            None,
-            200,
-        )
-        .await;
-    }
+        .await,
+        "routeResponseId",
+    );
+    assert_refused(
+        &emulator,
+        key,
+        "POST",
+        &uri,
+        Some(json!({ "routeResponseKey": key })),
+        bad_request(&route_response_key_taken(key)),
+    )
+    .await;
+
+    // The key is scoped to its route: the same key on the sibling route is accepted,
+    // and the response that holds it is still readable.
+    accepted(
+        &emulator,
+        key,
+        "POST",
+        &format!("/v2/apis/{api_id}/routes/{sibling_route}/routeresponses"),
+        Some(json!({ "routeResponseKey": key })),
+        201,
+    )
+    .await;
+    accepted(&emulator, key, "GET", &format!("{uri}/{held}"), None, 200).await;
 }
 
 /// RULE: `ReimportApi` resolves the `ApiId` its path names BEFORE it reads the body, so

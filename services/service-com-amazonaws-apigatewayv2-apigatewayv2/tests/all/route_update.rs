@@ -11,17 +11,19 @@
 //!   the stored member to be REMOVED, so neither the patch's answer nor any later read
 //!   reports it.
 //! * A route whose `AuthorizationType` hands the decision to an `Authorizer` resource
-//!   (`CUSTOM` or `JWT`) must be associated with one — `Route$AuthorizerId` is what
-//!   names it — so a request that leaves the merged record without one is refused with
+//!   (`CUSTOM` or `JWT`) must be associated with one OF ITS OWN API whose `AuthorizerType`
+//!   authorizes that type — `Route$AuthorizerId` is what names it — so a request that
+//!   leaves the merged record without one, or naming one of the other kind, is refused with
 //!   the modelled `BadRequestException` (400) and changes nothing. The same requirement
 //!   holds for `CreateRoute`, and both operations are driven here.
 //!
 //! The rows vary what each rule generalises over: the member's type (string, boolean,
 //! list, map), the number of members patched (none, one, several), list and map size
 //! (shorter, empty, different keys), the route key, every value of the modelled
-//! `AuthorizationType` enum, and the three forms a request can take on `AuthorizerId`
-//! (a minted id, absent, empty). The recorded case that filed the issue — an update to
-//! `JWT` with no authorizer — is one row of the second table.
+//! `AuthorizationType` enum, and the forms a request can take on `AuthorizerId` (the id of
+//! an authorizer of each modelled `AuthorizerType`, absent, empty). The recorded case that
+//! filed the issue — an update to `JWT` with no authorizer — is one row of the second
+//! table.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -80,25 +82,31 @@ async fn create_route(
     as_str(&created, "routeId")
 }
 
-/// Create one `REQUEST` authorizer under `api_id` and answer its `AuthorizerId`.
+/// Create one authorizer of `authorizer_type` under `api_id` and answer its `AuthorizerId`.
 ///
-/// The id a route names here is one the service actually minted, not a literal.
-/// `AuthorizerPayloadFormatVersion` is "Required for HTTP API Lambda authorizers", so
-/// it is sent only for an HTTP api.
-async fn create_authorizer(
+/// The id a route names here is one the service actually minted, not a literal. Each type
+/// is sent the configuration its own documentation requires: a `REQUEST` authorizer names
+/// the Lambda it invokes, plus the payload format version that is "Required for HTTP API
+/// Lambda authorizers"; a `JWT` authorizer names the issuer its tokens come from.
+async fn create_authorizer_of_type(
     emulator: &MultiServiceRouter,
     case: &str,
     api_id: &str,
     protocol: &str,
+    authorizer_type: &str,
 ) -> String {
     let mut request = json!({
-        "name": "route-authorizer",
-        "authorizerType": "REQUEST",
-        "identitySource": ["$request.header.Authorization"],
-        "authorizerUri": lambda_uri()
+        "name": format!("route-authorizer-{}", authorizer_type.to_ascii_lowercase()),
+        "authorizerType": authorizer_type,
+        "identitySource": ["$request.header.Authorization"]
     });
-    if protocol == "HTTP" {
-        request["authorizerPayloadFormatVersion"] = json!("2.0");
+    if authorizer_type == "JWT" {
+        request["jwtConfiguration"] = json!({ "issuer": "https://example-issuer.test/oauth2" });
+    } else {
+        request["authorizerUri"] = json!(lambda_uri());
+        if protocol == "HTTP" {
+            request["authorizerPayloadFormatVersion"] = json!("2.0");
+        }
     }
     let (status, created) = call(
         emulator,
@@ -112,6 +120,16 @@ async fn create_authorizer(
         "case {case:?}: expected 201 from CreateAuthorizer, got {status} {created}"
     );
     as_str(&created, "authorizerId")
+}
+
+/// Create one `REQUEST` authorizer under `api_id` and answer its `AuthorizerId`.
+async fn create_authorizer(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    protocol: &str,
+) -> String {
+    create_authorizer_of_type(emulator, case, api_id, protocol, "REQUEST").await
 }
 
 /// Create one MOCK integration under `api_id` and answer its `IntegrationId`.
@@ -373,32 +391,48 @@ async fn update_route_replaces_the_members_it_names_and_keeps_the_rest() {
     }
 }
 
-/// The three forms a request can take on `AuthorizerId`: a minted id, no member at all,
-/// and an empty string (`Id` carries no length constraint, so the boundary validator
-/// passes an empty one through to the handler).
+/// The forms a request can take on `AuthorizerId`: the id of an authorizer of each
+/// modelled `AuthorizerType` the api holds, no member at all, and an empty string (`Id`
+/// carries no length constraint, so the boundary validator passes an empty one through to
+/// the handler).
 enum AuthorizerIdForm {
-    Minted,
+    /// The id of the api's authorizer whose `AuthorizerType` is this one.
+    OfType(&'static str),
     Absent,
     Empty,
 }
 
 impl AuthorizerIdForm {
-    fn label(&self) -> &'static str {
+    fn label(&self) -> String {
         match self {
-            Self::Minted => "naming the authorizer the api holds",
-            Self::Absent => "naming no authorizer",
-            Self::Empty => "with an empty AuthorizerId",
+            Self::OfType(authorizer_type) => {
+                format!("naming the api's {authorizer_type} authorizer")
+            }
+            Self::Absent => "naming no authorizer".to_string(),
+            Self::Empty => "with an empty AuthorizerId".to_string(),
         }
     }
 
-    /// Does the request leave the record associated with an authorizer?
-    fn names_authorizer(&self) -> bool {
-        matches!(self, Self::Minted)
+    /// The `AuthorizerType` of the authorizer the merged record ends up associated with,
+    /// or `None` where it names none at all.
+    fn authorizer_type(&self) -> Option<&'static str> {
+        match self {
+            Self::OfType(authorizer_type) => Some(authorizer_type),
+            Self::Absent | Self::Empty => None,
+        }
     }
 
-    fn value(&self, minted: &str) -> Option<String> {
+    /// The value the request sends for `AuthorizerId`, resolved against the ids the api
+    /// minted — one authorizer per `AuthorizerType`.
+    fn value(&self, minted: &[(&'static str, String)]) -> Option<String> {
         match self {
-            Self::Minted => Some(minted.to_string()),
+            Self::OfType(authorizer_type) => Some(
+                minted
+                    .iter()
+                    .find(|(kind, _)| kind == authorizer_type)
+                    .map(|(_, id)| id.clone())
+                    .expect("the api minted an authorizer of each modelled type"),
+            ),
             Self::Absent => None,
             Self::Empty => Some(String::new()),
         }
@@ -406,30 +440,60 @@ impl AuthorizerIdForm {
 }
 
 #[tokio::test]
-async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_one() {
+async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_a_matching_one() {
     // The table is the MODEL's own catalog of `AuthorizationType` values
     // (`smithy_query(query="shape", shape="AuthorizationType")`:
-    // `AWS_IAM | CUSTOM | JWT | NONE`), and the expectation is computed from the
-    // service's list of the values that delegate to an `Authorizer` resource — so a
-    // value added to either list is covered here without editing this test.
+    // `AWS_IAM | CUSTOM | JWT | NONE`) crossed with the forms an `AuthorizerId` takes, and
+    // the expectation is computed from the service's own pairing of an authorization type
+    // with the `AuthorizerType` that authorizes it — so a value added to either catalog is
+    // covered here without editing this test.
     use service_com_amazonaws_apigatewayv2_apigatewayv2::ops::types::AUTHORIZATION_TYPE_VALUES;
-    use service_com_amazonaws_apigatewayv2_apigatewayv2::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES;
+    use service_com_amazonaws_apigatewayv2_apigatewayv2::state::authorizer_type_authorizing;
 
     let emulator = emulator();
     // An HTTP api: "For HTTP APIs, valid values are NONE …, JWT …, AWS_IAM … and
-    // CUSTOM", so every value of the catalog is one this api's routes may carry.
+    // CUSTOM", so every value of the catalog is one this api's routes may carry, and a
+    // `JWT` authorizer is "supported only for HTTP APIs".
     let api_id = create_api(&emulator, "authorization table", &http_api("route-auth-host")).await;
-    let minted = create_authorizer(&emulator, "authorization table", &api_id, "HTTP").await;
+    // One authorizer of each modelled `AuthorizerType`, so a row can name the kind its
+    // authorization type calls for, the other kind, or none.
+    let minted: Vec<(&'static str, String)> = vec![
+        (
+            "REQUEST",
+            create_authorizer_of_type(
+                &emulator,
+                "authorization table",
+                &api_id,
+                "HTTP",
+                "REQUEST",
+            )
+            .await,
+        ),
+        (
+            "JWT",
+            create_authorizer_of_type(&emulator, "authorization table", &api_id, "HTTP", "JWT")
+                .await,
+        ),
+    ];
 
     for authorization_type in AUTHORIZATION_TYPE_VALUES {
-        for form in [
-            AuthorizerIdForm::Minted,
+        for (index, form) in [
+            AuthorizerIdForm::OfType("REQUEST"),
+            AuthorizerIdForm::OfType("JWT"),
             AuthorizerIdForm::Absent,
             AuthorizerIdForm::Empty,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let case = format!("{authorization_type} {}", form.label());
-            let accepted = !AUTHORIZER_BACKED_AUTHORIZATION_TYPES.contains(authorization_type)
-                || form.names_authorizer();
+            // The rule itself: a type that delegates to an authorizer is accepted only
+            // where the record names one of the kind that authorizes it; a type that
+            // decides without one takes any form, including an id of either kind.
+            let accepted = match authorizer_type_authorizing(authorization_type) {
+                None => true,
+                Some(required) => form.authorizer_type() == Some(required),
+            };
 
             let mut members = json!({ "authorizationType": authorization_type });
             if let Some(id) = form.value(&minted) {
@@ -437,7 +501,7 @@ async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_one() {
             }
 
             // (1) CreateRoute: the same requirement, on the create.
-            let route_key = format!("GET /{authorization_type}-{}", form.label().len());
+            let route_key = format!("GET /{authorization_type}-{index}");
             let mut create = members.clone();
             create["routeKey"] = json!(route_key);
             let (status, created) = call(
@@ -486,7 +550,7 @@ async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_one() {
             // (2) UpdateRoute: the same requirement, reached as a patch of an open
             // route that names no authorizer.
             let open_route = json!({
-                "routeKey": format!("PUT /open-{authorization_type}-{}", form.label().len())
+                "routeKey": format!("PUT /open-{authorization_type}-{index}")
             });
             let route_id = create_route(&emulator, &case, &api_id, &open_route).await;
             let (_, before) = get_route(&emulator, &api_id, &route_id).await;
@@ -522,50 +586,88 @@ async fn a_route_authorized_by_an_authorizer_is_refused_unless_it_names_one() {
 }
 
 #[tokio::test]
-async fn a_route_that_already_names_an_authorizer_may_switch_between_authorizer_backed_types() {
-    use service_com_amazonaws_apigatewayv2_apigatewayv2::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES;
+async fn a_route_may_switch_to_any_authorization_type_the_authorizer_it_names_authorizes() {
+    use service_com_amazonaws_apigatewayv2_apigatewayv2::ops::types::AUTHORIZATION_TYPE_VALUES;
+    use service_com_amazonaws_apigatewayv2_apigatewayv2::state::authorizer_type_authorizing;
 
     let emulator = emulator();
     let api_id = create_api(&emulator, "switch", &http_api("route-auth-switch")).await;
-    let authorizer_id = create_authorizer(&emulator, "switch", &api_id, "HTTP").await;
 
     // The requirement is on the MERGED record, so a route already associated with an
-    // authorizer may move to any authorizer-backed type without resending the id.
-    for authorization_type in AUTHORIZER_BACKED_AUTHORIZATION_TYPES {
-        let case = format!("switch to {authorization_type}");
-        let route_id = create_route(
-            &emulator,
-            &case,
-            &api_id,
-            &json!({
-                "routeKey": format!("GET /switch-{authorization_type}"),
-                "authorizationType": "CUSTOM",
-                "authorizerId": authorizer_id
-            }),
-        )
-        .await;
+    // authorizer may move WITHOUT resending the id to any authorization type that
+    // authorizer authorizes — and may not move to one it does not. Driven from an
+    // authorizer of each modelled `AuthorizerType`, against every modelled
+    // `AuthorizationType`.
+    for authorizer_type in ["REQUEST", "JWT"] {
+        let authorizer_id =
+            create_authorizer_of_type(&emulator, "switch", &api_id, "HTTP", authorizer_type).await;
+        // The authorization type this kind of authorizer authorizes, read off the
+        // service's own pairing rather than restated here.
+        let started_as = AUTHORIZATION_TYPE_VALUES
+            .iter()
+            .copied()
+            .find(|value| authorizer_type_authorizing(value) == Some(authorizer_type))
+            .expect("each modelled AuthorizerType authorizes one AuthorizationType");
 
-        let (status, updated) = update_route(
-            &emulator,
-            &api_id,
-            &route_id,
-            &json!({ "authorizationType": authorization_type }),
-        )
-        .await;
-        assert_eq!(
-            status, 201,
-            "case {case:?}: expected 201 from UpdateRoute, got {status} {updated}"
-        );
-        assert_eq!(
-            as_str(&updated, "authorizerId"),
-            authorizer_id,
-            "case {case:?}: the stored AuthorizerId must survive a patch that omits it, got {updated}"
-        );
-        assert_eq!(
-            as_str(&updated, "authorizationType"),
-            *authorization_type,
-            "case {case:?}: wrong AuthorizationType, got {updated}"
-        );
+        for authorization_type in AUTHORIZATION_TYPE_VALUES {
+            let case = format!("a route on a {authorizer_type} authorizer switching to \
+                                {authorization_type}");
+            let route_id = create_route(
+                &emulator,
+                &case,
+                &api_id,
+                &json!({
+                    "routeKey": format!("GET /switch-{authorizer_type}-{authorization_type}"),
+                    "authorizationType": started_as,
+                    "authorizerId": authorizer_id
+                }),
+            )
+            .await;
+            let (_, before) = get_route(&emulator, &api_id, &route_id).await;
+
+            let (status, updated) = update_route(
+                &emulator,
+                &api_id,
+                &route_id,
+                &json!({ "authorizationType": authorization_type }),
+            )
+            .await;
+            let authorizes = authorizer_type_authorizing(authorization_type)
+                .is_none_or(|required| required == authorizer_type);
+            if authorizes {
+                assert_eq!(
+                    status, 201,
+                    "case {case:?}: expected 201 from UpdateRoute, got {status} {updated}"
+                );
+                assert_eq!(
+                    as_str(&updated, "authorizerId"),
+                    authorizer_id,
+                    "case {case:?}: the stored AuthorizerId must survive a patch that omits \
+                     it, got {updated}"
+                );
+                assert_eq!(
+                    as_str(&updated, "authorizationType"),
+                    *authorization_type,
+                    "case {case:?}: wrong AuthorizationType, got {updated}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected 400 from UpdateRoute, got {status} {updated}"
+                );
+                assert_eq!(
+                    error_code(&updated),
+                    "BadRequestException",
+                    "case {case:?}: expected BadRequestException, got {updated}"
+                );
+                let (_, after) = get_route(&emulator, &api_id, &route_id).await;
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: a refused UpdateRoute must leave the record as it was; \
+                     expected {before}, got {after}"
+                );
+            }
+        }
     }
 }
 

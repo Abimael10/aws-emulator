@@ -356,7 +356,7 @@ fn rows(f: &Fixture) -> Vec<Row> {
             case: "UpdateRouteResponse, a patch of a child of a route (modelled 200)",
             method: "PATCH",
             uri: format!("/v2/apis/{socket_api}/routes/{socket_route}/routeresponses/{route_response}"),
-            body: Some(json!({ "routeResponseKey": "moved" })),
+            body: Some(json!({ "responseModels": { "$default": "Empty" } })),
             status: 201,
             empty: false,
         },

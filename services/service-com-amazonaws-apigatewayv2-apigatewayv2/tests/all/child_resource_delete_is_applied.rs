@@ -72,7 +72,8 @@ struct Row {
     uri: String,
     /// The identifier it carries, as its collection reader reports it.
     id: String,
-    /// A sibling of the same kind under the same parent: the delete must leave it alone.
+    /// A sibling of the same kind under the same parent — or, where a parent holds at most
+    /// one resource of the kind, under a parent of its own: the delete must leave it alone.
     sibling_uri: String,
     /// The sibling's identifier, so the collection reader is shown to still report it.
     sibling_id: String,
@@ -132,6 +133,17 @@ async fn assert_not_found(
         message,
         "case {case:?}: expected the refusal {message:?} from {method} {uri}, got {answered}"
     );
+}
+
+/// The identifiers a collection reader reported, read out of each item's `member`.
+fn reported_ids(listed: &Value, member: &str) -> Vec<String> {
+    listed["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| as_str(item, member))
+        .collect()
 }
 
 /// One WebSocket api — the protocol that carries route responses, integration responses
@@ -204,14 +216,32 @@ async fn rows(emulator: &MultiServiceRouter) -> Vec<Row> {
     let route_id = as_str(&route, "routeId");
     let route_responses = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses");
 
+    // A route carries at most ONE route response — the service serves one
+    // `RouteResponseKey` — so the sibling this delete must spare lives on a route of its
+    // own, under that same key.
+    let sibling_route = as_str(
+        &accepted(
+            emulator,
+            "the route holding the sibling response",
+            "POST",
+            &format!("/v2/apis/{api_id}/routes"),
+            Some(json!({ "routeKey": "sendMessage" })),
+            201,
+        )
+        .await,
+        "routeId",
+    );
+    let sibling_route_responses =
+        format!("/v2/apis/{api_id}/routes/{sibling_route}/routeresponses");
+
     let mut route_response_ids = Vec::new();
-    for key in ["$default", "echo"] {
+    for collection in [&route_responses, &sibling_route_responses] {
         let created = accepted(
             emulator,
-            key,
+            "$default",
             "POST",
-            &route_responses,
-            Some(json!({ "routeResponseKey": key })),
+            collection,
+            Some(json!({ "routeResponseKey": "$default" })),
             201,
         )
         .await;
@@ -306,10 +336,12 @@ async fn rows(emulator: &MultiServiceRouter) -> Vec<Row> {
             kind: "RouteResponse",
             uri: format!("{route_responses}/{}", route_response_ids[0]),
             id: route_response_ids[0].clone(),
-            sibling_uri: format!("{route_responses}/{}", route_response_ids[1]),
+            sibling_uri: format!("{sibling_route_responses}/{}", route_response_ids[1]),
             sibling_id: route_response_ids[1].clone(),
             message: ROUTE_RESPONSE_NOT_FOUND.to_string(),
-            patch: Some(json!({ "routeResponseKey": "moved" })),
+            // The patch names the one `RouteResponseKey` the service serves, so the 404 is
+            // the addressing's and not the key's.
+            patch: Some(json!({ "routeResponseKey": "$default" })),
             extra_reads: Vec::new(),
             collection: Some((route_responses.clone(), "routeResponseId")),
             repeat_delete_status: 404,
@@ -428,22 +460,24 @@ async fn a_deleted_child_resource_stops_resolving_for_every_later_caller() {
         // The collection reader reports the siblings and not the deleted record.
         if let Some((collection, member)) = &row.collection {
             let listed = accepted(&emulator, case, "GET", collection, None, 200).await;
-            let reported: Vec<String> = listed["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .map(|item| as_str(item, member))
-                .collect();
+            let reported = reported_ids(&listed, member);
             assert!(
                 !reported.contains(&row.id),
                 "case {case:?}: expected {} to be gone from {collection}, got {reported:?}",
                 row.id
             );
+            // The sibling is read through the collection that holds IT, which is the same
+            // one for every kind whose parent may hold several.
+            let sibling_collection = row
+                .sibling_uri
+                .rsplit_once('/')
+                .map_or(row.sibling_uri.as_str(), |(collection, _)| collection);
+            let listed = accepted(&emulator, case, "GET", sibling_collection, None, 200).await;
+            let reported = reported_ids(&listed, member);
             assert!(
                 reported.contains(&row.sibling_id),
-                "case {case:?}: expected the sibling {} to survive in {collection}, got \
-                 {reported:?}",
+                "case {case:?}: expected the sibling {} to survive in {sibling_collection}, \
+                 got {reported:?}",
                 row.sibling_id
             );
         }

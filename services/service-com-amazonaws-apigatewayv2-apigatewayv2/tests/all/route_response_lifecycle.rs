@@ -15,14 +15,12 @@
 //! * A route response is a WebSocket-only resource
 //!   (`RouteResponse$ModelSelectionExpression`: "Supported only for WebSocket APIs"), so
 //!   a create against an api of another protocol type is refused 400 and stores nothing.
-//! * A route holds at most `MAX_ROUTE_RESPONSES_PER_ROUTE` route responses: past that
-//!   bound a create is refused 429 `TooManyRequestsException` and stores nothing, so no
-//!   loop of creates grows the store without end.
 //!
-//! The rows vary what the rules generalise over: the route response key's form, which
-//! optional members the request carries, and how many response models and response
-//! parameters it names (none, one, several). The recorded WebSocket case that filed the
-//! issue — a `$default` route response on a route of a WebSocket api — is one row.
+//! The rows vary what the rules generalise over: which optional members the request
+//! carries, and how many response models and response parameters it names (none, one,
+//! several). The recorded WebSocket case that filed the issue — a `$default` route response
+//! on a route of a WebSocket api — is one row. Which KEY a route response may carry at all
+//! is the rule beside this one (`tests/all/route_response_key_support.rs`).
 
 use std::collections::BTreeSet;
 
@@ -32,10 +30,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::api_lifecycle::{as_str, assert_minted_id, call, carries_nothing, emulator, error_code};
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::duplicate_identity::route_response_key_in_use_message;
 
-/// The most route responses one route holds, after which a create is refused: the
-/// crate's own bound, so the test tracks it rather than restating a number.
-const MAX_ROUTE_RESPONSES_PER_ROUTE: usize =
-    service_com_amazonaws_apigatewayv2_apigatewayv2::state::MAX_ROUTE_RESPONSES_PER_ROUTE;
+/// The one `RouteResponseKey` the service serves: the crate's own constant, so the suite
+/// tracks it rather than restating a literal.
+const SUPPORTED_ROUTE_RESPONSE_KEY: &str =
+    service_com_amazonaws_apigatewayv2_apigatewayv2::state::SUPPORTED_ROUTE_RESPONSE_KEY;
 
 /// One row: the `CreateRouteResponse` request, and the members the stored route
 /// response must report back.
@@ -53,7 +51,7 @@ struct Row {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "the $default route response key, only the required member",
+            case: "only the required member",
             request: json!({ "routeResponseKey": "$default" }),
             expected: || vec![("routeResponseKey", json!("$default"))],
             expect_empty: &[
@@ -63,14 +61,14 @@ fn rows() -> Vec<Row> {
             ],
         },
         Row {
-            case: "a custom selection key with a model selection expression",
+            case: "a model selection expression",
             request: json!({
-                "routeResponseKey": "echo",
+                "routeResponseKey": "$default",
                 "modelSelectionExpression": "$request.body.action"
             }),
             expected: || {
                 vec![
-                    ("routeResponseKey", json!("echo")),
+                    ("routeResponseKey", json!("$default")),
                     ("modelSelectionExpression", json!("$request.body.action")),
                 ]
             },
@@ -79,12 +77,12 @@ fn rows() -> Vec<Row> {
         Row {
             case: "one response model",
             request: json!({
-                "routeResponseKey": "single-model",
+                "routeResponseKey": "$default",
                 "responseModels": { "$default": "Empty" }
             }),
             expected: || {
                 vec![
-                    ("routeResponseKey", json!("single-model")),
+                    ("routeResponseKey", json!("$default")),
                     ("responseModels", json!({ "$default": "Empty" })),
                 ]
             },
@@ -93,7 +91,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "several response models and response parameters",
             request: json!({
-                "routeResponseKey": "many",
+                "routeResponseKey": "$default",
                 "modelSelectionExpression": "$request.body.kind",
                 "responseModels": { "$default": "Empty", "application/json": "Reply" },
                 "responseParameters": {
@@ -103,7 +101,7 @@ fn rows() -> Vec<Row> {
             }),
             expected: || {
                 vec![
-                    ("routeResponseKey", json!("many")),
+                    ("routeResponseKey", json!("$default")),
                     ("modelSelectionExpression", json!("$request.body.kind")),
                     (
                         "responseModels",
@@ -123,11 +121,11 @@ fn rows() -> Vec<Row> {
         Row {
             case: "explicitly empty collections, which store nothing",
             request: json!({
-                "routeResponseKey": "empty-maps",
+                "routeResponseKey": "$default",
                 "responseModels": {},
                 "responseParameters": {}
             }),
-            expected: || vec![("routeResponseKey", json!("empty-maps"))],
+            expected: || vec![("routeResponseKey", json!("$default"))],
             expect_empty: &[
                 "modelSelectionExpression",
                 "responseModels",
@@ -181,10 +179,13 @@ async fn create_route(
 async fn create_route_response_persists_the_record_get_route_response_reports_back() {
     let emulator = emulator();
     let api_id = create_api(&emulator, "the owning api", &websocket_api("route-response-host")).await;
-    let route_id = create_route(&emulator, "the owning route", &api_id, "$connect").await;
 
     let mut minted = BTreeSet::new();
-    for row in rows() {
+    for (index, row) in rows().into_iter().enumerate() {
+        // One route per row: a route carries at most one route response, because the one
+        // key the service serves can only be taken once on it.
+        let route_id =
+            create_route(&emulator, row.case, &api_id, &format!("sendMessage{index}")).await;
         let (status, created) = call(
             &emulator,
             "POST",
@@ -418,7 +419,7 @@ async fn a_route_response_is_refused_on_an_api_that_is_not_a_websocket_api() {
         ),
         (
             "a key with response models",
-            json!({ "routeResponseKey": "echo", "responseModels": { "$default": "Empty" } }),
+            json!({ "routeResponseKey": "$default", "responseModels": { "$default": "Empty" } }),
         ),
     ] {
         let (status, body) = call(
@@ -454,58 +455,72 @@ async fn a_route_response_is_refused_on_an_api_that_is_not_a_websocket_api() {
 }
 
 #[tokio::test]
-async fn a_route_holds_at_most_the_bounded_number_of_route_responses() {
+async fn a_route_holds_at_most_one_route_response() {
     let emulator = emulator();
     let api_id = create_api(&emulator, "the owning api", &websocket_api("bounded-ws-api")).await;
     let route_id = create_route(&emulator, "the owning route", &api_id, "$connect").await;
     let uri = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses");
 
-    // Fill the route to its bound, each response under a key of its own.
-    for index in 0..MAX_ROUTE_RESPONSES_PER_ROUTE {
+    // The route's one route response: the service serves one key, so this takes it.
+    let (status, created) = call(
+        &emulator,
+        "POST",
+        &uri,
+        Some(json!({ "routeResponseKey": SUPPORTED_ROUTE_RESPONSE_KEY })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "expected 201 for the route's first route response, got {status} {created}"
+    );
+    let held = as_str(&created, "routeResponseId");
+
+    // Every further create on that route is refused, so no loop of creates grows the
+    // store, and the response it already holds is untouched.
+    for attempt in 0..3 {
         let (status, body) = call(
             &emulator,
             "POST",
             &uri,
-            Some(json!({ "routeResponseKey": format!("key-{index}") })),
+            Some(json!({ "routeResponseKey": SUPPORTED_ROUTE_RESPONSE_KEY })),
         )
         .await;
         assert_eq!(
-            status, 201,
-            "route response {index}: expected 201 while under the bound of \
-             {MAX_ROUTE_RESPONSES_PER_ROUTE}, got {status} {body}"
+            status, 400,
+            "attempt {attempt}: expected 400 for a second route response on one route, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "BadRequestException",
+            "attempt {attempt}: expected BadRequestException, got {body}"
         );
     }
-
-    // One past it is refused, and the refusal stores nothing.
-    let (status, body) = call(
-        &emulator,
-        "POST",
-        &uri,
-        Some(json!({ "routeResponseKey": "one-too-many" })),
-    )
-    .await;
+    let (status, listed) = call(&emulator, "GET", &uri, None).await;
     assert_eq!(
-        status, 429,
-        "expected 429 past the bound of {MAX_ROUTE_RESPONSES_PER_ROUTE}, got {status} {body}"
+        status, 200,
+        "expected 200 from GetRouteResponses, got {status} {listed}"
     );
+    let reported: Vec<String> = listed["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| as_str(item, "routeResponseId"))
+        .collect();
     assert_eq!(
-        error_code(&body),
-        "TooManyRequestsException",
-        "expected TooManyRequestsException, got {body}"
-    );
-    assert_eq!(
-        as_str(&body, "limitType"),
-        "RouteResponse",
-        "expected the refusal to name the limit it exceeded, got {body}"
+        reported,
+        vec![held],
+        "expected the route to hold its one route response, got {listed}"
     );
 
-    // Another route of the same api is unaffected: the bound is per route.
+    // Another route of the same api is unaffected: the key is scoped to its route.
     let sibling = create_route(&emulator, "another route", &api_id, "sendMessage").await;
     let (status, body) = call(
         &emulator,
         "POST",
         &format!("/v2/apis/{api_id}/routes/{sibling}/routeresponses"),
-        Some(json!({ "routeResponseKey": "$default" })),
+        Some(json!({ "routeResponseKey": SUPPORTED_ROUTE_RESPONSE_KEY })),
     )
     .await;
     assert_eq!(

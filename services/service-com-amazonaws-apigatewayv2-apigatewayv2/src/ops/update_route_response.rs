@@ -234,6 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.response_parameters = response_parameters.into_iter().collect();
         }
 
+        // The MERGED key is held to the same rule the create holds one to: the service
+        // serves exactly one route response key, so a patch cannot move a response onto
+        // one it does not serve either (`crate::state::route_response_key`).
+        if let Err(message) =
+            crate::state::validate_route_response_key(&updated.route_response_key)
+        {
+            return Err(bad_request(&message));
+        }
+
         // The route response key is what a route response is SELECTED by, so one route
         // cannot carry two responses under one key: an update cannot move a response onto
         // a key a SIBLING response of the same route already holds. The response being

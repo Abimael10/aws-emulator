@@ -324,34 +324,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The route's references name a resource of its OWN api, and neither may be stored
+        // unresolved. Checked BEFORE an id is minted, so a refused create leaves the api's
+        // routes exactly as they were. The target's FORM is weighed first: a value that is
+        // not `integrations/{IntegrationId}` addresses no integration to resolve (see
+        // `crate::state::validate_route_target`), and this create has minted no `RouteId`
+        // for the sentence to name.
+        if let Err(message) =
+            crate::state::validate_route_target(input.target.as_deref(), ::std::option::Option::None)
+        {
+            return Err(bad_request(&message));
+        }
+        if let Some(message) = api.unresolved_route_target(input.target.as_deref()) {
+            return Err(bad_request(&message));
+        }
+
         // "valid values are NONE for open access" (`Route$AuthorizationType`): a route
         // the request gave no authorization type is open.
         let authorization_type = input
             .authorization_type
             .unwrap_or_else(|| crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string());
         // The same requirement every writer of a route enforces: a route whose
-        // authorization is decided by an `Authorizer` resource has to name one. Checked
-        // BEFORE an id is minted, so a refused create consumes nothing.
+        // authorization is decided by an `Authorizer` resource has to be associated with
+        // one of its own api that can make that decision — an authorizer the api holds, of
+        // the type that authorization type names. Checked BEFORE an id is minted, so a
+        // refused create consumes nothing.
         if let Err(message) = crate::state::validate_route_authorization(
+            &api.authorizers,
             &authorization_type,
-            input.authorizer_id.as_deref(),
-        ) {
-            return Err(bad_request(&message));
-        }
-
-        // Both of the route's references name a resource of its OWN api, and neither may
-        // be stored unresolved. Checked BEFORE an id is minted, so a refused create
-        // leaves the api's routes exactly as they were. The target's FORM is weighed
-        // first: a value that is not `integrations/{IntegrationId}` addresses no
-        // integration to resolve (see `crate::state::validate_route_target`), and this
-        // create has minted no `RouteId` for the sentence to name.
-        if let Err(message) =
-            crate::state::validate_route_target(input.target.as_deref(), ::std::option::Option::None)
-        {
-            return Err(bad_request(&message));
-        }
-        if let Some(message) = api.unresolved_route_reference(
-            input.target.as_deref(),
             input.authorizer_id.as_deref(),
         ) {
             return Err(bad_request(&message));

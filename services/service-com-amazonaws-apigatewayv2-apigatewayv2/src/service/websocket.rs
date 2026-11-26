@@ -842,7 +842,8 @@ pub(crate) type HandshakeRefusal = (u16, &'static str);
 /// targets is reached by a handshake refused here. Two refusals are computed from the api's
 /// own records:
 ///
-/// * an authorizer-backed route ([`crate::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES`])
+/// * an authorizer-backed route ([`crate::state::authorizer_type_authorizing`] pairs its
+///   `AuthorizationType` with an authorizer type)
 ///   whose `AuthorizerId` names no authorizer of this api cannot be served at all — the
 ///   decision has no configuration to come from — which is a fault of the api's
 ///   configuration and not of the caller: `500`. The writers of a route refuse that
@@ -890,12 +891,10 @@ where
     else {
         return Ok(None);
     };
-    if !crate::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES
-        .contains(&route.authorization_type.as_str())
-    {
+    if crate::state::authorizer_type_authorizing(&route.authorization_type).is_none() {
         // `NONE` is "open access" and `AWS_IAM` is decided by an IAM policy this emulator
         // holds no records of, so neither has an authorization this module can apply. The
-        // other value of that constant, `JWT`, cannot reach this data plane: a JWT
+        // other type that pairing names, `JWT`, cannot reach this data plane: a JWT
         // authorizer is "supported only for HTTP APIs" and `validate_authorizer_config`
         // refuses one on a WEBSOCKET api, so the identity-source rule below is only ever
         // applied to the `REQUEST` authorizers it is the rule for.

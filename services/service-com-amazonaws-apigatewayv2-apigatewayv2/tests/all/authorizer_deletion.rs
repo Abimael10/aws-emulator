@@ -422,14 +422,16 @@ async fn delete_authorizer_is_refused_while_a_route_of_its_api_names_it() {
         let spare_name = format!("in-use-spare-{index}");
         let authorizer_id =
             create_authorizer(&emulator, row.case, &api_id, authorizer_request).await;
-        // A second authorizer for the routes to be re-pointed at below.
-        let spare_authorizer_id = create_authorizer(
-            &emulator,
-            row.case,
-            &api_id,
-            request_authorizer(&spare_name, row.protocol),
-        )
-        .await;
+        // A second authorizer for the routes to be re-pointed at below, of the kind this
+        // row's `AuthorizationType` is authorized by: a route is only ever associated with
+        // an authorizer of that kind.
+        let spare_request = if row.authorization_type == "JWT" {
+            jwt_authorizer(&spare_name)
+        } else {
+            request_authorizer(&spare_name, row.protocol)
+        };
+        let spare_authorizer_id =
+            create_authorizer(&emulator, row.case, &api_id, spare_request).await;
 
         let mut route_ids = Vec::new();
         for route_key in row.route_keys {

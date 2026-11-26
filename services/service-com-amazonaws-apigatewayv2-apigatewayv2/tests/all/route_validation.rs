@@ -7,7 +7,8 @@
 //! * **A route's references are resolved against its own api before anything is
 //!   persisted.** A route references two resources of the api that owns it — the
 //!   integration its `Target` addresses (`integrations/{IntegrationId}`) and the
-//!   authorizer its `AuthorizerId` names — and a request naming one the api cannot
+//!   authorizer its `AuthorizerId` names, which has to be of the `AuthorizerType` that
+//!   authorizes the route's `AuthorizationType` — and a request naming one the api cannot
 //!   resolve is "not valid, for example, the input is incomplete or incorrect":
 //!   `BadRequestException` (400, `smithy_query(query="operation",
 //!   operation="CreateRoute")`), with nothing created. A value that is not of the target
@@ -23,16 +24,19 @@
 //!   key <RouteKey> already exists for this API`, with code `ConflictException` (409).
 //!
 //! The rows span what each rule generalises over: which reference is unresolvable and
-//! why (never minted, deleted, minted on another api, not a reference at all), the
-//! authorization type that names an authorizer, the shape of the conflicting route key
-//! (a named variable, the greedy variable, a deeper position, a different method, the
-//! `ANY` method), and the form of the duplicated key (a method-and-path key, a
-//! WebSocket key, the catch-all). The recorded cases that filed the issue — a target of
-//! `integrations/abc1234`, an `AuthorizerId` of `nonexistent123`, `GET /items/{proxy+}`
-//! beside `GET /items/{id}`, and the `GET /dup` conflict message — are ONE row each.
+//! why (never minted, deleted, minted on another api, an authorizer of the other kind, not
+//! a reference at all), the authorization type that names an authorizer, the shape of the
+//! conflicting route key (a named variable, the greedy variable, a deeper position, a
+//! different method, the `ANY` method), and the form of the duplicated key (a
+//! method-and-path key, a WebSocket key, the catch-all). The recorded cases that filed the
+//! issue — a target of `integrations/abc1234`, an `AuthorizerId` of `nonexistent123`, `GET
+//! /items/{proxy+}` beside `GET /items/{id}`, and the `GET /dup` conflict message — are ONE
+//! row each.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_apigatewayv2_apigatewayv2::state::UNRESOLVED_AUTHORIZER_MESSAGE;
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
+    invalid_authorizer_reference_message, UNRESOLVED_AUTHORIZER_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, call, emulator, error_code};
@@ -79,19 +83,32 @@ async fn create_integration(emulator: &MultiServiceRouter, case: &str, api_id: &
     as_str(&created, "integrationId")
 }
 
-/// Create one `REQUEST` authorizer under an HTTP `api_id` and answer its `AuthorizerId`.
-async fn create_authorizer(emulator: &MultiServiceRouter, case: &str, api_id: &str) -> String {
+/// Create one authorizer of `authorizer_type` under an HTTP `api_id` and answer its
+/// `AuthorizerId`. Each type is sent the configuration its own documentation requires.
+async fn create_authorizer_of_type(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    authorizer_type: &str,
+) -> String {
+    let mut request = json!({
+        "name": format!("route-authorizer-{}", authorizer_type.to_ascii_lowercase()),
+        "authorizerType": authorizer_type,
+        "identitySource": ["$request.header.Authorization"]
+    });
+    if authorizer_type == "JWT" {
+        request["jwtConfiguration"] = json!({ "issuer": "https://example-issuer.test/oauth2" });
+    } else {
+        request["authorizerUri"] = json!(
+            "arn:aws:apigateway:eu-west-1:lambda:path/2015-03-31/functions/arn:aws:lambda:eu-west-1:000000000000:function:authorizer/invocations"
+        );
+        request["authorizerPayloadFormatVersion"] = json!("2.0");
+    }
     let (status, created) = call(
         emulator,
         "POST",
         &format!("/v2/apis/{api_id}/authorizers"),
-        Some(json!({
-            "name": "route-authorizer",
-            "authorizerType": "REQUEST",
-            "identitySource": ["$request.header.Authorization"],
-            "authorizerUri": "arn:aws:apigateway:eu-west-1:lambda:path/2015-03-31/functions/arn:aws:lambda:eu-west-1:000000000000:function:authorizer/invocations",
-            "authorizerPayloadFormatVersion": "2.0"
-        })),
+        Some(request),
     )
     .await;
     assert_eq!(
@@ -99,6 +116,11 @@ async fn create_authorizer(emulator: &MultiServiceRouter, case: &str, api_id: &s
         "case {case:?}: expected 201 from CreateAuthorizer, got {status} {created}"
     );
     as_str(&created, "authorizerId")
+}
+
+/// Create one `REQUEST` authorizer under an HTTP `api_id` and answer its `AuthorizerId`.
+async fn create_authorizer(emulator: &MultiServiceRouter, case: &str, api_id: &str) -> String {
+    create_authorizer_of_type(emulator, case, api_id, "REQUEST").await
 }
 
 /// Send one CreateRoute and answer `(status, body)`.
@@ -139,6 +161,10 @@ async fn a_route_whose_reference_its_api_cannot_resolve_is_refused_and_creates_n
     let api_id = create_api(&emulator, "the api under test", &http_api("reference-host")).await;
     let integration_id = create_integration(&emulator, "the api's integration", &api_id).await;
     let authorizer_id = create_authorizer(&emulator, "the api's authorizer", &api_id).await;
+    // And a JWT authorizer of the same api, so the table covers an id that resolves to an
+    // authorizer of the OTHER kind as well as one that resolves to nothing.
+    let jwt_authorizer_id =
+        create_authorizer_of_type(&emulator, "the api's JWT authorizer", &api_id, "JWT").await;
 
     // A second api holding TWO integrations: each api mints its ids from its own
     // sequence, so this api's second id is one the api under test never minted.
@@ -203,6 +229,24 @@ async fn a_route_whose_reference_its_api_cannot_resolve_is_refused_and_creates_n
                 "routeKey": "GET /unknown-jwt-authorizer",
                 "authorizationType": "JWT",
                 "authorizerId": "nonexistent123"
+            }),
+            invalid_authorizer_reference_message("JWT"),
+        ),
+        (
+            "a JWT route naming this api's REQUEST authorizer",
+            json!({
+                "routeKey": "GET /jwt-on-request-authorizer",
+                "authorizationType": "JWT",
+                "authorizerId": authorizer_id.clone()
+            }),
+            invalid_authorizer_reference_message("JWT"),
+        ),
+        (
+            "a CUSTOM route naming this api's JWT authorizer",
+            json!({
+                "routeKey": "GET /custom-on-jwt-authorizer",
+                "authorizationType": "CUSTOM",
+                "authorizerId": jwt_authorizer_id.clone()
             }),
             UNRESOLVED_AUTHORIZER_MESSAGE.to_string(),
         ),
@@ -279,7 +323,7 @@ async fn a_route_whose_reference_its_api_cannot_resolve_is_refused_and_creates_n
                 "routeKey": "GET /both-resolved",
                 "target": format!("integrations/{integration_id}"),
                 "authorizationType": "JWT",
-                "authorizerId": authorizer_id
+                "authorizerId": jwt_authorizer_id
             }),
         ),
         (

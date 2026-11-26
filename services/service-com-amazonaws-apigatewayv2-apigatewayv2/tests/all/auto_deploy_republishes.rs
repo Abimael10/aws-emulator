@@ -82,6 +82,10 @@ struct Prepared {
     route_id: String,
     /// The route's route key, so a row may ask for a key that is already taken.
     route_key: String,
+    /// A second route carrying no route response, so a row may create one: a route holds
+    /// at most one, under the single `RouteResponseKey` the service serves (a WebSocket api
+    /// only).
+    spare_route_id: String,
     /// The route response of the route (a WebSocket api only).
     route_response_id: String,
     /// The deployment the pinned stage serves.
@@ -167,15 +171,15 @@ fn rows() -> Vec<Row> {
                 method: "POST",
                 uri: format!(
                     "/v2/apis/{}/routes/{}/routeresponses",
-                    prepared.api_id, prepared.route_id
+                    prepared.api_id, prepared.spare_route_id
                 ),
-                body: Some(json!({ "routeResponseKey": "added" })),
+                body: Some(json!({ "routeResponseKey": "$default" })),
             },
             status: 201,
             expect: Expect::Released,
         },
         Row {
-            case: "UpdateRouteResponse moves a response onto another key",
+            case: "UpdateRouteResponse patches the response a route carries",
             protocol: Protocol::WebSocket,
             request: |prepared| Request {
                 method: "PATCH",
@@ -183,7 +187,7 @@ fn rows() -> Vec<Row> {
                     "/v2/apis/{}/routes/{}/routeresponses/{}",
                     prepared.api_id, prepared.route_id, prepared.route_response_id
                 ),
-                body: Some(json!({ "routeResponseKey": "moved" })),
+                body: Some(json!({ "responseModels": { "$default": "Empty" } })),
             },
             status: 201,
             expect: Expect::Released,
@@ -444,6 +448,30 @@ async fn prepare(emulator: &MultiServiceRouter, case: &str, protocol: Protocol) 
     );
     let route_id = as_str(&route, "routeId");
 
+    // A spare route on a WebSocket api, carrying no route response: a route holds at most
+    // one, so a row that CREATES one addresses this route rather than the one above. It
+    // fronts the same integration, so the api stays deployable.
+    let spare_route_id = if protocol == Protocol::WebSocket {
+        let (status, spare) = call(
+            emulator,
+            "POST",
+            &format!("/v2/apis/{api_id}/routes"),
+            Some(json!({
+                "routeKey": "broadcast",
+                "target": format!("integrations/{integration_id}")
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: CreateRoute must answer 201 for the spare route, got {status} \
+             {spare}"
+        );
+        as_str(&spare, "routeId")
+    } else {
+        String::new()
+    };
+
     let route_response_id = if protocol == Protocol::WebSocket {
         let (status, response) = call(
             emulator,
@@ -506,6 +534,7 @@ async fn prepare(emulator: &MultiServiceRouter, case: &str, protocol: Protocol) 
         spare_integration_id,
         route_id,
         route_key,
+        spare_route_id,
         route_response_id,
         pinned_deployment_id,
     }

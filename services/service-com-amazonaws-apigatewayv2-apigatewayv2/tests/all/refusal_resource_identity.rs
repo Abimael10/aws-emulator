@@ -45,7 +45,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::paging::MAX_RESULTS_NOT_AN_INTEGER_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::api_lifecycle::{as_str, assert_minted_id, call, emulator, error_code};
+use crate::api_lifecycle::{as_str, assert_minted_id, call, carries_nothing, emulator, error_code};
 
 /// The stage name the fixture's api carries. "Stage names can only contain alphanumeric
 /// characters, hyphens, and underscores" (`CreateStage$StageName`).
@@ -636,68 +636,91 @@ async fn the_route_response_list_reports_the_routes_responses_and_names_what_it_
     let route_id = create_route(&emulator, &api_id, "$default", None).await;
     let collection = format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses");
 
-    // The rows span the number of responses one route holds, and the key's form.
-    let mut minted: Vec<String> = Vec::new();
-    for key in ["$default", "first", "second-response", "$disconnect"] {
-        let response = created(
+    // The rows span what a route's route-response collection can hold: nothing, and the
+    // one response the service's single `RouteResponseKey` admits. The sibling routes show
+    // the collection is the ROUTE's: each lists only its own.
+    let (status, empty) = call(&emulator, "GET", &collection, None).await;
+    assert_eq!(
+        status, 200,
+        "expected 200 from GetRouteResponses on a route holding none, got {status} {empty}"
+    );
+    assert_eq!(
+        empty["items"].as_array().map(Vec::len),
+        Some(0),
+        "expected a route holding no route response to list none, got {empty}"
+    );
+
+    let response = created(
+        &emulator,
+        "$default",
+        &collection,
+        json!({ "routeResponseKey": "$default" }),
+    )
+    .await;
+    let minted = as_str(&response, "routeResponseId");
+    let (status, listed) = call(&emulator, "GET", &collection, None).await;
+    assert_eq!(
+        status, 200,
+        "expected 200 from GetRouteResponses, got {status} {listed}"
+    );
+    let reported: Vec<String> = listed["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| as_str(item, "routeResponseId"))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![minted.clone()],
+        "expected the list to report the route response the route holds, got {listed}"
+    );
+
+    for route_key in ["sendMessage", "broadcast"] {
+        let sibling = create_route(&emulator, &api_id, route_key, None).await;
+        let sibling_collection = format!("/v2/apis/{api_id}/routes/{sibling}/routeresponses");
+        let sibling_response = created(
             &emulator,
-            key,
-            &collection,
-            json!({ "routeResponseKey": key }),
+            route_key,
+            &sibling_collection,
+            json!({ "routeResponseKey": "$default" }),
         )
         .await;
-        minted.push(as_str(&response, "routeResponseId"));
-        minted.sort();
-
-        let (status, listed) = call(&emulator, "GET", &collection, None).await;
+        let sibling_id = as_str(&sibling_response, "routeResponseId");
+        let (status, listed) = call(&emulator, "GET", &sibling_collection, None).await;
         assert_eq!(
             status, 200,
-            "case {key:?}: expected 200 from GetRouteResponses, got {status} {listed}"
+            "case {route_key:?}: expected 200 from GetRouteResponses, got {status} {listed}"
         );
-        let mut reported: Vec<String> = listed["items"]
+        let reported: Vec<String> = listed["items"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .iter()
             .map(|item| as_str(item, "routeResponseId"))
             .collect();
-        reported.sort();
         assert_eq!(
-            reported, minted,
-            "case {key:?}: expected the list to report every route response the route \
-             holds, got {listed}"
+            reported,
+            vec![sibling_id],
+            "case {route_key:?}: expected the sibling route to list its own response only, \
+             got {listed}"
         );
     }
 
-    // One page at a time, in the store's own `RouteResponseId` order, resumed by the
-    // token the previous page answered with.
-    let (status, first) = call(&emulator, "GET", &format!("{collection}?maxResults=2"), None).await;
+    // A page the collection fits in whole is answered without a token to resume from.
+    let (status, page) = call(&emulator, "GET", &format!("{collection}?maxResults=2"), None).await;
     assert_eq!(
         status, 200,
-        "expected 200 from the first page, got {status} {first}"
+        "expected 200 from a page of two, got {status} {page}"
     );
     assert_eq!(
-        first["items"].as_array().map(Vec::len),
-        Some(2),
-        "expected a page of two, got {first}"
+        page["items"].as_array().map(Vec::len),
+        Some(1),
+        "expected the route's one route response, got {page}"
     );
-    let token = as_str(&first, "nextToken");
-    assert!(!token.is_empty(), "expected a nextToken, got {first}");
-    let (status, second) = call(
-        &emulator,
-        "GET",
-        &format!("{collection}?maxResults=2&nextToken={token}"),
-        None,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "expected 200 from the resumed page, got {status} {second}"
-    );
-    assert_eq!(
-        second["items"].as_array().map(Vec::len),
-        Some(2),
-        "expected the rest of the collection, got {second}"
+    assert!(
+        carries_nothing(&page, "nextToken"),
+        "expected no token where the whole collection fits in the page, got {page}"
     );
 
     // A page size the caller asks for is clamped server-side: a huge `MaxResults`

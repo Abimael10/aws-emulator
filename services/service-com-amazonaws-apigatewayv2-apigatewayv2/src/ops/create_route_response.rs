@@ -196,6 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A route response is the WebSocket two-way reply, and the service serves exactly
+        // one selection key for it, so a key it does not serve is refused before anything
+        // is written (`crate::state::route_response_key`).
+        if let Err(message) =
+            crate::state::validate_route_response_key(&input.route_response_key)
+        {
+            return Err(bad_request(&message));
+        }
+
         // The route response key is what a route response is SELECTED by ("the result
         // is compared against one or more selection keys to find a matching key",
         // `SelectionKey`), so one route cannot carry two responses under one key. The
@@ -214,24 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // Bound the growth a caller drives: a route holds at most
-        // `MAX_ROUTE_RESPONSES_PER_ROUTE` route responses, and
-        // `TooManyRequestsException` is the modelled error for "a limit has been
-        // exceeded" (it carries the limit's name in `LimitType`). The key check above
-        // refuses a DUPLICATE key; this bounds the number of distinct ones, and with it
-        // the cost of that scan.
-        if route.route_responses.len() >= crate::state::MAX_ROUTE_RESPONSES_PER_ROUTE {
-            return Err(CreateRouteResponseErrorModeled::TooManyRequestsException(
-                TooManyRequestsException {
-                    limit_type: Some("RouteResponse".to_string()),
-                    message: Some(format!(
-                        "The maximum number of route responses ({}) for this route has been reached.",
-                        crate::state::MAX_ROUTE_RESPONSES_PER_ROUTE
-                    )),
-                },
-            )
-            .into());
-        }
+        // Nothing further bounds the growth a caller drives here: the key rule above
+        // admits ONE key and the duplicate-key refusal admits it once, so a route holds at
+        // most one route response however many creates are sent at it.
 
         let route_response_id = route.mint_route_response_id();
         let record = crate::state::RouteResponse {
