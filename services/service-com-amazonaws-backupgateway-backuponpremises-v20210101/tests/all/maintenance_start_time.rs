@@ -34,13 +34,18 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
-use backup_gateway::state::{service_state, MAINTENANCE_START_TIME_INVALID};
+use backup_gateway::state::{
+    service_state, GATEWAY_NOT_FOUND, GATEWAY_NOT_FOUND_MESSAGE, MAINTENANCE_START_TIME_INVALID,
+};
 
 use crate::bandwidth_rate_limit_schedule::{arn_in, arn_of_length};
 use crate::gateway_lifecycle::{
     build_engine, build_router, call, create, create_body, gateway_count, issued_activation_key,
     never_created_arn, Reply,
 };
+// One refusal is read one way across this crate's suites: the status, the error shape, the
+// `ErrorCode` member and the sentence.
+use crate::metadata_sync_requires_property_mappings::refusal;
 
 /// One maintenance window as the request states it.
 ///
@@ -675,5 +680,143 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
         (200, &stored.expected()),
         "the window set by the accepted call must survive every refusal, \
          got {status} {reported:?}"
+    );
+}
+
+/// The refusal for a `GatewayArn` this store holds no gateway under is ONE answer, chosen
+/// for the condition and not per operation: the modelled `ResourceNotFoundException` at
+/// HTTP 400, carrying the `ErrorCode` that names the kind of resource that is missing and
+/// the fixed sentence this service states for it, which carries no part of the request.
+///
+/// So `PutMaintenanceStartTime`'s refusal is compared, for the very same ARN, against the
+/// refusal of the other operations of this service that resolve a gateway on their own —
+/// all three parts of it, the `ErrorCode` member included — over every window form a
+/// request can carry and over ARNs differing in how they came to name nothing, in
+/// partition, in resource type and in length. Nothing is written for any of them.
+#[tokio::test]
+async fn the_missing_gateway_refusal_is_the_one_every_gateway_operation_states() {
+    let engine = build_engine();
+    let router = build_router(&engine);
+
+    // A gateway that really exists, so each refusal below is about the ARN that was asked
+    // for and not about an empty store. Its window — the one its activation assigned — is
+    // read before the refusals, so what the last assertion compares is a window this store
+    // really holds.
+    let live = create(&router, "gw-refusal-contract").await;
+    let (live_status, live_window) = reported_window(&router, &live).await;
+    assert_eq!(
+        live_status, 200,
+        "GetGateway on the live gateway must answer 200, got {live_status} {live_window:?}"
+    );
+
+    // An ARN this service really minted and served, then deleted: its refusal cannot be
+    // about the ARN's shape.
+    let deleted = create(&router, "gw-refusal-contract-deleted").await;
+    let removed = call(
+        &router,
+        "DeleteGateway",
+        &json!({ "GatewayArn": deleted.clone() }),
+    )
+    .await;
+    assert_eq!(
+        removed.status, 200,
+        "DeleteGateway must answer 200 before the ARN is reused as a missing one, got {} {:?}",
+        removed.status, removed.body
+    );
+
+    // `GatewayArn` `@length(min: 50, max: 180)` with its partition pattern
+    // (`smithy_query(query="shape",shape="GatewayArn")`), so every row reaches a handler
+    // rather than the boundary validator.
+    let arn_rows: Vec<(&str, String)> = vec![
+        ("a gateway ARN that was never created", never_created_arn()),
+        ("a gateway that was created and deleted", deleted),
+        (
+            "a gateway ARN in the aws-cn partition",
+            arn_in("aws-cn", "gateway", "bgw-ffffffffffffff21"),
+        ),
+        (
+            "a gateway ARN in the aws-us-gov partition",
+            arn_in("aws-us-gov", "gateway", "bgw-ffffffffffffff22"),
+        ),
+        (
+            "an ARN naming another resource type of this service",
+            arn_in("aws", "vm", "vm-ffffffffffffff23"),
+        ),
+        (
+            "the 50-character minimum of the modelled GatewayArn",
+            arn_of_length(50),
+        ),
+        (
+            "the 180-character maximum of the modelled GatewayArn",
+            arn_of_length(180),
+        ),
+    ];
+
+    let expected = (
+        400u16,
+        Some("ResourceNotFoundException"),
+        Some(GATEWAY_NOT_FOUND),
+        Some(GATEWAY_NOT_FOUND_MESSAGE),
+    );
+
+    for (arn_case, arn) in &arn_rows {
+        for (window_case, window) in window_rows() {
+            let refused = put(&router, arn, &window).await;
+            let answer = refusal(&refused);
+            assert_eq!(
+                answer, expected,
+                "case {arn_case:?} / {window_case:?}: PutMaintenanceStartTime on an ARN with \
+                 no stored gateway must answer {expected:?}, got {answer:?}"
+            );
+            assert!(
+                answer
+                    .3
+                    .is_some_and(|message| !message.contains(arn.as_str())),
+                "case {arn_case:?} / {window_case:?}: the sentence must state the condition \
+                 and not echo the ARN the request carried, got {answer:?}"
+            );
+        }
+
+        // The operations the documented contract of this one names, on the same ARN: one
+        // condition, one answer.
+        let siblings: Vec<(&str, Value)> = vec![
+            ("GetGateway", json!({ "GatewayArn": arn })),
+            ("DeleteGateway", json!({ "GatewayArn": arn })),
+            (
+                "UpdateGatewayInformation",
+                json!({ "GatewayArn": arn, "GatewayDisplayName": "renamed" }),
+            ),
+        ];
+        for (operation, body) in &siblings {
+            let refused = call(&router, operation, body).await;
+            let answer = refusal(&refused);
+            assert_eq!(
+                answer, expected,
+                "case {arn_case:?}: {operation} must state the same refusal \
+                 PutMaintenanceStartTime states for the same ARN, got {answer:?}"
+            );
+        }
+
+        assert_eq!(
+            gateway_count(&engine),
+            1,
+            "case {arn_case:?}: a refused request must not add or remove a stored gateway"
+        );
+    }
+
+    // The gateway that does exist is untouched by every refusal above: it still reports its
+    // own record, and the window on it is the one it carried before them.
+    let (status, gateway) = gateway_object(&router, &live).await;
+    assert_eq!(
+        (status, gateway.get("GatewayDisplayName")),
+        (200, Some(&json!("gw-refusal-contract"))),
+        "the gateway that exists must be unchanged after the refusals, got {status} \
+         {gateway:?}"
+    );
+    assert_eq!(
+        gateway.get("MaintenanceStartTime"),
+        Some(&live_window),
+        "no refused put may change the window of the gateway that exists, expected \
+         {live_window:?}, got {gateway:?}"
     );
 }

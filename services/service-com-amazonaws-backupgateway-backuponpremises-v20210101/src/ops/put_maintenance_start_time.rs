@@ -80,9 +80,14 @@
 //!   every gateway the store holds, so this operation never answers it.
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
 //!   wasn't found: the refusal for a well-formed `GatewayArn` the store holds no gateway
-//!   under, whether it was never created or has been deleted — the same answer, and the
-//!   same status and absent `ErrorCode`, every other gateway operation of this service
-//!   gives (`get_gateway`, `delete_gateway`, `update_gateway_information`).
+//!   under, whether it was never created or has been deleted. Answered at HTTP 400 with
+//!   `ErrorCode` [`crate::state::GATEWAY_NOT_FOUND`] and the fixed sentence
+//!   [`crate::state::GATEWAY_NOT_FOUND_MESSAGE`], which carries no part of the request:
+//!   all three parts of it are read off [`crate::state::MissingResource`], the one place
+//!   this service chooses how it refuses an ARN it holds no record under, so this is the
+//!   same answer — status, `ErrorCode` and sentence alike — every other gateway operation
+//!   of this service gives (`get_gateway`, `delete_gateway`,
+//!   `update_gateway_information`).
 //! * `ValidationException` (HTTP 400) — the refusal for a request naming BOTH `DayOfWeek`
 //!   and `DayOfMonth`, `ErrorCode`
 //!   [`crate::state::MAINTENANCE_START_TIME_INVALID`]: a maintenance start time is weekly
