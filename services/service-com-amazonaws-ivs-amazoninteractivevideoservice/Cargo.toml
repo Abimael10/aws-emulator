@@ -66,6 +66,11 @@ hex = { workspace = true }
 # the announced ingest address is dialable drives a real encoder's handshake, commands and
 # media messages over a socket.
 rml_rtmp = "0.8"
+# The CLIENT side of the TLS an `rtmps://` encoder opens on that same announced address:
+# `rustls`/`tokio-rustls` run the handshake the core's own TLS server terminates, so the
+# suite drives the encrypted wire a broadcaster really dials. TEST-ONLY.
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 # Real key pairs for the playback-key-pair tests, so what they import is a genuine
 # public key rather than a hand-built byte string.
 rcgen = "0.13"

@@ -127,13 +127,13 @@ impl Ivs {
         write(&mut store)
     }
 
-    /// The `host:port` of the SOCKET this deployment's contribute plane answers on, which
-    /// is where a publisher that holds a port opens its connection.
+    /// The `host:port` of the SOCKET this deployment's contribute plane answers on, as the
+    /// plane itself records it.
     ///
-    /// A deployment detail, not an announced value: what the control plane announces is the
-    /// contribute HOST (`announced_channel_endpoints.rs`), and the port a client appends to
-    /// it is its protocol's. A suite that drives a real encoder over a real socket needs the
-    /// socket, and this is where the plane records it.
+    /// It is also the value the control plane ANNOUNCES as every channel's `ingestEndpoint`
+    /// (`announced_channel_endpoints.rs` is where that rule is asserted), so a suite that
+    /// drives a real encoder over a real socket can check the announced value against where
+    /// the plane really listens.
     pub(crate) fn contribute_socket(&self) -> String {
         self.with_store(|store| {
             store
@@ -264,9 +264,9 @@ impl Ivs {
 /// the client session reads next. `Err` carries what went wrong instead.
 ///
 /// The one handshake of this crate's suites, shared rather than copied: it is generic over
-/// the stream, so the publisher that dials the plane's SOCKET
-/// (`live_stream_reads.rs`) and the in-process client that opens a connection to an
-/// address composed from the ANNOUNCED host (`announced_channel_endpoints.rs`) run the same
+/// the stream, so the publisher that dials the ANNOUNCED contribute address over a socket
+/// (`live_stream_reads.rs`) and the in-process client that opens a connection to that same
+/// address (`announced_channel_endpoints.rs`) run the same
 /// one. The protocol itself is the maintained implementation of it (`rml_rtmp`).
 pub(crate) async fn rtmp_handshake<Conn>(conn: &mut Conn) -> Result<Vec<u8>, String>
 where

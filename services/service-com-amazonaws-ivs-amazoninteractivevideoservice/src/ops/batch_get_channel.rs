@@ -162,6 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // The one contribute address this deployment announces, read once for the whole
+        // batch: one socket serves every channel of the account.
+        let contribute = crate::state::contribute_authority(&store);
         // One verdict per requested ARN, in the order the caller asked for them: a
         // batch read reports each ARN on its own, so an ARN naming nothing cannot
         // fail the whole call — that is what the `errors` list is for — and the two
@@ -173,9 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Each channel is announced to THIS request through the projection every
                 // read of a channel shares, so one batch read and the single-ARN read of
                 // the same channel answer the same addresses.
-                Some(channel) => {
-                    channels.push(crate::state::announced_channel(ctx, channel.clone()))
-                }
+                Some(channel) => channels.push(crate::state::announced_channel(
+                    ctx,
+                    contribute,
+                    channel.clone(),
+                )),
                 None => errors.push(BatchError {
                     arn: Some(arn.clone()),
                     code: Some(NOT_FOUND_CODE.to_string()),

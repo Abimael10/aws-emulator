@@ -16416,6 +16416,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rml_rtmp",
+ "rustls",
  "serde_json",
  "service-com-amazonaws-mediatailor-mediatailor",
  "service-com-amazonaws-s3-amazons3",
@@ -16423,6 +16424,7 @@ dependencies = [
  "sha2 0.10.9",
  "spki 0.7.3",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

@@ -157,10 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(GetChannelOutput {
-            // The record the store holds, announced to THIS request: the playback URL
+            // The record the store holds, announced to THIS request: the contribute address
+            // is the socket this deployment's ingest plane answers on, and the playback URL
             // names the address this caller reached the emulator at, because that is the
             // address the channel is played back from.
-            channel: Some(crate::state::announced_channel(ctx, channel)),
+            channel: Some(crate::state::announced_channel(
+                ctx,
+                crate::state::contribute_authority(&store),
+                channel,
+            )),
         })
     }
 }

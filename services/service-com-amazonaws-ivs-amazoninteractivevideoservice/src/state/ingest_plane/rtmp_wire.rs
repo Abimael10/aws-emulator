@@ -320,15 +320,26 @@ impl IngestConnection {
     }
 }
 
-/// The stream key a publisher presented, without any query the encoder appended to it: a
-/// broadcaster configures `…/app/<streamKey>`, and some encoders carry their own parameters
-/// after it.
+/// The stream key a publisher presented: the LAST path segment of what it configured,
+/// without any query the encoder appended to it.
+///
+/// A broadcaster configures `rtmps://<ingestEndpoint>/app/<streamKey>`, and what reaches an
+/// ingest server as the "stream name" depends on where that encoder split the application
+/// off from the key: most present the key alone, some present the whole path after the host,
+/// and some append parameters of their own after it. The key is the one thing that
+/// authenticates the publish and names the channel — "stream key used to authenticate an
+/// RTMPS stream for ingestion" (`smithy_query(query="shape",shape="StreamKey")`) — so it is
+/// read out of whatever the publisher presented rather than requiring one spelling of the
+/// path.
 fn presented_stream_key(stream_key: &str) -> &str {
     stream_key
         .split('?')
         .next()
         .unwrap_or(stream_key)
         .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
 }
 
 /// What the publisher's own metadata says it is sending, in this service's vocabulary.
@@ -386,12 +397,13 @@ mod tests {
     use super::*;
 
     /// RULE: the stream key a publisher presents is the key itself, whatever an encoder
-    /// appended to the path it configured.
+    /// appended to the path it configured or kept in front of it.
     #[test]
     fn a_presented_stream_key_is_read_without_what_an_encoder_appended() {
         // The rows span what the reading generalises over: the key alone, a key carrying
-        // the encoder's own query, a key written with the path separator, and nothing at
-        // all.
+        // the encoder's own query, a key written with the path separator, a publisher that
+        // presented the whole path after the host (an encoder that split no application off
+        // the key), and nothing at all.
         let rows: &[(&str, &str, &str)] = &[
             ("the key alone", "sk_us-west-2_abc_def", "sk_us-west-2_abc_def"),
             (
@@ -400,6 +412,16 @@ mod tests {
                 "sk_us-west-2_abc_def",
             ),
             ("a key written with separators", "/sk_abc/", "sk_abc"),
+            (
+                "the whole path after the host",
+                "app/sk_us-west-2_abc_def",
+                "sk_us-west-2_abc_def",
+            ),
+            (
+                "the whole path, with a query",
+                "/app/sk_abc?token=1",
+                "sk_abc",
+            ),
             ("no key at all", "", ""),
         ];
         for (case, presented, expected) in rows {

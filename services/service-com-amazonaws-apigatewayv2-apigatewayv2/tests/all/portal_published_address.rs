@@ -454,11 +454,22 @@ async fn a_client_that_dials_the_published_address_is_served_the_portals_site() 
             status, 204,
             "case {case:?}: expected 204 from DeletePortal, got {status} {body}"
         );
-        assert!(
-            !connects(&address).await,
-            "case {case:?}: expected {address} to accept no connection once the portal is \
-             deleted"
-        );
+        // The listener's accept loop is torn down WITH the handle the delete dropped, which
+        // the runtime completes after the 204 has been answered, so the wait is for that
+        // CONDITION — the port refusing a dial — and not for the instant the delete returned,
+        // which is only how fast the host happens to be.
+        let deadline = std::time::Instant::now() + CONDITION_DEADLINE;
+        loop {
+            if !connects(&address).await {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: expected {address} to accept no connection once the portal is \
+                 deleted"
+            );
+            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
     }
 }
 

@@ -181,7 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
 
         Ok(GetStreamSessionOutput {
-            stream_session: Some(crate::state::announced_stream_session(ctx, session)),
+            stream_session: Some(crate::state::announced_stream_session(
+                ctx,
+                crate::state::contribute_authority(&store),
+                session,
+            )),
         })
     }
 }

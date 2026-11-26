@@ -4,21 +4,22 @@
 //! stream to, and what an accepted publish writes into this store.
 //!
 //! RULE: an endpoint a service announces for a wire protocol is an address this emulator
-//! ANSWERS that protocol on. `Channel$ingestEndpoint` is "part of the definition of an
+//! ANSWERS that protocol on, reachable by a client that runs OUTSIDE this process.
+//! `Channel$ingestEndpoint` is "part of the definition of an
 //! ingest server, used when you set up streaming software"
 //! (`smithy_query(query="shape",shape="Channel")`) — a value whose whole purpose is to be
-//! DIALED: a broadcaster points its encoder at `rtmps://<ingestEndpoint>:443/app/<streamKey>`
+//! DIALED: a broadcaster points its encoder at `rtmps://<ingestEndpoint>/app/<streamKey>`
 //! and expects the handshake to complete and the channel to go live. So this service opens a
 //! socket of the EMULATOR's own through the core
 //! ([`::emulator_server::Listeners::tcp_plaintext`], which owns the socket, the bind
 //! interface, the port range, the TLS, the handshake deadline, the idle timeout and the
-//! connection caps) and serves the SAME handler at both ends of the address the control
-//! plane announces ([`super::announced_ingest_endpoint`]): the core's socket, and a
-//! connection an in-process client of this emulator opens to that announced NAME on each
-//! port a contribution is dialed on ([`::service_common::dialable_data_planes`], the tree's
-//! one register of the planes it has opened). The member itself carries only the host,
-//! because the client composes the port ([`super::CONTRIBUTE_PORTS`]) — so what is recorded
-//! there is every address a client composes from the value it was handed.
+//! connection caps), and the `host:port` the CORE reports for that socket
+//! ([`IngestPlane::authority`]) is exactly what the control plane announces
+//! ([`super::announced_channel`]) — so the value a client is handed is the address it dials,
+//! whether it runs in this process or holds a socket of its own. A connection an in-process
+//! client opens to that address is served by the same handler
+//! ([`::service_common::dialable_data_planes`], the tree's one register of the planes it has
+//! opened).
 //!
 //! ONE socket serves the whole account, because AWS publishes one ingest server per account
 //! rather than one per channel, and WHICH channel a connection publishes to is carried by
@@ -60,14 +61,14 @@ pub(super) const SIGNING_NAME: &str = "ivs";
 /// Dropping it closes the port and severs every connection on it, so it is held on the
 /// store for as long as this deployment serves channels.
 pub struct IngestPlane {
-    /// The `host:port` the core says the socket is dialable at — where a publisher on this
-    /// machine opens its connection. The NAME the control plane announces for this plane is
-    /// composed per request ([`super::announced_ingest_endpoint`]).
+    /// The `host:port` the core says the socket is dialable at, which is the address the
+    /// control plane announces for this plane ([`super::announced_channel`]) — where a
+    /// publisher anywhere on this machine opens its connection.
     authority: String,
     /// The socket itself. Never read: it is held because dropping it closes the port.
     _listener: ::emulator_server::ResourceListener,
     /// The record that resolves this plane for an in-process client opening a connection to
-    /// an address composed from the announced contribute name. Never read: it is held
+    /// the announced contribute address. Never read: it is held
     /// because dropping it withdraws those addresses, exactly as dropping the listener
     /// closes the port. `None` on an engine that vends no such register.
     _planes: Option<::service_common::dialable_data_planes::OpenedPlanes>,
@@ -85,18 +86,33 @@ impl std::fmt::Debug for IngestPlane {
 }
 
 impl IngestPlane {
-    /// The `host:port` of the SOCKET this plane answers on, which is where a publisher that
-    /// holds a port of its own dials it.
+    /// The `host:port` of the SOCKET this plane answers on, which is both what the control
+    /// plane announces and where every publisher dials it.
     #[must_use]
     pub fn authority(&self) -> &str {
         &self.authority
     }
 }
 
+/// The `host:port` this deployment's contribute plane answers on, as the control plane
+/// ANNOUNCES it, or `None` when no plane is open — a deployment whose engine vends no
+/// listener surface, or where the core could not bind, which has no contribute address to
+/// announce at all.
+///
+/// Read off the store a caller already holds, which is where the plane records its socket
+/// ([`ensure_ingest_plane`]): one deployment, one contribute plane, one address for every
+/// channel of the account.
+#[must_use]
+pub fn contribute_authority(
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+) -> Option<&str> {
+    state.ingest_plane.as_ref().map(IngestPlane::authority)
+}
+
 /// The `host:port` the contribute plane answers on, OPENING its socket on first use, or
 /// `None` when this engine vends no listener surface or the core could not bind — in which
-/// case there is no plane and the announced contribute name is a name nothing answers at,
-/// which is the honest report of a plane that could not be served.
+/// case there is no plane, and a channel announces no contribute address, which is the
+/// honest report of a plane that could not be served.
 ///
 /// Idempotent and it disturbs no connection: the first socket is kept, so every channel of
 /// this deployment is served by one contribute plane and a broadcaster may cache the
@@ -119,10 +135,10 @@ pub async fn ensure_ingest_plane<Eng: Send + Sync + 'static>(
         // that could prepare none serves the publishers that dial in the clear alone.
         upgrader: listeners.tls_upgrader().ok(),
     });
-    // ONE handler at both ends of this plane's addresses: the core's socket, and the
-    // connections an in-process client opens to the announced name. Byte 0 is the handler's
-    // on both, because the encryption of a contribution is negotiated by the protocol
-    // itself rather than by the transport.
+    // ONE handler at both ends of this plane's address: the core's socket, and a connection
+    // an in-process client opens to that same address. Byte 0 is the handler's on both,
+    // because the encryption of a contribution is negotiated by the protocol itself rather
+    // than by the transport.
     let served = ::service_common::dialable_data_planes::served_in_process(
         ::std::sync::Arc::clone(&handler),
         None,
@@ -138,47 +154,32 @@ pub async fn ensure_ingest_plane<Eng: Send + Sync + 'static>(
     // reading of it: a wildcard bind has no single address to dial and is published as
     // loopback, and an IPv6 bind keeps its brackets.
     let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
-    let announced = contribute_host_on_this_machine();
     let mut store = state.lock();
     // Another call may have opened one while this one was binding; keep the first, so an
     // announced address never changes under a broadcaster. Dropping the loser closes its
-    // own port, and it has recorded nothing: the addresses of the announced NAME are the
-    // same keys for every call of this deployment, so only the call that WINS may record
-    // them — a loser that had recorded them first would withdraw the winner's records when
-    // its own handle dropped, and the announced host would resolve to nothing while the
-    // winner's plane was still listening.
+    // own port, and it has recorded nothing.
     if let Some(open) = store.ingest_plane.as_ref() {
         return Some(open.authority().to_string());
     }
-    // Every address a client composes from the announced contribute name, beside the
-    // socket's own: the name on each port the plane's own wires are dialed on. A connection
-    // opened to one of them in this process is served by the very handler the socket's are.
-    // Recorded under this service's own store guard, which is the order the register
-    // documents for a publisher.
+    // The address this plane is ANNOUNCED at, recorded so an in-process client handed it is
+    // served by the very handler the socket's connections are. Recorded under this service's
+    // own store guard, which is the order the register documents for a publisher.
     //
     // The register and this store are ONE engine's: the records are read back out of the
     // same shared engine this store lives in
     // (`::service_common::dialable_data_planes::DialablePlanes::of(engine)`), so another
     // engine in this process resolves none of them and shares no plane with this one, and
     // the guard taken above is that engine's single IVS store rather than one of several.
-    // The name itself carries the label minted for the ACCOUNT
-    // ([`contribute_host_on_this_machine`]), so a deployment serving another account
-    // announces — and records — a different host.
-    let addresses: Vec<String> = ::std::iter::once(authority.clone())
-        .chain(CONTRIBUTE_PORTS.iter().map(|port| {
-            ::service_common::data_plane_addressing::host_port_authority(&announced, *port)
-        }))
-        .collect();
     let registered = ::service_common::dialable_data_planes::DialablePlanes::of(engine)
-        .map(|planes| planes.opening(addresses, SIGNING_NAME, &served));
+        .map(|planes| planes.opening(vec![authority.clone()], SIGNING_NAME, &served));
     if registered.is_none() {
-        // An engine that vends no register leaves the announced name resolving to nothing
-        // for an in-process client, which is a deployment fact worth being able to read off
-        // a log rather than an absence that looks like a successful record.
+        // An engine that vends no register leaves an in-process client to the socket itself,
+        // which is a deployment fact worth being able to read off a log rather than an
+        // absence that looks like a successful record.
         ::tracing::debug!(
-            %announced,
-            "this engine vends no register of open planes: the contribute name is reachable \
-             at the socket alone"
+            %authority,
+            "this engine vends no register of open planes: the contribute address is \
+             reachable at the socket alone"
         );
     }
     store.ingest_plane = Some(IngestPlane {
@@ -189,8 +190,8 @@ pub async fn ensure_ingest_plane<Eng: Send + Sync + 'static>(
     drop(store);
     ::tracing::info!(
         %authority,
-        %announced,
-        "opened the IVS contribute plane: channels announce this name as their ingest server"
+        "opened the IVS contribute plane: channels announce this address as their ingest \
+         server"
     );
     Some(authority)
 }

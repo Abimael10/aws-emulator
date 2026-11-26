@@ -6,35 +6,35 @@
 //!
 //! The rules under test, each stated once and then exercised over a SET of inputs:
 //!
-//! 1. A member this API fills with an address is announced in the FORM that member carries.
-//!    A channel's `ingestEndpoint`, and the `srt.endpoint` that equals it, carries the HOST
-//!    a client composes an authority from, appending the port its own protocol dials
-//!    (`rtmps://<ingestEndpoint>:443/app/<streamKey>`, `srt://<srt.endpoint>:<port>`), so it
-//!    is a DNS hostname — a minted label under the labels this service publishes its
-//!    contribute plane in, in the zone this emulator may announce a name of its own in —
-//!    carrying no scheme, no path and NO PORT, and never an address literal.
+//! 1. A member this API fills with the address of a plane a client DIALS announces an address
+//!    this emulator answers that plane's protocol on, reachable from outside this process: a
+//!    channel's `ingestEndpoint`, and the `srt.endpoint` that equals it, is the `host:port`
+//!    the core bound this deployment's contribute socket at — a host of this machine's own
+//!    and the port the plane really listens on — carrying no scheme and no path, so a
+//!    broadcaster composes `rtmps://<ingestEndpoint>/app/<streamKey>` and reaches the plane.
 //! 2. A member that carries a URL the client FETCHES exactly as it stands keeps the `https`
 //!    scheme and the playlist path `/api/video/v1/<region>.<account>.channel.<id>.m3u8`,
 //!    with the Region, the account and the channel id read off the channel's own ARN, and its
-//!    HOST is a hostname of the SAME class as rule 1's: a minted label under the labels this
+//!    HOST is a name of this emulator's own: a minted label under the labels this
 //!    service publishes its playback edge in, in the zone this emulator may announce in,
 //!    carrying NO PORT — the port such a URL is dialed on is the one its scheme names.
-//! 3. The ZONE every announced name sits in — the host of an announced URL included — comes
+//! 3. The ZONE an announced NAME sits in — the host of the announced playback URL — comes
 //!    from the CALLER's own addressing: the loopback zone for a caller that reached an
 //!    address, the reached name for a caller that reached one of this emulator's own names
-//!    — never a zone AWS serves its own names in.
+//!    — never a zone AWS serves its own names in. The contribute address is a socket this
+//!    deployment bound, so every caller is told that one address whatever addressing reached
+//!    this emulator.
 //! 4. Every projection of one channel agrees: the create, the single read, the batch read,
 //!    the update and the live stream read off that channel all announce the same addresses
 //!    for the same caller, and a read announces its own caller's addresses without changing
 //!    what a later caller is told.
-//! 5. The contribute host is the ACCOUNT's, not a channel's: every channel of the account
+//! 5. The contribute address is the ACCOUNT's, not a channel's: every channel of the account
 //!    reports the SAME `ingestEndpoint`, whatever Region its credential scope names and
 //!    whatever the channel's own id is, and a read or an update does not move it.
-//! 6. The address a client COMPOSES from the announced contribute host — that host plus each
-//!    port the plane's own wires are dialed on — is served by this deployment's own
-//!    contribute plane: a connection opened to it is answered by a server that speaks RTMP.
-//!    A port this emulator opened nothing on is served by nothing, the port an SRT ingest URL
-//!    names included, because this emulator answers no SRT.
+//! 6. The announced contribute address is SERVED: a connection opened to it — over a real
+//!    socket, the way a publisher outside this process opens one, and through the register a
+//!    client inside this emulator resolves it with — is answered by a server that speaks
+//!    RTMP. A port this emulator opened nothing on is served by nothing.
 //! 7. The announced playback NAME is one a client INSIDE this emulator resolves: the register
 //!    every such client reads answers this service for it, on the bare name and on the port
 //!    its scheme names, and the URL as announced is answered by this service's own playback
@@ -58,11 +58,6 @@ const PLAYBACK_PATH_PREFIX: &str = "/api/video/v1";
 /// The suffix of that path.
 const PLAYBACK_PATH_SUFFIX: &str = ".m3u8";
 
-/// The domain label a channel's contribute host carries between its minted label and this
-/// service's own domain: the ingest server is the account's, published once rather than per
-/// Region.
-const CONTRIBUTE_DOMAIN_LABEL: &str = "global-contribute";
-
 /// The domain label a channel's PLAYBACK host carries between the channel's Region and this
 /// service's own domain: the playlists of a Region's channels are served by that Region's
 /// edge.
@@ -76,16 +71,16 @@ const SERVICE_DOMAIN_LABEL: &str = "ivs";
 /// in: the twelve lowercase-hex characters of an IVS host label.
 const HOST_LABEL_LENGTH: usize = 12;
 
-/// The ports a client APPENDS to the announced contribute host, which is the half of the
-/// authority the member does not carry: RTMPS on 443 and RTMP on 1935, the two wires this
-/// deployment's contribute plane really speaks and the two an encoder configured with a
-/// channel's ingest endpoint opens.
-const CONTRIBUTE_PORTS: [u16; 2] = [443, 1935];
+/// A port this emulator opened nothing on, which nothing may be served at. Chosen outside
+/// the range the core hands a resource listener, so no plane of this deployment can land on
+/// it: the two ports an encoder would APPEND to a bare host, had the announced value not
+/// carried the plane's own port.
+const UNOPENED_PORTS: [u16; 2] = [443, 1935];
 
-/// The port an SRT ingest URL names. The `srt.endpoint` a channel announces is the same host
-/// as its `ingestEndpoint` — one host for both, as the recording holds — but nothing of this
-/// emulator answers SRT, so no plane may be found there: a reachability this deployment does
-/// not provide must not be claimed.
+/// The port an SRT ingest URL names on AWS. The `srt.endpoint` a channel announces is the
+/// same value as its `ingestEndpoint` — one address for both, as the recording holds — and
+/// this deployment answers no SRT, so no plane may be found at that port of the announced
+/// host: a reachability this deployment does not provide must not be claimed.
 const SRT_PORT: u16 = 9000;
 
 /// The port a playback URL is DIALED on, which is the port its `https` scheme names: the
@@ -141,7 +136,7 @@ fn split_url(url: &str) -> (String, String) {
     }
 }
 
-/// Rule 1's and rule 2's shared form, on one announced HOST: a DNS hostname carrying no
+/// Rule 2's form, on one announced HOST: a DNS hostname carrying no
 /// scheme, no path, no userinfo and no port, whose first label is a minted one and whose
 /// remaining labels are `suffix` — the labels this service publishes that plane under,
 /// ending in the zone the caller's own addressing puts this emulator in.
@@ -190,34 +185,25 @@ fn assert_announced_hostname(case: &str, member: &str, host: &str, suffix: &str)
     );
 }
 
-/// The labels a contribute host carries after its minted label, for a caller whose
-/// addressing puts this emulator in `zone`.
-fn contribute_suffix(zone: &str) -> String {
-    format!("{CONTRIBUTE_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.{zone}")
-}
-
 /// The labels the host of a playback URL carries after its minted label, for a channel of
 /// `region` announced to a caller whose addressing puts this emulator in `zone`.
 fn playback_suffix(region: &str, zone: &str) -> String {
     format!("{region}.{PLAYBACK_DOMAIN_LABEL}.{SERVICE_DOMAIN_LABEL}.{zone}")
 }
 
-/// Rules 1 and 5 on a channel's INGEST host: the account's contribute server, with the
-/// `srt.endpoint` beside it the same value — one host serves both protocols. Answers the
+/// Rules 1 and 5 on a channel's INGEST address: the authority this deployment's contribute
+/// plane answers on — `served_at`, the `host:port` the core bound its socket at, which this
+/// suite reads off the plane itself rather than from the response — with the `srt.endpoint`
+/// beside it the same value, because one socket serves the channel's ingest. Answers the
 /// value, so a caller can compare it across projections.
 pub(crate) fn assert_announced_ingest(
     case: &str,
     member: &str,
     channel: &Value,
-    zone: &str,
+    served_at: &str,
 ) -> String {
     let ingest = text(channel, "ingestEndpoint");
-    assert_announced_hostname(
-        case,
-        &format!("{member} ingestEndpoint"),
-        &ingest,
-        &contribute_suffix(zone),
-    );
+    assert_dialable_authority(case, &format!("{member} ingestEndpoint"), &ingest, served_at);
     assert_eq!(
         text(&channel["srt"], "endpoint"),
         ingest,
@@ -227,8 +213,43 @@ pub(crate) fn assert_announced_ingest(
     ingest
 }
 
-/// Rules 2 and 3 on one announced playback URL: the `https` scheme, a HOST of the same class
-/// as the ingest host beside it — a minted label over this service's playback labels in the
+/// Rule 1 on one announced contribute address: the authority a client DIALS, which is the
+/// one this deployment's plane is bound at (`served_at`) — a host of this machine's own, the
+/// port the plane listens on, and nothing else, so `rtmps://<value>/app/<key>` composes into
+/// an address an encoder reaches.
+fn assert_dialable_authority(case: &str, member: &str, announced: &str, served_at: &str) {
+    assert_eq!(
+        announced, served_at,
+        "case {case:?}: {member} must be the authority this deployment's contribute plane \
+         answers on, got {announced:?}"
+    );
+    for forbidden in ["://", "/", "@", " "] {
+        assert!(
+            !announced.contains(forbidden),
+            "case {case:?}: {member} must be a bare authority carrying no {forbidden:?} (no \
+             scheme, no path, no userinfo), got {announced:?}"
+        );
+    }
+    for domain in FOREIGN_DOMAINS {
+        assert!(
+            !::service_common::data_plane_addressing::host_only(announced).ends_with(domain),
+            "case {case:?}: {member} must not send a client to a {domain} host, got \
+             {announced:?}"
+        );
+    }
+    let port = ::service_common::data_plane_addressing::addressed_port(Some(announced));
+    assert!(
+        port.is_some_and(|port| port > 0),
+        "case {case:?}: {member} must carry the port the plane listens on, got {announced:?}"
+    );
+    assert!(
+        ::service_common::data_plane_addressing::host_names_the_bound_interface(announced),
+        "case {case:?}: {member} must name an interface this emulator bound, got {announced:?}"
+    );
+}
+
+/// Rules 2 and 3 on one announced playback URL: the `https` scheme, a HOST of this
+/// emulator's own — a minted label over this service's playback labels in the
 /// zone this caller's addressing puts the emulator in, with no port — and the playlist path
 /// with the channel's own identity in it. Answers the host, so a caller can compare it across
 /// projections.
@@ -353,8 +374,8 @@ fn create_requests() -> Vec<(&'static str, Value)> {
 }
 
 /// Rules 1-4 over the addressing table: every operation that projects a channel announces
-/// the one contribute host this deployment serves and the playlist URL on that channel's
-/// own playback host, both in the zone that caller's addressing puts this emulator in.
+/// the one contribute address this deployment serves and the playlist URL on that channel's
+/// own playback host, the latter in the zone that caller's addressing puts this emulator in.
 #[tokio::test]
 async fn every_channel_projection_announces_both_addresses_for_its_own_caller() {
     for addressing in addressings() {
@@ -392,7 +413,12 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             zone,
             &arn,
         );
-        let ingest = assert_announced_ingest(case, "CreateChannel $.channel", channel, zone);
+        let ingest = assert_announced_ingest(
+            case,
+            "CreateChannel $.channel",
+            channel,
+            &ivs.contribute_socket(),
+        );
 
         // Rule 4: every other projection of the same channel agrees, for the same caller.
         let read = call("GetChannel", json!({ "arn": arn })).await;
@@ -403,7 +429,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             zone,
             &arn,
         );
-        assert_announced_ingest(case, "GetChannel $.channel", &read["channel"], zone);
+        assert_announced_ingest(case, "GetChannel $.channel", &read["channel"], &ingest);
         let updated = call("UpdateChannel", json!({ "arn": arn, "name": "renamed" })).await;
         assert_announced_playback(
             case,
@@ -412,7 +438,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             zone,
             &arn,
         );
-        assert_announced_ingest(case, "UpdateChannel $.channel", &updated["channel"], zone);
+        assert_announced_ingest(case, "UpdateChannel $.channel", &updated["channel"], &ingest);
         let batch = call("BatchGetChannel", json!({ "arns": [arn] })).await;
         let batched = &batch["channels"][0];
         assert_announced_playback(
@@ -422,7 +448,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             zone,
             &arn,
         );
-        assert_announced_ingest(case, "BatchGetChannel $.channels[0]", batched, zone);
+        assert_announced_ingest(case, "BatchGetChannel $.channels[0]", batched, &ingest);
 
         // The live stream is played back from its channel's own URL, so the same rule
         // holds for the stream a broadcasting channel reports.
@@ -436,24 +462,17 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
             &arn,
         );
 
-        // Rules 1 and 2 together: the two hosts are of ONE class — both end in this
-        // service's own domain inside the zone this caller's addressing names, and neither
-        // carries a port — while each names the plane it serves, which is the plane label it
-        // carries ahead of that domain.
-        let suffix = format!("{SERVICE_DOMAIN_LABEL}.{zone}");
-        for (member, announced) in [("ingestEndpoint", &ingest), ("playbackUrl's host", &playback)]
-        {
-            assert!(
-                announced.ends_with(&suffix) && !announced.contains(':'),
-                "case {case:?}: {member} must be a port-less name under {suffix:?}, got \
-                 {announced:?}"
-            );
-        }
+        // Rules 1 and 2 together: each value is the address of the plane it names — the
+        // contribute address is the socket this deployment bound, carrying its port, and the
+        // playback host is a name of this service's own under the zone this caller's
+        // addressing names, carrying none, because the port its scheme names is the one it is
+        // fetched on.
         assert!(
-            ingest.contains(&format!(".{CONTRIBUTE_DOMAIN_LABEL}."))
+            playback.ends_with(&format!("{SERVICE_DOMAIN_LABEL}.{zone}"))
+                && !playback.contains(':')
                 && playback.contains(&format!(".{PLAYBACK_DOMAIN_LABEL}.")),
-            "case {case:?}: each host must carry the label of the plane it names, got \
-             {ingest:?} and {playback:?}"
+            "case {case:?}: playbackUrl's host must be a port-less name under this service's \
+             playback labels in {zone:?}, got {playback:?}"
         );
 
         // Rule 5: the contribute server is the account's, so nothing of this channel is in
@@ -466,14 +485,14 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
         );
 
         // Rule 5's other half: a second channel of the same account contributes to the SAME
-        // host, so one encoder configuration serves the next channel.
+        // address, so one encoder configuration serves the next channel.
         let second = call("CreateChannel", json!({ "name": "announced-2" })).await;
         let second_arn = text(&second["channel"], "arn");
         let second_ingest = assert_announced_ingest(
             case,
             "CreateChannel $.channel (second)",
             &second["channel"],
-            zone,
+            &ingest,
         );
         assert_announced_playback(
             case,
@@ -484,7 +503,7 @@ async fn every_channel_projection_announces_both_addresses_for_its_own_caller() 
         );
         assert_eq!(
             second_ingest, ingest,
-            "case {case:?}: every channel of the account contributes to one host, got \
+            "case {case:?}: every channel of the account contributes to one address, got \
              {second_ingest:?} and {ingest:?}"
         );
     }
@@ -529,12 +548,17 @@ async fn a_read_through_one_address_does_not_change_what_another_caller_is_told(
                 zone,
                 &arn,
             );
-            assert_announced_ingest(&case, "GetChannel $.channel", &read.body["channel"], zone);
+            assert_announced_ingest(
+                &case,
+                "GetChannel $.channel",
+                &read.body["channel"],
+                &ivs.contribute_socket(),
+            );
         }
     }
 }
 
-/// Rule 5: the ingest server is the ACCOUNT's, not a channel's — one contribute host for
+/// Rule 5: the ingest server is the ACCOUNT's, not a channel's — one contribute address for
 /// every channel of the account whatever Region its caller's credential scope names,
 /// carrying no part of the channel's own identity, and unmoved by a read or an update.
 #[tokio::test]
@@ -542,7 +566,7 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
     let ivs = Ivs::new();
     // Rows: the Regions a caller's credential scope can name — ordinary Region codes and
     // the shapes around them (a one-character one, a digit-bearing one) — each with the
-    // whole create table driven through it. None of them may change the contribute name,
+    // whole create table driven through it. None of them may change the contribute address,
     // because this one deployment is what every channel of the account contributes to.
     let regions = [
         "us-east-1",
@@ -572,7 +596,7 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
                 &case,
                 "CreateChannel $.channel",
                 channel,
-                "emulator.invalid",
+                &ivs.contribute_socket(),
             );
             // The channel's own Region is in its ARN, and therefore both in the Region label
             // of its playback host and in the playlist PATH of its playback URL; the create
@@ -600,7 +624,7 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
             );
 
             // Rule 5 on every other projection of the same channel: a read, an update and
-            // a batch read all report the contribute name the create reported.
+            // a batch read all report the contribute address the create reported.
             let read = ivs
                 .call_as("GetChannel", &json!({ "arn": arn }), None, &authorization)
                 .await;
@@ -654,20 +678,21 @@ async fn the_ingest_endpoint_is_the_accounts_and_not_a_channels() {
     );
 }
 
-/// Rule 6: the address a client COMPOSES from the announced contribute host is served by
-/// this deployment's contribute plane.
+/// Rule 6: the contribute address a channel announces is SERVED by this deployment's
+/// contribute plane — which is the one thing a member whose whole purpose is to be dialed
+/// has to be.
 ///
-/// A client does not dial the member as it stands — it appends the port its protocol uses —
-/// so what has to answer is the host on each of those ports. Rows differ along the port a
-/// client appends (RTMPS, RTMP, SRT), along how the caller read the value (an SDK client, a
-/// client on the loopback address, a client that resolves AWS's own hosts), and on the ports
-/// this emulator opened nothing on — an unopened one and the port an SRT ingest URL names —
-/// which must be served by nothing.
+/// Each row dials the value the create announced AS IT STANDS: once over a real socket, the
+/// way a publisher that holds a port of its own — an encoder outside this process — opens
+/// one, and once through the register a client inside this emulator resolves an announced
+/// address with. Rows differ along how the caller read the value (a client on the loopback
+/// address, one naming the loopback by name, one on an IPv6 literal), none of which may
+/// change the address this deployment serves. The closing rows are ports this emulator
+/// opened nothing on: the two an encoder would have had to APPEND had the value carried no
+/// port, and the port an SRT ingest URL names, because this emulator answers no SRT.
 #[tokio::test]
-async fn the_address_a_client_composes_from_the_announced_ingest_host_is_served() {
+async fn the_announced_ingest_address_is_served_by_the_contribute_plane() {
     let ivs = Ivs::new();
-    // Every caller whose addressing puts this emulator in the loopback zone is told the one
-    // name that zone's resolver answers with the interface the core binds its listeners on.
     let callers = [
         ("a client on the loopback address", "127.0.0.1:9297"),
         ("a client naming the loopback by name", "localhost:40305"),
@@ -689,78 +714,79 @@ async fn the_address_a_client_composes_from_the_announced_ingest_host_is_served(
             case,
             "CreateChannel $.channel",
             &created.body["channel"],
-            "localhost",
+            &ivs.contribute_socket(),
         );
+        let port = super::live_stream_reads::authority_port(&ingest);
 
-        for port in CONTRIBUTE_PORTS {
-            let composed = format!("{ingest}:{port}");
-            let dialed = planes.dialable(&ingest, port);
-            let served = dialed.as_ref().map(|dialed| dialed.served_by.clone());
-            assert_eq!(
-                served.as_deref(),
-                Some("ivs"),
-                "case {case:?}: {composed} must be served by this service's contribute \
-                 plane, got {served:?}"
-            );
-            let mut conn = dialed
-                .expect("the composed address resolves to a plane")
-                .plane
-                .dial(None)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("case {case:?}: {composed} must accept a connection: {error}")
-                });
-            // And what answers there SPEAKS the protocol the member is for: the server half
-            // of an RTMP handshake completes on the connection, through the one handshake
-            // this crate's suites share with the publisher that dials the plane's socket.
-            super::channel_lifecycle::rtmp_handshake(&mut conn)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("case {case:?}: {composed} must answer RTMP: {error}")
-                });
-        }
+        // A publisher OUTSIDE this process has nothing but the value it was handed: it dials
+        // the port that value carries, on the loopback interface its host names (the one the
+        // core binds the plane's socket on, which `assert_announced_ingest` has just checked
+        // the announced host to be), over a socket of its own. What answers SPEAKS the
+        // protocol the member is for — the server half of an RTMP handshake completes on the
+        // connection, through the one handshake this crate's suites share with the publisher
+        // in `live_stream_reads.rs`.
+        let mut dialled = ::tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: {ingest} must accept a connection: {error}")
+            });
+        super::channel_lifecycle::rtmp_handshake(&mut dialled)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: {ingest} must answer RTMP: {error}"));
+
+        // And a client INSIDE this emulator resolves that same address to this service's
+        // own plane, which answers the same wire there.
+        let announced_host = ::service_common::data_plane_addressing::host_only(&ingest);
+        let resolved = planes.dialable(announced_host, port);
+        let served = resolved.as_ref().map(|dialed| dialed.served_by.clone());
+        assert_eq!(
+            served.as_deref(),
+            Some("ivs"),
+            "case {case:?}: {ingest} must be served by this service's contribute plane, got \
+             {served:?}"
+        );
+        let mut in_process = resolved
+            .expect("the announced address resolves to a plane")
+            .plane
+            .dial(None)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: {ingest} must accept an in-process connection: {error}")
+            });
+        super::channel_lifecycle::rtmp_handshake(&mut in_process)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: {ingest} must answer RTMP in process: {error}")
+            });
 
         announced.insert(ingest);
     }
     assert_eq!(
         announced.len(),
         1,
-        "every caller is told the one contribute host this deployment serves, got \
+        "every caller is told the one contribute address this deployment serves, got \
          {announced:?}"
     );
 
-    // The plane's own SOCKET is open too, which is where a publisher that holds a port
-    // dials it: the core binds it, and the announced name is how the control plane reports
-    // the plane a client composes an address for.
-    let socket = ivs.contribute_socket();
-    let port = ::service_common::data_plane_addressing::addressed_port(Some(&socket))
-        .and_then(|port| u16::try_from(port).ok())
-        .unwrap_or_else(|| panic!("the contribute socket carries a port, got {socket:?}"));
-    let dialled = ::tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await;
-    assert!(
-        dialled.is_ok(),
-        "the contribute socket {socket:?} must accept a connection, got {:?}",
-        dialled.err()
-    );
-
     // The ports nothing was opened on are served by nothing, so the register answers for the
-    // addresses this plane really has and not for every address of this machine — the port an
-    // SRT ingest URL names included, because the plane speaks the RTMP wires and this
-    // emulator answers no SRT.
-    let host = announced
+    // address this plane really has and not for every address of this machine.
+    let socket = announced
         .iter()
         .next()
-        .expect("a created channel announced a contribute host")
+        .expect("a created channel announced a contribute address")
         .clone();
-    let unopened = match port {
-        8443 => 8444,
-        _ => 8443,
-    };
-    for (case, asked) in [
-        ("a port nothing was opened on", unopened),
-        ("the port an SRT ingest URL names", SRT_PORT),
-    ] {
-        let nothing = planes.dialable(&host, asked);
+    let host = ::service_common::data_plane_addressing::host_only(&socket);
+    let served_port = super::live_stream_reads::authority_port(&socket);
+    for (case, asked) in UNOPENED_PORTS
+        .into_iter()
+        .map(|port| ("a port an encoder would have had to append", port))
+        .chain([("the port an SRT ingest URL names", SRT_PORT)])
+    {
+        assert_ne!(
+            asked, served_port,
+            "case {case:?}: the core must not have bound the port this case asks about"
+        );
+        let nothing = planes.dialable(host, asked);
         assert!(
             nothing.is_none(),
             "case {case:?}: {host}:{asked} must be served by nothing, got {nothing:?}"

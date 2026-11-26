@@ -219,11 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ingest server every channel announces is served by a socket of this
         // emulator's OWN, and the call that creates the thing an encoder contributes to is
-        // the call that has to be able to tell it where. Opened once per deployment and
-        // before the store is read, because the bind is awaited and a store guard cannot
-        // be held across an await; a deployment that could open none announces the
-        // contribute name with nothing answering it.
-        crate::state::ensure_ingest_plane(&*self.engine, &state).await;
+        // the call that has to be able to tell it where — so the address that socket is
+        // bound at is what this call announces. Opened once per deployment and before the
+        // store is read, because the bind is awaited and a store guard cannot be held across
+        // an await; a deployment that could open none announces no contribute address.
+        let contribute = crate::state::ensure_ingest_plane(&*self.engine, &state).await;
 
         let mut store = state.lock();
         // The store grows by one channel and one stream key per call and lives for
@@ -255,10 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             latency_mode: Some(latency_mode),
             r#type: Some(channel_type),
             recording_configuration_arn: Some(input.recording_configuration_arn.unwrap_or_default()),
-            // Both addresses a channel announces are names in this emulator's own zone,
-            // composed for the request that reports the channel by the shared projection
-            // below, and never persisted: this emulator is the thing a client contributes
-            // to and plays back from.
+            // Both addresses a channel announces are this emulator's own — the socket its
+            // contribute plane is bound at and a name of its own for playback — composed for
+            // the request that reports the channel by the shared projection below, and never
+            // persisted: this emulator is the thing a client contributes to and plays back
+            // from.
             ingest_endpoint: None,
             playback_url: None,
             authorized: input.authorized,
@@ -308,10 +309,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateChannelOutput {
             // What the create answers is the channel it persisted, announced to THIS
-            // request: both addresses are names in the zone this caller reached the
-            // emulator in, which is the zone it can resolve the channel's contribute and
-            // playback hosts in.
-            channel: Some(crate::state::announced_channel(ctx, channel)),
+            // request: the contribute address is the socket this deployment's ingest plane
+            // answers on, and the playback URL is a name in the zone this caller reached the
+            // emulator in.
+            channel: Some(crate::state::announced_channel(
+                ctx,
+                contribute.as_deref(),
+                channel,
+            )),
             stream_key: Some(stream_key),
         })
     }

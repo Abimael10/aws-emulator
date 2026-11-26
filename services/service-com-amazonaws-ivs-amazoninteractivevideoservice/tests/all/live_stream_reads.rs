@@ -594,10 +594,105 @@ const AUDIO_CONFIGURATION: &[u8] = &[0xaf, 0x00, 0x12, 0x10];
 /// One audio frame.
 const AUDIO_FRAME: &[u8] = &[0xaf, 0x01, 0x21, 0x10, 0x04, 0x60];
 
+/// What a dialled contribute connection is: a plaintext socket, or the TLS stream over one
+/// — the two wires this plane serves on the one address it announces.
+trait Dialled: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Dialled for T {}
+
+/// The client side of the TLS an `rtmps://` publisher opens: the certificate is the one the
+/// core generated for its own listeners — self-signed, and this client is the emulator's own
+/// test dialling a port this very process opened — so there is no authority to check it
+/// against. An encoder dialling `rtmps://` out of this process is in the same position.
+#[derive(Debug)]
+struct AcceptTheEmulatorsCertificate(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Open a connection to the announced contribute `authority`, encrypted when the publisher
+/// dialled `rtmps://` and in the clear when it dialled `rtmp://`.
+///
+/// The port is the one the announced value itself carries — all a publisher outside this
+/// process holds — and the host it names is this machine's own loopback interface, which is
+/// where the core binds the plane's socket and what `assert_dialable_authority` has already
+/// checked the announced host to be.
+async fn dial_contribute(authority: &str, encrypted: bool) -> Result<Box<dyn Dialled>, String> {
+    let port = authority_port(authority);
+    let socket = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|error| {
+            format!("the contribute socket {authority} must accept a connection: {error}")
+        })?;
+    if !encrypted {
+        return Ok(Box::new(socket));
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("the provider supports the default protocol versions: {error}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptTheEmulatorsCertificate(
+            provider,
+        )))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").expect("localhost is a server name");
+    let encrypted = connector
+        .connect(server_name, socket)
+        .await
+        .map_err(|error| {
+            format!("an rtmps publisher's TLS handshake to {authority} must complete: {error}")
+        })?;
+    Ok(Box::new(encrypted))
+}
+
 /// One encoder publishing to the address a channel announced, over a real socket.
 struct Publisher {
-    /// The connection to the announced contribute address.
-    conn: tokio::net::TcpStream,
+    /// The connection to the announced contribute address, encrypted or in the clear.
+    conn: Box<dyn Dialled>,
     /// The client half of the RTMP session, which is what writes the publisher's bytes.
     session: rml_rtmp::sessions::ClientSession,
     /// Every byte the ingest server has sent on this connection. A refused publish is
@@ -607,19 +702,31 @@ struct Publisher {
 }
 
 impl Publisher {
-    /// Dial the announced `authority` and publish `stream_key`, the way an encoder
-    /// configured with a channel's ingest endpoint and stream key does, or `Err` carrying
-    /// what the ingest server said when it refused the publish (or when the connection
-    /// ended without one).
+    /// Dial the announced `authority` IN THE CLEAR and publish `stream_key`, the way an
+    /// encoder configured with a channel's ingest endpoint and stream key does over
+    /// `rtmp://`, or `Err` carrying what the ingest server said when it refused the publish
+    /// (or when the connection ended without one).
     async fn publishing(authority: &str, stream_key: &str) -> Result<Self, String> {
+        Self::publishing_over(authority, stream_key, false).await
+    }
+
+    /// The same publish over TLS, which is what an encoder pointed at
+    /// `rtmps://<ingestEndpoint>/app/<streamKey>` opens.
+    async fn publishing_over_tls(authority: &str, stream_key: &str) -> Result<Self, String> {
+        Self::publishing_over(authority, stream_key, true).await
+    }
+
+    /// Dial the announced `authority` and publish `stream_key`, encrypted or in the clear.
+    async fn publishing_over(
+        authority: &str,
+        stream_key: &str,
+        encrypted: bool,
+    ) -> Result<Self, String> {
         use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, PublishRequestType};
 
         // The contribute socket is bound on one of this machine's own interfaces, so the
         // encoder's connection is this emulator's own loopback port.
-        let port = authority_port(authority);
-        let mut conn = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .map_err(|error| format!("the contribute socket {authority} must accept a connection: {error}"))?;
+        let mut conn = dial_contribute(authority, encrypted).await?;
         // The one handshake of this crate's suites, shared with the suite that opens an
         // in-process connection to an address composed from the announced host.
         let leftover = super::channel_lifecycle::rtmp_handshake(&mut conn).await?;
@@ -853,7 +960,7 @@ fn carries(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Read some bytes from `conn`, bounded by a generous deadline, or `Err` when the server
 /// closed the connection — which is how a refused publish ends.
-async fn read_some(conn: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> {
+async fn read_some(conn: &mut Box<dyn Dialled>) -> Result<Vec<u8>, String> {
     let mut buffer = [0_u8; 4096];
     let read = tokio::time::timeout(READ_DEADLINE, conn.read(&mut buffer))
         .await
@@ -866,7 +973,7 @@ async fn read_some(conn: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> 
 }
 
 /// Write `bytes` to `conn`.
-async fn write_all(conn: &mut tokio::net::TcpStream, bytes: &[u8]) -> Result<(), String> {
+async fn write_all(conn: &mut Box<dyn Dialled>, bytes: &[u8]) -> Result<(), String> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -880,7 +987,7 @@ async fn write_all(conn: &mut tokio::net::TcpStream, bytes: &[u8]) -> Result<(),
 ///
 /// Bytes the server writes before closing (the session's own bookkeeping) are read past, and
 /// a connection that stays open until the deadline is not severed.
-async fn severed(conn: &mut tokio::net::TcpStream) -> bool {
+async fn severed(conn: &mut Box<dyn Dialled>) -> bool {
     for _read in 0..8 {
         let mut buffer = [0_u8; 4096];
         match tokio::time::timeout(READ_DEADLINE, conn.read(&mut buffer)).await {
@@ -912,23 +1019,32 @@ where
     }
 }
 
-/// The SOCKET a publisher on this machine dials this deployment's contribute plane at, and
-/// the stream key the create minted for the channel it publishes to.
+/// The ADDRESS a publisher dials this deployment's contribute plane at, and the stream key
+/// the create minted for the channel it publishes to — both read off the create's own
+/// response, which is everything a broadcaster holds.
 ///
-/// The channel's announced `ingestEndpoint` is the HOST of that plane — the value a client
-/// appends its protocol's port to, whose composed address `announced_channel_endpoints.rs`
-/// proves is served — and the socket is the port the core bound for it, which is what a
-/// publisher holding a socket of its own connects to.
+/// The channel's announced `ingestEndpoint` IS that address: the `host:port` the core bound
+/// the plane's socket at, which an encoder dials as it stands
+/// (`rtmps://<ingestEndpoint>/app/<streamKey>`). The plane's own record of where it listens
+/// is asserted to be that same value, so these cases drive what a client is told rather than
+/// a deployment detail they looked up.
 fn contribute_target(ivs: &Ivs, created: &Value) -> (String, String) {
-    (
+    let announced = text(&created["channel"], "ingestEndpoint");
+    assert_eq!(
+        announced,
         ivs.contribute_socket(),
-        text(&created["streamKey"], "value"),
-    )
+        "the announced ingestEndpoint must be the address this deployment's contribute plane \
+         answers on, got {announced:?}"
+    );
+    (announced, text(&created["streamKey"], "value"))
 }
 
 /// The port one `host:port` authority names, read through the workspace's one reading of an
 /// authority.
-fn authority_port(authority: &str) -> u16 {
+///
+/// Shared with `announced_channel_endpoints.rs`, which asserts the same announced value's
+/// form, rather than kept twice in one test binary.
+pub(crate) fn authority_port(authority: &str) -> u16 {
     ::service_common::data_plane_addressing::addressed_port(Some(authority))
         .and_then(|port| u16::try_from(port).ok())
         .unwrap_or_else(|| panic!("a dialable authority carries a port, got {authority:?}"))
@@ -1417,6 +1533,93 @@ async fn a_message_larger_than_a_segment_disconnects_its_publisher() {
             "case {case:?}: the channel reports the stream the publish started, got {}",
             reply.body["stream"]
         );
+    }
+}
+
+/// RULE, the whole live path a broadcaster drives from what the create announced: an encoder
+/// that dials `channel.ingestEndpoint` as it stands and authenticates with
+/// `streamKey.value` brings that channel live, metadata is accepted while it is live,
+/// `StopStream` takes it offline again, and `GetStream` answers `ChannelNotBroadcasting`
+/// before the publish and after the stop.
+///
+/// Rows differ along the WIRE the encoder opens on that one announced address — `rtmps://`,
+/// which is TLS from the first byte and what AWS documents an encoder to use, and `rtmp://`
+/// in the clear — because the member carries no scheme and the publisher chooses.
+#[tokio::test]
+async fn the_announced_address_serves_the_whole_live_path_on_both_wires() {
+    let ivs = Ivs::new();
+    let wires: [(&str, bool); 2] = [
+        ("rtmps, TLS from the first byte", true),
+        ("rtmp, in the clear", false),
+    ];
+    for (case, encrypted) in wires {
+        let created = ivs
+            .create(json!({ "name": "announced-wire", "latencyMode": "NORMAL" }))
+            .await;
+        let arn = text(&created["channel"], "arn");
+        // Everything the broadcaster holds: the announced address and the minted key.
+        let (ingest, key) = contribute_target(&ivs, &created);
+
+        // Before the publish the channel is not broadcasting, with the modelled refusal.
+        let offline = get_stream(&ivs, &arn).await;
+        assert_not_broadcasting(&format!("{case}: before the publish"), &offline, &arn);
+
+        let mut publisher = match encrypted {
+            true => Publisher::publishing_over_tls(&ingest, &key).await,
+            false => Publisher::publishing(&ingest, &key).await,
+        }
+        .unwrap_or_else(|error| panic!("case {case:?}: {ingest} must accept a publish: {error}"));
+        publisher
+            .send_configuration()
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+        publisher
+            .send_media(0, 2)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+
+        // The publish is what brings the channel live, so the case waits for THAT condition.
+        poll_until(case, "GetStream to report the channel LIVE", || {
+            let ivs = &ivs;
+            let arn = arn.clone();
+            async move {
+                let reply = get_stream(ivs, &arn).await;
+                reply.status == 200 && text(&reply.body["stream"], "state") == "LIVE"
+            }
+        })
+        .await;
+        let live = get_stream(&ivs, &arn).await;
+        assert_live_stream(
+            case,
+            &live,
+            &created["channel"],
+            &text(&live.body["stream"], "streamId"),
+        );
+
+        // Metadata a broadcaster inserts into the live stream is accepted, with the empty
+        // body the model gives that operation.
+        let metadata = ivs
+            .call(
+                "PutMetadata",
+                &json!({ "channelArn": arn, "metadata": "{\"event\":\"goal\"}" }),
+            )
+            .await;
+        assert_eq!(
+            metadata.status, 204,
+            "case {case:?}: PutMetadata on a live channel must answer HTTP 204, got {} {}",
+            metadata.status, metadata.body
+        );
+
+        // And the stop unwinds it: the channel is not broadcasting again, with the same
+        // modelled refusal it answered before the publish.
+        let stopped = ivs.call("StopStream", &json!({ "channelArn": arn })).await;
+        assert_eq!(
+            stopped.status, 200,
+            "case {case:?}: StopStream must be accepted while the publisher runs, got {} {}",
+            stopped.status, stopped.body
+        );
+        let after = get_stream(&ivs, &arn).await;
+        assert_not_broadcasting(&format!("{case}: after StopStream"), &after, &arn);
     }
 }
 
