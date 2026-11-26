@@ -159,8 +159,8 @@ pub enum HealthRefusal {
 }
 
 impl HealthRefusal {
-    /// The sentence this refusal carries, each about ONE thing the request got wrong: the
-    /// status it may state, or the instance it named.
+    /// The sentence this refusal carries, each about ONE thing that stopped the request: the
+    /// status it may state, the instance it named, or the period that instance is inside.
     #[must_use]
     pub fn message(&self) -> String {
         match self {
