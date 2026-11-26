@@ -166,8 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // The package the request names must be visible in this Region — one
-        // this account created, else one the service publishes: this is a read
-        // OF that package, not of an empty set.
+        // this account created there: this is a read OF that package, not of an
+        // empty set.
         if store
             .visible_package(&region, &input.package_id)
             .is_none()

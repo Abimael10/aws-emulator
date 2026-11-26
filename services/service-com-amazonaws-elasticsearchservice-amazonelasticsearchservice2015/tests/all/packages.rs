@@ -11,10 +11,10 @@
 //!    `PackageDetails`; a later `DescribePackages` answers from that same
 //!    record, with the id the service minted for it.
 //!
-//! `DescribePackages` reports "all packages available to Amazon ES", so every
-//! answer below also carries the plugin packages the service publishes; the
-//! rows here are about the packages this account CREATES, and the published
-//! catalogue is the subject of `published_package_catalog.rs`.
+//! `DescribePackages` reports "all packages available to Amazon ES", which is
+//! the set of packages this account HOLDS in the Region the call was signed for;
+//! that the listing is exactly those records is the subject of
+//! `published_package_catalog.rs`.
 //! 2. A created package is `COPYING` for a non-zero span and then settles on
 //!    `AVAILABLE`, which is when it has an `AvailablePackageVersion` — and no
 //!    read changes what the next read sees.
@@ -86,8 +86,7 @@ fn entry_for(answer: &Answer, case: &str, package_id: &str) -> Value {
 }
 
 /// The names a describe answer carries, restricted to the ones `names` lists —
-/// the packages the case itself created, told apart from the published
-/// catalogue every answer also carries.
+/// the packages the case itself created.
 fn own_names(answer: &Answer, case: &str, names: &[&str]) -> Vec<String> {
     let mut got: Vec<String> = reported(answer, case)
         .iter()
@@ -541,8 +540,8 @@ async fn a_describe_is_region_scoped_and_filters_by_the_field_it_names() {
             "case {case:?}: a filtered describe must answer 200, got {} {}",
             answer.status, answer.body
         );
-        // Restricted to the packages this case created: a status filter also
-        // selects published packages, which the catalogue suite asserts.
+        // Restricted to the packages this case created, which in this Region is
+        // the whole reported set.
         let got = own_names(&answer, case, &created_names);
         assert_eq!(
             got, expected,
@@ -586,9 +585,10 @@ async fn max_results_pages_the_set_and_next_token_resumes_it() {
         5,
         "a request naming no page size must report every package of this account, got {all:?}"
     );
-    assert!(
-        all.len() > 5,
-        "the answer must also carry the published catalogue, got {all:?}"
+    assert_eq!(
+        all.len(),
+        5,
+        "the answer must carry this account's own packages and nothing else, got {all:?}"
     );
     assert!(
         whole.missing("/NextToken"),

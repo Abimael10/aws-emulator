@@ -2,10 +2,12 @@
 
 //! @op DescribePackages
 //! Reports the packages VISIBLE in the Region the call was signed for — "all
-//! packages available to Amazon ES" (this operation's own documentation): the
-//! plugin packages the service publishes to every account plus the packages
-//! this account created there. Every answer is that package's own
-//! `PackageDetails`, filtered and paged. A read, so nothing here writes.
+//! packages available to Amazon ES" (this operation's own documentation),
+//! which is the set of packages this account HOLDS there: every entry is
+//! projected from that package's own stored record and version history
+//! ([`crate::state::package_catalog`]), filtered and paged, so the listing
+//! names no package a later read cannot resolve. A read, so nothing here
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -195,7 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // Order-stable, because the visible set is ordered by package id: the
         // same request reports the same order twice, which is what lets a token
-        // name a place in the set.
+        // name a place in the set. Every entry is a package this account
+        // created in this Region — the listing is a projection of the store.
         let matching: Vec<Package> = store
             .visible_packages(&region)
             .into_iter()

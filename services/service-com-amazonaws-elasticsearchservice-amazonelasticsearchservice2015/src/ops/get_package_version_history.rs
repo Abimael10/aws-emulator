@@ -2,10 +2,9 @@
 
 //! @op GetPackageVersionHistory
 //! Reports one package's version history, NEWEST FIRST: every entry is a
-//! revision of that package's content, paged. For a package this account
-//! created, the revisions `CreatePackage` and each `UpdatePackage` recorded;
-//! for one the service publishes, the versions its catalog offers. A read, so
-//! nothing here writes.
+//! revision of that package's content, paged — the revisions `CreatePackage`
+//! and each `UpdatePackage` recorded on the stored package. A read, so nothing
+//! here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -174,7 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // Every package visible in the Region resolves here: one this account
-        // created, else one the service's own catalog publishes.
+        // created there, and nothing else — a package exists for this service
+        // only once a create wrote its record.
         let Some(package) = store.visible_package(&region, &input.package_id) else {
             // The resource named is not there: HTTP 404
             // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the

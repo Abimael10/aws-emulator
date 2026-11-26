@@ -3,7 +3,10 @@
 //! @op CreatePackage
 //! Creates a package and PERSISTS it: the stored record is what this call's own
 //! `PackageDetails` and every later `DescribePackages` answer are both built
-//! from, so the two cannot disagree.
+//! from, so the two cannot disagree. The package's content is the Amazon S3
+//! object `PackageSource` names, resolved in this emulator's own Amazon S3
+//! before the record is minted ([`crate::state::package_source`]), so no
+//! package is created with nothing behind it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,9 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         // A package is held by the control plane of the Region the call was
-        // signed for, which is the scope its name is unique in and the scope a
-        // describe reports it from.
+        // signed for, which is the scope its name is unique in, the scope a
+        // describe reports it from, and the scope the content is imported in.
         let region = crate::state::request_region(&ctx.parts().headers);
+
+        // THE CONTENT FIRST, before any record is minted and with no store held
+        // (the read awaits): the package IS the object this source names, so a
+        // source the service cannot read describes a package with nothing behind
+        // it. A create that is wrong in this way AND in another is refused here,
+        // because an unreadable artifact cannot be made servable by fixing the
+        // rest of the request.
+        if crate::state::package_source::is_unreadable(ctx, &region, &input.package_source).await {
+            return Err(CreatePackageErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::package_source::PACKAGE_FILE_NOT_ACCESSIBLE.to_string()),
+            })
+            .into());
+        }
 
         let mut store = state.lock();
 

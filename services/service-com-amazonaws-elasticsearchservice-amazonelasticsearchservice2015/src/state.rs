@@ -23,10 +23,12 @@
 //! A [`Package`] carries its own content history — one [`PackageVersionRecord`]
 //! per revision, appended by `CreatePackage` and `UpdatePackage` — and a
 //! [`DomainPackage`] records one package installed on one domain, which
-//! `AssociatePackage` writes and the two list operations read. Beside the
-//! packages an account creates, the service publishes a catalogue of plugin
-//! packages every account sees ([`PUBLISHED_PACKAGES`]); the package reads
-//! answer from the union of the two ([`ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State::visible_packages`]).
+//! `AssociatePackage` writes and the two list operations read. Every package a
+//! package read reports or resolves an id against is one this store HOLDS for
+//! the Region the call was signed for
+//! ([`ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State::visible_packages`]):
+//! the listing, the per-id reads and the associations are all projections of
+//! those records, so a package nothing created is reported by none of them.
 //!
 //! The other resource this store holds is the outbound
 //! [`CrossClusterSearchConnection`]: `CreateOutboundCrossClusterSearchConnection`
@@ -1245,235 +1247,14 @@ impl CrossClusterSearchConnection {
 // Packages
 // ---------------------------------------------------------------------------
 
-/// The plugin packages the service itself publishes, which every account sees
-/// beside the ones it created.
+/// The packages this account holds, as stored — the records every package read
+/// is a projection of.
 mod package_catalog;
 pub use package_catalog::*;
 
-/// `PackageStatus`'s `COPYING`: the package's content is still being copied out
-/// of the customer's S3 location. The status a package holds from the instant
-/// `CreatePackage` returns until [`active_deadline`] has passed.
-pub const PACKAGE_STATUS_COPYING: &str = "COPYING";
-
-/// `PackageStatus`'s `AVAILABLE`: the copy finished and the package can be
-/// associated with a domain.
-pub const PACKAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
-
-/// The label the `ordinal`-th revision of a package's content carries.
-///
-/// `PackageVersion` is an unconstrained string, and the versions one package
-/// goes through are a GENERATED SEQUENCE rather than anything the caller
-/// supplies: a create mints the first, and every `UpdatePackage` the next
-/// counting number behind the same `v` prefix. One function is the only place
-/// that shape is written, so `AvailablePackageVersion`, the version history and
-/// an association's `PackageVersion` cannot name a package's version three
-/// different ways.
-pub fn package_version_label(ordinal: usize) -> String {
-    format!("v{ordinal}")
-}
-
-/// The most revisions one package may hold.
-///
-/// `UpdatePackage` is a caller-driven growth site on a record that is never
-/// otherwise trimmed, and this is the emulator's own bound on it, answered with
-/// the modelled `LimitExceededException` ("trying to create more than allowed
-/// resources or sub-resources"). It sits far above the number of revisions a
-/// dictionary goes through in any one workflow.
-pub const MAX_PACKAGE_VERSIONS: usize = 100;
-
-/// A hard ceiling on every stored package, across every region.
-///
-/// Packages are the second caller-driven growth site in this store, and
-/// `CreatePackage`'s only bound on it: the region comes from the request's own
-/// credential scope, so a per-region allowance alone would not bound the total.
-/// It sits far above the number of packages any domain workflow associates, so
-/// no caller that stays inside the service's own quotas is clipped by it.
-pub const MAX_PACKAGES_TOTAL: usize = 1_000;
-
-/// The key one package is stored under: the region it was created in and the id
-/// the service minted for it.
-pub fn package_key(region: &str, package_id: &str) -> (String, String) {
-    (region.to_string(), package_id.to_string())
-}
-
-/// The id a package is addressed by.
-///
-/// `PackageID` declares no constraint, so what matters is that the id is opaque
-/// and that two packages never share one: it is the store's monotonic package
-/// counter scrambled through the bijection described on [`ID_MULTIPLIER`],
-/// behind the prefix naming the resource it identifies.
-pub fn package_id(seq: u64) -> String {
-    format!("pkg-{token:016x}", token = seq.wrapping_mul(ID_MULTIPLIER))
-}
-
-/// One revision of a package's content, as stored.
-///
-/// The sequence of these IS the package's version history: `CreatePackage`
-/// appends the first and each `UpdatePackage` the next, so the history a read
-/// reports is the stored sequence rather than anything recomputed per response.
-#[derive(Debug, Clone)]
-pub struct PackageVersionRecord {
-    /// This revision's label — see [`package_version_label`].
-    pub version: String,
-    /// `CommitMessage`, "a message associated with the version", where the
-    /// update that minted it carried one. A create has no such input member, so
-    /// a package's first version has none.
-    pub commit_message: Option<String>,
-    /// When this revision was minted.
-    pub created_at: SystemTime,
-}
-
-impl PackageVersionRecord {
-    /// This record as the `PackageVersionHistory` entry a history read reports.
-    pub fn to_history(&self) -> PackageVersionHistory {
-        PackageVersionHistory {
-            package_version: Some(self.version.clone()),
-            commit_message: self.commit_message.clone(),
-            created_at: Some(datetime_of(self.created_at)),
-        }
-    }
-}
-
-/// One package, as stored.
-///
-/// The record is the single source of truth for every answer about the package:
-/// the create's response and every later read are both [`Self::to_details`] of
-/// it, so the two cannot disagree. The package's status is COMPUTED from the
-/// instant its copy falls due rather than stored as a mutable status, so no read
-/// has to write.
-#[derive(Debug, Clone)]
-pub struct Package {
-    /// `PackageID`, unique per package, so it is half the key the store holds
-    /// the record under.
-    pub package_id: String,
-    /// `PackageName`, the name the caller gave the package. Unique among the
-    /// packages of one region, which is the scope a create checks it in.
-    pub package_name: String,
-    /// `PackageType` — one of `PACKAGE_TYPE_VALUES`.
-    pub package_type: String,
-    /// `PackageDescription`, where the create supplied one.
-    pub package_description: Option<String>,
-    /// The S3 location the content was imported from, as the request gave it.
-    pub source: PackageSource,
-    /// When the package was created.
-    pub created_at: SystemTime,
-    /// When the package last changed.
-    pub last_updated_at: SystemTime,
-    /// When the clock finishes copying the current content, i.e. when the
-    /// package becomes [`PACKAGE_STATUS_AVAILABLE`].
-    pub available_at: SystemTime,
-    /// Every revision of the package's content, oldest first — the package's
-    /// version history, and the source of the version its current content
-    /// carries.
-    pub versions: Vec<PackageVersionRecord>,
-}
-
-impl Package {
-    /// A newly created package, whose content is still being copied.
-    pub fn create(
-        package_id: String,
-        package_name: String,
-        package_type: String,
-        package_description: Option<String>,
-        source: PackageSource,
-        now: SystemTime,
-    ) -> Self {
-        Self {
-            package_id,
-            package_name,
-            package_type,
-            package_description,
-            source,
-            created_at: now,
-            last_updated_at: now,
-            available_at: active_deadline(now),
-            versions: vec![PackageVersionRecord {
-                version: package_version_label(1),
-                commit_message: None,
-                created_at: now,
-            }],
-        }
-    }
-
-    /// The label of the package's newest revision — the version its current
-    /// copy is of, and the one `AvailablePackageVersion` names once that copy
-    /// has landed.
-    pub fn current_version(&self) -> &str {
-        self.versions
-            .last()
-            .map(|revision| revision.version.as_str())
-            .unwrap_or_default()
-    }
-
-    /// Take new content: the package's source becomes `source`, the clock starts
-    /// copying it again, and the history grows by the next version.
-    ///
-    /// `PackageDescription` is replaced only when the update supplied one, since
-    /// the member is optional and an update that omits it changes nothing about
-    /// the description.
-    pub fn revise(
-        &mut self,
-        source: PackageSource,
-        package_description: Option<String>,
-        commit_message: Option<String>,
-        now: SystemTime,
-    ) {
-        self.source = source;
-        if package_description.is_some() {
-            self.package_description = package_description;
-        }
-        self.versions.push(PackageVersionRecord {
-            version: package_version_label(self.versions.len() + 1),
-            commit_message,
-            created_at: now,
-        });
-        self.last_updated_at = now;
-        self.available_at = active_deadline(now);
-    }
-
-    /// The package's version history, NEWEST FIRST: a history read reports the
-    /// most recent revision first, so the newest version is the head of the
-    /// first page.
-    pub fn history_newest_first(&self) -> Vec<&PackageVersionRecord> {
-        self.versions.iter().rev().collect()
-    }
-
-    /// Whether the clock has not yet finished copying the package's content.
-    pub fn copying(&self, now: SystemTime) -> bool {
-        now < self.available_at
-    }
-
-    /// The package's modelled state — one of `PACKAGE_STATUS_VALUES`.
-    pub fn status(&self, now: SystemTime) -> &'static str {
-        if self.copying(now) {
-            PACKAGE_STATUS_COPYING
-        } else {
-            PACKAGE_STATUS_AVAILABLE
-        }
-    }
-
-    /// This record as the `PackageDetails` every package operation reports.
-    ///
-    /// `AvailablePackageVersion` names the version a domain can associate, so a
-    /// package whose copy has not landed yet has none to report; `ErrorDetails`
-    /// is "additional information if the package is in an error state. Null
-    /// otherwise" (its own documentation), and a stored package is in no error
-    /// state.
-    pub fn to_details(&self, now: SystemTime) -> PackageDetails {
-        PackageDetails {
-            package_id: Some(self.package_id.clone()),
-            package_name: Some(self.package_name.clone()),
-            package_type: Some(self.package_type.clone()),
-            package_description: self.package_description.clone(),
-            package_status: Some(self.status(now).to_string()),
-            created_at: Some(datetime_of(self.created_at)),
-            last_updated_at: Some(datetime_of(self.last_updated_at)),
-            available_package_version: (!self.copying(now))
-                .then(|| self.current_version().to_string()),
-            error_details: None,
-        }
-    }
-}
+/// Whether the Amazon S3 object a package's content is imported from can be READ
+/// by this service, which is what decides whether a package is minted at all.
+pub mod package_source;
 
 // ---------------------------------------------------------------------------
 // Package/domain associations
@@ -1819,31 +1600,25 @@ impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
             .map(|(_, package)| package)
     }
 
-    /// Every package VISIBLE in one Region, in package-id order: the catalog of
-    /// plugin packages the service publishes to every account, plus the
-    /// packages this account created in that Region.
+    /// Every package VISIBLE in one Region, in package-id order: the packages
+    /// this account created there, and nothing else.
     ///
-    /// This is the set the package reads report and resolve an id against —
-    /// `DescribePackages` describes "all packages available to Amazon ES", not
-    /// only the ones a caller created. The published entries are computed from
-    /// the read-only catalog table on each call rather than inserted into the
-    /// store, so reporting them writes nothing, and the merged set is ordered
-    /// by package id, so two calls report the same order and a pagination
-    /// token names a place in it.
+    /// This is the set the package reads report and resolve an id against, and
+    /// it is a projection of the STORE: a package exists for this service only
+    /// once a create wrote its record, so an id nothing created resolves
+    /// nowhere and a listing reports no package the account does not hold. The
+    /// set is ordered by package id, so two calls report the same order and a
+    /// pagination token names a place in it.
     pub fn visible_packages(&self, region: &str) -> Vec<Package> {
-        let mut visible = published_packages();
-        visible.extend(self.packages_in(region).cloned());
+        let mut visible: Vec<Package> = self.packages_in(region).cloned().collect();
         visible.sort_by(|left, right| left.package_id.cmp(&right.package_id));
         visible
     }
 
-    /// The visible package of one Region carrying `package_id` — one this
-    /// account created there, else one the service publishes.
+    /// The visible package of one Region carrying `package_id` — the record this
+    /// account's create wrote there, if the store holds one.
     pub fn visible_package(&self, region: &str, package_id: &str) -> Option<Package> {
-        self.packages
-            .get(&package_key(region, package_id))
-            .cloned()
-            .or_else(|| published_package(package_id))
+        self.packages.get(&package_key(region, package_id)).cloned()
     }
 
     /// The package of `region` carrying `package_name`, if the store holds one:

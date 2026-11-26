@@ -5,6 +5,9 @@
 //! record: the package's source becomes the one given, the clock starts copying
 //! it (so the package is `COPYING` again until that copy falls due) and the
 //! version history grows by one entry, which `GetPackageVersionHistory` reads.
+//! The content is resolved in this emulator's own Amazon S3 first
+//! ([`crate::state::package_source`]), so a source the service cannot read
+//! revises nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -167,8 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         // A package is held by the control plane of the Region its create was
-        // signed for, so that is the scope this id is resolved in.
+        // signed for, so that is the scope this id is resolved in and the scope
+        // the new content is imported in.
         let region = crate::state::request_region(&ctx.parts().headers);
+
+        // THE CONTENT FIRST, before the record is resolved and with no store
+        // held (the read awaits): an update IS the import of this object as the
+        // package's next revision, so an object the service cannot read is
+        // refused whatever else the request names — the same rule
+        // `CreatePackage` applies to the source it is given.
+        if crate::state::package_source::is_unreadable(ctx, &region, &input.package_source).await {
+            return Err(UpdatePackageErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::package_source::PACKAGE_FILE_NOT_ACCESSIBLE.to_string()),
+            })
+            .into());
+        }
 
         let mut store = state.lock();
         let Some(package) = store

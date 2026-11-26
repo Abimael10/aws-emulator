@@ -98,12 +98,13 @@ pub fn quoted_pattern(pattern: &str) -> String {
 }
 
 /// The syntax a package id has to satisfy, as the shared package resource declares it
-/// (`com.amazonaws.opensearch#PackageID`): either a published-package id (`F`/`G` followed
-/// by digits) or an account's own `pkg-` id over lowercase hex.
+/// (`com.amazonaws.opensearch#PackageID`): either an AWS-published package id (`F`/`G`
+/// followed by digits) or an account's own `pkg-` id over lowercase hex.
 ///
-/// Both forms this emulator MINTS satisfy it — `crate::state::package_id` writes
-/// `pkg-<16 hex>` and `crate::state::published_package_id` writes `pkg-<40 hex>` — so an
-/// id handed back by a create is accepted by every later call that names it.
+/// The form this emulator MINTS satisfies it — `crate::state::package_id` writes
+/// `pkg-<16 hex>` — so an id handed back by a create is accepted by every later call that
+/// names it, and a well-formed id of either form that nothing created resolves to no
+/// package here.
 pub const PACKAGE_ID_PATTERN: &str = r"^([FG][0-9]+)$|^(pkg-[a-f0-9]+)$";
 
 /// [`PACKAGE_ID_PATTERN`] compiled once, as the pattern is a constant rather than anything

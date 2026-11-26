@@ -1,242 +1,256 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The plugin packages the SERVICE publishes, which every account of a Region
-//! sees beside the packages it created itself.
+//! The packages this account HOLDS, as stored: one record per package a
+//! `CreatePackage` minted, carrying every revision of that package's content.
 //!
-//! `DescribePackages`'s own documentation is "Describes all packages available
-//! to Amazon ES" — not "the packages this account created" — and the plugin
-//! packages the service publishes are part of that set: a client discovers an
-//! installable plugin by listing it here and then reads its versions with
-//! `GetPackageVersionHistory` before associating one with a domain.
-//!
-//! The entries are READ-ONLY reference data, held as a table rather than
-//! inserted into the store, so a read of them can never write: every answer
-//! about a published package is [`PublishedPackage::record`] of the same table
-//! row, which makes two reads of one agree and makes the whole catalog
-//! identical in every Region.
-//!
-//! Each row's `PackageName` is the plugin's own name in the engine
-//! distribution, which is what a ZIP plugin package installs; the ids are
-//! derived (see [`published_package_id`]) rather than listed, since `PackageID`
-//! is "internal ID of the package" (its model documentation) and so is the
-//! service's to mint.
-//!
-//! The ROW SET itself — which plugins the table carries, the wording of each
-//! description and the publication instants — is this emulator's own stand-in
-//! for the catalogue a Region serves, chosen so that the catalogue is populated,
-//! plausible and stable; it is not a transcription of what the service offers
-//! today. What the operations guarantee is the shape and the resolution rule
-//! above, so a row may be added or reworded without changing any of it.
-//!
-//! The SIBLING statement of the same content is
-//! `service-com-amazonaws-opensearch-amazonopensearchservice`'s own
-//! `state/package_catalog.rs`: the current API version of this service publishes the
-//! same plugin catalog through its larger `PackageDetails` shape (per engine release,
-//! with the plugin's properties and the package's configuration), so the two tables
-//! are two projections of one catalog and an edit to the plugins one of them names
-//! belongs in both.
-
-use std::time::{Duration, SystemTime};
+//! A package exists for this service only once a create wrote its record, so
+//! every answer about a package — the create's own `PackageDetails`, the
+//! `DescribePackages` listing, the version history and an association's
+//! `PackageVersion` — is a projection of the record below. There is no table of
+//! packages beside the store: a listing reports the records of the Region the
+//! call was signed for and nothing else, which is what keeps it from reporting a
+//! package the account does not own and cannot read back.
 
 use super::*;
 
-/// `PackageType` for a package whose content is a plugin archive.
-///
-/// The model's `PackageType` enum carries only `TXT-DICTIONARY` — the type a
-/// CALLER may create here, and what `CreatePackage`'s own documentation says it
-/// "currently supports" — while the plugin packages the service publishes are
-/// reported with the plugin type, which is the value the service answers for
-/// them.
-pub const PACKAGE_TYPE_ZIP_PLUGIN: &str = "ZIP-PLUGIN";
+/// `PackageStatus`'s `COPYING`: the package's content is still being copied out
+/// of the customer's S3 location. The status a package holds from the instant
+/// `CreatePackage` returns until [`active_deadline`] has passed.
+pub const PACKAGE_STATUS_COPYING: &str = "COPYING";
 
-/// One row of the catalog the service publishes.
-#[derive(Debug, Clone, Copy)]
-pub struct PublishedPackage {
-    /// `PackageName` — the plugin's name in the engine distribution. It
-    /// satisfies the member's own constraints (`@length(3, 28)`,
-    /// `@pattern("^[a-z][a-z0-9\\-]+$")`).
-    pub name: &'static str,
-    /// `PackageDescription` — what the plugin does.
-    pub description: &'static str,
-    /// The instant, in seconds since the epoch, at which the service published
-    /// each revision of this package's content, OLDEST FIRST. One entry per
-    /// published version, so this sequence is the package's version history and
-    /// its length is the number of versions the catalog offers.
-    ///
-    /// Fixed values, so the stamps a read reports are stable across reads and
-    /// across processes rather than taken from the clock of the read.
-    pub published_at: &'static [u64],
+/// `PackageStatus`'s `AVAILABLE`: the copy finished and the package can be
+/// associated with a domain.
+pub const PACKAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The label the `ordinal`-th revision of a package's content carries.
+///
+/// `PackageVersion` is an unconstrained string, and the versions one package
+/// goes through are a GENERATED SEQUENCE rather than anything the caller
+/// supplies: a create mints the first, and every `UpdatePackage` the next
+/// counting number behind the same `v` prefix. One function is the only place
+/// that shape is written, so `AvailablePackageVersion`, the version history and
+/// an association's `PackageVersion` cannot name a package's version three
+/// different ways.
+pub fn package_version_label(ordinal: usize) -> String {
+    format!("v{ordinal}")
 }
 
-/// The plugin packages this service publishes, in name order.
+/// The most revisions one package may hold.
 ///
-/// A ZIP plugin package carries one plugin of the engine distribution, so each
-/// row is named for the plugin it installs: the `analysis-*` tokenizers and
-/// token filters a non-English index needs, the `mapper-*` field types, the
-/// ingest processors, and the separately licensed third-party analyzers. The
-/// members every row projects are `PackageDetails`'s own:
-///
-/// ```text
-/// smithy_query(query="shape",shape="PackageDetails",model_path="services/service-com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015/smithy-model/com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015.json")
-/// ```
-pub const PUBLISHED_PACKAGES: &[PublishedPackage] = &[
-    PublishedPackage {
-        name: "analysis-icu",
-        description: "ICU analysis plugin: Unicode-aware tokenization, normalization, collation \
-                      and transliteration from the International Components for Unicode \
-                      library.",
-        published_at: &[1_600_000_000, 1_700_000_000],
-    },
-    PublishedPackage {
-        name: "analysis-kuromoji",
-        description: "Kuromoji analysis plugin: Japanese morphological tokenization, \
-                      part-of-speech filtering and reading-form conversion.",
-        published_at: &[1_600_000_000],
-    },
-    PublishedPackage {
-        name: "analysis-nori",
-        description: "Nori analysis plugin: Korean morphological tokenization backed by the \
-                      mecab-ko dictionary.",
-        published_at: &[1_626_048_000, 1_722_384_000],
-    },
-    PublishedPackage {
-        name: "analysis-phonetic",
-        description: "Phonetic analysis plugin: Soundex, Metaphone, Caverphone and Beider-Morse \
-                      token filters for matching names that sound alike.",
-        published_at: &[1_600_000_000, 1_672_531_200],
-    },
-    PublishedPackage {
-        name: "analysis-seunjeon",
-        description: "Seunjeon analysis plugin: Korean tokenization with a user-extensible \
-                      dictionary.",
-        published_at: &[1_626_048_000],
-    },
-    PublishedPackage {
-        name: "analysis-smartcn",
-        description: "SmartCN analysis plugin: probabilistic sentence and word segmentation for \
-                      Simplified Chinese.",
-        published_at: &[1_600_000_000],
-    },
-    PublishedPackage {
-        name: "analysis-stempel",
-        description: "Stempel analysis plugin: algorithmic stemming for Polish.",
-        published_at: &[1_600_000_000],
-    },
-    PublishedPackage {
-        name: "analysis-ukrainian",
-        description: "Ukrainian analysis plugin: lemmatization through the Morfologik \
-                      dictionary.",
-        published_at: &[1_626_048_000],
-    },
-    PublishedPackage {
-        name: "babel-street-match",
-        description: "Babel Street Match analysis plugin: multilingual name matching and entity \
-                      extraction. Licensed separately from the service.",
-        published_at: &[1_700_000_000, 1_740_000_000],
-    },
-    PublishedPackage {
-        name: "ingest-attachment",
-        description: "Ingest attachment processor: extracts text and metadata from binary \
-                      attachments with Apache Tika.",
-        published_at: &[1_650_000_000, 1_740_000_000],
-    },
-    PublishedPackage {
-        name: "mapper-annotated-text",
-        description: "Annotated-text mapper plugin: a text field type that carries inline entity \
-                      annotations alongside the text it indexes.",
-        published_at: &[1_672_531_200],
-    },
-    PublishedPackage {
-        name: "mapper-murmur3",
-        description: "Murmur3 mapper plugin: stores the hash of a field's values at index time, \
-                      for cheaper cardinality aggregations.",
-        published_at: &[1_650_000_000],
-    },
-    PublishedPackage {
-        name: "mapper-size",
-        description: "Size mapper plugin: indexes the byte size of each document's _source in \
-                      the _size field.",
-        published_at: &[1_650_000_000],
-    },
-];
+/// `UpdatePackage` is a caller-driven growth site on a record that is never
+/// otherwise trimmed, and this is the emulator's own bound on it, answered with
+/// the modelled `LimitExceededException` ("trying to create more than allowed
+/// resources or sub-resources"). It sits far above the number of revisions a
+/// dictionary goes through in any one workflow.
+pub const MAX_PACKAGE_VERSIONS: usize = 100;
 
-/// The id a published package is addressed by.
+/// A hard ceiling on every stored package, across every region.
 ///
-/// `PackageID` declares no constraint, so what matters is that the id is
-/// opaque, stable and that two packages never share one: it is the leading 40
-/// hex digits of a SHA-256 over the package's name, behind the prefix naming
-/// the resource it identifies. Deriving it from the name rather than from a
-/// counter is what makes a published package resolvable by the same id in every
-/// Region and in every run, and the length keeps it apart from the ids
-/// [`package_id`] mints for a caller's own packages.
-pub fn published_package_id(name: &str) -> String {
+/// Packages are the second caller-driven growth site in this store, and
+/// `CreatePackage`'s only bound on it: the region comes from the request's own
+/// credential scope, so a per-region allowance alone would not bound the total.
+/// It sits far above the number of packages any domain workflow associates, so
+/// no caller that stays inside the service's own quotas is clipped by it.
+pub const MAX_PACKAGES_TOTAL: usize = 1_000;
+
+/// The key one package is stored under: the region it was created in and the id
+/// the service minted for it.
+pub fn package_key(region: &str, package_id: &str) -> (String, String) {
+    (region.to_string(), package_id.to_string())
+}
+
+/// How many hexadecimal digits a package id carries behind its prefix.
+///
+/// `PackageID` declares no constraint, so the FORM is read off the wire this API
+/// is recorded on: every package id a recorded request of this API addresses a
+/// package by is `pkg-` followed by 40 lowercase hex digits. An id is something a
+/// client stores and presents back, so minting one of that width is what keeps
+/// an id this emulator hands out indistinguishable in shape from one the service
+/// hands out; the DIGITS are this store's own, derived below.
+const PACKAGE_ID_HEX_DIGITS: usize = 40;
+
+/// The id a package is addressed by.
+///
+/// What matters of the value is that it is opaque and that two packages never
+/// share one: the digits are a digest of the store's monotonic package counter,
+/// which is injective in practice for the counter values one store reaches, and
+/// they carry no part of the caller's request — a package name is not recoverable
+/// from the id. The width is [`PACKAGE_ID_HEX_DIGITS`].
+pub fn package_id(seq: u64) -> String {
     use sha2::Digest;
-    let digest = sha2::Sha256::digest(name.as_bytes());
+    let digest = sha2::Sha256::digest(format!("package/{seq}").as_bytes());
     let hex = hex::encode(digest);
-    format!("pkg-{token}", token = &hex[..40])
+    format!(
+        "pkg-{token}",
+        token = hex.get(..PACKAGE_ID_HEX_DIGITS).unwrap_or(hex.as_str())
+    )
 }
 
-impl PublishedPackage {
-    /// This row as the [`Package`] every package operation answers from.
-    ///
-    /// The content of a published package is held by the service, not in a
-    /// caller's bucket, so it names no S3 source; it is published already
-    /// copied, so its copy is due at the instant it was published and the
-    /// status a read computes is `AVAILABLE`.
-    pub fn record(&self) -> Package {
-        let versions: Vec<PackageVersionRecord> = self
-            .published_at
-            .iter()
-            .enumerate()
-            .map(|(index, at)| PackageVersionRecord {
-                version: package_version_label(index + 1),
-                // "A message associated with the version" — the service
-                // publishes none for its own plugin packages.
-                commit_message: None,
-                created_at: instant_of(*at),
-            })
-            .collect();
-        let created_at = versions
-            .first()
-            .map_or_else(|| instant_of(0), |first| first.created_at);
-        let last_updated_at = versions
-            .last()
-            .map_or_else(|| instant_of(0), |last| last.created_at);
-        Package {
-            package_id: published_package_id(self.name),
-            package_name: self.name.to_string(),
-            package_type: PACKAGE_TYPE_ZIP_PLUGIN.to_string(),
-            package_description: Some(self.description.to_string()),
-            source: PackageSource::default(),
-            created_at,
-            last_updated_at,
-            available_at: last_updated_at,
-            versions,
+/// One revision of a package's content, as stored.
+///
+/// The sequence of these IS the package's version history: `CreatePackage`
+/// appends the first and each `UpdatePackage` the next, so the history a read
+/// reports is the stored sequence rather than anything recomputed per response.
+#[derive(Debug, Clone)]
+pub struct PackageVersionRecord {
+    /// This revision's label — see [`package_version_label`].
+    pub version: String,
+    /// `CommitMessage`, "a message associated with the version", where the
+    /// update that minted it carried one. A create has no such input member, so
+    /// a package's first version has none.
+    pub commit_message: Option<String>,
+    /// When this revision was minted.
+    pub created_at: SystemTime,
+}
+
+impl PackageVersionRecord {
+    /// This record as the `PackageVersionHistory` entry a history read reports.
+    pub fn to_history(&self) -> PackageVersionHistory {
+        PackageVersionHistory {
+            package_version: Some(self.version.clone()),
+            commit_message: self.commit_message.clone(),
+            created_at: Some(datetime_of(self.created_at)),
         }
     }
 }
 
-/// An instant from its seconds since the epoch.
-fn instant_of(epoch_seconds: u64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(epoch_seconds)
+/// One package, as stored.
+///
+/// The record is the single source of truth for every answer about the package:
+/// the create's response and every later read are both [`Self::to_details`] of
+/// it, so the two cannot disagree. The package's status is COMPUTED from the
+/// instant its copy falls due rather than stored as a mutable status, so no read
+/// has to write.
+#[derive(Debug, Clone)]
+pub struct Package {
+    /// `PackageID`, unique per package, so it is half the key the store holds
+    /// the record under.
+    pub package_id: String,
+    /// `PackageName`, the name the caller gave the package. Unique among the
+    /// packages of one region, which is the scope a create checks it in.
+    pub package_name: String,
+    /// `PackageType` — one of `PACKAGE_TYPE_VALUES`.
+    pub package_type: String,
+    /// `PackageDescription`, where the create supplied one.
+    pub package_description: Option<String>,
+    /// The S3 location the content was imported from, as the request gave it.
+    pub source: PackageSource,
+    /// When the package was created.
+    pub created_at: SystemTime,
+    /// When the package last changed.
+    pub last_updated_at: SystemTime,
+    /// When the clock finishes copying the current content, i.e. when the
+    /// package becomes [`PACKAGE_STATUS_AVAILABLE`].
+    pub available_at: SystemTime,
+    /// Every revision of the package's content, oldest first — the package's
+    /// version history, and the source of the version its current content
+    /// carries.
+    pub versions: Vec<PackageVersionRecord>,
 }
 
-/// The whole published catalog as package records, in package-id order — the
-/// order the store keys the account's own packages in, so the two sets merge
-/// into one order-stable set a pagination token can name a place in.
-pub fn published_packages() -> Vec<Package> {
-    let mut packages: Vec<Package> = PUBLISHED_PACKAGES
-        .iter()
-        .map(PublishedPackage::record)
-        .collect();
-    packages.sort_by(|left, right| left.package_id.cmp(&right.package_id));
-    packages
-}
+impl Package {
+    /// A newly created package, whose content is still being copied.
+    pub fn create(
+        package_id: String,
+        package_name: String,
+        package_type: String,
+        package_description: Option<String>,
+        source: PackageSource,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            package_id,
+            package_name,
+            package_type,
+            package_description,
+            source,
+            created_at: now,
+            last_updated_at: now,
+            available_at: active_deadline(now),
+            versions: vec![PackageVersionRecord {
+                version: package_version_label(1),
+                commit_message: None,
+                created_at: now,
+            }],
+        }
+    }
 
-/// The published package carrying `package_id`, if the catalog holds one.
-pub fn published_package(package_id: &str) -> Option<Package> {
-    PUBLISHED_PACKAGES
-        .iter()
-        .find(|published| published_package_id(published.name) == package_id)
-        .map(PublishedPackage::record)
+    /// The label of the package's newest revision — the version its current
+    /// copy is of, and the one `AvailablePackageVersion` names once that copy
+    /// has landed.
+    pub fn current_version(&self) -> &str {
+        self.versions
+            .last()
+            .map(|revision| revision.version.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Take new content: the package's source becomes `source`, the clock starts
+    /// copying it again, and the history grows by the next version.
+    ///
+    /// `PackageDescription` is replaced only when the update supplied one, since
+    /// the member is optional and an update that omits it changes nothing about
+    /// the description.
+    pub fn revise(
+        &mut self,
+        source: PackageSource,
+        package_description: Option<String>,
+        commit_message: Option<String>,
+        now: SystemTime,
+    ) {
+        self.source = source;
+        if package_description.is_some() {
+            self.package_description = package_description;
+        }
+        self.versions.push(PackageVersionRecord {
+            version: package_version_label(self.versions.len() + 1),
+            commit_message,
+            created_at: now,
+        });
+        self.last_updated_at = now;
+        self.available_at = active_deadline(now);
+    }
+
+    /// The package's version history, NEWEST FIRST: a history read reports the
+    /// most recent revision first, so the newest version is the head of the
+    /// first page.
+    pub fn history_newest_first(&self) -> Vec<&PackageVersionRecord> {
+        self.versions.iter().rev().collect()
+    }
+
+    /// Whether the clock has not yet finished copying the package's content.
+    pub fn copying(&self, now: SystemTime) -> bool {
+        now < self.available_at
+    }
+
+    /// The package's modelled state — one of `PACKAGE_STATUS_VALUES`.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.copying(now) {
+            PACKAGE_STATUS_COPYING
+        } else {
+            PACKAGE_STATUS_AVAILABLE
+        }
+    }
+
+    /// This record as the `PackageDetails` every package operation reports.
+    ///
+    /// `AvailablePackageVersion` names the version a domain can associate, so a
+    /// package whose copy has not landed yet has none to report; `ErrorDetails`
+    /// is "additional information if the package is in an error state. Null
+    /// otherwise" (its own documentation), and a stored package is in no error
+    /// state.
+    pub fn to_details(&self, now: SystemTime) -> PackageDetails {
+        PackageDetails {
+            package_id: Some(self.package_id.clone()),
+            package_name: Some(self.package_name.clone()),
+            package_type: Some(self.package_type.clone()),
+            package_description: self.package_description.clone(),
+            package_status: Some(self.status(now).to_string()),
+            created_at: Some(datetime_of(self.created_at)),
+            last_updated_at: Some(datetime_of(self.last_updated_at)),
+            available_package_version: (!self.copying(now))
+                .then(|| self.current_version().to_string()),
+            error_details: None,
+        }
+    }
 }
