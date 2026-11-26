@@ -235,9 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_form_id(&key);
-        // The position in the service's one creation order an `ExportForms` page
-        // token indexes into, drawn from the counter a component's cursor also
-        // comes from.
+        // The position in the service's one creation order a `ListForms` or an
+        // `ExportForms` page token indexes into, drawn from the counter every
+        // create of a paged record draws from.
         let cursor = store.next_cursor();
         let form = crate::state::StoredForm {
             app_id: input.app_id,

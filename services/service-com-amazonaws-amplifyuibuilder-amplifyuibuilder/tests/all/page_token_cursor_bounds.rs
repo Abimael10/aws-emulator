@@ -15,6 +15,13 @@
 //! one of them, each with a token of the collection it pages: the cursor bound is a
 //! property of the token, not of the operation that reads it.
 //!
+//! The cases at the end of the file are about WHERE the cursors in that span come from:
+//! one counter every record kind of the service draws from — its components, forms, themes
+//! and codegen jobs alike — in the order the creates arrive, so a record's cursor is its
+//! position in that single order rather than its position among its own collection's
+//! records, and the ceiling of the span a token may carry is advanced by a create of any of
+//! them.
+//!
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
 
@@ -601,4 +608,348 @@ async fn the_span_a_token_may_carry_follows_what_the_store_handed_out() {
          must stay refused, got {} with {:?}",
         refused.status, refused.body
     );
+}
+
+/// The first cursor the service hands out: the counter pre-increments, so zero belongs to
+/// no record. Spelled out here rather than imported, so a counter starting somewhere else
+/// fails these cases instead of moving with them.
+const FIRST_CURSOR: u64 = 1;
+
+/// Every collection this service pages, by the path segment its `@http` URIs name it
+/// under. Each one has a create that draws a cursor — `CreateComponent`, `CreateForm`,
+/// `CreateTheme` and `StartCodegenJob`.
+const COLLECTIONS: [&str; 4] = ["components", "forms", "themes", "codegen-jobs"];
+
+/// The smallest create payload of one record of `collection`, named by the position the
+/// creation order gives it so no two records of a case collide on a name.
+fn minimal_record(collection: &str, index: usize) -> Value {
+    let name = format!("Cursor-{index}");
+    match collection {
+        "components" => minimal_component(&name),
+        "forms" => minimal_form(&name),
+        "themes" => minimal_theme(&name),
+        "codegen-jobs" => minimal_codegen_job(),
+        other => panic!("no create payload for the {other} collection"),
+    }
+}
+
+/// The list paging `collection`, which its own refusals name.
+fn list_operation(collection: &str) -> &'static str {
+    match collection {
+        "components" => "ListComponents",
+        "forms" => "ListForms",
+        "themes" => "ListThemes",
+        "codegen-jobs" => "ListCodegenJobs",
+        other => panic!("no list of this service pages the {other} collection"),
+    }
+}
+
+/// One row of the shared-counter case: the order the creates of a store arrive in, as the
+/// collection each of them addresses.
+struct CreationOrder {
+    case: &'static str,
+    order: Vec<&'static str>,
+}
+
+/// The creation orders the shared counter is asserted over: they differ in which
+/// collections the creates alternate between and in how many records each collection ends
+/// up with — what the rule generalises over. A cursor counted per collection would agree
+/// with the shared one in none of them.
+fn creation_orders() -> Vec<CreationOrder> {
+    vec![
+        CreationOrder {
+            case: "round robin over all four collections",
+            order: (0..3).flat_map(|_| COLLECTIONS).collect(),
+        },
+        CreationOrder {
+            case: "one collection at a time",
+            order: vec![
+                "forms",
+                "forms",
+                "codegen-jobs",
+                "codegen-jobs",
+                "themes",
+                "themes",
+                "components",
+                "components",
+            ],
+        },
+        CreationOrder {
+            case: "uneven counts in no repeating order",
+            order: vec![
+                "themes",
+                "components",
+                "codegen-jobs",
+                "forms",
+                "components",
+                "themes",
+                "codegen-jobs",
+                "forms",
+                "components",
+                "forms",
+            ],
+        },
+        CreationOrder {
+            case: "the four collections in reverse, twice",
+            order: (0..2)
+                .flat_map(|_| ["codegen-jobs", "themes", "forms", "components"])
+                .collect(),
+        },
+    ]
+}
+
+/// Every collection of this service draws its records' cursors from ONE counter, in the
+/// order the creates arrive: the token a list issues after a record carries the next
+/// record's position in that single order — not its position among its own collection's
+/// records — so no two records of the store hold the same cursor, and the ceiling of the
+/// span a token may carry counts the creates of every collection rather than of the one
+/// the token names.
+///
+/// The rows differ in the order the creates of the four collections arrive in and in how
+/// many records each of them ends up with.
+#[tokio::test]
+async fn every_collection_draws_its_cursors_from_the_one_counter() {
+    for CreationOrder { case, order } in creation_orders() {
+        // A fresh store per row, so the cursors its records hold are the first ones the
+        // counter hands out, in the order this row creates them.
+        let router = emulator();
+        for (index, collection) in order.iter().enumerate() {
+            create(&router, collection, minimal_record(collection, index)).await;
+        }
+        // The highest cursor handed out: one per create, whichever collection it addressed.
+        let issued = FIRST_CURSOR + u64::try_from(order.len()).expect("the row length fits") - 1;
+
+        for collection in COLLECTIONS {
+            // The positions the one creation order gave this collection's records.
+            let positions: Vec<u64> = (0..order.len())
+                .filter(|index| order[*index] == collection)
+                .map(|index| FIRST_CURSOR + u64::try_from(index).expect("an index fits in u64"))
+                .collect();
+            assert!(
+                positions.len() >= 2,
+                "case {case} / {collection}: the row must create at least two records of every \
+                 collection, so its list issues a token, got {positions:?}"
+            );
+
+            // Walking the list one record at a time issues, after each record, the token
+            // that resumes at the next one: the cursor it carries is that record's position
+            // in the one creation order the four collections share. Counted per collection
+            // it would be lower for every record created after another collection's.
+            let tokens = issued_tokens(&router, collection, positions.len() + 1).await;
+            let cursors: Vec<u64> = tokens.iter().map(|token| cursor_of(token)).collect();
+            let expected: Vec<u64> = positions.iter().skip(1).copied().collect();
+            assert_eq!(
+                cursors,
+                expected,
+                "case {case} / {}: each token the walk issues must carry the next record's \
+                 position in the service's one creation order, got {cursors:?} from {tokens:?}",
+                list_operation(collection)
+            );
+            let scope_source = tokens
+                .first()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case} / {collection}: a walk of {} records must issue a token",
+                        positions.len()
+                    )
+                })
+                .clone();
+            let list_uri = collection_uri(collection);
+
+            // The cursor of this collection's FIRST record, which no token of that walk
+            // reports: resumed there, the page carries every record of the collection.
+            let head = forge(&scope_source, positions[0]);
+            let whole = call(&router, "GET", &format!("{list_uri}?nextToken={head}"), None).await;
+            assert_eq!(
+                whole.status,
+                200,
+                "case {case} / {}: the cursor {} of this collection's first record must be \
+                 served, got {} with {:?}",
+                list_operation(collection),
+                positions[0],
+                whole.status,
+                whole.body
+            );
+            assert_eq!(
+                whole.entity_count(),
+                Some(positions.len()),
+                "case {case} / {}: a page resumed at the first record's cursor {} must carry \
+                 every record of the collection, got {:?}",
+                list_operation(collection),
+                positions[0],
+                whole.body
+            );
+
+            // The ceiling of the admitted span is the shared counter, which every create of
+            // the row advanced: it is served against this collection — carrying the records
+            // whose own position is at or above it, which is none of them unless the row's
+            // last create was its own — while the next value is not.
+            let at_ceiling = forge(&scope_source, issued);
+            let served = call(
+                &router,
+                "GET",
+                &format!("{list_uri}?nextToken={at_ceiling}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                served.status,
+                200,
+                "case {case} / {}: the highest cursor the shared counter handed out ({issued}) \
+                 must be served, got {} with {:?}",
+                list_operation(collection),
+                served.status,
+                served.body
+            );
+            let at_or_above = positions
+                .iter()
+                .filter(|position| **position >= issued)
+                .count();
+            assert_eq!(
+                served.entity_count(),
+                Some(at_or_above),
+                "case {case} / {}: a page resumed at {issued} must carry this collection's \
+                 records at or above that cursor, got {:?}",
+                list_operation(collection),
+                served.body
+            );
+
+            let past_ceiling = forge(&scope_source, issued + 1);
+            let refused = call(
+                &router,
+                "GET",
+                &format!("{list_uri}?nextToken={past_ceiling}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                refused.status,
+                400,
+                "case {case} / {}: the cursor past the highest the shared counter handed out \
+                 ({}) must be refused, got {} with {:?}",
+                list_operation(collection),
+                issued + 1,
+                refused.status,
+                refused.body
+            );
+            assert_eq!(
+                refused.entity_count(),
+                None,
+                "case {case} / {}: a refusal must carry no entities, got {:?}",
+                list_operation(collection),
+                refused.body
+            );
+            assert_eq!(
+                refused.error_code(),
+                "",
+                "case {case} / {}: a refusal must name no error type, got {:?}",
+                list_operation(collection),
+                refused.body
+            );
+            let message = refused.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(list_operation(collection)) && message.contains(&past_ceiling),
+                "case {case} / {}: the refusal must name the operation and the token it \
+                 refuses, got {message:?}",
+                list_operation(collection)
+            );
+        }
+    }
+}
+
+/// How many records of every collection the ceiling case starts from: two, so each list has
+/// issued a token whose scope digest a cursor can be forged under.
+const CEILING_FIXTURES: usize = 2;
+
+/// The ceiling of the span a token's cursor may carry is the shared counter's value, so a
+/// create of ANY collection moves it for EVERY collection: a cursor refused against each of
+/// the four before the create is served against each of them after, even where the create
+/// added no record to the collection the token names, and the cursor past it stays refused.
+///
+/// The rows differ in which collection the one create addresses.
+#[tokio::test]
+async fn a_create_of_any_collection_moves_the_cursor_ceiling_of_all_of_them() {
+    for mover in COLLECTIONS {
+        // A fresh store per row: the same number of records in every collection, so each
+        // list has issued a token and the highest cursor handed out is the last fixture's.
+        let router = emulator();
+        let mut created = 0usize;
+        for collection in COLLECTIONS {
+            for _ in 0..CEILING_FIXTURES {
+                create(&router, collection, minimal_record(collection, created)).await;
+                created += 1;
+            }
+        }
+        let mut scope_sources: Vec<(&str, String)> = Vec::new();
+        for collection in COLLECTIONS {
+            scope_sources.push((
+                collection,
+                fixture_token(&router, collection, CEILING_FIXTURES).await,
+            ));
+        }
+        // The cursor the next create of any collection will mint, one past the highest the
+        // fixtures took.
+        let next = FIRST_CURSOR + u64::try_from(created).expect("the fixture count fits in u64");
+
+        for (collection, scope_source) in &scope_sources {
+            let token = forge(scope_source, next);
+            let refused = call(
+                &router,
+                "GET",
+                &format!("{}?nextToken={token}", collection_uri(collection)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                refused.status,
+                400,
+                "case a create of {mover} / {}: the cursor {next} is not handed out yet, so it \
+                 must be refused, got {} with {:?}",
+                list_operation(collection),
+                refused.status,
+                refused.body
+            );
+        }
+
+        create(&router, mover, minimal_record(mover, created)).await;
+
+        for (collection, scope_source) in &scope_sources {
+            let list_uri = collection_uri(collection);
+            let token = forge(scope_source, next);
+            let served = call(&router, "GET", &format!("{list_uri}?nextToken={token}"), None).await;
+            assert_eq!(
+                served.status,
+                200,
+                "case a create of {mover} / {}: the create advanced the one counter to {next}, \
+                 so that cursor must be served, got {} with {:?}",
+                list_operation(collection),
+                served.status,
+                served.body
+            );
+            // The record that create minted holds exactly that cursor, so the page carries
+            // it for the collection it was created in and nothing for the other three.
+            let expected = usize::from(*collection == mover);
+            assert_eq!(
+                served.entity_count(),
+                Some(expected),
+                "case a create of {mover} / {}: a page resumed at {next} must carry the record \
+                 that cursor names and no other, got {:?}",
+                list_operation(collection),
+                served.body
+            );
+
+            let beyond = forge(scope_source, next + 1);
+            let refused = call(&router, "GET", &format!("{list_uri}?nextToken={beyond}"), None).await;
+            assert_eq!(
+                refused.status,
+                400,
+                "case a create of {mover} / {}: one create advanced the counter by one, so {} \
+                 must stay refused, got {} with {:?}",
+                list_operation(collection),
+                next + 1,
+                refused.status,
+                refused.body
+            );
+        }
+    }
 }

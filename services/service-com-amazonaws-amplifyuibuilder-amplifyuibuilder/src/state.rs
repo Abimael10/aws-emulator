@@ -368,9 +368,12 @@ pub struct StoredComponent {
     pub modified_at: SystemTime,
     /// The position this component holds in its environment's creation order.
     ///
-    /// It is what a `ListComponents` page token indexes into: it never changes
-    /// and never repeats, so a page resumes at the same place whether or not
-    /// components were created or deleted since the previous page.
+    /// It is what a `ListComponents` or an `ExportComponents` page token indexes
+    /// into: drawn from the service's one counter,
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::cursor_seq`], it
+    /// never changes and never repeats, so a page resumes at the same place
+    /// whether or not components were created or deleted since the previous
+    /// page.
     pub cursor: u64,
 }
 
@@ -445,9 +448,10 @@ pub struct StoredCodegenJob {
     /// The position this job holds in its environment's start order.
     ///
     /// It is what a `ListCodegenJobs` page token indexes into: drawn from the
-    /// same counter [`StoredComponent::cursor`] is drawn from, it never changes
-    /// and never repeats, so a page resumes at the same place whatever was
-    /// started since the previous page.
+    /// service's one counter,
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::cursor_seq`], it
+    /// never changes and never repeats, so a page resumes at the same place
+    /// whatever was started since the previous page.
     pub cursor: u64,
 }
 
@@ -557,10 +561,10 @@ pub struct StoredForm {
     /// The position this form holds in its environment's creation order.
     ///
     /// It is what a `ListForms` or an `ExportForms` page token indexes into:
-    /// drawn from the same
-    /// counter [`StoredComponent::cursor`] is drawn from, it never changes and
-    /// never repeats, so a page resumes at the same place whether or not forms
-    /// were created or deleted since the previous page.
+    /// drawn from the service's one counter,
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::cursor_seq`], it
+    /// never changes and never repeats, so a page resumes at the same place
+    /// whether or not forms were created or deleted since the previous page.
     pub cursor: u64,
 }
 
@@ -622,11 +626,12 @@ pub struct StoredTheme {
     /// so it starts at [`StoredTheme::created_at`].
     pub modified_at: SystemTime,
     /// The position this theme holds in its environment's creation order, drawn
-    /// from the same counter a component's [`StoredComponent::cursor`] is.
+    /// from the service's one counter,
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::cursor_seq`].
     ///
-    /// It is what an `ExportThemes` page token indexes into: it never changes
-    /// and never repeats, so a page resumes at the same place whether or not
-    /// themes were created or deleted since the previous page.
+    /// It is what a `ListThemes` or an `ExportThemes` page token indexes into:
+    /// it never changes and never repeats, so a page resumes at the same place
+    /// whether or not themes were created or deleted since the previous page.
     pub cursor: u64,
 }
 
@@ -703,8 +708,16 @@ pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// component, the key carries the (appId, environmentName) the create
     /// addressed: a token is scoped to the environment it was used in.
     pub form_tokens: HashMap<(EnvironmentKey, String), String>,
-    /// The counter [`StoredComponent::cursor`] and [`StoredTheme::cursor`]
-    /// values are drawn from.
+    /// The counter EVERY record this service pages draws its cursor from, in the
+    /// order the creates that mint them arrive: all four [`PagedRecord`] kinds —
+    /// [`StoredComponent::cursor`], [`StoredForm::cursor`],
+    /// [`StoredTheme::cursor`] and [`StoredCodegenJob::cursor`] — whatever
+    /// collection and app environment each belongs to.
+    ///
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::next_cursor`] is its
+    /// only writer, so the cursors in existence run from [`FIRST_CURSOR`] up to
+    /// this value: the span [`parse_page_token`] admits a token's cursor from,
+    /// for every paginated operation of the service alike.
     pub cursor_seq: u64,
     /// Every theme, keyed by the (appId, environmentName) it belongs to and held
     /// in creation order within that environment.
@@ -903,7 +916,10 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.components.values().map(Vec::len).sum()
     }
 
-    /// The next cursor in this service's one creation order.
+    /// The next cursor in this service's one creation order, which the create of
+    /// every record the service pages draws from — a component, a form, a theme
+    /// and a started codegen job alike — so no two records of the store ever
+    /// hold the same cursor.
     ///
     /// Saturating rather than wrapping so the "never repeats" invariant above
     /// holds for every value it can actually reach: exhausting a `u64` would

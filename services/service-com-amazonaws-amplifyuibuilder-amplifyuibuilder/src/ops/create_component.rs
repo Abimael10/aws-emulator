@@ -265,6 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_component_id(&key);
+        // The position in the service's one creation order a `ListComponents` or
+        // an `ExportComponents` page token indexes into, drawn from the counter
+        // every create of a paged record draws from.
         let cursor = store.next_cursor();
         let component = crate::state::StoredComponent {
             app_id: input.app_id,

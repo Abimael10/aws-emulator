@@ -209,8 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_codegen_job_id(&key);
-        // The position this job takes in its environment's start order, which is
-        // what a `ListCodegenJobs` page token indexes into.
+        // The position in the service's one creation order a `ListCodegenJobs`
+        // page token indexes into, drawn from the counter every create of a
+        // paged record draws from.
         let cursor = store.next_cursor();
         let job = crate::state::StoredCodegenJob {
             app_id: input.app_id,

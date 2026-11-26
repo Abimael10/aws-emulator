@@ -225,8 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_theme_id(&key);
-        // The position this theme takes in its environment's creation order,
-        // which is the order `ExportThemes` pages over.
+        // The position in the service's one creation order a `ListThemes` or an
+        // `ExportThemes` page token indexes into, drawn from the counter every
+        // create of a paged record draws from.
         let cursor = store.next_cursor();
         let theme = crate::state::StoredTheme {
             app_id: input.app_id,
