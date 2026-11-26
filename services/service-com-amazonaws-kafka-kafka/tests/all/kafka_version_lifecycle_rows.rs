@@ -292,8 +292,10 @@ async fn a_second_row_changes_no_answer_about_the_version() {
                 created.body
             ),
         }
-        // Whichever of the two it is, the service still OFFERS the version: the
-        // matrix names it as a target reachable from some source it publishes.
+        // Whichever of the two it is, the version is answered about by the VERSION
+        // rather than by its last row: the matrix offers it as a target exactly
+        // when the service still SHIPS it — the set that same refusal lists —
+        // since an in-place update installs the software the service ships.
         let offered_as_target = matrix
             .at("/compatibleKafkaVersions")
             .as_array()
@@ -304,10 +306,11 @@ async fn a_second_row_changes_no_answer_about_the_version() {
                     .as_array()
                     .is_some_and(|targets| targets.iter().any(|target| target == version))
             });
-        assert!(
+        assert_eq!(
             offered_as_target,
-            "case version={version:?}: a version with an {ACTIVE} row must be offered as an \
-             upgrade target, got {}",
+            listed.contains(&version),
+            "case version={version:?}: a version the service ships is an upgrade target and one \
+             it has stopped shipping is no source's target, whatever its rows say, got {}",
             matrix.body
         );
     }

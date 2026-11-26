@@ -51,9 +51,11 @@ pub const KAFKA_VERSION_VARIANT_TIERED: &str = "tiered";
 /// which lists the versions MSK offers, the variants it offers them in (the
 /// `.kraft` metadata-mode lines, the `.tiered` storage line, the `link` line) and
 /// the ones it has deprecated, together with the catalog the service itself
-/// publishes, which this table reproduces ROW FOR ROW. A deprecated version is
-/// still a valid SOURCE version — a cluster already running it can be upgraded
-/// away from it — but never a target.
+/// publishes, which this table reproduces ROW FOR ROW. A version the catalog
+/// publishes a deprecated row for is neither an upgrade TARGET nor an upgrade
+/// SOURCE: the service publishes no path off a version it has stopped offering
+/// ([`compatible_target_versions`]), while a cluster already running it goes on
+/// running it.
 ///
 /// Nothing outside that catalog belongs here: a version string the service does
 /// not publish names no broker software, so this table holds EXACTLY the versions
@@ -228,34 +230,76 @@ pub fn final_zookeeper_release() -> &'static [u32] {
     &FINAL_RELEASE
 }
 
-/// The versions a cluster running `source` can be upgraded to: the per-source
-/// upgrade graph the catalog itself describes, in catalog order.
+/// The Apache Kafka versions this service would INSTALL on a cluster that already
+/// exists: the versions it still builds NEW clusters on
+/// ([`new_cluster_kafka_versions`], whichever broker category is offered them),
+/// each once, in published order.
+///
+/// An in-place version update installs the broker software the service currently
+/// ships, so the set an upgrade can land is the set it still offers a cluster that
+/// does not exist yet. That is NARROWER than the versions the catalog publishes an
+/// `ACTIVE` row for: the catalog goes on publishing a version, and the service goes
+/// on taking it as an upgrade SOURCE, after it has stopped shipping it to new
+/// clusters. So publication, and even publication as offered, does not by itself
+/// make a version an upgrade target.
+///
+/// The broker CATEGORY is not a question an upgrade asks — the cluster already has
+/// its brokers — so a version any category is offered is one an upgrade can land.
+///
+/// Derived once, like [`catalogued_kafka_versions`]: both factors are constants.
+pub fn upgrade_target_kafka_versions() -> &'static [&'static str] {
+    static TARGETS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        catalogued_kafka_versions()
+            .iter()
+            .filter(|version| {
+                KAFKA_VERSIONS_FOR_A_NEW_CLUSTER
+                    .iter()
+                    .any(|offering| offering.versions.contains(*version))
+            })
+            .copied()
+            .collect()
+    });
+    &TARGETS
+}
+
+/// The versions a cluster running `source` can be upgraded to: that ONE source's
+/// own upgrade ladder, in published order — never a list shared by several
+/// sources.
 ///
 /// Amazon MSK upgrades a cluster's Apache Kafka version IN PLACE, never
-/// downgrades, and never upgrades to a version it has deprecated — and an upgrade
-/// stays inside the source's own LINE ([`kafka_version_line`]), because a line is
-/// a different build of the broker rather than a later release of the same one.
-/// So a target must be [`KAFKA_VERSION_ACTIVE`], sit on the SAME line as the
+/// downgrades, and installs only software it still ships
+/// ([`upgrade_target_kafka_versions`]) — and an upgrade stays inside the source's
+/// own LINE ([`kafka_version_line`]), because a line is a different build of the
+/// broker rather than a later release of the same one. So a target must be a
+/// version the service still offers a new cluster, sit on the SAME line as the
 /// source and name a strictly newer release.
+///
+/// The ladder is offered only OFF a version the service still offers
+/// ([`is_offered_kafka_version`]): once it has deprecated a version it publishes no
+/// upgrade path off it, so a deprecated source is terminal whatever its line holds
+/// above it, and so is a version the catalog publishes no row for at all.
 ///
 /// The one cross-line move MSK offers is the KRaft migration, to the `.kraft`
 /// version of the source's own release, and it is offered at ONE release: the
 /// final ZooKeeper-mode release the service still offers
 /// ([`final_zookeeper_release`]). A cluster on an older ZooKeeper-mode release
 /// climbs its own line to that release first, and is offered no `.kraft` target
-/// before it gets there. A version with no newer offered member of its line, and
+/// before it gets there. A version with no newer shipped member of its line, and
 /// no KRaft version to cross over to, is terminal and reports an EMPTY list.
 ///
-/// `source` need not be catalogued: a cluster running a version this catalog does
-/// not list is still placed against it by [`kafka_version_release`] and
-/// [`kafka_version_line`].
+/// This is the one derivation behind all three answers about an upgrade: the ladder
+/// the published matrix carries under this source, the ladder that matrix reports
+/// for a cluster running it, and the set an update of such a cluster is admitted
+/// on.
 pub fn compatible_target_versions(source: &str) -> Vec<String> {
+    if !is_offered_kafka_version(source) {
+        return Vec::new();
+    }
     let release = kafka_version_release(source);
     let line = kafka_version_line(source);
     let migration_release = final_zookeeper_release();
-    catalogued_kafka_versions()
+    upgrade_target_kafka_versions()
         .iter()
-        .filter(|version| is_offered_kafka_version(version))
         .filter(|version| {
             let target_release = kafka_version_release(version);
             match (line, kafka_version_line(version)) {
@@ -524,8 +568,9 @@ pub fn unsupported_kafka_version_message(rejected: &str) -> String {
 
 /// Whether the service still OFFERS `version`: whether the catalog publishes it
 /// and the status it is offered under ([`kafka_version_status`]) is
-/// [`KAFKA_VERSION_ACTIVE`]. This is what makes a version an upgrade target and
-/// what a deprecation check reads.
+/// [`KAFKA_VERSION_ACTIVE`]. This is what makes a version an upgrade SOURCE and
+/// what a deprecation check reads; which versions an upgrade may LAND is the
+/// narrower offering ([`upgrade_target_kafka_versions`]).
 pub fn is_offered_kafka_version(version: &str) -> bool {
     kafka_version_status(version) == Some(KAFKA_VERSION_ACTIVE)
 }

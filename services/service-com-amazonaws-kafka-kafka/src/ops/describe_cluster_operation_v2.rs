@@ -11,8 +11,11 @@
 //! moves because the clock moved, never because somebody polled it.
 //!
 //! A well-formed operation ARN this region holds no operation for is a
-//! `NotFoundException`; a value that is not an operation ARN at all is a
-//! `BadRequestException` — the division this service's other ARN readers make.
+//! `NotFoundException` — whichever account the ARN names, since the record of a
+//! cluster's work is no resource an account holds a policy over — naming the
+//! cluster whose operation was looked for in `InvalidParameter`; a value that is
+//! not an operation ARN at all is a `BadRequestException` — the division this
+//! service's other ARN readers make.
 //!
 //! PARTIAL SCOPE, exactly as for `DescribeClusterOperation`: the registry this
 //! reads ([`crate::state::ComAmazonawsKafkaKafkaState::cluster_operations`]) holds
@@ -158,10 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Decided FIRST, before anything the request names is resolved: AWS
-        // authorizes at the IAM layer ahead of the service, so a value that names
-        // no cluster operation of this account matches no resource-scoped
-        // permission and is told it is not authorized rather than told what this
-        // registry holds. See [`crate::state::authorization`].
+        // authorizes at the IAM layer ahead of the service, so a caller whose own
+        // identity policies do not permit this action is told it is not authorized
+        // rather than told what this registry holds. The record of a cluster's work
+        // is no resource a policy is attached to, so the ACCOUNT its ARN names
+        // withholds no grant and an operation this endpoint does not hold is
+        // reported absent below. See [`crate::state::authorization`].
         crate::state::authorization::authorize_cluster_operation_target(
             &*self.engine,
             ctx,
@@ -191,10 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(operation) = state.cluster_operation_in(&region, &input.cluster_operation_arn)
         else {
             return Err(DescribeClusterOperationV2ErrorModeled::NotFoundException(
-                NotFoundException {
-                    invalid_parameter: Some("ClusterOperationArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                },
+                // The CLUSTER is the member this refusal blames: a
+                // cluster-operation ARN is a reference to work done on one, and
+                // what the lookup could not find is that cluster's operation, so
+                // the parameter at fault is named in the service's own wire
+                // vocabulary ([`crate::state::CLUSTER_ARN_MEMBER`]).
+                crate::state::resource_not_found(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         };

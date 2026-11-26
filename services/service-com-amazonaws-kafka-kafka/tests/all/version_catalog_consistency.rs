@@ -68,11 +68,47 @@ fn published(reply: &Reply) -> BTreeMap<String, Vec<String>> {
 }
 
 /// Whether the catalog still OFFERS `version`: whether it publishes any
-/// [`ACTIVE`] row for it, which is what makes a version an upgrade target.
+/// [`ACTIVE`] row for it, which is what makes a version an upgrade SOURCE.
 fn offered(catalog: &BTreeMap<String, Vec<String>>, version: &str) -> bool {
     catalog
         .get(version)
         .is_some_and(|statuses| statuses.iter().any(|status| status == ACTIVE))
+}
+
+/// A version no catalog publishes, so a create naming it is refused with the whole
+/// valid-value list of the broker category it asked for.
+const NO_SUCH_VERSION: &str = "0.0.0-no-such-version";
+
+/// The versions the service still SHIPS to a new cluster, read off the wire: the
+/// valid-value list its own refusal of [`NO_SUCH_VERSION`] advertises. That is the
+/// software an in-place update installs, so it is the set a matrix row may offer as
+/// a target — narrower than the versions the catalog publishes as offered.
+///
+/// Read for the standard broker category; `new_cluster_kafka_version_offering.rs`
+/// pins the per-category lists and that both are offered the same versions.
+async fn shipped_versions(emulator: &Emulator) -> BTreeSet<String> {
+    let reply = emulator
+        .create(&ClusterRequest {
+            kafka_version: NO_SUCH_VERSION,
+            ..ClusterRequest::named("shipped-versions")
+        })
+        .await;
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (400, "BadRequestException"),
+        "a create naming no published version must be refused, got {} {}",
+        reply.status,
+        reply.body
+    );
+    let message = reply.error_message().to_string();
+    let listed = message
+        .rsplit_once("Valid values: [")
+        .and_then(|(_, tail)| tail.strip_suffix(']'))
+        .unwrap_or_else(|| {
+            panic!("the refusal must carry a valid-value list, got {message:?}")
+        })
+        .to_string();
+    listed.split(", ").map(str::to_string).collect()
 }
 
 /// The release at which the catalog offers the KRaft migration: the newest
@@ -145,6 +181,16 @@ async fn the_matrix_is_derived_from_the_published_catalog() {
                 catalog.get(target)
             );
         }
+        // A source the catalog publishes as deprecated is published no path off
+        // it: the service installs no software on a version it has stopped
+        // offering.
+        if !offered(&catalog, source) {
+            assert!(
+                targets.is_empty(),
+                "case source={source:?}: a version the catalog no longer offers is terminal, \
+                 got {targets:?}"
+            );
+        }
     }
     // Every published ROW is a row the matrix publishes a source for, in the same
     // order: the matrix is the published table of that catalog, so a client
@@ -188,18 +234,20 @@ fn published_sequence(reply: &Reply) -> Vec<String> {
 }
 
 /// RULE: the matrix is a per-source upgrade GRAPH, not one blanket list: each
-/// source's targets are the versions the catalog permits an upgrade to FROM it —
-/// still offered, on that source's own build line and strictly newer, or, at the
-/// one release the catalog offers the crossing at (its final offered
-/// ZooKeeper-mode release), the KRaft version of that release — so a terminal
-/// version reports an EMPTY list and two sources on different lines are offered
-/// different things.
+/// source's targets are the versions the service would install on a cluster
+/// running it — software it still ships to a new cluster, on that source's own
+/// build line and strictly newer, or, at the one release the catalog offers the
+/// crossing at (its final offered ZooKeeper-mode release), the KRaft version of
+/// that release — and nothing at all off a source the catalog no longer offers. So
+/// a terminal version reports an EMPTY list and two sources on different lines are
+/// offered different things.
 #[tokio::test]
 async fn each_source_is_offered_only_the_upgrades_its_own_line_permits() {
     let emulator = Emulator::new();
     let catalog = published(&list_versions(&emulator).await);
     let matrix = rows(&matrix(&emulator).await);
     let crossing = migration_release(&catalog);
+    let shipped = shipped_versions(&emulator).await;
 
     for (source, targets) in &matrix {
         // No self-upgrade, and no duplicate: a version is offered once or not at
@@ -236,20 +284,23 @@ async fn each_source_is_offered_only_the_upgrades_its_own_line_permits() {
         }
         // And every version the catalog permits is offered: the row is the whole
         // subset, not a sample of it.
-        let permitted: BTreeSet<&String> = catalog
-            .keys()
-            .filter(|version| offered(&catalog, version))
-            .filter(|version| {
-                if line(version) == line(source) {
-                    line(source) != OTHER_LINE && release(version) > release(source)
-                } else {
-                    line(source).is_empty()
-                        && line(version) == "kraft"
-                        && release(version) == release(source)
-                        && release(source) == crossing
-                }
-            })
-            .collect();
+        let permitted: BTreeSet<&String> = match offered(&catalog, source) {
+            false => BTreeSet::new(),
+            true => catalog
+                .keys()
+                .filter(|version| shipped.contains(version.as_str()))
+                .filter(|version| {
+                    if line(version) == line(source) {
+                        line(source) != OTHER_LINE && release(version) > release(source)
+                    } else {
+                        line(source).is_empty()
+                            && line(version) == "kraft"
+                            && release(version) == release(source)
+                            && release(source) == crossing
+                    }
+                })
+                .collect(),
+        };
         assert_eq!(
             distinct, permitted,
             "case source={source:?}: expected exactly the permitted upgrades {permitted:?}, \

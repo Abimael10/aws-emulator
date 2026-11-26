@@ -66,8 +66,18 @@
 //! it acts on: the control-plane gate ([`authorize_caller_operation`], taken by
 //! every operation that names a cluster by `ClusterArn`), the data-plane one a
 //! TOPIC call takes ([`authorize_cluster_connect`]), and the readers of one cluster
-//! OPERATION ([`authorize_cluster_operation_target`]), whose target is a resource
-//! of this service named by ARN just the same.
+//! OPERATION ([`authorize_cluster_operation_target`]), whose target is named by ARN
+//! just the same.
+//!
+//! A cluster OPERATION differs in ONE reading, and it is the account's. The record
+//! of work done on a cluster is not a resource a policy is attached to, so no
+//! document over it is one an account can hold or withhold: what such a read turns
+//! on is whether this endpoint HOLDS the record, and a well-formed
+//! cluster-operation ARN naming none is answered as the absence it is — the
+//! modelled `NotFoundException`, as this service's recorded answer for an
+//! operation ARN of another account shows — rather than refused on the account the
+//! ARN names ([`TargetReading::decided_by_the_targets_account`]). The caller's own
+//! identity-based decision is taken for it exactly as for every other target.
 //!
 //! An operation that MANAGES one of the client VPC connections made to a cluster
 //! is decided one step further ([`no_resource_policy_for_cluster`]). Multi-VPC
@@ -284,6 +294,15 @@ pub fn authorize_caller_operation<Eng: Send + Sync + 'static, E>(
 /// decision is the authorization refusal rather than a description of the value's
 /// shape, taken before the operation is resolved. A value naming another kind of
 /// resource is left to the operation, as [`authorize_named_resource`] says.
+///
+/// What this target's ACCOUNT says is NOT part of the decision
+/// ([`TargetReading::decided_by_the_targets_account`]): a cluster operation is a
+/// RECORD of work done on a cluster rather than a resource a document is attached
+/// to, so there is no resource-based policy over it for an account to withhold,
+/// and whether this endpoint holds the record is what the request turns on. A
+/// well-formed cluster-operation ARN naming no operation of this Region is
+/// therefore reported absent — the modelled `NotFoundException` the readers answer
+/// — whichever account the ARN names.
 pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -301,6 +320,7 @@ pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
             only_a_resource_policy_can_grant: grantable_by_cluster_policy(
                 &control_plane_action(operation),
             ),
+            decided_by_the_targets_account: false,
             naming: UngrantedResource::Resolved,
         },
     )
@@ -332,6 +352,7 @@ fn authorize_cluster_action<Eng: Send + Sync + 'static, E>(
             resource_type: crate::state::CLUSTER_RESOURCE_TYPE,
             names_the_resource: crate::state::is_cluster_arn(cluster_arn),
             only_a_resource_policy_can_grant: grantable_by_cluster_policy(action),
+            decided_by_the_targets_account: true,
             naming,
         },
     )
@@ -351,6 +372,14 @@ struct TargetReading<'reading> {
     names_the_resource: bool,
     /// Whether the only document that can grant `action` is the RESOURCE's own.
     only_a_resource_policy_can_grant: bool,
+    /// Whether the target's ACCOUNT can refuse the request: whether a document
+    /// over the resource it names is one this endpoint's account could hold, so
+    /// that an ARN of another account reaches no resource-based grant
+    /// ([`authorize_action`]). A target that is a RECORD of a resource rather than
+    /// a resource a document is attached to is decided by nothing in its ARN: the
+    /// endpoint either holds the record or does not, and the operation answers
+    /// that.
+    decided_by_the_targets_account: bool,
     /// Which reading of the submitted value a refusal quotes as the resource.
     naming: UngrantedResource,
 }
@@ -387,7 +416,10 @@ fn authorize_named_resource<Eng: Send + Sync + 'static, E>(
     value: &str,
     reading: TargetReading<'_>,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_action(engine, ctx, action, value)?;
+    match reading.decided_by_the_targets_account {
+        true => authorize_caller_action(engine, ctx, action, value)?,
+        false => authorize_calling_identity(engine, ctx, action, value)?,
+    }
     if reading.names_the_resource {
         return Ok(());
     }
@@ -550,16 +582,34 @@ pub fn authorize_caller_action<Eng: Send + Sync + 'static, E>(
     action: &str,
     target_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    authorize_calling_identity(engine, ctx, action, target_arn)?;
+    authorize_action(action, target_arn)
+}
+
+/// The FIRST of those two decisions on its own: what the CALLING PRINCIPAL's own
+/// identity-based policies say about `action` on `target_arn`.
+///
+/// Every gate here takes it, whatever its target is, because IAM is evaluated
+/// ahead of the service for every request alike. It is factored out of
+/// [`authorize_caller_action`] so that a target whose ACCOUNT decides nothing
+/// ([`TargetReading::decided_by_the_targets_account`]) still takes this half, and
+/// so the two halves cannot be reordered by accident.
+fn authorize_calling_identity<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    target_arn: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     let caller = crate::state::identity_authorization::caller_identity(engine, ctx);
     let refusal = if grantable_by_cluster_policy(action) {
         caller.explicit_deny(action, target_arn)
     } else {
         caller.refusal(action, target_arn)
     };
-    if let Some(refusal) = refusal {
-        return Err(refusal);
+    match refusal {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
     }
-    authorize_action(action, target_arn)
 }
 
 /// The resource an authorization decision is taken over when the request named

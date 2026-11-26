@@ -5,14 +5,16 @@
 //! from.
 //!
 //! The RULE under test: the compatible target versions of a source version are
-//! the upgrades the catalog permits FROM that version — a version the service
-//! still offers (the catalog publishes an `ACTIVE` row for it in
+//! that source's OWN upgrade ladder — a version the service still builds NEW
+//! clusters on (its per-category offering, narrower than the `ACTIVE` rows of
 //! [`KAFKA_VERSION_CATALOG`]), on the SAME variant line as the source and naming a
 //! strictly newer release, plus the one cross-line move MSK offers: at its final
 //! offered ZooKeeper-mode release, the `.kraft` version of that release (the KRaft
-//! migration). MSK upgrades in place, never downgrades, never offers a version it
-//! has deprecated, and never moves a cluster between builds of the broker, so a
-//! source with nothing newer on its line is TERMINAL and reports an empty list.
+//! migration). The ladder is published only OFF a version the service still offers
+//! (the catalog publishes an `ACTIVE` row for it): MSK upgrades in place, never
+//! downgrades, never moves a cluster between builds of the broker, and publishes no
+//! path off a version it has deprecated — so a deprecated source, and a source with
+//! nothing newer it still ships on its line, is TERMINAL and reports an empty list.
 //! With a `ClusterArn` the single source version is the one the STORED cluster
 //! runs; without one, the answer is the published TABLE — one row per ROW the
 //! catalog publishes, in published order, which is the sequence
@@ -28,7 +30,9 @@
 //! is asserted against itself.
 
 use serde_json::Value;
-use service_com_amazonaws_kafka_kafka::state::{KAFKA_VERSION_ACTIVE, KAFKA_VERSION_CATALOG};
+use service_com_amazonaws_kafka_kafka::state::{
+    new_cluster_kafka_versions, KAFKA_VERSION_ACTIVE, KAFKA_VERSION_CATALOG,
+};
 
 use crate::kafka_harness::{
     kafka_version_line, kafka_version_release, pct, ClusterRequest, Emulator, Reply, ACCOUNT,
@@ -84,13 +88,13 @@ fn entries(reply: &Reply) -> Vec<(String, Vec<String>)> {
 }
 
 /// The target versions the catalog ITSELF implies for `source`, computed here
-/// from the published entries rather than from the service's helper, so it is an
-/// independent check of the handler's answer: an offered version (the catalog
-/// publishes an `ACTIVE` row for it) that is either NEWER on the source's own
-/// upgradable line — ZooKeeper mode, which the `.tiered` spelling is on too, or
-/// KRaft — or, when the source sits at the final offered ZooKeeper-mode release,
-/// the `.kraft` version of that release. A source on any other line is terminal.
-/// In catalog order, each version once.
+/// from the published entries rather than from the service's ladder helper, so it
+/// is an independent check of the handler's answer: a version the service still
+/// builds new clusters on that is either NEWER on the source's own upgradable line
+/// — ZooKeeper mode, which the `.tiered` spelling is on too, or KRaft — or, when
+/// the source sits at the final offered ZooKeeper-mode release, the `.kraft`
+/// version of that release. A source the service no longer offers, and one on any
+/// other line, is terminal. In catalog order, each version once.
 fn targets_from_catalog(source: &str) -> Vec<String> {
     /// The `(release, line)` of a version, read through the shared harness's
     /// version-spelling helpers so this suite places a version exactly as its
@@ -99,6 +103,11 @@ fn targets_from_catalog(source: &str) -> Vec<String> {
         (kafka_version_release(version), kafka_version_line(version))
     }
 
+    // A version the service has deprecated is published no path off it, so it
+    // carries no ladder however much newer software exists.
+    if !is_offered(source) {
+        return Vec::new();
+    }
     let (source_release, source_line) = placed(source);
     // The release the crossing to KRaft is offered at: the newest release the
     // catalog publishes an offered ZooKeeper-mode version of.
@@ -111,7 +120,10 @@ fn targets_from_catalog(source: &str) -> Vec<String> {
         .unwrap_or_default();
     let mut targets: Vec<String> = Vec::new();
     for entry in KAFKA_VERSION_CATALOG {
-        if !published_statuses(entry.version).contains(&KAFKA_VERSION_ACTIVE) {
+        // An upgrade installs the software the service still ships, which is the
+        // set a NEW cluster of either broker category may name — both categories
+        // are offered the same versions, so one of them says it.
+        if !shipped_for_a_new_cluster(entry.version) {
             continue;
         }
         let (release, line) = placed(entry.version);
@@ -144,6 +156,15 @@ fn published_statuses(version: &str) -> Vec<&'static str> {
 /// row for it.
 fn is_offered(version: &str) -> bool {
     published_statuses(version).contains(&KAFKA_VERSION_ACTIVE)
+}
+
+/// Whether the service still builds a NEW cluster on `version` — the offering a
+/// create is admitted on, which is the software an in-place update installs. Read
+/// for the standard broker category; both categories are offered the same
+/// versions, and `new_cluster_kafka_version_offering.rs` pins that set against the
+/// create refusal's own valid-value sentence.
+fn shipped_for_a_new_cluster(version: &str) -> bool {
+    new_cluster_kafka_versions("kafka.m5.large").contains(&version)
 }
 
 /// Every version the catalog publishes, each once, in published order.
@@ -270,16 +291,14 @@ async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
         // ZooKeeper mode.
         (
             "3.8.x.kraft",
-            versions(&["3.9.x.kraft", "4.0.x.kraft", "4.1.x.kraft", "4.2.x.kraft"]),
+            versions(&["3.9.x.kraft", "4.0.x.kraft", "4.1.x.kraft"]),
         ),
-        (
-            "3.9.x.kraft",
-            versions(&["4.0.x.kraft", "4.1.x.kraft", "4.2.x.kraft"]),
-        ),
-        ("4.0.x.kraft", versions(&["4.1.x.kraft", "4.2.x.kraft"])),
-        // The newest KRaft version a create admits: its one target is the version
-        // the catalog publishes both an offered and a deprecated row for.
-        ("4.1.x.kraft", versions(&["4.2.x.kraft"])),
+        ("3.9.x.kraft", versions(&["4.0.x.kraft", "4.1.x.kraft"])),
+        ("4.0.x.kraft", versions(&["4.1.x.kraft"])),
+        // The newest KRaft version a create admits: nothing above it is software
+        // the service still ships, so it is terminal — the catalog publishing a
+        // newer `.kraft` row does not make that row an upgrade target.
+        ("4.1.x.kraft", Vec::new()),
     ];
 
     for (index, (version, expected)) in rows.iter().enumerate() {

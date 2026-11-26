@@ -258,11 +258,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The target must be one of the versions this cluster's version can be
-        // updated to: MSK updates Apache Kafka in place, so a version at or
-        // below the one the brokers run, one MSK has deprecated, and one it does
-        // not offer at all are each refused rather than installed. The ladder is
-        // the one `GetCompatibleKafkaVersions` reports, so an update can only
-        // land a version that reader offers for this cluster.
+        // updated to: MSK updates Apache Kafka in place and installs only the
+        // software it still ships, so a version at or below the one the brokers
+        // run, one it no longer offers a new cluster, and one it does not publish
+        // at all are each refused rather than installed. The ladder is the one
+        // `GetCompatibleKafkaVersions` reports, so an update can only land a
+        // version that reader offers for this cluster.
         if !crate::state::compatible_target_versions(&kafka_version)
             .contains(&input.target_kafka_version)
         {

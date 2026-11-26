@@ -166,8 +166,10 @@ async fn a_page_resumes_after_a_row_at_every_boundary() {
 /// RULE: a version the catalog publishes an `ACTIVE` row for is one the service
 /// still OFFERS, and one it publishes a `DEPRECATED` row for is not — on every
 /// surface that answers about the version rather than about the catalog's rows:
-/// the upgrade matrix's target lists, and the valid-value list a create refusal
-/// carries, which names each offered version ONCE in published order.
+/// which sources the upgrade matrix publishes a ladder for, which versions that
+/// matrix offers as targets (narrower still: the software the service ships to a
+/// new cluster), and the valid-value list a create refusal carries, which names
+/// each version it ships ONCE in published order.
 #[tokio::test]
 async fn a_version_with_an_active_row_is_the_offered_version_set() {
     let emulator = Emulator::new();
@@ -200,40 +202,11 @@ async fn a_version_with_an_active_row_is_the_offered_version_set() {
         );
     }
 
-    // The matrix offers a version as a target exactly when the catalog publishes
-    // an `ACTIVE` row for it: a deprecated-everywhere version is no source's
-    // target, and an offered version is a target wherever the catalog publishes a
-    // version an upgrade to it can start from — an older release of its own build
-    // line, whether that source is still offered or not.
-    let matrix = matrix(&emulator).await;
-    let versions = distinct_versions(&catalog);
-    for version in &versions {
-        let is_target = matrix
-            .iter()
-            .any(|(_, targets)| targets.iter().any(|target| target == version));
-        if !offered(&catalog, version) {
-            assert!(
-                !is_target,
-                "case version={version:?}: a version with no ACTIVE row must be no source's \
-                 target, got the matrix {matrix:?}"
-            );
-            continue;
-        }
-        let has_older_on_line = versions.iter().any(|other| {
-            line(other) == line(version) && release(other) < release(version)
-        });
-        assert!(
-            is_target || !has_older_on_line,
-            "case version={version:?}: an offered version with an older version on its own \
-             line must be that source's upgrade target, got the matrix {matrix:?}"
-        );
-    }
-
-    // And the create refusal's valid-value list is drawn from that same set: the
+    // The create refusal's valid-value list is drawn from that same set: the
     // versions MSK takes for a NEW cluster are the ones it still offers, each named
-    // once — a narrower set than the offered one, since a version stays an upgrade
-    // target for the clusters already on it after the service has stopped taking it
-    // for a cluster that does not exist yet.
+    // once — a narrower set than the offered one, since a version stays published,
+    // and stays an upgrade SOURCE, after the service has stopped taking it for a
+    // cluster that does not exist yet.
     let refusal = emulator
         .create(&ClusterRequest {
             kafka_version: "9.9.9",
@@ -253,6 +226,46 @@ async fn a_version_with_an_active_row_is_the_offered_version_set() {
         .and_then(|(_, tail)| tail.strip_suffix(']'))
         .unwrap_or_else(|| panic!("the refusal must carry a valid-value list, got {message:?}"));
     let listed: Vec<&str> = listed.split(", ").collect();
+
+    // The matrix offers a version as a target exactly when the service still
+    // SHIPS it to a new cluster — an in-place update installs the software the
+    // service ships — and it offers it from every published version an upgrade to
+    // it can start from: an older release of its own build line that the catalog
+    // still publishes as offered. A version with no `ACTIVE` row, and one the
+    // catalog publishes as offered but no longer ships, is no source's target.
+    let matrix = matrix(&emulator).await;
+    let versions = distinct_versions(&catalog);
+    for version in &versions {
+        let is_target = matrix
+            .iter()
+            .any(|(_, targets)| targets.iter().any(|target| target == version));
+        if !offered(&catalog, version) {
+            assert!(
+                !is_target,
+                "case version={version:?}: a version with no ACTIVE row must be no source's \
+                 target, got the matrix {matrix:?}"
+            );
+            continue;
+        }
+        if !listed.contains(&version.as_str()) {
+            assert!(
+                !is_target,
+                "case version={version:?}: a version the service no longer ships to a new \
+                 cluster must be no source's target, got the matrix {matrix:?}"
+            );
+            continue;
+        }
+        let has_older_offered_on_line = versions.iter().any(|other| {
+            line(other) == line(version)
+                && release(other) < release(version)
+                && offered(&catalog, other)
+        });
+        assert!(
+            is_target || !has_older_offered_on_line,
+            "case version={version:?}: a shipped version with an older offered version on its \
+             own line must be that source's upgrade target, got the matrix {matrix:?}"
+        );
+    }
     let offered_versions: Vec<String> = distinct_versions(&catalog)
         .into_iter()
         .filter(|version| offered(&catalog, version))

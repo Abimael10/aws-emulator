@@ -30,8 +30,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    BAD_REQUEST_MESSAGE, CLUSTER_ARN_MEMBER, KAFKA_VERSION_ACTIVE, KAFKA_VERSION_CATALOG,
-    OPERATION_STATE_COMPLETE, OPERATION_STATE_IN_PROGRESS,
+    new_cluster_kafka_versions, BAD_REQUEST_MESSAGE, CLUSTER_ARN_MEMBER, KAFKA_VERSION_ACTIVE,
+    KAFKA_VERSION_CATALOG, OPERATION_STATE_COMPLETE, OPERATION_STATE_IN_PROGRESS,
     OPERATION_TYPE_UPDATE_CLUSTER_KAFKA_VERSION, PROVISIONED_ONLY_MESSAGE,
     RESOURCE_NOT_FOUND_MESSAGE,
 };
@@ -159,20 +159,24 @@ fn assert_version_token(version: &str, case: &str) {
 
 /// Whether the catalog offers `target` as an update for a cluster running
 /// `source`, decided here from the PUBLISHED catalog rather than from the
-/// helper the handler uses: a target is offered when the service still offers it
-/// (the catalog publishes an `ACTIVE` row for it) and it is either a strictly
-/// newer release on the SOURCE's own upgradable build line or, when the source
-/// sits at the final offered ZooKeeper-mode release, the `.kraft` version of that
-/// release — the KRaft migration, which MSK offers at that one release. A source
-/// on a line MSK publishes no upgrade path off is terminal. Source: the
+/// helper the handler uses: a target is offered when the service still SHIPS it to
+/// a new cluster ([`new_cluster_kafka_versions`], the software an in-place update
+/// installs — narrower than the versions the catalog publishes an `ACTIVE` row
+/// for) and it is either a strictly newer release on the SOURCE's own upgradable
+/// build line or, when the source sits at the final offered ZooKeeper-mode
+/// release, the `.kraft` version of that release — the KRaft migration, which MSK
+/// offers at that one release. A source the service no longer offers, and one on a
+/// line MSK publishes no upgrade path off, is terminal. Source: the
 /// `KAFKA_VERSION_CATALOG` rows (the Amazon MSK Developer Guide's "Supported
-/// Apache Kafka versions"), plus the Developer Guide's rule that an MSK cluster's
-/// Apache Kafka version is updated in place and cannot be downgraded.
+/// Apache Kafka versions") and the per-category offering a create refusal
+/// advertises, plus the Developer Guide's rule that an MSK cluster's Apache Kafka
+/// version is updated in place and cannot be downgraded.
 fn catalog_offers(source: &str, target: &str) -> bool {
-    let offered = KAFKA_VERSION_CATALOG
+    let shipped = new_cluster_kafka_versions("kafka.m5.large").contains(&target);
+    let source_offered = KAFKA_VERSION_CATALOG
         .iter()
-        .any(|entry| entry.version == target && entry.status == KAFKA_VERSION_ACTIVE);
-    if !offered {
+        .any(|entry| entry.version == source && entry.status == KAFKA_VERSION_ACTIVE);
+    if !shipped || !source_offered {
         return false;
     }
     let (source_release, source_line) = (version_key(source).0, build_line(source));
@@ -254,7 +258,7 @@ async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
         ("kraft-next", "3.8.x.kraft", "3.9.x.kraft"),
         ("kraft-ladder", "3.8.x.kraft", "4.1.x.kraft"),
         ("kraft-step", "4.0.x.kraft", "4.1.x.kraft"),
-        ("whole-ladder", "3.9.x.kraft", "4.2.x.kraft"),
+        ("whole-ladder", "3.9.x.kraft", "4.1.x.kraft"),
     ];
 
     let emulator = Emulator::new();
@@ -457,9 +461,10 @@ async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
 
 /// RULE: `TargetKafkaVersion` becomes the Apache Kafka version the brokers run,
 /// so it must be one the service offers as an update for the version they run
-/// now — catalogued, still offered, and strictly newer. Every other value is
-/// refused `BadRequestException` naming that member, and the cluster is left
-/// exactly as it was.
+/// now — software the service still ships to a new cluster, on the source's own
+/// build line and strictly newer (or the one crossing to KRaft), off a source the
+/// service still offers. Every other value is refused `BadRequestException`
+/// naming that member, and the cluster is left exactly as it was.
 #[tokio::test]
 async fn only_a_target_the_service_offers_is_accepted() {
     // The rows differ along what the rule generalises over: the source's build
@@ -479,8 +484,10 @@ async fn only_a_target_the_service_offers_is_accepted() {
         ("kraft-migration", "3.9.x", "3.9.x.kraft"),
         ("kraft-next", "3.8.x.kraft", "3.9.x.kraft"),
         ("kraft-far", "3.8.x.kraft", "4.1.x.kraft"),
-        ("kraft-ladder-top", "4.1.x.kraft", "4.2.x.kraft"),
         // Not offered.
+        // The newest `.kraft` row the catalog publishes: the service has stopped
+        // shipping it, so the top of the shipped ladder is terminal.
+        ("kraft-ladder-top", "4.1.x.kraft", "4.2.x.kraft"),
         ("same-version", "3.9.x", "3.9.x"),
         ("one-minor-back", "3.9.x", "3.8.x"),
         ("far-downgrade", "3.9.x", "2.8.1"),

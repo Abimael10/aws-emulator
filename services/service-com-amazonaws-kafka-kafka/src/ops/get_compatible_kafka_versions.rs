@@ -7,9 +7,11 @@
 //!
 //! * With `ClusterArn`: ONE `CompatibleKafkaVersion`, whose `SourceVersion` is the
 //!   version the stored cluster runs and whose `TargetVersions` are the upgrades
-//!   the catalog permits FROM that version
-//!   ([`crate::state::compatible_target_versions`]) — a per-source subset, empty
-//!   for a terminal version, never one blanket list shared by every source.
+//!   the service offers FROM that version
+//!   ([`crate::state::compatible_target_versions`]: the software it still ships, on
+//!   that version's own build line and strictly newer, plus the one crossing to
+//!   KRaft) — a per-source subset, empty for a terminal or deprecated source, never
+//!   one blanket list shared by every source.
 //! * Without `ClusterArn` (the member is optional in the model): the whole
 //!   published matrix — one entry per ROW the catalog publishes
 //!   ([`crate::state::published_kafka_versions`]), in published order, each
