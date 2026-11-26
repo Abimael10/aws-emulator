@@ -1202,9 +1202,13 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
             "case {:?}: a refusal must carry the service's own sentence, got {response}",
             case.what
         );
+        // The modeled shape requires `reason` beside `message`, so a refusal
+        // always classifies itself; which class each defect states is pinned
+        // in `scan_sbom_refusal_reason.rs`.
         assert!(
-            response["reason"].is_null() && response["fields"].is_null(),
-            "case {:?}: the service sends neither reason nor fields here, got {response}",
+            response["reason"].is_string(),
+            "case {:?}: a refusal must classify itself with the modeled reason, got \
+             {response}",
             case.what
         );
     }
@@ -1329,8 +1333,8 @@ async fn a_component_tree_nested_too_deep_is_refused() {
         "the refusal must name the components member, got {response}"
     );
     assert!(
-        response["reason"].is_null() && response["fields"].is_null(),
-        "the service sends neither reason nor fields here, got {response}"
+        response["reason"].is_string(),
+        "a refusal must classify itself with the modeled reason, got {response}"
     );
 }
 

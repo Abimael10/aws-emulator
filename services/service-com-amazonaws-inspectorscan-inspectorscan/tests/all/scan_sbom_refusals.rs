@@ -3,10 +3,14 @@
 //! The WIRE CONTRACT of a `ScanSbom` input refusal, end-to-end over HTTP.
 //!
 //! One rule, asserted over every class of input defect this operation refuses:
-//! a bad input SBOM is answered HTTP 400 `ValidationException` whose body
-//! carries `message` ALONE — the fixed text `Input SBOM failed validation: `
-//! followed by a clause naming the CLASS of defect (never an index, a member
-//! path, or a value read back out of the submitted document).
+//! a bad input SBOM is answered HTTP 400 `ValidationException` whose `message`
+//! is the fixed text `Input SBOM failed validation: ` followed by a clause
+//! naming the CLASS of defect (never an index, a member path, or a value read
+//! back out of the submitted document).
+//!
+//! The refusal is the operation's OWN modeled shape, so it carries the required
+//! `reason` beside that sentence; which `reason` each class states, and the
+//! `fields` entry that goes with it, is pinned in `scan_sbom_refusal_reason.rs`.
 //!
 //! The table below is that rule's cases, grouped by class. Each class is
 //! exercised in several forms — an absent member and a wrongly-valued one, a
@@ -364,18 +368,30 @@ async fn every_class_of_input_defect_is_refused_with_the_services_own_sentence()
             case.what,
             case.expect
         );
-        // The body carries `message` alone: the service populates neither
-        // `reason` nor `fields` on this refusal, so a client must not find
-        // them. `__type` is the protocol's error discriminator, not a member of
-        // the shape.
-        let members: Vec<&String> = response
+        // The body carries the members of the MODELED shape and nothing else:
+        // `message` and `reason` are both required, `fields` is optional.
+        // `__type` is the protocol's error discriminator, not a member of the
+        // shape.
+        let members: Vec<String> = response
             .as_object()
-            .map(|body| body.keys().filter(|k| *k != "__type").collect())
+            .map(|body| {
+                body.keys()
+                    .filter(|key| *key != "__type")
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
-        assert_eq!(
-            members,
-            vec!["message"],
-            "case {:?}: the refusal body must carry message alone, got {response}",
+        assert!(
+            members.iter().all(|member| {
+                member == "message" || member == "reason" || member == "fields"
+            }),
+            "case {:?}: the refusal body must carry only the modeled shape's members, \
+             got {members:?} in {response}",
+            case.what
+        );
+        assert!(
+            response["reason"].is_string(),
+            "case {:?}: the modeled shape requires reason, got {response}",
             case.what
         );
     }

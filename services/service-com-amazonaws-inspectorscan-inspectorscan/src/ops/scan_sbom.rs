@@ -385,6 +385,11 @@ enum SbomDefect<'m> {
     /// `sbom` is not a document a scan can read at all: not a JSON object, or
     /// JSON this operation cannot take in (see [`MAX_SBOM_DEPTH`]).
     CannotParse,
+    /// The document READS as a BOM but states, at member `m`, a BOM format or
+    /// revision this operation does not scan — `bomFormat` naming a format
+    /// other than CycloneDX, or `specVersion` naming another CycloneDX
+    /// revision. `m` is the member's name as CycloneDX spells it.
+    UnsupportedFormat(&'m str),
     /// The CycloneDX member `m` is absent where the specification requires it,
     /// or carries a value the specification does not allow there. `m` is the
     /// member's name as CycloneDX spells it (`bomFormat`, `components`,
@@ -396,36 +401,117 @@ enum SbomDefect<'m> {
 }
 
 impl SbomDefect<'_> {
-    /// The refusal `message` for this class of defect.
-    fn message(self) -> String {
-        let condition = match self {
+    /// The condition that failed: the clause [`SBOM_VALIDATION_PREFIX`] is
+    /// followed by in the refusal `message`, and the sentence the refusal's
+    /// `fields` entry carries for the member it fired at.
+    fn condition(self) -> String {
+        match self {
             Self::CannotParse => "Invalid json".to_string(),
-            Self::InvalidValue(member) => format!("Invalid value for \"{member}\""),
+            Self::UnsupportedFormat(member) | Self::InvalidValue(member) => {
+                format!("Invalid value for \"{member}\"")
+            }
             Self::TooManyComponents(limit) => {
                 format!("Max number of components exceeded ({limit})")
             }
+        }
+    }
+
+    /// The refusal `message` for this class of defect.
+    fn message(self) -> String {
+        format!("{SBOM_VALIDATION_PREFIX}{}", self.condition())
+    }
+
+    /// Which class of validation failure the refusal's modeled `reason` states.
+    fn reason(self) -> RefusalReason {
+        match self {
+            // Nothing in the request could be read as a BOM document at all,
+            // so no member of one is what failed.
+            Self::CannotParse => RefusalReason::CannotParse,
+            // The document does name a BOM type, and it is not one a scan
+            // reads.
+            Self::UnsupportedFormat(_) => RefusalReason::UnsupportedSbomType,
+            // A member of the document carries a value it cannot hold, or more
+            // entries than it may hold.
+            Self::InvalidValue(_) | Self::TooManyComponents(_) => {
+                RefusalReason::FieldValidationFailed
+            }
+        }
+    }
+
+    /// The fields that failed validation: the member the defect fired at, with
+    /// the condition that fired there.
+    ///
+    /// Empty for a defect that is no member's value — a request body that does
+    /// not read as a BOM document fails as a whole, and the shape's `fields` is
+    /// then left absent rather than naming a member nothing was read from.
+    fn fields(self) -> Vec<ValidationExceptionField> {
+        let name = match self {
+            Self::CannotParse => return Vec::new(),
+            Self::UnsupportedFormat(member) | Self::InvalidValue(member) => member.to_string(),
+            // The ceiling is a bound on the `components` array, whatever level
+            // of the tree the entry past it sits at.
+            Self::TooManyComponents(_) => "components".to_string(),
         };
-        format!("{SBOM_VALIDATION_PREFIX}{condition}")
+        vec![ValidationExceptionField {
+            name,
+            message: self.condition(),
+        }]
+    }
+}
+
+/// The class of validation failure a refusal states, as the model's own
+/// `ValidationExceptionReason` enum
+/// (`super::types::VALIDATION_EXCEPTION_REASON_VALUES`) spells it. Only the
+/// classes a client-input refusal of THIS operation can be in are listed: the
+/// enum's remaining values belong to failures this handler cannot reach — an
+/// operation the service does not have, and a failure in no class at all.
+#[derive(Debug, Clone, Copy)]
+enum RefusalReason {
+    /// The request carries something no BOM document can be read out of.
+    CannotParse,
+    /// A member of the request carries a value it cannot hold.
+    FieldValidationFailed,
+    /// The submitted document states a BOM format or revision this operation
+    /// does not scan.
+    UnsupportedSbomType,
+}
+
+impl RefusalReason {
+    /// The wire value, one of `super::types::VALIDATION_EXCEPTION_REASON_VALUES`.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::CannotParse => "CANNOT_PARSE",
+            Self::FieldValidationFailed => "FIELD_VALIDATION_FAILED",
+            Self::UnsupportedSbomType => "UNSUPPORTED_SBOM_TYPE",
+        }
     }
 }
 
 /// Refuse the submitted SBOM with `ValidationException` (HTTP 400), the status
 /// and error code the model gives that failure.
-///
-/// The body carries `message` ALONE. The modeled shape also declares `reason`
-/// (required) and `fields`, but the service populates neither on this refusal:
-/// it reports a whole-document validation failure, not a member-level field
-/// error, so a `reason`/`fields` pair here would be two members a client is
-/// told to read and the service never sends. `message` alone is what
-/// [`crate::scaffolded::ValidationException`] serializes, under the same 400 +
-/// `ValidationException` envelope the modeled shape renders in.
 fn invalid(defect: SbomDefect<'_>) -> ScanSbomError {
-    refused(defect.message())
+    refused(defect.message(), defect.reason(), defect.fields())
 }
 
-/// A `ValidationException` (HTTP 400) carrying `message` and nothing else.
-fn refused(message: impl Into<String>) -> ScanSbomError {
-    ScanSbomError::validation(message)
+/// A modeled `ValidationException` (HTTP 400).
+///
+/// The refusal is rendered from the operation's OWN modeled shape, so every
+/// member the model marks required is on the wire: `message`, the sentence the
+/// caller fixes the request from, and `reason`, the class of validation failure
+/// a client branches on rather than parsing that sentence. `fields` — the
+/// model's list of the fields that failed — carries the member the refusal
+/// fired at when the failure is a member's value, and is absent when it is not.
+fn refused(
+    message: impl Into<String>,
+    reason: RefusalReason,
+    fields: Vec<ValidationExceptionField>,
+) -> ScanSbomError {
+    ScanSbomErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: reason.wire().to_string(),
+        fields: (!fields.is_empty()).then_some(fields),
+    })
+    .into()
 }
 
 /// The operation's own modeled HTTP path (`POST /scan/sbom`,
@@ -1111,14 +1197,20 @@ fn parse_sbom(sbom: &Value) -> Result<ParsedSbom, ScanSbomError> {
 
     match submitted_string(object, "bomFormat")? {
         Some(CYCLONEDX_BOM_FORMAT) => {}
-        // Absent, or naming a format that is not CycloneDX at all.
-        _ => return Err(invalid(SbomDefect::InvalidValue("bomFormat"))),
+        // Naming a format that is not CycloneDX at all: a BOM type no scan
+        // reads, rather than a member carrying something it cannot hold.
+        Some(_) => return Err(invalid(SbomDefect::UnsupportedFormat("bomFormat"))),
+        // Absent: the member the specification requires states no format.
+        None => return Err(invalid(SbomDefect::InvalidValue("bomFormat"))),
     }
 
     match submitted_string(object, "specVersion")? {
         Some(CYCLONEDX_SPEC_VERSION) => {}
-        // Absent, or a CycloneDX revision other than the one a scan reads.
-        _ => return Err(invalid(SbomDefect::InvalidValue("specVersion"))),
+        // A CycloneDX revision other than the one a scan reads: again a BOM
+        // type this operation does not scan.
+        Some(_) => return Err(invalid(SbomDefect::UnsupportedFormat("specVersion"))),
+        // Absent: the member the specification requires states no revision.
+        None => return Err(invalid(SbomDefect::InvalidValue("specVersion"))),
     }
 
     // The document's own members the report is built from, before anything is
@@ -2098,10 +2190,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output_format = match input.output_format.as_deref() {
             None => OutputFormat::Inspector,
             Some(requested) => OutputFormat::from_wire(requested).ok_or_else(|| {
-                refused(format!(
+                // The member that failed is the request's own `outputFormat`,
+                // not one of the submitted document's, so the refusal names
+                // that member and states the same class of failure a
+                // member-level defect of the document does.
+                let condition = format!(
                     "outputFormat must be one of {}, got \"{requested}\"",
                     super::types::OUTPUT_FORMAT_VALUES.join(", ")
-                ))
+                );
+                refused(
+                    condition.clone(),
+                    RefusalReason::FieldValidationFailed,
+                    vec![ValidationExceptionField {
+                        name: "outputFormat".to_string(),
+                        message: condition,
+                    }],
+                )
             })?,
         };
 
