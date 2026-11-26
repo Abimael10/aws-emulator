@@ -214,9 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The delete needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
-
         // "The account ID of the expected bucket owner. If the account ID that you provide
         // does not match the actual owner of the bucket, the request fails with the HTTP
         // status code 403 Forbidden (access denied)"
@@ -241,6 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // WHO is asking, resolved before this service's own guard is taken: the stores this
+        // service reads the calling principal and its policies from are never reached while
+        // that guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
@@ -249,6 +250,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::NO_SUCH_BUCKET_MESSAGE,
             ));
         };
+
+        // "The `s3:DeleteBucketPolicy` permission is required in a policy" (this operation's
+        // own documentation): a signed request is authorized against the documents in force
+        // on the principal it signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order, and the lockout
+        // guard the three bucket-policy operations carry), BEFORE the record is cleared — so
+        // a refused call leaves the bucket's policy exactly as it was, which is what makes a
+        // principal denied this action unable to withdraw it.
+        if let Some(message) = crate::service::request_authorization::policy_operation_denial(
+            &caller,
+            bucket.policy.as_deref(),
+            &crate::service::request_authorization::AddressedTags::of(bucket),
+            crate::service::request_authorization::DELETE_BUCKET_POLICY_ACTION,
+            &crate::state::bucket_arn(&input.bucket),
+            &crate::service::authorization::read_conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
 
         // Idempotent: the record is cleared whether or not a policy was configured, and
         // either way the answer is the modelled 204. Nothing else about the bucket is

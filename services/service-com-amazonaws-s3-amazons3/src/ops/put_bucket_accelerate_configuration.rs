@@ -123,23 +123,24 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketAccelerateConfi
 // `#[operation_error]` accepts only variants the model declares for this operation (plus
 // the `extra_errors` widening below), so the scaffold's `NotImplemented` cannot live here
 // — hence the `PutBucketAccelerateConfigurationError` alias further down.
-// Widened by `NoSuchBucket` and `InvalidRequest`: the model's error list for this
+// Widened by `NoSuchBucket`: the model's error list for this
 // operation is empty (`smithy_query(query="operation",
 // operation="PutBucketAccelerateConfiguration")` reports `errors: []`), but `Bucket` is an
 // @httpLabel, so a request can name a bucket that does not exist and AWS answers the
-// service-wide `NoSuchBucket` ("The specified bucket does not exist", `httpError 404`);
-// and a bucket this feature cannot be used with is a request whose "parameter or header
-// in your request isn't valid", which is `InvalidRequest` (400). Both shapes are ones the
-// SERVICE models, so `extra_errors` widens the set with them rather than inventing a
-// second rule, the way `PutBucketVersioning` and `PutBucketAcl` do.
+// service-wide `NoSuchBucket` ("The specified bucket does not exist", `httpError 404`).
+// That shape is one the SERVICE models, so `extra_errors` widens the set with it rather
+// than inventing a second rule, the way `PutBucketVersioning` and `PutBucketAcl` do.
+//
+// The bucket-name refusal below is NOT taken through the modelled `InvalidRequest` shape:
+// S3 publishes a sentence of its own for it ([`PERIODS_IN_NAME_MESSAGE`]), and a modelled
+// shape carries only the generic sentence that code states for any invalid parameter.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3#PutBucketAccelerateConfiguration",
-    extra_errors = ["NoSuchBucket", "InvalidRequest"]
+    extra_errors = ["NoSuchBucket"]
 )]
 #[derive(Debug)]
 pub enum PutBucketAccelerateConfigurationErrorModeled {
     NoSuchBucket(NoSuchBucket),
-    InvalidRequest(InvalidRequest),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -265,14 +266,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must not contain periods (".")" (this operation's own documentation): the
         // subresource cannot be set on such a bucket at all, whichever state the
         // configuration names, so the request is one that cannot be carried out as given —
-        // the modelled `InvalidRequest` (HTTP 400). Judged after the lookup, so a name no
-        // bucket of this emulator's carries is still the 404 every bucket-scoped operation
-        // answers that with.
+        // `InvalidRequest` (HTTP 400), carrying the sentence S3 publishes for THIS rule
+        // ([`PERIODS_IN_NAME_MESSAGE`]) rather than the generic one that code states for any
+        // invalid parameter: the name is the one thing a caller can act on, and the generic
+        // sentence names no rule at all. Judged after the lookup, so a name no bucket of
+        // this emulator's carries is still the 404 every bucket-scoped operation answers
+        // that with.
         if input.bucket.contains(BUCKET_NAME_PERIOD) {
-            return Err(
-                PutBucketAccelerateConfigurationErrorModeled::InvalidRequest(InvalidRequest {})
-                    .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                PERIODS_IN_NAME_MESSAGE,
+            ));
         }
 
         bucket.set_accelerate_status(status);
@@ -289,3 +294,9 @@ const MALFORMED_XML_STATUS: u16 = 400;
 /// The character a bucket name used with Transfer Acceleration must not carry: "must not
 /// contain periods (".")" (this operation's documentation).
 const BUCKET_NAME_PERIOD: char = '.';
+
+/// The sentence S3 refuses a put against a bucket whose name carries a period with: fixed
+/// text in full, naming the FEATURE and the rule the name broke, with nothing of the request
+/// interpolated — the name that broke it is the one the request addressed.
+const PERIODS_IN_NAME_MESSAGE: &str =
+    "S3 Transfer Acceleration is not supported for buckets with periods (.) in their names";

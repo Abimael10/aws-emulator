@@ -836,6 +836,20 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
             crate::state::INVALID_BUCKET_NAME_CODE,
             crate::state::INVALID_BUCKET_NAME_MESSAGE.to_string(),
         ),
+        // The `ChecksumAlgorithm` every write that may checksum its payload binds — the
+        // `x-amz-checksum-algorithm` of the two copies and the `x-amz-sdk-checksum-algorithm`
+        // of the others: S3 publishes its OWN refusal for a value outside the set it
+        // implements, naming every algorithm it does
+        // ([`crate::state::unsupported_checksum_algorithm_message`]), which is the only thing
+        // that tells a caller which value to send instead — where the generic enum clause
+        // names the member path the value travelled on and no set to choose from. The CODE is
+        // its own too: the request names a parameter S3 cannot carry out
+        // ([`crate::state::INVALID_REQUEST_CODE`]), which a client branches on separately
+        // from a bad argument.
+        "checksumAlgorithm" if matches!(violation.kind, ViolationKind::EnumValue(_)) => (
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::unsupported_checksum_algorithm_message(),
+        ),
         // The two `CopyObject` directives, each an enum over [COPY, REPLACE].
         "taggingDirective" => (
             crate::state::INVALID_ARGUMENT_CODE,

@@ -497,6 +497,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             return Err(crate::scaffolded::Scaffolded::customer_key_read(refusal));
         }
 
+        // The checksum MODE half: the completion's `ChecksumType` "determines how part-level
+        // checksums are combined to create an object-level checksum for multipart objects"
+        // (`CompleteMultipartUploadRequest$ChecksumType`), and which composition that is was
+        // settled by the INITIATION — so a completion stating the OTHER mode asks for a
+        // composition this upload was not built for, whatever digest it carries. S3 refuses
+        // that as a request it cannot carry out (`InvalidRequest`, 400) naming the mode the
+        // upload was created with ([`crate::state::mismatched_checksum_mode_message`]), which
+        // is the value the caller has to repeat; the digest check further down would blame the
+        // VALUE instead and send the caller back with the same wrong mode. Judged here —
+        // before any part is matched and before anything is assembled — so such a completion
+        // stores no object and leaves the upload in progress with every part it held.
+        //
+        // A completion stating NO type states nothing to contradict the upload: the mode is
+        // the upload's own, exactly as for one that repeats it.
+        if let Some(stated) = input.checksum_type.as_deref() {
+            let upload_mode = crate::state::upload_checksum_mode(upload.checksum_type.as_deref());
+            if stated != upload_mode {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_REQUEST_CODE,
+                    crate::state::INVALID_REQUEST_STATUS,
+                    crate::state::mismatched_checksum_mode_message(upload_mode),
+                ));
+            }
+        }
+
         // "For each part in the list, you must provide the PartNumber value and the ETag
         // value that are returned after that part was uploaded" (this operation's own
         // documentation), so each named part is matched against the part the upload really

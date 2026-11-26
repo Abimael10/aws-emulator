@@ -36,6 +36,35 @@ Issue-Commit: 898fb31eb69e07df3cb7a6861bbbd7f63697428c
 
 > _Note: this issue was identified against the code base at commit `898fb31eb69e07df3cb7a6861bbbd7f63697428c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution (not all eight causes)
+
+- Cause 1 (OPTIONS preflight) — already served from the bucket's stored cors configuration
+  before this fix; the two preflight-only checks pass.
+- Causes 5, 6, 7 and 8 — FIXED: the bucket-policy report and removal are authorized against
+  the caller's documents and the bucket policy; `CompleteMultipartUpload` refuses a checksum
+  mode other than the one its upload was created with; `PutBucketAccelerateConfiguration`
+  carries the published sentence for a dotted bucket name; and an unsupported
+  `ChecksumAlgorithm` is refused with S3's own `InvalidRequest` listing the supported set.
+- Cause 4 (the V1 S3 Metadata table surface answers `NotImplemented` where AWS answers
+  `V1APIsNotAllowed`) — STILL OPEN, and re-filed as
+  `20261118T090000Z-s3-2-causes-left-open-a-32-mib-putobject-and-the-v1-metadata-table-sentence.md`.
+  The code and the status are known from the recorded evidence, but an error message is as much
+  a requirement as its code, and AWS's sentence for `V1APIsNotAllowed` is in neither the Smithy
+  model (which declares no error shape for it) nor anything this repository holds — so the three
+  operations keep their scaffold rather than shipping a plausible sentence AWS never sends.
+  `tests/all/metadata_table_v1_surface.rs` already pins the part of the contract that does not
+  depend on which refusal it is (no V1 call is served, the three answer alike, and none disturbs
+  the bucket's V2 configuration).
+- Cause 2 (a data-plane request carrying `Origin`, presigned or header-signed, refused 403)
+  and cause 3 (a 32 MiB `PutObject` refused 413) — STILL OPEN, both behind the read-only
+  vendor tree: `refuse_cross_site_browsers` refuses every `Origin`-carrying request before
+  authentication (`vendor/smithy-server-runtime/src/multi_service_router.rs`, hardcoded
+  `RemoteOrigins::SameOriginOnly`), and `MAX_PRODUCTION_BODY_BYTES = 16 MiB` refuses a larger
+  body before any service sees it (`vendor/server/src/lib.rs`). No service-crate seam reaches
+  either; each needs a core change. Cause 3 is re-filed in the report named above; cause 2's
+  checks are owned by `20261117T213222Z-s3-3-net-new-browser-edge-refusal-causes.md`, whose
+  diagnosis that report corrects.
+
 ## Operation
 PutBucketCors
 

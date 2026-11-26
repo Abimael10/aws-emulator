@@ -971,6 +971,62 @@ pub fn incompatible_checksum_pair_message(checksum_type: &str, algorithm: &str) 
     )
 }
 
+/// The message S3 refuses a request naming a `ChecksumAlgorithm` value it does not implement
+/// with.
+///
+/// Fixed text around the SUPPORTED SET, and the set is the model's own enum
+/// (`crate::ops::types::CHECKSUM_ALGORITHM_VALUES`, which
+/// `smithy_query(query="shape",shape="ChecksumAlgorithm")` publishes) rendered in the order
+/// that enum declares them — so the sentence states exactly the algorithms this service
+/// computes and cannot drift from them. It names nothing from the request: what a caller has
+/// to act on is which values ARE accepted, not the one it sent.
+pub fn unsupported_checksum_algorithm_message() -> String {
+    format!(
+        "Checksum algorithm provided is unsupported. Please try again with any of the valid \
+         types: [{}]",
+        crate::ops::types::CHECKSUM_ALGORITHM_VALUES.join(", ")
+    )
+}
+
+/// The message S3 refuses a completion whose `ChecksumType` is not the one its upload was
+/// created with.
+///
+/// "The checksum type … determines how part-level checksums are combined to create an
+/// object-level checksum for multipart objects"
+/// (`CompleteMultipartUploadRequest$ChecksumType`), and that is settled by the INITIATION
+/// ([`settle_multipart_checksum_type`]), so a completion asking for the other mode asks for a
+/// composition the upload was not built for. The text is fixed; the one variable part is the
+/// mode the upload carries, read from the upload's own record (`COMPOSITE` /
+/// `FULL_OBJECT`) — the value that says which mode the completion has to repeat.
+pub fn mismatched_checksum_mode_message(upload_mode: &str) -> String {
+    format!(
+        "The upload was created using the {upload_mode} checksum mode. The complete request \
+         must use the same checksum mode."
+    )
+}
+
+/// The `ChecksumType` the multipart upload a completion addresses was created with: the one
+/// the initiation settled.
+///
+/// An initiation that named an ALGORITHM settles a type ([`settle_multipart_checksum_type`]) —
+/// `COMPOSITE` for every algorithm whose part digests combine into one, which is the default
+/// mode a create that asks for no type gets. An initiation that named NO algorithm settles
+/// none, and the object such an upload completes into is stored under the algorithm every
+/// object S3 protects when the client named none ([`DEFAULT_CHECKSUM_ALGORITHM`], whose
+/// checksum "is always a full object checksum"), so the mode it carries is the one that
+/// algorithm settles: the mode the stored object's own checksum has rather than one of its
+/// own.
+///
+/// ONE reading, so the mode a completion is judged against is the mode the object it would
+/// store carries ([`multipart_checksum`] computes the value under the same rule).
+pub fn upload_checksum_mode(settled: Option<&str>) -> &str {
+    match settled {
+        Some(settled) => settled,
+        None => settle_multipart_checksum_type(DEFAULT_CHECKSUM_ALGORITHM, None)
+            .unwrap_or(CHECKSUM_TYPE_FULL_OBJECT),
+    }
+}
+
 /// The RAW digest bytes the `ChecksumAlgorithm` value `algorithm` computes over `data`, or
 /// `None` for a value this emulator has no implementation of.
 ///

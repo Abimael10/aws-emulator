@@ -210,6 +210,17 @@ pub const DIRECTORY_PUT_ENCRYPTION_CONFIGURATION_ACTION: &str =
 /// permission is required in a policy" (`PutBucketPolicy`'s own documentation).
 pub const PUT_BUCKET_POLICY_ACTION: &str = "s3:PutBucketPolicy";
 
+/// The IAM action a bucket-policy READ is authorized under: "the `s3:GetBucketPolicy`
+/// permission is required in a policy" (`GetBucketPolicy`'s own documentation). It is a
+/// permission of its own: a caller holding [`PUT_BUCKET_POLICY_ACTION`] does not hold it.
+pub const GET_BUCKET_POLICY_ACTION: &str = "s3:GetBucketPolicy";
+
+/// The IAM action a bucket-policy REMOVAL is authorized under: "the
+/// `s3:DeleteBucketPolicy` permission is required in a policy" (`DeleteBucketPolicy`'s own
+/// documentation) — its own action rather than the write's, which is what lets a policy leave
+/// a principal able to replace a bucket's policy without being able to remove it.
+pub const DELETE_BUCKET_POLICY_ACTION: &str = "s3:DeleteBucketPolicy";
+
 /// The IAM action a read of a bucket's TAG SET is authorized under: "to use this operation,
 /// you must have permission to perform the `s3:GetBucketTagging` action" (`GetBucketTagging`'s
 /// own documentation).

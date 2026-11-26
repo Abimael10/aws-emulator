@@ -191,8 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(refusal);
         }
-        // A read needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // A read needs nothing from the request beyond its deserialized input and WHO asked.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 "InternalError",
@@ -200,6 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the S3 store is unavailable",
             ));
         };
+        // WHO is asking, resolved before this service's own guard is taken: the stores this
+        // service reads the calling principal and its policies from are never reached while
+        // that guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
@@ -208,6 +211,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::NO_SUCH_BUCKET_MESSAGE,
             ));
         };
+        // "The `s3:GetBucketPolicy` permission is required in a policy" (this operation's own
+        // documentation): a signed request is authorized against the documents in force on
+        // the principal it signed for and against the bucket's own policy
+        // ([`crate::service::request_authorization`] carries IAM's order, and the lockout
+        // guard the three bucket-policy operations carry), BEFORE anything about the policy
+        // is reported — so a caller no document leaves this action to learns neither the
+        // document nor whether the bucket carries one.
+        if let Some(message) = crate::service::request_authorization::policy_operation_denial(
+            &caller,
+            bucket.policy.as_deref(),
+            &crate::service::request_authorization::AddressedTags::of(bucket),
+            crate::service::request_authorization::GET_BUCKET_POLICY_ACTION,
+            &crate::state::bucket_arn(&input.bucket),
+            &crate::service::authorization::read_conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
         let Some(policy) = bucket.policy.clone() else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::NO_SUCH_BUCKET_POLICY_CODE,
@@ -221,3 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The HTTP status an authorization refusal of this read carries: 403, the status S3's
+/// error-responses list carries for [`crate::state::ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
