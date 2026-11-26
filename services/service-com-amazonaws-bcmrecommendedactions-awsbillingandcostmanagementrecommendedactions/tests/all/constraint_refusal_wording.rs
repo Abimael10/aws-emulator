@@ -8,10 +8,12 @@
 //! One rule, over every constraint class this input carries: a refused member is
 //! stated twice and the two statements carry different halves of it. The summary
 //! (`N validation error(s) detected: …`) names the member's dotted path and the
-//! requirement it failed and states NO value at all — no clause of it carries the
-//! `Value '<sent>' at …` frame; the member's own `fieldList` entry is the one place
-//! the value the request sent is reported, and it names no path, because the entry's
-//! `name` member is what identifies the member there. The requirement's wording comes from the constraint and the bound the
+//! requirement it failed; the member's own `fieldList` entry states that same
+//! requirement and names no path, because the entry's `name` member is what
+//! identifies the member there. NEITHER half states the value the request sent: no
+//! clause carries the `Value '<sent>' …` frame at all, and the entry's value slot
+//! carries the fixed token [`WITHHELD`] instead, so the message a client logs and
+//! matches on is the same string whatever a caller submitted. The requirement's wording comes from the constraint and the bound the
 //! model publishes, so the same sentence covers a page size below its minimum, one
 //! above its maximum, a list shorter than its minimum length and a string outside
 //! its length — and a request that breaks two at once is summarised with one clause
@@ -52,6 +54,11 @@ const NEXT_TOKEN_LENGTH: (i64, i64) = (1, 8192);
 /// The modelled `reason` every refusal of a value the service READ carries
 /// (`ValidationExceptionReason$fieldValidationFailed`).
 const REASON: &str = "fieldValidationFailed";
+
+/// The token a `fieldList` entry carries where the clause's value would stand. A
+/// FIXED string: this service states the requirement a member failed and withholds
+/// what that member carried, whichever constraint class it belongs to.
+const WITHHELD: &str = "[redacted]";
 
 /// One emulator: a shared engine, and a router with this service mounted on it.
 struct Emulator {
@@ -149,13 +156,13 @@ fn field_list(case: &str, body: &Value) -> Vec<(String, String)> {
 }
 
 /// One member a refusal states: the dotted path it names the member by, the
-/// requirement that member failed, and the value a refusal REPORTS for it in that
-/// member's own entry (the value as sent for a scalar, the element count for a list
-/// — the rendering the framework gives a collection).
+/// requirement that member failed, and what the request SENT in it (the value as
+/// sent for a scalar, the element count for a list — the rendering the framework
+/// gives a collection), which no half of the refusal may disclose.
 struct RefusedMember {
     path: String,
     requirement: String,
-    reported: String,
+    sent: String,
 }
 
 /// One constraint-refusal case: a request, and every member the refusal states.
@@ -190,16 +197,11 @@ fn filter_path(position: usize, member: &str) -> String {
     format!("filter.actions.{position}.member.{member}")
 }
 
-/// The value a refusal reports for a string the request sent: the string, or —
-/// past the length a refusal echoes — its first bytes with the rest counted, the
-/// elision the framework applies to a caller-chosen value (`MAX_ECHOED_VALUE` in
-/// `vendor/smithy-schema-server/src/constraints.rs`).
-fn reported(sent: &str) -> String {
-    const MAX_ECHOED: usize = 256;
-    if sent.len() <= MAX_ECHOED {
-        return sent.to_string();
-    }
-    format!("{}... [{} bytes]", &sent[..MAX_ECHOED], sent.len())
+/// The span of a sent value a refusal is checked against: enough of it to identify
+/// it wherever it might be echoed, and short enough that a long value is still
+/// caught by its leading characters.
+fn traced(sent: &str) -> String {
+    sent.chars().take(32).collect()
 }
 
 /// A filter naming one or more `ActionFilter`s.
@@ -229,7 +231,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: "maxResults".to_string(),
                 requirement: min_value(min_results),
-                reported: (min_results - 1).to_string(),
+                sent: (min_results - 1).to_string(),
             }],
         },
         Case {
@@ -238,7 +240,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: "maxResults".to_string(),
                 requirement: min_value(min_results),
-                reported: "-7".to_string(),
+                sent: "-7".to_string(),
             }],
         },
         Case {
@@ -247,7 +249,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: "maxResults".to_string(),
                 requirement: max_value(max_results),
-                reported: (max_results + 1).to_string(),
+                sent: (max_results + 1).to_string(),
             }],
         },
         Case {
@@ -256,7 +258,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: "maxResults".to_string(),
                 requirement: max_value(max_results),
-                reported: "1000000".to_string(),
+                sent: "1000000".to_string(),
             }],
         },
         Case {
@@ -265,7 +267,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: filter_path(1, "values"),
                 requirement: min_length(FILTER_VALUES_MIN_LENGTH),
-                reported: "0 items".to_string(),
+                sent: "0 items".to_string(),
             }],
         },
         Case {
@@ -274,7 +276,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: filter_path(2, "values"),
                 requirement: min_length(FILTER_VALUES_MIN_LENGTH),
-                reported: "0 items".to_string(),
+                sent: "0 items".to_string(),
             }],
         },
         Case {
@@ -284,12 +286,12 @@ fn cases() -> Vec<Case> {
                 RefusedMember {
                     path: filter_path(1, "values"),
                     requirement: min_length(FILTER_VALUES_MIN_LENGTH),
-                    reported: "0 items".to_string(),
+                    sent: "0 items".to_string(),
                 },
                 RefusedMember {
                     path: filter_path(2, "values"),
                     requirement: min_length(FILTER_VALUES_MIN_LENGTH),
-                    reported: "0 items".to_string(),
+                    sent: "0 items".to_string(),
                 },
             ],
         },
@@ -299,7 +301,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: "nextToken".to_string(),
                 requirement: min_length(min_token),
-                reported: String::new(),
+                sent: String::new(),
             }],
         },
         Case {
@@ -308,7 +310,7 @@ fn cases() -> Vec<Case> {
             refused: vec![RefusedMember {
                 path: "nextToken".to_string(),
                 requirement: max_length(max_token),
-                reported: reported(&long_token),
+                sent: long_token.clone(),
             }],
         },
         Case {
@@ -321,12 +323,12 @@ fn cases() -> Vec<Case> {
                 RefusedMember {
                     path: "maxResults".to_string(),
                     requirement: min_value(min_results),
-                    reported: (min_results - 1).to_string(),
+                    sent: (min_results - 1).to_string(),
                 },
                 RefusedMember {
                     path: filter_path(1, "values"),
                     requirement: min_length(FILTER_VALUES_MIN_LENGTH),
-                    reported: "0 items".to_string(),
+                    sent: "0 items".to_string(),
                 },
             ],
         },
@@ -337,12 +339,12 @@ fn cases() -> Vec<Case> {
                 RefusedMember {
                     path: "maxResults".to_string(),
                     requirement: max_value(max_results),
-                    reported: (max_results + 1).to_string(),
+                    sent: (max_results + 1).to_string(),
                 },
                 RefusedMember {
                     path: "nextToken".to_string(),
                     requirement: min_length(min_token),
-                    reported: String::new(),
+                    sent: String::new(),
                 },
             ],
         },
@@ -394,22 +396,16 @@ async fn a_constraint_refusal_summarises_the_member_and_its_requirement_without_
             "case {case:?}: expected the summary to state {expected:?}, got {stated:?}"
         );
 
-        // No clause of the summary carries a value: the frame an echoed value
-        // appears in is absent from it altogether, whichever constraint failed.
+        // No clause of the refusal carries a value: the frame an echoed value
+        // appears in is absent from the whole body, whichever constraint failed.
+        let rendered = body.to_string();
         assert!(
-            !message.contains("Value '"),
-            "case {case:?}: the summary must state no value, got {message:?}"
+            !rendered.contains("Value '"),
+            "case {case:?}: no part of the refusal may state a value, got {rendered}"
         );
-        for member in &refused {
-            assert!(
-                !message.contains(&format!("Value '{}'", member.reported)),
-                "case {case:?}: the summary must not report the value of {:?}, got {message:?}",
-                member.path
-            );
-        }
-        // The member's own entry: the same requirement, plus the value the request
-        // sent — the half of the refusal the summary withholds — and no member path,
-        // which the entry's `name` carries instead.
+        // The member's own entry: the same requirement over the fixed token where a
+        // value would stand, and no member path, which the entry's `name` carries
+        // instead.
         let fields = field_list(&case, &body);
         assert_eq!(
             fields.len(),
@@ -428,8 +424,8 @@ async fn a_constraint_refusal_summarises_the_member_and_its_requirement_without_
                     )
                 });
             let expected_entry = format!(
-                "Value '{}' failed to satisfy constraint: {}",
-                member.reported, member.requirement
+                "Value {WITHHELD} failed to satisfy constraint: {}",
+                member.requirement
             );
             assert_eq!(
                 stated, expected_entry,
@@ -437,6 +433,19 @@ async fn a_constraint_refusal_summarises_the_member_and_its_requirement_without_
                  {stated:?}",
                 member.path
             );
+            // And the value that member carried reaches no part of the body — not the
+            // summary, not this entry. The requirement itself may spell the bound a
+            // value crossed, so a sent value the requirement states is not evidence of
+            // an echo and is skipped.
+            let echoed = traced(&member.sent);
+            if !echoed.is_empty() && !member.requirement.contains(&echoed) {
+                assert!(
+                    !rendered.contains(&echoed),
+                    "case {case:?}: the refusal of {:?} must not echo the submitted value \
+                     {echoed:?}, got {rendered}",
+                    member.path
+                );
+            }
         }
     }
 }

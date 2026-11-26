@@ -57,10 +57,12 @@
 //!   wording of a member-level refusal is split between its two statements, each
 //!   identifying the refused member ONCE: the summary envelope names the member's
 //!   dotted path and the requirement it failed, the member's own `fieldList` entry
-//!   states the value the request sent in that member, the same requirement, and no
-//!   path at all — its `name` member is where that entry names the member (a member
-//!   the request left out sent no value, so both statements say it arrived with
-//!   none) — and a
+//!   states the same requirement and no path at all — its `name` member is where
+//!   that entry names the member. NEITHER statement discloses the value the request
+//!   sent in that member: the entry states the requirement over the fixed token
+//!   [`WITHHELD_VALUE`] where a value would stand, and the summary names no value at
+//!   all (a member the request left out sent nothing to withhold, so both statements
+//!   say it arrived with no value). And a
 //!   requirement over an enumerated value set lists that enum's members in the
 //!   order this service states that set in
 //!   (`crate::state::FilterName::VALUE_SET_ORDER`), which is not the model's
@@ -208,6 +210,30 @@ const REASON_CANNOT_PARSE: &str = "cannotParse";
 /// position in a different listing).
 const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
+/// What a `fieldList` entry states where the clause's value would stand: a FIXED
+/// token, never the value the request sent in the refused member.
+///
+/// A per-field message is the part of a refusal a client surfaces to a human and
+/// logs, so this service states the requirement a member failed and withholds what
+/// that member carried — the slot is a constant, so no refusal reflects
+/// caller-supplied request data into an error body or into a log, and a client may
+/// match the message exactly. Neither the enums this input closes nor its other
+/// constrained members are `@sensitive`
+/// (`smithy_query(query="shape", shape="ActionFilter,FilterName,MatchOption")`), so
+/// the withholding is a property of how this service words a refusal rather than of
+/// a shape trait — which is why it holds for EVERY constraint class and not only for
+/// the value sets.
+const WITHHELD_VALUE: &str = "[redacted]";
+
+/// What a `fieldList` entry states for a member the request LEFT OUT: the `null` it
+/// arrived as.
+///
+/// Not a withheld value — there was none to withhold. That the member was absent is
+/// a fact of the request's SHAPE, which is what the refusal is about, so it is
+/// stated rather than replaced by [`WITHHELD_VALUE`]; the framework words the same
+/// absence the same way in the summary's clause.
+const ABSENT_VALUE: &str = "null";
+
 /// The modelled `MaxResults` range (`smithy_query(query="shape",
 /// shape="MaxResults")`: range 1..1000).
 const MAX_RESULTS_RANGE: (i32, i32) = (1, 1000);
@@ -242,21 +268,25 @@ const TOKEN_LEN: usize = TOKEN_FINGERPRINT_LEN + TOKEN_OFFSET_LEN;
 ///
 /// Each violation is stated TWICE and the two statements carry different halves of
 /// it, each identifying the refused member once: the envelope's clause names the
-/// member PATH and the requirement it failed and states no value at all
-/// ([`without_echoed_value`]), while the member's own `fieldList` entry states the
-/// value that member sent and that same requirement and names no path
+/// member PATH and the requirement it failed ([`without_echoed_value`]), while the
+/// member's own `fieldList` entry states that same requirement and names no path
 /// ([`field_clause`]) — the entry's `name` member already carries it. So a caller
 /// reading the summary is told where the request must change and what the service
 /// requires there, and a caller reading a member's entry is told what that member
-/// sent.
+/// had to satisfy.
+///
+/// What NEITHER statement carries is the value the request sent: the summary names
+/// no value at all and the entry states the requirement over the fixed token
+/// [`WITHHELD_VALUE`], so a refusal of this input reflects no caller-supplied value
+/// back to the caller or into its logs, whichever constraint the value broke.
 pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActionsErrorModeled {
     // BOUNDED, like the boundary validator's own walk: every violation is stated
     // TWICE into the body (a clause in the message and a `fieldList` entry), each
-    // statement interpolating the requirement it failed and one of the member path /
-    // rejected value, so an unbounded count turns a small request into an
-    // arbitrarily large refusal. The cap is the framework's (`MAX_VIOLATIONS`), and
-    // like the framework the envelope keeps counting what was RECORDED, so the two
-    // refusal paths read alike.
+    // statement interpolating the requirement it failed and, in the summary, the
+    // member path, so an unbounded count turns a small request into an arbitrarily
+    // large refusal. The cap is the framework's (`MAX_VIOLATIONS`), and like the
+    // framework the envelope keeps counting what was RECORDED, so the two refusal
+    // paths read alike.
     // Each violation as this service STATES it: the value set listed in this
     // service's order ([`as_stated`]).
     let stated: Vec<Violation> = violations
@@ -266,7 +296,7 @@ pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActio
         .collect();
     // The SUMMARY clause names the member and the requirement it failed, and
     // withholds the value the request sent ([`without_echoed_value`]); the member's
-    // own entry below states that value and the same requirement
+    // own entry below states the same requirement over the withheld-value token
     // ([`field_clause`]), with no path of its own.
     let summarised: Vec<Violation> = stated.iter().map(without_echoed_value).collect();
     ListRecommendedActionsErrorModeled::ValidationException(ValidationException {
@@ -346,42 +376,40 @@ fn without_echoed_value(violation: &Violation) -> Violation {
     }
 }
 
-/// The message a violation's own `fieldList` entry states: the clause the framework
-/// writes for that violation with the MEMBER PATH half dropped, so the entry reports
-/// the value the request sent and the requirement that value failed and states no
-/// path at all — the entry's `name` member is what identifies the member there, so a
-/// path in the message would state one entry's member twice.
+/// The message a violation's own `fieldList` entry states: the requirement the
+/// refused member failed, over the value slot's FIXED token — so the entry carries
+/// nothing the request sent, and no member path either, the entry's `name` member
+/// being what identifies the member there (a path in the message would state one
+/// entry's member twice).
 ///
-/// The mirror of [`without_echoed_value`], which drops the other half for the
+/// The mirror of [`without_echoed_value`], which withholds the value for the
 /// summary: between them each statement identifies the refused member once and
 /// states one half of the violation — the summary where the request must change and
-/// what is required there, the entry what that member sent and the same requirement.
-/// Like it, this takes its words from the framework rather than respelling them
-/// here: the path half is REMOVED from the framework's own clause, so the rendering
-/// of the rejected value (including the elision a long one is cut to), the `null` an
-/// absent member is stated with and the punctuation around them stay single-homed,
-/// and the requirement sentence is the shared one every service states for that
-/// constraint ([`service_common::validation_message::requirement`]).
+/// what is required there, the entry what that member had to satisfy — and NEITHER
+/// discloses what the request carried in it. The value slot is a constant
+/// ([`WITHHELD_VALUE`]) whichever constraint class the violation belongs to, because
+/// what makes a caller's value unfit to state is that a refusal reflects it into a
+/// response and into logs, which is true of every class; the one thing stated there
+/// instead of the token is the [`ABSENT_VALUE`] of a member that sent nothing at
+/// all.
 ///
-/// Both removals are anchored at the END of the clause, which is what keeps the cut
-/// independent of the value the request sent: a caller-chosen value that happens to
-/// spell a path clause of its own sits BEFORE the cut, never at it, so it is
-/// reported as sent. A clause the framework does not write in that frame at all is
-/// stated exactly as it was written, so the worst a change upstream can do is leave
-/// the path in rather than produce a malformed sentence.
+/// The requirement sentence is NOT respelled here: it is the shared one every
+/// service states for that constraint
+/// ([`service_common::validation_message::requirement`]), so a new constraint class
+/// is worded in one place for the summary and the entry alike.
 fn field_clause(violation: &Violation) -> String {
-    let stated = violation.message();
-    let requirement = format!(
-        " failed to satisfy constraint: {}",
-        service_common::validation_message::requirement(violation.kind.clone())
-    );
-    let Some(value) = stated
-        .strip_suffix(&requirement)
-        .and_then(|stated| stated.strip_suffix(&format!(" at '{}'", violation.path)))
-    else {
-        return stated;
+    // A member the request LEFT OUT is the one violation with no value to withhold:
+    // its absence is a fact of the request's shape, and is the very requirement it
+    // failed, so it is stated as the `null` it arrived as — the same word the
+    // framework writes into the summary's clause for it.
+    let value = match violation.kind {
+        ViolationKind::MissingRequiredMember => ABSENT_VALUE,
+        _ => WITHHELD_VALUE,
     };
-    format!("{value}{requirement}")
+    format!(
+        "Value {value} failed to satisfy constraint: {}",
+        service_common::validation_message::requirement(violation.kind.clone())
+    )
 }
 
 /// A 400 `ValidationException` for a request this service could not READ —

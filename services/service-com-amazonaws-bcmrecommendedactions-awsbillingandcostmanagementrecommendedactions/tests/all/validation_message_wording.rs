@@ -10,13 +10,15 @@
 //! * A refused member is stated twice and the two statements carry different
 //!   halves of it, each identifying the member ONCE. The summary envelope
 //!   (`N validation error(s) detected: …`) names the member's dotted path and the
-//!   requirement it failed and does NOT echo the value the request sent; that
-//!   member's own `fieldList` entry reports that value and the same requirement and
-//!   names no path, because the entry's `name` member is what identifies it there. A
-//!   requirement over an enumerated value set lists that enum's members in the
-//!   order this service states that set in, which is a property of the service's
-//!   message and not the model's declaration order — so each enum carries its own
-//!   order and no sorting of the model reproduces both.
+//!   requirement it failed; that member's own `fieldList` entry states the same
+//!   requirement and names no path, because the entry's `name` member is what
+//!   identifies it there. NEITHER half discloses the value the request sent in that
+//!   member: the entry's value slot carries a FIXED token ([`WITHHELD`]), so the
+//!   message a client logs and matches on is the same string whatever a caller
+//!   submitted. A requirement over an enumerated value set lists that enum's members
+//!   in the order this service states that set in, which is a property of the
+//!   service's message and not the model's declaration order — so each enum carries
+//!   its own order and no sorting of the model reproduces both.
 //! * A `nextToken` whose payload this service cannot use is refused as a
 //!   pagination-token exception that names the operation it was presented to and
 //!   the wrapping schema the SUPPLIED token's own decoded payload names, rather
@@ -61,6 +63,14 @@ const MATCH_OPTION_SET: &str = "[NOT_EQUALS, EQUALS]";
 /// The modelled bounds of `NextToken` (`smithy_query(query="shape",
 /// shape="NextToken")`: length 1..8192).
 const NEXT_TOKEN_LENGTH: (usize, usize) = (1, 8192);
+
+/// The token a `fieldList` entry carries where the clause's value would stand. A
+/// FIXED string: the model marks no member of this input `@sensitive`
+/// (`smithy_query(query="shape", shape="ActionFilter,FilterName,MatchOption")`), so
+/// the withholding is a property of how this service words a per-field message, and
+/// the string it withholds with is recorded behaviour rather than anything the model
+/// states.
+const WITHHELD: &str = "[redacted]";
 
 /// One emulator: a shared engine, and a router with this service mounted on it.
 struct Emulator {
@@ -148,24 +158,19 @@ fn field_message(case: &str, body: &Value, name: &str) -> String {
 }
 
 /// One refused enum member: the path the refusal names it by, the value set the
-/// clause must list, and the value the request sent (which that member's entry
-/// reports and the summary withholds).
+/// clause must list, and the value the request sent (which NEITHER half of the
+/// refusal may disclose).
 struct RefusedMember {
     path: &'static str,
     value_set: &'static str,
     sent: String,
 }
 
-/// The value a refusal REPORTS for a member that carried `sent`: the value as sent,
-/// or — past the length a refusal echoes — its first bytes with the rest counted,
-/// the elision the framework applies to a caller-chosen value (`MAX_ECHOED_VALUE` in
-/// `vendor/smithy-schema-server/src/constraints.rs`).
-fn reported(sent: &str) -> String {
-    const MAX_ECHOED: usize = 256;
-    if sent.len() <= MAX_ECHOED {
-        return sent.to_string();
-    }
-    format!("{}... [{} bytes]", &sent[..MAX_ECHOED], sent.len())
+/// The span of a sent value a refusal is checked against: enough of it to identify
+/// it wherever it might be echoed, and short enough that a value a refusal would
+/// have elided is still caught by its leading characters.
+fn traced(sent: &str) -> String {
+    sent.chars().take(32).collect()
 }
 
 /// One enum-refusal case: a request and every member it refuses, in the order the
@@ -371,13 +376,13 @@ async fn an_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it(
         );
 
         for member in &refused {
-            // The member's own entry states the same requirement and reports the
-            // value the request sent in that member — and names no member path: the
-            // entry's own `name` is what identifies the member there.
+            // The member's own entry states the same requirement over the fixed
+            // token, and names no member path: the entry's own `name` is what
+            // identifies the member there.
             let stated = field_message(case, &body, member.path);
             let expected_entry = format!(
-                "Value '{}' failed to satisfy constraint: Member must satisfy enum value set: {}",
-                reported(&member.sent),
+                "Value {WITHHELD} failed to satisfy constraint: Member must satisfy enum value \
+                 set: {}",
                 member.value_set
             );
             assert_eq!(
@@ -386,17 +391,99 @@ async fn an_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it(
                  {stated:?}",
                 member.path
             );
-            // The SUMMARY states the same violation and withholds that value. An
-            // empty value has nothing to withhold, and a value past the length a
-            // refusal echoes is reported elided, so the check runs on the span a
-            // refusal carries in full.
-            let echoed: String = member.sent.chars().take(32).collect();
+            // And NEITHER half carries the value the request sent: the whole body is
+            // searched, so no part of the refusal may reflect it back. An empty value
+            // has nothing to disclose, and a long one is caught by its leading
+            // characters.
+            let echoed = traced(&member.sent);
             if !echoed.is_empty() {
+                let rendered = body.to_string();
                 assert!(
-                    !message.contains(&echoed),
-                    "case {case:?}: the summary must not echo the rejected value {echoed:?}, \
-                     got {message:?}"
+                    !rendered.contains(&echoed),
+                    "case {case:?}: the refusal must not echo the rejected value {echoed:?}, \
+                     got {rendered}"
                 );
+            }
+        }
+    }
+}
+
+/// Values a caller can send in an enum-typed member, spanning the forms a message
+/// built by interpolating caller input would differ along: ordinary text, a
+/// published member with whitespace around it, text spelling the quote-and-path
+/// frame a clause is assembled from, text spelling the withheld-value token itself,
+/// JSON, non-ASCII text, a line break, digits, and a value longer than any refusal
+/// would echo.
+///
+/// None of them is a member of `FilterName` or of `MatchOption`
+/// (`smithy_query(query="shape", shape="FilterName,MatchOption")`), so each one is
+/// refused in whichever of the two members carries it.
+fn submitted_values() -> Vec<String> {
+    vec![
+        "NOT_A_PUBLISHED_MEMBER".to_string(),
+        " FEATURE ".to_string(),
+        "x' at 'filter.actions.1.member.key".to_string(),
+        "<redacted>".to_string(),
+        "{\"nested\": [\"json\"]}".to_string(),
+        "ünïcödé".to_string(),
+        "two\nlines".to_string(),
+        "741".to_string(),
+        "Z".repeat(300),
+    ]
+}
+
+#[tokio::test]
+async fn an_enum_refusal_is_the_same_whatever_value_the_member_carried() {
+    let emulator = Emulator::new();
+
+    // THE RULE: a per-field message states the member's requirement and withholds
+    // what the member carried, so the refusal of one member is ONE response whatever
+    // a caller submitted there — which is what makes the message safe to log and
+    // exact-matchable. Asserted by refusing the same member over a set of values and
+    // comparing the whole bodies: a message assembled from the request could not keep
+    // them equal.
+    for (member, value_set) in [
+        ("key", FILTER_NAME_SET),
+        ("matchOption", MATCH_OPTION_SET),
+    ] {
+        let expected_entry = format!(
+            "Value {WITHHELD} failed to satisfy constraint: Member must satisfy enum value set: \
+             {value_set}"
+        );
+        let path = format!("filter.actions.1.member.{member}");
+        let mut first: Option<(String, Value)> = None;
+        for value in submitted_values() {
+            let case = format!("{member} carrying {value:?}");
+            let action = match member {
+                "key" => json!({"key": value, "matchOption": "EQUALS", "values": ["BUDGETS"]}),
+                _ => json!({"key": "FEATURE", "matchOption": value, "values": ["BUDGETS"]}),
+            };
+            let (status, body) = emulator.list(&filters(vec![action])).await;
+            refusal_message(&case, status, &body);
+
+            let stated = field_message(&case, &body, &path);
+            assert_eq!(
+                stated, expected_entry,
+                "case {case:?}: expected the entry for {path:?} to state {expected_entry:?}, got \
+                 {stated:?}"
+            );
+            // Nothing the caller chose reaches the body at all.
+            let echoed = traced(&value);
+            let rendered = body.to_string();
+            assert!(
+                !rendered.contains(&echoed),
+                "case {case:?}: the refusal must not echo the submitted value {echoed:?}, got \
+                 {rendered}"
+            );
+            // And the response is the same one every other value of this member is
+            // refused with.
+            match &first {
+                None => first = Some((case, body)),
+                Some((before, expected)) => assert_eq!(
+                    &body, expected,
+                    "case {case:?}: expected the same refusal as case {before:?} ({expected}), \
+                     got {body}"
+                ),
             }
         }
     }
@@ -410,12 +497,13 @@ const MAX_RESULTS_RANGE: (i32, i32) = (1, 1000);
 /// shape="ActionFilter,FilterValues")`: min 1).
 const FILTER_VALUES_MIN_LENGTH: i64 = 1;
 
-/// What a refusal reports for one member: the value the request SENT in it, or
-/// nothing at all for a member the request left out.
+/// What the request SENT in one member: a value, or nothing at all for a member it
+/// left out. A refusal reports neither, but which of the two it was decides the word
+/// its clauses carry where a value would stand.
 enum Sent {
     /// The member carried this value.
     Value(String),
-    /// The member was absent, so there is no value to report.
+    /// The member was absent, so there is no value to withhold.
     Nothing,
 }
 
@@ -443,17 +531,17 @@ impl StatedMember {
         )
     }
 
-    /// The message this member's own `fieldList` ENTRY states: the value the
-    /// request sent and the requirement, and no member path — the entry's `name`
-    /// carries that. A member the request left out sent no value, so its entry
-    /// keeps the `null` its absence is.
+    /// The message this member's own `fieldList` ENTRY states: the requirement, over
+    /// the fixed token that stands where a value would, and no member path — the
+    /// entry's `name` carries that. A member the request left out sent no value to
+    /// withhold, so its entry keeps the `null` its absence is.
     fn entry_message(&self) -> String {
         let value = match &self.sent {
-            Sent::Value(sent) => format!("Value '{}'", reported(sent)),
-            Sent::Nothing => "Value null".to_string(),
+            Sent::Value(_) => WITHHELD,
+            Sent::Nothing => "null",
         };
         format!(
-            "{value} failed to satisfy constraint: {}",
+            "Value {value} failed to satisfy constraint: {}",
             self.requirement
         )
     }
@@ -605,8 +693,9 @@ fn stated_cases() -> Vec<StatedCase> {
                 requirement: format!(
                     "Member must have length greater than or equal to {FILTER_VALUES_MIN_LENGTH}"
                 ),
-                // A collection is reported by the element count the framework
-                // renders for one, not by a value of its own.
+                // A collection sent a value like any other member — the framework
+                // renders it as the element count it held — and that rendering is
+                // withheld from the entry like any other.
                 sent: Sent::Value("0 items".to_string()),
             }],
         },
@@ -689,7 +778,7 @@ fn stated_cases() -> Vec<StatedCase> {
 }
 
 #[tokio::test]
-async fn a_field_list_entry_states_the_value_and_the_requirement_and_no_member_path() {
+async fn a_field_list_entry_withholds_the_value_and_states_the_requirement_and_no_member_path() {
     let emulator = Emulator::new();
 
     for StatedCase {
@@ -728,7 +817,7 @@ async fn a_field_list_entry_states_the_value_and_the_requirement_and_no_member_p
         );
 
         // The ENTRY half: one entry per refused member, its `name` the path and its
-        // message the value that member sent plus the same requirement.
+        // message the same requirement over the withheld-value token.
         let entries = field_entries(&case, &body);
         assert_eq!(
             entries.len(),
@@ -753,37 +842,33 @@ async fn a_field_list_entry_states_the_value_and_the_requirement_and_no_member_p
                  {stated:?}",
                 member.path
             );
-            // The path is the entry's `name`, so the message states no path clause
-            // of its own and names the member nowhere — except where the VALUE the
-            // request sent spells one, which the entry reports as sent.
-            let sent_spells_a_path = match &member.sent {
-                Sent::Value(sent) => sent.contains(&member.path) || sent.contains(" at '"),
-                Sent::Nothing => false,
-            };
-            if !sent_spells_a_path {
+            // The path is the entry's `name`, so the message states no path clause of
+            // its own and names the member nowhere — not even where the VALUE the
+            // request sent spells a path clause, since no part of that value reaches
+            // the message.
+            assert!(
+                !stated.contains(" at '") && !stated.contains(&member.path),
+                "case {case:?}: the entry for {:?} must name no member path, got {stated:?}",
+                member.path
+            );
+            // A member that DID send a value has that value withheld from both
+            // halves: the entry's value slot is the fixed token, the summary names no
+            // value at all, and nothing a caller chose appears anywhere in the body.
+            if let Sent::Value(sent) = &member.sent {
+                let slot = format!("Value {WITHHELD} ");
                 assert!(
-                    !stated.contains(" at '") && !stated.contains(&member.path),
-                    "case {case:?}: the entry for {:?} must name no member path, got {stated:?}",
+                    stated.starts_with(&slot),
+                    "case {case:?}: the entry for {:?} must state {slot:?} where the submitted \
+                     value would stand, got {stated:?}",
                     member.path
                 );
-            }
-            // The value the request sent is reported HERE and withheld from the
-            // summary, which is the split between the two halves. An empty value has
-            // nothing to report, and a long one is reported elided, so the check
-            // runs on the span a refusal carries in full.
-            if let Sent::Value(sent) = &member.sent {
-                let echoed: String = reported(sent).chars().take(32).collect();
-                if !echoed.is_empty() {
+                let echoed = traced(sent);
+                if !echoed.is_empty() && !member.requirement.contains(&echoed) {
+                    let rendered = body.to_string();
                     assert!(
-                        stated.contains(&echoed),
-                        "case {case:?}: the entry for {:?} must report the value {echoed:?} the \
-                         request sent, got {stated:?}",
-                        member.path
-                    );
-                    assert!(
-                        !message.contains(&echoed),
-                        "case {case:?}: the summary must withhold the value {echoed:?} of {:?}, \
-                         got {message:?}",
+                        !rendered.contains(&echoed),
+                        "case {case:?}: the refusal of {:?} must not echo the submitted value \
+                         {echoed:?}, got {rendered}",
                         member.path
                     );
                 }
