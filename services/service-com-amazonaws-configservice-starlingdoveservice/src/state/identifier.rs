@@ -3,12 +3,15 @@
 //! How this service draws the identifiers it ASSIGNS.
 //!
 //! Every id Config hands back for a resource a caller created is opaque: the caller
-//! cannot derive it, and holding one tells it nothing about any other. The two forms
-//! those ids take here are a run of base-36 characters ([`opaque_id`]) and a uuid
-//! written the one way AWS publishes a uuid — canonical and hyphenated ([`uuid_id`],
-//! and [`stack_id`] for the uuid CloudFormation assigns a stack) — and all are drawn
-//! from randomness, so an id carries neither the order its resource was created in nor
-//! a hint of the next one.
+//! cannot derive it, and holding one tells it nothing about any other. Config writes
+//! every id it assigns as ONE UNBROKEN RUN of base-36 characters ([`opaque_id`]),
+//! sometimes behind a fixed prefix naming the kind of resource, and never as
+//! hyphen-delimited groups; a uuid written the one way
+//! AWS publishes a uuid — canonical and hyphenated ([`uuid_id`]) — belongs to the
+//! resources of the services that spell their ids that way, which here is only the
+//! stack CloudFormation assigns a conformance pack ([`stack_id`]). All are drawn from
+//! randomness, so an id carries neither the order its resource was created in nor a
+//! hint of the next one.
 
 use rand::Rng;
 
@@ -34,7 +37,7 @@ pub const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
 
 /// One random (version 4) uuid in the canonical, hyphenated 36-character form
 /// ([`UUID_GROUPS`]) — the one spelling AWS publishes a uuid in, and so the form of
-/// every identifier this service hands back as a uuid.
+/// every identifier this crate reports as a uuid ([`stack_id`]).
 pub fn uuid_id() -> String {
     ::uuid::Uuid::new_v4().as_hyphenated().to_string()
 }

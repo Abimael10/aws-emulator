@@ -545,14 +545,66 @@ fn a_resource_evaluation_id_is_distinct_for_every_evaluation() {
         ids.len()
     );
     for id in &ids {
-        let widths: Vec<usize> = id.split('-').map(|group| group.chars().count()).collect();
         assert!(
-            (1..=128).contains(&id.len())
-                && widths == UUID_GROUPS
-                && id.chars().all(|c| c == '-'
-                    || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase())),
-            "a ResourceEvaluationId is a canonical hyphenated uuid inside the modelled \
-             1..128 length, got {id:?}"
+            (1..=128).contains(&id.chars().count())
+                && id.chars().count() == RESOURCE_EVALUATION_ID_CHARS
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "a ResourceEvaluationId is one unbroken run of {RESOURCE_EVALUATION_ID_CHARS} \
+             base-36 characters inside the modelled 1..128 length, got {id:?}"
+        );
+        assert!(
+            !id.contains('-'),
+            "a ResourceEvaluationId carries no hyphen-delimited group, got {id:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stored_query_id_is_the_resource_id_segment_of_its_arn() {
+    // Rows differ along the query NAME the ARN is built around — the shortest name the
+    // pattern allows, a name with each separator it admits and the longest one — because
+    // the form of the id Config assigns is a property of the service, not of the name.
+    let names: [(&str, String); 4] = [
+        ("a single-character name", "q".to_string()),
+        ("a hyphenated name", "stored-query-name".to_string()),
+        ("an underscored name", "stored_query_NAME_9".to_string()),
+        (
+            "the longest name the model allows",
+            "n".repeat(STORED_QUERY_NAME_MAX_LENGTH),
+        ),
+    ];
+
+    for (case, name) in names {
+        let id = mint_stored_query_id();
+        let body = id
+            .strip_prefix(STORED_QUERY_ID_PREFIX)
+            .unwrap_or_else(|| panic!("case {case:?}: a QueryId opens with the published \
+                 prefix {STORED_QUERY_ID_PREFIX:?}, got {id:?}"));
+        assert!(
+            body.chars().count() == STORED_QUERY_ID_CHARS
+                && (1..=36).contains(&id.chars().count())
+                && body
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "case {case:?}: a QueryId is its prefix and one unbroken run of \
+             {STORED_QUERY_ID_CHARS} base-36 characters inside the modelled 1..36 \
+             length, got {id:?}"
+        );
+        assert!(
+            !body.contains('-') && !id.chars().any(char::is_whitespace),
+            "case {case:?}: a QueryId carries no hyphen-delimited group past its prefix \
+             and no whitespace, got {id:?}"
+        );
+
+        // The ARN's resource-id segment IS that id, so the id a caller reads back and
+        // the ARN it holds are the same characters.
+        let arn = stored_query_arn("us-west-2", &name, &id);
+        assert!(
+            arn.ends_with(&format!(":{STORED_QUERY_ARN_RESOURCE_TYPE}/{name}/{id}")),
+            "case {case:?}: expected the ARN to carry the name and the id as its \
+             resource-id segment, got {arn:?} beside {id:?}"
         );
     }
 }

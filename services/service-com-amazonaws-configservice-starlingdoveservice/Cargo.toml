@@ -78,9 +78,9 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # `flate2`: a delivered configuration snapshot is a gzip-framed object, so the snapshot
 # delivery writes its payload through this crate's gzip encoder.
 flate2 = "1"
-# `uuid`: the identifiers Config hands back in the uuid form (a stored query's `QueryId`,
-# a `ResourceEvaluationId`) are drawn as version-4 uuids by this crate, so the id is
-# random rather than derived from how many have been minted (`state::identifier`).
+# `uuid`: the one identifier this crate reports in the uuid form — the id CloudFormation
+# assigns the stack a conformance pack deploys as — is drawn as a version-4 uuid, so it
+# is random rather than derived from how many have been minted (`state::identifier`).
 uuid = { version = "1", features = ["v4"] }
 # `rand`: the identifiers Config hands back as a run of opaque base-36 characters draw
 # every character from this crate's thread-local generator, for the same reason

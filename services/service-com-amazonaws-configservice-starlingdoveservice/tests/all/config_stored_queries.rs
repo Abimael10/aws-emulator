@@ -92,14 +92,16 @@ async fn read_back(emulator: &Emulator, name: &str) -> Value {
 }
 
 /// Check `arn` against the form `QueryArn`'s pattern requires:
-/// `arn:aws:config:<region>:<account-id>:stored-query/<name>/query-<id>`.
+/// `arn:aws:config:<region>:<account-id>:stored-query/<name>/<QueryId>`, whose last
+/// segment is the query's id (which itself opens with `query-`, the prefix the pattern
+/// spells there).
 fn assert_query_arn(case: &str, arn: &str, region: &str, name: &str, query_id: &str) {
     let prefix = format!("arn:aws:config:{region}:");
     assert!(
         arn.starts_with(&prefix),
         "case {case:?}: expected a query ARN starting {prefix:?}, got {arn:?}"
     );
-    let suffix = format!(":stored-query/{name}/query-{query_id}");
+    let suffix = format!(":stored-query/{name}/{query_id}");
     assert!(
         arn.ends_with(&suffix),
         "case {case:?}: expected a query ARN ending {suffix:?}, got {arn:?}"

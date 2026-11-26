@@ -2911,30 +2911,52 @@ pub fn mint_recorder_id() -> String {
 }
 
 /// The ARN resource type of a stored query, as Config spells it in the ARNs it mints
-/// (`QueryArn`'s pattern: `stored-query/<name>/query-<id>`).
+/// (`QueryArn`'s pattern: `stored-query/<name>/<QueryId>`, where the id itself opens
+/// with `query-`).
 pub const STORED_QUERY_ARN_RESOURCE_TYPE: &str = "stored-query";
 
 /// The ARN of a stored query:
-/// `arn:aws:config:<region>:<account>:stored-query/<name>/query-<id>`, the form
+/// `arn:aws:config:<region>:<account>:stored-query/<name>/<QueryId>`, the form
 /// `QueryArn`'s pattern requires — both the query's name and the id Config assigned it
 /// are part of the ARN.
+///
+/// `QueryArn`'s doc spells the layout `resource-type/resource-name/resource-id`, so the
+/// last segment is the query's id VERBATIM ([`mint_stored_query_id`], which is why that
+/// id opens with the `query-` the pattern spells there): the id a caller reads back and
+/// the ARN's resource-id segment are one string, the way a recorder's and a conformance
+/// pack's are.
 pub fn stored_query_arn(region: &str, name: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("{STORED_QUERY_ARN_RESOURCE_TYPE}/{name}/query-{id}"),
+        &format!("{STORED_QUERY_ARN_RESOURCE_TYPE}/{name}/{id}"),
     )
 }
 
-/// The `QueryId` Config assigns a stored query created in this emulator: a uuid in the
-/// canonical hyphenated form ([`uuid_id`]), which is exactly the 36 characters
-/// `QueryId`'s 1..36 length allows, satisfies its `^\S+$` pattern and is admitted by
-/// the `query-<id>` segment of `QueryArn`'s own pattern (`[a-zA-Z\d-_/]+`).
+/// The prefix a stored query's assigned `QueryId` opens with, which is also the prefix
+/// `QueryArn`'s pattern spells in its resource-id segment
+/// (`.../query-[a-zA-Z\d-_/]+$`).
+pub const STORED_QUERY_ID_PREFIX: &str = "query-";
+
+/// How many base-36 characters a stored query's assigned `QueryId` carries after its
+/// prefix: a compact token that keeps the whole id well inside the 36 characters
+/// `QueryId`'s 1..36 length allows.
+pub const STORED_QUERY_ID_CHARS: usize = 16;
+
+/// The `QueryId` Config assigns a stored query created in this emulator: the fixed
+/// `query-` prefix ([`STORED_QUERY_ID_PREFIX`]) followed by ONE UNBROKEN RUN of opaque
+/// base-36 characters ([`opaque_id`]) — no hyphen-delimited groups — the way every
+/// identifier this service assigns is written. The whole id is inside `QueryId`'s 1..36
+/// length, satisfies its `^\S+$` pattern, and IS the resource-id segment of the query's
+/// ARN ([`stored_query_arn`]).
 ///
 /// DRAWN rather than derived from how many queries have been created: a caller holding
 /// one query's id learns nothing about another's.
 pub fn mint_stored_query_id() -> String {
-    uuid_id()
+    format!(
+        "{STORED_QUERY_ID_PREFIX}{}",
+        opaque_id(STORED_QUERY_ID_CHARS)
+    )
 }
 
 /// Whether `name` is a `QueryName` the model allows: 1..64 characters of
@@ -4233,16 +4255,22 @@ pub async fn publish_service_event_via(
     }
 }
 
+/// How many base-36 characters a `ResourceEvaluationId` carries: one compact opaque
+/// token, the width this service's other drawn tokens are spelled at and far inside the
+/// 128 characters the model allows the member.
+pub const RESOURCE_EVALUATION_ID_CHARS: usize = 16;
+
 /// The `ResourceEvaluationId` Config assigns a resource evaluation started in this
 /// emulator.
 ///
-/// The model gives `ResourceEvaluationId` no pattern (only a 1..128 length), and the
-/// recorded ids are opaque and unordered, so the id takes the same canonical
-/// hyphenated uuid form a stored query's does ([`uuid_id`]): DRAWN rather than derived
-/// from how many evaluations have been started, so one evaluation's id tells a caller
-/// nothing about another's.
+/// The model gives `ResourceEvaluationId` no pattern (only a 1..128 length) and the
+/// recorded ids are one compact opaque token with no hyphen-delimited groups, so the id
+/// is drawn as one unbroken run of base-36 characters ([`opaque_id`]), the way every
+/// other identifier this service assigns is written: DRAWN rather than derived from how
+/// many evaluations have been started, so one evaluation's id tells a caller nothing
+/// about another's.
 pub fn mint_resource_evaluation_id() -> String {
-    uuid_id()
+    opaque_id(RESOURCE_EVALUATION_ID_CHARS)
 }
 
 /// `at` as nanoseconds since the Unix epoch: one totally ordered integer for an
