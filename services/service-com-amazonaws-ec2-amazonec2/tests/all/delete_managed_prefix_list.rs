@@ -29,8 +29,9 @@
 //!    gateway route table, and an IPAM prefix list resolver target.
 //! 5. A request this operation cannot serve is REFUSED with EC2's code for that class and
 //!    deletes nothing: an id that is no prefix list id, an id nothing the caller can see
-//!    carries, a list Amazon Web Services publishes rather than the account owning, and a list
-//!    whose creation the clock still owes.
+//!    carries, and a list Amazon Web Services publishes rather than the account owning. (A
+//!    list of the account whose own lifecycle the clock still owes a move is NOT such a
+//!    request — `delete_managed_prefix_list_while_settling` covers that it is deleted.)
 //! 6. A `DryRun` answers 412 `DryRunOperation` and deletes nothing at all.
 //! 7. A delete of a list whose removal is ALREADY owed answers it as it stands and leaves that
 //!    removal's own due instant where it was, so a second call cannot keep a list alive.
@@ -49,6 +50,7 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{element, elements, error_code, error_message, filters};
+use super::rbin_retention_rules::poll_until;
 use super::wire::{Param, child_text, document, param, set_items};
 
 /// The Region every call here is signed for.
@@ -63,6 +65,39 @@ const NOT_FOUND: &str = "InvalidPrefixListID.NotFound";
 /// Long enough past [`TRANSITION_DELAY`] that a move the clock owes is due.
 fn past_the_transition() -> Duration {
     TRANSITION_DELAY + Duration::from_millis(250)
+}
+
+/// The settled state a revision of the entry set reaches, from the modelled catalog
+/// (`smithy_query(query="shape",shape="PrefixListState")`).
+const MODIFY_COMPLETE: &str = "modify-complete";
+
+/// Look again until the describe reports `prefix_list_id` in `state`.
+///
+/// Waits for the CONDITION the clock owes rather than for the span it owes it in, so a loaded
+/// host cannot read the list before the move has been applied.
+async fn poll_until_state(
+    case: &str,
+    router: &MultiServiceRouter,
+    prefix_list_id: &str,
+    state: &str,
+) {
+    let waiting_for = format!("the prefix list {prefix_list_id} to reach {state}");
+    poll_until(case, &waiting_for, || async {
+        let (status, body) = describe_one(router, prefix_list_id).await;
+        status == 200 && element(&body, "state").as_deref() == Some(state)
+    })
+    .await;
+}
+
+/// Look again until nothing reports `prefix_list_id` any more — the REMOVAL a delete starts,
+/// which the clock owes the list.
+async fn poll_until_gone(case: &str, router: &MultiServiceRouter, prefix_list_id: &str) {
+    let waiting_for = format!("the prefix list {prefix_list_id} to stop being reported");
+    poll_until(case, &waiting_for, || async {
+        let (status, body) = describe_one(router, prefix_list_id).await;
+        (status, error_code(&body).as_str()) == (400, NOT_FOUND)
+    })
+    .await;
 }
 
 /// One `action` call carrying `params`, as its HTTP status and XML body.
@@ -294,9 +329,9 @@ fn stored_state(engine: &engine::InMemoryEngine, prefix_list_id: &str) -> Option
 async fn a_delete_answers_the_stored_list_and_the_clock_removes_it() {
     let (router, engine) = super::ec2_query::emulator();
 
-    // Every row's list first, then ONE wait for the creations the clock owes: a list whose
-    // creation is still in progress is not one a delete may remove, which rule 5 asserts in its
-    // own right.
+    // Every row's list first, then ONE wait for the creations the clock owes, so the describe
+    // this rule compares the delete's answer against reports a SETTLED list (a delete of a list
+    // the clock still owes a move is covered by `delete_managed_prefix_list_while_settling`).
     let cases = list_cases();
     let mut lists = Vec::new();
     for (index, case) in cases.iter().enumerate() {
@@ -309,7 +344,15 @@ async fn a_delete_answers_the_stored_list_and_the_clock_removes_it() {
         .await;
         lists.push(member(case.name, &body, "prefixListId"));
     }
-    tokio::time::sleep(past_the_transition()).await;
+    for (case, prefix_list_id) in cases.iter().zip(&lists) {
+        poll_until_state(
+            case.name,
+            &router,
+            prefix_list_id,
+            PREFIX_LIST_STATE_CREATE_COMPLETE,
+        )
+        .await;
+    }
 
     // The revision of the one row that asks for it, and the wait that settles it.
     for (case, prefix_list_id) in cases.iter().zip(&lists) {
@@ -324,9 +367,9 @@ async fn a_delete_answers_the_stored_list_and_the_clock_removes_it() {
                 ],
             )
             .await;
+            poll_until_state(case.name, &router, prefix_list_id, MODIFY_COMPLETE).await;
         }
     }
-    tokio::time::sleep(past_the_transition()).await;
 
     for (case, prefix_list_id) in cases.iter().zip(&lists) {
         let (status, described) = describe_one(&router, prefix_list_id).await;
@@ -397,9 +440,14 @@ async fn a_delete_answers_the_stored_list_and_the_clock_removes_it() {
         );
     }
 
-    tokio::time::sleep(past_the_transition()).await;
+    // Rule 2: the removal is owed to the clock, so the suite looks again until it has fallen
+    // due rather than waiting a span for it.
+    for (case, prefix_list_id) in cases.iter().zip(&lists) {
+        poll_until_gone(case.name, &router, prefix_list_id).await;
+    }
 
-    // Rule 2: once the span has passed, nothing reports the list and nothing holds it.
+    // Rule 2: once that removal has been carried out, nothing reports the list and nothing
+    // holds it.
     let listed = ok("every removed list", &router, "DescribeManagedPrefixLists", &[]).await;
     let reported = elements(&listed, "prefixListId");
     for (case, prefix_list_id) in cases.iter().zip(&lists) {
@@ -727,8 +775,9 @@ async fn the_delete_refuses_what_it_cannot_serve() {
     .await;
     let published_id = member("a published list", &published, "prefixListId");
 
-    // A list whose creation the clock still owes: created and NOT waited for.
-    let creating = create_one("a creating list", &router, "still-creating").await;
+    // A list of the account no refusal below names, which is what proves a refused delete
+    // wrote nothing: it is still there afterwards and settles as the clock owed it.
+    let bystanding = create_one("a bystanding list", &router, "a-bystanding-list").await;
 
     let rows: Vec<(&str, String, u16, &str)> = vec![
         (
@@ -748,12 +797,6 @@ async fn the_delete_refuses_what_it_cannot_serve() {
             published_id.clone(),
             400,
             "UnsupportedOperation",
-        ),
-        (
-            "a list whose creation is still in progress",
-            creating.clone(),
-            400,
-            "IncorrectState",
         ),
     ];
 
@@ -788,22 +831,30 @@ async fn the_delete_refuses_what_it_cannot_serve() {
         );
     }
 
-    // Nothing was deleted: the list the refusals named is still there, and settles as the clock
-    // owed it — read back through the describe, which is what applies a move the clock owes.
-    tokio::time::sleep(past_the_transition()).await;
-    let (status, described) = describe_one(&router, &creating).await;
+    // A refused delete deletes NOTHING: the list of the account none of the refusals above
+    // named is still there, and settles as the clock owed it — looked at again until that move
+    // has fallen due rather than waited a span for, the describe being what applies it.
+    poll_until_state(
+        "a bystanding list",
+        &router,
+        &bystanding,
+        PREFIX_LIST_STATE_CREATE_COMPLETE,
+    )
+    .await;
+    let (status, described) = describe_one(&router, &bystanding).await;
     assert_eq!(
         status, 200,
-        "a refused delete must leave the list it named, got {status} with body {described}"
+        "a refused delete must leave every other list of the account, got {status} with body \
+         {described}"
     );
     assert_eq!(
         element(&described, "state").as_deref(),
         Some(PREFIX_LIST_STATE_CREATE_COMPLETE),
-        "a refused delete must leave the list it named to settle, got {described}"
+        "a refused delete must leave every other list of the account to settle, got {described}"
     );
     assert!(
-        stored_state(&engine, &creating).is_some(),
-        "a refused delete must leave the list it named in the store"
+        stored_state(&engine, &bystanding).is_some(),
+        "a refused delete must leave every other list of the account in the store"
     );
     let (status, body) = describe_one(&router, &published_id).await;
     assert_eq!(

@@ -141,9 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::ops::get_managed_prefix_list_associations::prefix_list_associations;
-        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::{
-            PREFIX_LIST_STATES_ADMITTING_A_REVISION, require_prefix_list_versions,
-        };
+        use crate::ops::modify_managed_prefix_list::managed_prefix_list_entries::require_prefix_list_versions;
         use crate::state;
 
         // The request's own FORM first, before anything is resolved: "not a prefix list id at
@@ -196,25 +194,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // as it stands rather than refused for the state that delete put it in, and the
             // removal keeps its own due instant — the same reading a repeated delete of a
             // transit gateway prefix list reference has.
-            let current_state = record.view.state.clone().unwrap_or_default();
             let already_deleting = record
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.to == state::ManagedPrefixListMove::Removed);
 
             if !already_deleting {
-                // A list whose creation or whose last revision is still owed to the clock has
-                // not settled into the list this delete would remove, so it is refused with
-                // the state it is in — EC2's `IncorrectState`, worded the way every refusal of
-                // this crate that turns solely on a resource's state is.
-                if !PREFIX_LIST_STATES_ADMITTING_A_REVISION.contains(&current_state.as_str()) {
-                    return Err(state::incorrect_state_of(
-                        "Prefix list",
-                        &input.prefix_list_id,
-                        &current_state,
-                    ));
-                }
-
+                // The ONE precondition this operation states is the references other
+                // resources hold — "you must first remove all references to the prefix list in
+                // your resources" (`DeleteManagedPrefixList`) — and a move the clock still
+                // owes the list is not one of them: a list whose creation or whose last
+                // revision has not settled yet is still a list of the account, and the delete
+                // SUPERSEDES that owed move rather than being refused for it (a revision in
+                // flight never comes into force, the list going out instead). That is what
+                // keeps a caller that creates or revises a list and tears it down straight
+                // afterwards from being told its own list cannot be deleted; a revision, by
+                // contrast, needs a settled entry set to start from, which is why
+                // `ModifyManagedPrefixList` and `RestoreManagedPrefixListVersion` still turn
+                // on `PREFIX_LIST_STATES_ADMITTING_A_REVISION` and this delete does not.
+                //
                 // "You must first remove all references to the prefix list in your resources"
                 // (`DeleteManagedPrefixList`): the references are the ones
                 // `GetManagedPrefixListAssociations` reports — a security group rule's grant, a
