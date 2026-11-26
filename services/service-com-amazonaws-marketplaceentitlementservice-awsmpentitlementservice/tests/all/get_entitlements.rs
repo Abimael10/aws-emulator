@@ -624,8 +624,55 @@ async fn max_results_outside_the_modeled_range_is_refused() {
     }
 }
 
+/// The error shape an error body names, with any namespace prefix stripped.
+///
+/// awsJson1_1 carries it in `__type` (`com.amazonaws.…#Shape`); the framework also sets
+/// `code` on some bodies, so either is accepted.
+fn error_shape(body: &serde_json::Value) -> Option<&str> {
+    body["__type"]
+        .as_str()
+        .or_else(|| body["code"].as_str())
+        .map(|shape| shape.rsplit('#').next().unwrap_or(shape))
+}
+
+/// Every token `PROD_PAGED` cannot resume, as `(case, token, product code)` rows.
+///
+/// Rows differ along the token's value, length, form and provenance: free text, a single
+/// character, a very long value, a plausible cursor structure, a cursor with a tampered
+/// digest, a cursor presented to a different query, and a value made only of punctuation.
+/// Every row satisfies the modeled `NonEmptyString` `^\S+$` pattern, so each reaches the
+/// handler rather than boundary validation. `issued` is a token the query really did
+/// issue, so the forged rows differ from a usable one only in being unusable.
+fn unusable_next_token_cases(issued: &str) -> Vec<(&'static str, String, &'static str)> {
+    // The digest half tampered with, one hex character.
+    let mut tampered = issued.to_string();
+    let last = tampered.pop().expect("the issued token is non-empty");
+    tampered.push(if last == 'a' { 'b' } else { 'a' });
+
+    vec![
+        ("free text", "not-a-token".to_string(), PROD_PAGED),
+        ("one character", "x".to_string(), PROD_PAGED),
+        ("a 600-character value", "z".repeat(600), PROD_PAGED),
+        ("punctuation only", "!!!".to_string(), PROD_PAGED),
+        ("plausible structure", "30.deadbeef".to_string(), PROD_PAGED),
+        (
+            "hex offset, invented digest",
+            format!("{}.{}", hex::encode("2"), "0".repeat(32)),
+            PROD_PAGED,
+        ),
+        ("digest only", format!(".{}", "0".repeat(32)), PROD_PAGED),
+        ("offset only", hex::encode("2"), PROD_PAGED),
+        ("tampered digest", tampered, PROD_PAGED),
+        (
+            "a token issued for another product code",
+            issued.to_string(),
+            PROD_MAIN,
+        ),
+    ]
+}
+
 #[tokio::test]
-async fn a_next_token_that_is_not_a_cursor_of_this_query_is_refused() {
+async fn a_next_token_that_is_not_a_cursor_of_this_query_is_refused_naming_that_token() {
     let (engine, router) = build_router();
     seed_all(&engine);
 
@@ -641,23 +688,7 @@ async fn a_next_token_that_is_not_a_cursor_of_this_query_is_refused() {
         .expect("a 30-record product paged at 2 has a second page")
         .to_string();
 
-    // Rows differ along the shape of the forgery: free text, a plausible structure, a
-    // valid token with a tampered offset or digest, and a valid token for another query.
-    let mut cases: Vec<(&str, String, &str)> = vec![
-        ("free text", "not-a-token".to_string(), PROD_PAGED),
-        ("plausible structure", "30.deadbeef".to_string(), PROD_PAGED),
-        ("hex offset, invented digest", format!("{}.{}", hex::encode("2"), "0".repeat(32)), PROD_PAGED),
-        ("digest only", format!(".{}", "0".repeat(32)), PROD_PAGED),
-        ("offset only", hex::encode("2"), PROD_PAGED),
-        ("a token issued for another product code", issued.clone(), PROD_MAIN),
-    ];
-    // The digest half tampered with, one hex character at a time.
-    let mut tampered = issued.clone();
-    let last = tampered.pop().expect("the issued token is non-empty");
-    tampered.push(if last == 'a' { 'b' } else { 'a' });
-    cases.push(("tampered digest", tampered, PROD_PAGED));
-
-    for (case, token, product_code) in cases {
+    for (case, token, product_code) in unusable_next_token_cases(&issued) {
         let (status, parsed) = get_entitlements(
             &router,
             &serde_json::json!({"ProductCode": product_code, "NextToken": token}),
@@ -666,6 +697,20 @@ async fn a_next_token_that_is_not_a_cursor_of_this_query_is_refused() {
         assert_eq!(
             status, 400,
             "case {case:?} (token {token:?}): expected HTTP 400, got {status} with body {parsed:?}"
+        );
+        assert_eq!(
+            error_shape(&parsed),
+            Some("InvalidParameterException"),
+            "case {case:?} (token {token:?}): wrong error shape, got {parsed:?}"
+        );
+        // The message is the fixed prefix plus the caller's token, verbatim: the token
+        // is the only part that varies from row to row. The prefix is restated here on
+        // purpose rather than imported from the handler, so this asserts the wording the
+        // recording shows and not whatever literal the implementation happens to carry.
+        assert_eq!(
+            parsed["message"].as_str(),
+            Some(format!("Invalid NextToken: {token}").as_str()),
+            "case {case:?}: expected the token named after the fixed prefix, got {parsed:?}"
         );
     }
 
@@ -694,8 +739,16 @@ async fn a_next_token_that_is_not_a_cursor_of_this_query_is_refused() {
         "case \"a token issued for another filter\": expected HTTP 400, got {status} with \
          body {parsed:?}"
     );
+    assert_eq!(
+        parsed["message"].as_str(),
+        Some(format!("Invalid NextToken: {filtered_token}").as_str()),
+        "case \"a token issued for another filter\": expected the token named after the \
+         fixed prefix, got {parsed:?}"
+    );
 
-    // And the token really is usable for the query it was issued for.
+    // And the token really is usable for the query it was issued for — and a usable
+    // token carries no refusal message, so the wording above belongs to the refusal path
+    // and not to every paginated call.
     let (status, second) = get_entitlements(
         &router,
         &serde_json::json!({"ProductCode": PROD_PAGED, "MaxResults": 2, "NextToken": issued}),
@@ -706,6 +759,11 @@ async fn a_next_token_that_is_not_a_cursor_of_this_query_is_refused() {
         dimensions(&second),
         vec!["p-02".to_string(), "p-03".to_string()],
         "the issued token must resume exactly where page one ended"
+    );
+    assert!(
+        second["message"].is_null(),
+        "case \"the issued token\": a successful page must carry no error message, got \
+         {second:?}"
     );
 }
 

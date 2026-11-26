@@ -102,6 +102,13 @@ const DEFAULT_PAGE_SIZE: usize = 25;
 /// The smallest page size the model allows (`PageSizeInteger` `@range` min).
 const MIN_PAGE_SIZE: usize = 1;
 
+/// The fixed text the service puts in front of a refused pagination token.
+///
+/// The whole message is this prefix followed immediately by the `NextToken` the caller
+/// sent, verbatim: the rejected token is the message's only variable part, so a caller
+/// can recover which token was refused from the text alone.
+const INVALID_NEXT_TOKEN_PREFIX: &str = "Invalid NextToken: ";
+
 /// Domain separator mixed into every page-cursor digest, so a token only ever
 /// authenticates as a cursor of THIS operation.
 const PAGE_CURSOR_DOMAIN: &str =
@@ -378,10 +385,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     filter_keys = ?filter_keys,
                     "GetEntitlements refused a NextToken that is not a cursor of this query"
                 );
-                invalid_parameter(
-                    "NextToken is not a pagination token this service issued for this \
-                     ProductCode and Filter",
-                )
+                // The service names the token it refused and nothing else: the fixed
+                // text `INVALID_NEXT_TOKEN_PREFIX` followed by the `NextToken` member
+                // exactly as it arrived, with no mention of the product code, the
+                // filter, or where the token came from.
+                invalid_parameter(format!("{INVALID_NEXT_TOKEN_PREFIX}{token}"))
             })?,
         };
 
