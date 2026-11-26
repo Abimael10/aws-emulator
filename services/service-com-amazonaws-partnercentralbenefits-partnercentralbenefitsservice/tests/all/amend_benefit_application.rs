@@ -16,12 +16,15 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    not_found_message, APPLICATION_KIND, MAX_AMENDMENTS_PER_REQUEST, MAX_AMENDMENT_REASON_LEN,
-    MAX_CLIENT_TOKEN_LEN, MAX_DETAILS_MEMBERS, MAX_DETAILS_TEXT_LEN, MAX_DETAILS_VALUE_LEN,
-    MAX_FIELD_PATH_LEN, MIN_AMENDMENTS_PER_REQUEST,
+    not_found_message, revision_conflict_message, status_conflict_message, APPLICATION_KIND,
+    CATALOG_KIND, IDEMPOTENT_PARAMETER_MISMATCH, MAX_AMENDMENTS_PER_REQUEST,
+    MAX_AMENDMENT_REASON_LEN, MAX_CLIENT_TOKEN_LEN, MAX_DETAILS_MEMBERS, MAX_DETAILS_TEXT_LEN,
+    MAX_DETAILS_VALUE_LEN, MAX_FIELD_PATH_LEN, MIN_AMENDMENTS_PER_REQUEST, SEEDED_CATALOGS,
+    STATUS_CANCELED,
 };
 
 use crate::benefit_application_lifecycle::{error_code, Harness};
+use crate::unknown_catalog_lookup::{unknown_catalogs, with_catalog};
 
 /// The production catalog, one of the two the service serves.
 const CATALOG: &str = "AWS";
@@ -1144,4 +1147,332 @@ async fn amend_reports_an_application_that_does_not_exist() {
             "case {case:?}: expected the not-found sentence, got {out:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The order the refusals are answered in
+// ---------------------------------------------------------------------------
+
+/// What one call must be answered with: the HTTP status, the modelled error code, and —
+/// where the rule fixes the whole sentence — the message.
+type Answer = (u16, &'static str, Option<String>);
+
+/// Call this operation and require `expected` of its answer.
+async fn assert_answer(harness: &Harness, case: &str, body: &Value, expected: &Answer) {
+    let (expected_status, expected_code, expected_message) = expected;
+    let (status, out) = harness.call("AmendBenefitApplication", body).await;
+    assert_eq!(
+        status, *expected_status,
+        "case {case:?}: expected {expected_status}, got {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        *expected_code,
+        "case {case:?}: expected {expected_code}, got {out:?}"
+    );
+    if let Some(expected_message) = expected_message {
+        let message = message_of(&out);
+        assert_eq!(
+            &message, expected_message,
+            "case {case:?}: expected the answer to state {expected_message:?}, got {message:?}"
+        );
+    }
+}
+
+/// The order this operation answers in, pinned one adjacent pair at a time.
+///
+/// The rule: a writing operation resolves the `Catalog` its request names FIRST and
+/// applies the account-level entitlement gate only to a request whose catalog resolved,
+/// and each later check — this service's own bounds on the unconstrained members, the
+/// `ClientToken` replay, the application lookup, the application's status, the revision,
+/// then the amendments — answers only a request the step before it admitted.
+///
+/// Each row carries TWO faults, one for each side of one adjacent pair, and must be
+/// answered by the EARLIER step's own refusal: status, code and — where the rule fixes the
+/// whole sentence — message. The rows span the pairs of the whole chain, crossed with the
+/// catalog spellings and the identifier forms the modelled patterns admit and with both
+/// entitlements where the pair is about the gate.
+#[tokio::test]
+async fn amend_answers_its_refusals_in_the_documented_order() {
+    let entitled = Harness::new();
+    let unentitled = Harness::unentitled();
+
+    // Two applications in the entitled store: one still amendable, one taken to a
+    // terminal status over the wire.
+    let created = seed(
+        &entitled,
+        "seed",
+        "tok-order-live",
+        json!({ "Name": "demo" }),
+    )
+    .await;
+    let live = text("seed", &created, "Id");
+    let created = seed(
+        &entitled,
+        "seed",
+        "tok-order-terminal",
+        json!({ "Name": "demo" }),
+    )
+    .await;
+    let terminal = text("seed", &created, "Id");
+    ok(
+        &entitled,
+        "seed",
+        "CancelBenefitApplication",
+        &json!({
+            "Catalog": CATALOG,
+            "ClientToken": "tok-order-cancel",
+            "Identifier": terminal,
+            "Reason": "the partner withdrew the application",
+        }),
+    )
+    .await;
+
+    // A revision no application is at, so every row that REACHES the revision check fails
+    // it — and only those rows are answered by it.
+    let stale = "99999";
+    let one_amendment = json!([amendment("Name", "should-not-apply")]);
+
+    // Request-shape validation, ahead of the catalog lookup: a malformed `Identifier` is
+    // the centralized walk's 400 whatever catalog the request names and whichever account
+    // it comes from.
+    for (name, catalog) in unknown_catalogs() {
+        for (entitlement, harness) in [("un-entitled", &unentitled), ("entitled", &entitled)] {
+            let case =
+                format!("shape validation ahead of the catalog lookup: {name}, {entitlement}");
+            let body = with_catalog(
+                &amend_body(
+                    "!!not an identifier!!",
+                    stale,
+                    "tok-order-shape",
+                    one_amendment.clone(),
+                ),
+                &catalog,
+            );
+            assert_answer(harness, &case, &body, &(400, "ValidationException", None)).await;
+        }
+    }
+
+    // The catalog lookup, ahead of the entitlement gate: a catalog this service does not
+    // hold is that lookup's own 404 for the account the gate would deny, even though the
+    // same request would also fail every check below.
+    for (name, catalog) in unknown_catalogs() {
+        let case = format!("the catalog lookup ahead of the entitlement gate: {name}");
+        let body = with_catalog(
+            &amend_body(UNKNOWN_APPLICATION, stale, "tok-order-catalog", json!([])),
+            &catalog,
+        );
+        assert_answer(
+            &unentitled,
+            &case,
+            &body,
+            &(
+                404,
+                "ResourceNotFoundException",
+                Some(not_found_message(CATALOG_KIND, &catalog)),
+            ),
+        )
+        .await;
+    }
+
+    // The entitlement gate, ahead of this operation's own bounds: on every catalog the
+    // service DOES hold, the un-entitled caller is denied before the empty list it sent is
+    // judged and before any application is resolved.
+    for catalog in SEEDED_CATALOGS {
+        let case = format!("the entitlement gate ahead of this operation's own bounds: {catalog}");
+        let body = with_catalog(
+            &amend_body(UNKNOWN_APPLICATION, stale, "tok-order-gate", json!([])),
+            catalog,
+        );
+        assert_answer(
+            &unentitled,
+            &case,
+            &body,
+            &(
+                DENIED_STATUS,
+                "AccessDeniedException",
+                Some(ENTITLEMENT_MESSAGE.to_string()),
+            ),
+        )
+        .await;
+    }
+
+    // This operation's own bounds, ahead of the application lookup: both bounds on the
+    // amendment list, each one past, on a request naming no stored application.
+    let bounds: Vec<(&str, Value, String)> = vec![
+        (
+            "no amendment at all",
+            json!([]),
+            clause(
+                "amendments",
+                &format!(
+                    "Member must have length greater than or equal to \
+                     {MIN_AMENDMENTS_PER_REQUEST}"
+                ),
+            ),
+        ),
+        (
+            "one amendment past the most a request may carry",
+            Value::Array(
+                (0..=MAX_AMENDMENTS_PER_REQUEST)
+                    .map(|index| amendment(&format!("BenefitApplicationDetails.f{index}"), "x"))
+                    .collect(),
+            ),
+            clause(
+                "amendments",
+                &format!(
+                    "Member must have length less than or equal to {MAX_AMENDMENTS_PER_REQUEST}"
+                ),
+            ),
+        ),
+    ];
+    for (index, (name, amendments, expected)) in bounds.iter().enumerate() {
+        let case = format!("this operation's own bounds ahead of the application lookup: {name}");
+        let body = amend_body(
+            UNKNOWN_APPLICATION,
+            stale,
+            &format!("tok-order-bound-{index}"),
+            amendments.clone(),
+        );
+        assert_answer(
+            &entitled,
+            &case,
+            &body,
+            &(400, "ValidationException", Some(expected.clone())),
+        )
+        .await;
+    }
+
+    // The application lookup, ahead of the status and the revision: an application the
+    // catalog does not hold is the lookup's own 404, in either identifier form, and not
+    // the revision conflict the same request also carries.
+    for (index, (name, identifier)) in [
+        ("an id no create minted", UNKNOWN_APPLICATION.to_string()),
+        ("an ARN no create minted", application_arn(UNKNOWN_APPLICATION)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let case = format!("the application lookup ahead of the status and the revision: {name}");
+        let body = amend_body(
+            identifier,
+            stale,
+            &format!("tok-order-missing-{index}"),
+            one_amendment.clone(),
+        );
+        assert_answer(
+            &entitled,
+            &case,
+            &body,
+            &(
+                404,
+                "ResourceNotFoundException",
+                Some(not_found_message(APPLICATION_KIND, identifier)),
+            ),
+        )
+        .await;
+    }
+
+    // The application's status, ahead of the revision: a terminal application is refused
+    // for the status it is in even when the request names a revision it is not at.
+    let case = "the status ahead of the revision";
+    let body = amend_body(&terminal, stale, "tok-order-status", one_amendment.clone());
+    assert_answer(
+        &entitled,
+        case,
+        &body,
+        &(
+            409,
+            "ConflictException",
+            Some(status_conflict_message(
+                &terminal,
+                STATUS_CANCELED,
+                "amended",
+            )),
+        ),
+    )
+    .await;
+
+    // The revision, ahead of the amendments the request carries: a stale revision carrying
+    // an amendment that could never apply is answered by the revision check, which names
+    // the revisions and no field path.
+    let current = text(
+        "the revision ahead of the amendments",
+        &get(&entitled, "the revision ahead of the amendments", &live).await,
+        "Revision",
+    );
+    let case = "the revision ahead of the amendments it carries";
+    let body = amend_body(
+        &live,
+        stale,
+        "tok-order-revision",
+        json!([amendment("Status", "APPROVED")]),
+    );
+    assert_answer(
+        &entitled,
+        case,
+        &body,
+        &(
+            409,
+            "ConflictException",
+            Some(revision_conflict_message(&live, &current, stale)),
+        ),
+    )
+    .await;
+
+    // The `ClientToken` replay check, ahead of the status and the revision — run last,
+    // because it is the one pair here whose first call WRITES. A retry of the amendment
+    // that already applied answers success although the revision it still carries is now
+    // the one the first call moved past, and a DIFFERENT request carrying that spent token
+    // is the replay check's own conflict rather than that revision's.
+    let first = amend_body(
+        &live,
+        &current,
+        "tok-order-replay",
+        json!([amendment("Name", "amended-once")]),
+    );
+    ok(
+        &entitled,
+        "the replay check",
+        "AmendBenefitApplication",
+        &first,
+    )
+    .await;
+    let applied = get(&entitled, "the replay check", &live).await;
+    ok(
+        &entitled,
+        "the replay check, retried",
+        "AmendBenefitApplication",
+        &first,
+    )
+    .await;
+    let retried = get(&entitled, "the replay check, retried", &live).await;
+    assert_eq!(
+        retried, applied,
+        "case \"the replay check, retried\": a retry must apply nothing a second time, \
+         got {retried:?}"
+    );
+    let case = "the replay check ahead of the revision";
+    let mismatch = amend_body(
+        &live,
+        &current,
+        "tok-order-replay",
+        json!([amendment("Name", "amended-differently")]),
+    );
+    assert_answer(
+        &entitled,
+        case,
+        &mismatch,
+        &(
+            409,
+            "ConflictException",
+            Some(IDEMPOTENT_PARAMETER_MISMATCH.to_string()),
+        ),
+    )
+    .await;
+    let after = get(&entitled, case, &live).await;
+    assert_eq!(
+        after, applied,
+        "case {case:?}: a refused amendment must change nothing, got {after:?}"
+    );
 }

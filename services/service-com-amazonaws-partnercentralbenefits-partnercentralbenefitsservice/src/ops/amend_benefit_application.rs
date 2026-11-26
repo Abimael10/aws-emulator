@@ -5,21 +5,31 @@
 //! [`crate::state`], bumps its revision and `UpdatedAt` where that changed the record,
 //! and records the amendment.
 //!
-//! The operation answers in this order, which is the order AWS reports:
+//! The operation answers in this order, which is the order its sibling write paths answer
+//! in (`crate::ops::update_benefit_application`, and the resource writes beside it):
 //!
 //! 1. request-shape validation — the centralized walk, before this handler runs;
-//! 2. the partner-entitlement gate — a caller holding no active AWS partner benefit is
-//!    refused with `AccessDeniedException` (see [`crate::state::ENTITLEMENT_REQUIRED`]),
-//!    so it never learns whether the application it named exists;
-//! 3. the `ClientToken` replay check — a retry of an amendment already applied changes
+//! 2. the `Catalog` the request names, and then the partner-entitlement gate — one
+//!    construction of that order for every writing operation
+//!    ([`crate::state::write_request_refusal`]): a catalog this service does not hold has
+//!    no application to amend inside it, so it is answered with that lookup's own
+//!    `ResourceNotFoundException` whatever the calling account holds, and a caller holding
+//!    no active AWS partner benefit whose catalog DID resolve is refused with
+//!    `AccessDeniedException` (see [`crate::state::PARTNER_ENTITLEMENT_REQUIRED`]), so it
+//!    never learns whether the application it named exists;
+//! 3. the bounds this service puts on the members the model leaves unconstrained — how
+//!    many amendments one request carries, and the two strings the record keeps;
+//! 4. the `ClientToken` replay check — a retry of an amendment already applied changes
 //!    nothing and answers success, while the same token on a request naming different
 //!    amendments, reason, revision or application is refused with `ConflictException` (see
 //!    [`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::replayed_application_write`]);
-//! 4. the application's status — AWS has finished with a terminal application
+//! 5. the application itself — one the named catalog does not hold is
+//!    `ResourceNotFoundException`;
+//! 6. the application's status — AWS has finished with a terminal application
 //!    ([`crate::state::TERMINAL_STATUSES`]), so amending one is `ConflictException`;
-//! 5. optimistic concurrency — the request's `Revision` must be the application's
+//! 7. optimistic concurrency — the request's `Revision` must be the application's
 //!    current one, else `ConflictException`;
-//! 6. the amendments themselves, applied to a copy so that a request carrying one that
+//! 8. the amendments themselves, applied to a copy so that a request carrying one that
 //!    cannot be applied leaves the stored application exactly as it was.
 //!
 //! The revision is the record's optimistic-concurrency token, so it moves only when the
