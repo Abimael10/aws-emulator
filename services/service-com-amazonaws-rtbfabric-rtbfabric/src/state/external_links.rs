@@ -33,6 +33,18 @@ pub const CONNECTIVITY_TYPE_PUBLIC_EGRESS: &str = "PUBLIC_EGRESS";
 /// this resource (`smithy_query(query="shape", shape="ConnectivityType")`).
 pub const CONNECTIVITY_TYPE_EXTERNAL_INBOUND: &str = "EXTERNAL_INBOUND";
 
+/// What a responder gateway whose type does not take links from outside the fabric is
+/// refused `CreateInboundExternalLink` with.
+///
+/// The inbound-external-link surface and the certificate surface are the two surfaces
+/// only an `EXTERNAL` responder gateway has, so this states the same precondition the
+/// other one states, in the same words
+/// ([`CERTIFICATE_EXTERNAL_ONLY_MESSAGE`](super::CERTIFICATE_EXTERNAL_ONLY_MESSAGE)):
+/// fixed text naming the type the surface requires and nothing from the request or
+/// from state.
+pub const INBOUND_EXTERNAL_LINK_EXTERNAL_ONLY_MESSAGE: &str =
+    "Inbound external link creation is only supported for EXTERNAL gatewayType";
+
 /// The DNS name this service assigns ONE inbound external link: the link's own id as
 /// the leftmost label under the inbound name of the gateway it was created on
 /// ([`external_inbound_endpoint`](super::external_inbound_endpoint)).

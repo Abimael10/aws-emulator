@@ -41,6 +41,7 @@ pub use certificates::{
 pub use external_links::{
     inbound_external_link_domain_name, InboundExternalLink, OutboundExternalLink,
     CONNECTIVITY_TYPE_EXTERNAL_INBOUND, CONNECTIVITY_TYPE_PUBLIC_EGRESS,
+    INBOUND_EXTERNAL_LINK_EXTERNAL_ONLY_MESSAGE,
 };
 pub use page_tokens::{
     decode_next_token, encode_next_token, token_refusal, PageTokenKey, TokenRefusal, Walk,

@@ -7,7 +7,9 @@
 //! the fabric, including `attributes`, `logSettings` and `tags` — which this
 //! operation's response shape does not carry, so `GetInboundExternalLink` can only
 //! read them from state. An unknown responder gateway -> `ResourceNotFoundException`
-//! (404); a replayed `clientToken` answers with the link the first call minted.
+//! (404); a stored responder gateway whose `gatewayType` is not `EXTERNAL` ->
+//! `ValidationException` (400), because only that type takes links from outside the
+//! fabric; a replayed `clientToken` answers with the link the first call minted.
 //!
 //! ## Shape of an operation
 //!
@@ -191,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@http` URI addresses — so it is stored only where that gateway is. A
         // requester gateway of that id is no responder gateway: it opens outbound
         // external links instead.
-        if !store.responder_gateways.contains_key(&input.gateway_id) {
+        let Some(gateway) = store.responder_gateways.get(&input.gateway_id) else {
             return Err(
                 CreateInboundExternalLinkErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -200,6 +202,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+        // Only an EXTERNAL gateway takes links from outside the fabric, so only it has
+        // the public inbound name such a link is reached under — the one it reports as
+        // its `externalInboundEndpoint`. The precondition is read off the stored
+        // gateway's own type through the one reading of it the whole crate shares,
+        // exactly as the other surface only that type has reads it.
+        if !gateway.is_external() {
+            return Err(CreateInboundExternalLinkErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::INBOUND_EXTERNAL_LINK_EXTERNAL_ONLY_MESSAGE.to_string(),
+                },
+            )
+            .into());
         }
 
         // See `create_requester_gateway` for the `@idempotencyToken` contract; the

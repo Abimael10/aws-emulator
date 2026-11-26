@@ -122,6 +122,9 @@ impl Fabric {
     }
 
     /// Create a responder gateway carrying `tags` and return its minted id.
+    ///
+    /// `EXTERNAL`, because this suite tags the inbound external links such a gateway
+    /// takes, and that surface is one only that gateway type has.
     async fn responder_gateway(&self, case: &str, tags: &[(String, String)]) -> String {
         let mut body = json!({
             "vpcId": "vpc-0123456789abcdef0",
@@ -131,6 +134,7 @@ impl Fabric {
             "protocol": "HTTPS",
             "listenerConfig": { "protocols": ["HTTPS"] },
             "domainName": "responder.example.com",
+            "gatewayType": "EXTERNAL",
             "clientToken": "token-responder",
         });
         if !tags.is_empty() {

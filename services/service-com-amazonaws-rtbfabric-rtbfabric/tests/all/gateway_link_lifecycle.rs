@@ -2946,7 +2946,10 @@ struct InboundRow {
     case: &'static str,
     /// Which row of [`ROWS`] the responder gateway is created from, so the table
     /// spans both forms a responder gateway is reached by (a caller-stated
-    /// `domainName` and a managed endpoint) and both gateway types.
+    /// `domainName` and a managed endpoint) and the whole range of ports, protocols
+    /// and subnet counts those rows state. The gateway is always created `EXTERNAL`,
+    /// because that is the only type this surface exists for — the type precondition
+    /// itself is the `inbound_external_link_gateway_type` suite's subject.
     gateway_row: usize,
     /// A `LinkAttributes`, or `Value::Null` for a link that carries none.
     attributes: Value,
@@ -2974,21 +2977,21 @@ impl InboundRow {
 }
 
 /// The inbound-external-link table. The rows differ along what the rule
-/// generalises over: how the responder gateway taking the link is reached and what
-/// type it is, which members of `attributes` are stated and whether any are, how
-/// many tags the link carries, and the sampling percentages, including each
-/// published bound of that range.
+/// generalises over: how the responder gateway taking the link is reached, which
+/// members of `attributes` are stated and whether any are, how many tags the link
+/// carries, and the sampling percentages, including each published bound of that
+/// range.
 fn inbound_rows() -> Vec<InboundRow> {
     vec![
         InboundRow {
-            case: "a domain-name gateway of no stated type, no attributes, no tags",
+            case: "a domain-name gateway, no attributes, no tags",
             gateway_row: 0,
             attributes: Value::Null,
             log_settings: log_settings_at(100.0, 0.0),
             tags: Value::Null,
         },
         InboundRow {
-            case: "an EXTERNAL gateway behind a managed endpoint, a customer id, one tag",
+            case: "a gateway behind a managed endpoint, a customer id, one tag",
             gateway_row: 1,
             attributes: json!({ "customerProvidedId": "exchange-north-1" }),
             log_settings: log_settings_at(12.5, 37.25),
@@ -3000,7 +3003,7 @@ fn inbound_rows() -> Vec<InboundRow> {
             // `loggingTypes` holds one or two of NONE, METRIC, RESPONSE
             // (`smithy_query(query="shape",
             // shape="ResponderErrorMaskingForHttpCode")`).
-            case: "an INTERNAL gateway, error masking for two codes, three tags",
+            case: "a gateway at the other end of each bound, error masking for two codes, three tags",
             gateway_row: 2,
             attributes: json!({
                 "customerProvidedId": "exchange_south-2",
@@ -3026,15 +3029,19 @@ fn inbound_rows() -> Vec<InboundRow> {
 
 impl Fabric {
     /// A stored responder gateway, as `CreateResponderGateway` mints one from the
-    /// lifecycle table's row `gateway_row`.
-    async fn responder_gateway_of(&self, case: &str, gateway_row: usize, token: &str) -> String {
-        let (status, body) = self
-            .send(
-                "POST",
-                "/responder-gateway",
-                Some(ROWS[gateway_row].responder_body(token)),
-            )
-            .await;
+    /// lifecycle table's row `gateway_row`, of the `EXTERNAL` type: the
+    /// inbound-external-link surface is one only that type has, so a row of the
+    /// inbound table states the rest of the gateway's shape and this states its
+    /// type.
+    async fn external_responder_gateway_of(
+        &self,
+        case: &str,
+        gateway_row: usize,
+        token: &str,
+    ) -> String {
+        let mut request = ROWS[gateway_row].responder_body(token);
+        request["gatewayType"] = json!("EXTERNAL");
+        let (status, body) = self.send("POST", "/responder-gateway", Some(request)).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected CreateResponderGateway to answer 200, got {status} {body:?}"
@@ -3079,7 +3086,7 @@ async fn an_inbound_external_link_round_trips_through_state() {
         let case = row.case;
         let fabric = Fabric::new();
         let gateway_id = fabric
-            .responder_gateway_of(case, row.gateway_row, "token-responder")
+            .external_responder_gateway_of(case, row.gateway_row, "token-responder")
             .await;
 
         let (status, created) = fabric
@@ -3244,7 +3251,7 @@ async fn an_inbound_external_link_settles_to_the_status_the_clock_owes_it() {
     let rows = inbound_rows();
     let row = &rows[1];
     let gateway_id = fabric
-        .responder_gateway_of(case, row.gateway_row, "token-responder")
+        .external_responder_gateway_of(case, row.gateway_row, "token-responder")
         .await;
 
     let (status, created) = fabric
@@ -3300,10 +3307,10 @@ async fn an_inbound_external_link_resolves_only_through_the_gateway_it_was_creat
     let row = &rows[0];
 
     let gateway_id = fabric
-        .responder_gateway_of(case, row.gateway_row, "token-responder")
+        .external_responder_gateway_of(case, row.gateway_row, "token-responder")
         .await;
     let other_gateway_id = fabric
-        .responder_gateway_of(case, row.gateway_row, "token-other")
+        .external_responder_gateway_of(case, row.gateway_row, "token-other")
         .await;
     let requester_id = fabric.requester_gateway(case, "token-requester").await;
 
@@ -3441,7 +3448,7 @@ async fn a_repeated_client_token_answers_with_the_first_inbound_external_link() 
         let case = row.case;
         let fabric = Fabric::new();
         let gateway_id = fabric
-            .responder_gateway_of(case, row.gateway_row, "token-responder")
+            .external_responder_gateway_of(case, row.gateway_row, "token-responder")
             .await;
 
         let (status, first) = fabric
