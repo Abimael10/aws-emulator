@@ -65,3 +65,32 @@ Cause 2 (metric-stream lifecycle):
 3. Then GetMetricStream(Name=<exclude stream>) and assert ExcludeFilters == [{'Namespace':'AWS/EC2','MetricNames':['CPUUtilization','NetworkIn','NetworkOut','DiskReadBytes','DiskWriteBytes']}] in that order and FirehoseArn == the stack's Firehose ARN; ListMetricStreams + GetMetricStream must derive exactly that one exclude stream.
 4. StopMetricStreams on both, let the Firehose drain, then DeleteStack — GetMetricStream must then answer ResourceNotFoundException (404).
 5. Re-replay the id to confirm the scenario reaches a verdict inside the suite's cap.
+
+## Resolution
+
+Cause 1 — FIXED. A read is answered from every datum of the series inside its range, each reported
+at the start of the span that datum's own `StorageResolution` stores it in (the whole minute for a
+regular-resolution datum, its own second for a high-resolution one), and the data sharing one window
+of the requested `Period` are folded by the query's `Stat`. That is what the one window fold every
+reader of a series goes through already does in this code base
+(`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/state.rs`:
+`StoredDatum::aggregated_instant` / `aggregated_span`, `windows_by_unit` / `windows_of`), over the
+per-datum class `PutMetricData` records (`src/ops/put_metric_data.rs`, `storage_resolution`), and
+`GetMetricData`'s per-query fold (`src/state/metric_query.rs`, `folded_series`) keeps every window of
+the range. The recorded unit replays green; the rule is now pinned for `GetMetricData` by
+`tests/all/metric_data_mixed_resolution_folds.rs`, over a table of periods, statistics, storage-class
+declarations and publish instants, including the cross-period agreement of `Sum`/`SampleCount`.
+
+Cause 2 — DECLINED: no emulator divergence. Nothing of the lifecycle answers differently from the
+recording — the whole recorded sequence (a CREATE change set waited for and executed,
+`GetMetricStream` per stream, the paginated `ListMetricStreams` walk, `StopMetricStreams`, emptying
+the destination until it stays empty, `DeleteStack`, and the post-destroy not-found reads) is driven
+end to end over the assembled emulator by
+`core/router/tests/all/cloudformation_monitoring_metric_streams_lifecycle.rs`, where every call
+answers from state and both estates complete in 19.1 s (≈9.5 s each), of which the delivery stream's
+`CREATING` -> `ACTIVE` and `DELETING` -> removed transitions are one span each. The check reaches no
+verdict because its own waits do not fit the replay harness's 60 s per-check cap: it is killed inside
+its destination-drain loop's `time.sleep(2)` while watching for the 90 s quiet window its
+`_QUIET_S` asks for, which no emulator behaviour can make shorter than the cap. Same
+budget-exhaustion shape as 20261116T122519Z-codebuild-ecr-ecs-elbv2-logs-both-container-ci.md and
+20261120T073735Z-lambda-rds-secretsmanager-the-iam-auth-rds-proxy.md.
