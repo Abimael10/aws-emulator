@@ -14,8 +14,9 @@
 //!
 //! Enabling, resizing or disabling the stage's cache cluster is a transition the CLOCK
 //! owes: the due instant is stored on the record (see [`crate::state::StageEntry`]) and
-//! `cacheClusterStatus` is computed from it, so a caller reading straight after this call
-//! still observes `CREATE_IN_PROGRESS` or `DELETE_IN_PROGRESS`.
+//! `cacheClusterStatus` is computed from it as of the instant this call is answered, so
+//! THIS answer reports the `CREATE_IN_PROGRESS` or `DELETE_IN_PROGRESS` it accepted and a
+//! later call reports what the clock has since made of it.
 //!
 //! Turning a method's EXECUTION logging on is gated on the account rather than on the
 //! stage: API Gateway writes those log events under the account-level CloudWatch Logs
@@ -535,6 +536,10 @@ struct StagePatchContext<'a> {
     /// Whether the ACCOUNT has a CloudWatch Logs role, which a patch turning execution
     /// logging on requires (see [`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`]).
     logging_role_configured: bool,
+    /// The instant this update is ANSWERED at: when a patch of the cache cluster accepts
+    /// the provisioning or the teardown it asks for, so the due instant every op of one
+    /// list records is the same one this answer is rendered as of.
+    accepted_at: ::std::time::Instant,
 }
 
 /// Apply one patch to a COPY of a stored stage.
@@ -637,8 +642,8 @@ fn apply_stage_patch(
             Ok(())
         }
         "tracingEnabled" => patch_stage_bool(&mut entry.tracing_enabled, patch),
-        "cacheClusterEnabled" => apply_cache_cluster_enabled(entry, patch),
-        "cacheClusterSize" => apply_cache_cluster_size(entry, patch),
+        "cacheClusterEnabled" => apply_cache_cluster_enabled(entry, patch, context.accepted_at),
+        "cacheClusterSize" => apply_cache_cluster_size(entry, patch, context.accepted_at),
         "variables" => {
             let name = patch.map_key(1)?;
             // The name and the value go through the one check `CreateStage` enforces for
@@ -754,8 +759,12 @@ fn apply_deployment_id(
 }
 
 /// Enable or disable the stage's cache cluster, recording the instant the transition the
-/// clock now owes is due.
-fn apply_cache_cluster_enabled(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
+/// clock now owes is due — `accepted_at` being the instant this update is answered at.
+fn apply_cache_cluster_enabled(
+    entry: &mut StageEntry,
+    patch: &Patch,
+    accepted_at: ::std::time::Instant,
+) -> Result<(), PatchFailure> {
     let was_enabled = entry.cache_cluster_enabled;
     patch_stage_bool(&mut entry.cache_cluster_enabled, patch)?;
     if entry.cache_cluster_enabled == was_enabled {
@@ -763,7 +772,7 @@ fn apply_cache_cluster_enabled(entry: &mut StageEntry, patch: &Patch) -> Result<
         // owed and an outstanding one is left alone.
         return Ok(());
     }
-    let now = ::std::time::Instant::now();
+    let now = accepted_at;
     // A cluster that is provisioned or torn down holds nothing: the entries of the one
     // that was there do not survive it (`StageEntry::response_cache`).
     entry.flush_response_cache();
@@ -791,12 +800,15 @@ fn apply_cache_cluster_enabled(entry: &mut StageEntry, patch: &Patch) -> Result<
 /// `CreateStage` or `CreateDeployment` carries one and the request-validation layer
 /// checks it — and not this member's stored string, which every reader of the stage
 /// echoes back as it was set.
-fn apply_cache_cluster_size(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
+fn apply_cache_cluster_size(
+    entry: &mut StageEntry,
+    patch: &Patch,
+    accepted_at: ::std::time::Instant,
+) -> Result<(), PatchFailure> {
     let before = entry.cache_cluster_size.clone();
     patch_optional_string(&mut entry.cache_cluster_size, patch, MAX_STRING_CHARS)?;
     if entry.cache_cluster_enabled && entry.cache_cluster_size != before {
-        entry.cache_cluster_ready_at =
-            Some(::std::time::Instant::now() + crate::state::CACHE_CLUSTER_CREATE_SPAN);
+        entry.cache_cluster_ready_at = Some(accepted_at + crate::state::CACHE_CLUSTER_CREATE_SPAN);
         entry.cache_flush_done_at = None;
         entry.cache_cluster_removed_at = None;
         // A cluster of the new capacity comes up holding nothing, as a provisioned one
@@ -1420,6 +1432,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(patch_failure)?;
 
         let now = crate::state::now();
+        // The instant this call is ANSWERED at: a patch of the cache cluster accepts the
+        // provisioning or the teardown it asks for at this instant, and the answer is
+        // rendered as of it (see `crate::state::StageEntry::cache_cluster_status_at`).
+        let accepted_at = ::std::time::Instant::now();
         // The store is locked for THIS block alone, which is the whole state change: what it
         // answers is owned, so the group the stage publishes is created below with no guard
         // held — a write into CloudWatch Logs is a call into another service.
@@ -1462,6 +1478,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployments: &deployments,
                 client_certificates: &client_certificates,
                 logging_role_configured,
+                accepted_at,
             };
 
             for patch in &patches {
@@ -1502,7 +1519,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Rendered through the one `Stage` body this crate builds, from the record about
             // to be stored, so the update reports the stage exactly as `GetStage` will read
             // it back.
-            let body = super::create_stage::stage_body(&updated, None);
+            let body = super::create_stage::stage_body_as_of(&updated, None, accepted_at);
             let region = api.arn_region().to_string();
             // Whether the stage this patch leaves behind has its EXECUTION logging on, which
             // is what API Gateway publishes the stage's own log group for

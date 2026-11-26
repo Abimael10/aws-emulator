@@ -683,7 +683,8 @@ pub struct StageEntry {
     pub cache_cluster_enabled: bool,
     pub cache_cluster_size: Option<String>,
     /// When the stage's cache cluster finishes being created. A cluster is reported
-    /// `CREATE_IN_PROGRESS` until this instant and `AVAILABLE` after it; absent when the
+    /// `CREATE_IN_PROGRESS` by an answer taken AT this instant — the call that accepted the
+    /// provisioning — and `AVAILABLE` by every call after it; absent when the
     /// stage has no cache cluster, which is reported `NOT_AVAILABLE`. See
     /// [`CACHE_CLUSTER_CREATE_SPAN`].
     pub cache_cluster_ready_at: Option<::std::time::Instant>,
@@ -785,21 +786,32 @@ pub struct StageEntry {
 impl StageEntry {
     /// The `cacheClusterStatus` this stage reports now.
     ///
-    /// A stage without a cache cluster has none to report, which is `NOT_AVAILABLE`. A
-    /// cluster the caller asked for is created over [`CACHE_CLUSTER_CREATE_SPAN`], so a
-    /// caller reading straight after the call still sees `CREATE_IN_PROGRESS`; the
-    /// transition is one the CLOCK owes, materialised from the stored due instant rather
-    /// than by sleeping or by being read. A cluster a `FlushStageCache` call emptied
-    /// reports `FLUSH_IN_PROGRESS` over [`CACHE_CLUSTER_FLUSH_SPAN`] the same way, and is
-    /// `AVAILABLE` again once that instant has passed. A cluster an `UpdateStage`
-    /// disabled is torn down over [`CACHE_CLUSTER_DELETE_SPAN`], reporting
-    /// `DELETE_IN_PROGRESS` until then and `NOT_AVAILABLE` after it.
+    /// Every reader of a stored stage goes through this; the answer that ACCEPTED a change
+    /// of the cluster reports it as of the instant it accepted that change instead
+    /// ([`Self::cache_cluster_status_at`]).
     pub fn cache_cluster_status(&self) -> &'static str {
-        let now = ::std::time::Instant::now();
+        self.cache_cluster_status_at(::std::time::Instant::now())
+    }
+
+    /// The `cacheClusterStatus` this stage reports as of `at` — the instant the call that
+    /// reports it was answered.
+    ///
+    /// A stage without a cache cluster has none to report, which is `NOT_AVAILABLE`. A
+    /// cluster the caller asked for is provisioned over [`CACHE_CLUSTER_CREATE_SPAN`], so
+    /// the answer that ACCEPTED the provisioning — rendered as of the instant it was
+    /// accepted — reports `CREATE_IN_PROGRESS`, and every later call reports the terminal
+    /// status the clock then owes; the transition is one the CLOCK owes, materialised from
+    /// the stored due instant rather than by sleeping or by being read. A cluster a
+    /// `FlushStageCache` call emptied reports `FLUSH_IN_PROGRESS` over
+    /// [`CACHE_CLUSTER_FLUSH_SPAN`] the same way, and is `AVAILABLE` again once that
+    /// instant has passed. A cluster an `UpdateStage` disabled is torn down over
+    /// [`CACHE_CLUSTER_DELETE_SPAN`], reporting `DELETE_IN_PROGRESS` until then and
+    /// `NOT_AVAILABLE` after it.
+    pub fn cache_cluster_status_at(&self, at: ::std::time::Instant) -> &'static str {
         // A teardown the clock owes outranks the cluster that is going away: the stage
         // reports the removal until it is due, and `NOT_AVAILABLE` from then on.
         if let Some(removed_at) = self.cache_cluster_removed_at {
-            return if now < removed_at {
+            return if at < removed_at {
                 CACHE_CLUSTER_DELETE_IN_PROGRESS
             } else {
                 CACHE_CLUSTER_NOT_AVAILABLE
@@ -807,9 +819,12 @@ impl StageEntry {
         }
         match self.cache_cluster_ready_at {
             None => CACHE_CLUSTER_NOT_AVAILABLE,
-            Some(ready_at) if now < ready_at => CACHE_CLUSTER_CREATE_IN_PROGRESS,
+            // Due AT `ready_at`: the call that accepted the provisioning is answered as of
+            // that very instant and reports the provisioning it accepted, and every call
+            // strictly after it reports the cluster the clock has since brought up.
+            Some(ready_at) if at <= ready_at => CACHE_CLUSTER_CREATE_IN_PROGRESS,
             Some(_) => {
-                if self.cache_flush_done_at.is_some_and(|done_at| now < done_at) {
+                if self.cache_flush_done_at.is_some_and(|done_at| at < done_at) {
                     CACHE_CLUSTER_FLUSH_IN_PROGRESS
                 } else {
                     CACHE_CLUSTER_AVAILABLE
@@ -2479,12 +2494,22 @@ pub const MAX_MODELS_PER_API: usize = 300;
 pub const MAX_STAGE_NAME_CHARS: usize = 128;
 
 /// How long a stage's cache cluster takes to come up, after which it reports
-/// `AVAILABLE`. API Gateway documents no duration for it ("it can take up to 4 minutes
-/// to create" is guidance, not a contract), so this span is the emulator's own, chosen
-/// so a caller reading straight after `CreateStage` still observes
-/// `CREATE_IN_PROGRESS`.
-pub const CACHE_CLUSTER_CREATE_SPAN: ::std::time::Duration =
-    ::std::time::Duration::from_millis(500);
+/// `AVAILABLE`: no time at all, so the move is already owed once the call that asked for
+/// the cluster has answered.
+///
+/// A cluster the caller asked for is reported `CREATE_IN_PROGRESS` by the answer that
+/// ACCEPTED it — provisioning has been accepted, not completed, which is what
+/// `CreateStage` and `UpdateStage` report ([`StageEntry::cache_cluster_status_at`] renders
+/// that answer as of the instant it was accepted) — and the observed behaviour is that the
+/// cluster is up by the time the caller's NEXT request arrives: a `GetStage` taken right
+/// after the accept reports a terminal `AVAILABLE`, and the stage's per-method response
+/// caching is in effect from then on. So the span a later call could observe
+/// `CREATE_IN_PROGRESS` for is empty: the record passes through it, and the move to
+/// `AVAILABLE` falls due at the accept instant rather than at a later one this emulator
+/// would have to invent (API Gateway documents no duration for it — "it can take up to 4
+/// minutes to create" is guidance, not a contract). Nothing sleeps for it either: the due
+/// instant is stored on the record and materialised by whichever call reads it next.
+pub const CACHE_CLUSTER_CREATE_SPAN: ::std::time::Duration = ::std::time::Duration::ZERO;
 
 /// The `cacheClusterStatus` of a stage with no cache cluster.
 pub const CACHE_CLUSTER_NOT_AVAILABLE: &str = "NOT_AVAILABLE";

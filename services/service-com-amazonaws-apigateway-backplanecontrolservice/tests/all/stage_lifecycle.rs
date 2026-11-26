@@ -15,12 +15,10 @@
 //! `apiSummary` over the methods the API had when it was created, and every identifier
 //! these operations resolve over the records that do and do not exist.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    CACHE_CLUSTER_AVAILABLE, CACHE_CLUSTER_CREATE_IN_PROGRESS, CACHE_CLUSTER_CREATE_SPAN,
-    CACHE_CLUSTER_NOT_AVAILABLE, MAX_STAGE_NAME_CHARS,
+    CACHE_CLUSTER_AVAILABLE, CACHE_CLUSTER_CREATE_IN_PROGRESS, CACHE_CLUSTER_NOT_AVAILABLE,
+    MAX_STAGE_NAME_CHARS,
 };
 
 use crate::rest_api_lifecycle::{
@@ -310,7 +308,7 @@ async fn a_stage_name_is_accepted_only_as_its_documentation_publishes_it() {
 }
 
 #[tokio::test]
-async fn a_cache_cluster_a_stage_asked_for_comes_up_after_its_span() {
+async fn a_cache_cluster_a_stage_asked_for_is_up_by_the_callers_next_request() {
     let gateway = Gateway::new();
     let (api, _) = api_with_a_method(&gateway, "stage-cache").await;
     let deployment =
@@ -333,7 +331,7 @@ async fn a_cache_cluster_a_stage_asked_for_comes_up_after_its_span() {
         "case CreateStage(cacheClusterEnabled): expected 201, got {} with {:?}",
         created.status, created.body
     );
-    // A caller reading straight after the call still sees the cluster coming up.
+    // The answer that ACCEPTED the provisioning reports the provisioning it accepted.
     assert_eq!(
         created.body["cacheClusterStatus"].as_str(),
         Some(CACHE_CLUSTER_CREATE_IN_PROGRESS),
@@ -347,15 +345,15 @@ async fn a_cache_cluster_a_stage_asked_for_comes_up_after_its_span() {
         created.body["cacheClusterSize"]
     );
 
-    // The transition is one the clock owes: once the span has passed, the cluster is up
-    // — for every reader, not just the first.
-    tokio::time::sleep(CACHE_CLUSTER_CREATE_SPAN + Duration::from_millis(100)).await;
-    for round in 0..2 {
+    // The cluster is up by the caller's NEXT request, with nothing waited out: the status
+    // reaches the terminal value a client polls for — for every reader, not just the first.
+    for round in 0..3 {
         let read = get_stage(&gateway, &api, "cached").await;
         assert_eq!(
             read.body["cacheClusterStatus"].as_str(),
             Some(CACHE_CLUSTER_AVAILABLE),
-            "case GetStage(round {round}) after the span: expected {CACHE_CLUSTER_AVAILABLE}, got {:?}",
+            "case GetStage(round {round}) after the create: expected {CACHE_CLUSTER_AVAILABLE}, \
+             got {:?}",
             read.body["cacheClusterStatus"]
         );
     }

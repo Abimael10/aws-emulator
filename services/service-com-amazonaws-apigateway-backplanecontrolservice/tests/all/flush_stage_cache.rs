@@ -21,15 +21,43 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    CACHE_CLUSTER_AVAILABLE, CACHE_CLUSTER_CREATE_IN_PROGRESS, CACHE_CLUSTER_CREATE_SPAN,
-    CACHE_CLUSTER_FLUSH_IN_PROGRESS, CACHE_CLUSTER_FLUSH_SPAN, CACHE_CLUSTER_NOT_AVAILABLE,
+    CACHE_CLUSTER_AVAILABLE, CACHE_CLUSTER_FLUSH_IN_PROGRESS, CACHE_CLUSTER_NOT_AVAILABLE,
 };
 
 use crate::rest_api_lifecycle::{assert_failure, create_api, without, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
-/// A margin on top of a stored span, so a test waiting one out is not racing it.
-const MARGIN: Duration = Duration::from_millis(150);
+/// How long a poll for a transition the clock owes keeps looking, and how often it looks.
+/// Generous: nothing here is timed, and the deadline is only what stops a test whose
+/// condition will never hold.
+const WAIT: Duration = Duration::from_secs(30);
+const LOOK_AGAIN: Duration = Duration::from_millis(25);
+
+/// Read `stage_name` back until its `cacheClusterStatus` is `wanted`, answering the stage
+/// body it reported then: what the stage looks like once the transition the clock owes has
+/// been materialised. Looks again until [`WAIT`] has passed, so nothing here depends on how
+/// fast the host runs.
+pub(crate) async fn polled_stage(
+    gateway: &Gateway,
+    api: &str,
+    stage_name: &str,
+    wanted: &str,
+    case: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let read = get_stage(gateway, api, stage_name).await;
+        if read.body["cacheClusterStatus"].as_str() == Some(wanted) {
+            return read.body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {case}: expected {wanted} from GetStage within {WAIT:?}, last body {:?}",
+            read.body
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
 
 /// `FlushStageCache` for `stage_name` of `api`. Shared with the `delete_stage` suite,
 /// which flushes a deleted stage's cache to show the record is gone for every reader.
@@ -59,10 +87,10 @@ fn without_cluster_status(body: &Value) -> Value {
 }
 
 /// Create `stage_name` on `api` from `extra` (the cache members and whatever else the row
-/// sets), answering the created stage's body. Waits out
-/// [`CACHE_CLUSTER_CREATE_SPAN`] for a stage that asked for a cluster, so the stage is
-/// `AVAILABLE` — a settled cluster — before the flush under test. Shared with the
-/// `flush_stage_authorizers_cache` suite, which needs the same settled stages.
+/// sets), answering the created stage's body. A stage that asked for a cluster is read back
+/// until that cluster is `AVAILABLE` — a settled cluster — before the flush under test.
+/// Shared with the `flush_stage_authorizers_cache` suite, which needs the same settled
+/// stages.
 pub(crate) async fn settled_stage(
     gateway: &Gateway,
     api: &str,
@@ -86,7 +114,7 @@ pub(crate) async fn settled_stage(
         created.status, created.body
     );
     if extra["cacheClusterEnabled"] == json!(true) {
-        tokio::time::sleep(CACHE_CLUSTER_CREATE_SPAN + MARGIN).await;
+        return polled_stage(gateway, api, stage_name, CACHE_CLUSTER_AVAILABLE, case).await;
     }
     get_stage(gateway, api, stage_name).await.body
 }
@@ -201,7 +229,7 @@ async fn flushing_a_stage_cache_empties_that_cluster_and_changes_nothing_else() 
 
         // The return to a settled cluster is one the clock owes, and it is owed to every
         // reader, not just the first.
-        tokio::time::sleep(CACHE_CLUSTER_FLUSH_SPAN + MARGIN).await;
+        polled_stage(&gateway, &api, stage_name, expected_after, case).await;
         for round in 0..2 {
             let settled = get_stage(&gateway, &api, stage_name).await;
             let status = cluster_status(&settled.body, case);
@@ -333,19 +361,19 @@ async fn flushing_a_cache_the_request_cannot_resolve_is_a_not_found() {
 }
 
 #[tokio::test]
-async fn a_flush_of_a_cluster_that_is_still_coming_up_is_due_after_it_is_up() {
+async fn a_flush_asked_for_right_after_the_create_is_outstanding_on_its_own() {
     let gateway = Gateway::new();
-    let (api, _) = create_api(&gateway, "flush-while-creating").await;
+    let (api, _) = create_api(&gateway, "flush-right-after-create").await;
     let deployment = create_deployment(
         &gateway,
         &api,
-        "CreateDeployment for the overlapping flush",
+        "CreateDeployment for the flush right after the create",
         json!({}),
     )
     .await;
 
-    // The stage is NOT settled before the flush: the cluster is still being created, so
-    // the flush overlaps the creation the clock still owes.
+    // The flush is asked for in the caller's very next request after the create, with
+    // nothing waited out in between.
     let created = gateway
         .call(
             "POST",
@@ -367,35 +395,26 @@ async fn a_flush_of_a_cluster_that_is_still_coming_up_is_due_after_it_is_up() {
     let flushed = flush_cache(&gateway, &api, "creating").await;
     assert_eq!(
         flushed.status, 202,
-        "case FlushStageCache(while creating): expected 202, got {} with {:?}",
+        "case FlushStageCache(right after the create): expected 202, got {} with {:?}",
         flushed.status, flushed.body
     );
 
-    // A cluster that has not come up yet reports its CREATION, which is the transition
-    // the clock owes first.
-    let during_create = get_stage(&gateway, &api, "creating").await;
-    let creating = cluster_status(&during_create.body, "while the cluster is coming up");
-    assert_eq!(
-        creating, CACHE_CLUSTER_CREATE_IN_PROGRESS,
-        "case while the cluster is coming up: expected {CACHE_CLUSTER_CREATE_IN_PROGRESS}, \
-         got {creating}"
-    );
-
-    // Once it is up, the flush it was asked for is what is outstanding: the overlapping
-    // flush is not swallowed by the creation.
-    tokio::time::sleep(CACHE_CLUSTER_CREATE_SPAN + MARGIN).await;
+    // The cluster the create accepted is up by this next call, so what is outstanding is
+    // the flush itself: it is not swallowed by the creation it followed.
     let during_flush = get_stage(&gateway, &api, "creating").await;
-    let flushing = cluster_status(&during_flush.body, "once the cluster is up");
+    let flushing = cluster_status(&during_flush.body, "right after the flush");
     assert_eq!(
         flushing, CACHE_CLUSTER_FLUSH_IN_PROGRESS,
-        "case once the cluster is up: expected {CACHE_CLUSTER_FLUSH_IN_PROGRESS}, got {flushing}"
+        "case right after the flush: expected {CACHE_CLUSTER_FLUSH_IN_PROGRESS}, got {flushing}"
     );
 
-    tokio::time::sleep(CACHE_CLUSTER_FLUSH_SPAN + MARGIN).await;
-    let settled = get_stage(&gateway, &api, "creating").await;
-    let status = cluster_status(&settled.body, "once both spans have passed");
-    assert_eq!(
-        status, CACHE_CLUSTER_AVAILABLE,
-        "case once both spans have passed: expected {CACHE_CLUSTER_AVAILABLE}, got {status}"
-    );
+    // And the return to a settled cluster is the transition the clock then owes.
+    polled_stage(
+        &gateway,
+        &api,
+        "creating",
+        CACHE_CLUSTER_AVAILABLE,
+        "once the flush span has passed",
+    )
+    .await;
 }

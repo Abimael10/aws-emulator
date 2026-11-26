@@ -158,13 +158,31 @@ pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
 ///
 /// `methodSettings` is reported even when empty: every stage has the map, and it is what
 /// `UpdateStage` fills. `cacheClusterStatus` is computed from the stored record (see
-/// [`StageEntry::cache_cluster_status`]).
+/// [`StageEntry::cache_cluster_status`]) as of the instant this answer is taken, which for
+/// a reader is now; the call that ACCEPTS a change of the cluster renders its own answer as
+/// of the instant it accepted that change ([`stage_body_as_of`]).
 ///
 /// `web_acl_arn` is NOT a field of the record: it is the web ACL WAF currently has in
 /// front of this stage ([`crate::state::associated_web_acl_arn`]), which the caller
 /// resolves with this service's store unlocked and hands in, so every reader of a stage
 /// reports the one live association and none of them can report a stale one.
 pub fn stage_body(entry: &StageEntry, web_acl_arn: Option<String>) -> CreateStageOutput {
+    stage_body_as_of(entry, web_acl_arn, ::std::time::Instant::now())
+}
+
+/// The same `Stage` body, reported as of `at`: the instant the call rendering it was
+/// answered.
+///
+/// The one member this changes is `cacheClusterStatus`, which is the status of the cluster
+/// AT that instant ([`StageEntry::cache_cluster_status_at`]): the call that accepted a
+/// provisioning, a flush or a teardown of the cluster reports what it accepted, and every
+/// call after it reports what the clock has since made of it. Every other member is the
+/// stored record's and does not depend on when it is read.
+pub fn stage_body_as_of(
+    entry: &StageEntry,
+    web_acl_arn: Option<String>,
+    at: ::std::time::Instant,
+) -> CreateStageOutput {
     CreateStageOutput {
         deployment_id: Some(entry.deployment_id.clone()),
         client_certificate_id: entry.client_certificate_id.clone(),
@@ -172,7 +190,7 @@ pub fn stage_body(entry: &StageEntry, web_acl_arn: Option<String>) -> CreateStag
         description: entry.description.clone(),
         cache_cluster_enabled: entry.cache_cluster_enabled,
         cache_cluster_size: entry.cache_cluster_size.clone(),
-        cache_cluster_status: Some(entry.cache_cluster_status().to_string()),
+        cache_cluster_status: Some(entry.cache_cluster_status_at(at).to_string()),
         method_settings: Some(
             entry
                 .method_settings
@@ -372,6 +390,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whole epoch seconds, like every other instant this surface reports; see
         // `crate::state::now`.
         let now = crate::state::now();
+        // The instant this call is ANSWERED at, which is when the provisioning of a cache
+        // cluster the request asked for is accepted: the due instant is taken from it and
+        // the answer is rendered as of it, so this answer reports the provisioning it
+        // accepted and every later call reports the cluster the clock has brought up.
+        let accepted_at = ::std::time::Instant::now();
         let mut store = state.lock();
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             CreateStageErrorModeled::NotFoundException(NotFoundException {
@@ -431,9 +454,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cache_cluster_size: input.cache_cluster_size,
             // A cache cluster the caller asked for is still coming up when this answer
             // is written; the span is stored, never slept through.
-            cache_cluster_ready_at: input.cache_cluster_enabled.then(|| {
-                ::std::time::Instant::now() + crate::state::CACHE_CLUSTER_CREATE_SPAN
-            }),
+            cache_cluster_ready_at: input
+                .cache_cluster_enabled
+                .then(|| accepted_at + crate::state::CACHE_CLUSTER_CREATE_SPAN),
             // No flush has run on a stage this call creates.
             cache_flush_done_at: None,
             // Nor has a cluster been torn down on it.
@@ -470,7 +493,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .stages
             .get(&input.stage_name)
             .ok_or_else(crate::state::state_unavailable)?;
-        let body = stage_body(stored, None);
+        let body = stage_body_as_of(stored, None, accepted_at);
         // The web ACL in front of the stage is WAFv2's record, read with this service's
         // store released: a stage can already be protected when it is created, because a
         // web ACL is bound to the stage's ARN rather than to the record this call wrote.
