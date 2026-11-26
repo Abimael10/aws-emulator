@@ -25,7 +25,9 @@
 //! `PASSWORD_VERIFIER` response carries the claim the exchange that sign-in served
 //! checks against the stored password ([`crate::state::user_srp_auth`]), and a sign-in
 //! that proves it reaches the same challenge — a new password, or the user's second
-//! factor — as one that sent its password directly.
+//! factor — as one that sent its password directly. That challenge's continuation is
+//! the `SECRET_BLOCK` it served rather than a `Session`, so its response names the
+//! exchange it answers by echoing that block and presents no session token.
 //!
 //! Answering the challenge is what TERMINATES the sign-in attempt it belongs to, so this
 //! call is also the OBSERVATION of that attempt's outcome, published into the pool's
@@ -338,7 +340,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|responses| responses.get(USERNAME))
             .cloned();
         let challenge = crate::state::auth_events::challenge_of(&input.challenge_name);
-        let answered_session = input.session.clone();
+        // Which attempt this response continues: the `Session` it presents, or — for
+        // the challenge whose continuation its own parameters carried — the
+        // `SECRET_BLOCK` the response echoes, which is the value that challenge was
+        // left outstanding on.
+        let answered_session = input.session.clone().or_else(|| {
+            input
+                .challenge_responses
+                .as_ref()?
+                .get(crate::state::PASSWORD_CLAIM_SECRET_BLOCK_RESPONSE)
+                .cloned()
+        });
         let ip_address = input
             .context_data
             .as_ref()
@@ -442,11 +454,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
         let now = ::std::time::SystemTime::now();
         // `Session` is "the session identifier that maintains the state of
         // authentication requests and challenge responses": without it there is
-        // no outstanding challenge to answer.
-        let session_token = input
-            .session
-            .clone()
-            .ok_or_else(|| missing_parameter("Session"))?;
+        // no outstanding challenge to answer — EXCEPT the `PASSWORD_VERIFIER`
+        // challenge of the secure-remote-password sign-in, whose continuation is
+        // carried by the challenge parameters it served, so its response
+        // resolves the exchange it answers out of what the response itself
+        // carries and presents no session.
+        let srp_continuation = input.challenge_name == crate::state::PASSWORD_VERIFIER_CHALLENGE;
+        let presented_session = input.session.clone();
+        if presented_session.is_none() && !srp_continuation {
+            return Err(missing_parameter("Session"));
+        }
         let responses = input.challenge_responses.clone().unwrap_or_default();
         // Every challenge response names the user it answers for: "all of the following
         // challenges require USERNAME and, when the app client has a client secret,
@@ -503,6 +520,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                 }
             }
 
+            // The `PASSWORD_VERIFIER` challenge of the secure-remote-password
+            // sign-in is answered with the claim that sign-in's exchange checks:
+            // "respond with `PASSWORD_CLAIM_SIGNATURE`,
+            // `PASSWORD_CLAIM_SECRET_BLOCK`, and `TIMESTAMP`"
+            // (`ChallengeResponses` in this service's model), held to the one
+            // rule both response operations ask
+            // ([`crate::state::UserSrpRefusal`]) over the password stored for
+            // the user the challenge was served for. The exchange is the one
+            // whose `SECRET_BLOCK` the response echoes — the continuation that
+            // challenge served — so no stored session decides this response.
+            if srp_continuation {
+                // The claim is the credential this challenge checks, so it is
+                // checked FIRST: a response that does not prove the password is
+                // refused as the wrong password whatever state the stored user
+                // is in, which is what keeps that refusal from stating anything
+                // about the user.
+                let proved = guard
+                    .answer_password_verifier(&input.client_id, &responses, now)
+                    .map_err(srp_refused)?;
+                // A response that names a DEVICE answers for that device, so the
+                // key has to name one this pool registered to the user the
+                // challenge was served for.
+                if let Some(pool) = guard.pool(&proved.user_pool_id) {
+                    let presents_no_device = pool.user(&proved.username).is_some_and(|user| {
+                        pool.registers_no_presented_device(
+                            user,
+                            responses.get(DEVICE_KEY).map(String::as_str),
+                        )
+                    });
+                    if presents_no_device {
+                        return Err(device_not_found());
+                    }
+                }
+                // The password is proved, so the stored user's own state decides
+                // the sign-in from here — a disabled, reset or unconfirmed user
+                // cannot sign in whatever credential it proved — exactly as it
+                // decides one that sent the password directly.
+                let username = usable_user(guard, &proved.user_pool_id, &proved.username)?;
+                let owed = guard
+                    .sign_in_after_password(
+                        &proved.user_pool_id,
+                        &proved.username,
+                        responses.get(DEVICE_KEY).map(String::as_str),
+                        now,
+                    )
+                    .ok_or_else(internal_error)?;
+                // The challenge is answered either way, so its continuation is
+                // spent: the same claim cannot carry a second sign-in.
+                guard.end_user_srp_exchange(&proved.secret_block);
+                match owed {
+                    // Nothing stands between this sign-in and its tokens.
+                    crate::state::PasswordVerified::Complete => {
+                        break 'answered Answered::Completed {
+                            username,
+                            // "Called after user authentication flows have
+                            // completed" is this generation's own documented
+                            // trigger source.
+                            generation:
+                                crate::state::lambda_triggers::TokenGeneration::Authentication,
+                            // The password was proved by the user, not by a device.
+                            device_key: None,
+                        };
+                    }
+                    // A further challenge is owed, so it is outstanding on a
+                    // session of its own — which is the challenge that carries
+                    // one.
+                    crate::state::PasswordVerified::Challenge {
+                        challenge_name,
+                        challenge_parameters,
+                        code,
+                    } => {
+                        let delivered = code
+                            .as_ref()
+                            .map(|code| (code.code.clone(), code.attribute.clone()));
+                        let validity = guard
+                            .pool(&proved.user_pool_id)
+                            .and_then(|pool| pool.clients.get(&input.client_id))
+                            .map(|client| client.auth_session_validity())
+                            .ok_or_else(internal_error)?;
+                        let next = guard.start_session(
+                            now,
+                            crate::state::AuthSession {
+                                user_pool_id: proved.user_pool_id.clone(),
+                                client_id: input.client_id.clone(),
+                                username: username.clone(),
+                                challenge_name: challenge_name.clone(),
+                                expires_at: now + validity,
+                                // Outstanding: this session has answered nothing yet.
+                                spent: false,
+                                code,
+                                // A response to one of the sign-in's challenges
+                                // is what handed it out.
+                                issued_by: crate::state::SessionIssuer::SignIn,
+                            },
+                        );
+                        break 'answered Answered::Next {
+                            output: Box::new(AdminRespondToAuthChallengeOutput {
+                                challenge_name: Some(challenge_name),
+                                session: Some(next),
+                                challenge_parameters: Some(challenge_parameters),
+                                authentication_result: None,
+                                available_challenges: None,
+                            }),
+                            delivered: delivered
+                                .map(|(code, attribute)| (username, code, attribute)),
+                        };
+                    }
+                }
+            }
+
+            // Every other challenge of this service is carried by a stored
+            // session.
+            let session_token =
+                presented_session.ok_or_else(|| missing_parameter("Session"))?;
             // The STORED session says which challenge is outstanding and for whom.
             // A token this emulator never handed out, one the clock has already
             // expired, or one started for another pool or app client authorizes
@@ -780,96 +911,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                     device_key: Some(device_key),
                 };
             }
-            // The `PASSWORD_VERIFIER` challenge of the secure-remote-password sign-in
-            // is answered with the claim that sign-in's exchange checks: "respond with
-            // `PASSWORD_CLAIM_SIGNATURE`, `PASSWORD_CLAIM_SECRET_BLOCK`, and
-            // `TIMESTAMP`" (`ChallengeResponses` in this service's model), held to the
-            // one rule both response operations ask
-            // ([`crate::state::UserSrpRefusal`]) over the password stored for the user
-            // its session was started for.
-            if session.challenge_name == crate::state::PASSWORD_VERIFIER_CHALLENGE {
-                // The claim is the credential this challenge checks, so it is checked
-                // FIRST: a response that does not prove the password is refused as the
-                // wrong password whatever state the stored user is in, which is what
-                // keeps that refusal from stating anything about the user.
-                guard
-                    .answer_password_verifier(&session_token, &session, &responses)
-                    .map_err(srp_refused)?;
-                // The password is proved, so the stored user's own state decides the
-                // sign-in from here — a disabled, reset or unconfirmed user cannot
-                // sign in whatever credential it proved — exactly as it decides one
-                // that sent the password directly.
-                let username = usable_session_user(guard, &session)?;
-                let owed = guard
-                    .sign_in_after_password(
-                        &session,
-                        responses.get(DEVICE_KEY).map(String::as_str),
-                        now,
-                    )
-                    .ok_or_else(internal_error)?;
-                match owed {
-                    // Nothing stands between this sign-in and its tokens, so the
-                    // challenge is answered and its session is spent: the same claim
-                    // cannot complete a second sign-in.
-                    crate::state::PasswordVerified::Complete => {
-                        guard.end_session(&session_token);
-                        break 'answered Answered::Completed {
-                            username,
-                            // "Called after user authentication flows have completed"
-                            // is this generation's own documented trigger source.
-                            generation:
-                                crate::state::lambda_triggers::TokenGeneration::Authentication,
-                            // The password was proved by the user, not by a device.
-                            device_key: None,
-                        };
-                    }
-                    // A further challenge is owed, so it is outstanding on a session of
-                    // its own and this one is spent.
-                    crate::state::PasswordVerified::Challenge {
-                        challenge_name,
-                        challenge_parameters,
-                        code,
-                    } => {
-                        let delivered = code
-                            .as_ref()
-                            .map(|code| (code.code.clone(), code.attribute.clone()));
-                        let validity = guard
-                            .pool(&input.user_pool_id)
-                            .and_then(|pool| pool.clients.get(&input.client_id))
-                            .map_or(session.expires_at, |client| {
-                                now + client.auth_session_validity()
-                            });
-                        let next = guard.start_session(
-                            now,
-                            crate::state::AuthSession {
-                                user_pool_id: input.user_pool_id.clone(),
-                                client_id: input.client_id.clone(),
-                                username: username.clone(),
-                                challenge_name: challenge_name.clone(),
-                                expires_at: validity,
-                                // Outstanding: this session has answered nothing yet.
-                                spent: false,
-                                code,
-                                // A response to one of the sign-in's challenges is
-                                // what handed it out.
-                                issued_by: crate::state::SessionIssuer::SignIn,
-                            },
-                        );
-                        guard.end_session(&session_token);
-                        break 'answered Answered::Next {
-                            output: Box::new(AdminRespondToAuthChallengeOutput {
-                                challenge_name: Some(challenge_name),
-                                session: Some(next),
-                                challenge_parameters: Some(challenge_parameters),
-                                authentication_result: None,
-                                available_challenges: None,
-                            }),
-                            delivered: delivered
-                                .map(|(code, attribute)| (username, code, attribute)),
-                        };
-                    }
-                }
-            }
             if session.challenge_name != NEW_PASSWORD_REQUIRED {
                 // No other challenge is started with a session yet, so no stored
                 // state could decide whether a response to it is right.
@@ -1039,9 +1080,26 @@ fn usable_session_user(
     state: &crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
     session: &crate::state::AuthSession,
 ) -> Result<String, AdminRespondToAuthChallengeError> {
+    usable_user(state, &session.user_pool_id, &session.username)
+}
+
+/// The STORED user `username` of the pool `user_pool_id`, refusing one that can
+/// no longer sign in.
+///
+/// The one rule every response of this operation reads the user it answers for
+/// by, whether the challenge it answers was carried by a stored session or by
+/// the continuation the challenge parameters served: the user may have been
+/// disabled, reset or deleted since the challenge was started, so every response
+/// is refused on the stored user's own state just as the sign-in that started
+/// the challenge was ([`crate::state::UserStatus`]).
+fn usable_user(
+    state: &crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState,
+    user_pool_id: &str,
+    username: &str,
+) -> Result<String, AdminRespondToAuthChallengeError> {
     let user = state
-        .pool(&session.user_pool_id)
-        .and_then(|pool| pool.user(&session.username))
+        .pool(user_pool_id)
+        .and_then(|pool| pool.user(username))
         .ok_or_else(user_not_found)?;
     if !user.enabled {
         return Err(not_authorized("User is disabled."));

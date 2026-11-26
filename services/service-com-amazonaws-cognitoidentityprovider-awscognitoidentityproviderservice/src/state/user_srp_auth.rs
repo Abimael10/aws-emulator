@@ -12,6 +12,11 @@
 //! `TIMESTAMP`" (`ChallengeResponses` in this service's model) — and the claim
 //! that response carries is what the stored password checks.
 //!
+//! The continuation of that challenge is the `SECRET_BLOCK` it serves rather
+//! than a session token: the response echoes that block, so the exchange a claim
+//! is checked against is the one the block names, and a client holding no
+//! session answers the challenge all the same.
+//!
 //! One concern of [`super`]'s store, in its own file: the records and helpers
 //! here are reached as `crate::state::…` because the parent re-exports them, so
 //! both sign-in operations and both challenge-response operations ask the SAME
@@ -27,11 +32,24 @@ use super::srp::{self, SrpServerHalf, digest, generator, group_prime, padded, ra
 use super::*;
 use ::num_bigint::BigUint;
 
+/// The most outstanding user SRP continuations this emulator holds; the ones
+/// whose window has closed are swept first and the oldest are evicted past it,
+/// so repeating the sign-in cannot grow the store without limit. The same bound
+/// the challenge SESSIONS of this service are held under
+/// ([`super::MAX_AUTH_SESSIONS`]), since one sign-in starts one of either.
+const MAX_USER_SRP_EXCHANGES: usize = super::MAX_AUTH_SESSIONS;
+
 /// The `ChallengeNameType` member that asks the caller for the claim the stored
 /// password checks: "`PASSWORD_VERIFIER` — Respond with
 /// `PASSWORD_CLAIM_SIGNATURE`, `PASSWORD_CLAIM_SECRET_BLOCK`, and `TIMESTAMP`"
 /// (`ChallengeResponses` in this service's model).
 pub const PASSWORD_VERIFIER_CHALLENGE: &str = "PASSWORD_VERIFIER";
+
+/// The `ChallengeParameters` entry the continuation of that challenge travels
+/// in, read from the one place this service names it ([`super::srp`]): what the
+/// challenge serves there is what the response echoes, so it is also what
+/// identifies the sign-in attempt a response continues.
+pub const SECRET_BLOCK_PARAMETER: &str = super::srp::SECRET_BLOCK_PARAMETER;
 
 /// The `AuthFlowType` member this exchange serves.
 pub const USER_SRP_AUTH_FLOW: &str = "USER_SRP_AUTH";
@@ -69,20 +87,41 @@ pub const INVALID_SRP_A_MESSAGE: &str = "Invalid SRP_A value.";
 /// RFC 5054 §2.1 states for the salt of an SRP verifier ("s shall be 16 bytes").
 const SALT_BYTES: usize = 16;
 
-/// The server's half of one user SRP exchange, bound to the session that
-/// carries the `PASSWORD_VERIFIER` challenge it was served with: the claim is
-/// answerable exactly while that session lasts, so this is held against the
-/// session token rather than against the user.
+/// The server's half of one user SRP exchange, which is the whole of the
+/// outstanding `PASSWORD_VERIFIER` challenge it was served with: the sign-in it
+/// belongs to, the user it is for and the window it is answerable in.
+///
+/// The continuation travels in the `SECRET_BLOCK` the challenge serves rather
+/// than in a session token, so an exchange is held against that block — the
+/// response echoes it in `PASSWORD_CLAIM_SECRET_BLOCK` and signs its claim over
+/// it, which is what names the exchange the claim is checked against.
 #[derive(Clone)]
 pub struct UserSrpExchange {
+    /// The pool the sign-in this challenge belongs to runs against.
+    pub user_pool_id: String,
+    /// The app client that sign-in was addressed to: the continuation belongs to
+    /// that app client's sign-in, so no other app client's response answers it.
+    pub client_id: String,
     /// The user as STORED, which is the name the challenge served in
     /// `USER_ID_FOR_SRP` and the one the key schedule hashes.
     pub username: String,
+    /// When the challenge stops being answerable: the window the app client's
+    /// own `AuthSessionValidity` gives a challenge of this sign-in.
+    pub expires_at: SystemTime,
     /// The salt the verifier of THIS exchange was derived with, exactly as the
     /// challenge served it.
     salt: Vec<u8>,
     /// The exchange itself, as [`super::srp`] serves and checks one.
     half: SrpServerHalf,
+}
+
+impl UserSrpExchange {
+    /// The `SECRET_BLOCK` the challenge served this exchange's continuation in,
+    /// which is the key a response resolves it by.
+    #[must_use]
+    pub fn secret_block(&self) -> String {
+        self.half.served_secret_block()
+    }
 }
 
 /// Stated rather than derived: the private exponent and the secret block of one
@@ -97,12 +136,22 @@ impl ::std::fmt::Debug for UserSrpExchange {
 }
 
 /// What a sign-in that named the SRP flow serves: the `ChallengeParameters` of
-/// the `PASSWORD_VERIFIER` challenge, and the exchange state to bind to the
-/// session carrying it.
+/// the `PASSWORD_VERIFIER` challenge, and the exchange state holding the
+/// continuation those parameters carry.
 #[derive(Debug, Clone)]
 pub struct ServedUserSrpChallenge {
     pub challenge_parameters: HashMap<String, String>,
     pub exchange: UserSrpExchange,
+}
+
+/// What a response that ANSWERED the `PASSWORD_VERIFIER` challenge proved: the
+/// sign-in the continuation belonged to, and the block that names the
+/// continuation it has now spent.
+#[derive(Debug, Clone)]
+pub struct AnsweredUserSrp {
+    pub user_pool_id: String,
+    pub username: String,
+    pub secret_block: String,
 }
 
 /// Why a response to the `PASSWORD_VERIFIER` challenge does not answer it. The
@@ -114,9 +163,10 @@ pub enum UserSrpRefusal {
     /// not carry, named by that entry.
     MissingResponse(&'static str),
     /// The claim does not prove the caller holds the password stored for the
-    /// user the session was started for: the signature does not verify, the
-    /// exchange it was made against is not one this service is holding, or the
-    /// user holds no password at all.
+    /// user the challenge was served for: the signature does not verify, the
+    /// block it echoes names no exchange this service is holding, that exchange
+    /// belongs to another app client or another user, or the user holds no
+    /// password at all.
     ClaimNotVerified,
 }
 
@@ -168,6 +218,11 @@ impl UserPool {
 /// password and the salt it served, and the two always describe one key
 /// schedule.
 ///
+/// The challenge is answerable until `expires_at`, the window the app client
+/// that asked for the sign-in gives a challenge of it, and belongs to that app
+/// client's sign-in: `client_id` is what a response has to come through for its
+/// claim to answer this challenge.
+///
 /// `None` when the user holds no password for a verifier to be derived from,
 /// when the randomness this needs could not be read, or when the presented
 /// public value is none the group can use ([`srp::serve`], which
@@ -175,7 +230,9 @@ impl UserPool {
 pub fn serve_user_srp(
     pool: &UserPool,
     user: &User,
+    client_id: &str,
     client_srp_a: &str,
+    expires_at: SystemTime,
 ) -> Option<ServedUserSrpChallenge> {
     let password = user.password.as_deref()?;
     // The salt is reported, and hashed, as these bytes: the key schedule hashes
@@ -195,7 +252,10 @@ pub fn serve_user_srp(
     Some(ServedUserSrpChallenge {
         challenge_parameters,
         exchange: UserSrpExchange {
+            user_pool_id: pool.id.clone(),
+            client_id: client_id.to_string(),
             username: user.username.clone(),
+            expires_at,
             salt,
             half,
         },
@@ -261,59 +321,99 @@ fn presented<'r>(
 }
 
 impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
-    /// Bind `exchange` to the session token `session`, which is the session
-    /// carrying the `PASSWORD_VERIFIER` challenge it was served with.
+    /// Hold `exchange` as the outstanding `PASSWORD_VERIFIER` challenge of the
+    /// sign-in that served it, keyed by the `SECRET_BLOCK` it was served in.
     ///
-    /// The exchanges of sessions this service no longer holds are dropped
-    /// first: a challenge is answerable exactly while its session lasts, so an
-    /// exchange outlives nothing and this map stays inside the bound on the
-    /// stored sessions themselves ([`Self::start_session`]).
-    pub fn start_user_srp_exchange(&mut self, session: &str, exchange: UserSrpExchange) {
-        let sessions = &self.auth_sessions;
+    /// The continuation of this exchange is the block itself, so that is what a
+    /// response resolves it by ([`Self::answer_password_verifier`]) and what
+    /// this is held against — no session token names it. Exchanges whose window
+    /// the clock has already closed are swept first — the expiry was owed at
+    /// this instant whether or not anybody called — and the oldest are evicted
+    /// if the store is still at [`MAX_USER_SRP_EXCHANGES`], so repeating the
+    /// sign-in cannot grow this map without limit.
+    pub fn start_user_srp_exchange(&mut self, now: SystemTime, exchange: UserSrpExchange) {
         self.user_srp_exchanges
-            .retain(|token, _| sessions.contains_key(token));
+            .retain(|_, held| held.expires_at > now);
+        evict_oldest_until(
+            &mut self.user_srp_exchanges,
+            MAX_USER_SRP_EXCHANGES.saturating_sub(1),
+            |held| held.expires_at,
+        );
         self.user_srp_exchanges
-            .insert(session.to_string(), exchange);
+            .insert(exchange.secret_block(), exchange);
     }
 
-    /// Check the password claim answering the `PASSWORD_VERIFIER` challenge the
-    /// session `session_token` carries, and answer with the user that proved
-    /// its password.
+    /// Spend the continuation `secret_block` names: a challenge is answered
+    /// once, so the exchange goes once the response that ANSWERED it completed
+    /// or advanced the sign-in.
     ///
-    /// The claim is the HMAC of the exchange's own session key over the pool
-    /// name, the username, the secret block THIS exchange served and the
-    /// instant the response carries, so a signature computed from any other
-    /// password does not verify. A PURE check: a refused claim writes nothing
-    /// and leaves the challenge outstanding, exactly as a refused one-time
-    /// password does ([`Self::answer_mfa_challenge`]), and an accepted one
-    /// leaves the exchange standing for the response that ANSWERS the challenge
-    /// to spend with it ([`Self::end_session`]) — so a sign-in whose claim
-    /// verified but which the stored user's own state refuses can be presented
-    /// again once that state allows it.
+    /// A claim that was refused spends nothing, which is what leaves the
+    /// challenge outstanding for a corrected response while its window lasts.
+    pub fn end_user_srp_exchange(&mut self, secret_block: &str) {
+        self.user_srp_exchanges.remove(secret_block);
+    }
+
+    /// Check the password claim a response to the `PASSWORD_VERIFIER` challenge
+    /// of the app client `client_id` carries, and answer with the sign-in it
+    /// proved its password for.
+    ///
+    /// The continuation is carried by the response itself: the exchange checked
+    /// is the one whose `SECRET_BLOCK` the response echoes, which is also the
+    /// block the claim is signed over, so the challenge is answerable by a
+    /// caller holding no session token at all. The claim is the HMAC of that
+    /// exchange's own session key over the pool name, the username, the block
+    /// and the instant the response carries, so a signature computed from any
+    /// other password does not verify.
+    ///
+    /// A PURE check: a refused claim writes nothing and leaves the challenge
+    /// outstanding, exactly as a refused one-time password does
+    /// ([`Self::answer_mfa_challenge`]), and an accepted one leaves the exchange
+    /// standing for the response that ANSWERS the challenge to spend with it
+    /// ([`Self::end_user_srp_exchange`]) — so a sign-in whose claim verified but
+    /// which the stored user's own state refuses can be presented again once
+    /// that state allows it.
     pub fn answer_password_verifier(
         &mut self,
-        session_token: &str,
-        session: &AuthSession,
+        client_id: &str,
         responses: &HashMap<String, String>,
-    ) -> Result<String, UserSrpRefusal> {
+        now: SystemTime,
+    ) -> Result<AnsweredUserSrp, UserSrpRefusal> {
         let timestamp = presented(responses, super::TIMESTAMP_RESPONSE)?.to_string();
         let secret_block =
             presented(responses, super::PASSWORD_CLAIM_SECRET_BLOCK_RESPONSE)?.to_string();
         let signature =
             presented(responses, super::PASSWORD_CLAIM_SIGNATURE_RESPONSE)?.to_string();
-        // The exchange the claim is checked against is the one THIS session was
-        // served with: a session carrying no exchange of this service has no
-        // served secret block or public value to check a claim against at all.
+        // Continuations the clock has already closed are swept first: the expiry
+        // was owed at this instant whether or not anybody called.
+        self.user_srp_exchanges
+            .retain(|_, held| held.expires_at > now);
+        // The exchange the claim is checked against is the one whose block the
+        // response echoes, and it answers the sign-in of ITS OWN app client: a
+        // block naming no exchange of this service, and one naming an exchange
+        // another app client's sign-in served, have no served public value to
+        // check a claim against.
         let exchange = self
             .user_srp_exchanges
-            .get(session_token)
+            .get(&secret_block)
+            .filter(|held| held.client_id == client_id)
             .cloned()
             .ok_or(UserSrpRefusal::ClaimNotVerified)?;
         let pool = self
-            .pool(&session.user_pool_id)
+            .pool(&exchange.user_pool_id)
             .ok_or(UserSrpRefusal::ClaimNotVerified)?;
+        // A response names the user it answers for, and the claim it carries
+        // was signed over the user the challenge was served for: a response
+        // naming any other user answers this challenge for nobody.
+        if responses
+            .get(CHALLENGE_USERNAME)
+            .is_none_or(|named| {
+                pool.user_storage_key(named) != pool.user_storage_key(&exchange.username)
+            })
+        {
+            return Err(UserSrpRefusal::ClaimNotVerified);
+        }
         let user = pool
-            .user(&session.username)
+            .user(&exchange.username)
             .ok_or(UserSrpRefusal::ClaimNotVerified)?;
         let password = user
             .password
@@ -329,12 +429,16 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         ) {
             return Err(UserSrpRefusal::ClaimNotVerified);
         }
-        Ok(user.username.clone())
+        Ok(AnsweredUserSrp {
+            user_pool_id: exchange.user_pool_id.clone(),
+            username: user.username.clone(),
+            secret_block,
+        })
     }
 
-    /// What the sign-in the session `session` belongs to still owes now that
-    /// the user's PASSWORD is proved, as of `now`, for a request that presented
-    /// `presented_device_key`.
+    /// What the sign-in of `username` in the pool `user_pool_id` still owes now
+    /// that the user's PASSWORD is proved, as of `now`, for a request that
+    /// presented `presented_device_key`.
     ///
     /// The same two questions the password sign-in asks once the stored
     /// password matched, in the same order: a user Amazon Cognito is waiting on
@@ -344,16 +448,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// through the SRP exchange reaches the same challenge as one that sent the
     /// password directly.
     ///
-    /// `None` when the session names a user this service no longer holds, or a
-    /// factor nothing can report.
+    /// `None` when the names given are of a user this service no longer holds,
+    /// or of a factor nothing can report.
     pub fn sign_in_after_password(
         &self,
-        session: &AuthSession,
+        user_pool_id: &str,
+        username: &str,
         presented_device_key: Option<&str>,
         now: SystemTime,
     ) -> Option<PasswordVerified> {
-        let pool = self.pool(&session.user_pool_id)?;
-        let user = pool.user(&session.username)?;
+        let pool = self.pool(user_pool_id)?;
+        let user = pool.user(username)?;
         if user.status == UserStatus::ForceChangePassword {
             return Some(PasswordVerified::Challenge {
                 challenge_name: NEW_PASSWORD_REQUIRED_CHALLENGE.to_string(),

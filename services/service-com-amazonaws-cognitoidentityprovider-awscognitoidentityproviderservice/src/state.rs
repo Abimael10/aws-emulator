@@ -416,7 +416,15 @@ pub const ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE: &str = "Auth flow not enabled for
 /// unauthenticated caller can provoke, carries no identifier of the app client
 /// it was sent to. The administrative sign-in's own wording is
 /// [`ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE`].
+///
+/// Amazon Cognito does not word this refusal identically for every flow, so the
+/// sentence each flow earns is the one measured for IT: the
+/// secure-remote-password flow is refused with "<flow> is not enabled for the
+/// client." and every other flow with "<flow> flow not enabled for this client".
 pub fn auth_flow_not_enabled_message(auth_flow: &str) -> String {
+    if auth_flow == USER_SRP_AUTH_FLOW {
+        return format!("{auth_flow} is not enabled for the client.");
+    }
     format!("{auth_flow} flow not enabled for this client")
 }
 
@@ -1648,13 +1656,13 @@ pub struct ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceS
     /// ([`Self::start_device_auth_exchange`] drops the ones whose session is
     /// gone).
     pub device_auth_exchanges: HashMap<String, DeviceSrpExchange>,
-    /// The server half of the user SRP exchanges in flight
-    /// ([`UserSrpExchange`]), keyed by the `Session` token of the
-    /// `PASSWORD_VERIFIER` challenge each was served with: the claim is
-    /// answerable exactly while that session lasts, so an exchange is held
-    /// against the session rather than against the user
-    /// ([`Self::start_user_srp_exchange`] drops the ones whose session is
-    /// gone).
+    /// The user SRP exchanges in flight ([`UserSrpExchange`]), keyed by the
+    /// `SECRET_BLOCK` the `PASSWORD_VERIFIER` challenge each was served in: the
+    /// continuation of that challenge is the block itself, which the response
+    /// echoes, so an exchange is held against the block rather than against a
+    /// session token or the user
+    /// ([`Self::start_user_srp_exchange`] drops the ones whose window has
+    /// closed).
     pub user_srp_exchanges: HashMap<String, UserSrpExchange>,
     /// Every token this emulator issued, keyed by the token string, so a later
     /// operation can resolve a token back to the stored user.
@@ -1899,18 +1907,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// sweeps in [`Self::session`] and [`Self::start_session`] are what drop it
     /// — so a caller replaying the session is answered as the replay it is
     /// rather than as a session this emulator never issued.
-    ///
-    /// The SRP exchange bound to it goes, though: an exchange belongs to the
-    /// challenge its session carries ([`Self::start_user_srp_exchange`]), so
-    /// once that challenge is ANSWERED there is nothing left to check a claim
-    /// against — while a challenge still outstanding keeps its exchange, so a
-    /// caller whose claim verified but whose sign-in was refused on the stored
-    /// user's own state can present that claim again.
     pub fn end_session(&mut self, token: &str) {
         if let Some(stored) = self.auth_sessions.get_mut(token) {
             stored.spent = true;
         }
-        self.user_srp_exchanges.remove(token);
     }
 
     /// Store a passkey registration and return the CHALLENGE value its creation

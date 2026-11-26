@@ -249,8 +249,11 @@ pub struct AuthEvent {
     /// session identifier that maintains the state of authentication requests and
     /// challenge responses" (this service's model), so the response carrying that
     /// session belongs to THIS attempt and not to another the same user started.
-    /// A session token authorizes a challenge response, so it is never rendered,
-    /// logged or put in a response (see the [`::std::fmt::Debug`] impl below).
+    /// A challenge whose continuation is its own parameters rather than a session
+    /// is identified by that continuation instead, since the response answering it
+    /// echoes it for exactly the same reason. Either value authorizes a challenge
+    /// response, so it is never rendered, logged or put in a response (see the
+    /// [`::std::fmt::Debug`] impl below).
     pub outstanding_session: Option<String>,
     /// The `FeedbackToken` this event's one-click feedback links carry, which is
     /// what `UpdateAuthEventFeedback` authorizes a user's own feedback with. A

@@ -29,7 +29,14 @@ use ::num_bigint::BigUint;
 const SERVER_SECRET_BYTES: usize = 32;
 
 /// The block a password claim signs, minted per exchange.
-const SECRET_BLOCK_BYTES: usize = 64;
+///
+/// Amazon Cognito's block is the CONTINUATION of the exchange rather than a
+/// nonce — the server reads the exchange it belongs to back out of the block the
+/// response echoes — so it travels as a long base64 string, which is the shape a
+/// client library reads out of `SECRET_BLOCK` and sends back in
+/// `PASSWORD_CLAIM_SECRET_BLOCK`. A whole multiple of three bytes, so the base64
+/// it is served as needs no padding.
+const SECRET_BLOCK_BYTES: usize = 1_296;
 
 /// The size of the key the claim is signed under, which is what this key
 /// schedule expands its shared secret to.
@@ -112,13 +119,20 @@ impl SrpServerHalf {
     pub(super) fn report(&self, parameters: &mut HashMap<String, String>, salt: &[u8]) {
         parameters.insert(
             SRP_B_PARAMETER.to_string(),
-            ::hex::encode(&self.server_public),
+            group_width_hex(&self.server_public),
         );
         parameters.insert(SALT_PARAMETER.to_string(), ::hex::encode(salt));
         parameters.insert(
             SECRET_BLOCK_PARAMETER.to_string(),
-            encode_base64(&self.secret_block),
+            self.served_secret_block(),
         );
+    }
+
+    /// The `SECRET_BLOCK` this half serves, which is also what the response to
+    /// the challenge echoes in `PASSWORD_CLAIM_SECRET_BLOCK` and signs its
+    /// claim over.
+    pub(super) fn served_secret_block(&self) -> String {
+        encode_base64(&self.secret_block)
     }
 
     /// The key this exchange's claim is signed under, for the verifier
@@ -205,6 +219,23 @@ pub(super) const SALT_PARAMETER: &str = "SALT";
 
 /// The `ChallengeParameters` entry carrying the block the password claim signs.
 pub(super) const SECRET_BLOCK_PARAMETER: &str = "SECRET_BLOCK";
+
+/// `value` as the hexadecimal a public value of this group is REPORTED in: the
+/// number it spells, left-padded with zeros to the group prime's own byte width.
+///
+/// A public value is a number modulo the group's prime, so every one of them is
+/// spelled in the same number of hexadecimal digits as that prime — the width
+/// `SRP_B` carries for every exchange, whatever the value happens to be. That is
+/// not the spelling the key schedule HASHES ([`padded`], which is the shortest
+/// one), so the two are separate: a client library reads the reported value as a
+/// number and pads it itself before hashing.
+fn group_width_hex(value: &[u8]) -> String {
+    let width = group_prime().to_bytes_be().len();
+    let number = BigUint::from_bytes_be(value).to_bytes_be();
+    let mut spelled = vec![0_u8; width.saturating_sub(number.len())];
+    spelled.extend_from_slice(&number);
+    ::hex::encode(spelled)
+}
 
 /// The prime of the group the exchange runs over: the 3072-bit group of RFC
 /// 3526, read from the library that defines the SRP groups (RFC 5054 takes its

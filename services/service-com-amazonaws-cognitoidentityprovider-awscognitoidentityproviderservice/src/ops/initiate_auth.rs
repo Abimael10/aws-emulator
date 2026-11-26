@@ -388,7 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     outstanding_session: answered
                         .as_ref()
                         .ok()
-                        .and_then(|output| output.session.clone()),
+                        .and_then(outstanding_continuation),
                 },
                 ::std::time::SystemTime::now(),
             )
@@ -410,6 +410,23 @@ fn sign_in_event(
         crate::state::auth_metrics::Counter::TokenRefresh
         | crate::state::auth_metrics::Counter::Registration => None,
     }
+}
+
+/// What the attempt this call logs is left WAITING ON, which is what identifies
+/// the attempt a later call CONTINUES: the `Session` of the challenge the
+/// sign-in answered with, or — for a challenge whose continuation is its own
+/// parameters rather than a session — the `SECRET_BLOCK` that continuation
+/// travels in, which the response answering it echoes for the same reason.
+///
+/// `None` for a response that leaves no challenge outstanding.
+fn outstanding_continuation(output: &InitiateAuthOutput) -> Option<String> {
+    output.session.clone().or_else(|| {
+        output
+            .challenge_parameters
+            .as_ref()?
+            .get(crate::state::SECRET_BLOCK_PARAMETER)
+            .cloned()
+    })
 }
 
 /// The `ChallengeName` a sign-in in `auth_flow` CHECKED in this call, or `None` for
@@ -1076,9 +1093,11 @@ fn decide_password_sign_in(
 /// where that proof arrives, exactly as the direct password flow decides them once
 /// the stored password matched.
 ///
-/// The exchange is bound to the session carrying that challenge, so the claim is
-/// answerable exactly while the session lasts and no two sign-ins of one user share a
-/// public value.
+/// The continuation of that challenge travels in the `SECRET_BLOCK` its parameters
+/// carry rather than in a `Session`: the challenge response echoes that block, so the
+/// exchange its claim is checked against is the one the block names and the response
+/// needs no session token. No two sign-ins of one user share a public value or a
+/// block, and the challenge is answerable for the window this app client gives one.
 fn srp_sign_in(
     store: &Store,
     client_id: &str,
@@ -1094,9 +1113,9 @@ fn srp_sign_in(
 
     let state = &mut *store.lock();
     // Everything the challenge is built from is read under the lock and OWNED before
-    // the session it is served on is started: the stored pool and user are borrowed
-    // from the same store the session is written to.
-    let (user_pool_id, served, session_validity) = {
+    // the exchange it serves is held: the stored pool and user are borrowed from the
+    // same store that exchange is written to.
+    let served = {
         let pool = state
             .pool_of_client(client_id)
             .ok_or_else(|| client_not_found(client_id))?;
@@ -1124,7 +1143,6 @@ fn srp_sign_in(
         }
         let hides_user_existence = client.hides_user_existence();
         let session_validity = client.auth_session_validity();
-        let user_pool_id = pool.id.clone();
         let Some(user) = pool.user(username) else {
             // `PreventUserExistenceErrors=ENABLED` "suppresses messages that might
             // indicate a valid user exists"; `LEGACY` answers
@@ -1141,34 +1159,26 @@ fn srp_sign_in(
         // credential the exchange would go on to prove, so each is reported for what
         // it is rather than served an exchange that can never complete.
         refuse_unusable_user(user)?;
-        let served = crate::state::serve_user_srp(pool, user, presented_public_value)
-            .ok_or_else(|| invalid_parameter(crate::state::INVALID_SRP_A_MESSAGE.to_string()))?;
-        (user_pool_id, served, session_validity)
+        // The challenge stands for the window this app client gives a challenge of
+        // its sign-ins, which is what `AuthSessionValidity` states.
+        crate::state::serve_user_srp(
+            pool,
+            user,
+            client_id,
+            presented_public_value,
+            now + session_validity,
+        )
+        .ok_or_else(|| invalid_parameter(crate::state::INVALID_SRP_A_MESSAGE.to_string()))?
     };
 
-    let session = state.start_session(
-        now,
-        crate::state::AuthSession {
-            user_pool_id,
-            client_id: client_id.to_string(),
-            username: served.exchange.username.clone(),
-            challenge_name: crate::state::PASSWORD_VERIFIER_CHALLENGE.to_string(),
-            expires_at: now + session_validity,
-            // Outstanding: this session has answered nothing yet.
-            spent: false,
-            // This challenge is answered with a claim the caller signs, not with a
-            // code anything delivered.
-            code: None,
-            // The sign-in is what handed it out.
-            issued_by: crate::state::SessionIssuer::SignIn,
-        },
-    );
-    // The claim is checked against the values THIS exchange served, so the exchange is
-    // bound to the session that carries the challenge it was served with.
-    state.start_user_srp_exchange(&session, served.exchange);
+    // The claim is checked against the values THIS exchange served, and the block it
+    // served is what a response names it by.
+    state.start_user_srp_exchange(now, served.exchange);
     Ok(InitiateAuthOutput {
         challenge_name: Some(crate::state::PASSWORD_VERIFIER_CHALLENGE.to_string()),
-        session: Some(session),
+        // The continuation is in the challenge parameters, so this challenge carries
+        // no session for the caller to echo.
+        session: None,
         challenge_parameters: Some(served.challenge_parameters),
         authentication_result: None,
         available_challenges: None,

@@ -10,8 +10,9 @@
 //! the Secure Remote Password (SRP) protocol" (`InitiateAuth.AuthFlow` in this
 //! service's model) — so it is answered with the `PASSWORD_VERIFIER` challenge
 //! of one SRP exchange (`SALT`, `SRP_B` and the `SECRET_BLOCK` the claim signs,
-//! beside the `USER_ID_FOR_SRP` the challenge names the user in) and a
-//! `Session`; the challenge response carries the claim that exchange checks —
+//! beside the `USER_ID_FOR_SRP` the challenge names the user in) and NO
+//! `Session`, because that challenge's continuation is the block it served; the
+//! challenge response carries the claim that exchange checks —
 //! "`PASSWORD_VERIFIER`: Respond with `PASSWORD_CLAIM_SIGNATURE`,
 //! `PASSWORD_CLAIM_SECRET_BLOCK`, and `TIMESTAMP`" (`ChallengeResponses` in this
 //! service's model) — and a claim computed from the password this service STORED
@@ -54,38 +55,38 @@ use super::software_token_setup::{
 };
 
 /// The user every fixture signs in.
-const USERNAME: &str = "ada";
+pub(crate) const USERNAME: &str = "ada";
 
 /// The `AuthFlowType` member under test.
-const USER_SRP_AUTH: &str = "USER_SRP_AUTH";
+pub(crate) const USER_SRP_AUTH: &str = "USER_SRP_AUTH";
 
 /// The `ChallengeNameType` members the sign-in can answer with here.
-const PASSWORD_VERIFIER: &str = "PASSWORD_VERIFIER";
+pub(crate) const PASSWORD_VERIFIER: &str = "PASSWORD_VERIFIER";
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 const SOFTWARE_TOKEN_MFA: &str = "SOFTWARE_TOKEN_MFA";
 
 /// The `ChallengeParameters` entries the `PASSWORD_VERIFIER` challenge serves.
-const SALT: &str = "SALT";
-const SRP_B: &str = "SRP_B";
-const SECRET_BLOCK: &str = "SECRET_BLOCK";
-const USER_ID_FOR_SRP: &str = "USER_ID_FOR_SRP";
+pub(crate) const SALT: &str = "SALT";
+pub(crate) const SRP_B: &str = "SRP_B";
+pub(crate) const SECRET_BLOCK: &str = "SECRET_BLOCK";
+pub(crate) const USER_ID_FOR_SRP: &str = "USER_ID_FOR_SRP";
 
 /// The instant the claims below are signed at, which the response carries in
 /// `TIMESTAMP` and the service folds into the signed message exactly as it
 /// arrives. Fixed text: nothing in the exchange reads it as a time.
-const CLAIM_TIMESTAMP: &str = "Mon Jan 1 00:00:00 UTC 2024";
+pub(crate) const CLAIM_TIMESTAMP: &str = "Mon Jan 1 00:00:00 UTC 2024";
 
 /// Every refusal of this service is answered 400 and names its class in the
 /// body, so a row asserting a refusal asserts that status with the code.
-const REFUSED: u16 = 400;
+pub(crate) const REFUSED: u16 = 400;
 
 /// The class and the entirely fixed sentence a claim that proves no password
 /// earns — the same answer a sign-in that sent the wrong password directly gets.
-const NOT_AUTHORIZED: &str = "NotAuthorizedException";
-const INCORRECT_CREDENTIALS_MESSAGE: &str = "Incorrect username or password.";
+pub(crate) const NOT_AUTHORIZED: &str = "NotAuthorizedException";
+pub(crate) const INCORRECT_CREDENTIALS_MESSAGE: &str = "Incorrect username or password.";
 
 /// The class a request whose parameters are refused earns.
-const INVALID_PARAMETER: &str = "InvalidParameterException";
+pub(crate) const INVALID_PARAMETER: &str = "InvalidParameterException";
 
 /// A temporary password an administrator creates a user with, which leaves that
 /// user owing the `NEW_PASSWORD_REQUIRED` challenge.
@@ -96,32 +97,32 @@ const CHOSEN_PASSWORD: &str = "Ch0senPassw0rd!";
 
 /// A pool with one app client that enables the SRP flow, and one user holding
 /// the stored password the claims are checked against.
-struct Fixture {
-    user_pool_id: String,
-    client_id: String,
+pub(crate) struct Fixture {
+    pub(crate) user_pool_id: String,
+    pub(crate) client_id: String,
     /// The pool NAME the key schedule hashes: the part of the pool id after the
     /// Region that prefixes it.
-    pool_name: String,
+    pub(crate) pool_name: String,
 }
 
 /// Which pair of operations a row drives: the client-side pair, authorized by
 /// the app client alone, and the administrative pair, authorized by IAM
 /// credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Driver {
+pub(crate) enum Driver {
     Client,
     Admin,
 }
 
 impl Driver {
-    fn initiate(self) -> &'static str {
+    pub(crate) fn initiate(self) -> &'static str {
         match self {
             Self::Client => "InitiateAuth",
             Self::Admin => "AdminInitiateAuth",
         }
     }
 
-    fn respond(self) -> &'static str {
+    pub(crate) fn respond(self) -> &'static str {
         match self {
             Self::Client => "RespondToAuthChallenge",
             Self::Admin => "AdminRespondToAuthChallenge",
@@ -130,12 +131,12 @@ impl Driver {
 
     /// Whether this pair is addressed with a credential scope, as an SDK sends
     /// every administrative operation.
-    fn signed(self) -> bool {
+    pub(crate) fn signed(self) -> bool {
         self == Self::Admin
     }
 
     /// The request body of an SRP sign-in through this pair.
-    fn sign_in_body(self, fixture: &Fixture, parameters: Value) -> Value {
+    pub(crate) fn sign_in_body(self, fixture: &Fixture, parameters: Value) -> Value {
         let mut body = Map::new();
         if self == Self::Admin {
             body.insert("UserPoolId".to_string(), json!(fixture.user_pool_id));
@@ -146,12 +147,14 @@ impl Driver {
         Value::Object(body)
     }
 
-    /// The request body of a challenge response through this pair.
-    fn respond_body(
+    /// The request body of a challenge response through this pair, carrying
+    /// `session` only where the challenge answered is one that handed one out:
+    /// the SRP continuation is not, so its response presents none.
+    pub(crate) fn respond_body(
         self,
         fixture: &Fixture,
         challenge_name: &str,
-        session: &str,
+        session: Option<&str>,
         responses: Value,
     ) -> Value {
         let mut body = Map::new();
@@ -160,7 +163,9 @@ impl Driver {
         }
         body.insert("ClientId".to_string(), json!(fixture.client_id));
         body.insert("ChallengeName".to_string(), json!(challenge_name));
-        body.insert("Session".to_string(), json!(session));
+        if let Some(session) = session {
+            body.insert("Session".to_string(), json!(session));
+        }
         body.insert("ChallengeResponses".to_string(), responses);
         Value::Object(body)
     }
@@ -169,7 +174,12 @@ impl Driver {
 /// A pool named `name` with `pool_extra` merged into its creation, one app
 /// client that enables the SRP and password flows, and the user `USERNAME`
 /// holding `password` as its permanent password.
-async fn fixture(emulator: &Emulator, name: &str, pool_extra: Value, password: &str) -> Fixture {
+pub(crate) async fn fixture(
+    emulator: &Emulator,
+    name: &str,
+    pool_extra: Value,
+    password: &str,
+) -> Fixture {
     let user_pool_id = pool(emulator, name, pool_extra).await;
     let client_id = app_client(
         emulator,
@@ -212,7 +222,7 @@ async fn fixture(emulator: &Emulator, name: &str, pool_extra: Value, password: &
 
 /// The pool name the key schedule hashes: a `UserPoolId` is the Region, an
 /// underscore and the pool's own name, and the client library hashes that name.
-fn pool_name_of(user_pool_id: &str) -> String {
+pub(crate) fn pool_name_of(user_pool_id: &str) -> String {
     user_pool_id
         .split_once('_')
         .map_or(user_pool_id, |(_region, name)| name)
@@ -221,13 +231,13 @@ fn pool_name_of(user_pool_id: &str) -> String {
 
 /// The client's half of one exchange: the ephemeral pair the sign-in presents
 /// `SRP_A` from, derived from `label` so each row runs its own.
-struct ClientExchange {
+pub(crate) struct ClientExchange {
     private: BigUint,
     public: BigUint,
 }
 
 impl ClientExchange {
-    fn new(label: &str) -> Self {
+    pub(crate) fn new(label: &str) -> Self {
         let private = BigUint::from_bytes_be(&pseudo_random(label, 32)) % prime();
         Self {
             public: generator().modpow(&private, prime()),
@@ -236,7 +246,7 @@ impl ClientExchange {
     }
 
     /// The public value as `SRP_A` carries it.
-    fn public_hex(&self) -> String {
+    pub(crate) fn public_hex(&self) -> String {
         hex::encode(padded(&self.public))
     }
 
@@ -244,7 +254,7 @@ impl ClientExchange {
     /// <password>))`, `u = H(PAD(A) | PAD(B))`, `S = (B - k·g^x)^(a + u·x) (mod
     /// N)` and the first [`SESSION_KEY_BYTES`] of the HKDF-SHA256 expansion of
     /// that secret, salted with `u` and labelled [`DERIVED_KEY_LABEL`].
-    fn session_key(
+    pub(crate) fn session_key(
         &self,
         pool_name: &str,
         username: &str,
@@ -278,7 +288,7 @@ impl ClientExchange {
 /// The claim: the HMAC of the exchange's session key over the pool name, the
 /// username the challenge served, the secret block it served and the instant the
 /// claim was signed at.
-fn claim_signature(
+pub(crate) fn claim_signature(
     session_key: &[u8],
     pool_name: &str,
     username: &str,
@@ -300,17 +310,16 @@ fn claim_signature(
 }
 
 /// The `PASSWORD_VERIFIER` challenge a sign-in through `driver` was answered
-/// with: its session and the three values the claim is computed from.
-struct Served {
-    session: String,
-    user_id_for_srp: String,
-    salt: String,
-    server_public: String,
-    secret_block: String,
+/// with: the three values the claim is computed from and the user it names.
+pub(crate) struct Served {
+    pub(crate) user_id_for_srp: String,
+    pub(crate) salt: String,
+    pub(crate) server_public: String,
+    pub(crate) secret_block: String,
 }
 
 /// Start an SRP sign-in through `driver` and read the exchange it served.
-async fn serve(
+pub(crate) async fn serve(
     emulator: &Emulator,
     driver: Driver,
     fixture: &Fixture,
@@ -341,6 +350,11 @@ async fn serve(
         payload["AuthenticationResult"].is_null(),
         "case {case:?}: no password has been proved yet, so no token is issued, got {payload}"
     );
+    assert!(
+        payload.get("Session").is_none_or(Value::is_null),
+        "case {case:?}: this challenge's continuation is in its parameters, so it carries no \
+         Session, got {payload}"
+    );
     let parameter = |entry: &str| {
         payload["ChallengeParameters"][entry]
             .as_str()
@@ -350,10 +364,6 @@ async fn serve(
             .to_string()
     };
     Served {
-        session: payload["Session"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: the challenge carries a session, got {payload}"))
-            .to_string(),
         user_id_for_srp: parameter(USER_ID_FOR_SRP),
         salt: parameter(SALT),
         server_public: parameter(SRP_B),
@@ -362,8 +372,9 @@ async fn serve(
 }
 
 /// Answer the `PASSWORD_VERIFIER` challenge `served` with the claim `password`
-/// produces, through `driver`.
-async fn claim(
+/// produces, through `driver` — carrying no `Session`, as a client that was
+/// handed none cannot.
+pub(crate) async fn claim(
     emulator: &Emulator,
     driver: Driver,
     fixture: &Fixture,
@@ -391,7 +402,7 @@ async fn claim(
         &driver.respond_body(
             fixture,
             PASSWORD_VERIFIER,
-            &served.session,
+            None,
             json!({
                 "USERNAME": served.user_id_for_srp,
                 "PASSWORD_CLAIM_SECRET_BLOCK": served.secret_block,
@@ -518,15 +529,10 @@ async fn every_sign_in_serves_an_exchange_of_its_own() {
         "case {case:?}: each exchange serves its own secret block, got {:?} twice",
         first.secret_block
     );
-    assert_ne!(
-        first.session, second.session,
-        "case {case:?}: each sign-in carries its own session, got {:?} twice",
-        first.session
-    );
 
-    // The claim of one exchange answers THAT exchange: presenting it on the
-    // other sign-in's session proves nothing, because the secret block it signed
-    // is not the one that session served.
+    // A claim answers the exchange it was SIGNED over: a response that echoes
+    // the second sign-in's block under the first sign-in's session key proves
+    // nothing, because that key is not the one the second exchange derives.
     let session_key = first_exchange.session_key(
         &fixture.pool_name,
         &first.user_id_for_srp,
@@ -538,7 +544,7 @@ async fn every_sign_in_serves_an_exchange_of_its_own() {
         &session_key,
         &fixture.pool_name,
         &first.user_id_for_srp,
-        &first.secret_block,
+        &second.secret_block,
         CLAIM_TIMESTAMP,
     );
     let (status, payload) = dispatch(
@@ -547,10 +553,10 @@ async fn every_sign_in_serves_an_exchange_of_its_own() {
         &Driver::Client.respond_body(
             &fixture,
             PASSWORD_VERIFIER,
-            &second.session,
+            None,
             json!({
                 "USERNAME": first.user_id_for_srp,
-                "PASSWORD_CLAIM_SECRET_BLOCK": first.secret_block,
+                "PASSWORD_CLAIM_SECRET_BLOCK": second.secret_block,
                 "PASSWORD_CLAIM_SIGNATURE": signature,
                 "TIMESTAMP": CLAIM_TIMESTAMP,
             }),
@@ -565,8 +571,8 @@ async fn every_sign_in_serves_an_exchange_of_its_own() {
          {payload}"
     );
 
-    // That refusal left the session standing, so the claim of its own exchange
-    // still completes it.
+    // That refusal answered no challenge, so the second exchange still takes
+    // its own claim — and so does the first.
     let (status, payload) = claim(
         &emulator,
         Driver::Client,
@@ -578,13 +584,27 @@ async fn every_sign_in_serves_an_exchange_of_its_own() {
     .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: the session must still be answerable with its own claim, got {status} \
+        "case {case:?}: the challenge must still be answerable with its own claim, got {status} \
          with {payload}"
+    );
+    let (status, payload) = claim(
+        &emulator,
+        Driver::Client,
+        &fixture,
+        &first_exchange,
+        &first,
+        GOOD_PASSWORD,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: answering one exchange leaves the other standing, got {status} with \
+         {payload}"
     );
 }
 
-/// A claim answers its challenge ONCE: the session it answered is spent, so
-/// replaying the same claim completes no second sign-in.
+/// A claim answers its challenge ONCE: the continuation it was made against is
+/// spent, so replaying the same claim completes no second sign-in.
 #[tokio::test]
 async fn a_claim_answers_its_challenge_once() {
     let emulator = emulator();
@@ -619,7 +639,8 @@ async fn a_claim_answers_its_challenge_once() {
     assert_eq!(
         (status, error_code(&payload)),
         (REFUSED, NOT_AUTHORIZED),
-        "case {case:?}: the answered session cannot be answered again, got {status} with {payload}"
+        "case {case:?}: the answered challenge cannot be answered again, got {status} with \
+         {payload}"
     );
     assert!(
         payload.get("AuthenticationResult").is_none(),
@@ -696,7 +717,7 @@ async fn a_proved_password_reaches_the_challenge_the_user_still_owes() {
         &Driver::Client.respond_body(
             &fixture,
             NEW_PASSWORD_REQUIRED,
-            &session,
+            Some(&session),
             json!({ "USERNAME": USERNAME, "NEW_PASSWORD": CHOSEN_PASSWORD }),
         ),
         false,
@@ -836,7 +857,7 @@ async fn a_proved_password_still_owes_the_activated_second_factor() {
         &Driver::Client.respond_body(
             &fixture,
             SOFTWARE_TOKEN_MFA,
-            &session,
+            Some(&session),
             json!({
                 "USERNAME": USERNAME,
                 "SOFTWARE_TOKEN_MFA_CODE": one_time_password(&secret_code, enrolment_step),
@@ -1079,7 +1100,7 @@ async fn the_srp_sign_in_refuses_what_it_cannot_serve() {
         (
             REFUSED,
             INVALID_PARAMETER,
-            "USER_SRP_AUTH flow not enabled for this client"
+            "USER_SRP_AUTH is not enabled for the client."
         ),
         "case {case:?}: a client the flow is not enabled for serves no exchange, got {status} \
          with {payload}"
@@ -1132,7 +1153,7 @@ async fn a_password_verifier_response_names_the_entry_it_is_missing() {
             &Driver::Client.respond_body(
                 &fixture,
                 PASSWORD_VERIFIER,
-                &served.session,
+                None,
                 Value::Object(responses),
             ),
             false,
