@@ -548,12 +548,15 @@ def _invoked_result(text):
         return text
 
 
-# How long this model waits between two readings of a callback it is waiting on, in seconds.
+# How long this model waits between two readings of a callback it is waiting on, in seconds, when
+# the HOST did not wait inside the reading itself.
 #
 # The window a callback is open for is the HOST's, and so is the instant it closes, so a reading
 # only ever reports what already happened: this is how often the wait looks. Short against the
-# shortest timeout a handler would configure, and long enough that a wait of minutes is a
-# handful of readings a second rather than a spin.
+# shortest timeout a handler would configure, and long enough that a wait of minutes is a handful
+# of readings a second rather than a spin. A wait taken here is spent against what the function's
+# `Timeout` allows the handler, like every other sleep a handler takes, which is what brings a
+# wait the host no longer suspends to an end.
 _CALLBACK_POLL_SECONDS = 0.05
 
 
@@ -759,9 +762,10 @@ class DurableContext:
         is still running.
 
         The window is the `timeout` the configuration named: once it closes, nothing can signal
-        the callback any more and this raises `CallbackTimeoutError`. Like every other way a
-        handler spends time, the wait is spent INSIDE the invocation, so a wait the function's
-        own `Timeout` cuts off ends the run as any other unfinished handler's does.
+        the callback any more and this raises `CallbackTimeoutError`. The waiting itself is the
+        HOST's: a durable execution SUSPENDS while it waits for something outside itself, so
+        neither the span a client takes to signal the callback nor the window it closes after is
+        spent by this invocation's own run.
         """
         held = config if config is not None else options.get("callback_config")
         if timeout is None:
@@ -809,9 +813,18 @@ class DurableContext:
                 error = answered.get("error") or {}
                 raise CallbackTimeoutError(error.get("errorMessage") or "")
             # Still waiting: the window is the host's, and so is the instant it closes. The
-            # wait between two readings is the standard library's own sleep, which this runtime
-            # clamps to what is left of the invocation.
-            time.sleep(_CALLBACK_POLL_SECONDS)
+            # wait between two readings is this EXECUTION's wait rather than the invocation's —
+            # a durable execution suspends while it waits for something outside itself — so the
+            # host takes it inside the reading above and nothing of the run's own span is spent
+            # on it.
+            #
+            # A reading the host did NOT wait inside says so, and then the wait is taken HERE,
+            # through the standard library's own sleep, which this runtime clamps to what the
+            # run has left. So every turn of this loop waits once: the ones the host suspends
+            # cost the run nothing, and once it suspends no more the waits are the run's own and
+            # its deadline is what ends the wait.
+            if not answered.get("waited"):
+                time.sleep(_CALLBACK_POLL_SECONDS)
 
     def invoke(self, function_name=None, payload=None, config=None, name=None, **options):
         """Invoke ANOTHER function as one CHAINED INVOCATION of this execution, and answer

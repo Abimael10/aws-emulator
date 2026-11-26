@@ -533,6 +533,24 @@ pub const INIT_PHASE_LIMIT: Duration = Duration::from_secs(10);
 /// running every other suite of a build beside it.
 pub const ENVIRONMENT_BUILD_SPAN: Duration = Duration::from_secs(60);
 
+/// How long ONE run may sit SUSPENDED on a callback of the durable execution it is the run of,
+/// in all.
+///
+/// A durable execution's wait for something OUTSIDE itself is the execution's and not the
+/// invocation's: the execution suspends until a client signals the callback or the window it was
+/// configured with closes, which is why that span is charged to neither the function's `Timeout`
+/// nor [`HOST_WAIT_CEILING`] ([`python::Bounds::suspend`]). What the suspension does hold is an
+/// execution environment of THIS PROCESS, so how long this emulator keeps one open for a
+/// callback nobody has signalled is bounded here.
+///
+/// EMULATOR-CHOSEN, like [`HOST_WAIT_CEILING`] beside it: no published span says how long a
+/// durable execution may wait for a callback — `CallbackOptions$TimeoutSeconds` is the caller's
+/// own window and `DurableConfig$ExecutionTimeout` reaches a year — so this is what a run is
+/// given before the wait becomes a wait of its own and the run's bounds end it. It is generous
+/// against the windows a client configures for work it is waiting on, and far shorter than the
+/// span either of those members admits.
+pub const CALLBACK_SUSPENSION_CEILING: Duration = Duration::from_secs(600);
+
 /// How long after its budget is spent a run is still waited for before it is abandoned.
 pub const ABANDON_GRACE: Duration = Duration::from_secs(2);
 
@@ -1236,6 +1254,11 @@ pub async fn run_invocation(
     }
     let heap_bytes = run_heap_bytes(invocation.memory_size);
     let started = SystemTime::now();
+    // Whether this invocation is the run of a DURABLE EXECUTION, which is what decides the
+    // span its wait below allows for a run sitting SUSPENDED on a callback of that execution
+    // ([`CALLBACK_SUSPENSION_CEILING`]). Read before the journal travels onto the run's own
+    // thread.
+    let runs_a_durable_execution = durable.is_some();
     let request_id = invocation.request_id.clone();
     let reported = invocation.clone();
     let (sender, receiver) = ::tokio::sync::oneshot::channel();
@@ -1330,7 +1353,17 @@ pub async fn run_invocation(
         // UP ([`ENVIRONMENT_BUILD_SPAN`]): that work is charged to neither phase, so a wait
         // that did not allow for it would give up on a run whose own bounds had not been
         // reached — the very failure the function's configuration never asked for.
-        .saturating_add(ENVIRONMENT_BUILD_SPAN);
+        .saturating_add(ENVIRONMENT_BUILD_SPAN)
+        // And, for the run of a DURABLE EXECUTION, the span that execution may sit SUSPENDED
+        // on a callback of itself ([`CALLBACK_SUSPENSION_CEILING`]): that span is the
+        // execution's rather than the run's, so a wait that did not allow for it would give up
+        // on a run whose handler is still waiting for a callback a client may yet signal —
+        // and the completion of the execution would be reported as a run nothing finished.
+        .saturating_add(if runs_a_durable_execution {
+            CALLBACK_SUSPENSION_CEILING
+        } else {
+            Duration::ZERO
+        });
     // The accounting of a run that outlives the caller is a GUARD rather than a branch, so
     // it happens however this invocation ends: the wait running out, the caller's request
     // being cancelled while it is suspended (which drops this future at the await below),

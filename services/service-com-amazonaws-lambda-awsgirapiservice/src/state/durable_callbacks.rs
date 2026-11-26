@@ -456,6 +456,50 @@ fn polled_for_run(
     Ok(callback_answer(callback))
 }
 
+/// Whether the document [`answered_for_run`] built reports a callback that is still WAITING:
+/// one no client has signalled and whose window has not closed.
+///
+/// Read by the seam the run asks over ([`super::execution::python`]), which is what waits
+/// between two readings of a callback that is still open — a wait the EXECUTION takes rather
+/// than the invocation, since a durable execution suspends while it waits for something outside
+/// itself. An answer that is no reading of a callback's state at all — the refusal of the call,
+/// the id a mint answered — reports no callback waiting.
+#[must_use]
+pub fn answer_is_still_waiting(answered: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(answered)
+        .ok()
+        .as_ref()
+        .and_then(|answer| answer.get("state"))
+        .and_then(::serde_json::Value::as_str)
+        == Some(CALLBACK_STATE_WAITING)
+}
+
+/// The same answer, saying whether the host WAITED inside this reading.
+///
+/// The run reads a callback it is waiting on in a LOOP, so the one thing that loop has to know
+/// about a reading is whether the wait before the next one has already been taken: a reading the
+/// host waited inside costs the guest nothing to take again, and one it did not — because what a
+/// run may sit suspended for is spent ([`super::execution::CALLBACK_SUSPENSION_CEILING`]) — is
+/// one the guest waits after itself, through the sleep this runtime clamps to what the run has
+/// left. That is what bounds the loop: every turn of it either waits here or waits there, and a
+/// wait the run is charged for brings its own deadline closer.
+///
+/// The member is added to the answer rather than replacing it, so what the reading says about
+/// the callback is untouched; an answer that is no JSON object is left exactly as it was.
+#[must_use]
+pub fn answer_waited(answered: &str, waited: bool) -> String {
+    let Ok(::serde_json::Value::Object(mut answer)) =
+        ::serde_json::from_str::<::serde_json::Value>(answered)
+    else {
+        return answered.to_string();
+    };
+    answer.insert(ANSWER_WAITED_MEMBER.to_string(), ::serde_json::json!(waited));
+    ::serde_json::Value::Object(answer).to_string()
+}
+
+/// The member [`answer_waited`] carries that in, which the runtime's own durable SDK reads.
+const ANSWER_WAITED_MEMBER: &str = "waited";
+
 /// The refusal a `CallbackId` that addresses no callback this emulator holds gets: the
 /// canonical sentence every Lambda resource-shaped refusal follows, naming the resource the
 /// request asked about (compare the `Durable execution not found: <arn>`
@@ -659,4 +703,90 @@ pub fn signal_callback(
     };
     durable_steps::append_checkpoint(execution, &checkpoint, now);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: the seam the run reads a callback over tells the reader two things about one
+    /// answer — whether the callback is still WAITING, and whether the host waited inside the
+    /// reading — and says them about the answer it was given rather than about any one shape of
+    /// it.
+    ///
+    /// The rows differ along what the rule generalises over: the state the answer reports, an
+    /// answer that reports no state at all (the refusal of the call, the id a mint answered),
+    /// and an answer that is no document.
+    #[test]
+    fn an_answer_says_whether_the_callback_waits_and_whether_the_host_waited() {
+        // (case, the answer, whether it reports a callback still waiting)
+        let rows: &[(&str, ::serde_json::Value, bool)] = &[
+            (
+                "a callback no client has signalled",
+                ::serde_json::json!({ "state": CALLBACK_STATE_WAITING }),
+                true,
+            ),
+            (
+                "a callback a client completed",
+                ::serde_json::json!({ "state": CALLBACK_STATE_SUCCEEDED, "result": "{}" }),
+                false,
+            ),
+            (
+                "a callback a client failed",
+                ::serde_json::json!({ "state": CALLBACK_STATE_FAILED }),
+                false,
+            ),
+            (
+                "a callback whose window closed",
+                ::serde_json::json!({ "state": CALLBACK_STATE_TIMED_OUT }),
+                false,
+            ),
+            (
+                "the id a mint answered, which reports no state",
+                ::serde_json::json!({ "callbackId": "Zm9v" }),
+                false,
+            ),
+            (
+                "the refusal of the call itself",
+                ::serde_json::json!({ "refused": "this run holds no such callback" }),
+                false,
+            ),
+        ];
+        for (case, answer, waiting) in rows {
+            let document = answer.to_string();
+            assert_eq!(
+                answer_is_still_waiting(&document),
+                *waiting,
+                "case {case:?}: expected the answer to report waiting={waiting}, got {document}"
+            );
+            // Whichever it reports, what the reading says about the callback survives the
+            // member the seam adds, and that member is what the reader was told.
+            for waited in [true, false] {
+                let said = answer_waited(&document, waited);
+                let read: ::serde_json::Value =
+                    ::serde_json::from_str(&said).unwrap_or_default();
+                assert_eq!(
+                    read.get(ANSWER_WAITED_MEMBER).and_then(|m| m.as_bool()),
+                    Some(waited),
+                    "case {case:?}: expected the answer to say waited={waited}, got {said}"
+                );
+                for (member, value) in answer.as_object().into_iter().flatten() {
+                    assert_eq!(
+                        read.get(member),
+                        Some(value),
+                        "case {case:?}: expected {member:?} to survive, got {said}"
+                    );
+                }
+            }
+        }
+        // An answer that is no document at all is left exactly as it was.
+        let text = "not a document";
+        assert_eq!(
+            answer_waited(text, true),
+            text,
+            "case {:?}: expected the answer to travel as written, got {:?}",
+            "an answer that is no document",
+            answer_waited(text, true)
+        );
+    }
 }

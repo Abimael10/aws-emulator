@@ -14,10 +14,11 @@
 //!
 //! The suites beside this one assert that wording for the two READS of an execution's data.
 //! The rows here differ along what else the rule generalises over: WHICH operation on the data
-//! is refused — the two reads, the history, and `CheckpointDurableExecution`, the one that
-//! WRITES data, carrying the execution's own current checkpoint token so nothing but the key
-//! could refuse it — and the state the key is in (disabled, scheduled for deletion), which is
-//! what decides the class the refusal relays. Each refusal is compared whole.
+//! is refused — the two reads, the history, `CheckpointDurableExecution`, the one that WRITES
+//! data, carrying the execution's own current checkpoint token so nothing but the key could
+//! refuse it, and `StopDurableExecution`, which records the error it is given WITH the
+//! execution — and the state the key is in (disabled, scheduled for deletion), which is what
+//! decides the class the refusal relays. Each refusal is compared whole.
 //!
 //! A refusal of this class is a refusal to touch the data at all, so each row also asserts
 //! what it left behind: the execution's current checkpoint token is still current, its history
@@ -36,7 +37,7 @@ use crate::durable_execution_completion::{
     DATA_DISABLED_SENTENCE, DATA_INVALID_STATE_SENTENCE,
 };
 use crate::durable_execution_data_key_message::data_reads;
-use crate::function_lifecycle::{create_function, package_bytes, zip_file, Answer, ROLE};
+use crate::function_lifecycle::{create_function, json_call, package_bytes, zip_file, Answer, ROLE};
 
 /// The `DurableConfig$ExecutionTimeout` the function here runs under, in seconds: far longer
 /// than the suite takes, so nothing times out under it.
@@ -273,8 +274,8 @@ async fn every_operation_on_execution_data_is_refused_with_the_key_services_rela
 }
 
 /// Every operation that handles ONE execution's data: the three reads that ask for it (the
-/// axis the suite beside this one defines), and the checkpoint that WRITES data — each
-/// labelled by how it asked.
+/// axis the suite beside this one defines), the checkpoint that WRITES data, and the stop that
+/// records the error it is given with the execution — each labelled by how it asked.
 async fn data_operations(
     router: &MultiServiceRouter,
     arn: &str,
@@ -285,7 +286,26 @@ async fn data_operations(
         "CheckpointDurableExecution, carrying the execution's current token",
         checkpoint(router, arn, &checkpoint_body(token)).await,
     ));
+    operations.push((
+        "StopDurableExecution, carrying the error it records with the execution",
+        stop(router, arn).await,
+    ));
     operations
+}
+
+/// `StopDurableExecution` on `arn`, carrying the `ErrorObject` it records with the execution —
+/// the data that write stores under the function's own key.
+async fn stop(router: &MultiServiceRouter, arn: &str) -> Answer {
+    json_call(
+        router,
+        "POST",
+        &format!(
+            "/2025-12-01/durable-executions/{}/stop",
+            arn.replace('/', "%2F")
+        ),
+        &json!({ "ErrorType": "OperatorStopped", "ErrorMessage": "stopped by the operator" }),
+    )
+    .await
 }
 
 /// One checkpoint carrying `token` and the single update whose data it would store.

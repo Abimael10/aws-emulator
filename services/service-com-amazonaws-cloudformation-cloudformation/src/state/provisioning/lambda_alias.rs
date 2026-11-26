@@ -31,6 +31,20 @@
 //! The alias's NAME and the FUNCTION it belongs to are its identity — neither can change on
 //! an alias that exists — so a declaration that states either differently is a different
 //! resource; everything else about an alias is applied in place by `UpdateAlias`.
+//!
+//! ## One property whose SHAPE is not the member's
+//!
+//! `RoutingConfig` is `CreateAlias`'s own member under the same name, but the weights inside it
+//! are not shaped the same on both sides: the resource type declares
+//! `AdditionalVersionWeights` as a LIST of `{FunctionVersion, FunctionWeight}` entries, while
+//! AWS Lambda models the member as a MAP of version to weight
+//! (`smithy_query(query="shape", shape="AliasRoutingConfiguration")`:
+//! `AdditionalVersionWeights` targets a map whose key is a version and whose value is the
+//! `Weight` double). So the declared entries are read as that map before the call is made
+//! ([`routing_config_as_modelled`]) — a declaration carried through as written reaches a
+//! map-typed member as an array, which is no request AWS Lambda can deserialize — and the map
+//! AWS Lambda reports is read back as the declared shape where the resource's configuration is
+//! compared with its declaration ([`actual_configuration`]).
 
 use std::collections::BTreeMap;
 
@@ -65,6 +79,14 @@ const NAME_PROPERTY: &str = "Name";
 /// The property that is no member of the create: the call of its own the module
 /// documentation names.
 const PROVISIONED_CONCURRENCY_PROPERTY: &str = "ProvisionedConcurrencyConfig";
+
+/// The property whose declared SHAPE is not the shape of the member it travels in, and the
+/// members of each shape: the type declares a LIST of entries naming a version and its weight,
+/// and AWS Lambda models a MAP of the one to the other (see the module header).
+const ROUTING_CONFIG_PROPERTY: &str = "RoutingConfig";
+const ADDITIONAL_VERSION_WEIGHTS_MEMBER: &str = "AdditionalVersionWeights";
+const VERSION_WEIGHT_VERSION_MEMBER: &str = "FunctionVersion";
+const VERSION_WEIGHT_WEIGHT_MEMBER: &str = "FunctionWeight";
 
 /// The member the create and the update answer the alias's own ARN under, which is this
 /// resource's physical id and the `AliasArn` attribute the type publishes.
@@ -110,7 +132,7 @@ pub(super) async fn create(
     let mut request = Map::new();
     for member in CREATE_MEMBERS {
         if let Some(value) = declared(&resource.properties, member) {
-            request.insert((*member).to_string(), value.clone());
+            request.insert((*member).to_string(), modelled_member(member, value)?);
         }
     }
     // "Ref returns the alias name" is NOT what this type publishes — the physical id is the
@@ -173,7 +195,7 @@ pub(super) async fn update(
     let mut request = Map::new();
     for member in UPDATE_MEMBERS {
         if let Some(value) = declared(declared_properties, member) {
-            request.insert((*member).to_string(), value.clone());
+            request.insert((*member).to_string(), modelled_member(member, value)?);
         }
     }
     let request = lambda_declaration(&Value::Object(request));
@@ -232,7 +254,11 @@ pub(super) async fn actual_configuration(
             let mut reported = Map::new();
             for member in ["Name", "FunctionVersion", "Description", "RoutingConfig"] {
                 if let Some(value) = declared(&answered, member) {
-                    reported.insert(member.to_string(), value.clone());
+                    // The one member whose declared shape is not the shape AWS Lambda reports
+                    // it in is read back as the shape the type publishes, so what the resource
+                    // IS is compared with its declaration rather than with another spelling of
+                    // the same weights (see the module header).
+                    reported.insert(member.to_string(), declared_member(member, value));
                 }
             }
             Ok(Some(Value::Object(reported)))
@@ -383,6 +409,113 @@ fn declared<'a>(properties: &'a Value, name: &str) -> Option<&'a Value> {
     properties.get(name).filter(|value| !value.is_null())
 }
 
+/// One declared property as the member it travels in is SHAPED: the property whose shapes
+/// differ read as AWS Lambda's ([`routing_config_as_modelled`]), and every other one exactly
+/// as the template evaluated it.
+fn modelled_member(member: &str, declared: &Value) -> Result<Value, Refusal> {
+    if member == ROUTING_CONFIG_PROPERTY {
+        return routing_config_as_modelled(declared);
+    }
+    Ok(declared.clone())
+}
+
+/// The reverse: one member AWS Lambda reported, as the property the TYPE publishes is shaped
+/// ([`routing_config_as_declared`]).
+fn declared_member(member: &str, reported: &Value) -> Value {
+    if member == ROUTING_CONFIG_PROPERTY {
+        return routing_config_as_declared(reported);
+    }
+    reported.clone()
+}
+
+/// A declared `RoutingConfig`, with its weights read as the MAP of version to weight AWS
+/// Lambda models `AliasRoutingConfiguration$AdditionalVersionWeights` as: one key per declared
+/// `{FunctionVersion, FunctionWeight}` entry, keyed by the version the entry names and valued
+/// by the weight it gives it (see the module header).
+///
+/// A declaration that already states that map travels as written, so a weight stated either way
+/// reaches the call in the one shape the member has. An entry that names NO version names no
+/// key of that map, and is refused rather than dropped: an alias is never reported as created
+/// or updated with less traffic shifting than its declaration asked for.
+fn routing_config_as_modelled(declared: &Value) -> Result<Value, Refusal> {
+    let Some(entries) = declared
+        .get(ADDITIONAL_VERSION_WEIGHTS_MEMBER)
+        .and_then(Value::as_array)
+    else {
+        return Ok(declared.clone());
+    };
+    let mut weights = Map::new();
+    for entry in entries {
+        let version = entry
+            .get(VERSION_WEIGHT_VERSION_MEMBER)
+            .and_then(version_named)
+            .ok_or_else(|| incomplete_version_weight(VERSION_WEIGHT_VERSION_MEMBER))?;
+        let weight = entry
+            .get(VERSION_WEIGHT_WEIGHT_MEMBER)
+            .filter(|weight| !weight.is_null())
+            .ok_or_else(|| incomplete_version_weight(VERSION_WEIGHT_WEIGHT_MEMBER))?;
+        weights.insert(version, weight.clone());
+    }
+    let mut config = declared.as_object().cloned().unwrap_or_default();
+    config.insert(
+        ADDITIONAL_VERSION_WEIGHTS_MEMBER.to_string(),
+        Value::Object(weights),
+    );
+    Ok(Value::Object(config))
+}
+
+/// A reported `RoutingConfig`, with its weights read as the LIST of entries the resource type
+/// declares them as: one entry per key of the map AWS Lambda answered, in the order that map
+/// carries them.
+///
+/// An answer that carries no such map travels as reported.
+fn routing_config_as_declared(reported: &Value) -> Value {
+    let Some(weights) = reported
+        .get(ADDITIONAL_VERSION_WEIGHTS_MEMBER)
+        .and_then(Value::as_object)
+    else {
+        return reported.clone();
+    };
+    let entries: Vec<Value> = weights
+        .iter()
+        .map(|(version, weight)| {
+            ::serde_json::json!({
+                VERSION_WEIGHT_VERSION_MEMBER: version,
+                VERSION_WEIGHT_WEIGHT_MEMBER: weight,
+            })
+        })
+        .collect();
+    let mut config = reported.as_object().cloned().unwrap_or_default();
+    config.insert(
+        ADDITIONAL_VERSION_WEIGHTS_MEMBER.to_string(),
+        Value::Array(entries),
+    );
+    Value::Object(config)
+}
+
+/// The VERSION one declared weight names, as the key of the map it becomes: the text the entry
+/// states, or the whole number a template wrote unquoted, which is the same version either way.
+fn version_named(declared: &Value) -> Option<String> {
+    match declared {
+        Value::String(version) if !version.is_empty() => Some(version.clone()),
+        Value::Number(version) => Some(version.to_string()),
+        _ => None,
+    }
+}
+
+/// The refusal for a declared weight that names no `member`: the entry carries no key or no
+/// weight for the map AWS Lambda takes, so there is no request to make for it.
+fn incomplete_version_weight(member: &str) -> Refusal {
+    Refusal {
+        code: "InvalidRequest".to_string(),
+        message: format!(
+            "each {ROUTING_CONFIG_PROPERTY}.{ADDITIONAL_VERSION_WEIGHTS_MEMBER} entry of \
+             {LAMBDA_ALIAS} states a {VERSION_WEIGHT_VERSION_MEMBER} and a \
+             {VERSION_WEIGHT_WEIGHT_MEMBER}, and this one states no {member}"
+        ),
+    }
+}
+
 /// One member of an answer read as TEXT.
 fn reported_text(answered: &Value, member: &str) -> Option<String> {
     answered
@@ -506,6 +639,95 @@ mod tests {
                 Some((*function, *name)),
                 "case {case:?}: expected the call to address {function:?}/{name:?}, got \
                  {addressed:?}"
+            );
+        }
+    }
+
+    /// RULE: the weights an alias routes with are declared as a LIST of entries naming a
+    /// version and its weight and travel in a MAP of the one to the other, so every declared
+    /// entry becomes one key of that map — and the map AWS Lambda reports is read back as that
+    /// same list where the two are compared.
+    ///
+    /// The rows differ along what the rule generalises over: how many entries the declaration
+    /// carries, whether the version is quoted, whether the weight is, whether the declaration
+    /// already states the map, and whether a configuration carries weights at all.
+    #[test]
+    fn the_weights_an_alias_routes_with_travel_as_the_map_the_member_is() {
+        // (case, the declared configuration, the member the call carries)
+        let cases: &[(&str, Value, Value)] = &[
+            (
+                "one entry naming a version and its weight",
+                serde_json::json!({
+                    "AdditionalVersionWeights": [{"FunctionVersion": "2", "FunctionWeight": 0.5}]
+                }),
+                serde_json::json!({"AdditionalVersionWeights": {"2": 0.5}}),
+            ),
+            (
+                "two entries, one with the version a template wrote unquoted",
+                serde_json::json!({"AdditionalVersionWeights": [
+                    {"FunctionVersion": 3, "FunctionWeight": 0.25},
+                    {"FunctionVersion": "4", "FunctionWeight": "0.75"}
+                ]}),
+                serde_json::json!({"AdditionalVersionWeights": {"3": 0.25, "4": "0.75"}}),
+            ),
+            (
+                "a configuration that carries no weights at all",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "a declaration that already states the map",
+                serde_json::json!({"AdditionalVersionWeights": {"2": 0.1}}),
+                serde_json::json!({"AdditionalVersionWeights": {"2": 0.1}}),
+            ),
+            (
+                "no entries declared",
+                serde_json::json!({"AdditionalVersionWeights": []}),
+                serde_json::json!({"AdditionalVersionWeights": {}}),
+            ),
+        ];
+        for (case, declared, expected) in cases {
+            let actual = routing_config_as_modelled(declared);
+            assert_eq!(
+                actual.as_ref().ok(),
+                Some(expected),
+                "case {case:?}: expected the call to carry {expected}, got {actual:?}"
+            );
+        }
+        // And the way back, off the map AWS Lambda answers.
+        let reported = serde_json::json!({"AdditionalVersionWeights": {"2": 0.5}});
+        let declared = routing_config_as_declared(&reported);
+        assert_eq!(
+            declared,
+            serde_json::json!({
+                "AdditionalVersionWeights": [{"FunctionVersion": "2", "FunctionWeight": 0.5}]
+            }),
+            "case {:?}: expected the reported map to read back as the declared list, got \
+             {declared}",
+            "the map AWS Lambda answers"
+        );
+    }
+
+    /// A declared weight that names no version, and one that names no weight, are refused
+    /// rather than sent as a map entry of nothing.
+    #[test]
+    fn an_incomplete_declared_weight_is_refused() {
+        let cases: &[(&str, Value)] = &[
+            (
+                "an entry naming no version",
+                serde_json::json!({"AdditionalVersionWeights": [{"FunctionWeight": 0.5}]}),
+            ),
+            (
+                "an entry naming no weight",
+                serde_json::json!({"AdditionalVersionWeights": [{"FunctionVersion": "2"}]}),
+            ),
+        ];
+        for (case, declared) in cases {
+            let refused = routing_config_as_modelled(declared);
+            assert!(
+                refused.is_err(),
+                "case {case:?}: expected a refusal naming the member the entry states none of, \
+                 got {refused:?}"
             );
         }
     }

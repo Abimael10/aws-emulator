@@ -180,6 +180,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // The stop CARRIES the execution's data — "the error information to record with the
+        // stopped execution" — so recording it stores that data under the key the function's
+        // `DurableConfig` names, which is why this operation binds the four KMS failures at
+        // 502 exactly as every other operation that reads or writes a durable execution's data
+        // does. The key is asked about at the point of use, with no store guard held (see
+        // [`crate::state::durable_data_key_fault`]).
+        let data_key = {
+            let mut store = state.lock();
+            crate::state::resolve_durable_execution(
+                &mut store,
+                &input.durable_execution_arn,
+                &region,
+                now,
+            )
+            .ok()
+            .and_then(|(record, name)| {
+                record
+                    .durable_executions
+                    .get(&name)
+                    .and_then(|execution| execution.kms_key_arn.clone())
+            })
+        };
+        if let Some(fault) =
+            crate::state::durable_data_key_fault(ctx.callback(), &region, data_key.as_deref())
+                .await
+        {
+            return Err(kms_refusal(fault));
+        }
+
         let mut store = state.lock();
 
         // The execution is addressed by the ARN its start answered, which carries the
@@ -236,4 +266,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stop_timestamp: ::aws_smithy_types::DateTime::from(stopped),
         })
     }
+}
+
+/// How a key that cannot be used for a durable execution's data refuses this WRITE: the
+/// modelled 502 for the fault the key service reported, carrying that fault's own sentence —
+/// the same reading and the same wording every other operation over a durable execution's data
+/// answers ([`crate::state::durable_data_key_fault`]).
+fn kms_refusal(fault: crate::state::EnvironmentKeyFault) -> StopDurableExecutionError {
+    match fault {
+        crate::state::EnvironmentKeyFault::Disabled(message) => {
+            StopDurableExecutionErrorModeled::KMSDisabledException(KMSDisabledException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::InvalidState(message) => {
+            StopDurableExecutionErrorModeled::KMSInvalidStateException(KMSInvalidStateException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::NotFound(message) => {
+            StopDurableExecutionErrorModeled::KMSNotFoundException(KMSNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::AccessDenied(message) => {
+            StopDurableExecutionErrorModeled::KMSAccessDeniedException(KMSAccessDeniedException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

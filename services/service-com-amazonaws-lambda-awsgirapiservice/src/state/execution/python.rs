@@ -1512,6 +1512,18 @@ fn bounded_sleep(bounds: &Arc<Bounds>, seconds: f64) {
 /// time clamps it further.
 const MAX_GUEST_SLEEP_SECONDS: f64 = 3_600.0;
 
+/// How long the host waits between two readings of a CALLBACK of the durable execution a run is
+/// the run of, while that callback is still open.
+///
+/// The window a callback is open for is the host's, and so is the instant it closes, so a
+/// reading only ever reports what already happened: this is how often the wait looks. Short
+/// against the shortest timeout a handler would configure, so a callback a client signals is
+/// noticed about as soon as it is signalled, and long enough that a wait of minutes is a
+/// handful of readings a second rather than a spin. The span is spent SUSPENDED
+/// ([`Bounds::suspend`]), so the number of readings a long wait takes costs the run's own span
+/// nothing.
+const CALLBACK_POLL_SPAN: Duration = Duration::from_millis(50);
+
 /// Which PHASE of a run answered, which is what the failure of that answer belongs to: the
 /// INITIALIZATION of the execution environment, or the invocation being served in it.
 ///
@@ -2241,7 +2253,27 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                     )
                     .into());
             };
-            Ok(vm.ctx.new_str(journal.callback(&document)).into())
+            let answered = journal.callback(&document);
+            // The WAIT between two readings of a callback that is still OPEN is the host's, and
+            // it is the EXECUTION's wait rather than this run's: a durable execution suspends
+            // while it waits for something outside itself, so the span is charged to neither
+            // the function's `Timeout` nor this host's ceiling on one run
+            // ([`Bounds::suspend`]) — which is what lets a callback signalled, or a window
+            // closed, long after the invocation began still reach the handler waiting on it.
+            //
+            // The answer SAYS whether that wait was taken, because the reader is a loop: a
+            // reading this host did not wait inside is one the guest waits after itself
+            // ([`super::durable_callbacks::answer_waited`]), so no number of readings can spin.
+            if super::super::durable_callbacks::answer_is_still_waiting(&answered) {
+                let waited = waiting.bounds().suspend(CALLBACK_POLL_SPAN);
+                return Ok(vm
+                    .ctx
+                    .new_str(super::super::durable_callbacks::answer_waited(
+                        &answered, waited,
+                    ))
+                    .into());
+            }
+            Ok(vm.ctx.new_str(answered).into())
         },
     );
     // What the SDK's own PAGINATOR for one operation drives: the input member a continuation
@@ -2676,6 +2708,11 @@ pub struct Bounds {
     /// How much of [`super::GUEST_WAIT_HOST_SPAN`] the waits of this run have really spent,
     /// in nanoseconds.
     host_waiting: AtomicU64,
+    /// How long this run has sat SUSPENDED on a callback of the durable execution it is the
+    /// run of ([`Self::suspend`]), in nanoseconds — a span charged to neither the function's
+    /// `Timeout` nor this host's ceiling on one run, and bounded by
+    /// [`super::CALLBACK_SUSPENSION_CEILING`].
+    suspended: AtomicU64,
     /// How much of [`super::INIT_PHASE_LIMIT`] the code OUTSIDE the handler has asked to wait
     /// for, in nanoseconds — the waits taken before the invoke phase began
     /// ([`Self::start`]).
@@ -2724,6 +2761,7 @@ impl Bounds {
             spending: AtomicBool::new(false),
             waived_waiting: AtomicU64::new(0),
             host_waiting: AtomicU64::new(0),
+            suspended: AtomicU64::new(0),
             init_waiting: AtomicU64::new(0),
         }
     }
@@ -2900,6 +2938,60 @@ impl Bounds {
         self.waived_waiting
             .fetch_add(nanoseconds(held.saturating_sub(really)), Ordering::Relaxed);
         self.clock.wait(really);
+    }
+
+    /// Spend a WAIT the run takes while the durable execution it is the run of is SUSPENDED:
+    /// the wait for a CALLBACK of that execution to be signalled or for its window to close.
+    ///
+    /// Such a wait is the EXECUTION's and not the run's. A durable execution suspends while it
+    /// waits for something outside itself — the invocation that started it is not the thing
+    /// doing the waiting, and the execution continues when a client signals the callback or the
+    /// window the callback was configured with closes — so neither the function's `Timeout` nor
+    /// the most of this host one run may be held for is spent by it: the span is waited out and
+    /// the run's own deadline moves with it, leaving what the handler has left exactly as it
+    /// was.
+    ///
+    /// What one run may sit suspended for in all is this HOST's own bound
+    /// ([`super::CALLBACK_SUSPENSION_CEILING`]), because what it holds open is an execution
+    /// environment of this process: past it the span is a wait of the run's own
+    /// ([`Self::wait`]) and the run's bounds end it, exactly as they end a handler that waits
+    /// too long.
+    ///
+    /// The caller states the span; no guest code reaches it. Answers whether the span was spent
+    /// SUSPENDED, which is what lets the seam tell the guest whether the wait between two
+    /// readings has already been taken for it: a reading the host did not wait inside is one
+    /// the guest has to wait after itself, so no loop of readings can spin.
+    fn suspend(&self, span: Duration) -> bool {
+        let spent = Duration::from_nanos(self.suspended.load(Ordering::Relaxed));
+        let suspended = span.min(super::CALLBACK_SUSPENSION_CEILING.saturating_sub(spent));
+        if suspended.is_zero() {
+            self.wait(span);
+            return false;
+        }
+        self.suspended
+            .fetch_add(nanoseconds(suspended), Ordering::Relaxed);
+        // The deadline moves BEFORE the span is waited out, so the host's own watch over the
+        // run does not read a deadline the suspension has not been credited to yet.
+        {
+            let mut deadline = self.deadline.lock().unwrap_or_else(PoisonError::into_inner);
+            *deadline += suspended;
+        }
+        // And so does the instant the handler is TOLD it has until: a resumed execution has the
+        // span its function is configured for, not what a client's signalling took off it.
+        let told = self.deadline_epoch_ms.load(Ordering::Relaxed);
+        if told > 0 {
+            self.deadline_epoch_ms.store(
+                told.saturating_add(i64::try_from(suspended.as_millis()).unwrap_or(i64::MAX)),
+                Ordering::Relaxed,
+            );
+        }
+        self.clock.wait(suspended);
+        // Whatever the ceiling no longer covered is a wait of the run's own.
+        let charged = span.saturating_sub(suspended);
+        if !charged.is_zero() {
+            self.wait(charged);
+        }
+        true
     }
 
     /// Spend a WAIT the code OUTSIDE the handler asked for: one taken while the execution
