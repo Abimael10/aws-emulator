@@ -17,9 +17,30 @@ pub struct GetCrawlerInput {
     pub name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetCrawlerResponse")]
+/// `GetCrawlerResponse`: the stored crawler as the writes to it left it.
+///
+/// Member set and order from `smithy_query(query="operation", operation="GetCrawler")`. The
+/// crawler is reported through [`ReportedCrawler`], which carries the members the published
+/// `Crawler` and `CrawlerTargets` do not bind, which is why the schema and the serializer
+/// come from `types/recorded_catalog_members.rs` rather than from the derive (see that
+/// module's note).
 #[derive(Debug, Clone, Default)]
 pub struct GetCrawlerOutput {
     pub crawler: Option<Crawler>,
 }
 
+glue_schema_and_serializer!(
+    GetCrawlerOutput,
+    GET_CRAWLER_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#GetCrawlerResponse",
+    "com.amazonaws.glue",
+    "GetCrawlerResponse",
+    (
+        M_CRAWLER,
+        crawler,
+        "Crawler",
+        0,
+        opt,
+        wrapped_struct(ReportedCrawler)
+    ),
+);

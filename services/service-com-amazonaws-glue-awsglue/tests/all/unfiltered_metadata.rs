@@ -8,7 +8,8 @@
 //!
 //! The rule under test: these reads are served only to a query engine calling through a
 //! vended query session, so a caller presenting ordinary credentials is refused with HTTP
-//! 400 `AccessDeniedException` and an empty message; the gate is decided BEFORE any
+//! 400 `AccessDeniedException` whose body carries NO `Message` member at all — absent, not
+//! present and empty; the gate is decided BEFORE any
 //! catalog lookup, so the refusal is identical for a partition the catalog holds and for
 //! one it never held — it leaks no not-found signal — and it changes nothing, so the
 //! ungated `GetPartition` reports exactly what it reported before.
@@ -22,7 +23,6 @@
 //! an `AuditContext` or a `Region`.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::UNFILTERED_PARTITION_METADATA_ACCESS_DENIED;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::partitions::{batch_create, get_partition, partition_errors, seed_table};
@@ -109,17 +109,14 @@ async fn assert_denied(router: &MultiServiceRouter, case: &str, operation: &str,
         error_code(&parsed)
     );
     assert_eq!(
-        error_message(&parsed),
-        UNFILTERED_PARTITION_METADATA_ACCESS_DENIED,
-        "case {case:?}: the refusal carries no wording at all, got {:?}",
-        error_message(&parsed)
+        parsed.get("Message"),
+        None,
+        "case {case:?}: expected no Message member in the refusal body, got {parsed}"
     );
-    // The same expectation spelled literally: the recorded refusal's message is the empty
-    // string, so a change to the crate's constant cannot silently redefine what is pinned.
     assert_eq!(
         error_message(&parsed),
-        "",
-        "case {case:?}: the recorded refusal's message is empty, got {:?}",
+        "<no Message>",
+        "case {case:?}: expected no Message member in the refusal body, got {:?}",
         error_message(&parsed)
     );
 }

@@ -51,6 +51,10 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-blueprint-r
 /// The role the layouts below give the jobs and crawlers they create.
 const PASS_ROLE: &str = "arn:aws:iam::000000000000:role/sim2real-glue-pass-role";
 
+/// The NAME of that role, which is what a read of a CRAWLER reports: a crawler's `Role` may
+/// be written as a name or as an ARN and reads back as the name IAM holds the role under.
+const PASS_ROLE_NAME: &str = "sim2real-glue-pass-role";
+
 /// The `BlueprintRunState` values a settled run reports: "Succeeded — The blueprint run
 /// completed successfully" and "Failed — The blueprint run failed and rollback is complete"
 /// (`smithy_query shape=BlueprintRun`, member `State`).
@@ -438,7 +442,7 @@ async fn a_run_deploys_the_entities_its_layout_creates() {
                 read.get("Crawler")
                     .and_then(|held| held.get("Role"))
                     .and_then(Value::as_str),
-                Some(PASS_ROLE),
+                Some(PASS_ROLE_NAME),
                 "case {case}: the crawler {crawler} must be readable with the role the layout \
                  gave it, got {read}"
             );

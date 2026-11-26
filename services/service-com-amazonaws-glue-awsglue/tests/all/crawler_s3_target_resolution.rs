@@ -76,6 +76,37 @@ async fn reported_crawler(router: &MultiServiceRouter, name: &str) -> Value {
     ok(router, "GetCrawler", &json!({ "Name": name })).await["Crawler"].clone()
 }
 
+/// Every target list a crawler reports: the eight the published `CrawlerTargets` binds
+/// (`smithy_query shape=CrawlerTargets`) and the REST catalog list the service reports beside
+/// them.
+const REPORTED_TARGET_LISTS: [&str; 9] = [
+    "S3Targets",
+    "JdbcTargets",
+    "MongoDBTargets",
+    "DynamoDBTargets",
+    "CatalogTargets",
+    "DeltaTargets",
+    "IcebergTargets",
+    "HudiTargets",
+    "RestCatalogTargets",
+];
+
+/// The `Targets` a read reports for a write that sent `sent`: the lists it named, every list
+/// it did not name EMPTY, and each Amazon S3 target carrying the glob patterns it excludes —
+/// none, which is the empty list.
+fn as_reported(sent: &Value) -> Value {
+    let mut reported = json!({});
+    for list in REPORTED_TARGET_LISTS {
+        reported[list] = sent.get(list).cloned().unwrap_or_else(|| json!([]));
+    }
+    for target in reported["S3Targets"].as_array_mut().into_iter().flatten() {
+        if target.get("Exclusions").is_none() {
+            target["Exclusions"] = json!([]);
+        }
+    }
+    reported
+}
+
 /// One row: what the crawler's targets name, and the target a write of them must be refused
 /// for — `None` for a row every write stores as written.
 struct Row {
@@ -199,7 +230,8 @@ async fn create_resolves_every_s3_target_against_the_object_store() {
             );
             let crawler = reported_crawler(&router, &name).await;
             assert_eq!(
-                crawler["Targets"], row.targets,
+                crawler["Targets"],
+                as_reported(&row.targets),
                 "case {case:?}: the stored targets must be the ones sent, got {:?}",
                 crawler["Targets"]
             );
@@ -260,7 +292,8 @@ async fn update_resolves_the_targets_it_would_store() {
             );
             let crawler = reported_crawler(&router, &name).await;
             assert_eq!(
-                crawler["Targets"], row.targets,
+                crawler["Targets"],
+                as_reported(&row.targets),
                 "case {case:?}: the update's targets must be the stored ones, got {:?}",
                 crawler["Targets"]
             );
@@ -271,7 +304,7 @@ async fn update_resolves_the_targets_it_would_store() {
         let crawler = reported_crawler(&router, &name).await;
         assert_eq!(
             crawler["Targets"],
-            s3_targets(&[&held]),
+            as_reported(&s3_targets(&[&held])),
             "case {case:?}: a refused update leaves the stored targets as they were, got {:?}",
             crawler["Targets"]
         );
@@ -334,7 +367,7 @@ async fn a_bucket_the_object_store_refuses_to_read_is_not_absent() {
     let crawler = reported_crawler(&router, "target-denied").await;
     assert_eq!(
         crawler["Targets"],
-        s3_targets(&[&path]),
+        as_reported(&s3_targets(&[&path])),
         "the stored targets must be the ones sent, got {:?}",
         crawler["Targets"]
     );
@@ -362,7 +395,8 @@ async fn with_no_object_store_to_ask_every_target_is_stored() {
         );
         let crawler = reported_crawler(&router, &name).await;
         assert_eq!(
-            crawler["Targets"], row.targets,
+            crawler["Targets"],
+            as_reported(&row.targets),
             "case {case:?}: the stored targets must be the ones sent, got {:?}",
             crawler["Targets"]
         );

@@ -302,8 +302,8 @@ async fn a_stack_whose_crawler_target_exists_deploys() {
     );
     let crawler = ok(&router, "GetCrawler", &json!({ "Name": names.crawler })).await;
     assert_eq!(
-        crawler["Crawler"]["Targets"],
-        json!({ "S3Targets": [{ "Path": names.target_path() }] }),
+        crawler["Crawler"]["Targets"]["S3Targets"],
+        json!([{ "Path": names.target_path(), "Exclusions": [] }]),
         "case {case:?}: the crawler must carry the declared target, got {crawler}"
     );
 }

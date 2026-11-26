@@ -87,8 +87,10 @@ async fn create_crawler(router: &MultiServiceRouter, name: &str) -> Value {
 /// the two the write moves (`Version` and `LastUpdated`), which each test asserts itself.
 ///
 /// This is the rule, applied member by member rather than row by row: a named member
-/// replaces, an unnamed one is left standing, an empty `Description` is taken off, and a
-/// cron expression is reported inside the `Schedule` structure that carries its state.
+/// replaces, an unnamed one is left standing, an empty `Description` is taken off, a cron
+/// expression is reported inside the `Schedule` structure that carries its state, a `Role` is
+/// reported by the NAME IAM holds it under, and the target lists are reported in full
+/// ([`reported_targets`]).
 fn merged(before: &Value, update: &Value) -> Value {
     let mut expected = before.clone();
     let members = expected.as_object_mut().expect("a Crawler is a structure");
@@ -106,12 +108,52 @@ fn merged(before: &Value, update: &Value) -> Value {
                     json!({ "ScheduleExpression": value, "State": "SCHEDULED" }),
                 );
             }
+            // Written as a name or as an ARN, read back as the name.
+            "Role" => {
+                let named = value.as_str().unwrap_or_default();
+                let name = named.rsplit('/').next().unwrap_or(named);
+                members.insert("Role".to_string(), json!(name));
+            }
+            "Targets" => {
+                members.insert("Targets".to_string(), reported_targets(value));
+            }
             _ => {
                 members.insert(member.clone(), value.clone());
             }
         }
     }
     expected
+}
+
+/// Every target list a crawler reports: the eight the published `CrawlerTargets` binds
+/// (`smithy_query shape=CrawlerTargets`) and the REST catalog list the service reports beside
+/// them.
+const REPORTED_TARGET_LISTS: [&str; 9] = [
+    "S3Targets",
+    "JdbcTargets",
+    "MongoDBTargets",
+    "DynamoDBTargets",
+    "CatalogTargets",
+    "DeltaTargets",
+    "IcebergTargets",
+    "HudiTargets",
+    "RestCatalogTargets",
+];
+
+/// The `Targets` a read reports for a write that sent `sent`: the lists it named, every list
+/// it did not name EMPTY, and each Amazon S3 target carrying the glob patterns it excludes —
+/// none, which is the empty list.
+fn reported_targets(sent: &Value) -> Value {
+    let mut reported = json!({});
+    for list in REPORTED_TARGET_LISTS {
+        reported[list] = sent.get(list).cloned().unwrap_or_else(|| json!([]));
+    }
+    for target in reported["S3Targets"].as_array_mut().into_iter().flatten() {
+        if target.get("Exclusions").is_none() {
+            target["Exclusions"] = json!([]);
+        }
+    }
+    reported
 }
 
 /// The `LastUpdated` of a reported crawler, as epoch seconds.

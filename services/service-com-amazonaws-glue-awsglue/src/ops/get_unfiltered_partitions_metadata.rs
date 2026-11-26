@@ -215,14 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is decided before any catalog lookup, so neither what the addressed table holds
         // nor whether it exists can change the answer, and the store is never touched.
         let _ = (&input, ctx, &self.engine);
+        // RECORDED: the refusal body carries NO `Message` member at all — the member is
+        // ABSENT, not empty — so it discloses nothing about the catalog, and in particular
+        // nothing about whether the addressed table or partition exists. The serializer
+        // leaves out what there is no value for, where an empty string would be a member
+        // present on the wire carrying no reason.
         Err(
             GetUnfilteredPartitionsMetadataErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(
-                        crate::state::messages::UNFILTERED_PARTITION_METADATA_ACCESS_DENIED
-                            .to_string(),
-                    ),
-                },
+                AccessDeniedException { message: None },
             )
             .into(),
         )

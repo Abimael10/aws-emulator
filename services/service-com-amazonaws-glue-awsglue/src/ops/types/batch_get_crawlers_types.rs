@@ -17,10 +17,40 @@ pub struct BatchGetCrawlersInput {
     pub crawler_names: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#BatchGetCrawlersResponse")]
+/// `BatchGetCrawlersResponse`: the crawlers the request named that the account holds, and
+/// the names it holds none under.
+///
+/// Member set and order from
+/// `smithy_query(query="operation", operation="BatchGetCrawlers")`. Every crawler of the
+/// answer is reported through [`ReportedCrawler`], exactly as the single read reports it,
+/// which is why the schema and the serializer come from
+/// `types/recorded_catalog_members.rs` rather than from the derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetCrawlersOutput {
     pub crawlers: Option<Vec<Crawler>>,
     pub crawlers_not_found: Option<Vec<String>>,
 }
 
+glue_schema_and_serializer!(
+    BatchGetCrawlersOutput,
+    BATCH_GET_CRAWLERS_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#BatchGetCrawlersResponse",
+    "com.amazonaws.glue",
+    "BatchGetCrawlersResponse",
+    (
+        M_CRAWLERS,
+        crawlers,
+        "Crawlers",
+        0,
+        opt,
+        list_of_wrapped_struct(Crawler, ReportedCrawler)
+    ),
+    (
+        M_CRAWLERS_NOT_FOUND,
+        crawlers_not_found,
+        "CrawlersNotFound",
+        1,
+        opt,
+        list_of_string
+    ),
+);

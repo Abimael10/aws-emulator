@@ -16,7 +16,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 pub struct GetDataCatalogExportConfigurationInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetDataCatalogExportConfigurationOutput")]
+/// `GetDataCatalogExportConfigurationOutput`: the catalog's export configuration as the last
+/// write to it left it, and the status the clock has reached with it.
+///
+/// Member set and order from
+/// `smithy_query(query="operation", operation="GetDataCatalogExportConfiguration")`, plus
+/// the data-quality and lineage export members appended last — members the real service
+/// reports on this response and the on-disk model omits, which is why the schema and the
+/// serializer come from `types/recorded_catalog_members.rs` rather than from the derive (see
+/// that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct GetDataCatalogExportConfigurationOutput {
     pub export_setting: Option<String>,
@@ -25,5 +33,69 @@ pub struct GetDataCatalogExportConfigurationOutput {
     pub s3_table_bucket_arn: Option<String>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
+    pub data_quality_export_setting: Option<String>,
+    pub data_quality_export_status: Option<String>,
+    pub lineage_export_setting: Option<String>,
+    pub lineage_export_status: Option<String>,
 }
+
+glue_schema_and_serializer!(
+    GetDataCatalogExportConfigurationOutput,
+    GET_DATA_CATALOG_EXPORT_CONFIGURATION_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#GetDataCatalogExportConfigurationOutput",
+    "com.amazonaws.glue",
+    "GetDataCatalogExportConfigurationOutput",
+    (M_EXPORT_SETTING, export_setting, "ExportSetting", 0, opt, string),
+    (M_STATUS, status, "Status", 1, opt, string),
+    (
+        M_ENCRYPTION_CONFIGURATION,
+        encryption_configuration,
+        "EncryptionConfiguration",
+        2,
+        opt,
+        structure
+    ),
+    (
+        M_S3_TABLE_BUCKET_ARN,
+        s3_table_bucket_arn,
+        "S3TableBucketArn",
+        3,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "CreatedAt", 4, opt, timestamp),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 5, opt, timestamp),
+    (
+        M_DATA_QUALITY_EXPORT_SETTING,
+        data_quality_export_setting,
+        "DataQualityExportSetting",
+        6,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+    (
+        M_DATA_QUALITY_EXPORT_STATUS,
+        data_quality_export_status,
+        "DataQualityExportStatus",
+        7,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+    (
+        M_LINEAGE_EXPORT_SETTING,
+        lineage_export_setting,
+        "LineageExportSetting",
+        8,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+    (
+        M_LINEAGE_EXPORT_STATUS,
+        lineage_export_status,
+        "LineageExportStatus",
+        9,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+);
 

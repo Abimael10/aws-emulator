@@ -46,10 +46,19 @@ macro_rules! glue_shape_type {
     (integer) => {
         ::aws_smithy_schema::ShapeType::Integer
     };
+    (structure) => {
+        ::aws_smithy_schema::ShapeType::Structure
+    };
+    (wrapped_struct) => {
+        ::aws_smithy_schema::ShapeType::Structure
+    };
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
     };
     (list_of_struct) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
+    (list_of_wrapped_struct) => {
         ::aws_smithy_schema::ShapeType::List
     };
     (map_of_struct) => {
@@ -59,8 +68,10 @@ macro_rules! glue_shape_type {
 
 /// One member's schema, as the vendored codegen would emit it.
 ///
-/// `$kind` is the member's shape kind — `string`, `integer`, `timestamp`,
-/// `list_of_string`, `list_of_struct(T)`, `map_of_struct(T)` — or
+/// `$kind` is the member's shape kind — `string`, `integer`, `timestamp`, `structure`,
+/// `list_of_string`, `list_of_struct(T)`, `map_of_struct(T)`, or, where the value is
+/// written through one of this crate's reported projections,
+/// `wrapped_struct(W)` / `list_of_wrapped_struct(T, W)` — or
 /// `recorded("<namespace>", <kind>)` for a member the model does not declare at all.
 macro_rules! glue_member_schema {
     // A member the model does not declare, which the real service carries on the wire: its
@@ -68,7 +79,7 @@ macro_rules! glue_member_schema {
     // encoding is the one its `$kind` names, like any other member.
     (
         $ns:literal, $local:literal, $wire:literal, $idx:literal,
-        recorded($rns:literal, $kind:tt $(($inner:ty))?)
+        recorded($rns:literal, $kind:tt $(($($inner:ty),+ $(,)?))?)
     ) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
@@ -81,7 +92,10 @@ macro_rules! glue_member_schema {
             $idx,
         )
     };
-    ($ns:literal, $local:literal, $wire:literal, $idx:literal, $kind:tt $(($inner:ty))?) => {
+    (
+        $ns:literal, $local:literal, $wire:literal, $idx:literal,
+        $kind:tt $(($($inner:ty),+ $(,)?))?
+    ) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
                 concat!($ns, "#", $local, "$", $wire),
@@ -113,6 +127,14 @@ macro_rules! glue_write_member {
     ($s:ident, $m:expr, $v:expr, integer) => {
         $s.write_integer($m, *$v)?;
     };
+    ($s:ident, $m:expr, $v:expr, structure) => {
+        $s.write_struct($m, $v)?;
+    };
+    // A structure this service reports through one of its projections: the value is written
+    // by the WRAPPER, which carries the members the published shape does not bind.
+    ($s:ident, $m:expr, $v:expr, wrapped_struct($wrapper:path)) => {
+        $s.write_struct($m, &$wrapper($v))?;
+    };
     ($s:ident, $m:expr, $v:expr, list_of_string) => {
         $s.write_list($m, &|__sl| {
             for __it in $v.iter() {
@@ -125,6 +147,17 @@ macro_rules! glue_write_member {
         $s.write_list($m, &|__sl| {
             for __it in $v.iter() {
                 __sl.write_struct(&<$inner>::SCHEMA, __it)?;
+            }
+            Ok(())
+        })?;
+    };
+    // A list of structures this service reports through one of its projections: each element
+    // names its own published shape's schema, as the generated list serializers do, and is
+    // written by the wrapper.
+    ($s:ident, $m:expr, $v:expr, list_of_wrapped_struct($inner:ty, $wrapper:path)) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_struct(&<$inner>::SCHEMA, &$wrapper(__it))?;
             }
             Ok(())
         })?;

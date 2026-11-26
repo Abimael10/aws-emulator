@@ -6,7 +6,9 @@
 //! The rule under test: a catalog's encryption settings are ONE record per catalog that
 //! a write replaces whole and a read reports, with each setting a stored record does not
 //! name reported at that setting's own default — encryption at rest `DISABLED`, and
-//! connection passwords returned as stored. A read reports, so it never changes what a
+//! connection passwords returned as stored. A write that turns connection-password
+//! protection ON without naming a key is served by the service's AWS managed key, which the
+//! read then reports. A read reports, so it never changes what a
 //! later read sees, and a `CatalogId` this emulator holds no catalog under is refused by
 //! both operations rather than served or created.
 //!
@@ -47,6 +49,11 @@ fn default_settings() -> Value {
         "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": false }
     }))
 }
+
+/// The AWS MANAGED key of this service, as the alias that names it: the key a catalog
+/// protects its connection passwords under when the write that turned that protection on
+/// named no key of its own.
+const MANAGED_GLUE_KEY: &str = "alias/aws/glue";
 
 /// The published settings `configured` as a READ reports them: with
 /// `EncryptedCatalogSearchStatus` beside them.
@@ -158,6 +165,21 @@ fn round_trip_rows() -> Vec<SettingsRow> {
                 "ConnectionPasswordEncryption": {
                     "ReturnConnectionPasswordEncrypted": true,
                     "AwsKmsKeyId": "alias/glue-connections"
+                }
+            })),
+        ),
+        (
+            // Turned on without naming a key: the catalog encrypts the passwords under the
+            // service's AWS managed key, which is what the read then reports.
+            "connection password encryption enabled under no key of its own",
+            json!({
+                "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": true }
+            }),
+            as_reported(json!({
+                "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
+                "ConnectionPasswordEncryption": {
+                    "ReturnConnectionPasswordEncrypted": true,
+                    "AwsKmsKeyId": MANAGED_GLUE_KEY
                 }
             })),
         ),
@@ -365,7 +387,10 @@ async fn a_second_write_replaces_the_record_rather_than_merging_into_it() {
             json!({ "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": true } }),
             as_reported(json!({
                 "EncryptionAtRest": { "CatalogEncryptionMode": "DISABLED" },
-                "ConnectionPasswordEncryption": { "ReturnConnectionPasswordEncrypted": true }
+                "ConnectionPasswordEncryption": {
+                    "ReturnConnectionPasswordEncrypted": true,
+                    "AwsKmsKeyId": MANAGED_GLUE_KEY
+                }
             })),
         ),
         (
@@ -575,7 +600,11 @@ async fn the_settings_record_lives_beside_the_catalog_resources() {
     );
 
     let reported = get_settings(&router, &json!({})).await;
-    let expected = as_reported(settings);
+    // The write turned password protection on without naming a key, so the catalog holds
+    // the service's AWS managed key for it.
+    let mut expected = settings;
+    expected["ConnectionPasswordEncryption"]["AwsKmsKeyId"] = json!(MANAGED_GLUE_KEY);
+    let expected = as_reported(expected);
     assert_eq!(
         reported, expected,
         "creating catalog resources must not change the settings record; expected \

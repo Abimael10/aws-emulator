@@ -70,6 +70,19 @@ pub const EXPORT_SSE_ALGORITHMS: &[&str] = &["AES256", "aws:kms"];
 /// that reads it; nothing sleeps.
 pub const EXPORT_CONFIGURATION_SETTLES_AFTER: Duration = BLUEPRINT_SETTLES_AFTER;
 
+/// The `ExportSetting` and `ExportStatus` of the catalog's DATA QUALITY export and of its
+/// LINEAGE export, which the service reports beside the metadata export's own.
+///
+/// RECORDED, not modelled: the published `GetDataCatalogExportConfigurationOutput` binds
+/// `ExportSetting`/`Status` for the catalog's metadata export only, and
+/// `PutDataCatalogExportConfiguration` carries no member for either of these two exports, so
+/// nothing can ask for a catalog's data quality or its lineage to be exported and no catalog
+/// this service holds exports either. The service reports both regardless, so a client
+/// reading the catalog's export configuration sees the state each of those exports is in —
+/// which, with nothing to turn them on, is off ([`EXPORT_SETTING_DISABLED`]) and settled
+/// there ([`EXPORT_STATUS_DISABLED`]).
+const UNEXPORTED: (&str, &str) = (EXPORT_SETTING_DISABLED, EXPORT_STATUS_DISABLED);
+
 /// ONE catalog's export configuration: the setting the last write asked for, how the
 /// exported data is encrypted, when the configuration was first written and last changed,
 /// and the instant from which the clock owes the setting's settled status.
@@ -203,6 +216,12 @@ impl DataCatalogExportConfigurationEntry {
             s3_table_bucket_arn,
             created_at: Some(to_date_time(self.created_at)),
             updated_at: Some(to_date_time(self.updated_at)),
+            // Neither of the other two exports can be asked for, so each reports the state
+            // it is in, which is off ([`UNEXPORTED`]).
+            data_quality_export_setting: Some(UNEXPORTED.0.to_string()),
+            data_quality_export_status: Some(UNEXPORTED.1.to_string()),
+            lineage_export_setting: Some(UNEXPORTED.0.to_string()),
+            lineage_export_status: Some(UNEXPORTED.1.to_string()),
         }
     }
 }
@@ -229,6 +248,10 @@ pub fn unconfigured_data_catalog_export() -> crate::ops::types::GetDataCatalogEx
         s3_table_bucket_arn: None,
         created_at: None,
         updated_at: None,
+        data_quality_export_setting: Some(UNEXPORTED.0.to_string()),
+        data_quality_export_status: Some(UNEXPORTED.1.to_string()),
+        lineage_export_setting: Some(UNEXPORTED.0.to_string()),
+        lineage_export_status: Some(UNEXPORTED.1.to_string()),
     }
 }
 

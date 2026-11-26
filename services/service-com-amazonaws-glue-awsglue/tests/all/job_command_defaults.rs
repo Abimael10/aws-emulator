@@ -11,18 +11,21 @@
 //! supplied included — while a member the request declared nothing for and the service
 //! documents no value for stays ABSENT. `JobCommand$PythonVersion` ("The Python version
 //! being used to run a Python shell job. Allowed values are 2 or 3") is such a nested
-//! member: a command that named no version is stored with the service's own, written inside
-//! the structure the caller sent, and a command that named one keeps it.
+//! member: a command that named no version is stored with the one the GLUE VERSION the write
+//! stated calls for — 3 where that version runs no Python 2, else the historical default of
+//! 2 — written inside the structure the caller sent, and a command that named a version
+//! keeps it.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the job
 //! command, the Python version the request named (each value the member's `@pattern`
-//! admits), the write that submitted the definition (`CreateJob` or the `UpdateJob` that
-//! overwrites it), and the capacity form the definition expresses.
+//! admits), the Glue version the write states beside it, the write that submitted the
+//! definition (`CreateJob` or the `UpdateJob` that overwrites it), and the capacity form the
+//! definition expresses.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     DEFAULT_JOB_MODE, DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_PYTHON_VERSION,
-    DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4,
+    DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4, PYTHON_VERSION_3,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -61,7 +64,8 @@ async fn command_of(router: &MultiServiceRouter, name: &str) -> Value {
 /// The rows differ along the job command: the two Spark commands and the Python shell one
 /// (`JobCommand$Name`: "For an Apache Spark ETL job, this must be `glueetl` … for a Python
 /// shell job, it must be `pythonshell` … for an Apache Spark streaming ETL job, this must be
-/// `gluestreaming`").
+/// `gluestreaming`"), and along the Glue version the create states beside the command, which
+/// is what decides WHICH version is filled in.
 #[tokio::test]
 async fn a_command_that_named_no_python_version_is_stored_with_the_services_own() {
     let router = emulator();
@@ -70,36 +74,49 @@ async fn a_command_that_named_no_python_version_is_stored_with_the_services_own(
     // list; the Ray command is the row of the suite below, its versions being its
     // `Runtime`'s to state.
     for command_name in ["glueetl", "gluestreaming", "pythonshell"] {
-        let job = format!("defaults-{command_name}");
-        ok(
-            &router,
-            "CreateJob",
-            &json!({
+        // (the Glue version the create states, the version that calls for). The published
+        // versions either run Python 2 (0.9, 1.0) or run Python 3 alone (2.0 and later),
+        // and a create that states none keeps the historical default.
+        let versions: [(Option<&str>, &str); 5] = [
+            (None, DEFAULT_PYTHON_VERSION),
+            (Some("0.9"), DEFAULT_PYTHON_VERSION),
+            (Some("1.0"), DEFAULT_PYTHON_VERSION),
+            (Some("2.0"), PYTHON_VERSION_3),
+            (Some("5.0"), PYTHON_VERSION_3),
+        ];
+        for (index, (glue_version, expected)) in versions.into_iter().enumerate() {
+            let job = format!("defaults-{command_name}-{index}");
+            let mut request = json!({
                 "Name": job,
                 "Role": ROLE_ARN,
                 "Command": { "Name": command_name, "ScriptLocation": SCRIPT_LOCATION },
-            }),
-        )
-        .await;
+            });
+            if let Some(glue_version) = glue_version {
+                request["GlueVersion"] = json!(glue_version);
+            }
+            ok(&router, "CreateJob", &request).await;
 
-        let command = command_of(&router, &job).await;
-        assert_eq!(
-            command.get("PythonVersion").and_then(Value::as_str),
-            Some(DEFAULT_PYTHON_VERSION),
-            "case {command_name}: a command that named no PythonVersion must be stored with \
-             the service's own, expected {DEFAULT_PYTHON_VERSION:?}, got {command}"
-        );
-        assert_eq!(
-            command.get("Name").and_then(Value::as_str),
-            Some(command_name),
-            "case {command_name}: the command name the create sent must round-trip, got {command}"
-        );
-        assert_eq!(
-            command.get("ScriptLocation").and_then(Value::as_str),
-            Some(SCRIPT_LOCATION),
-            "case {command_name}: the script location the create sent must round-trip, got \
-             {command}"
-        );
+            let command = command_of(&router, &job).await;
+            assert_eq!(
+                command.get("PythonVersion").and_then(Value::as_str),
+                Some(expected),
+                "case {command_name} on Glue {glue_version:?}: a command that named no \
+                 PythonVersion must be stored with the one that Glue version calls for, \
+                 expected {expected:?}, got {command}"
+            );
+            assert_eq!(
+                command.get("Name").and_then(Value::as_str),
+                Some(command_name),
+                "case {command_name} on Glue {glue_version:?}: the command name the create \
+                 sent must round-trip, got {command}"
+            );
+            assert_eq!(
+                command.get("ScriptLocation").and_then(Value::as_str),
+                Some(SCRIPT_LOCATION),
+                "case {command_name} on Glue {glue_version:?}: the script location the create \
+                 sent must round-trip, got {command}"
+            );
+        }
     }
 }
 
@@ -176,15 +193,15 @@ async fn a_ray_command_is_stored_with_its_runtime_and_no_python_version() {
     );
 }
 
-/// The same rule on the write that OVERWRITES a definition: "the previous job definition is
-/// completely overwritten by this information" (`UpdateJob`), so the command the update
-/// submits is stored with the same service-supplied version a create's is — and an update
-/// that names one keeps it.
+/// The write that OVERWRITES a definition fills the Python version in exactly as the create
+/// does — "the previous job definition is completely overwritten by this information"
+/// (`UpdateJob`) — and WHICH version it fills in follows the Glue version THAT request
+/// states, not the one the definition already ran on.
 ///
-/// The rows differ along the version the submitted command named: none, and each value the
-/// member admits.
+/// The rows differ along the version the submitted command named (none, and each value the
+/// member admits) and along the Glue version the update states beside it.
 #[tokio::test]
-async fn an_update_stores_its_command_with_the_same_python_version_rule() {
+async fn an_update_fills_the_version_the_glue_version_it_states_calls_for() {
     let router = emulator();
     let job = "updated-command";
     ok(
@@ -196,32 +213,50 @@ async fn an_update_stores_its_command_with_the_same_python_version_rule() {
             "Command": {
                 "Name": "glueetl",
                 "ScriptLocation": SCRIPT_LOCATION,
-                "PythonVersion": "2",
+                "PythonVersion": "3.9",
             },
         }),
     )
     .await;
 
-    // (case, what the update's command names for the version, the version the stored
-    // definition must then report).
-    let rows: Vec<(&str, Option<&str>, &str)> = vec![
-        ("an update naming no version", None, DEFAULT_PYTHON_VERSION),
-        ("an update naming 2", Some("2"), "2"),
-        ("an update naming 3", Some("3"), "3"),
-        ("an update naming 3.9", Some("3.9"), "3.9"),
+    // (case, what the update's command names for the version, the Glue version the update
+    // states, the version the stored definition must then report).
+    let rows: Vec<(&str, Option<&str>, Option<&str>, &str)> = vec![
+        (
+            "an update naming neither version",
+            None,
+            None,
+            DEFAULT_PYTHON_VERSION,
+        ),
+        (
+            "an update stating a Glue version that runs no Python 2",
+            None,
+            Some("4.0"),
+            PYTHON_VERSION_3,
+        ),
+        (
+            "an update stating a Glue version that runs Python 2",
+            None,
+            Some("1.0"),
+            DEFAULT_PYTHON_VERSION,
+        ),
+        ("an update naming 2", Some("2"), Some("4.0"), "2"),
+        ("an update naming 3", Some("3"), None, "3"),
+        ("an update naming 3.9", Some("3.9"), None, "3.9"),
     ];
-    for (case, named, expected) in rows {
+    for (case, named, glue_version, expected) in rows {
         let mut command = json!({ "Name": "glueetl", "ScriptLocation": SCRIPT_LOCATION });
         if let Some(named) = named {
             command["PythonVersion"] = json!(named);
         }
+        let mut update = json!({ "Role": ROLE_ARN, "Command": command });
+        if let Some(glue_version) = glue_version {
+            update["GlueVersion"] = json!(glue_version);
+        }
         ok(
             &router,
             "UpdateJob",
-            &json!({
-                "JobName": job,
-                "JobUpdate": { "Role": ROLE_ARN, "Command": command },
-            }),
+            &json!({ "JobName": job, "JobUpdate": update }),
         )
         .await;
 
@@ -258,7 +293,7 @@ async fn the_filled_version_is_part_of_the_definition_a_repeat_create_is_compare
         ),
         (
             "the repeat names another version",
-            Some("2"),
+            Some(PYTHON_VERSION_3),
             Some("IdempotentParameterMismatchException"),
         ),
     ];
@@ -356,8 +391,9 @@ async fn a_create_reports_every_default_it_applied_and_omits_what_it_was_not_sen
 
     assert_eq!(
         stored["Command"].get("PythonVersion").and_then(Value::as_str),
-        Some(DEFAULT_PYTHON_VERSION),
-        "the nested Python version must be filled in, got {stored}"
+        Some(PYTHON_VERSION_3),
+        "the nested Python version must be filled in, and this create states a Glue version \
+         that runs no Python 2, got {stored}"
     );
     assert_eq!(
         stored.get("MaxRetries").and_then(Value::as_i64),

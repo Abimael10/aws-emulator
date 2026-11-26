@@ -173,13 +173,27 @@ async fn created_crawlers_are_read_back_from_the_store() {
         .await;
 
         // Everything the request carried, except the members that are not part of the
-        // `Crawler` shape (`Tags`) or that the server re-shapes (`Schedule`).
+        // `Crawler` shape (`Tags`) or that the server re-shapes (`Schedule`, and the `Role`
+        // a read reports by the NAME IAM holds it under whichever form the create named it
+        // in).
         let mut echoed = request.clone();
-        let sent_schedule = echoed
+        let members = echoed
             .as_object_mut()
-            .expect("the request is a structure")
-            .remove("Schedule");
+            .expect("the request is a structure");
+        let sent_schedule = members.remove("Schedule");
+        let sent_role = members.remove("Role");
         assert_echoed(case, &echoed, &crawler);
+
+        // The role is reported by its name: the last segment of an ARN that names one of
+        // this account's roles, and a bare name as it was sent.
+        let sent_role = sent_role.unwrap_or_default();
+        let named = sent_role.as_str().unwrap_or_default();
+        let expected_role = named.rsplit('/').next().unwrap_or(named);
+        assert_eq!(
+            crawler.get("Role").and_then(Value::as_str),
+            Some(expected_role),
+            "case {case}: expected the role name {expected_role:?}, got {crawler}"
+        );
 
         // A crawler is created ready to run: no crawl is in progress, none has run.
         assert_eq!(

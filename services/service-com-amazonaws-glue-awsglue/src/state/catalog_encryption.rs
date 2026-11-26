@@ -46,6 +46,7 @@ use ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use ::service_common::relayed_refusal::{answered_request_id, caught_exception_message, CaughtCall};
 
 use super::ComAmazonawsGlueAwsglueState;
+use crate::ops::types::{ConnectionPasswordEncryption, DataCatalogEncryptionSettings};
 
 /// The name the relayed envelope names the called service by: the name the SDK layer that
 /// relays a Key Management Service call reports it under, which is neither that service's
@@ -60,6 +61,55 @@ const KMS_SDK_SERVICE_NAME: &str = "AWSKMS";
 /// `SSE-KMS-WITH-SERVICE-ROLE`. `DISABLED` is the one that names no key (see
 /// [`super::CATALOG_ENCRYPTION_MODE_DISABLED`]), so the other two are these.
 pub const KEYED_ENCRYPTION_MODES: [&str; 2] = ["SSE-KMS", "SSE-KMS-WITH-SERVICE-ROLE"];
+
+/// The key a catalog protects a secret of its own under when the write that asked for that
+/// protection named no key: the AWS MANAGED key of this service, which every account has
+/// one of in every Region and which the service uses on the account's behalf when a caller
+/// names no key of its own.
+///
+/// RECORDED: the alias the service reports such a key by, which is the form a caller reads
+/// the setting back in. It is the account's managed key for Glue — the key an alias of this
+/// name resolves to — and not a key this service mints.
+pub const AWS_MANAGED_GLUE_KEY_ALIAS: &str = "alias/aws/glue";
+
+/// The `ConnectionPasswordEncryption` a write STORES, from the one it carried: the setting
+/// as sent, with the key the service resolves for it filled in.
+///
+/// "An KMS key that is used to encrypt the connection password"
+/// (`ConnectionPasswordEncryption$AwsKmsKeyId`) is the key the catalog encrypts a stored
+/// connection's password with, so a setting that asks for passwords to be returned
+/// ENCRYPTED is asking to have them encrypted under SOME key: a write that names none is
+/// served by the account's AWS managed key for this service
+/// ([`AWS_MANAGED_GLUE_KEY_ALIAS`]), which is then what a read of the settings reports. A
+/// write that names a key keeps the one it named, whichever form it named it in, and a
+/// setting that asks for no encryption at all names no key of its own to fill in.
+pub fn stored_connection_password_encryption(
+    sent: &ConnectionPasswordEncryption,
+) -> ConnectionPasswordEncryption {
+    let mut stored = sent.clone();
+    if stored.return_connection_password_encrypted && stored.aws_kms_key_id.is_none() {
+        stored.aws_kms_key_id = Some(AWS_MANAGED_GLUE_KEY_ALIAS.to_string());
+    }
+    stored
+}
+
+/// The `DataCatalogEncryptionSettings` a `PutDataCatalogEncryptionSettings` STORES, from the
+/// structure it carried: the settings as sent, with the members the SERVICE fills in present
+/// on them ([`stored_connection_password_encryption`]).
+///
+/// One place, so what the write stores and what a read of the catalog reports cannot
+/// disagree about the key a setting is in force with.
+pub fn stored_data_catalog_encryption_settings(
+    sent: DataCatalogEncryptionSettings,
+) -> DataCatalogEncryptionSettings {
+    DataCatalogEncryptionSettings {
+        connection_password_encryption: sent
+            .connection_password_encryption
+            .as_ref()
+            .map(stored_connection_password_encryption),
+        ..sent
+    }
+}
 
 /// The key material ONE catalog object was written under.
 ///

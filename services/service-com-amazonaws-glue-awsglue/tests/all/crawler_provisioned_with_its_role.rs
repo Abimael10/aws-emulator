@@ -166,13 +166,14 @@ async fn a_crawler_on_a_glue_assumable_role_is_created_over_any_s3_target() {
         );
         assert_eq!(
             crawler["Role"],
-            json!(role),
-            "case {case:?}: the stored role must be the one sent, got {:?}",
+            json!(ROLE_NAME),
+            "case {case:?}: the role is reported by the NAME IAM holds it under, whichever \
+             form the create named it in, got {:?}",
             crawler["Role"]
         );
         assert_eq!(
-            crawler["Targets"],
-            json!({ "S3Targets": [{ "Path": row.path }] }),
+            crawler["Targets"]["S3Targets"],
+            json!([{ "Path": row.path, "Exclusions": [] }]),
             "case {case:?}: the stored targets must be the ones sent, got {:?}",
             crawler["Targets"]
         );

@@ -246,7 +246,9 @@ pub struct CrawlPlan {
 impl CrawlPlan {
     /// The plan the stored `crawler`'s definition states.
     pub fn of(crawler: &CrawlerEntry) -> Self {
-        let policy = crawler.schema_change_policy.as_ref();
+        // The policy IN FORCE on the crawler, which is the one a read of it reports: the
+        // behaviours its write stated, each one it did not at the service's own default.
+        let policy = stated_schema_change_policy(crawler.schema_change_policy.as_ref());
         Self {
             crawler_name: crawler.name.clone(),
             role: crawler.role.clone(),
@@ -270,10 +272,10 @@ impl CrawlPlan {
                 .clone()
                 .unwrap_or_default(),
             update_behavior: policy
-                .and_then(|policy| policy.update_behavior.clone())
+                .update_behavior
                 .unwrap_or_else(|| UPDATE_BEHAVIOR_UPDATE_IN_DATABASE.to_string()),
             delete_behavior: policy
-                .and_then(|policy| policy.delete_behavior.clone())
+                .delete_behavior
                 .unwrap_or_else(|| DELETE_BEHAVIOR_DEPRECATE_IN_DATABASE.to_string()),
             table_grouping: TableGrouping::of_configuration(crawler.configuration.as_deref()),
         }

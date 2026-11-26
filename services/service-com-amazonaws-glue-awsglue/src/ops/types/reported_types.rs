@@ -198,3 +198,154 @@ impl ::aws_smithy_schema::serde::SerializableStruct
         Ok(())
     }
 }
+
+/// Whether a crawler collects statistics about the tables it catalogues, as the service
+/// reports it inside every `Crawler` it answers with.
+///
+/// RECORDED, not modelled: the published `Crawler` binds no `TableProfilingConfiguration`,
+/// so no `CreateCrawler` or `UpdateCrawler` can turn table profiling on and no crawler this
+/// service holds collects table statistics on a crawl. The service reports the setting
+/// regardless, so a client reading a crawler back sees an explicit `false` rather than
+/// nothing at all.
+const COLLECT_TABLE_STATISTICS: bool = false;
+
+/// The `TableProfilingConfiguration` the service reports on every crawler: a structure of
+/// one member, [`COLLECT_TABLE_STATISTICS`].
+///
+/// RECORDED, not modelled: this shape is in no published member list, so it carries its
+/// schema and its serializer here, with its shape id in the recorded namespace the other
+/// unmodelled members of this crate use.
+pub struct ReportedTableProfilingConfiguration;
+
+#[allow(non_upper_case_globals)]
+impl ReportedTableProfilingConfiguration {
+    const M_COLLECT_TABLE_STATISTICS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue.recorded#TableProfilingConfiguration$CollectTableStatistics",
+                "com.amazonaws.glue.recorded",
+                "CollectTableStatistics",
+            ),
+            ::aws_smithy_schema::ShapeType::Boolean,
+            "CollectTableStatistics",
+            0,
+        );
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportedTableProfilingConfiguration {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        __s.write_boolean(&Self::M_COLLECT_TABLE_STATISTICS, COLLECT_TABLE_STATISTICS)?;
+        Ok(())
+    }
+}
+
+/// `CrawlerTargets` as this service reports them: the target lists the published shape
+/// binds, as the crawler holds them, plus the REST catalog targets the service reports
+/// beside them.
+///
+/// RECORDED, not modelled: the published `CrawlerTargets` binds `S3Targets`, `JdbcTargets`,
+/// `MongoDBTargets`, `DynamoDBTargets`, `CatalogTargets`, `DeltaTargets`, `IcebergTargets`
+/// and `HudiTargets` only, so no write can state a REST catalog target and no crawler this
+/// service holds has one. The service reports the list regardless, and for a crawler with no
+/// such target it is EMPTY — the same way every other target list a crawler was given no
+/// target for is reported.
+///
+/// The published members are written by the wrapped value's OWN serializer, under their own
+/// member schemas, so this type restates none of them.
+pub struct ReportedCrawlerTargets<'a>(pub &'a CrawlerTargets);
+
+#[allow(non_upper_case_globals)]
+impl ReportedCrawlerTargets<'_> {
+    /// The member index continues after the eight the published shape binds.
+    const M_REST_CATALOG_TARGETS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue.recorded#CrawlerTargets$RestCatalogTargets",
+                "com.amazonaws.glue.recorded",
+                "RestCatalogTargets",
+            ),
+            ::aws_smithy_schema::ShapeType::List,
+            "RestCatalogTargets",
+            8,
+        );
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportedCrawlerTargets<'_> {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.0.serialize_members(__s)?;
+        // No write of this service can state a REST catalog target, so the list every
+        // crawler reports is the empty one.
+        __s.write_list(&Self::M_REST_CATALOG_TARGETS, &|__sl| {
+            let _ = __sl;
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+/// `Crawler` as this service reports one: the crawler's published members, as a read of the
+/// stored crawler built them, with its `Targets` written through
+/// [`ReportedCrawlerTargets`] and the [`ReportedTableProfilingConfiguration`] the service
+/// reports beside them.
+///
+/// Every published member but one is written by the wrapped value's OWN serializer, under
+/// its own member schema. The exception is `Targets`, which is TAKEN OUT of the copy that
+/// delegation writes and written below through the wrapper that carries the recorded target
+/// list — so that member's schema is restated here, at the index the published `Crawler`
+/// gives it, and the targets are written exactly once.
+pub struct ReportedCrawler<'a>(pub &'a Crawler);
+
+#[allow(non_upper_case_globals)]
+impl ReportedCrawler<'_> {
+    const M_TARGETS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.glue#Crawler$Targets",
+            "com.amazonaws.glue",
+            "Targets",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "Targets",
+        2,
+    );
+
+    /// The member index continues after the twenty-one the published shape binds.
+    const M_TABLE_PROFILING_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.glue.recorded#Crawler$TableProfilingConfiguration",
+                "com.amazonaws.glue.recorded",
+                "TableProfilingConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "TableProfilingConfiguration",
+            21,
+        );
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ReportedCrawler<'_> {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The published members but the targets, written by the published serializer: the
+        // copy it is handed carries no `Targets`, so that member is left for the write
+        // below and this delegation can neither omit a published member nor double one.
+        let mut published = self.0.clone();
+        let targets = published.targets.take();
+        published.serialize_members(__s)?;
+        if let Some(__v) = targets.as_ref() {
+            __s.write_struct(&Self::M_TARGETS, &ReportedCrawlerTargets(__v))?;
+        }
+        __s.write_struct(
+            &Self::M_TABLE_PROFILING_CONFIGURATION,
+            &ReportedTableProfilingConfiguration,
+        )?;
+        Ok(())
+    }
+}

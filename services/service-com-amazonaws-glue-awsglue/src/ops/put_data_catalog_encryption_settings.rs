@@ -240,8 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The write carries the WHOLE settings structure, so it replaces the record
         // rather than merging into it: a setting this request does not name reads back
-        // as that setting's default, not as what an earlier write left there.
-        catalog.encryption_settings = Some(input.data_catalog_encryption_settings);
+        // as that setting's default, not as what an earlier write left there. The members
+        // the SERVICE fills in are written here, beside what the request sent, so a read of
+        // the catalog reports the settings as they are in force (see
+        // `crate::state::catalog_encryption::stored_data_catalog_encryption_settings`).
+        catalog.encryption_settings = Some(
+            crate::state::catalog_encryption::stored_data_catalog_encryption_settings(
+                input.data_catalog_encryption_settings,
+            ),
+        );
         ::tracing::info!(
             operation = "PutDataCatalogEncryptionSettings",
             catalog_id = %catalog_id,

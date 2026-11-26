@@ -19,12 +19,137 @@ pub(super) fn stated_schedule_state(expression: Option<&str>) -> String {
     }
 }
 
+/// `RecrawlPolicy$RecrawlBehavior` a crawler whose write stated no policy carries: of the
+/// modelled `RecrawlBehavior` (`CRAWL_EVERYTHING | CRAWL_NEW_FOLDERS_ONLY |
+/// CRAWL_EVENT_MODE`), the one that crawls "the entire dataset again", which is what a
+/// crawler with no policy of its own does.
+pub const RECRAWL_BEHAVIOR_CRAWL_EVERYTHING: &str = "CRAWL_EVERYTHING";
+
+/// `LineageConfiguration$CrawlerLineageSettings` a crawler whose write stated no
+/// configuration carries: of the modelled `CrawlerLineageSettings` (`ENABLE | DISABLE`), the
+/// one that leaves data lineage OFF, which is where a crawler nothing enabled it for sits.
+pub const CRAWLER_LINEAGE_SETTINGS_DISABLE: &str = "DISABLE";
+
+/// `LakeFormationConfiguration$AccountId` a crawler whose write named none carries:
+/// "required for cross account crawls. For same account crawls as the target data, this can
+/// be left as null" — a crawler that names no other account crawls its own, which the
+/// configuration states as the empty account rather than as a member that is not there.
+pub const LAKE_FORMATION_SAME_ACCOUNT: &str = "";
+
+/// The `SchemaChangePolicy` a crawler REPORTS, from the one its write stated: every member
+/// the write left unset filled in with the behaviour the service applies to a crawler that
+/// states none ([`UPDATE_BEHAVIOR_UPDATE_IN_DATABASE`],
+/// [`DELETE_BEHAVIOR_DEPRECATE_IN_DATABASE`]) — the very behaviours a crawl of such a
+/// crawler follows ([`CrawlPlan::of`]), so what a read reports and what a crawl does cannot
+/// disagree.
+pub fn stated_schema_change_policy(
+    stated: Option<&SchemaChangePolicy>,
+) -> SchemaChangePolicy {
+    SchemaChangePolicy {
+        update_behavior: Some(
+            stated
+                .and_then(|policy| policy.update_behavior.clone())
+                .unwrap_or_else(|| UPDATE_BEHAVIOR_UPDATE_IN_DATABASE.to_string()),
+        ),
+        delete_behavior: Some(
+            stated
+                .and_then(|policy| policy.delete_behavior.clone())
+                .unwrap_or_else(|| DELETE_BEHAVIOR_DEPRECATE_IN_DATABASE.to_string()),
+        ),
+    }
+}
+
+/// The `RecrawlPolicy` a crawler REPORTS, from the one its write stated: the behaviour the
+/// write named, else [`RECRAWL_BEHAVIOR_CRAWL_EVERYTHING`].
+fn stated_recrawl_policy(stated: Option<&RecrawlPolicy>) -> RecrawlPolicy {
+    RecrawlPolicy {
+        recrawl_behavior: Some(
+            stated
+                .and_then(|policy| policy.recrawl_behavior.clone())
+                .unwrap_or_else(|| RECRAWL_BEHAVIOR_CRAWL_EVERYTHING.to_string()),
+        ),
+    }
+}
+
+/// The `LineageConfiguration` a crawler REPORTS, from the one its write stated: the setting
+/// the write named, else [`CRAWLER_LINEAGE_SETTINGS_DISABLE`].
+fn stated_lineage_configuration(stated: Option<&LineageConfiguration>) -> LineageConfiguration {
+    LineageConfiguration {
+        crawler_lineage_settings: Some(
+            stated
+                .and_then(|configuration| configuration.crawler_lineage_settings.clone())
+                .unwrap_or_else(|| CRAWLER_LINEAGE_SETTINGS_DISABLE.to_string()),
+        ),
+    }
+}
+
+/// The `LakeFormationConfiguration` a crawler REPORTS, from the one its write stated: the
+/// members the write named, else the configuration of a crawler that uses its own IAM role's
+/// credentials on its own account's data — "specifies whether to use Lake Formation
+/// credentials for the crawler instead of the IAM role credentials" is off, and the account
+/// is [`LAKE_FORMATION_SAME_ACCOUNT`].
+fn stated_lake_formation_configuration(
+    stated: Option<&LakeFormationConfiguration>,
+) -> LakeFormationConfiguration {
+    LakeFormationConfiguration {
+        use_lake_formation_credentials: Some(
+            stated
+                .and_then(|configuration| configuration.use_lake_formation_credentials)
+                .unwrap_or(false),
+        ),
+        account_id: Some(
+            stated
+                .and_then(|configuration| configuration.account_id.clone())
+                .unwrap_or_else(|| LAKE_FORMATION_SAME_ACCOUNT.to_string()),
+        ),
+    }
+}
+
+/// The `CrawlerTargets` a crawler REPORTS, from the ones its write stated: every target list
+/// the write did not name reported as the EMPTY list rather than as a member that is not
+/// there, and every Amazon S3 target's `Exclusions` likewise — a crawler that names no
+/// exclusion crawls everything under its path, which is the empty exclusion list, not an
+/// unstated one.
+///
+/// The set of lists is the modelled `CrawlerTargets` member list in full
+/// (`smithy_query shape=CrawlerTargets`), so a list the model adds later is reported the
+/// moment this crate's shape carries it.
+fn stated_targets(stated: &CrawlerTargets) -> CrawlerTargets {
+    CrawlerTargets {
+        s3_targets: Some(
+            stated
+                .s3_targets
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|target| S3Target {
+                    exclusions: Some(target.exclusions.unwrap_or_default()),
+                    ..target
+                })
+                .collect(),
+        ),
+        jdbc_targets: Some(stated.jdbc_targets.clone().unwrap_or_default()),
+        mongo_db_targets: Some(stated.mongo_db_targets.clone().unwrap_or_default()),
+        dynamo_db_targets: Some(stated.dynamo_db_targets.clone().unwrap_or_default()),
+        catalog_targets: Some(stated.catalog_targets.clone().unwrap_or_default()),
+        delta_targets: Some(stated.delta_targets.clone().unwrap_or_default()),
+        iceberg_targets: Some(stated.iceberg_targets.clone().unwrap_or_default()),
+        hudi_targets: Some(stated.hudi_targets.clone().unwrap_or_default()),
+    }
+}
+
 /// A stored crawler.
 ///
 /// Every member of the modelled `Crawler` shape that a create can fill is held here, so
 /// a later `GetCrawler` reports what the create stored and nothing else. The members only
 /// a CRAWL produces (`LastCrawl`, `CrawlElapsedTime`) are held here too, written by the
 /// crawl that produced them: a crawler nothing has crawled reports neither.
+///
+/// The sub-structures of a crawler's definition that the service DEFAULTS — its policies,
+/// its configurations and its target lists — are held exactly as the write stated them,
+/// including unstated; the value each of them is IN FORCE with is what a read reports
+/// ([`stated_schema_change_policy`] and the three beside it), which is the same value a
+/// crawl of the crawler follows.
 #[derive(Debug, Clone)]
 pub struct CrawlerEntry {
     /// The crawler's name, which is also its key in [`ComAmazonawsGlueAwsglueState::crawlers`].
@@ -457,17 +582,33 @@ impl CrawlerEntry {
     /// `CrawlElapsedTime` is measured from the instant the crawl in flight began. Every
     /// other member comes from the store, so repeated reads of a crawler with no crawl in
     /// flight agree.
+    ///
+    /// The sub-structures of the definition that the service defaults are reported with the
+    /// value they are IN FORCE with: the members the write stated, and the service's own
+    /// default for each one it did not ([`stated_schema_change_policy`] and the three
+    /// beside it). A crawler whose write stated no policy at all is still crawling under
+    /// one, so the read reports the policy it would be crawled under rather than leaving a
+    /// client to guess it — and the target lists it names no target in are reported EMPTY,
+    /// because a crawler has every kind of target list and crawls nothing in the ones it
+    /// was given no target for.
     pub fn to_crawler(&self, now: SystemTime) -> Crawler {
         Crawler {
             name: Some(self.name.clone()),
-            role: Some(self.role.clone()),
-            targets: Some(self.targets.clone()),
+            // "The IAM role or Amazon Resource Name (ARN) of an IAM role" is what a write
+            // may name the crawler's role by; what a read reports is the NAME IAM holds
+            // that role under ([`reported_crawler_role`]).
+            role: Some(reported_crawler_role(&self.role)),
+            targets: Some(stated_targets(&self.targets)),
             database_name: self.database_name.clone(),
             description: self.description.clone(),
             classifiers: Some(self.classifiers.clone()),
-            recrawl_policy: self.recrawl_policy.clone(),
-            schema_change_policy: self.schema_change_policy.clone(),
-            lineage_configuration: self.lineage_configuration.clone(),
+            recrawl_policy: Some(stated_recrawl_policy(self.recrawl_policy.as_ref())),
+            schema_change_policy: Some(stated_schema_change_policy(
+                self.schema_change_policy.as_ref(),
+            )),
+            lineage_configuration: Some(stated_lineage_configuration(
+                self.lineage_configuration.as_ref(),
+            )),
             state: Some(self.state.clone()),
             table_prefix: self.table_prefix.clone(),
             schedule: self.schedule_expression.as_ref().map(|expression| Schedule {
@@ -486,10 +627,24 @@ impl CrawlerEntry {
             version: self.version,
             configuration: self.configuration.clone(),
             crawler_security_configuration: self.crawler_security_configuration.clone(),
-            lake_formation_configuration: self.lake_formation_configuration.clone(),
+            lake_formation_configuration: Some(stated_lake_formation_configuration(
+                self.lake_formation_configuration.as_ref(),
+            )),
             catalog_id: Some(self.catalog_id.clone()),
         }
     }
+}
+
+/// The `Role` a READ of a crawler reports, from the value its write named the role by.
+///
+/// A write names the crawler's execution role by "the IAM role or Amazon Resource Name
+/// (ARN) of an IAM role" (`CreateCrawler$Role`), so the member admits two forms of the same
+/// thing; a read reports the NAME IAM holds that role under — the role's own name, which an
+/// ARN of this account's role carries after its path ([`glue_role_reference`], this crate's
+/// one reading of the member). A value that names no role of this account is reported as it
+/// was given: there is no name inside it this service may claim.
+pub fn reported_crawler_role(role: &str) -> String {
+    glue_role_reference(role).name.to_string()
 }
 
 /// The median of `durations`, in seconds, or zero for a crawler whose crawls have produced

@@ -217,7 +217,16 @@ fn rewind(engine: &Arc<engine::InMemoryEngine>, elapsed: Duration) {
 async fn an_unconfigured_catalog_reports_the_export_as_off() {
     let (router, _engine) = emulator_with_s3_tables();
 
-    let expected = json!({ "ExportSetting": "DISABLED", "Status": "DISABLED" });
+    let expected = json!({
+        "ExportSetting": "DISABLED",
+        "Status": "DISABLED",
+        // The other two exports the service reports beside the metadata one: nothing can
+        // ask for either, so each is off and settled there.
+        "DataQualityExportSetting": "DISABLED",
+        "DataQualityExportStatus": "DISABLED",
+        "LineageExportSetting": "DISABLED",
+        "LineageExportStatus": "DISABLED",
+    });
     for case in ["the first read", "the second read", "the third read"] {
         let reported = get_configuration(&router).await;
         assert_eq!(
@@ -330,6 +339,22 @@ async fn a_written_export_configuration_is_reported_back_by_the_read() {
             case = row.case,
             expected = row.encryption
         );
+        // The data-quality and lineage exports the service reports beside the catalog's
+        // metadata export: no operation can ask for either, so each reports off whatever
+        // this write asked for the metadata export.
+        for member in [
+            "DataQualityExportSetting",
+            "DataQualityExportStatus",
+            "LineageExportSetting",
+            "LineageExportStatus",
+        ] {
+            assert_eq!(
+                reported[member],
+                json!("DISABLED"),
+                "case {case}: expected {member} DISABLED, got {reported}",
+                case = row.case
+            );
+        }
         let created_at = reported.get("CreatedAt").cloned().unwrap_or(Value::Null);
         let updated_at = reported.get("UpdatedAt").cloned().unwrap_or(Value::Null);
         assert!(

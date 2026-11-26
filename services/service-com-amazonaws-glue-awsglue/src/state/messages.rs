@@ -2631,14 +2631,6 @@ pub fn partition_to_update_not_found(values: &[String]) -> String {
     format!("Partition [{}] not found", values.join(", "))
 }
 
-/// A partition-metadata read of the Lake Formation application-integration surface
-/// (`GetUnfilteredPartitionMetadata`, `GetUnfilteredPartitionsMetadata`) made with
-/// ordinary credentials rather than through a vended query session. RECORDED: the
-/// refusal carries NO wording at all — an empty message — so it discloses nothing
-/// about the catalog, and in particular nothing about whether the addressed partition
-/// exists.
-pub const UNFILTERED_PARTITION_METADATA_ACCESS_DENIED: &str = "";
-
 /// `CreateSecurityConfiguration` for a name already taken. NOT recorded: inferred
 /// from the recorded `CreateDatabase` duplicate, like [`CRAWLER_ALREADY_EXISTS`] —
 /// 400, `AlreadyExistsException`, and no disclosure of the requested name.

@@ -594,15 +594,15 @@ async fn a_stack_provisions_the_glue_catalog_entities_its_template_declares() {
             Some(database_name.as_str()),
             "case {case:?}: expected Crawler.DatabaseName to be {database_name:?}, got {crawler}"
         );
-        let role_arn = physical_ids
+        let role_name = physical_ids
             .get(ROLE_LOGICAL_ID)
-            .map(|name| format!("arn:aws:iam::{ACCOUNT}:role/{name}"))
+            .cloned()
             .unwrap_or_else(|| panic!("case {case:?}: no {ROLE_LOGICAL_ID} resource"));
         assert_eq!(
             crawler.get("Role").and_then(Value::as_str),
-            Some(role_arn.as_str()),
-            "case {case:?}: expected Crawler.Role to be the role ARN the template passed \
-             ({role_arn:?}), got {crawler}"
+            Some(role_name.as_str()),
+            "case {case:?}: the template passed the role's ARN, and a crawler reports its \
+             `Role` as the NAME IAM holds the role under ({role_name:?}), got {crawler}"
         );
         for (pointer, expected) in (row.expected_crawler)() {
             let actual = crawler.pointer(pointer).cloned().unwrap_or(Value::Null);

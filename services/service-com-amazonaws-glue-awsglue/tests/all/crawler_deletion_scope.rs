@@ -36,6 +36,11 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/AWSGlueServiceRo
 const REPLACEMENT_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AWSGlueServiceRole-replacement";
 
+/// The NAME of that role, which is what a read of the crawler reports: a crawler's `Role`
+/// may be written as a name or as an ARN and reads back as the name IAM holds the role
+/// under.
+const REPLACEMENT_ROLE_NAME: &str = "AWSGlueServiceRole-replacement";
+
 /// The one crawl target the replacement create names.
 const REPLACEMENT_PATH: &str = "s3://crawler-bucket/replacement/";
 
@@ -43,21 +48,38 @@ const REPLACEMENT_PATH: &str = "s3://crawler-bucket/replacement/";
 const ALREADY_EXISTS: &str = "AlreadyExistsException";
 const ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
 
-/// Every member of `Crawler` that a create can FILL and that the model leaves absent when
-/// no create named it (`smithy_query shape=Crawler`): a crawler created without them must
-/// report none of them, so a value here after a delete-then-create is a record that
-/// outlived its deletion.
-const OPTIONAL_CRAWLER_MEMBERS: [&str; 9] = [
+/// Every member of `Crawler` that a create can FILL and that a crawler created without it
+/// reports NOTHING for (`smithy_query shape=Crawler`): a value here after a
+/// delete-then-create is a record that outlived its deletion. The sub-structures the service
+/// DEFAULTS — the policies, the configurations and the target lists — are not among them: a
+/// crawler reports the value each of those is in force with whether or not its create named
+/// one, so they are asserted at their defaults below instead.
+const OPTIONAL_CRAWLER_MEMBERS: [&str; 6] = [
     "Description",
     "Schedule",
     "TablePrefix",
     "DatabaseName",
-    "SchemaChangePolicy",
-    "RecrawlPolicy",
-    "LineageConfiguration",
     "Configuration",
     "CrawlerSecurityConfiguration",
 ];
+
+/// The sub-structures a crawler reports whatever its create named, each with the value the
+/// service defaults it to: what the replacement crawler below must report, since its own
+/// create named none of them.
+fn defaulted_crawler_members() -> Value {
+    json!({
+        "SchemaChangePolicy": {
+            "UpdateBehavior": "UPDATE_IN_DATABASE",
+            "DeleteBehavior": "DEPRECATE_IN_DATABASE",
+        },
+        "RecrawlPolicy": { "RecrawlBehavior": "CRAWL_EVERYTHING" },
+        "LineageConfiguration": { "CrawlerLineageSettings": "DISABLE" },
+        "LakeFormationConfiguration": {
+            "UseLakeFormationCredentials": false,
+            "AccountId": "",
+        },
+    })
+}
 
 /// Create one crawler under `name`, carrying the members a row declares beside the name,
 /// role and target every row's crawler has.
@@ -175,7 +197,7 @@ async fn a_deleted_crawler_frees_its_name_and_the_next_create_inherits_nothing()
         );
         assert_eq!(
             replacement.get("Role").and_then(Value::as_str),
-            Some(REPLACEMENT_ROLE),
+            Some(REPLACEMENT_ROLE_NAME),
             "case {case:?}: expected the replacement role, got {replacement}"
         );
         assert_eq!(
@@ -207,6 +229,21 @@ async fn a_deleted_crawler_frees_its_name_and_the_next_create_inherits_nothing()
             assert!(
                 replacement.get(member).is_none_or(Value::is_null),
                 "case {case:?}: expected no {member} on the replacement crawler, got \
+                 {replacement}"
+            );
+        }
+        // The members the service defaults are reported for the replacement's OWN create,
+        // which named none of them: each is at its default, not at what the removed
+        // crawler's create had put there.
+        for (member, defaulted) in defaulted_crawler_members()
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(
+                replacement.get(member),
+                Some(defaulted),
+                "case {case:?}: expected {member} at its default {defaulted}, got \
                  {replacement}"
             );
         }

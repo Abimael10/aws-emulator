@@ -383,12 +383,6 @@ fn push(nodes: &mut Vec<Node>, kind: NodeKind, input: Option<usize>) -> usize {
     nodes.len() - 1
 }
 
-/// The name the node at `index` binds: its kind's stem and its position in the script, so
-/// every node of a plan is named once however many pipelines it has.
-fn node_name(kind: &NodeKind, index: usize) -> String {
-    format!("{prefix}{index}", prefix = kind.prefix())
-}
-
 /// The location a plan with no catalog target writes to, and the connection type that
 /// location's member names. `Location` is "the parameters for the mapping" — where the
 /// mapped data goes when no target TABLE says so — so it is read only when the request
@@ -794,6 +788,12 @@ pub(crate) fn script_frame(language: ScriptLanguage) -> ScriptFrame {
             epilogue: SCALA_EPILOGUE,
         },
     }
+}
+
+/// The name the node at `index` binds: its kind's stem and its position in the script, so
+/// every node of a plan is named once however many pipelines it has.
+fn node_name(kind: &NodeKind, index: usize) -> String {
+    format!("{prefix}{index}", prefix = kind.prefix())
 }
 
 /// The script the plan generates, in one language: the language's preamble, then each node

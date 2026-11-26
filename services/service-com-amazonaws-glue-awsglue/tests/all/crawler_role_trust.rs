@@ -257,14 +257,14 @@ async fn a_crawler_is_created_only_for_a_role_iam_shows_glue_can_assume() {
                 "case {:?}: expected the create to be admitted, got {status} with {body}",
                 row.case
             );
-            // Round trip: the crawler the create admitted is readable, carrying the role
-            // it was created with.
+            // Round trip: the crawler the create admitted is readable, carrying the NAME IAM
+            // holds the role it was created with under.
             let read = ok(&router, "GetCrawler", &json!({ "Name": crawler })).await;
             assert_eq!(
                 read["Crawler"]["Role"],
-                json!(role),
-                "case {:?}: expected the stored crawler to carry the role it was created \
-                 with, got {read}",
+                json!(role_name),
+                "case {:?}: expected the stored crawler to carry the name of the role it was \
+                 created with, got {read}",
                 row.case
             );
             continue;
@@ -528,10 +528,16 @@ async fn an_update_that_replaces_the_role_is_held_to_the_same_resolution() {
         }
 
         let read = ok(&router, "GetCrawler", &json!({ "Name": crawler })).await;
+        // A read reports the NAME IAM holds the role under, whichever form the write named
+        // it in: the name an ARN of this account's role carries after its path.
+        let expected_name = expected_role
+            .rsplit('/')
+            .next()
+            .unwrap_or(expected_role.as_str());
         assert_eq!(
             read["Crawler"]["Role"],
-            json!(expected_role),
-            "case {case:?}: expected the stored crawler to carry {expected_role:?}, got {read}"
+            json!(expected_name),
+            "case {case:?}: expected the stored crawler to carry {expected_name:?}, got {read}"
         );
     }
 }

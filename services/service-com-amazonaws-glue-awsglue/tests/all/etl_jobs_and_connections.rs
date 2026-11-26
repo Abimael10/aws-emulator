@@ -39,7 +39,9 @@
 //! and the recorded `glueetl`/`s3://…` case from the issue is one row among them.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::{DEFAULT_GLUE_VERSION, DEFAULT_PYTHON_VERSION};
+use service_com_amazonaws_glue_awsglue::state::{
+    DEFAULT_GLUE_VERSION, DEFAULT_PYTHON_VERSION, PYTHON_VERSION_3,
+};
 
 use crate::wire::{call, emulator, error_code, ok};
 /// This emulator's account id, which is also the default `CatalogId`.
@@ -234,10 +236,20 @@ async fn a_created_job_definition_reads_back_with_what_it_was_given_and_the_docu
                 row.case
             );
         }
-        let expected_python_version = if sent_command["Name"] == json!("glueray") {
-            None
-        } else {
-            Some(DEFAULT_PYTHON_VERSION)
+        // A command that named a Python version keeps it; one that named none is stored
+        // with the version the Glue version the request STATED calls for — 3 where that
+        // version runs no Python 2, else the historical default. A Ray job's versions are
+        // its `Runtime`'s to state, so none is filled in for it.
+        let stated_glue_version = row.request.get("GlueVersion").and_then(Value::as_str);
+        let runs_no_python_2 = stated_glue_version
+            .and_then(|version| version.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= 2);
+        let expected_python_version = match sent_command.get("PythonVersion") {
+            Some(named) => named.as_str(),
+            None if sent_command["Name"] == json!("glueray") => None,
+            None if runs_no_python_2 => Some(PYTHON_VERSION_3),
+            None => Some(DEFAULT_PYTHON_VERSION),
         };
         assert_eq!(
             stored_command.get("PythonVersion").and_then(Value::as_str),

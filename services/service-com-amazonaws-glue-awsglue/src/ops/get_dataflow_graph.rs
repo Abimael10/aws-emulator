@@ -10,7 +10,7 @@
 //! `@return` (the name the node binds, which is its identifier in the graph) and `@inputs`
 //! (the frames the node reads, each under the parameter it is passed as). This operation
 //! reads those annotations back out: every annotated node answers one `CodeGenNode`, with
-//! its properties as name-value pairs and the line its own statement stands on, and every
+//! its properties as name-value pairs and the line its own annotation block opens on, and every
 //! input answers one `CodeGenEdge` from the node it names to the node that reads it, under
 //! the parameter it is read as. A script annotating no node — and a request stating no
 //! script at all — describes no graph, so both lists come back empty.
@@ -28,6 +28,11 @@
 //! name `CodeGenIdentifier` does not admit cannot name a node or an end of an edge, a name
 //! bound twice is not "unique within the node's graph", and a node annotated with more
 //! properties than `CodeGenNodeArgs` admits does not fit one node of the answer.
+//!
+//! A script whose annotated TEXT stops reading as a list of entries is refused with the same
+//! error, before any of that: the entries of an annotated list are separated by commas, so
+//! text that opens a second entry where no comma began one is where the script stopped
+//! parsing, and the refusal names the position it stopped at and quotes the text up to it.
 //!
 //! The annotations are read, never evaluated: an argument's value is carried as the text it
 //! is spelled with, and the only structure read out of that text is where one entry of an
@@ -204,12 +209,6 @@ fn annotation(line: &str) -> Option<(&str, &str)> {
     Some((name, value.trim()))
 }
 
-/// Whether a line of the script is a comment, so it is the annotations of a node and never
-/// the statement they describe.
-fn is_comment(line: &str) -> bool {
-    line.trim_start().starts_with('#')
-}
-
 /// How far into brackets and quotes a scan of annotated text stands. ONE scanner, read by
 /// both splits below, so the two of them read a quoted string and a bracket the same way:
 /// the text an annotation carries is Python source, where a separator inside a string, a
@@ -318,6 +317,84 @@ fn named(entry: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Where `part` begins in `whole`, which `part` is a slice OF: every slice this operation
+/// reads is cut out of the script it was handed, so the position of any of them in that
+/// script is the distance between their starts.
+///
+/// `None` for a slice of anything else, so a reading that is handed one answers nothing
+/// rather than a meaningless offset — the same shape the other crates of this workspace
+/// spell this helper with
+/// (`service_common`-less copies in `service-com-amazonaws-eventbridge-awsevents`'s
+/// `state::event_pattern` and `service-com-amazonaws-sns-amazonsimplenotificationservice`'s
+/// `state::filter_policy`).
+fn offset_in(whole: &str, part: &str) -> Option<usize> {
+    (part.as_ptr() as usize).checked_sub(whole.as_ptr() as usize)
+}
+
+/// The 1-based line and the 0-based column of the character at byte `at` in `script`: where
+/// a reader of the script would say the text at that offset stands.
+///
+/// The column is counted in CHARACTERS from the start of that line, so a line carrying
+/// characters outside ASCII is still counted the way the text reads.
+fn position(script: &str, at: usize) -> (usize, usize) {
+    let before = script.get(..at).unwrap_or(script);
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rfind('\n')
+        .map_or(before, |newline| &before[newline + 1..])
+        .chars()
+        .count();
+    (line, column)
+}
+
+/// `text` as a refusal quotes it: the whitespace that would break the quoting written as the
+/// escapes it is spelled with in source.
+fn escaped(text: &str) -> String {
+    text.replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// The token at which an entry of an annotated list stops being readable as one entry: the
+/// name of a SECOND binding standing inside the entry's value, with no separator between
+/// the two — `[database = "db" table_name = "t"]`, where the list's entries are separated by
+/// commas and `table_name` opens an entry no comma began.
+///
+/// `None` for every entry that reads as one binding, including an entry that binds no name
+/// at all (a frame named positionally) and one whose value merely CARRIES an `=` inside a
+/// quoted string, a bracket or a comparison — the scan that finds the binding is the one
+/// [`named`] uses, so what counts as a binding is the same question in both places.
+fn juxtaposed_binding(entry: &str) -> Option<&str> {
+    let (_, value) = named(entry)?;
+    let (before, _) = named(value)?;
+    let token = before.split_whitespace().next_back()?;
+    // The token has to FOLLOW text of the entry's own value for the two bindings to be
+    // juxtaposed: a value that is itself nothing but a binding is one entry, not two.
+    (before.trim() != token && names_a_node(token)).then_some(token)
+}
+
+/// The refusal for an annotated list of `node` whose text stops being readable as a list of
+/// entries, or `None` while every entry of it reads as one.
+///
+/// The wording is the parse failure's own: the position the text stopped parsing at, and the
+/// text from the start of the node's annotation block up to and including the token it
+/// stopped at, quoted — which is what a reader needs to find the place in the script that
+/// has to change.
+fn no_viable_alternative(
+    script: &str,
+    node: &Annotated<'_>,
+    list: &str,
+) -> Option<GetDataflowGraphError> {
+    let token = entries(list).into_iter().find_map(juxtaposed_binding)?;
+    let token_begins = offset_in(script, token)?;
+    let token_ends = token_begins + token.len();
+    let (line, column) = position(script, token_begins);
+    let quoted = escaped(script.get(node.block_at..token_ends).unwrap_or(token));
+    Some(invalid_input(format!(
+        "line {line}:{column} no viable alternative at input '{quoted}'"
+    )))
+}
+
 /// Whether the text an argument's value is spelled with is a literal the script states
 /// outright, rather than a reference the script resolves. `CodeGenNodeArg$Param` is "true if
 /// the value is used as a parameter", which is what a value that is NOT a literal is: the
@@ -336,64 +413,57 @@ fn is_literal(value: &str) -> bool {
 struct Annotated<'script> {
     /// The `@type` the node is annotated with.
     node_type: &'script str,
-    /// The 1-based line that `@type` stands on.
+    /// The 1-based line that `@type` stands on, which is the line the node's annotation
+    /// block OPENS on and so the line the node is reported at ([`Annotated::line`]).
     annotated_at: usize,
+    /// Where in the script that line BEGINS, which is where the text a parse failure inside
+    /// this node's annotations quotes starts ([`no_viable_alternative`]).
+    block_at: usize,
     /// The text of the `@args`, `@return` and `@inputs` annotations, as spelled.
     args: &'script str,
     returns: Option<&'script str>,
     inputs: &'script str,
-    /// The 1-based line the node's own statement stands on: the first line under its
-    /// annotations that is neither blank nor a comment.
-    statement_at: Option<usize>,
 }
 
 impl Annotated<'_> {
-    /// The line of the script the node stands on: the line of its statement, and — for a
-    /// node the script annotates without a statement of its own — the line it is annotated
-    /// on.
+    /// The line of the script the node stands on: the line its ANNOTATION BLOCK opens on,
+    /// which is the `@type` that opens it — "the line number of the node"
+    /// (`CodeGenNode$LineNumber`) is where the node is written in the script, and what is
+    /// written there is the block codegen puts above the statement, not the statement under
+    /// it.
     fn line(&self) -> usize {
-        self.statement_at.unwrap_or(self.annotated_at)
+        self.annotated_at
     }
 }
 
-/// The nodes a script annotates, in the order it annotates them: a `@type` opens a node, the
-/// annotations under it describe that node, and the first line of code under them is its
-/// statement.
+/// The nodes a script annotates, in the order it annotates them: a `@type` opens a node and
+/// the annotations under it describe that node.
 fn annotated(script: &str) -> Vec<Annotated<'_>> {
     let mut nodes: Vec<Annotated<'_>> = Vec::new();
     for (index, line) in script.lines().enumerate() {
         let at = index + 1;
-        if let Some((name, value)) = annotation(line) {
-            if name == TYPE_ANNOTATION {
-                nodes.push(Annotated {
-                    node_type: value,
-                    annotated_at: at,
-                    ..Annotated::default()
-                });
-                continue;
-            }
-            let Some(node) = nodes.last_mut() else {
-                continue;
-            };
-            match name {
-                ARGS_ANNOTATION => node.args = value,
-                RETURN_ANNOTATION => node.returns = Some(value),
-                INPUTS_ANNOTATION => node.inputs = value,
-                // An annotation this operation reads nothing from describes no part of the
-                // graph, so it is left where it stands.
-                _ => {}
-            }
+        let Some((name, value)) = annotation(line) else {
+            continue;
+        };
+        if name == TYPE_ANNOTATION {
+            nodes.push(Annotated {
+                node_type: value,
+                annotated_at: at,
+                block_at: offset_in(script, line).unwrap_or_default(),
+                ..Annotated::default()
+            });
             continue;
         }
-        if line.trim().is_empty() || is_comment(line) {
+        let Some(node) = nodes.last_mut() else {
             continue;
-        }
-        if let Some(node) = nodes.last_mut() {
-            // The FIRST statement under a node's annotations is that node's; what follows it
-            // is code the annotations do not describe.
-            if node.statement_at.is_none() {
-                node.statement_at = Some(at);
-            }
+        };
+        match name {
+            ARGS_ANNOTATION => node.args = value,
+            RETURN_ANNOTATION => node.returns = Some(value),
+            INPUTS_ANNOTATION => node.inputs = value,
+            // An annotation this operation reads nothing from describes no part of the
+            // graph, so it is left where it stands.
+            _ => {}
         }
     }
     nodes
@@ -457,12 +527,25 @@ fn arguments(annotated: &str) -> Vec<CodeGenNodeArg> {
 /// The graph a script describes: one node per annotated node, and one edge per frame a node
 /// reads, from the node that binds that frame to the node reading it, under the parameter it
 /// is read as.
+///
+/// The TEXT is read first, across every node the script annotates: a list whose entries stop
+/// reading as entries is a parse failure of the script and is refused where it stopped
+/// ([`no_viable_alternative`]), before anything the annotations describe is judged.
 fn graph(script: &str) -> Result<(Vec<CodeGenNode>, Vec<CodeGenEdge>), GetDataflowGraphError> {
     let mut nodes: Vec<CodeGenNode> = Vec::new();
     let mut edges: Vec<CodeGenEdge> = Vec::new();
     let mut named_already: HashSet<&str> = HashSet::new();
+    let annotated_nodes = annotated(script);
 
-    for node in annotated(script) {
+    for node in &annotated_nodes {
+        for list in [node.args, node.inputs] {
+            if let Some(refusal) = no_viable_alternative(script, node, list) {
+                return Err(refusal);
+            }
+        }
+    }
+
+    for node in annotated_nodes {
         let line = node.line();
         let Some(id) = node.returns else {
             return Err(invalid_input(unnamed_node_message(node.node_type, line)));

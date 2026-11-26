@@ -18,10 +18,31 @@ pub struct GetCrawlersInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetCrawlersResponse")]
+/// `GetCrawlersResponse`: one page of the stored crawlers.
+///
+/// Member set and order from `smithy_query(query="operation", operation="GetCrawlers")`.
+/// Every listed crawler is reported through [`ReportedCrawler`], exactly as the single read
+/// reports it, which is why the schema and the serializer come from
+/// `types/recorded_catalog_members.rs` rather than from the derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct GetCrawlersOutput {
     pub crawlers: Option<Vec<Crawler>>,
     pub next_token: Option<String>,
 }
 
+glue_schema_and_serializer!(
+    GetCrawlersOutput,
+    GET_CRAWLERS_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#GetCrawlersResponse",
+    "com.amazonaws.glue",
+    "GetCrawlersResponse",
+    (
+        M_CRAWLERS,
+        crawlers,
+        "Crawlers",
+        0,
+        opt,
+        list_of_wrapped_struct(Crawler, ReportedCrawler)
+    ),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+);

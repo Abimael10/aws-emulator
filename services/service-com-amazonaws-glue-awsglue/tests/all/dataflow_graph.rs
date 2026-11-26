@@ -7,7 +7,7 @@
 //! as the script spells them), `@return` (the name the node binds, which is its identifier)
 //! and `@inputs` (the frames it reads, each under the parameter it is passed as) — and this
 //! operation reads those annotations back: one `CodeGenNode` per annotated node, carrying
-//! its properties as name-value pairs and the line its own statement stands on, and one
+//! its properties as name-value pairs and the line its own annotation block opens on, and one
 //! `CodeGenEdge` per input, from the node it names to the node reading it under that
 //! parameter. An argument's `Value` is the text the script spells it with, quotes and
 //! brackets included, and `Param` is set where that text is a reference the script resolves
@@ -165,7 +165,7 @@ fn rows() -> Vec<Row> {
             nodes: vec![Node {
                 id: "datasource0",
                 node_type: "DataSource",
-                line: 5,
+                line: 1,
                 args: vec![
                     ("database", "\"legislators\"", false),
                     ("table_name", "\"persons_json\"", false),
@@ -193,13 +193,13 @@ fn rows() -> Vec<Row> {
                 Node {
                     id: "datasource0",
                     node_type: "DataSource",
-                    line: 4,
+                    line: 1,
                     args: vec![],
                 },
                 Node {
                     id: "applymapping1",
                     node_type: "ApplyMapping",
-                    line: 10,
+                    line: 6,
                     args: vec![
                         (
                             "mapping",
@@ -231,7 +231,7 @@ fn rows() -> Vec<Row> {
             nodes: vec![Node {
                 id: "datasink2",
                 node_type: "DataSink",
-                line: 5,
+                line: 1,
                 args: vec![
                     ("table_name", "args[\"TARGET_TABLE\"]", true),
                     ("path", "target_path", true),
@@ -260,7 +260,7 @@ fn rows() -> Vec<Row> {
             nodes: vec![Node {
                 id: "datasource0",
                 node_type: "DataSource",
-                line: 5,
+                line: 1,
                 args: vec![
                     (
                         "connection_options",
@@ -293,19 +293,19 @@ fn rows() -> Vec<Row> {
                 Node {
                     id: "datasource0",
                     node_type: "DataSource",
-                    line: 4,
+                    line: 1,
                     args: vec![],
                 },
                 Node {
                     id: "datasource1",
                     node_type: "DataSource",
-                    line: 8,
+                    line: 5,
                     args: vec![],
                 },
                 Node {
                     id: "join2",
                     node_type: "Join",
-                    line: 13,
+                    line: 9,
                     args: vec![("keys1", "[\"id\"]", false), ("keys2", "[\"id\"]", false)],
                 },
             ],
@@ -339,13 +339,13 @@ fn rows() -> Vec<Row> {
                 Node {
                     id: "datasource0",
                     node_type: "DataSource",
-                    line: 4,
+                    line: 1,
                     args: vec![],
                 },
                 Node {
                     id: "selectfields1",
                     node_type: "SelectFields",
-                    line: 9,
+                    line: 5,
                     args: vec![("paths", "[\"id\"]", false)],
                 },
             ],
@@ -386,7 +386,7 @@ fn rows() -> Vec<Row> {
             }],
         },
         Row {
-            case: "blank lines and the code after the statement leave the node's line alone",
+            case: "blank lines and the statement under the block leave the node's line alone",
             script: concat!(
                 "## @type: DataSource\n",
                 "\n",
@@ -399,7 +399,7 @@ fn rows() -> Vec<Row> {
             nodes: vec![Node {
                 id: "datasource0",
                 node_type: "DataSource",
-                line: 6,
+                line: 1,
                 args: vec![],
             }],
             edges: vec![],
@@ -474,7 +474,7 @@ const DATABASE: &str = "graph_db";
 
 /// The graph of a script this emulator GENERATED is that script's own pipeline: the plan's
 /// nodes in order, chained by the frame each reads, with every node's `LineNumber` naming
-/// the line of the script that binds that node — which is what makes the graph a reading of
+/// the line its annotation block opens on — which is what makes the graph a reading of
 /// the script rather than a restatement of the request.
 #[tokio::test]
 async fn the_graph_of_a_generated_plan_is_that_plans_pipeline() {
@@ -543,16 +543,18 @@ async fn the_graph_of_a_generated_plan_is_that_plans_pipeline() {
          {identified:?}"
     );
 
-    // Every node stands on the script line that binds its name.
+    // Every node stands on the line its own annotation block opens on.
     let lines: Vec<&str> = script.lines().collect();
-    for (id, _, line, args) in &nodes {
+    for (id, node_type, line, args) in &nodes {
         let at = usize::try_from(*line).expect("a line number is positive");
         let spelled = lines
             .get(at.saturating_sub(1))
             .unwrap_or_else(|| panic!("node {id} names line {line}, past the script's end"));
-        assert!(
-            spelled.trim_start().starts_with(&format!("{id} = ")),
-            "node {id} must stand on the line that binds it; line {line} is {spelled:?}"
+        assert_eq!(
+            spelled.trim(),
+            format!("## @type: {node_type}"),
+            "node {id} must stand on the line its annotation block opens on; line {line} is \
+             {spelled:?}"
         );
         // Every node of a generated plan carries the transformation context naming it.
         assert!(
@@ -655,7 +657,7 @@ async fn a_script_that_describes_no_graph_is_refused() {
                 "datasource0 = glueContext.create_dynamic_frame.from_catalog()\n",
             )
             .to_string(),
-            message: "the node annotated @type: DataSource at line 3 carries no @return naming it"
+            message: "the node annotated @type: DataSource at line 1 carries no @return naming it"
                 .to_string(),
         },
         Miss {
@@ -666,7 +668,7 @@ async fn a_script_that_describes_no_graph_is_refused() {
                 "datasource = glueContext.create_dynamic_frame.from_catalog()\n",
             )
             .to_string(),
-            message: "0datasource at line 3 is not a node identifier a dataflow graph may carry"
+            message: "0datasource at line 1 is not a node identifier a dataflow graph may carry"
                 .to_string(),
         },
         Miss {
@@ -677,7 +679,7 @@ async fn a_script_that_describes_no_graph_is_refused() {
                 "data_source = glueContext.create_dynamic_frame.from_catalog()\n",
             )
             .to_string(),
-            message: "data-source at line 3 is not a node identifier a dataflow graph may carry"
+            message: "data-source at line 1 is not a node identifier a dataflow graph may carry"
                 .to_string(),
         },
         Miss {
@@ -691,7 +693,7 @@ async fn a_script_that_describes_no_graph_is_refused() {
                 "datasource0 = glueContext.write_dynamic_frame.from_catalog()\n",
             )
             .to_string(),
-            message: "datasource0 at line 6 names a node the script already names".to_string(),
+            message: "datasource0 at line 4 names a node the script already names".to_string(),
         },
         Miss {
             case: "a frame the script reads under a name no node may carry",
@@ -702,7 +704,7 @@ async fn a_script_that_describes_no_graph_is_refused() {
                 "applymapping1 = ApplyMapping.apply(frame = datasource0)\n",
             )
             .to_string(),
-            message: "9datasource at line 4 is not a node identifier a dataflow graph may carry"
+            message: "9datasource at line 1 is not a node identifier a dataflow graph may carry"
                 .to_string(),
         },
     ];
@@ -735,6 +737,220 @@ async fn a_script_that_describes_no_graph_is_refused() {
         node_rows("after the refusals", &served).len(),
         1,
         "a script describing one node must still be transformed, got {served}"
+    );
+}
+
+/// A script whose annotated TEXT stops reading as a list of entries is refused where it
+/// stopped: the entries of an annotated list are separated by commas, so a second binding
+/// opening inside one entry is a list that does not parse, and the refusal names the
+/// position of the token it stopped at and quotes the text from the start of that node's
+/// annotation block up to and including it.
+///
+/// The rows differ along what the rule generalises over: which annotated list carries the
+/// missing separator (`@args`, `@inputs`), where the node's block stands in the script (at
+/// the first line, after a preamble, as the second of two blocks), and how many entries
+/// stand before the malformed one.
+#[tokio::test]
+async fn a_list_whose_entries_lose_their_separator_is_refused_where_it_stopped() {
+    /// One row: the script, and the position and quoted span the refusal must carry.
+    struct Stopped {
+        case: &'static str,
+        script: String,
+        line: usize,
+        column: usize,
+        /// The text the refusal quotes, with the newlines escaped as the refusal escapes
+        /// them.
+        quoted: &'static str,
+    }
+
+    let rows = vec![
+        Stopped {
+            case: "a missing comma between two @args entries",
+            script: concat!(
+                "## @type: DataSource\n",
+                "## @args: [database = \"example_db\" table_name = \"persons\"]\n",
+                "## @return: datasource0\n",
+                "datasource0 = x()\n",
+            )
+            .to_string(),
+            line: 2,
+            // `## @args: [` is eleven characters, then `database = "example_db" ` is
+            // twenty-four more, so the token that opens the second entry starts at 35.
+            column: 35,
+            quoted: "## @type: DataSource\\n## @args: [database = \"example_db\" table_name",
+        },
+        Stopped {
+            case: "a missing comma between two @inputs entries",
+            script: concat!(
+                "## @type: Join\n",
+                "## @return: join2\n",
+                "## @inputs: [frame1 = datasource0 frame2 = datasource1]\n",
+                "join2 = Join.apply()\n",
+            )
+            .to_string(),
+            line: 3,
+            column: 34,
+            quoted: "## @type: Join\\n## @return: join2\\n## @inputs: [frame1 = datasource0 \
+                     frame2",
+        },
+        Stopped {
+            case: "a block that stands after a job skeleton, not at the first line",
+            script: concat!(
+                "import sys\n",
+                "from awsglue.job import Job\n",
+                "\n",
+                "## @type: DataSource\n",
+                "## @args: [database = \"example_db\" table_name = \"persons\"]\n",
+                "## @return: datasource0\n",
+                "datasource0 = x()\n",
+            )
+            .to_string(),
+            line: 5,
+            column: 35,
+            quoted: "## @type: DataSource\\n## @args: [database = \"example_db\" table_name",
+        },
+        Stopped {
+            case: "the SECOND block of the script is the one that stops parsing",
+            script: concat!(
+                "## @type: DataSource\n",
+                "## @args: [database = \"example_db\"]\n",
+                "## @return: datasource0\n",
+                "datasource0 = x()\n",
+                "## @type: DataSink\n",
+                "## @args: [path = \"s3://b/out/\" format = \"json\"]\n",
+                "## @return: datasink1\n",
+                "datasink1 = y()\n",
+            )
+            .to_string(),
+            line: 6,
+            // `## @args: [` is eleven characters, then `path = "s3://b/out/" ` is
+            // twenty-one more, so the token that opens the second entry starts at 32.
+            column: 32,
+            quoted: "## @type: DataSink\\n## @args: [path = \"s3://b/out/\" format",
+        },
+        Stopped {
+            case: "two entries stand before the malformed one",
+            script: concat!(
+                "## @type: DataSink\n",
+                "## @args: [a = 1, b = 2, c = 3 d = 4]\n",
+                "## @return: datasink0\n",
+                "datasink0 = y()\n",
+            )
+            .to_string(),
+            line: 2,
+            column: 31,
+            quoted: "## @type: DataSink\\n## @args: [a = 1, b = 2, c = 3 d",
+        },
+    ];
+
+    let router = emulator();
+    for row in &rows {
+        assert_refusal(
+            &router,
+            row.case,
+            "GetDataflowGraph",
+            &json!({ "PythonScript": row.script }),
+            "InvalidInputException",
+            &format!(
+                "line {}:{} no viable alternative at input '{}'",
+                row.line, row.column, row.quoted
+            ),
+        )
+        .await;
+    }
+}
+
+/// What a comma-less juxtaposition is NOT: an annotated list whose entry merely CARRIES an
+/// `=` inside a quoted string, a bracket or a comparison is one entry and is SERVED, and so
+/// is a list whose entries are named positionally. The separator rule is about a second
+/// BINDING opening inside an entry, and nothing else.
+///
+/// The rows differ along where the `=` stands: inside a quoted value, inside a bracketed
+/// one, as a comparison operator, as part of a job-argument subscript, and in an entry that
+/// binds no name at all.
+#[tokio::test]
+async fn an_entry_that_merely_carries_an_equals_sign_is_still_served() {
+    let router = emulator();
+
+    // (case, the `@args` text, the names the served node must carry)
+    let rows: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "an `=` inside a quoted value",
+            "[predicate = \"year = 2026\", path = \"s3://b/a=b/\"]".to_string(),
+            vec!["predicate", "path"],
+        ),
+        (
+            "an `=` inside a bracketed value",
+            "[options = {\"filter\": \"dt = '2024-01-01'\"}]".to_string(),
+            vec!["options"],
+        ),
+        (
+            "a comparison, which binds nothing",
+            "[predicate = year == 2026]".to_string(),
+            vec!["predicate"],
+        ),
+        (
+            "a job argument the script resolves",
+            "[table_name = args[\"TARGET_TABLE\"]]".to_string(),
+            vec!["table_name"],
+        ),
+        (
+            "an entry that binds no name at all",
+            "[database, table_name = \"persons\"]".to_string(),
+            vec!["table_name"],
+        ),
+    ];
+
+    for (case, args, expected) in &rows {
+        let script = format!(
+            "## @type: DataSource\n## @args: {args}\n## @return: datasource0\n\
+             datasource0 = x()\n"
+        );
+        let answered = ok(
+            &router,
+            "GetDataflowGraph",
+            &json!({ "PythonScript": script }),
+        )
+        .await;
+        let nodes = node_rows(case, &answered);
+        let names: Vec<String> = nodes
+            .first()
+            .map(|(_, _, _, args)| args.iter().map(|(name, _, _)| name.clone()).collect())
+            .unwrap_or_default();
+        let expected: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+        assert_eq!(
+            names, expected,
+            "case {case:?}: expected the served node to carry the arguments {expected:?}, got \
+             {answered}"
+        );
+    }
+
+    // And a positional `@inputs` entry beside a named one: an edge under no parameter is
+    // not a list that lost a separator.
+    let answered = ok(
+        &router,
+        "GetDataflowGraph",
+        &json!({
+            "PythonScript": concat!(
+                "## @type: Join\n",
+                "## @return: join2\n",
+                "## @inputs: [datasource0, frame2 = datasource1]\n",
+                "join2 = Join.apply()\n",
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(
+        edge_rows("a positional input beside a named one", &answered),
+        vec![
+            ("datasource0".to_string(), "join2".to_string(), None),
+            (
+                "datasource1".to_string(),
+                "join2".to_string(),
+                Some("frame2".to_string())
+            ),
+        ],
+        "a positional input must still be read as an edge, got {answered}"
     );
 }
 
@@ -772,7 +988,7 @@ async fn the_identifier_length_bound_admits_the_ceiling_and_refuses_past_it() {
                 "GetDataflowGraph",
                 &request,
                 "InvalidInputException",
-                &format!("{name} at line 3 is not a node identifier a dataflow graph may carry"),
+                &format!("{name} at line 1 is not a node identifier a dataflow graph may carry"),
             )
             .await;
         }
