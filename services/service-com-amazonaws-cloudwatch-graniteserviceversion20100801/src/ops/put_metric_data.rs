@@ -536,6 +536,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              size."
                         )));
                     }
+                    // "Each number in the Count array is the number of times the corresponding
+                    // value in the Values array occurred during the period."
+                    // (`MetricDatum$Counts`) — a count is HOW MANY times an observation
+                    // happened, so a number that is not greater than 0 counts no occurrence and
+                    // weights nothing: the whole batch is refused rather than folded into the
+                    // series, where such a weight would subtract samples from every later
+                    // aggregate of it and leave a window whose sum no sample count explains.
+                    // A special value (NaN, +Infinity, -Infinity) is no count either, and is
+                    // refused as the unsupported value the operation documents it as
+                    // ([`checked_value`] below) rather than here — which is why only the FINITE
+                    // entries are judged against the bound: a magnitude the service cannot hold
+                    // is a different fault from a count that counts nothing, and a client acts
+                    // on which one it was told. So this states only the member's own rule. The
+                    // refusal names the `Counts` member of the datum the request put it on,
+                    // which is what locates the array that has to change.
+                    if counts
+                        .iter()
+                        .any(|count| count.is_finite() && *count <= 0.0)
+                    {
+                        return Err(invalid_parameter_value(format!(
+                            "The parameter {path}.Counts must contain only values greater than 0."
+                        )));
+                    }
                 }
                 let mut observations = Vec::with_capacity(values.len());
                 for (index, value) in values.iter().enumerate() {

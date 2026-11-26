@@ -29,8 +29,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    build_router, call, call_in_query_mode, call_with_headers, error_message, log_alarm_request,
-    merged, metric_alarm_request, ok, AlarmKind,
+    build_router, call, call_in_query_mode, call_with_headers, error_message, error_type,
+    log_alarm_request, merged, metric_alarm_request, ok, AlarmKind,
 };
 
 /// The header the legacy query error code and the fault side are reported in.
@@ -51,15 +51,6 @@ fn parameter_value_shape_id() -> String {
 /// The shape id of the modelled missing-parameter fault.
 fn missing_parameter_shape_id() -> String {
     format!("{SERVICE_PACKAGE}#MissingRequiredParameterException")
-}
-
-/// The `__type` a failure body carries, verbatim — the qualified id is the thing under test
-/// here, so this reads it unreduced rather than through the harness's bare-name reader.
-fn error_type(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// One refused call: what it varies, how to reach the refusal, and the two names the answer

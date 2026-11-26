@@ -1235,7 +1235,8 @@ pub fn retention_secs_at_period(period: i32) -> f64 {
 /// A window holding no datapoint is never inserted, so what this allocates is bounded by the
 /// datapoints the series holds in the range rather than by the range the request spans. A
 /// datapoint the retention tier of `period` no longer holds is not in any window
-/// ([`retained_at_period`]).
+/// ([`retained_at_period`]). A window whose datapoints stand for no SAMPLE is dropped as well:
+/// it defines no statistic of the series.
 ///
 /// The unit is part of the key because it is part of a datapoint's identity: "If you omit
 /// Unit, all data that was collected with any unit is returned, along with the corresponding
@@ -1302,6 +1303,14 @@ pub fn windows_by_unit<'a>(
         let index = ((instant - start) / span).floor() as i64;
         windows.entry((index, datum.unit())).or_default().push(datum);
     }
+    // A window is a span of SAMPLES, and every statistic over one is a statistic OF the
+    // observations it holds: a window whose datapoints stand for no sample at all defines none
+    // of them, so a sum beside a sample count of zero is not a measurement any reader can
+    // report and recovering an average from the pair divides by nothing. Such a window is no
+    // window of the series, so no reader of this fold answers with a datapoint for it.
+    windows.retain(|_window, data| {
+        data.iter().map(|datum| datum.sample_count).sum::<f64>() > 0.0
+    });
     windows
 }
 

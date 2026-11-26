@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::announced_value_sets::unit_in_set_message;
 use crate::harness::{
-    build_router, call_in_query_mode, call_with_headers, error_message, now_secs, ok,
+    build_router, call_in_query_mode, call_with_headers, error_message, error_type, now_secs, ok,
 };
 use crate::unit_read_identity::STANDARD_UNITS;
 
@@ -47,15 +47,6 @@ const PARAMETER_VALUE_SHAPE_ID: &str = "com.amazon.coral.service#InvalidParamete
 /// The report the header carries for that fault: its legacy `awsQueryError` code and the fault
 /// side a client branches on.
 const PARAMETER_VALUE_REPORT: &str = "InvalidParameterValue;Sender";
-
-/// The `__type` of a failure body, verbatim: the qualified id is part of what this suite
-/// asserts, so it is read unreduced rather than through the harness's bare-name reader.
-fn error_type(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// A `MetricDatum` for `metric` carrying one value, with `unit` when one is given.
 fn datum(metric: &str, unit: Option<&str>) -> Value {

@@ -740,6 +740,18 @@ pub fn error_code(body: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// The same member UNREDUCED: the qualified shape id a failure body names, verbatim.
+///
+/// The package a fault is named in is part of what a client reads off the body, so a suite that
+/// asserts the whole id reads it through here rather than through [`error_code`], which reduces
+/// it to the bare name.
+pub fn error_type(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// A role ARN of the form a log alarm's scheduled query names
 /// (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`).
 pub const QUERY_ROLE: &str = "arn:aws:iam::000000000000:role/cwl-scheduled-query";
