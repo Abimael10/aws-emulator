@@ -10,20 +10,22 @@
 //! and a destination Region two different Regions of one emulator. The assertions read the XML
 //! the emulator answers with, so a handler that computed nothing could not pass them.
 //!
-//! The rule under test: an operation that acts on a relationship a Region holds resolves THAT
-//! relationship and nothing else, so every call naming no replication into the Region of the
-//! call is refused the one modelled state fault — `InvalidDBInstanceStateFault`, awsQuery code
-//! `InvalidDBInstanceState`, HTTP 400 — worded from the ARN the request carried, whether the
-//! replication was never enabled, has already been stopped, runs into another Region, or the
-//! ARN names an instance that does not exist at all. The modelled
-//! `DBInstanceNotFoundFault` (HTTP 404) belongs to the leg that resolves the source INSTANCE,
-//! which is the start, so one ARN can be refused 404 by the start and 400 by the stop.
+//! The rule under test: an operation that acts on a relationship a Region holds resolves the
+//! SOURCE its request names first and THAT relationship second. So a stop whose
+//! `SourceDBInstanceArn` names an instance no Region holds is refused the modelled
+//! `DBInstanceNotFoundFault` — awsQuery code `DBInstanceNotFound`, HTTP 404, worded the
+//! Region-qualified way this service words every cross-Region source it cannot find, which is
+//! what the START leg answers for the same ARN — and a stop whose source IS resolved and that
+//! names no replication into the Region of the call is refused the one modelled state fault,
+//! `InvalidDBInstanceStateFault`, awsQuery code `InvalidDBInstanceState`, HTTP 400, worded
+//! from the ARN the request carried, whether the replication was never enabled, has already
+//! been stopped, or runs into another Region.
 //!
-//! The table below spans what the rule generalises over: an ARN naming no instance, an instance
-//! that exists and never replicated, a replication already stopped, a replication in force into
-//! ANOTHER Region, the Region segment of the ARN, and the engine family of the source. The
-//! positive rows show the same resolution answering a 200 — including for an ARN whose
-//! identifier is cased differently from the stored one — so the refusal is not a blanket one.
+//! The table below spans what the rule generalises over: an instance that exists and never
+//! replicated, a replication already stopped, a replication in force into ANOTHER Region, the
+//! Region segment of the ARN, and the engine family of the source. The positive rows show the
+//! same resolution answering a 200 — including for an ARN whose identifier is cased
+//! differently from the stored one — so the refusal is not a blanket one.
 //!
 //! Nothing here waits out a span: every state a transition this service owes leads to is
 //! reached by polling a REPORTING call through `lifecycle_poll_loops::poll_until`.
@@ -44,8 +46,8 @@ const ACCOUNT: &str = "000000000000";
 /// code this operation answers when the Region of the call holds no replication to stop.
 const INVALID_STATE: &str = "InvalidDBInstanceState";
 
-/// The `awsQueryError` code of `DBInstanceNotFoundFault`, which the START leg answers for a
-/// source instance it cannot resolve.
+/// The `awsQueryError` code of `DBInstanceNotFoundFault`, which BOTH legs answer for a source
+/// instance they cannot resolve.
 const NOT_FOUND: &str = "DBInstanceNotFound";
 
 /// The status a replicated automated backup reports once it has its first snapshot.
@@ -88,23 +90,15 @@ async fn replication_in_force(
     .await;
 }
 
-/// RULE: a stop naming no replication into the Region of the call is refused HTTP 400
-/// `InvalidDBInstanceState`, worded from the ARN the request carried — however the Region of the
-/// call came to hold no such replication.
+/// RULE: a stop whose source instance IS resolved and that names no replication into the
+/// Region of the call is refused HTTP 400 `InvalidDBInstanceState`, worded from the ARN the
+/// request carried — however the Region of the call came to hold no such replication.
 #[tokio::test]
 async fn a_stop_with_no_replication_into_this_region_is_refused_invalid_state() {
     let router = emulator();
     let destination = "us-east-1";
 
-    // Row 1: an ARN of this service's own form naming an instance that was never created, in
-    // the Region a source would live in.
-    let ghost = db_instance_arn("us-west-2", "emu-stop-abr-ghost");
-
-    // Row 2: an ARN naming an instance that was never created, in ANOTHER Region than row 1 —
-    // the ARN's Region segment is part of what it names.
-    let ghost_elsewhere = db_instance_arn("eu-west-2", "emu-stop-abr-ghost");
-
-    // Row 3: an existing instance whose automated backups were never replicated anywhere.
+    // Row 1: an existing instance whose automated backups were never replicated anywhere.
     let case = "an instance that never replicated";
     let (_, never_started) = available_instance(
         &router,
@@ -116,7 +110,7 @@ async fn a_stop_with_no_replication_into_this_region_is_refused_invalid_state() 
     )
     .await;
 
-    // Row 4: an instance whose replication into this Region was started and then STOPPED, so a
+    // Row 2: an instance whose replication into this Region was started and then STOPPED, so a
     // repeat stop finds the backups retained rather than replicating.
     let case = "a replication already stopped";
     let (stopped_id, already_stopped) =
@@ -127,7 +121,7 @@ async fn a_stop_with_no_replication_into_this_region_is_refused_invalid_state() 
         stop_replication(&router, destination, &already_stopped).await,
     );
 
-    // Row 5: an instance replicating into a DIFFERENT destination Region, the stop issued in
+    // Row 3: an instance replicating into a DIFFERENT destination Region, the stop issued in
     // this one — the question is about the Region of the call.
     let case = "a replication in force into another Region";
     let (other_id, other_destination) = available_instance(
@@ -142,11 +136,6 @@ async fn a_stop_with_no_replication_into_this_region_is_refused_invalid_state() 
     replication_in_force(&router, case, "sa-east-1", &other_destination, &other_id).await;
 
     let table: &[(&str, &str)] = &[
-        ("an ARN naming an instance that does not exist", &ghost),
-        (
-            "an ARN naming no instance, in another source Region",
-            &ghost_elsewhere,
-        ),
         (
             "an instance that exists and never replicated",
             &never_started,
@@ -171,7 +160,7 @@ async fn a_stop_with_no_replication_into_this_region_is_refused_invalid_state() 
         );
     }
 
-    // The replication row 5 set up elsewhere is untouched by the refusals above: the Region
+    // The replication row 3 set up elsewhere is untouched by the refusals above: the Region
     // that holds it can still stop it.
     let case = "the replication in another Region after the refusals";
     let stopped = expect_ok(
@@ -185,12 +174,12 @@ async fn a_stop_with_no_replication_into_this_region_is_refused_invalid_state() 
     );
 }
 
-/// RULE: the two legs of backup replication resolve DIFFERENT things, so one and the same ARN
-/// naming an instance that does not exist is refused 404 `DBInstanceNotFound` by the start,
-/// which resolves the source instance, and 400 `InvalidDBInstanceState` by the stop, which
-/// resolves only the replication into the Region of the call.
+/// RULE: both legs of backup replication resolve the SOURCE INSTANCE the ARN names, in the
+/// Region that ARN carries, so one and the same ARN naming an instance that does not exist is
+/// refused 404 `DBInstanceNotFound` by the start and by the stop alike, each with the
+/// Region-qualified sentence.
 #[tokio::test]
-async fn the_start_and_the_stop_legs_refuse_one_unresolvable_arn_differently() {
+async fn the_start_and_the_stop_legs_refuse_one_unresolvable_arn_the_same_way() {
     let router = emulator();
     let destination = "us-east-1";
     // The rows differ in the Region the ARN points at and in the identifier it carries, which
@@ -202,6 +191,8 @@ async fn the_start_and_the_stop_legs_refuse_one_unresolvable_arn_differently() {
     ];
     for (case, source_region, identifier) in table {
         let arn = db_instance_arn(source_region, identifier);
+        let expected =
+            format!("Requested DB Instance {identifier} not found in source region {source_region}");
         let refused_start = expect_error(
             case,
             start_replication(&router, destination, &arn, &[]).await,
@@ -210,20 +201,19 @@ async fn the_start_and_the_stop_legs_refuse_one_unresolvable_arn_differently() {
         );
         assert_eq!(
             text(&refused_start, "Message"),
-            format!("Requested DB Instance {identifier} not found in source region {source_region}"),
+            expected,
             "case {case:?}: the start resolves the source instance, got {refused_start}"
         );
         let refused_stop = expect_error(
             case,
             stop_replication(&router, destination, &arn).await,
-            400,
-            INVALID_STATE,
+            404,
+            NOT_FOUND,
         );
         assert_eq!(
             text(&refused_stop, "Message"),
-            not_replicating_here(&arn),
-            "case {case:?}: the stop resolves the replication into this Region, got \
-             {refused_stop}"
+            expected,
+            "case {case:?}: the stop resolves the same source instance, got {refused_stop}"
         );
     }
 }

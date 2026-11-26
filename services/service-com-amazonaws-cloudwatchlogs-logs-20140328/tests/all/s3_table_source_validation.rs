@@ -12,13 +12,13 @@
 //!    so the reader still reports what it reported before.
 //! 2. An `integrationArn` has to name an S3 Table Integration the ACCOUNT HOLDS, which is
 //!    the ARN the service that OWNS one mints, in the partition, Region and account that
-//!    integration lives in. Both operations resolve it through one ladder and state the rung
-//!    it failed — a resource that is not an integration's, another account's integration, an
-//!    ARN of another service, partition or Region, and a handle nothing is held under —
-//!    rather than answering an integration that is not there as one with no associations. The
-//!    CLASS is the rung's own: an ARN that could name no integration of this account is a
-//!    parameter stated incorrectly (`ValidationException`), while a handle of the right form
-//!    the account holds nothing under names a resource that does not exist
+//!    integration lives in. Both operations state the rung it failed — a resource that is not
+//!    an integration's, another account's integration, an ARN of another service, partition
+//!    or Region, and a handle nothing is held under — rather than answering an integration
+//!    that is not there as one with no associations. The CLASS each refusal travels under is
+//!    RECORDED PER OPERATION: the reader answers every rung of its ladder the
+//!    parameter-validity class (`ValidationException`), while the associate answers a handle
+//!    of the right form the account holds nothing under as a resource that does not exist
 //!    (`ResourceNotFoundException`).
 //! 3. An ARN-typed member of this family is held FIRST to the length an ARN takes: a value
 //!    shorter than that is refused with the standard one-violation constraint clause naming
@@ -52,11 +52,12 @@ const LIST: &str = "ListSourcesForS3TableIntegration";
 /// The code this family answers for a parameter it will not accept.
 const VALIDATION: &str = "ValidationException";
 
-/// The code this family answers for an `integrationArn` that IS the handle of an integration
+/// The code the associate answers for an `integrationArn` that IS the handle of an integration
 /// this caller could hold and names one the account does not hold: a resource that does not
 /// exist (smithy_query: operations AssociateSourceToS3TableIntegration and
 /// ListSourcesForS3TableIntegration both model `ResourceNotFoundException`, "the specified
-/// resource does not exist", httpError 400).
+/// resource does not exist", httpError 400). The reader records the parameter-validity class
+/// for that rung instead.
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The account every ARN this emulator mints carries.
@@ -277,92 +278,106 @@ async fn an_arn_naming_no_integration_of_this_account_is_refused_by_both_operati
         );
     }
 
-    // (case, the ARN, the refusal it must answer, the code it travels under) — wrong in each
-    // field an integration's ARN can be wrong in, including a handle of the right form the
-    // account holds nothing under, which is the NOT-FOUND class rather than the
-    // parameter-validity one.
+    // (case, the ARN, the refusal each operation must answer) — wrong in each field an
+    // integration's ARN can be wrong in, including a handle of the right form the account
+    // holds nothing under. The two operations do not always answer alike: the ASSOCIATE's
+    // ladder has a rung of its own for an integration of THIS service, and takes the
+    // NOT-FOUND class for a handle the account holds nothing under, while the READER resolves
+    // one family and answers every rung under the one class it records.
     let another_account = format!("arn:aws:observabilityadmin:{REGION}:123456789012:s3tableintegration/x");
     let unheld = integration_arn("held-by-nothing");
-    let unreachable: [(&str, String, String, &str); 10] = [
-        (
+    let unreachable: [UnreachableArn; 10] = [
+        UnreachableArn::alike(
             "another partition",
             format!("arn:aws-us-gov:observabilityadmin:{REGION}:{ACCOUNT}:s3tableintegration/x"),
+            VALIDATION,
             unreachable_arn_refusal(&format!(
                 "arn:aws-us-gov:observabilityadmin:{REGION}:{ACCOUNT}:s3tableintegration/x"
             )),
-            VALIDATION,
         ),
-        (
+        UnreachableArn::alike(
             "another service",
             format!("arn:aws:logs:{REGION}:{ACCOUNT}:s3tableintegration/x"),
+            VALIDATION,
             unreachable_arn_refusal(&format!(
                 "arn:aws:logs:{REGION}:{ACCOUNT}:s3tableintegration/x"
             )),
-            VALIDATION,
         ),
-        (
+        UnreachableArn::alike(
             "another Region",
             format!("arn:aws:observabilityadmin:us-west-2:{ACCOUNT}:s3tableintegration/x"),
+            VALIDATION,
             unreachable_arn_refusal(&format!(
                 "arn:aws:observabilityadmin:us-west-2:{ACCOUNT}:s3tableintegration/x"
             )),
-            VALIDATION,
         ),
-        (
+        UnreachableArn::alike(
             "another account",
             another_account.clone(),
-            cross_account_refusal(&another_account),
             VALIDATION,
+            cross_account_refusal(&another_account),
         ),
-        (
-            "a handle the account holds no integration under",
-            unheld.clone(),
-            not_found_refusal(&unheld),
-            NOT_FOUND,
-        ),
-        (
-            "an integration of this service instead",
-            format!("arn:aws:logs:{REGION}:{ACCOUNT}:integration:opensearch"),
-            not_found_refusal(&format!(
-                "arn:aws:logs:{REGION}:{ACCOUNT}:integration:opensearch"
-            )),
-            NOT_FOUND,
-        ),
-        (
+        UnreachableArn {
+            case: "a handle the account holds no integration under",
+            arn: unheld.clone(),
+            associate: (NOT_FOUND, not_found_refusal(&unheld)),
+            list: (VALIDATION, not_found_refusal(&unheld)),
+        },
+        UnreachableArn {
+            case: "an integration of this service instead",
+            arn: format!("arn:aws:logs:{REGION}:{ACCOUNT}:integration:opensearch"),
+            associate: (
+                NOT_FOUND,
+                not_found_refusal(&format!(
+                    "arn:aws:logs:{REGION}:{ACCOUNT}:integration:opensearch"
+                )),
+            ),
+            list: (
+                VALIDATION,
+                arn_form_refusal(&format!(
+                    "arn:aws:logs:{REGION}:{ACCOUNT}:integration:opensearch"
+                )),
+            ),
+        },
+        UnreachableArn::alike(
             "an S3 Tables table",
             format!("arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/logs-lake/table/cloudwatch"),
+            VALIDATION,
             arn_form_refusal(&format!(
                 "arn:aws:s3tables:{REGION}:{ACCOUNT}:bucket/logs-lake/table/cloudwatch"
             )),
-            VALIDATION,
         ),
-        (
+        UnreachableArn::alike(
             "the resource type spelled with hyphens",
             format!("arn:aws:observabilityadmin:{REGION}:{ACCOUNT}:s3-table-integration/x"),
+            VALIDATION,
             arn_form_refusal(&format!(
                 "arn:aws:observabilityadmin:{REGION}:{ACCOUNT}:s3-table-integration/x"
             )),
-            VALIDATION,
         ),
-        (
+        UnreachableArn::alike(
             "the resource prefix with no integration id",
             format!("arn:aws:observabilityadmin:{REGION}:{ACCOUNT}:s3tableintegration/"),
+            VALIDATION,
             arn_form_refusal(&format!(
                 "arn:aws:observabilityadmin:{REGION}:{ACCOUNT}:s3tableintegration/"
             )),
-            VALIDATION,
         ),
-        (
+        UnreachableArn::alike(
             "a log group",
             format!("arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aws/lambda/orders"),
+            VALIDATION,
             arn_form_refusal(&format!(
                 "arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aws/lambda/orders"
             )),
-            VALIDATION,
         ),
     ];
-    for (case, arn, expected, expected_code) in &unreachable {
-        for operation in [ASSOCIATE, LIST] {
+    for row in &unreachable {
+        for (operation, (expected_code, expected)) in
+            [(ASSOCIATE, &row.associate), (LIST, &row.list)]
+        {
+            let case = row.case;
+            let arn = &row.arn;
             let (status, answered) = logs.call(operation, &body(operation, arn)).await;
             assert_eq!(
                 status, 400,
@@ -384,11 +399,37 @@ async fn an_arn_naming_no_integration_of_this_account_is_refused_by_both_operati
     }
 }
 
-/// RULE 2 (the integration families): an `integrationArn` naming an INTEGRATION — of either
-/// family this service resolves one from — that the account does not hold is the NOT-FOUND
-/// class, because the request addresses a resource that does not exist; one the account DOES
-/// hold, of a kind this family cannot give query access through, is told the resource form an
-/// S3 Table Integration's ARN carries.
+/// One row of RULE 2's table: an `integrationArn` that resolves to no S3 Table Integration,
+/// and the `(code, message)` each operation of the family refuses it with.
+struct UnreachableArn {
+    case: &'static str,
+    arn: String,
+    /// What `AssociateSourceToS3TableIntegration` answers.
+    associate: (&'static str, String),
+    /// What `ListSourcesForS3TableIntegration` answers.
+    list: (&'static str, String),
+}
+
+impl UnreachableArn {
+    /// A row both operations answer identically, which is every ARN that could name no
+    /// integration of this account at all.
+    fn alike(case: &'static str, arn: String, code: &'static str, message: String) -> Self {
+        Self {
+            case,
+            arn,
+            associate: (code, message.clone()),
+            list: (code, message),
+        }
+    }
+}
+
+/// RULE 2 (the integration families): WHICH integrations an operation of this family resolves
+/// is the operation's own. The ASSOCIATE resolves an integration of THIS service's own family
+/// too, so an ARN naming one the account does not hold is the NOT-FOUND class — the request
+/// addresses a resource that does not exist — and one the account DOES hold is a real resource
+/// of the wrong KIND, told the resource form an S3 Table Integration's ARN carries. The READER
+/// resolves the S3 Table Integrations alone, so either way that ARN is simply not an S3 Table
+/// Integration's and is told that form, under the one class this operation records.
 ///
 /// The ONE ARN is sent around that state: before this service holds an integration of that
 /// name, and after it does — so what decides is the integration the account holds and nothing
@@ -399,15 +440,19 @@ async fn an_integration_of_this_service_is_not_found_until_the_account_holds_it(
     let name = "opensearch-held";
     let arn = format!("arn:aws:logs:{REGION}:{ACCOUNT}:integration:{name}");
 
-    for operation in [ASSOCIATE, LIST] {
+    // (the operation, the code it answers, the sentence it answers) before the account holds
+    // an integration of that name.
+    for (operation, code_expected, expected) in [
+        (ASSOCIATE, NOT_FOUND, not_found_refusal(&arn)),
+        (LIST, VALIDATION, arn_form_refusal(&arn)),
+    ] {
         let (status, answered) = logs.call(operation, &body(operation, &arn)).await;
         let code = crate::harness::error_code(&answered);
-        let expected = not_found_refusal(&arn);
         assert_eq!(
             (status, code.as_str(), answered.get("message").and_then(Value::as_str)),
-            (400, NOT_FOUND, Some(expected.as_str())),
+            (400, code_expected, Some(expected.as_str())),
             "case \"an integration of this service the account does not hold\" on {operation}: \
-             expected 400 {NOT_FOUND} {expected:?}, got {status} {answered}"
+             expected 400 {code_expected} {expected:?}, got {status} {answered}"
         );
     }
 
@@ -749,7 +794,8 @@ async fn an_integration_the_owning_service_created_is_one_a_source_can_be_associ
     );
 
     // The same integration DELETED through the owning service is one no source can be
-    // associated with any more: the ARN resolves to nothing, and both operations say so.
+    // associated with any more: the ARN resolves to nothing, and both operations say so —
+    // each under the class it records for that rung.
     let (status, deleted) = emulator
         .owner("DeleteS3TableIntegration", &json!({"Arn": arn}))
         .await;
@@ -757,7 +803,7 @@ async fn an_integration_the_owning_service_created_is_one_a_source_can_be_associ
         (200..300).contains(&status),
         "case \"the owning service's delete\": expected a success, got {status} {deleted}"
     );
-    for operation in [ASSOCIATE, LIST] {
+    for (operation, code_expected) in [(ASSOCIATE, NOT_FOUND), (LIST, VALIDATION)] {
         let (status, answered) = emulator
             .logs(
                 operation,
@@ -775,9 +821,9 @@ async fn an_integration_the_owning_service_created_is_one_a_source_can_be_associ
         let expected = not_found_refusal(&arn);
         let code = crate::harness::error_code(&answered);
         assert_eq!(
-            code, NOT_FOUND,
+            code, code_expected,
             "case \"an integration the owner no longer holds\" on {operation}: expected \
-             {NOT_FOUND}, got {code} / {answered}"
+             {code_expected}, got {code} / {answered}"
         );
         assert_eq!(
             answered.get("message").and_then(Value::as_str),

@@ -207,10 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetFunctionConcurrencyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        // The resource this read addressed is the function at the version its
-                        // capacity is reserved for
-                        // (`crate::state::reserved_concurrency_not_found_message`).
-                        message: Some(crate::state::reserved_concurrency_not_found_message(
+                        // The resource this read addressed is the function ITSELF, spelled
+                        // with the qualifier the request named — none
+                        // (`crate::state::reserved_concurrency_read_not_found_message`).
+                        message: Some(crate::state::reserved_concurrency_read_not_found_message(
                             &region, &reference, message,
                         )),
                     },

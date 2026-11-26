@@ -6,7 +6,8 @@
 //! status the clock has made due and the instant it was created — in the order they were
 //! associated, paged by `maxResults` through an opaque `nextToken`, and writes nothing.
 //! Refuses an `integrationArn` this service cannot resolve an integration of this account
-//! from. This is the ONLY file to touch for this operation.
+//! from with the modelled `ValidationException` (HTTP 400), whatever the rung it failed.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -221,25 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ARN has to name an S3 Table Integration this caller holds: the associations
         // this reads belong to one, so the ARN is resolved where the integrations of an
         // account live and the rung it fails is what the refusal states — never answered as
-        // "that integration has no associations". The CLASS is that rung's own: an ARN that
-        // could name no integration of this account is a parameter stated incorrectly, while
-        // a handle the account holds nothing under names a resource that does not exist.
-        match crate::state::unresolved_integration(&*self.engine, &region, &input.integration_arn)
-        {
-            Some(crate::state::UnresolvedIntegration::NotFound(message)) => {
-                return Err(
-                    ListSourcesForS3TableIntegrationErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(message),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            Some(unresolved @ crate::state::UnresolvedIntegration::Invalid(_)) => {
-                return Err(invalid(unresolved.message()));
-            }
-            None => {}
+        // "that integration has no associations". Every rung of this reader's ladder is the
+        // modelled `ValidationException`, which is what this operation records for an
+        // `integrationArn` it cannot resolve, whether the value could name no integration at
+        // all or names one the account does not hold
+        // (`crate::state::unresolved_s3_table_integration_message`).
+        if let Some(message) = crate::state::unresolved_s3_table_integration_message(
+            &*self.engine,
+            &region,
+            &input.integration_arn,
+        ) {
+            return Err(invalid(message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

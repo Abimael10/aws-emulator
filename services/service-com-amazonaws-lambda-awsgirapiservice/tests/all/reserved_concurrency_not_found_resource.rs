@@ -8,14 +8,17 @@
 //! (`smithy_query(query="operation",
 //! operation="PutFunctionConcurrency,GetFunctionConcurrency,DeleteFunctionConcurrency")`).
 //!
-//! The rule under test: **the capacity a reservation sets aside is the capacity an INVOCATION
-//! of the function holds, so the resource one of these operations addresses is the function AT
-//! the version such an invocation runs — the identifier they take carries no qualifier of its
-//! own, so it resolves to the unpublished version — and a request that resolves to no function
-//! is refused with the fixed text `Function not found: ` followed by that fully qualified ARN,
-//! `:$LATEST` included.** It is the same resource a synchronous `Invoke` of the same name says
-//! it could not find ([`crate::invoke_addressed_function`] pins that one), and the refusal
-//! changes nothing: a function that DOES hold a reservation still holds exactly it afterwards.
+//! The rule under test: **a request on a function's reserved concurrency that resolves to no
+//! function is refused with the fixed text `Function not found: ` followed by the ARN the
+//! REFUSING OPERATION names, which is recorded per operation: the WRITES
+//! (`PutFunctionConcurrency`, `DeleteFunctionConcurrency`) name the function at the version an
+//! invocation of the identifier would run — the identifier carries no qualifier of its own, so
+//! it resolves to the unpublished version and the ARN carries `:$LATEST` — while the READ
+//! (`GetFunctionConcurrency`) names the function ITSELF, the unqualified ARN, spelled with
+//! exactly the qualifier the request named.** The writes' resource is the same one a
+//! synchronous `Invoke` of the same name says it could not find
+//! ([`crate::invoke_addressed_function`] pins that one), and the refusal changes nothing: a
+//! function that DOES hold a reservation still holds exactly it afterwards.
 //!
 //! The rows differ along what the rule generalises over: WHICH operation asked (the write, the
 //! read, the removal), the documented `FunctionName` form the request addresses the function by
@@ -60,10 +63,16 @@ const ABSENT: &str = "reserved-not-found-absent";
 /// did.
 const DELETED: &str = "reserved-not-found-deleted";
 
-/// The resource the rule says a refusal names: the function's ARN in this endpoint's Region,
-/// qualified by the version an invocation of the identifier would run.
+/// The resource the rule says a WRITE's refusal names: the function's ARN in this endpoint's
+/// Region, qualified by the version an invocation of the identifier would run.
 fn resolved_arn(name: &str) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}:{LATEST}")
+}
+
+/// The resource the rule says the READ's refusal names: the function's own ARN in this
+/// endpoint's Region, carrying no qualifier — which is what the request named.
+fn addressed_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}")
 }
 
 /// `DeleteFunctionConcurrency` on `reference`.
@@ -140,7 +149,7 @@ async fn every_operation(router: &MultiServiceRouter, reference: &str) -> Vec<(&
 }
 
 #[tokio::test]
-async fn a_reservation_that_resolves_to_nothing_names_the_version_qualified_resource() {
+async fn a_reservation_that_resolves_to_nothing_names_the_resource_its_operation_addressed() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
 
@@ -163,10 +172,15 @@ async fn a_reservation_that_resolves_to_nothing_names_the_version_qualified_reso
         ("a name no function was ever held under", ABSENT),
         ("a function that was created and then deleted", DELETED),
     ] {
-        let expected = format!("{NOT_FOUND_PREFIX}{}", resolved_arn(name));
         for (form, reference) in references(name) {
             for (operation, answer) in every_operation(&router, &reference).await {
                 let case = format!("{missing} addressed by {form} ({operation})");
+                // The READ names the function itself; the write and the removal name the
+                // version the reserved capacity is held for.
+                let expected = match operation {
+                    "GetFunctionConcurrency" => format!("{NOT_FOUND_PREFIX}{}", addressed_arn(name)),
+                    _ => format!("{NOT_FOUND_PREFIX}{}", resolved_arn(name)),
+                };
                 assert_eq!(
                     answer.status,
                     404,

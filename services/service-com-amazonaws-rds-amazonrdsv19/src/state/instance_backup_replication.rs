@@ -45,7 +45,9 @@ use super::*;
 /// ([`arn_resource_name_of`]).
 #[derive(Debug, Clone)]
 pub struct SourceDbInstance {
-    /// The source instance's Region, from the ARN's Region field.
+    /// The source instance's Region, from the ARN's Region field, folded the way this store
+    /// keys a Region: the published lowercase region-id form every request's own scope is
+    /// held to (`request_region`).
     pub region: String,
     /// The source instance's identifier, folded the way this store keys one: "stored as a
     /// lowercase string".
@@ -60,7 +62,9 @@ pub struct SourceDbInstance {
 /// The region is the ARN's own, which is the whole point of naming a cross-region source by
 /// ARN; an ARN whose region segment is EMPTY names no region other than the one the request
 /// was signed for, so that is where its source is looked for — the rule the copies' source
-/// snapshot is resolved by (`snapshot_copy_source_not_found_message`).
+/// snapshot is resolved by (`snapshot_copy_source_not_found_message`). Both halves of what
+/// the ARN names are folded the way this store keys them, so a source is resolved by its ARN
+/// however the request spells it.
 pub fn source_db_instance_of(named: &str, request_region: &str) -> Option<SourceDbInstance> {
     let parsed = parse_rds_resource_arn(named)?;
     if parsed.resource_type != DB_INSTANCE_ARN_RESOURCE_TYPE {
@@ -72,7 +76,7 @@ pub fn source_db_instance_of(named: &str, request_region: &str) -> Option<Source
         parsed.region
     };
     Some(SourceDbInstance {
-        region: region.to_string(),
+        region: region.to_ascii_lowercase(),
         identifier: parsed.identifier.to_ascii_lowercase(),
     })
 }
@@ -110,14 +114,16 @@ pub fn same_region_backup_replication_message(source_arn: &str) -> String {
 /// What `StopDBInstanceAutomatedBackupsReplication` refuses a call that names no replication
 /// INTO the Region the call was made to with.
 ///
-/// The question that operation asks is about the Region of the call — is the instance the ARN
-/// names replicating its automated backups into THIS Region? — so the one state it can refuse
-/// is "nothing is replicating here", which is the modelled `InvalidDBInstanceStateFault` ("the
+/// The question that operation asks of the Region of the call — is the instance the ARN names
+/// replicating its automated backups into THIS Region? — has one state it can refuse:
+/// "nothing is replicating here", which is the modelled `InvalidDBInstanceStateFault` ("the
 /// DB instance isn't in a valid state"). It is the answer whether the replication was never
-/// enabled, has already been stopped, or the instance the ARN names does not exist at all:
-/// none of them is a replication into this Region. The sentence's one variable part is the
-/// request's `SourceDBInstanceArn`, reproduced whole, because the ARN is all this call
-/// resolves.
+/// enabled, has already been stopped, or runs into another Region: none of them is a
+/// replication into this Region. An ARN naming an instance that does not exist at all is NOT
+/// one of them — the source instance is resolved before this question is asked, and a source
+/// no Region holds is the Region-qualified `DBInstanceNotFoundFault`
+/// ([`source_db_instance_not_found_message`]). The sentence's one variable part is the
+/// request's `SourceDBInstanceArn`, reproduced whole.
 pub fn backup_replication_not_to_this_region_message(source_arn: &str) -> String {
     format!("DB Instance {source_arn} is not replicating to the current region.")
 }
@@ -336,9 +342,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// The automated backups replicated into `region` FROM the source DB instance a
     /// `SourceDBInstanceArn` names, resolved from the ARN alone: the record's own copy of the
     /// source carries that instance's Region and identifier
-    /// ([`RetainedInstanceBackupRecord`]), so a replication into this Region is found without
-    /// the source instance being looked up — which is what lets a Region answer "nothing is
-    /// replicating here" for an ARN naming an instance this store holds no record of at all.
+    /// ([`RetainedInstanceBackupRecord`]), so a replication into this Region is found from the
+    /// ARN itself rather than from the source instance's record — which is what lets a Region
+    /// answer "nothing is replicating here" for a source instance that exists and replicates
+    /// nowhere.
     ///
     /// Both halves of what the ARN names — the Region segment and the identifier — are matched
     /// without regard to case, as every name this service resolves against stored state is, so

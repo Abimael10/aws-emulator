@@ -101,11 +101,16 @@ pub const FUNCTION_ONLY_OPERATION_MESSAGE: &str =
 /// `Function not found: ` followed by the ARN the request RESOLVED.
 ///
 /// The capacity a reservation sets aside is the capacity an INVOCATION of the function holds,
-/// so the resource one of these operations addresses is the function AT the version such an
+/// so the resource one of these WRITES addresses is the function AT the version such an
 /// invocation runs: the identifier they take carries no qualifier of its own
 /// ([`FUNCTION_ONLY_OPERATION_MESSAGE`]), so it resolves to the unpublished version, and the
 /// refusal names that fully qualified ARN — the same resource a synchronous invocation of the
 /// same name says it could not find ([`super::resolved_invocation_arn`]).
+///
+/// WHICH spelling of the ARN the sentence carries is RECORDED PER OPERATION rather than
+/// derived — as the sentence a listing refuses a marker with is
+/// ([`INVALID_PAGINATION_KEY_MESSAGE`]) — so the READ of the reservation words its own
+/// ([`reserved_concurrency_read_not_found_message`]).
 ///
 /// `resolution_stated` is what the resolution itself worded, which stands wherever this
 /// endpoint resolves no ARN for the reference at all: an ARN of ANOTHER Region names no
@@ -123,6 +128,30 @@ pub fn reserved_concurrency_not_found_message(
     resolution_stated: String,
 ) -> String {
     super::resolved_invocation_arn(region, reference, None)
+        .map_or(resolution_stated, |arn| format!("Function not found: {arn}"))
+}
+
+/// What a READ of the function's reserved concurrency says it could not FIND: the same fixed
+/// `Function not found: ` prefix, followed by the function's OWN ARN — the resource the read
+/// addressed, spelled with exactly the qualifier the request named, which for these operations
+/// is none at all ([`FUNCTION_ONLY_OPERATION_MESSAGE`], and [`super::addressed_arn_of`] for
+/// that spelling).
+///
+/// `resolution_stated` stands for the same reason it does in
+/// [`reserved_concurrency_not_found_message`]: a reference this endpoint resolves no ARN of
+/// this Region for is refused on the Region.
+///
+/// Recorded behaviour: fixture `lambda-concurrency-qualified-and-missing-function-errors`,
+/// step `task#6`, where `GetFunctionConcurrency` on an unqualified name no function is held
+/// under is answered `404 ResourceNotFoundException` with the UNQUALIFIED function ARN after
+/// the fixed prefix.
+#[must_use]
+pub fn reserved_concurrency_read_not_found_message(
+    region: &str,
+    reference: &super::FunctionReference,
+    resolution_stated: String,
+) -> String {
+    super::addressed_arn_of(region, reference, None)
         .map_or(resolution_stated, |arn| format!("Function not found: {arn}"))
 }
 

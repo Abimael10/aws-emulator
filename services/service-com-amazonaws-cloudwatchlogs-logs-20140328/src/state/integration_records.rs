@@ -861,16 +861,59 @@ impl UnresolvedIntegration {
     }
 }
 
-/// The refusal an operation of this family answers for an `integrationArn` it cannot resolve
-/// an S3 Table Integration from, or `None` when the account holds the one it names.
+/// The refusal for an `integrationArn` that could name NO S3 Table Integration of this
+/// account, whatever the account holds: a resource that is not an integration's is told the
+/// form one carries, another account's integration is told that access is not given across
+/// accounts, and an ARN of another service, partition or Region is told it names no
+/// integration. `None` for an ARN that IS such a handle — whether or not the account holds
+/// the integration it names.
 ///
-/// ONE ladder, shared by the associate and the reader so the two cannot disagree about which
-/// ARN names which integration, each rung worded as this service words it: an integration of
-/// THIS service's own that the account does not hold is told the integration is not there, a
-/// resource that is not an integration's is told the form one carries, another account's
-/// integration is told that access is not given across accounts, an ARN of another service,
-/// partition or Region is told it names no integration, and a handle the account holds nothing
-/// under is told the integration is not there.
+/// The rungs that judge the VALUE, in one place, so every operation of this family reads an
+/// `integrationArn` the same way. The value has already been read as an ARN by the caller
+/// ([`malformed_arn_message`]), which is what the length and the parse are stated by.
+pub fn invalid_s3_table_integration_arn_message(region: &str, arn: &str) -> Option<String> {
+    not_an_s3_table_integration_arn_message(arn)
+        .or_else(|| cross_account_integration_message(arn))
+        .or_else(|| invalid_integration_arn_message(region, arn))
+}
+
+/// The refusal `ListSourcesForS3TableIntegration` answers for an `integrationArn` it cannot
+/// resolve an S3 Table Integration from, or `None` when the account holds the one it names.
+///
+/// This reader resolves ONE family — the S3 Table Integrations of the service that owns them,
+/// which is what its `integrationArn` names — so an ARN of any other resource is told the
+/// form an integration's carries ([`invalid_s3_table_integration_arn_message`]), including an
+/// ARN naming an integration of THIS service, which is a different resource and not a
+/// coarser-grained one. A handle of the right form the account holds nothing under is told the
+/// integration is not there.
+///
+/// Every rung of this reader's ladder travels under ONE class, the modelled
+/// `ValidationException`, which is RECORDED for this operation rather than derived from the
+/// rung: fixture `logs-b2-lookup-tables-and-integrations` step `task#6` answers an ARN of this
+/// service's own `integration:` resource `400 ValidationException` with the resource-form
+/// sentence, and fixture `logs-s3table-integration-not-found-workflow` step `task#2` answers a
+/// well-formed handle the account holds nothing under `400 ValidationException` with
+/// [`integration_not_found_arn_message`]. The associate words its own classes
+/// ([`unresolved_integration`]).
+pub fn unresolved_s3_table_integration_message<
+    Eng: ::std::marker::Send + ::std::marker::Sync + 'static,
+>(
+    engine: &Eng,
+    region: &str,
+    arn: &str,
+) -> Option<String> {
+    invalid_s3_table_integration_arn_message(region, arn).or_else(|| {
+        (!holds_s3_table_integration(engine, region, arn))
+            .then(|| integration_not_found_arn_message(arn))
+    })
+}
+
+/// The refusal `AssociateSourceToS3TableIntegration` answers for an `integrationArn` it cannot
+/// resolve an S3 Table Integration from, or `None` when the account holds the one it names.
+///
+/// The rungs are the reader's ([`unresolved_s3_table_integration_message`]) plus the one the
+/// associate has of its own: an integration of THIS service's own that the account does not
+/// hold is told the integration is not there. Each rung is worded as this service words it.
 ///
 /// The rungs that say an INTEGRATION is not there are the NOT-FOUND class and the rest are the
 /// parameter-validity one: an ARN that names an integration — of either family this service
@@ -889,13 +932,7 @@ pub fn unresolved_integration<Eng: ::std::marker::Send + ::std::marker::Sync + '
     if let Some(message) = unheld_logs_integration_message(engine, arn) {
         return Some(UnresolvedIntegration::NotFound(message));
     }
-    if let Some(message) = not_an_s3_table_integration_arn_message(arn) {
-        return Some(UnresolvedIntegration::Invalid(message));
-    }
-    if let Some(message) = cross_account_integration_message(arn) {
-        return Some(UnresolvedIntegration::Invalid(message));
-    }
-    if let Some(message) = invalid_integration_arn_message(region, arn) {
+    if let Some(message) = invalid_s3_table_integration_arn_message(region, arn) {
         return Some(UnresolvedIntegration::Invalid(message));
     }
     (!holds_s3_table_integration(engine, region, arn))
