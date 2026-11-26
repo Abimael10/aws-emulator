@@ -79,7 +79,11 @@ const NOT_FOUND_STATUS: u16 = 400;
 /// One call of that service over the `awsJson1_0` wire its model declares: the operation in
 /// `X-Amz-Target` after its service shape's own name, signed for `bcm-dashboards` — that
 /// model's own `sigv4Name` — in the Region the stack's resources live in.
-async fn bcm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn bcm(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://bcm-dashboards.{REGION}.amazonaws.com/"))
@@ -107,7 +111,7 @@ async fn bcm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 }
 
 /// That service's own read of one dashboard, by the ARN it minted.
-async fn get_dashboard(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+pub(crate) async fn get_dashboard(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     bcm(router, "GetDashboard", &json!({"arn": arn})).await
 }
 
@@ -154,7 +158,7 @@ async fn resource_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<Strin
 /// The account's own MANAGED dashboards are listed beside them — that service publishes a
 /// catalogue of them under ARNs of its own — and no stack created or can delete one, so
 /// they are not what a case about a stack's resources asks about.
-async fn listed_custom_dashboards(router: &MultiServiceRouter) -> Vec<String> {
+pub(crate) async fn listed_custom_dashboards(router: &MultiServiceRouter) -> Vec<String> {
     let (_, page) = bcm(router, "ListDashboards", &json!({"maxResults": 100})).await;
     page.get("dashboards")
         .and_then(Value::as_array)
@@ -178,7 +182,7 @@ async fn listed_custom_dashboards(router: &MultiServiceRouter) -> Vec<String> {
 /// `visual` a `VisualType` value and `granularity` a `Granularity` value (sources: the
 /// `CostAndUsageQuery`, `VisualType` and `Granularity` shapes of that model). The graph
 /// display map is keyed BY the metric, which is a value rather than a member name.
-fn graph_config(metric: &str, visual: &str, granularity: &str) -> Value {
+pub(crate) fn graph_config(metric: &str, visual: &str, granularity: &str) -> Value {
     json!({
         "QueryParameters": {
             "CostAndUsage": {
@@ -1077,43 +1081,60 @@ async fn deleting_the_stack_takes_both_resources_away() {
     );
 }
 
-/// One refusal row: a widget title the owning service refuses, and why.
+/// One refusal row: a widget value the owning service refuses, and why.
 struct Refused {
     case: &'static str,
     stack_name: &'static str,
-    title: String,
+    /// The widget the row declares, carrying the value that service refuses.
+    widget: Value,
+    /// The member of `Widget` whose rule the value breaks, which that service's own refusal
+    /// names.
+    member: &'static str,
 }
 
-/// The rows differ along WHICH rule of `WidgetTitle` the title breaks — its modelled
-/// `@pattern` `^(?!.* {2})[a-zA-Z0-9_-][ a-zA-Z0-9_-]*[a-zA-Z0-9_-]$` and its
-/// `@length(2..50)` (source: `smithy_query(query="shape", shape="Widget")` on that
-/// service's own model) — so the refusal is the owning service's whatever the fault is.
+/// The rows differ along WHICH rule of WHICH `Widget` member the declaration breaks — the
+/// `@length(2..50)` of `title` and the `@length(1..200)` of `description` (source:
+/// `smithy_query(query="shape", shape="Widget")` on that service's own model) — so the
+/// refusal is the owning service's whatever the fault is.
+///
+/// Every row breaks a rule CloudFormation's own pre-deployment validation does not judge: a
+/// value outside the `@pattern` its member publishes is refused by that stage before anything
+/// is asked of this service at all, which
+/// `nested_property_pattern_validation.rs` owns. What is left here is the direction this suite
+/// is about — the owning service as the authority on everything that stage is not.
 fn refused_titles() -> Vec<Refused> {
     vec![
         Refused {
-            case: "two consecutive spaces, which the title's negative lookahead forbids",
-            stack_name: "bcm-dashboard-double-space",
-            title: "Monthly  Spend".to_string(),
-        },
-        Refused {
-            case: "a leading space, which the title's first character class forbids",
-            stack_name: "bcm-dashboard-leading-space",
-            title: " Monthly Spend".to_string(),
-        },
-        Refused {
-            case: "a punctuation character the title's character class forbids",
-            stack_name: "bcm-dashboard-punctuation",
-            title: "Spend/Usage".to_string(),
-        },
-        Refused {
-            case: "one character, below the title's minimum length",
-            stack_name: "bcm-dashboard-too-short",
-            title: "S".to_string(),
-        },
-        Refused {
-            case: "one character past the title's maximum length",
+            case: "a title one character past its maximum length",
             stack_name: "bcm-dashboard-too-long",
-            title: "S".repeat(51),
+            widget: json!({
+                "Title": "S".repeat(51),
+                "Configs": [graph_config("UnblendedCost", "LINE", "MONTHLY")]
+            }),
+            member: "title",
+        },
+        Refused {
+            // The same bound, over a title whose every character and spacing its published
+            // pattern admits: what is left to refuse is the length alone.
+            case: "a title past its maximum length that is otherwise inside its form",
+            stack_name: "bcm-dashboard-too-long-spaced",
+            widget: json!({
+                "Title": format!("{} {}", "Monthly Spend".repeat(3), "T".repeat(11)),
+                "Configs": [graph_config("UnblendedCost", "LINE", "MONTHLY")]
+            }),
+            member: "title",
+        },
+        Refused {
+            // Another member of the same structure, whose own bound that stage does not judge
+            // either.
+            case: "a description one character past its maximum length",
+            stack_name: "bcm-dashboard-description-too-long",
+            widget: json!({
+                "Title": "Monthly Spend",
+                "Description": "D".repeat(201),
+                "Configs": [graph_config("UnblendedCost", "LINE", "MONTHLY")]
+            }),
+            member: "description",
         },
     ]
 }
@@ -1132,10 +1153,7 @@ async fn a_widget_title_the_owning_service_refuses_rolls_the_stack_back() {
                     "Type": BCM_DASHBOARD,
                     "Properties": {
                         "Name": "Refused Board",
-                        "Widgets": [{
-                            "Title": row.title,
-                            "Configs": [graph_config("UnblendedCost", "LINE", "MONTHLY")]
-                        }]
+                        "Widgets": [row.widget]
                     }
                 }
             }
@@ -1168,9 +1186,10 @@ async fn a_widget_title_the_owning_service_refuses_rolls_the_stack_back() {
             "case {case:?}: expected the owning service's refusal, got {reason:?}"
         );
         assert!(
-            quoted.contains("title"),
-            "case {case:?}: expected the refusal to name the member that broke the rule, got \
-             {reason:?}"
+            quoted.contains(row.member),
+            "case {case:?}: expected the refusal to name the member that broke the rule \
+             ({:?}), got {reason:?}",
+            row.member
         );
 
         // Nothing was created: the account holds no dashboard the stack could have made.

@@ -271,7 +271,11 @@ fn rows() -> Vec<Row> {
 
 /// Every validation result `DescribeEvents` reports for one operation, as the members a
 /// validation result carries.
-async fn validation_results(
+///
+/// Shared with the suites that assert the DETAIL half of a pre-deployment refusal for the other
+/// questions of that stage (`nested_property_pattern_validation.rs`): one spelling of "read the
+/// operation's events, keep the validation results, in the order they were recorded".
+pub(crate) async fn validation_results(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,

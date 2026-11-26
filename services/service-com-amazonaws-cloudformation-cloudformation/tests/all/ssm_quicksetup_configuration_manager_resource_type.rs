@@ -78,7 +78,7 @@ fn name_pattern() -> &'static str {
     PATTERNED_PROPERTIES
         .iter()
         .find(|row| {
-            row.resource_type == SSM_QUICKSETUP_CONFIGURATION_MANAGER && row.property == "Name"
+            row.resource_type == SSM_QUICKSETUP_CONFIGURATION_MANAGER && row.property == ["Name"]
         })
         .map(|row| row.pattern)
         .expect("the type's Name pattern is catalogued")

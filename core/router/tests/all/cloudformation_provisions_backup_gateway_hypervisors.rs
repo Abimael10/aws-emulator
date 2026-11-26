@@ -956,7 +956,7 @@ async fn a_value_outside_its_published_pattern_is_refused_before_anything_is_imp
         let pattern = PATTERNED_PROPERTIES
             .iter()
             .find(|catalogued| {
-                catalogued.resource_type == HYPERVISOR && catalogued.property == row.property
+                catalogued.resource_type == HYPERVISOR && catalogued.property == [row.property]
             })
             .map(|catalogued| catalogued.pattern)
             .unwrap_or_else(|| panic!("case {case:?}: the pattern of the property is catalogued"));

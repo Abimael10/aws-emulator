@@ -67,7 +67,7 @@ const LOG_GROUP_ARN: &str =
 fn pattern_of(resource_type: &str, property: &str) -> &'static str {
     PATTERNED_PROPERTIES
         .iter()
-        .find(|row| row.resource_type == resource_type && row.property == property)
+        .find(|row| row.resource_type == resource_type && row.property == [property])
         .map(|row| row.pattern)
         .unwrap_or_else(|| panic!("the pattern of {resource_type} {property} is catalogued"))
 }
@@ -346,7 +346,8 @@ fn no_judged_property_of_a_credential_carrying_type_is_a_credential() {
     for row in CREDENTIAL_PROPERTIES {
         for credential in row.credentials {
             let patterned = PATTERNED_PROPERTIES.iter().any(|judged| {
-                judged.resource_type == row.resource_type && judged.property == *credential
+                judged.resource_type == row.resource_type
+                    && judged.property.contains(credential)
             });
             assert!(
                 !patterned,
