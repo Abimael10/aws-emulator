@@ -18,11 +18,13 @@
 //!   under IS that other kind's identifier, so no profile could ever answer to it and the route
 //!   reports the identifier it cannot READ ("Id format is invalid"). That the account really
 //!   holds a live resource of that other kind under the value changes nothing: the refusal is a
-//!   property of the value, not of the store;
+//!   property of the value, not of the store. A value WIDER than that width is no identifier of
+//!   these kinds either, whatever letter it opens with, and earns the same sentence;
 //! * every other value is carried through to the store — one under the profile kind's OWN
 //!   letter, since WHICH profile identifier was ever issued is a property of the store, one
 //!   under a letter no kind of this service issues an identifier under, and one of the alphabet
-//!   at any OTHER width, since the issued width is one width CloudFront writes an identifier in
+//!   NARROWER than the issued width, since that width is one width CloudFront writes an
+//!   identifier in
 //!   rather than the only one — and the profile the store holds none under is the profile that
 //!   is simply ABSENT ("The specified field level encryption profile does not exist.").
 //!
@@ -38,9 +40,10 @@
 //!   `If-Match`, so no refusal below can be the precondition's;
 //! * the NAMESPACE LETTER and the WIDTH of values that are NOT another kind's identifier: the
 //!   profile's own letter over a body never minted, a letter no kind of this service issues one
-//!   under, and another kind's letter one character short of and one character past the issued
+//!   under, and another kind's letter one character short of the issued
 //!   width — each the profile reported ABSENT, which is what keeps the two sentences apart
-//!   rather than making the refusal cover every value.
+//!   rather than making the refusal cover every value — against another kind's letter one
+//!   character PAST that width, which is unreadable.
 //!
 //! The issued width is read off the identifiers these creates really answered with, so no width
 //! is written out by hand. Afterwards every live resource is read back at its own identifier and
@@ -324,13 +327,26 @@ async fn an_identifier_live_for_another_kind_is_refused_on_its_form_by_every_pro
     }
 
     // An identifier issued for another kind is the identifier no profile route can read, on
-    // every route addressed by a profile identifier.
-    for row in &live {
+    // every route addressed by a profile identifier — and so is a value WIDER than any
+    // identifier of these kinds is written, whatever letter it opens with.
+    let wider_than_issued = format!(
+        "{}{}A",
+        live[0].id.chars().next().expect("a minted identifier"),
+        "A".repeat(issued_width - 1)
+    );
+    for (case, id) in live
+        .iter()
+        .map(|row| (row.case.to_string(), row.id.clone()))
+        .chain([(
+            "another kind's namespace one character past the issued width".to_string(),
+            wider_than_issued,
+        )])
+    {
         for route in ROUTES {
-            let answer = route.send(&router, &row.id, &document, &if_match).await;
+            let answer = route.send(&router, &id, &document, &if_match).await;
             assert_refusal(
                 &answer,
-                &format!("{route:?} with {} ({:?})", row.case, row.id),
+                &format!("{route:?} with {case} ({id:?})"),
                 UNREADABLE_IDENTIFIER,
             );
         }
@@ -354,10 +370,6 @@ async fn an_identifier_live_for_another_kind_is_refused_on_its_form_by_every_pro
         (
             "another kind's namespace one character short of the issued width".to_string(),
             format!("{other_letter}{}", "A".repeat(issued_width - 2)),
-        ),
-        (
-            "another kind's namespace one character past the issued width".to_string(),
-            format!("{other_letter}{body}A"),
         ),
     ];
     for (case, id) in &carried {

@@ -4,16 +4,17 @@
 //! SEVERAL keys, end to end over HTTP.
 //!
 //! RULE under test: `GetPublicKey` (`GET /2020-05-31/public-key/{Id}`) and
-//! `GetPublicKeyConfig` (`GET /2020-05-31/public-key/{Id}/config`) resolve their `Id` against
-//! the STORE and nothing else — the model makes that member a required `@httpLabel` targeting
-//! `string` with no `@pattern` and no `@length`, and each operation models one 404,
+//! `GetPublicKeyConfig` (`GET /2020-05-31/public-key/{Id}/config`) answer one 404,
 //! `NoSuchPublicKey`, beside `AccessDenied` and no argument error at all
-//! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig")`). So the form
-//! of the value decides nothing: EVERY id the account really holds is served from that key's own
-//! record, and every id it holds no key under is the key reported ABSENT, under that one code,
-//! status and fixed sentence. The sentence that tells a caller its own identifier handling is
-//! broken is a different client contract — a non-retryable programming error rather than a
-//! resource that is simply not there — and these routes never answer it.
+//! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig")`), so the
+//! MESSAGE is what tells two conditions apart. EVERY id the account really holds is served from
+//! that key's own
+//! record; every id that COULD be an identifier CloudFront issued for a public key — the
+//! identifier alphabet, no wider than the width one is issued at, and at exactly that width
+//! under this kind's own namespace letter — and that the account holds no key under is the key
+//! reported ABSENT; and a value that could never be one is the identifier the route reports it
+//! cannot READ, which tells a caller its own identifier handling is broken rather than that a
+//! resource is not there.
 //!
 //! What this suite adds to its siblings, which drive ONE stored key
 //! ([`crate::public_key_absent_id_one_sentence`],
@@ -22,10 +23,12 @@
 //! shown to resolve against state rather than to answer whatever single record is there. The
 //! rows then vary what the rule generalises over by deriving, from each minted id, the ways a
 //! value can MISS the store while staying as close to a real identifier as possible — the id
-//! recased, one character short, one character long, under another namespace letter, broken by a
-//! separator, with its body digits-only — beside values of no CloudFront identifier shape at all.
-//! None of them is an id the account holds, and every one of them earns the absent-key sentence
-//! from both readers.
+//! one character short of the issued width and with its body digits-only, each the absent key —
+//! beside the ways it can stop being an identifier of this kind at all: recased, one character
+//! too long, under another namespace letter, broken by a separator, and values of no CloudFront
+//! identifier shape at all.
+//! None of them is an id the account holds, and each one earns the sentence its own form
+//! decides from both readers.
 //!
 //! The wire harness, the configuration writer and the create and read helpers are the crate's
 //! own, reused rather than copied.
@@ -43,8 +46,8 @@ use crate::response_headers_policy_lifecycle::text;
 /// these rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
-/// The sentence that says a caller's own identifier handling is broken, which several routes of
-/// this service do answer and these two never do: a value's form is not something they read.
+/// The sentence that says a caller's own identifier handling is broken, which these routes
+/// answer a value that could never be an identifier issued for a public key.
 const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// The one 404 code both readers model for an `Id` they cannot resolve.
@@ -200,27 +203,40 @@ async fn assert_served(router: &MultiServiceRouter, held: &Stored) {
     );
 }
 
-/// The ways a value can MISS the store while staying as close as possible to an identifier this
-/// service really minted: `(case, value)`.
+/// The ways a value can MISS the store while still being a value that COULD be an identifier
+/// CloudFront issued for a public key: `(case, value)`.
 ///
 /// Every row is derived from `minted` rather than written out here, so none of them can drift
-/// from the form this service issues — the alphabet (recased, digits only), the width (one
-/// character short, one past), the namespace letter the value opens with, and a body broken by a
-/// separator.
+/// from the form this service issues — the width (one character short of the issued one) and the
+/// body's character classes (digits only).
 fn near_misses(minted: &str) -> Vec<(String, String)> {
     let (namespace, body) = minted.split_at(1);
     let shortened: String = body.chars().take(body.chars().count() - 1).collect();
-    let recased = minted.to_lowercase();
-    // The namespace letter this service does NOT mint a public key under, so a value carrying it
-    // is no public key id of this mint however well-formed its body is.
-    let other_namespace = if namespace == "E" { "K" } else { "E" };
 
     vec![
-        ("the minted id in lower case".to_string(), recased),
         (
             "the minted id one character short".to_string(),
             format!("{namespace}{shortened}"),
         ),
+        (
+            "the minted width over a digits-only body".to_string(),
+            format!("{namespace}{}", "9".repeat(body.chars().count())),
+        ),
+    ]
+}
+
+/// The ways a value stops being an identifier CloudFront could have issued for a public key,
+/// derived from a minted id: `(case, value)`.
+fn unreadable_forms(minted: &str) -> Vec<(String, String)> {
+    let (namespace, body) = minted.split_at(1);
+    let shortened: String = body.chars().take(body.chars().count() - 1).collect();
+    let recased = minted.to_lowercase();
+    // The namespace letter this service does NOT mint a public key under, so a value carrying it
+    // at the issued width is no public key id of this mint however well-formed its body is.
+    let other_namespace = if namespace == "E" { "K" } else { "E" };
+
+    vec![
+        ("the minted id in lower case".to_string(), recased),
         (
             "the minted id one character long".to_string(),
             format!("{minted}9"),
@@ -233,15 +249,11 @@ fn near_misses(minted: &str) -> Vec<(String, String)> {
             "the minted id's body broken by a separator".to_string(),
             format!("{namespace}{shortened}-9"),
         ),
-        (
-            "the minted width over a digits-only body".to_string(),
-            format!("{namespace}{}", "9".repeat(body.chars().count())),
-        ),
     ]
 }
 
-/// Values of no CloudFront identifier shape at all, which these routes read no form of either:
-/// `(case, value)`.
+/// Values of no CloudFront identifier shape at all, which could never be an identifier issued
+/// for a public key: `(case, value)`.
 fn values_of_no_identifier_shape() -> Vec<(String, String)> {
     vec![
         ("a bare word".to_string(), "not-an-identifier".to_string()),
@@ -257,12 +269,17 @@ fn values_of_no_identifier_shape() -> Vec<(String, String)> {
             "a namespace-labelled opaque id".to_string(),
             "dt_3JO1OQa51Jb3BZh7XQh6pbvF3Wa".to_string(),
         ),
-        ("a bare digit".to_string(), "7".to_string()),
         (
             "a value far wider than any id this service mints".to_string(),
             "K".repeat(256),
         ),
     ]
+}
+
+/// Values of the identifier alphabet narrower than the width an identifier is issued at, which
+/// could be one CloudFront wrote at another width: `(case, value)`.
+fn values_narrower_than_the_issued_width() -> Vec<(String, String)> {
+    vec![("a bare digit".to_string(), "7".to_string())]
 }
 
 /// RULE: every id the account really holds is served from its OWN record, by both readers.
@@ -285,20 +302,38 @@ async fn every_minted_id_is_served_from_its_own_record() {
     );
 }
 
-/// RULE: an id the account holds no key under is the key reported ABSENT by both readers,
-/// whatever form the value takes — never the sentence that says the identifier cannot be read.
+/// RULE: an id that could be one CloudFront issued for a public key and that the account holds
+/// no key under is the key reported ABSENT by both readers, while a value that could never be
+/// one earns the unreadable-identifier sentence — the two sentences the one code carries.
 #[tokio::test]
-async fn every_id_the_account_holds_no_key_under_is_the_absent_key() {
+async fn every_id_the_account_holds_no_key_under_earns_the_sentence_its_form_decides() {
     let router = emulator();
     let stored = seed(&router).await;
     let held: BTreeSet<String> = stored.iter().map(|key| key.id.clone()).collect();
 
-    let mut rows = values_of_no_identifier_shape();
+    let mut rows: Vec<(String, String, &str)> = values_narrower_than_the_issued_width()
+        .into_iter()
+        .map(|(case, id)| (case, id, NO_SUCH_PUBLIC_KEY))
+        .chain(
+            values_of_no_identifier_shape()
+                .into_iter()
+                .map(|(case, id)| (case, id, UNREADABLE_IDENTIFIER)),
+        )
+        .collect();
     for key in &stored {
-        rows.extend(near_misses(&key.id));
+        rows.extend(
+            near_misses(&key.id)
+                .into_iter()
+                .map(|(case, id)| (case, id, NO_SUCH_PUBLIC_KEY)),
+        );
+        rows.extend(
+            unreadable_forms(&key.id)
+                .into_iter()
+                .map(|(case, id)| (case, id, UNREADABLE_IDENTIFIER)),
+        );
     }
 
-    for (case, id) in &rows {
+    for (case, id, expected) in &rows {
         assert!(
             !held.contains(id),
             "case {case:?}: the value submitted must be one the account holds no key under, got \
@@ -320,15 +355,9 @@ async fn every_id_the_account_holds_no_key_under_is_the_absent_key() {
                 answer.raw
             );
             let message = answer.root().find_text("Message").unwrap_or_default();
-            assert_ne!(
-                message, UNREADABLE_IDENTIFIER,
-                "case {case:?} ({reader}, Id {id:?}): these routes read no form of their id, so \
-                 one they cannot resolve is the key that is absent rather than an id they refuse \
-                 to read, got {message:?}"
-            );
             assert_eq!(
-                message, NO_SUCH_PUBLIC_KEY,
-                "case {case:?} ({reader}, Id {id:?}): expected {NO_SUCH_PUBLIC_KEY:?}, got \
+                message, *expected,
+                "case {case:?} ({reader}, Id {id:?}): expected {expected:?}, got \
                  {message:?}"
             );
             assert!(

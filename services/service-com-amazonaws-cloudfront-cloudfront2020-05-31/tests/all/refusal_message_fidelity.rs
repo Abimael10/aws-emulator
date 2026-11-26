@@ -62,6 +62,10 @@ use crate::web_acl_association::create as create_distribution_returning_id;
 /// these rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
+/// The sentence the same code carries for a value that could never be an identifier CloudFront
+/// issued for a public key, spelled out here for the same reason.
+const UNREADABLE_PUBLIC_KEY_ID: &str = "Id format is invalid";
+
 /// The sentence an `IpCount` outside the documented value set is refused with: it names the
 /// parameter the quantity arrives under and the two counts a list may be allocated for.
 const INVALID_IP_COUNT: &str = "The parameter Quantity Invalid quantity provided. The quantity \
@@ -432,15 +436,18 @@ struct IdRow {
 }
 
 /// Every operation that addresses a public key by `Id` answers `NoSuchPublicKey` (404) for an
-/// `Id` it cannot resolve, with the ONE sentence that reports the key as ABSENT — whatever the
-/// value is: a well-formed identifier of another resource kind this service mints (a
+/// `Id` it cannot resolve, under the sentence the value's own form decides: the key reported
+/// ABSENT where the value could be an identifier CloudFront issued for a public key — the
+/// identifier alphabet, no wider than the width one is issued at, and at exactly that width
+/// under this kind's own letter — and the identifier reported UNREADABLE where it could never
+/// be one: a well-formed identifier of another resource kind this service mints (a
 /// distribution, a key group's UUID, a field-level encryption profile or configuration), the
-/// public key namespace at a width CloudFront issues none at, a lower-cased identifier, a
-/// name, a caller reference, a word of no id shape at all. The `Id` is resolved against the
-/// STORE, so none of those forms earns a different answer, and no refusal touches the key the
+/// public key namespace wider than CloudFront issues one at, a lower-cased identifier, a
+/// name, a caller reference, a word of no id shape at all. No refusal touches the key the
 /// account really holds.
 #[tokio::test]
-async fn every_id_the_store_holds_no_public_key_for_is_refused_as_the_key_that_is_absent() {
+async fn every_id_the_store_holds_no_public_key_for_is_refused_under_the_sentence_its_form_decides(
+) {
     let router = emulator();
 
     // The one public key the account holds, and the two other namespaces whose ids are MINTED
@@ -497,12 +504,12 @@ async fn every_id_the_store_holds_no_public_key_for_is_refused_as_the_key_that_i
         IdRow {
             case: "a distribution id where a public key id belongs",
             id: distribution_id,
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             case: "a key group id, which this service draws as a UUID",
             id: group_id,
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             // The prefix is the one this service mints profile ids under
@@ -510,18 +517,18 @@ async fn every_id_the_store_holds_no_public_key_for_is_refused_as_the_key_that_i
             // alphabet, as `P280MFCLSYOCVU` is.
             case: "a field-level encryption profile id",
             id: format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}2AAAAAAAAAAAA"),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             // The sibling field-level encryption CONFIG namespace
             // (`FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX`).
             case: "a field-level encryption configuration id",
             id: format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}3AAAAAAAAAAAA"),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
-            // In the public key namespace (`PUBLIC_KEY_ID_PREFIX`) though of no minted id's
-            // width: the store holds no key under it either, which is all this read asks.
+            // In the public key namespace (`PUBLIC_KEY_ID_PREFIX`) though narrower than any
+            // minted id: the store holds no key under it either, which is all this read asks.
             case: "the public key prefix with too short a body",
             id: format!("{PUBLIC_KEY_ID_PREFIX}2AAA"),
             message: NO_SUCH_PUBLIC_KEY,
@@ -529,12 +536,12 @@ async fn every_id_the_store_holds_no_public_key_for_is_refused_as_the_key_that_i
         IdRow {
             case: "the public key prefix with too long a body",
             id: format!("{PUBLIC_KEY_ID_PREFIX}2AAAAAAAAAAAAAAAAAAA"),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             case: "the stored id with one character appended",
             id: format!("{known}9"),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             case: "a public key id of this namespace that was never minted",
@@ -554,12 +561,12 @@ async fn every_id_the_store_holds_no_public_key_for_is_refused_as_the_key_that_i
         IdRow {
             case: "the stored id in lower case",
             id: known.to_lowercase(),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             case: "the caller reference rather than the id",
             id: present.caller_reference.clone(),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
         IdRow {
             case: "a bare digit",
@@ -569,7 +576,7 @@ async fn every_id_the_store_holds_no_public_key_for_is_refused_as_the_key_that_i
         IdRow {
             case: "a word of no CloudFront id shape at all",
             id: "not-a-public-key-id".to_string(),
-            message: NO_SUCH_PUBLIC_KEY,
+            message: UNREADABLE_PUBLIC_KEY_ID,
         },
     ];
 

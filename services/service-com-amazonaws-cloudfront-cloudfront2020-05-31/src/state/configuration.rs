@@ -3554,16 +3554,12 @@ pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 /// public key — so nothing from the request belongs in the text and every path that raises
 /// this code reads the same.
 ///
-/// This is the answer EVERY operation addressed by a public key `Id` gives an `Id` the store
-/// holds no key under, whatever form that value takes: the model constrains that member no
-/// further than `string` — no `@pattern`, no `@length` — so its form is not something the
-/// route reads, and the STORE is what says whether a key answers to it. Recorded behaviour
-/// decides that: an `Id` written in another resource kind's form — a key group's UUID — is
-/// answered this very sentence, so the public key reads make no split of their own, unlike
-/// the reads of a resource whose identifier form IS fully specified
-/// ([`unresolved_key_group_id`]). A public key id borne by a submitted DOCUMENT rather than
-/// by the request's path addresses nothing either, so it too is resolved against the store
-/// alone and reports the absent key whatever its shape.
+/// This is the answer an operation gives an `Id` the store holds no key under once the value
+/// could be an identifier CloudFront issued for a public key at all: an identifier that
+/// ADDRESSES one is read for its form first ([`unresolved_public_key`]), and WHICH identifier of
+/// this kind was ever issued is a property of the STORE rather than of the value. A public key
+/// id borne by a submitted DOCUMENT rather than by the request's path addresses nothing, so it
+/// is resolved against the store alone and reports the absent key whatever its shape.
 pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
     crate::ops::types::NoSuchPublicKey {
         message: Some(NO_SUCH_PUBLIC_KEY_MESSAGE.to_string()),
@@ -3658,11 +3654,13 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 /// alone and therefore before the store is consulted. What the value has to say for the format
 /// refusal to be the answer is that it could never be an identifier CloudFront issued for a
 /// PROFILE ([`id_format_refused_for`]): it is written outside the alphabet an identifier is
-/// written in at all, or it is written exactly as an identifier is ISSUED under another kind's
-/// namespace letter, in which case it is that other kind's identifier. Either way the route
+/// written in at all, it is written wider than an identifier of this mint is issued, or it is
+/// written exactly as an identifier is ISSUED under another kind's namespace letter, in which
+/// case it is that other kind's identifier. Either way the route
 /// reports the identifier it cannot READ ([`id_format_invalid_message`]). Every other value is
 /// carried through to the store — WHICH identifier of this kind was ever issued is a property of
-/// the STORE rather than of the value, and so is a value of the alphabet at any other width —
+/// the STORE rather than of the value, and so is a value of the alphabet written narrower than
+/// the issued width —
 /// and the profile the store holds none under is the profile that is simply ABSENT.
 ///
 /// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
@@ -3799,8 +3797,9 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
 /// field-level encryption configuration `Id` that read or write the CONFIGURATION DOCUMENT —
 /// its `/config` read, its update and its delete — answer an `Id` they cannot resolve: the
 /// split [`unresolved_field_level_encryption_profile`] makes for the other field-level
-/// encryption record, over the alphabet an identifier is written in and the namespace letter an
-/// identifier written as an ISSUED one carries ([`id_format_refused_for`]).
+/// encryption record, over the alphabet an identifier is written in, the width one is issued at
+/// and the namespace letter an identifier written as an ISSUED one carries
+/// ([`id_format_refused_for`]).
 ///
 /// The RESOURCE read of the same kind (`GetFieldLevelEncryption`, `GET
 /// /2020-05-31/field-level-encryption/{Id}`) reads NO form of the value at all, as its own

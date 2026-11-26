@@ -77,3 +77,33 @@ Fixed vs variable message text: 'Id format is invalid' is fixed text in full for
 3. Cause 2: replay fixture cloudfront-field-level-encryption-profile-config-get-and-not-found and observe step task#4 — GET /2020-05-31/field-level-encryption-profile/{Id}/config with a malformed profile id. Expect 404 with 'Id format is invalid'; the emulator answers 404 with 'The specified field level encryption profile does not exist.'
 4. Cause 3: replay fixture cloudfront-get-public-key-wrong-resource-type-id-rejected and observe step task#3 — GET /2020-05-31/public-key/{Id} with an id belonging to another CloudFront resource type. Expect 404 with 'Id format is invalid'; the emulator answers 404 with 'The specified CloudFront public key does not exist.' Fixture cloudfront-public-key-and-key-group-lifecycle#task#10 reproduces it.
 5. In each case compare only $.ErrorResponse.Error.Message: the status (404) and error Code already match, so the fix must change the message emitted on the malformed-id branch without changing the well-formed-but-absent branch.
+
+## Resolution
+
+All three causes are closed; the replay reports all three of this issue's keys `fixed` and all four
+graded fixtures passing end to end.
+
+What separates the two sentences the one not-found code carries is whether the submitted value
+could be an identifier CloudFront ISSUED FOR THE ADDRESSED KIND, decided before the store lookup
+(`state::id_format_refused_for`). On a kind whose identifiers come from a namespace of its OWN —
+a public key, a field-level encryption profile, a field-level encryption configuration — three
+things about a value say it could not be one: it is written outside the alphabet an identifier is
+written in, it is written WIDER than the width an identifier of this mint is issued at, or it is
+written exactly as an identifier is issued under the namespace letter of another kind this service
+issues identifiers under. Every other value is carried through to the store — the kind's own
+letter at the issued width, any letter narrower than it, and a letter no kind of this service
+issues an identifier under — and the record the store holds none under is the record reported
+absent.
+
+- Cause 1 was already served by the code base and is now pinned: an operation addressed by a
+  distribution identifier reads the identifier ALPHABET and nothing more, because the `E` letter
+  is shared by four kinds (`state::unresolved_distribution_id`).
+- Cause 2 FIXED: the recorded probe is a value of the alphabet written wider than a profile
+  identifier is issued, which the previous reading of the rule carried through to the store. The
+  width is now part of the admission check, for both field-level encryption kinds and on every
+  operation addressed by one of their identifiers.
+- Cause 3 FIXED: the public key reads performed no admission at all. The four operations addressed
+  by a public key `Id` — both readers, the update and the delete — now resolve it through
+  `state::unresolved_public_key`, the same check the field-level encryption records use. A public
+  key id borne by a submitted DOCUMENT addresses nothing, so it is still resolved against the
+  store alone.

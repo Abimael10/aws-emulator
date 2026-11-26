@@ -739,8 +739,8 @@ async fn an_id_no_profile_holds_is_refused() {
             UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
-            "an identifier of this mint's alphabet at no issued width",
-            "PNEVERMINTEDATALL".to_string(),
+            "an identifier of this mint's alphabet narrower than the issued width",
+            "PNEVERMINTED".to_string(),
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
         (

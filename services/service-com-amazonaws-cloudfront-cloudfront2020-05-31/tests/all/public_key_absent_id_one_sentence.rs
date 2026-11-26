@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! ONE sentence under ONE code, over every operation that addresses a public key by `Id`.
+//! ONE code under TWO sentences, over every operation that addresses a public key by `Id`.
 //!
 //! RULE: `GetPublicKey`, `GetPublicKeyConfig`, `UpdatePublicKey` and `DeletePublicKey` model
 //! one 404 error for an `Id` they cannot resolve — `NoSuchPublicKey`
-//! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,DeletePublicKey")`)
-//! — and the `Id` is resolved against the STORE alone: the model constrains that member no
-//! further than `string`, so the FORM of the value says nothing, and every `Id` the account
-//! holds no key under earns the one absent-key sentence. It is fixed text and echoes nothing
-//! the request sent.
+//! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,DeletePublicKey")`
+//! reports it and `AccessDenied` and no argument error) — so the MESSAGE is the whole of what
+//! tells two conditions apart, and what decides it is whether the submitted value could be an
+//! identifier CloudFront ISSUED FOR A PUBLIC KEY at all: a value written outside the identifier
+//! alphabet, one written wider than an identifier of this mint is issued, and one written exactly
+//! as an identifier is ISSUED — that alphabet at the issued width — under another kind's
+//! namespace letter are each the identifier the route reports it cannot READ, while every other
+//! value is carried through to the STORE and the key it holds none under is the key reported
+//! ABSENT. Both sentences are fixed text and echo nothing the request sent.
 //!
 //! The rows span what the rule generalises over — the RELATION a value has to the identifier
 //! namespaces this service mints in: a live distribution id, a live key group's UUID, both
 //! field-level encryption namespaces, the public key namespace at widths this service mints
 //! none at, a never-minted id of the right shape, the stored id recased and with a character
-//! changed, the caller reference, a bare digit, an empty-looking word and a word of no id
+//! appended, the caller reference, a bare digit and a word of no id
 //! shape at all. The key the account really holds is the control: it still answers 200 after
 //! every row, so none of them touched the record.
 //!
@@ -36,6 +40,10 @@ use crate::web_acl_association::create as create_distribution_returning_id;
 /// out here rather than read off the crate under test: the WORDING is what these rows are held
 /// to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
+
+/// The sentence the same code carries for a value that could never be an identifier issued for a
+/// public key, written out here for the same reason.
+const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// `GET /2020-05-31/public-key/{Id}/config` — the second reader of the one stored record.
 async fn get_key_config(router: &MultiServiceRouter, id: &str) -> Answer {
@@ -63,7 +71,7 @@ async fn update_key(router: &MultiServiceRouter, id: &str, body: &str, if_match:
 }
 
 #[tokio::test]
-async fn one_sentence_covers_every_unresolvable_public_key_id_whatever_form_it_takes() {
+async fn one_code_carries_both_sentences_over_every_public_key_route() {
     let router = emulator();
 
     // The one key the account holds, plus a distribution and a key group whose ids are
@@ -109,42 +117,66 @@ async fn one_sentence_covers_every_unresolvable_public_key_id_whatever_form_it_t
         .unwrap_or_default()
         .to_string();
 
-    // (case, the `Id` each operation is addressed with) — every one of them earns the one
-    // absent-key sentence, whatever namespace or width the value belongs to.
-    let rows: Vec<(&str, String)> = vec![
-        ("a live distribution id", distribution_id),
-        ("a live key group id, drawn as a UUID", group_id),
+    // (case, the `Id` each operation is addressed with, the sentence the one code carries for it)
+    // — a value that could be an identifier issued for a public key earns the absent-key
+    // sentence, and one that could never be earns the unreadable-identifier sentence.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a live distribution id",
+            distribution_id,
+            UNREADABLE_IDENTIFIER,
+        ),
+        (
+            "a live key group id, drawn as a UUID",
+            group_id,
+            UNREADABLE_IDENTIFIER,
+        ),
         (
             "a field-level encryption profile id",
             format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}6AAAAAAAAAAAA"),
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a field-level encryption configuration id",
             format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}7AAAAAAAAAAAA"),
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "the public key prefix with too short a body",
             format!("{PUBLIC_KEY_ID_PREFIX}2AAA"),
+            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "the public key prefix with too long a body",
             format!("{PUBLIC_KEY_ID_PREFIX}2AAAAAAAAAAAAAAAAAAA"),
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a public key id of this namespace that was never minted",
             "K2NEVERMINTED1".to_string(),
+            NO_SUCH_PUBLIC_KEY,
         ),
-        ("the stored id in lower case", known.to_lowercase()),
+        (
+            "the stored id in lower case",
+            known.to_lowercase(),
+            UNREADABLE_IDENTIFIER,
+        ),
         (
             "the stored id with one character appended",
             format!("{known}9"),
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "the caller reference rather than the id",
             present.caller_reference.clone(),
+            UNREADABLE_IDENTIFIER,
         ),
-        ("a bare digit", "0".to_string()),
-        ("a word of no CloudFront id shape at all", "..".to_string()),
+        ("a bare digit", "0".to_string(), NO_SUCH_PUBLIC_KEY),
+        (
+            "a word of no CloudFront id shape at all",
+            "..".to_string(),
+            UNREADABLE_IDENTIFIER,
+        ),
     ];
 
     let body = Key {
@@ -153,7 +185,7 @@ async fn one_sentence_covers_every_unresolvable_public_key_id_whatever_form_it_t
     }
     .xml();
 
-    for (case, id) in &rows {
+    for (case, id, expected) in &rows {
         for (operation, answer) in [
             ("GetPublicKey", get_key(&router, id).await),
             ("GetPublicKeyConfig", get_key_config(&router, id).await),
@@ -173,8 +205,8 @@ async fn one_sentence_covers_every_unresolvable_public_key_id_whatever_form_it_t
             );
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
-                message, NO_SUCH_PUBLIC_KEY,
-                "case {case:?} ({operation}, Id {id:?}): expected {NO_SUCH_PUBLIC_KEY:?}, got \
+                message, *expected,
+                "case {case:?} ({operation}, Id {id:?}): expected {expected:?}, got \
                  {message:?}"
             );
             assert!(

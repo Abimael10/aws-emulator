@@ -10,9 +10,11 @@
 //! (digits and uppercase letters, no separator and no lower case), and a value written exactly
 //! the way an identifier is ISSUED, that alphabet at the width every identifier of this mint is
 //! issued at, under ANOTHER kind's namespace letter, which makes it that other kind's
-//! identifier. Every other value is carried through to the STORE — the kind's own letter at any
-//! width, and any letter at a width no identifier is issued at, since that width names no kind
-//! of its own — and the record the store holds none under is the record reported ABSENT.
+//! identifier. Every other value is carried through to the STORE — the kind's own letter at the
+//! issued width, and any letter NARROWER than it, since such a width names no kind
+//! of its own — and the record the store holds none under is the record reported ABSENT. A value
+//! WIDER than the issued width is no identifier of these kinds either, whatever letter it opens
+//! with, so it too is the identifier reported unreadable.
 //! These routes model one not-found code and no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`
 //! reports the kind's not-found error and `AccessDenied` and nothing else), so the message is
@@ -21,9 +23,11 @@
 //! The rows are PAIRS that isolate the discriminator one dimension at a time, with everything
 //! else held fixed:
 //!
-//! * the WIDTH, at the boundary: the issued width, one character short of it and one past it,
-//!   under the addressed kind's own namespace letter — every one of them the absent record,
-//!   since the width alone says nothing about which kind an identifier was issued for;
+//! * the WIDTH, at the boundary: the issued width and one character short of it, under the
+//!   addressed kind's own namespace letter — both the absent record,
+//!   since a width no wider than the issued one says nothing about which kind an identifier was
+//!   issued for — against one character PAST it, which no identifier of these kinds is written
+//!   at and which is therefore unreadable;
 //! * the same three widths with the body LOWER-CASED, which takes every one of them outside the
 //!   alphabet and so to the unreadable identifier — the case alone deciding whether the value
 //!   is an identifier at all;
@@ -32,8 +36,8 @@
 //!   other CloudFront entity id is drawn from, both unreadable, since at the issued width a
 //!   letter another kind issues under makes the value that kind's identifier; a leading digit
 //!   names no kind either;
-//! * and the same letters at a width no identifier is issued at — every one of them carried
-//!   through to the store.
+//! * and the same letters at TWICE the issued width — every one of them the identifier reported
+//!   unreadable, since no identifier of these kinds is written that wide.
 //!
 //! The issued width and the namespace letters are read off identifiers this emulator really
 //! issued, so no width and no letter here is written out by hand. The harness is the one
@@ -90,7 +94,7 @@ fn rows(kind: Kind, seeded: &Seeded) -> Vec<Row> {
         let written = format!("{letter}{}", body(width - 1));
         rows.push(Row {
             case: format!("{label} in the identifier alphabet"),
-            unreadable: false,
+            unreadable: !could_be_issued_for_the_kind(&written, minted),
             id: written.clone(),
         });
         rows.push(Row {
@@ -113,10 +117,11 @@ fn rows(kind: Kind, seeded: &Seeded) -> Vec<Row> {
             unreadable: !could_be_issued_for_the_kind(&at_the_issued_width, minted),
             id: at_the_issued_width,
         });
+        let at_twice_the_issued_width = format!("{opening}{}", body(issued * 2 - 1));
         rows.push(Row {
             case: format!("{label} at twice the issued width"),
-            id: format!("{opening}{}", body(issued * 2 - 1)),
-            unreadable: false,
+            unreadable: !could_be_issued_for_the_kind(&at_twice_the_issued_width, minted),
+            id: at_twice_the_issued_width,
         });
     }
     for row in &rows {

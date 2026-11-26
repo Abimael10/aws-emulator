@@ -53,6 +53,10 @@ use crate::response_headers_policy_lifecycle::text;
 const IMMUTABLE_FIELDS_MESSAGE: &str =
     "You cannot modify encoded material and name of a public key once created.";
 
+/// The sentence the one not-found code carries for a value that could never be an identifier
+/// CloudFront issued for a public key, spelled out here for the same reason.
+const UNREADABLE_IDENTIFIER_MESSAGE: &str = "Id format is invalid";
+
 // ---------------------------------------------------------------------------
 // Calling the update
 // ---------------------------------------------------------------------------
@@ -646,12 +650,12 @@ async fn an_id_no_key_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            NO_SUCH_PUBLIC_KEY_MESSAGE,
+            UNREADABLE_IDENTIFIER_MESSAGE,
         ),
         (
             "a token of no public key id's shape",
             "not-a-key".to_string(),
-            NO_SUCH_PUBLIC_KEY_MESSAGE,
+            UNREADABLE_IDENTIFIER_MESSAGE,
         ),
     ];
 

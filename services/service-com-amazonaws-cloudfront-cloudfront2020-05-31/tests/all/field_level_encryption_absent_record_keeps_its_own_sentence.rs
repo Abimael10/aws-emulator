@@ -13,10 +13,12 @@
 //! * a value that COULD be an identifier CloudFront issued for the addressed kind is carried
 //!   through to the STORE — WHICH identifier was ever issued is a property of the store rather
 //!   than of the value, and the width this service issues at is one width CloudFront writes an
-//!   identifier in rather than the only one — so the record the store holds none under is
+//!   identifier in rather than the only one, so a NARROWER value could be one too — so the record
+//!   the store holds none under is
 //!   reported ABSENT;
 //! * only a value that could NEVER be one — written outside the alphabet CloudFront writes an
-//!   identifier in, or written exactly the way an identifier is ISSUED (that alphabet at the
+//!   identifier in, written WIDER than an identifier of this mint is issued, or written exactly
+//!   the way an identifier is ISSUED (that alphabet at the
 //!   issued width) under the namespace letter of ANOTHER kind this service issues identifiers
 //!   under, which makes it that kind's identifier — is the identifier the route reports it
 //!   cannot READ.
@@ -28,8 +30,8 @@
 //! The rows vary what the rule generalises over:
 //!
 //! * the WIDTH a value of the identifier alphabet is written at: the width this service issues
-//!   at, one character short of it, one past it, twice it, and widths well above and below it
-//!   under no namespace letter at all;
+//!   at and one character short of it, each resolved against the store, against one past it,
+//!   twice it and a word well above it, each unreadable;
 //! * the LEADING LETTER: the addressed kind's own, a letter no kind of this service issues an
 //!   identifier under, a leading digit — each resolved against the store — against the sibling
 //!   field-level encryption kind's and a public key's really-minted identifiers and the letter
@@ -76,23 +78,11 @@ fn could_be_this_kinds_identifier(kind: Kind, seeded: &Seeded) -> Vec<(String, S
             format!("{letter}{}", body(issued_body - 1)),
         ),
         (
-            "the kind's own letter over a body one character too long".to_string(),
-            format!("{letter}{}", body(issued_body + 1)),
-        ),
-        (
-            "the kind's own letter over a body twice the issued width".to_string(),
-            format!("{letter}{}", body(issued_body * 2)),
-        ),
-        (
             "the kind's own letter over one letter repeated".to_string(),
             format!("{letter}{}", "Q".repeat(issued_body)),
         ),
-        // Values of the alphabet carrying no namespace letter of this service, above and below
-        // the issued width — the shapes a caller writes when it makes an identifier up.
-        (
-            "a word of the alphabet longer than any identifier is issued at".to_string(),
-            format!("NONEXISTENTRECORD{}", body(issued_body)),
-        ),
+        // Values of the alphabet carrying no namespace letter of this service, below the issued
+        // width — a shape a caller writes when it makes an identifier up.
         (
             "a word of the alphabet shorter than any identifier is issued at".to_string(),
             "NOSUCH1".to_string(),
@@ -128,7 +118,8 @@ fn could_be_this_kinds_identifier(kind: Kind, seeded: &Seeded) -> Vec<(String, S
 }
 
 /// Every value this suite submits where an identifier of `kind` belongs that could NEVER be an
-/// identifier CloudFront issued for that kind: another kind's issued identifier, and values
+/// identifier CloudFront issued for that kind: a value wider than one is ever issued, another
+/// kind's issued identifier, and values
 /// written outside the alphabet an identifier is written in at all.
 fn could_never_be_this_kinds_identifier(
     kind: Kind,
@@ -136,6 +127,7 @@ fn could_never_be_this_kinds_identifier(
     public_key: &str,
 ) -> Vec<(String, String)> {
     let minted = seeded.minted(kind);
+    let letter = namespace_letter_of(minted);
     let issued_body = minted.len() - 1;
     let sibling = match kind {
         Kind::Config => seeded.minted(Kind::Profile),
@@ -147,6 +139,18 @@ fn could_never_be_this_kinds_identifier(
     };
 
     vec![
+        (
+            "the kind's own letter over a body one character too long".to_string(),
+            format!("{letter}{}", body(issued_body + 1)),
+        ),
+        (
+            "the kind's own letter over a body twice the issued width".to_string(),
+            format!("{letter}{}", body(issued_body * 2)),
+        ),
+        (
+            "a word of the alphabet longer than any identifier is issued at".to_string(),
+            format!("NONEXISTENTRECORD{}", body(issued_body)),
+        ),
         (
             "the sibling field-level encryption kind's really-minted identifier".to_string(),
             sibling.to_string(),
@@ -223,7 +227,8 @@ async fn a_value_that_could_be_this_kinds_identifier_reports_the_absent_record()
 }
 
 /// The RULE's boundary: a value that could never be an identifier of the addressed kind — one
-/// written outside the alphabet an identifier is written in, and another kind's really-issued
+/// written outside the alphabet an identifier is written in, one wider than an identifier of this
+/// mint is issued, and another kind's really-issued
 /// identifier — is answered the unreadable-identifier sentence by every route that reads the
 /// form, while the configuration's resource read, which reads none of it, still reports the
 /// record absent.

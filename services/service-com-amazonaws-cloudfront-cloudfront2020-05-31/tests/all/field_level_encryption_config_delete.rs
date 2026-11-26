@@ -563,8 +563,8 @@ async fn an_id_no_configuration_holds_is_refused() {
             UNREADABLE_ID_MESSAGE,
         ),
         (
-            "an identifier of this mint's alphabet at no issued width",
-            "CBOGUSCONFIGID0000".to_string(),
+            "an identifier of this mint's alphabet narrower than the issued width",
+            "CBOGUSCONFIG".to_string(),
             NO_SUCH_CONFIG_MESSAGE,
         ),
         (

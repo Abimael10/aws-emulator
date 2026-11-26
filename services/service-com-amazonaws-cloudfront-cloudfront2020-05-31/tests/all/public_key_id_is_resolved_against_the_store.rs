@@ -5,9 +5,12 @@
 //! RULE under test: the operations that address a public key by `Id` — `GetPublicKey`,
 //! `GetPublicKeyConfig`, `UpdatePublicKey` and `DeletePublicKey`
 //! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,DeletePublicKey")`)
-//! — model one 404 error, `NoSuchPublicKey`, and resolve the `Id` against the STORE: the model
-//! constrains that member no further than `string`, so the form of the value decides nothing
-//! and every `Id` the store holds no key under is the key that is ABSENT. The sentence echoes
+//! — model one 404 error, `NoSuchPublicKey`, so its MESSAGE is what tells two conditions apart:
+//! a value that COULD be an identifier CloudFront issued for a public key — the identifier
+//! alphabet, no wider than the width one is issued at, and at exactly that width under this
+//! kind's own namespace letter — is resolved against the STORE, and the key it holds none under
+//! is the key that is ABSENT; a value that could never be one is the identifier the route
+//! reports it cannot READ. Both sentences echo
 //! nothing the request submitted.
 //!
 //! The rows span what the rule generalises over — a value's RELATION to this service's
@@ -34,8 +37,12 @@ use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 /// rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
+/// The sentence the same code carries for a value that could never be a public key identifier,
+/// spelled out here for the same reason.
+const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
+
 #[tokio::test]
-async fn a_public_key_id_is_resolved_against_the_store_whatever_form_it_takes() {
+async fn a_public_key_id_earns_the_sentence_its_own_form_decides() {
     let router = emulator();
 
     // The one public key the account holds, and the one key group: both ids are MINTED here
@@ -92,41 +99,61 @@ async fn a_public_key_id_is_resolved_against_the_store_whatever_form_it_takes() 
         key_read.status, key_read.raw
     );
 
-    // (case, the `Id` the read is addressed with) — a live id of another kind, each other
+    // (case, the `Id` the read is addressed with, the sentence the one code carries) — a live id
+    // of another kind, each other
     // namespace this service mints ids in, a value in the public key namespace of no minted
-    // id's width, and ids that could have been public keys CloudFront issued. The STORE is
-    // what decides, so every one of them earns the one absent-key sentence.
-    let rows: Vec<(&str, String)> = vec![
-        ("a key group id that really names a key group", group_id),
+    // id's width, and ids that could have been public keys CloudFront issued. Where the value
+    // could be a public key identifier the STORE is what decides, and the key it holds none
+    // under earns the absent-key sentence; where it could never be one the route says so.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a key group id that really names a key group",
+            group_id,
+            UNREADABLE_IDENTIFIER,
+        ),
         (
             "the public key prefix with a body of no minted id's width",
             format!("{PUBLIC_KEY_ID_PREFIX}2AA"),
+            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "a field-level encryption profile id",
             format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}4AAAAAAAAAAAA"),
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a field-level encryption configuration id",
             format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}5AAAAAAAAAAAA"),
+            UNREADABLE_IDENTIFIER,
         ),
         (
             "a public key id of this namespace that was never minted",
             "K2NEVERMINTED1".to_string(),
+            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "another public key id of this namespace that was never minted",
             format!("{PUBLIC_KEY_ID_PREFIX}3ZZZZZZZZZZZZ"),
+            NO_SUCH_PUBLIC_KEY,
         ),
-        ("the stored id in lower case", key_id.to_lowercase()),
+        (
+            "the stored id in lower case",
+            key_id.to_lowercase(),
+            UNREADABLE_IDENTIFIER,
+        ),
         (
             "the caller reference rather than the id",
             key.caller_reference.clone(),
+            UNREADABLE_IDENTIFIER,
         ),
-        ("a word of no CloudFront id shape at all", "..".to_string()),
+        (
+            "a word of no CloudFront id shape at all",
+            "..".to_string(),
+            UNREADABLE_IDENTIFIER,
+        ),
     ];
 
-    for (case, id) in &rows {
+    for (case, id, expected) in &rows {
         let answer = get_key(&router, id).await;
         assert_eq!(
             answer.status, 404,
@@ -141,8 +168,8 @@ async fn a_public_key_id_is_resolved_against_the_store_whatever_form_it_takes() 
         );
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, NO_SUCH_PUBLIC_KEY,
-            "case {case:?} (Id {id:?}): expected {NO_SUCH_PUBLIC_KEY:?}, got {message:?}"
+            message, *expected,
+            "case {case:?} (Id {id:?}): expected {expected:?}, got {message:?}"
         );
         assert!(
             !message.contains(id.as_str()),

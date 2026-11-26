@@ -1011,8 +1011,8 @@ async fn an_id_no_configuration_holds_is_refused() {
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (
-            "an id of this mint's alphabet at no issued width",
-            "CNEVERMINTEDATALL".to_string(),
+            "an id of this mint's alphabet narrower than the issued width",
+            "CNEVERMINTED".to_string(),
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (

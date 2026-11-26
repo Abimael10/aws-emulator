@@ -199,13 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The key being updated is looked up first: every refusal below is about the record
-        // this id names, and nothing is minted for an id the store does not hold. The STORE is
-        // what resolves the `Id` — the model constrains it no further than `string` — so an
-        // `Id` no key answers to is the key that is absent, whatever form the value takes
-        // ([`crate::state::no_such_public_key`]).
+        // this id names, and nothing is minted for an id the store does not hold. Whether the
+        // value could be an identifier CloudFront issued for a public key at all decides which
+        // of the one code's two sentences the refusal carries, and every other `Id` no key
+        // answers to is the key that is absent ([`crate::state::unresolved_public_key`]).
         let Some(stored) = store.public_key(&input.id) else {
             return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key(&input.id),
             )
             .into());
         };

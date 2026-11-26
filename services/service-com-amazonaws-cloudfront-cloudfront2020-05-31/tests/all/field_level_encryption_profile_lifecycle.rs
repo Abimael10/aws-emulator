@@ -968,23 +968,20 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
     // never minted, an id in another namespace at the width this service issues one at, an id
-    // of the alphabet at no issued width, and a value of no CloudFront identifier form at all.
+    // of the alphabet wider than the issued width, and a value of no CloudFront identifier form
+    // at all.
     // A value written the way this service ISSUES an identifier — the identifier alphabet at
     // the issued width — under ANOTHER kind's namespace letter is that kind's identifier, so it
-    // is the identifier the service cannot READ, and so is a value outside that alphabet, which
-    // claims to be no identifier of this mint at all; a value of the alphabet at no issued width
-    // names no kind of its own, so it is carried through to the STORE and is the profile
-    // reported absent.
+    // is the identifier the service cannot READ; so is a value outside that alphabet, which
+    // claims to be no identifier of this mint at all, and one written wider than any identifier
+    // of this kind is written, which overflows every identifier it could be.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
         ("E2QWRUHAPOMQZL", UNREADABLE_PROFILE_ID_MESSAGE),
-        (
-            "EDFDVBD6EXAMPLE",
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
-        ),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
         ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
     ] {
         for (reader, answer) in [

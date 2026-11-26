@@ -23,25 +23,28 @@
 //!   that alphabet is the identifier the route reports it cannot READ;
 //! * the field-level encryption CONFIGURATION DOCUMENT routes refuse the form of every value
 //!   that could never be an identifier issued for their kind — one written outside the alphabet
-//!   an identifier is written in, and one written exactly as an ISSUED identifier (that
-//!   alphabet at the issued width) under another kind's namespace letter, which makes it that
+//!   an identifier is written in, one written WIDER than an identifier of this mint is issued,
+//!   and one written exactly as an ISSUED identifier (that alphabet at the issued width) under
+//!   another kind's namespace letter, which makes it that
 //!   other kind's identifier ([`super::unresolved_field_level_encryption_config`],
 //!   [`super::unresolved_field_level_encryption_profile`]); every other value is carried
 //!   through to the store, while that configuration's resource read reads no form at all and
 //!   reports every id it cannot resolve as the configuration that is absent
 //!   ([`super::no_such_field_level_encryption_config`]);
+//! * the PUBLIC KEY routes refuse the form of every value that could never be an identifier
+//!   issued for their kind, the same three ways the field-level encryption documents' routes do
+//!   ([`unresolved_public_key`]);
 //! * the ORIGIN ACCESS CONTROL reads the ALPHABET and nothing more
 //!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
 //!
 //! The same split, for the kinds whose identifier form IS decided by the value alone, is made
 //! by the free functions beside the refusals they answer with:
-//! [`super::unresolved_distribution_id`], [`super::unresolved_key_group_id`] and the two
-//! field-level encryption records'. Those need
+//! [`super::unresolved_distribution_id`], [`super::unresolved_key_group_id`], the public key's
+//! and the two field-level encryption records'. Those need
 //! no store, which is the one reason the one below is a method. A kind whose recorded contract
 //! makes NO such split reads nothing of the value at all and reports the absent resource for
-//! every identifier it cannot resolve, which is what the public key and the
-//! field-level encryption configuration's RESOURCE read do
-//! ([`super::no_such_public_key`], [`super::no_such_field_level_encryption_config`]).
+//! every identifier it cannot resolve, which is what the field-level encryption configuration's
+//! RESOURCE read does ([`super::no_such_field_level_encryption_config`]).
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 
@@ -81,6 +84,40 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
 /// resource by, except the ones that address a resource held UNDER a distribution
 /// (`CreateInvalidation$DistributionId`).
 pub const ADDRESSED_BY_ID: &str = "Id";
+
+/// The modelled `NoSuchPublicKey` (HTTP 404) an operation ADDRESSED by a public key `Id` in its
+/// path answers an `Id` it cannot resolve.
+///
+/// These operations model this one not-found code and no argument error
+/// (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,\
+/// DeletePublicKey")` reports `AccessDenied` and `NoSuchPublicKey` as the only errors covering an
+/// `Id` they cannot resolve), so one code and one status cover two conditions and the MESSAGE is
+/// what tells them apart — decided from the value alone, and therefore before the store is
+/// consulted. What the value has to say for the format refusal to be the answer is that it could
+/// never be an identifier CloudFront issued for a PUBLIC KEY ([`id_format_refused_for`]): it is
+/// written outside the alphabet an identifier is written in at all, it is written wider than an
+/// identifier of this mint is issued, or it is written exactly as an identifier is ISSUED under
+/// another kind's namespace letter, in which case it is that other kind's identifier. Either way
+/// the route reports the
+/// identifier it cannot READ ([`id_format_invalid_message`]). Every other value is carried
+/// through to the store — WHICH identifier of this kind was ever issued is a property of the
+/// STORE rather than of the value, and so is a value of the alphabet written narrower than the
+/// issued width — and
+/// the key the store holds none under is the key that is simply ABSENT.
+///
+/// Only an identifier that ADDRESSES the operation is judged this way: a public key id borne by a
+/// submitted DOCUMENT (a key group's `Items` member, a field-level encryption profile's
+/// `PublicKeyId`) addresses nothing, so it is resolved against the store alone and reports the
+/// absent key whatever its shape ([`no_such_public_key`]).
+pub fn unresolved_public_key(id: &str) -> crate::ops::types::NoSuchPublicKey {
+    if id_format_refused_for(PUBLIC_KEY_ID_PREFIX, id) {
+        crate::ops::types::NoSuchPublicKey {
+            message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
+        }
+    } else {
+        no_such_public_key()
+    }
+}
 
 /// The model's name for the member the operations addressed by the distribution a resource is
 /// held under carry that distribution's identifier in — the invalidations of a distribution

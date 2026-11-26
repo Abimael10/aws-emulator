@@ -1475,12 +1475,14 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     // The rows span the ways an id can name no configuration: a well-shaped configuration id
     // that was never minted, an id in another namespace at the issued width, a minted id of
     // another kind (the profile's, a different resource under the same surface), the
-    // configuration's own id with a character changed, an id of the alphabet at no issued width
-    // (a bare digit and a 15-character one), and a value outside the identifier alphabet. A
+    // configuration's own id with a character changed, an id of the alphabet narrower than the
+    // issued width (a bare digit) and one wider than it (a 15-character one), and a value
+    // outside the identifier alphabet. A
     // value written the way this service ISSUES an identifier — the identifier alphabet at the
     // issued width — under ANOTHER kind's namespace letter IS that kind's identifier, so it is
-    // the identifier the service cannot READ, and so is a value outside that alphabet, which
-    // claims to be no identifier of this mint at all; a value of the alphabet at no issued width
+    // the identifier the service cannot READ; so is a value outside that alphabet, which
+    // claims to be no identifier of this mint at all, and one written wider than any identifier
+    // of these kinds is written; a value of the alphabet narrower than the issued width
     // names no kind of its own, so it is carried through to the store, since WHICH identifier
     // was ever issued is the store's to say.
     let mut mangled: Vec<char> = stored_id.chars().collect();
@@ -1490,7 +1492,7 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
         ("E2QWRUHAPOMQZL", UNREADABLE_ID_MESSAGE),
         (profile.as_str(), UNREADABLE_ID_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
