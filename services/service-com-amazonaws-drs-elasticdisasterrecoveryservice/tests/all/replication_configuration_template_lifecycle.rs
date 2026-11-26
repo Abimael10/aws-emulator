@@ -64,8 +64,9 @@ pub(crate) fn drs() -> MultiServiceRouter {
 /// The same router, with the engine handed back so a test can read or seed state no
 /// implemented operation reaches yet: a source server is registered by the
 /// replication agent, which this slice does not model, so `DescribeSourceServers`'
-/// filters can only be exercised over a store written directly — and the plans a
-/// create stored can only be COUNTED there while `ListRecoveryPlans` is a stub.
+/// filters can only be exercised over a store written directly — and a Recovery Plan
+/// can only be taken back OUT of the store there, `DeleteRecoveryPlan` being a
+/// scaffold stub.
 pub(crate) fn drs_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();

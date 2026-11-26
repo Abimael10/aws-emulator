@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecoveryPlans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecoveryPlans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecoveryPlans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every Recovery Plan the store holds, one page at a time, in creation order —
+//! the ids this service mints ascend with creation, so the store's key order IS creation
+//! order. A READ: it answers from the store and writes nothing, so what one caller gets
+//! is what the next one gets.
+//!
+//! Each plan is reported as the modelled summary (`crate::state::recovery_plans::
+//! RecoveryPlanRecord::to_summary`), built from the same stored record the single-plan
+//! read reports, so a listed plan cannot disagree with the plan read back by its ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +112,10 @@ impl From<ListRecoveryPlansErrorModeled> for ListRecoveryPlansError {
     }
 }
 
+/// Namespaces this operation's `nextToken`, so a token minted by another paginated
+/// DRS operation is refused rather than silently resuming in the wrong collection.
+const PAGE_TOKEN_KIND: &str = "RecoveryPlans";
+
 /// The `ListRecoveryPlans` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +152,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecoveryPlans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecoveryPlansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecoveryPlans"))
+        // `ctx` carries request metadata only: this read names no resource, and a
+        // stored plan's ARN already carries the Region it was created under, so
+        // nothing here is read off the request's credential scope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecoveryPlansErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        // Shared-reference guard only: `@readonly`, so nothing here mutates the store.
+        let store = state.lock();
+
+        // Only the page itself is rendered to the wire shape: the selection is a list
+        // of borrows over the store's own (creation-ordered) key order.
+        let all = store
+            .recovery_plans
+            .iter()
+            .map(|(id, record)| (id.as_str(), record));
+
+        let page = crate::state::paginate(
+            PAGE_TOKEN_KIND,
+            all,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::recovery_plans::RecoveryPlanRecord::to_summary,
+        )
+        .map_err(|message| {
+            ListRecoveryPlansErrorModeled::ValidationException(ValidationException {
+                message: Some(message.clone()),
+                code: None,
+                reason: None,
+                field_list: Some(vec![ValidationExceptionField {
+                    name: Some("nextToken".to_string()),
+                    message: Some(message),
+                }]),
+            })
+        })?;
+
+        Ok(ListRecoveryPlansOutput {
+            recovery_plans: page.items,
+            next_token: page.next_token,
+        })
     }
 }

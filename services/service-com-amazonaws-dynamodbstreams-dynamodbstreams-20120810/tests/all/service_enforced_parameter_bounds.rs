@@ -674,6 +674,24 @@ async fn a_future_timestamp_is_refused_only_where_the_iterator_type_reads_it() {
     );
 }
 
+/// `token` with its last character replaced by a DIFFERENT one.
+///
+/// Which character a minted token ends on is a function of the stream it names — the
+/// token's last segment is a base-64 envelope over a digest of that stream's own ARN —
+/// so a replacement written as one fixed character is now and then the character the
+/// token already ended with, which would change nothing and leave the row asserting
+/// about the LIVE token instead of a value nothing minted. Both characters below are in
+/// the base-64 alphabet, so what comes back has the form a real token has.
+pub(crate) fn last_character_changed(token: &str) -> String {
+    let (head, last) = token.split_at(
+        token
+            .len()
+            .checked_sub(1)
+            .expect("a minted token is not empty"),
+    );
+    format!("{head}{}", if last == "x" { "y" } else { "x" })
+}
+
 /// The identifier a request ADDRESSES is judged before the page-width bound above it,
 /// so a request that is wrong in both ways is refused over the identifier.
 ///
@@ -726,7 +744,7 @@ async fn the_addressed_identifier_is_judged_before_the_page_width_bound() {
         ),
         (
             "the minted token with its last character changed",
-            format!("{}x", &iterator[..iterator.len() - 1]),
+            last_character_changed(&iterator),
         ),
         (
             "a token at the modelled ceiling",

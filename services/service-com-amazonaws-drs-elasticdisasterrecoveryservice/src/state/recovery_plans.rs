@@ -21,7 +21,8 @@ use std::collections::HashMap;
 
 use super::ComAmazonawsDrsElasticdisasterrecoveryserviceState;
 use crate::ops::types::{
-    RecoveryPlan, RecoveryPlanStep, RecoveryPlanStepConfiguration, ResourceNotFoundException,
+    RecoveryPlan, RecoveryPlanStep, RecoveryPlanStepConfiguration, RecoveryPlanSummary,
+    ResourceNotFoundException,
 };
 
 /// The prefix of every Recovery Plan id: the model's `RecoveryPlanID` is
@@ -124,6 +125,23 @@ impl RecoveryPlanRecord {
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
             tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// The stored plan as the modelled `RecoveryPlanSummary` structure — the item
+    /// shape of the operation that enumerates the account's plans.
+    ///
+    /// A summary is the same plan reported with fewer members: it carries no
+    /// `description` and no `tags`, and every member it DOES carry is read off the
+    /// same stored record (and the same derived [`Self::status`]) as
+    /// [`Self::to_wire`], so a listed plan and a plan read back cannot disagree.
+    pub fn to_summary(&self) -> RecoveryPlanSummary {
+        RecoveryPlanSummary {
+            recovery_plan_arn: self.arn.clone(),
+            name: self.name.clone(),
+            status: self.status().to_string(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
         }
     }
 }

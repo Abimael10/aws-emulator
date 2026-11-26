@@ -8,9 +8,10 @@
 //! asserted is the wire behaviour (status, error code, JSON body), not a handler's
 //! Rust return value. The harness (the router, `call_in`, `Answer`) is the one
 //! `replication_configuration_template_lifecycle` builds; the engine it hands back is
-//! read directly in a few places, because the only operation that could enumerate
-//! plans (`ListRecoveryPlans`) is still a scaffold stub: without that read, "a refused
-//! create stored nothing" cannot be asserted at all.
+//! read directly in a few places, so that "a refused create stored nothing" is
+//! asserted against the store itself rather than against another operation's answer.
+//! What the enumeration of the account's plans reports is asserted in
+//! `recovery_plan_pagination`.
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one recorded
 //! request:
@@ -54,8 +55,8 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// others.
 const REGION: &str = "eu-west-1";
 
-/// How many Recovery Plans the store holds: the one read of this slice's state that no
-/// implemented operation can answer yet (see the module docs).
+/// How many Recovery Plans the store holds, read straight off the engine (see the
+/// module docs): what a refused create must leave untouched.
 pub(crate) fn stored_plans(engine: &Arc<engine::InMemoryEngine>) -> usize {
     engine.state::<DrsState>().lock().recovery_plans.len()
 }

@@ -27,6 +27,8 @@ use streams::state::{
     OperationType, RecordAppend, StreamRegistration, StreamViewType,
 };
 
+use crate::service_enforced_parameter_bounds::last_character_changed;
+
 /// A SigV4 credential scope naming `dynamodb`, which is how both DynamoDB and
 /// DynamoDB Streams requests are signed. Request authentication is off in these
 /// tests, so only the scope's routing signal matters.
@@ -386,11 +388,7 @@ async fn an_enveloped_token_still_resolves_to_the_position_it_was_minted_for() {
         ),
         (
             "the envelope with one payload character changed",
-            format!(
-                "{}{}",
-                &token[..token.len() - 1],
-                if token.ends_with('z') { 'y' } else { 'z' }
-            ),
+            last_character_changed(&token),
             400,
         ),
         (
