@@ -2,10 +2,14 @@
 
 //! @op GetAIPrompt
 //!
-//! REPORTS the AI prompt the route names, out of the record `CreateAIPrompt` stored, so a
-//! read answers exactly what the create answered and reading one changes nothing. A route
-//! naming an assistant this account does not hold, or a prompt that assistant does not
-//! hold, is the modelled `ResourceNotFoundException` (HTTP 404).
+//! REPORTS the AI prompt REVISION the route names, out of the stored record: the working
+//! copy `CreateAIPrompt` minted and `UpdateAIPrompt` writes where the label carries no
+//! version qualifier or the floating alias, and the immutable snapshot
+//! `CreateAIPromptVersion` published where it carries that version's number. So a read
+//! answers exactly what the write it reads answered, and reading one changes nothing. A
+//! route naming an assistant this account does not hold, a prompt that assistant does not
+//! hold, or a version that prompt never published, is the modelled
+//! `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -176,7 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.assistant_id,
             ));
         }
-        let Some(prompt) = store.ai_prompt(&input.assistant_id, &input.ai_prompt_id) else {
+        let Some(prompt) = store.ai_prompt_revision(&input.assistant_id, &input.ai_prompt_id)
+        else {
             return Err(not_found(
                 crate::state::MESSAGE_AI_PROMPT_NOT_FOUND,
                 &input.ai_prompt_id,
@@ -186,16 +191,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // copy's floating alias when the label named no version — which is what the
         // reported ARN carries, so a client can tell which version it read.
         let (_, qualifier) = crate::state::resolve_qualified_id(&input.ai_prompt_id);
-        let qualifier = qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST);
         Ok(GetAIPromptOutput {
-            ai_prompt: Some(prompt.to_ai_prompt_data_at_version(qualifier)),
+            ai_prompt: Some(
+                prompt.to_ai_prompt_data_at_version(
+                    qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST),
+                ),
+            ),
             // The model's own wording: the version number is "returned if an AI Prompt
             // version was specified via use of a qualifier for the `aiPromptId` on the
-            // request". This read answered for the prompt's working copy rather than for a
-            // published version of it — a numbered qualifier names nothing here — and the
-            // working copy carries no `Version` number (the model's `Version` is `range
-            // 1..`), so there is none to report.
-            version_number: None,
+            // request". A numbered qualifier is what names one, and it resolved to the
+            // published version above; a read of the working copy answered for no version,
+            // and the working copy carries no `Version` number (the model's `Version` is
+            // `range 1..`), so it reports none.
+            version_number: qualifier.and_then(|qualifier| qualifier.parse::<i64>().ok()),
         })
     }
 }

@@ -20,6 +20,11 @@ pub use ai_prompts::*;
 mod ai_agent_versions;
 pub use ai_agent_versions::*;
 
+/// The published versions of an AI prompt: the snapshot record, its projections and its
+/// lookups.
+mod ai_prompt_versions;
+pub use ai_prompt_versions::*;
+
 /// The message-template family: the record, its projections and its lookups.
 mod message_templates;
 pub use message_templates::*;
@@ -2052,6 +2057,12 @@ pub struct Assistant {
     /// [`Self::ai_guardrails`]: a prompt is reachable only through its assistant, so it
     /// goes when the assistant goes.
     pub ai_prompts: HashMap<String, AiPrompt>,
+    /// What every AI prompt of this assistant has PUBLISHED, keyed by `aiPromptId`, at
+    /// most [`MAX_AI_PROMPT_VERSIONS_PER_PROMPT`] versions per prompt, on the same footing
+    /// as [`Self::ai_agent_versions`]: a version is a snapshot of the prompt in
+    /// [`Self::ai_prompts`] that published it, so it goes when that prompt goes — and when
+    /// this assistant goes.
+    pub ai_prompt_versions: AiPromptVersions,
     /// This assistant's orchestrator configurations, with the same contract as
     /// [`Self::ai_agent_configuration`].
     pub orchestrator_configuration_list: Vec<OrchestratorConfigurationEntry>,

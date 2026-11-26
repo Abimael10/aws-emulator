@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAIPromptVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAIPromptVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAIPromptVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes an IMMUTABLE, numbered snapshot of the AI prompt's current working copy: the
+//! first version of a prompt is 1 and each later publish is the previous number plus 1, so
+//! a later write to the working copy leaves every published version as it was and
+//! `<aiPromptId>:<versionNumber>` keeps naming what was published under that number. The
+//! snapshot and the numbering live on the prompt's assistant in `crate::state`, so this
+//! response, a later version-addressed `GetAIPrompt` and `ListAIPromptVersions` are
+//! rendered out of one record.
+//!
+//! The number is allocated and the snapshot appended in ONE step while the store's lock is
+//! held ([`crate::state::Assistant::publish_ai_prompt_version`]), so concurrent callers
+//! are handed different numbers rather than one number twice.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +94,33 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> CreateAIPromptVersionError {
+    CreateAIPromptVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: String) -> CreateAIPromptVersionError {
+    CreateAIPromptVersionErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One instant in whole milliseconds since the epoch, which is the resolution the two
+/// instants the `modifiedTime` precondition compares are both stated at: the protocol
+/// carries a `Timestamp` as epoch seconds with a fractional part, so a value a caller read
+/// off a response and sent back names the same millisecond it was given but not
+/// necessarily the same nanosecond.
+fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +195,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAIPromptVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAIPromptVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAIPromptVersion"))
+        // Modelled constraints (both label patterns and `clientToken`'s length) are already
+        // refused BEFORE this handler runs, so reaching here means the input satisfies every
+        // one of them. Everything this operation answers with is rendered out of the stored
+        // record, so nothing here is built from request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateAIPromptVersion")
+        })?;
+        // One critical section for the whole publish: the number this call is handed and the
+        // snapshot it is handed with are written together, so no two callers can be handed
+        // the same number and no caller sees a number that nothing was published under.
+        let mut store = state.lock();
+
+        // An AI prompt exists only inside an assistant, so the parent is resolved first: a
+        // publish naming an assistant this account does not hold is not found, whatever the
+        // rest of the route names.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let assistant_id = assistant.assistant_id.clone();
+
+        // What is published is the prompt's WORKING COPY. A label naming a numbered VERSION
+        // names a published snapshot rather than the working copy, and a snapshot is not
+        // something a publish reads from, so such a label names nothing to publish.
+        let Some(prompt) = store.ai_prompt(&assistant_id, &input.ai_prompt_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_AI_PROMPT_NOT_FOUND,
+                &input.ai_prompt_id,
+            ));
+        };
+        let snapshot = prompt.clone();
+        let ai_prompt_id = snapshot.ai_prompt_id.clone();
+
+        // `modifiedTime` is the caller's precondition on WHAT is published: it states when
+        // "the AI Prompt was last modified", which a caller reads off the create or update of
+        // the prompt, so a publish of a working copy that has changed since the caller read
+        // it is refused rather than numbering a version of something the caller has not
+        // seen. A request that supplies none states no precondition and publishes the working
+        // copy as it stands.
+        if let Some(seen) = input.modified_time {
+            let stored = ::aws_smithy_types::DateTime::from(snapshot.modified_at);
+            if epoch_millis(&stored) > epoch_millis(&seen) {
+                return Err(conflict(crate::state::message_ai_prompt_modified_since()));
+            }
+        }
+
+        // What this publish's `@idempotencyToken` identifies: the precondition the request
+        // carried, which is the only member besides the route that says anything about what
+        // gets published. A replayed token answers with the version it already published
+        // rather than numbering a second identical one, while the same token carrying a
+        // DIFFERENT request is the modelled idempotency conflict. The token is scoped to
+        // this operation and this prompt, so the same token on another call is another
+        // request.
+        let fingerprint = crate::state::request_fingerprint(&[input
+            .modified_time
+            .map(|time| epoch_millis(&time).to_string())
+            .unwrap_or_default()]);
+        let token_scope = format!("{}/{assistant_id}/{ai_prompt_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(
+                    crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string(),
+                ))
+            }
+            crate::state::Replay::Retry(published) => {
+                if let Some(version) = published
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|number| store.ai_prompt_version(&assistant_id, &ai_prompt_id, number))
+                {
+                    return Ok(CreateAIPromptVersionOutput {
+                        ai_prompt: Some(version.to_ai_prompt_data()),
+                        version_number: Some(version.version_number),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        let Some(assistant) = store.assistant_mut(&assistant_id) else {
+            // Unreachable: the assistant was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        // The prompt's version bound, which is what keeps this store finite.
+        let Some(version_number) = assistant.publish_ai_prompt_version(snapshot) else {
+            return Err(
+                CreateAIPromptVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::message_ai_prompt_version_quota()),
+                    },
+                )
+                .into(),
+            );
+        };
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &version_number.to_string(),
+        );
+
+        // Answer out of the record that was just written: what this call reports is what a
+        // later read of that version, and a later `ListAIPromptVersions`, report. Publishing
+        // a snapshot of the prompt is no modification of the prompt, so the working copy is
+        // untouched and its `modifiedTime` stands.
+        let Some(version) = store.ai_prompt_version(&assistant_id, &ai_prompt_id, version_number)
+        else {
+            // Unreachable: the publish above put this version on the assistant while the
+            // lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAIPromptVersion",
+            ));
+        };
+        Ok(CreateAIPromptVersionOutput {
+            ai_prompt: Some(version.to_ai_prompt_data()),
+            version_number: Some(version.version_number),
+        })
     }
 }

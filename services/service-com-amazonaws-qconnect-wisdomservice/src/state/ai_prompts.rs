@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use super::*;
-use crate::ops::types::{AIPromptData, AIPromptInferenceConfiguration, AIPromptTemplateConfiguration};
+use crate::ops::types::{
+    AIPromptData, AIPromptInferenceConfiguration, AIPromptSummary, AIPromptTemplateConfiguration,
+};
 
 /// The fixed text for a request addressed to an AI prompt its named assistant does not
 /// hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`] for why the sentence quotes nothing from the
@@ -131,6 +133,39 @@ impl AiPrompt {
             ..self.to_ai_prompt_data()
         }
     }
+
+    /// The `AIPromptSummary` every operation that SUMMARISES this prompt answers with,
+    /// rendered out of the same stored record [`Self::to_ai_prompt_data`] renders: a
+    /// summary reports what a read of the prompt it summarises reports.
+    pub fn to_ai_prompt_summary(&self) -> AIPromptSummary {
+        AIPromptSummary {
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            ai_prompt_id: self.ai_prompt_id.clone(),
+            ai_prompt_arn: self.ai_prompt_arn.clone(),
+            name: self.name.clone(),
+            r#type: self.r#type.clone(),
+            template_type: self.template_type.clone(),
+            model_id: self.model_id.clone(),
+            api_format: self.api_format.clone(),
+            modified_time: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            description: self.description.clone(),
+            visibility_status: self.visibility_status.clone(),
+            tags: tags_out(&self.tags),
+            origin: Some(self.origin.clone()),
+            status: Some(self.status.clone()),
+        }
+    }
+
+    /// The same `AIPromptSummary` as [`Self::to_ai_prompt_summary`], for a summary of one
+    /// VERSION of this prompt: the reported ARN names the version summarised
+    /// ([`version_qualified_arn`]), the way a read of that version reports it.
+    pub fn to_ai_prompt_summary_at_version(&self, qualifier: &str) -> AIPromptSummary {
+        AIPromptSummary {
+            ai_prompt_arn: version_qualified_arn(&self.ai_prompt_arn, qualifier),
+            ..self.to_ai_prompt_summary()
+        }
+    }
 }
 
 impl Assistant {
@@ -148,9 +183,9 @@ impl Assistant {
     /// A label carrying the [`VERSION_QUALIFIER_LATEST`] qualifier names the prompt's own
     /// working copy, which is the record below — so the ARN a read reports, which names
     /// that version, addresses the same record it was read from. Any other qualifier names
-    /// a numbered VERSION of the prompt, and this emulator publishes none —
-    /// `CreateAIPromptVersion` is still a scaffold stub — so such a label names nothing
-    /// here and the caller gets the operation's not-found answer.
+    /// a numbered VERSION of the prompt, which is a published SNAPSHOT rather than the
+    /// working copy, so such a label names nothing here: an operation that reports a
+    /// version resolves through [`Self::ai_prompt_revision`] instead.
     pub fn ai_prompt(&self, label: &str) -> Option<&AiPrompt> {
         let (id, qualifier) = resolve_qualified_id(label);
         match qualifier {
@@ -218,6 +253,11 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .get_mut(&assistant_id)?
             .ai_prompts
             .remove(&prompt_id)?;
+        // A version is a snapshot of the prompt that published it, so a prompt that is gone
+        // takes every version of it along: nothing addresses `<aiPromptId>:<n>` afterwards.
+        if let Some(assistant) = self.assistants.get_mut(&assistant_id) {
+            assistant.forget_ai_prompt_versions_of(&prompt_id);
+        }
         self.forget_idempotency_for(&prompt_id);
         Some(prompt)
     }
