@@ -11,10 +11,12 @@
 //! requests rather than one recorded call:
 //!
 //! * every reported bundle's members are its catalog entry's: the id is
-//!   `<size>_<generation>` for a Linux/Unix plan and `<size>_win_<generation>` for
-//!   the Windows plan of the same size, `instanceType` is that size token, `name`
-//!   is the size token title-cased (`micro` -> `Micro`, as `Bundle$name`'s own
-//!   example shows), `supportedPlatforms` is the single platform the id names, and
+//!   `<size>_<generation>` for a dual-stack Linux/Unix plan, `<size>_win_<generation>`
+//!   for the Windows plan of the same size and `<size>[_win]_ipv6_<generation>` for
+//!   its IPv6-only plan, `instanceType` is that size token, `name` is the size token
+//!   title-cased (`micro` -> `Micro`, as `Bundle$name`'s own example shows),
+//!   `supportedPlatforms` is the single platform the id names, `publicIpv4AddressCount`
+//!   is the one address a dual-stack plan includes and none for an IPv6-only plan, and
 //!   the hardware, transfer, power and price are the plan's;
 //! * `includeInactive` is what widens the answer from the active plans to every
 //!   published one, and an absent flag reports the active ones only;
@@ -69,10 +71,9 @@ const WINDOWS: &str = "WINDOWS";
 /// larger plan then repeats), the vCPU count is two up to the 8 GB plan and
 /// doubles with the plan above it, and the Windows column of a size carries its
 /// own price, SSD size and power. The rows span what the rule generalises over:
-/// the smallest plan, a mid-sized one, the two largest published on both
-/// platforms (whose size token carries a multiplier), the largest published on
-/// Linux/Unix alone, the Windows plan whose SSD size and power differ from its
-/// Linux/Unix twin's, and Windows plans of two further sizes.
+/// the smallest plan, a mid-sized one, two larger ones whose size token carries a
+/// multiplier, the largest size of all, the Windows plan whose SSD size and power
+/// differ from its Linux/Unix twin's, and Windows plans of three further sizes.
 struct Expected {
     bundle_id: &'static str,
     instance_type: &'static str,
@@ -187,8 +188,8 @@ const EXPECTED: &[Expected] = &[
         power: 4_000,
         price: 124.0,
     },
-    // The size the plan table's Windows column ends at: published on Windows
-    // too, at that column's own monthly price.
+    // A size published in the Windows column at that column's own monthly
+    // price, SSD size and power.
     Expected {
         bundle_id: "8xlarge_win_3_0",
         instance_type: "8xlarge",
@@ -318,16 +319,23 @@ async fn every_reported_bundle_reports_its_own_plan() {
     for bundle in &bundles {
         let case = member(bundle, "bundleId");
 
-        // `<size>[_win]_<major>_<minor>`: the id form the modelled
-        // `Bundle$bundleId` documentation's `micro_x_x` shows, with the platform
-        // token a Windows plan carries.
+        // `<size>[_win][_ipv6]_<major>_<minor>`: the id form the modelled
+        // `Bundle$bundleId` documentation's `micro_x_x` shows, with the tokens the
+        // Windows and IPv6-only plans of a size carry.
         let tokens: Vec<&str> = case.split('_').collect();
         let platform = want_platform(&case);
-        let expected_tokens = if platform == WINDOWS { 4 } else { 3 };
+        let expected_tokens = if case.contains("_win_ipv6_") {
+            5
+        } else if case.contains("_win_") || case.contains("_ipv6_") {
+            4
+        } else {
+            3
+        };
         assert_eq!(
             tokens.len(),
             expected_tokens,
-            "case {case:?}: expected a <size>[_win]_<major>_<minor> bundle id, got {tokens:?}"
+            "case {case:?}: expected a <size>[_win][_ipv6]_<major>_<minor> bundle id, got \
+             {tokens:?}"
         );
         for version in &tokens[tokens.len() - 2..] {
             assert!(
@@ -382,20 +390,20 @@ async fn every_reported_bundle_reports_its_own_plan() {
             "case {case:?}: a plan has a power value, got {bundle:?}"
         );
 
-        // "the value is either 0 or 1" (`Bundle$publicIpv4AddressCount`), and
-        // every plan this catalog publishes is a standard plan that includes one
-        // public IPv4 address (0 is the IPv6-only case, which it publishes none
-        // of).
+        // "the value is either 0 or 1" (`Bundle$publicIpv4AddressCount`): a
+        // dual-stack plan includes the one public IPv4 address, and an IPv6-only
+        // plan — the ids carrying the `ipv6` token — includes none, which is what
+        // makes it IPv6-only.
         let ipv4 = bundle["publicIpv4AddressCount"].as_i64();
         assert!(
             ipv4 == Some(0) || ipv4 == Some(1),
             "case {case:?}: publicIpv4AddressCount is either 0 or 1, got {ipv4:?}"
         );
+        let want_ipv4 = if case.contains("_ipv6_") { 0 } else { 1 };
         assert_eq!(
             ipv4,
-            Some(1),
-            "case {case:?}: a published standard plan includes one public IPv4 address, got \
-             {ipv4:?}"
+            Some(want_ipv4),
+            "case {case:?}: expected publicIpv4AddressCount {want_ipv4}, got {ipv4:?}"
         );
 
         assert_eq!(
@@ -755,13 +763,13 @@ fn the_slice_rule_reports_an_inactive_plan_only_when_asked_for_it() {
         let case = row.case;
         for (include_inactive, expected) in [(false, row.active_only), (true, row.everything)] {
             let reported = state::bundles_from(&row.catalog, include_inactive);
-            // One entry per platform and size: the plans of a platform in the
-            // catalog's own order, the platforms in the published order.
-            let want: Vec<String> = state::BUNDLE_PLATFORMS
+            // One entry per published column and size: the plans of a column in
+            // the catalog's own order, the columns in the published order.
+            let want: Vec<String> = state::BUNDLE_COLUMNS
                 .iter()
-                .flat_map(|platform| {
+                .flat_map(|column| {
                     expected.iter().map(move |size| {
-                        state::bundle_id(size, platform, state::BUNDLE_GENERATION)
+                        state::column_bundle_id(size, *column, state::BUNDLE_GENERATION)
                     })
                 })
                 .collect();
@@ -816,7 +824,9 @@ fn synthetic(size: &'static str, is_active: bool) -> state::BundleSpec {
             price_usd_per_month: 12.0,
             disk_size_in_gb: 40,
             power: 500,
+            ipv6_only_price_usd_per_month: 10.0,
         }),
+        ipv6_only_price_usd_per_month: Some(3.5),
         is_active,
         app_categories: &[],
     }

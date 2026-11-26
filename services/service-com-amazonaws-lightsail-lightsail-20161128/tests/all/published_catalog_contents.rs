@@ -277,8 +277,8 @@ async fn the_blueprint_catalog_opens_with_the_windows_images_it_publishes() {
 /// doubling with the plan above it) and the plan power a blueprint's `minPower`
 /// is compared against. The rows are every published size, so the figures are
 /// pinned on the sizes the report did not quote as well as on the three it did,
-/// and they span the sizes published on both platforms and the larger ones
-/// published on Linux/Unix alone.
+/// and they span the smallest plan, the sizes whose vCPU count doubles and the
+/// two largest ones.
 struct Plan {
     size: &'static str,
     name: &'static str,
@@ -287,9 +287,9 @@ struct Plan {
     power: i64,
     linux_price: f64,
     /// The Windows COLUMN of the size: its monthly price and its own published
-    /// power. `None` where the plan table publishes no Windows plan of the size
-    /// — the sizes above the 64 GB plan, which Lightsail offers on Linux/Unix
-    /// only.
+    /// power. `None` where the plan table publishes no Windows plan of the size,
+    /// which has no Windows bundle at all rather than one priced like its
+    /// Linux/Unix twin.
     windows: Option<WindowsColumn>,
 }
 
@@ -396,7 +396,7 @@ const PLANS: &[Plan] = &[
         cpu_count: 32,
         power: 7_000,
         linux_price: 884.0,
-        // The plan the Windows column ends at, published on both platforms.
+        // The Windows column prices this size too, as it does every size.
         windows: Some(WindowsColumn {
             price: 1_254.0,
             power: 7_000,
@@ -408,7 +408,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 48,
         power: 7_500,
         linux_price: 1_324.0,
-        windows: None,
+        windows: Some(WindowsColumn {
+            price: 1_884.0,
+            power: 7_500,
+        }),
     },
     Plan {
         size: "16xlarge",
@@ -416,7 +419,10 @@ const PLANS: &[Plan] = &[
         cpu_count: 64,
         power: 8_000,
         linux_price: 1_764.0,
-        windows: None,
+        windows: Some(WindowsColumn {
+            price: 2_504.0,
+            power: 8_000,
+        }),
     },
 ];
 
@@ -439,44 +445,55 @@ async fn the_instance_plan_catalog_reports_the_linux_plans_before_the_windows_on
         .map(|bundle| text(bundle, "bundleId"))
         .collect();
 
-    // Every Linux/Unix plan precedes every Windows plan: the platform blocks do
-    // not interleave.
-    let linux_count = platforms.iter().take_while(|p| *p == LINUX_UNIX).count();
-    assert_eq!(
-        linux_count,
-        platforms.iter().filter(|p| *p == LINUX_UNIX).count(),
-        "case the whole catalog: the Linux/Unix plans must precede the Windows ones, got {ids:?}"
-    );
-    assert_eq!(
-        linux_count,
-        PLANS.len(),
-        "case the whole catalog: expected one Linux/Unix plan per published size, got {ids:?}"
-    );
-
-    // And within each platform the sizes are the catalog's own order: the
-    // Linux/Unix block carries every published size, the Windows block the sizes
-    // the plan table publishes a Windows price for.
-    let sizes_of = |block: &[Value]| -> Vec<String> {
-        block
-            .iter()
-            .map(|bundle| text(bundle, "instanceType"))
-            .collect()
-    };
-    let published_sizes: Vec<String> = PLANS.iter().map(|plan| plan.size.to_string()).collect();
-    let windows_sizes: Vec<String> = PLANS
+    // The blocks do not interleave, and each carries the published sizes in the
+    // catalog's own order: the dual-stack Linux/Unix plans first, then the
+    // Windows plans of the sizes the plan table publishes a Windows price for,
+    // then the IPv6-only plans of each platform in the same order.
+    let want_ids: Vec<String> = PLANS
         .iter()
-        .filter(|plan| plan.windows.is_some())
-        .map(|plan| plan.size.to_string())
+        .map(|plan| format!("{}_3_0", plan.size))
+        .chain(
+            PLANS
+                .iter()
+                .filter(|plan| plan.windows.is_some())
+                .map(|plan| format!("{}_win_3_0", plan.size)),
+        )
+        .chain(PLANS.iter().map(|plan| format!("{}_ipv6_3_0", plan.size)))
+        .chain(
+            PLANS
+                .iter()
+                .filter(|plan| plan.windows.is_some())
+                .map(|plan| format!("{}_win_ipv6_3_0", plan.size)),
+        )
         .collect();
     assert_eq!(
-        sizes_of(&bundles[..linux_count]),
-        published_sizes,
-        "case the Linux/Unix block: expected the published sizes in order, got {ids:?}"
+        ids, want_ids,
+        "case the whole catalog: expected each block's sizes in the catalog's own order, got \
+         {ids:?}"
     );
+
+    // The platform of a block's rows is the block's: `LINUX_UNIX` for the
+    // Linux/Unix blocks, `WINDOWS` for the Windows ones.
+    let want_platforms: Vec<String> = PLANS
+        .iter()
+        .map(|_| LINUX_UNIX.to_string())
+        .chain(
+            PLANS
+                .iter()
+                .filter(|plan| plan.windows.is_some())
+                .map(|_| WINDOWS.to_string()),
+        )
+        .chain(PLANS.iter().map(|_| LINUX_UNIX.to_string()))
+        .chain(
+            PLANS
+                .iter()
+                .filter(|plan| plan.windows.is_some())
+                .map(|_| WINDOWS.to_string()),
+        )
+        .collect();
     assert_eq!(
-        sizes_of(&bundles[linux_count..]),
-        windows_sizes,
-        "case the Windows block: expected the sizes published on Windows in order, got {ids:?}"
+        platforms, want_platforms,
+        "case the whole catalog: expected each block to report its own platform, got {ids:?}"
     );
 
     for plan in PLANS {

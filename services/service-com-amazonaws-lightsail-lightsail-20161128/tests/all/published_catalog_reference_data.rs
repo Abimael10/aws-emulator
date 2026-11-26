@@ -5,15 +5,15 @@
 //!
 //! The rule under test, across every catalog this service publishes: each row is
 //! the entry the service publishes and each column the value the service
-//! publishes for it — the whole plan table including the sizes offered on one
-//! platform only, the images a caller can select including the application images
+//! publishes for it — the whole plan table including every column a size is
+//! published in, the images a caller can select including the application images
 //! named after the product they install, each image's own software
 //! version, the whole geography sentence of a Region, and the price list's own
 //! figures — rather than a value the emulator derived from a neighbouring row, a
 //! name or a doubling rule.
 //!
-//! Every case is a TABLE spanning what that rule generalises over: the sizes
-//! published on both platforms and the larger ones published on Linux/Unix alone,
+//! Every case is a TABLE spanning what that rule generalises over: the smallest
+//! published size, the sizes whose vCPU count doubles and the largest ones,
 //! an operating-system image and an application image, a Region that is enabled
 //! by default and one that is opt-in, a standard database plan and its
 //! high-availability twin, and both database engines. Catalog figures are
@@ -84,14 +84,12 @@ fn is_price(reported: Option<f64>, expected: f64) -> bool {
 /// SOURCE: the "Instances" plans of the Lightsail pricing page, which
 /// `GetBundles` answers from: the hardware, the included monthly transfer and the
 /// plan power of each size, the Linux/Unix monthly price, and the Windows column
-/// of the same size where the table publishes one — which it does up to the 64 GB
-/// plan, above which the sizes are offered on Linux/Unix only. Every figure is
+/// of the same size where the table publishes one. Every figure is
 /// the table's published one: the SSD column stops growing at 1,280 GB and the
 /// monthly transfer at 10,240 GB, which every larger plan then carries.
 ///
-/// The rows are every published size, so they span a size published on both
-/// platforms and the larger sizes published on one, and the figures are pinned on
-/// sizes no report quoted as well as on the ones it did.
+/// The rows are every published size, so the figures are pinned on sizes no
+/// report quoted as well as on the ones it did.
 struct PlanRow {
     size: &'static str,
     cpu_count: i64,
@@ -238,8 +236,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 9_216,
         power: 7_000,
         linux_price: 884.0,
-        // The plan the Windows column ends at: it is published on both platforms,
-        // at the Windows column's own monthly price.
+        // The Windows column prices this size too, at its own monthly price.
         windows: Some(WindowsColumn {
             price: 1_254.0,
             disk_size_in_gb: 1_280,
@@ -254,7 +251,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 10_240,
         power: 7_500,
         linux_price: 1_324.0,
-        windows: None,
+        windows: Some(WindowsColumn {
+            price: 1_884.0,
+            disk_size_in_gb: 1_280,
+            power: 7_500,
+        }),
     },
     PlanRow {
         size: "16xlarge",
@@ -266,7 +267,11 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 10_240,
         power: 8_000,
         linux_price: 1_764.0,
-        windows: None,
+        windows: Some(WindowsColumn {
+            price: 2_504.0,
+            disk_size_in_gb: 1_280,
+            power: 8_000,
+        }),
     },
 ];
 
@@ -379,14 +384,18 @@ async fn the_plan_catalog_reports_every_size_of_the_plan_table_with_its_own_figu
     }
 
     // And the listing holds nothing BEYOND the table: every reported plan is a
-    // published size on a platform the table prices it on.
+    // published size in a column the table publishes it in — its Linux/Unix
+    // column, its Windows column where the table prices one, and the IPv6-only
+    // column of each, whose own figures `bundle_catalog_columns.rs` pins.
     let published: Vec<String> = PLAN_TABLE
         .iter()
         .flat_map(|row| {
             let mut ids = vec![format!("{}_{GENERATION}", row.size)];
             if row.windows.is_some() {
                 ids.push(format!("{}_win_{GENERATION}", row.size));
+                ids.push(format!("{}_win_ipv6_{GENERATION}", row.size));
             }
+            ids.push(format!("{}_ipv6_{GENERATION}", row.size));
             ids
         })
         .collect();
@@ -427,8 +436,7 @@ fn now_epoch_seconds() -> f64 {
 /// and is billed at the plan's published price.
 ///
 /// The rows are the four largest plans — the ones a sizing or cost calculation
-/// over the big end of the table reaches — and they span a size published on both
-/// platforms and the three published on Linux/Unix alone.
+/// over the big end of the table reaches.
 #[tokio::test]
 async fn an_instance_runs_on_the_largest_published_plans_at_their_published_price() {
     let emulator = Emulator::new();

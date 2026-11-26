@@ -55,13 +55,26 @@ pub struct BundleSpec {
     /// The plan table's WINDOWS column for this size, and `None` where the table
     /// publishes NO Windows plan of this size.
     ///
-    /// A plan is published per platform: the plan table carries a Windows column
-    /// only up to the largest size Lightsail offers Windows Server on, while the
-    /// Linux/Unix column goes on past it. A size with no Windows entry therefore
-    /// has no Windows bundle at all ([`bundles_from`]) rather than a Windows
-    /// bundle priced like its Linux/Unix twin, which would announce a plan the
-    /// service does not sell.
+    /// A plan is published per platform: a size the plan table prices in its
+    /// Windows column carries that column's own price, SSD size and power, and a
+    /// size it prices in no Windows column has no Windows bundle at all
+    /// ([`bundles_from`]) rather than a Windows bundle priced like its
+    /// Linux/Unix twin, which would announce a plan the service does not sell.
     pub windows: Option<WindowsPlan>,
+    /// The plan table's IPv6-ONLY column for this size — the monthly price of
+    /// the Linux/Unix plan of this size published WITHOUT a public IPv4 address
+    /// — and `None` where the table publishes no IPv6-only plan of this size.
+    ///
+    /// An IPv6-only plan is a published plan in its own right, not a reported
+    /// variation of its dual-stack twin: `SetIpAddressType$acceptBundleUpdate`
+    /// documents that "an instance bundle will change when switching from
+    /// dual-stack or ipv4, to ipv6", so the two are different bundles with
+    /// different ids, different prices and a different
+    /// `Bundle$publicIpv4AddressCount`. The hardware, monthly transfer and power
+    /// are the SIZE's and are shared with its dual-stack Linux/Unix plan; the
+    /// price is this column's own figure, which is why it is published per entry
+    /// rather than computed from the dual-stack price.
+    pub ipv6_only_price_usd_per_month: Option<f32>,
     /// `Bundle$isActive` — "A Boolean value indicating whether the bundle is
     /// active". A plan generation the service has retired stays in this table
     /// with `false` so an instance already running on it still resolves, while
@@ -105,6 +118,10 @@ pub struct WindowsPlan {
     /// `Bundle$power` of the Windows plan of this size, as the table publishes
     /// it for the Windows column.
     pub power: i32,
+    /// The monthly price of the IPv6-ONLY Windows plan of this size: the
+    /// Windows plan published without a public IPv4 address, as the plan table's
+    /// IPv6-only Windows column prices it.
+    pub ipv6_only_price_usd_per_month: f32,
 }
 
 /// Every instance plan size this service serves, smallest first.
@@ -124,18 +141,29 @@ pub struct WindowsPlan {
 /// modelled `Blueprint$minPower` documentation's own example names) and then a
 /// further 1000 per doubling step, 500 where a plan adds half a step of hardware.
 ///
-/// The sizes ABOVE the 128 GB plan are Linux/Unix only: the plan table's Windows
-/// column ends at that plan, so those entries carry no Windows plan (see
-/// [`BundleSpec::windows`]); the sizes it does cover carry that column's own
-/// price, SSD size and power ([`WindowsPlan`]).
+/// Each size is published in every column of the plan table — the Linux/Unix
+/// column, the Windows column ([`WindowsPlan`]) and the IPv6-only column of each
+/// platform ([`BundleSpec::ipv6_only_price_usd_per_month`],
+/// [`WindowsPlan::ipv6_only_price_usd_per_month`]) — so each size is reported as
+/// one bundle per published column ([`BUNDLE_COLUMNS`]), the Windows plans
+/// included on the largest sizes the table carries.
 ///
-/// The two price columns are PUBLISHED independently of each other: the Windows
-/// column's monthly prices are the figures the table lists for the Windows plans
-/// ($9.50, $14, $22, $44, $74, $124, $244, $574 and $1,254 from the smallest plan
-/// up), never the Linux/Unix price of the size plus a licence markup — the 4 GB
-/// Windows plan and the 8 GB Linux/Unix plan are published at the same monthly
-/// price, and the step from one Windows plan to the next is not the step between
-/// their Linux/Unix rows, neither of which any per-size markup produces.
+/// The price columns are PUBLISHED independently of each other, never one column
+/// plus a per-size markup or discount:
+///
+/// * the Windows column's monthly prices are the figures the table lists for the
+///   Windows plans ($9.50, $14, $22, $44, $74, $124, $244, $574, $1,254, $1,884
+///   and $2,504 from the smallest plan up) — the 4 GB Windows plan and the 8 GB
+///   Linux/Unix plan are published at the same monthly price, and the step from
+///   one Windows plan to the next is not the step between their Linux/Unix rows,
+///   neither of which any per-size markup produces;
+/// * the IPv6-only columns' monthly prices are the figures the table lists for
+///   the plans published without a public IPv4 address — $3.50, $5, $10, $20,
+///   $40, $80, $160, $380, $880, $1,320 and $1,760 on Linux/Unix, and $8, $12,
+///   $20, $40, $70, $120, $240, $570, $1,250, $1,880 and $2,500 on Windows — and
+///   the gap to the dual-stack row of the same platform is $1.50 on the smallest
+///   plan, $2 on the next two and $4 from the 4 GB plan up, so no one address
+///   charge subtracted from a dual-stack column produces these.
 ///
 /// Lightsail has retired none of these sizes, so every entry is active.
 pub const BUNDLE_SPECS: &[BundleSpec] = &[
@@ -153,7 +181,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 9.5,
             disk_size_in_gb: 30,
             power: 300,
+            ipv6_only_price_usd_per_month: 8.0,
         }),
+        ipv6_only_price_usd_per_month: Some(3.5),
         is_active: true,
         app_categories: &[],
     },
@@ -169,7 +199,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 14.0,
             disk_size_in_gb: 40,
             power: 500,
+            ipv6_only_price_usd_per_month: 12.0,
         }),
+        ipv6_only_price_usd_per_month: Some(5.0),
         is_active: true,
         app_categories: &[],
     },
@@ -185,7 +217,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 22.0,
             disk_size_in_gb: 60,
             power: 1_000,
+            ipv6_only_price_usd_per_month: 20.0,
         }),
+        ipv6_only_price_usd_per_month: Some(10.0),
         is_active: true,
         app_categories: &[],
     },
@@ -201,7 +235,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 44.0,
             disk_size_in_gb: 80,
             power: 2_000,
+            ipv6_only_price_usd_per_month: 40.0,
         }),
+        ipv6_only_price_usd_per_month: Some(20.0),
         is_active: true,
         app_categories: &[],
     },
@@ -217,7 +253,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 74.0,
             disk_size_in_gb: 160,
             power: 3_000,
+            ipv6_only_price_usd_per_month: 70.0,
         }),
+        ipv6_only_price_usd_per_month: Some(40.0),
         is_active: true,
         app_categories: &[],
     },
@@ -233,7 +271,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 124.0,
             disk_size_in_gb: 320,
             power: 4_000,
+            ipv6_only_price_usd_per_month: 120.0,
         }),
+        ipv6_only_price_usd_per_month: Some(80.0),
         is_active: true,
         app_categories: &[],
     },
@@ -249,7 +289,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 244.0,
             disk_size_in_gb: 640,
             power: 5_000,
+            ipv6_only_price_usd_per_month: 240.0,
         }),
+        ipv6_only_price_usd_per_month: Some(160.0),
         is_active: true,
         app_categories: &[],
     },
@@ -265,7 +307,9 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
             price_usd_per_month: 574.0,
             disk_size_in_gb: 1_280,
             power: 6_000,
+            ipv6_only_price_usd_per_month: 570.0,
         }),
+        ipv6_only_price_usd_per_month: Some(380.0),
         is_active: true,
         app_categories: &[],
     },
@@ -279,13 +323,15 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         transfer_gb_per_month: 9_216,
         power: 7_000,
         price_usd_per_month: 884.0,
-        // The Windows column reaches this plan: the table publishes it at its own
-        // monthly price, with the SSD size and power this size's rows carry.
+        // Every column publishes this plan at its own monthly price, with the
+        // SSD size and power this size's rows carry.
         windows: Some(WindowsPlan {
             price_usd_per_month: 1_254.0,
             disk_size_in_gb: 1_280,
             power: 7_000,
+            ipv6_only_price_usd_per_month: 1_250.0,
         }),
+        ipv6_only_price_usd_per_month: Some(880.0),
         is_active: true,
         app_categories: &[],
     },
@@ -297,7 +343,13 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         transfer_gb_per_month: 10_240,
         power: 7_500,
         price_usd_per_month: 1_324.0,
-        windows: None,
+        windows: Some(WindowsPlan {
+            price_usd_per_month: 1_884.0,
+            disk_size_in_gb: 1_280,
+            power: 7_500,
+            ipv6_only_price_usd_per_month: 1_880.0,
+        }),
+        ipv6_only_price_usd_per_month: Some(1_320.0),
         is_active: true,
         app_categories: &[],
     },
@@ -311,7 +363,13 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         transfer_gb_per_month: 10_240,
         power: 8_000,
         price_usd_per_month: 1_764.0,
-        windows: None,
+        windows: Some(WindowsPlan {
+            price_usd_per_month: 2_504.0,
+            disk_size_in_gb: 1_280,
+            power: 8_000,
+            ipv6_only_price_usd_per_month: 2_500.0,
+        }),
+        ipv6_only_price_usd_per_month: Some(1_760.0),
         is_active: true,
         app_categories: &[],
     },
@@ -352,20 +410,100 @@ pub const BUNDLE_GENERATION: &str = "3_0";
 /// its Linux/Unix plan.
 pub const BUNDLE_WINDOWS_TOKEN: &str = "win";
 
-/// The platforms every plan size is published for, in the order a page reports
-/// them, from the modelled `InstancePlatform` enum: "You can only launch a
-/// `WINDOWS` bundle on a blueprint that supports the `WINDOWS` platform.
-/// `LINUX_UNIX` blueprints require a `LINUX_UNIX` bundle"
-/// (`Bundle$supportedPlatforms`), so a size is a separate bundle on each.
-pub const BUNDLE_PLATFORMS: &[&str] = &[PLATFORM_LINUX_UNIX, PLATFORM_WINDOWS];
+/// The token an IPv6-only bundle id carries between its size and its generation
+/// (`micro_ipv6_3_0`), which is what distinguishes the IPv6-only plan of a size
+/// from the dual-stack plan of the same size and platform.
+pub const BUNDLE_IPV6_ONLY_TOKEN: &str = "ipv6";
 
-/// `Bundle$publicIpv4AddressCount` of every plan this catalog publishes — "an
-/// integer that indicates the public ipv4 address count included in the bundle,
-/// the value is either 0 or 1".
+/// The token the IPv6-only Windows bundle id of a size carries between its size
+/// and its generation (`micro_win_ipv6_3_0`): the platform token of a Windows
+/// plan and the addressing token of an IPv6-only one, in that order.
+pub const BUNDLE_WINDOWS_IPV6_ONLY_TOKEN: &str = "win_ipv6";
+
+/// One published column of the instance-plan table: a platform and the
+/// addressing a plan of that platform is published with, which together decide a
+/// row's id token, its `supportedPlatforms`, its `publicIpv4AddressCount` and
+/// which price the row carries.
 ///
-/// Every published plan is a standard plan that includes one public IPv4 address;
-/// 0 is the count of an IPv6-only plan, which this service publishes none of.
-pub const BUNDLE_PUBLIC_IPV4_ADDRESS_COUNT: i32 = 1;
+/// A size is a separate bundle in each column it is published in. The platform
+/// is one bundle's worth on its own — "You can only launch a `WINDOWS` bundle on
+/// a blueprint that supports the `WINDOWS` platform. `LINUX_UNIX` blueprints
+/// require a `LINUX_UNIX` bundle" (`Bundle$supportedPlatforms`) — and so is the
+/// addressing: `SetIpAddressType$acceptBundleUpdate` documents that "an instance
+/// bundle will change when switching from dual-stack or ipv4, to ipv6", so the
+/// IPv6-only plan of a size is its own bundle rather than the dual-stack bundle
+/// reported with a different address count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleColumn {
+    /// The plan table's Linux/Unix column: the plan published with a public IPv4
+    /// address.
+    LinuxUnix,
+    /// The plan table's Windows column ([`WindowsPlan`]): the plan published
+    /// with a public IPv4 address and a Windows Server licence.
+    Windows,
+    /// The plan table's IPv6-only column
+    /// ([`BundleSpec::ipv6_only_price_usd_per_month`]): the Linux/Unix plan of
+    /// the size published without a public IPv4 address.
+    LinuxUnixIpv6Only,
+    /// The plan table's IPv6-only Windows column: the Windows plan of the size
+    /// published without a public IPv4 address.
+    WindowsIpv6Only,
+}
+
+impl BundleColumn {
+    /// `Bundle$supportedPlatforms`' single value for every row of this column.
+    pub fn platform(self) -> &'static str {
+        match self {
+            Self::Windows | Self::WindowsIpv6Only => PLATFORM_WINDOWS,
+            Self::LinuxUnix | Self::LinuxUnixIpv6Only => PLATFORM_LINUX_UNIX,
+        }
+    }
+
+    /// The token a row of this column carries between its size and its
+    /// generation, and `None` for the column whose ids carry none
+    /// ([`BUNDLE_WINDOWS_TOKEN`], [`BUNDLE_IPV6_ONLY_TOKEN`]).
+    pub fn id_token(self) -> Option<&'static str> {
+        match self {
+            Self::LinuxUnix => None,
+            Self::Windows => Some(BUNDLE_WINDOWS_TOKEN),
+            Self::LinuxUnixIpv6Only => Some(BUNDLE_IPV6_ONLY_TOKEN),
+            Self::WindowsIpv6Only => Some(BUNDLE_WINDOWS_IPV6_ONLY_TOKEN),
+        }
+    }
+
+    /// `Bundle$publicIpv4AddressCount` of every row of this column — "an integer
+    /// that indicates the public ipv4 address count included in the bundle, the
+    /// value is either 0 or 1": the one address a dual-stack plan includes, and
+    /// none for an IPv6-only plan, which is what makes it IPv6-only.
+    pub fn public_ipv4_address_count(self) -> i32 {
+        match self {
+            Self::LinuxUnix | Self::Windows => 1,
+            Self::LinuxUnixIpv6Only | Self::WindowsIpv6Only => 0,
+        }
+    }
+}
+
+/// The columns of the plan table this service publishes, in the order a page
+/// reports them: every plan of a column, each column's plans in the catalog's own
+/// size order — the dual-stack columns of both platforms first, then the
+/// IPv6-only column of each.
+pub const BUNDLE_COLUMNS: &[BundleColumn] = &[
+    BundleColumn::LinuxUnix,
+    BundleColumn::Windows,
+    BundleColumn::LinuxUnixIpv6Only,
+    BundleColumn::WindowsIpv6Only,
+];
+
+/// The column the plan of a size on `platform` is published in when the plan
+/// includes a public IPv4 address — what a caller holding only a platform (a
+/// stored instance's bundle id, resolved by [`bundle_platform`]) reads.
+fn dual_stack_column(platform: &str) -> BundleColumn {
+    if platform == PLATFORM_WINDOWS {
+        BundleColumn::Windows
+    } else {
+        BundleColumn::LinuxUnix
+    }
+}
 
 /// How many bundles one `GetBundles` page carries.
 ///
@@ -376,15 +514,26 @@ pub const BUNDLE_PUBLIC_IPV4_ADDRESS_COUNT: i32 = 1;
 /// it.
 pub const BUNDLE_PAGE_SIZE: usize = 50;
 
-/// The id a plan of `size` carries on `platform` at `generation`: the size token,
-/// the platform token of a Windows plan, then the generation
+/// The id a plan of `size` carries at `generation` in a column whose id token is
+/// `token`: the size token, the column's token where it has one, then the
+/// generation.
+fn tokened_bundle_id(size: &str, token: Option<&str>, generation: &str) -> String {
+    match token {
+        Some(token) => format!("{size}_{token}_{generation}"),
+        None => format!("{size}_{generation}"),
+    }
+}
+
+/// The id the dual-stack plan of `size` carries on `platform` at `generation`:
+/// the size token, the platform token of a Windows plan, then the generation
 /// ([`BUNDLE_WINDOWS_TOKEN`], [`BUNDLE_GENERATION`]).
 pub fn bundle_id(size: &str, platform: &str, generation: &str) -> String {
-    if platform == PLATFORM_WINDOWS {
-        format!("{size}_{BUNDLE_WINDOWS_TOKEN}_{generation}")
-    } else {
-        format!("{size}_{generation}")
-    }
+    tokened_bundle_id(size, dual_stack_column(platform).id_token(), generation)
+}
+
+/// The id the plan of `size` carries in `column` at `generation`.
+pub fn column_bundle_id(size: &str, column: BundleColumn, generation: &str) -> String {
+    tokened_bundle_id(size, column.id_token(), generation)
 }
 
 /// The platform `bundle_id` names: Windows for exactly the ids carrying the
@@ -429,67 +578,95 @@ pub fn bundle_size_name(size: &str) -> String {
 }
 
 impl BundleSpec {
-    /// The monthly price of this plan on `platform`: the Windows column's price
-    /// on Windows, the Linux/Unix one otherwise — and `None` where the plan
-    /// table publishes no plan of this size on that platform, which is the one
-    /// answer to "what does this size cost there" that cannot be invented.
-    pub fn price(&self, platform: &str) -> Option<f32> {
-        if platform == PLATFORM_WINDOWS {
-            self.windows.map(|windows| windows.price_usd_per_month)
-        } else {
-            Some(self.price_usd_per_month)
+    /// The monthly price of this plan in `column`: that column's own published
+    /// figure, and `None` where the plan table publishes no plan of this size in
+    /// it — the one answer to "what does this size cost there" that cannot be
+    /// invented.
+    pub fn price_in(&self, column: BundleColumn) -> Option<f32> {
+        match column {
+            BundleColumn::LinuxUnix => Some(self.price_usd_per_month),
+            BundleColumn::Windows => self.windows.map(|windows| windows.price_usd_per_month),
+            BundleColumn::LinuxUnixIpv6Only => self.ipv6_only_price_usd_per_month,
+            BundleColumn::WindowsIpv6Only => self
+                .windows
+                .map(|windows| windows.ipv6_only_price_usd_per_month),
         }
     }
 
-    /// `Bundle$diskSizeInGb` of this plan on `platform`: the SSD size the plan
-    /// table publishes in that platform's column — the Windows column's where a
-    /// Windows plan of this size is published, the Linux/Unix one otherwise.
+    /// `Bundle$diskSizeInGb` of this plan in `column`: the SSD size the plan
+    /// table publishes in it — the Windows column's where a Windows plan of this
+    /// size is published, this size's own otherwise, since an IPv6-only plan
+    /// carries the storage of the Linux/Unix plan it drops the address from.
     ///
-    /// A size the table publishes NO Windows plan of has only one column, so
-    /// that is the figure answered for either platform: unlike
-    /// [`BundleSpec::price`], which answers `None` because a price the table does
-    /// not publish cannot be invented, the hardware of a plan that is not sold on
-    /// a platform is still this size's own. Whether the plan exists there at all
-    /// is [`BundleSpec::is_published_on`]'s question, which `GetBundles` asks
-    /// before reporting a row.
-    pub fn disk_size_in_gb_on(&self, platform: &str) -> i32 {
+    /// A size the table publishes NO Windows plan of has only one SSD figure, so
+    /// that is the one answered: unlike [`BundleSpec::price_in`], which answers
+    /// `None` because a price the table does not publish cannot be invented, the
+    /// hardware of a plan that is not sold in a column is still this size's own.
+    /// Whether the plan exists there at all is
+    /// [`BundleSpec::is_published_in`]'s question, which `GetBundles` asks before
+    /// reporting a row.
+    pub fn disk_size_in_gb_in(&self, column: BundleColumn) -> i32 {
         match self.windows {
-            Some(windows) if platform == PLATFORM_WINDOWS => windows.disk_size_in_gb,
+            Some(windows) if column.platform() == PLATFORM_WINDOWS => windows.disk_size_in_gb,
             _ => self.disk_size_in_gb,
         }
     }
 
-    /// `Bundle$power` of this plan on `platform`, from that platform's column of
-    /// the plan table. See [`BundleSpec::disk_size_in_gb_on`], including what a
-    /// size with no Windows column answers.
-    pub fn power_on(&self, platform: &str) -> i32 {
+    /// `Bundle$power` of this plan in `column`, from that column of the plan
+    /// table. See [`BundleSpec::disk_size_in_gb_in`], including what a size with
+    /// no Windows column answers.
+    pub fn power_in(&self, column: BundleColumn) -> i32 {
         match self.windows {
-            Some(windows) if platform == PLATFORM_WINDOWS => windows.power,
+            Some(windows) if column.platform() == PLATFORM_WINDOWS => windows.power,
             _ => self.power,
         }
     }
 
-    /// Whether the plan table publishes this size on `platform`.
-    pub fn is_published_on(&self, platform: &str) -> bool {
-        self.price(platform).is_some()
+    /// Whether the plan table publishes this size in `column`.
+    pub fn is_published_in(&self, column: BundleColumn) -> bool {
+        self.price_in(column).is_some()
     }
 
-    /// This plan on `platform` as the modelled `Bundle`, and `None` where the
-    /// table publishes no plan of this size on that platform.
-    pub fn view(&self, platform: &str) -> Option<Bundle> {
-        let price = self.price(platform)?;
+    /// The monthly price of the dual-stack plan of this size on `platform`: see
+    /// [`BundleSpec::price_in`], which this reads the platform's column with.
+    pub fn price(&self, platform: &str) -> Option<f32> {
+        self.price_in(dual_stack_column(platform))
+    }
+
+    /// `Bundle$diskSizeInGb` of the dual-stack plan of this size on `platform`:
+    /// see [`BundleSpec::disk_size_in_gb_in`].
+    pub fn disk_size_in_gb_on(&self, platform: &str) -> i32 {
+        self.disk_size_in_gb_in(dual_stack_column(platform))
+    }
+
+    /// `Bundle$power` of the dual-stack plan of this size on `platform`: see
+    /// [`BundleSpec::power_in`].
+    pub fn power_on(&self, platform: &str) -> i32 {
+        self.power_in(dual_stack_column(platform))
+    }
+
+    /// Whether the plan table publishes a dual-stack plan of this size on
+    /// `platform`.
+    pub fn is_published_on(&self, platform: &str) -> bool {
+        self.is_published_in(dual_stack_column(platform))
+    }
+
+    /// This plan in `column` as the modelled `Bundle`, and `None` where the table
+    /// publishes no plan of this size in that column.
+    pub fn view(&self, column: BundleColumn) -> Option<Bundle> {
+        let price = self.price_in(column)?;
         Some(Bundle {
-            bundle_id: Some(bundle_id(self.size, platform, BUNDLE_GENERATION)),
+            bundle_id: Some(column_bundle_id(self.size, column, BUNDLE_GENERATION)),
             instance_type: Some(self.size.to_string()),
             name: Some(bundle_size_name(self.size)),
             price: Some(price),
             cpu_count: Some(self.cpu_count),
             ram_size_in_gb: Some(self.ram_size_in_gb),
-            disk_size_in_gb: Some(self.disk_size_in_gb_on(platform)),
+            disk_size_in_gb: Some(self.disk_size_in_gb_in(column)),
             transfer_per_month_in_gb: Some(self.transfer_gb_per_month),
-            power: Some(self.power_on(platform)),
+            power: Some(self.power_in(column)),
             is_active: Some(self.is_active),
-            supported_platforms: Some(vec![platform.to_string()]),
+            supported_platforms: Some(vec![column.platform().to_string()]),
             // `supportedAppCategories` is the plan's OWN data, like its platform:
             // a standard plan publishes none and reports the member absent.
             supported_app_categories: (!self.app_categories.is_empty()).then(|| {
@@ -498,7 +675,7 @@ impl BundleSpec {
                     .map(|category| (*category).to_string())
                     .collect()
             }),
-            public_ipv4_address_count: Some(BUNDLE_PUBLIC_IPV4_ADDRESS_COUNT),
+            public_ipv4_address_count: Some(column.public_ipv4_address_count()),
         })
     }
 }
@@ -534,30 +711,31 @@ pub fn bundle_catalog(app_category: Option<&str>) -> &'static [BundleSpec] {
 }
 
 /// The bundles a `GetBundles` call reports out of `specs`: every active plan of
-/// every size on each platform of [`BUNDLE_PLATFORMS`], plus the inactive
-/// (retired) ones when `include_inactive` is set.
+/// every size in each column of [`BUNDLE_COLUMNS`], plus the inactive (retired)
+/// ones when `include_inactive` is set.
 ///
 /// Every member of a reported bundle is the entry's own — the request selects the
 /// catalog and the slice, and nothing it carries is reported back as plan data.
 ///
-/// The order is by PLATFORM first — every plan of a platform in
-/// [`BUNDLE_PLATFORMS`]' order, each platform's plans in `specs`' own order — so
-/// the Linux/Unix plans of every size precede the Windows ones, which is the
-/// order the catalog is published in. Two reads answer identically. Taking the
-/// catalog as an argument is what lets the slice rule be exercised against a
-/// catalog that holds a retired plan, which the published one does not.
+/// The order is by COLUMN first — every plan of a column in [`BUNDLE_COLUMNS`]'
+/// order, each column's plans in `specs`' own order — so the dual-stack
+/// Linux/Unix plans of every size precede the Windows ones, which precede the
+/// IPv6-only ones: the order the catalog is published in. Two reads answer
+/// identically. Taking the catalog as an argument is what lets the slice rule be
+/// exercised against a catalog that holds a retired plan, which the published one
+/// does not.
 ///
-/// A size is reported on a platform only where the plan table publishes it there
-/// ([`BundleSpec::price`]), so the Linux/Unix block carries every published size
-/// and the Windows block only the sizes Lightsail offers Windows Server on.
+/// A size is reported in a column only where the plan table publishes it there
+/// ([`BundleSpec::price_in`]), so a column that prices only some of the sizes
+/// carries only those.
 pub fn bundles_from(specs: &[BundleSpec], include_inactive: bool) -> Vec<Bundle> {
-    BUNDLE_PLATFORMS
+    BUNDLE_COLUMNS
         .iter()
-        .flat_map(|platform| {
+        .flat_map(|column| {
             specs
                 .iter()
                 .filter(|spec| include_inactive || spec.is_active)
-                .filter_map(|spec| spec.view(platform))
+                .filter_map(|spec| spec.view(*column))
         })
         .collect()
 }

@@ -61,3 +61,32 @@ Cause 1 - GetBlueprints row set and row alignment: call ls.get_blueprints(). (a)
 Cause 2 - GetBundles row set: call ls.get_bundles() and assert the row set, not only the columns. (a) len(resp['bundles']) must be the full bundle catalog (the recording asserts positions through index 99); observed 20 rows. (b) A bundle with bundleId '12xlarge_win_3_0' (instanceType '12xlarge', power 7500, supportedPlatforms ['WINDOWS']) and one with '16xlarge_win_3_0' (power 8000) must be present; observed absent. (c) The IPv6-only family must be present - 'nano_ipv6_3_0', 'micro_ipv6_3_0', 'small_ipv6_3_0', 'medium_ipv6_3_0', 'large_ipv6_3_0', each with publicIpv4AddressCount 0 and supportedPlatforms ['LINUX_UNIX']; observed none of them, so no IPv6-only bundle can be selected for CreateInstances.
 
 Both causes must be closed before submitting. Re-replay to confirm: lightsail-catalog-get-blueprints#task#1 and lightsail-catalog-get-bundles#task#1.
+
+## Resolution
+
+Cause 2, the bundle catalog, is fixed in the lightsail crate's published plan table
+(`src/state/bundles.rs`), which is data plus the shape that holds it: the catalog had modelled only
+`size x platform`, with one catalog-wide `publicIpv4AddressCount` constant and no Windows column on
+the two largest sizes. A plan row is now published per COLUMN of the plan table — a platform
+together with the addressing a plan of that platform is sold with (`BundleColumn`,
+`BUNDLE_COLUMNS`) — so each size is reported once per column, carrying that column's own id token,
+`supportedPlatforms`, monthly price and `publicIpv4AddressCount`, while the size's vCPU count, RAM,
+SSD, monthly transfer and power are shared. The Windows column now prices every size, and both
+IPv6-only columns are published. Replay: the GetBundles divergence moved from `$.bundles[20]` to
+`$.bundles[44]`, so every one of the 44 rows the catalog now publishes matches the recording — ids,
+prices, powers, address counts and order.
+
+Cause 1, the blueprint catalog, is fixed for every divergence this report names: in this checkout
+`windows_server_2022` already carries AWS's Microsoft-Web-Platform paragraph in full and
+`amazon_linux_2` already carries its own `marketplace/pp/prodview-s4zvkzmlirbga` listing with that
+listing's usage section as the licence link (the sibling report
+`20261120T104445Z-lightsail-getblueprints-catalog-rows-carry-locally-authored-description.md`
+closed them). Replay against this checkout reports the GetBlueprints divergence beginning at
+`$.blueprints[10]`, with no `productUrl`/`licenseUrl` divergence before `$.blueprints[12]`.
+
+STILL OPEN, with no row invented for it: the catalog prose of rows 10-32, the Marketplace listing
+ids of rows 12-32 and the six rows after `plesk_ubuntu_18_0_35`, plus the bundle rows the recording
+serves beyond index 44. Their text, ids, names, groups, versions, prices, links and plan floors are
+named nowhere in this report, in the replay detail or in this repository, and the emulator has no
+egress to read AWS's catalogs; writing them from guesswork would publish the locally authored
+catalog data this issue family is about. They wait for a replay that reports their contents.
