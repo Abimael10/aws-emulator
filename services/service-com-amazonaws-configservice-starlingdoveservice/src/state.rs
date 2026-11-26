@@ -2243,6 +2243,14 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// [`crate::ops::put_resource_config::MAX_RESOURCE_CONFIGURATION_BYTES`] and at most
     /// [`TAGS_PER_RESOURCE_QUOTA`] tags.
     pub discovered_resources: BTreeMap<(String, String), DiscoveredResourceEntry>,
+    /// The state recording RESUMED at, for each resource the stopped window left in a
+    /// state the inventory does not record — keyed by the same `(resourceType,
+    /// resourceId)` pair as the inventory above, written through
+    /// [`Self::note_state_at_resumption`] and read by the write path, which records no
+    /// configuration item for a resource it still finds in that state. Config records no
+    /// configuration change made while the recorder was stopped
+    /// (`state::resumed_recording`, which also states how this map stays bounded).
+    pub state_at_resumption: BTreeMap<(String, String), StateAtResumption>,
     /// Retention configurations, keyed by `RetentionConfigurationName`. A `BTreeMap`
     /// so `DescribeRetentionConfigurations` pages over a stable ordering; it holds at
     /// most [`RETENTION_CONFIGURATIONS_QUOTA`] entries, because one engine's store
@@ -2423,6 +2431,17 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         entry: DiscoveredResourceEntry,
     ) -> Option<RecordedItemChange> {
         let key = (entry.resource_type.clone(), entry.resource_id.clone());
+        // A resource still in the state recording RESUMED at records NOTHING: that state is
+        // what the stopped window left behind, and Config does not record a configuration
+        // change made while the recorder was stopped (`state::resumed_recording`). The
+        // inventory is left exactly as it was, so a resource it holds no item for stays
+        // undiscovered until it changes.
+        if self.is_the_state_resumed_at(&key, &entry) {
+            return None;
+        }
+        // Whatever is recorded below is a state the resource reached after recording
+        // resumed, so the state the stopped window left is no longer the one to hold back.
+        self.forget_resource_state_at_resumption(&key);
         let mut entry = entry;
         // What KIND of configuration item this write records, read off the item the
         // inventory holds BEFORE this one replaces it: the resource's first item, an item
@@ -2856,6 +2875,13 @@ pub use remediation_target::*;
 // names as `crate::state::<name>`.
 pub mod pump_lease;
 pub use pump_lease::*;
+
+// What a configuration recorder FOUND when recording RESUMED — the state the stopped
+// window left behind, which Config does not record — lives in
+// `state/resumed_recording.rs`, re-exported here like the modules above so a handler
+// reaches its names as `crate::state::<name>`.
+pub mod resumed_recording;
+pub use resumed_recording::*;
 
 // Which resource type NAMES a discovered-resource listing can be asked about — the types
 // this model enumerates and the CloudFormation registry type names a custom resource is

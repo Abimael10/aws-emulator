@@ -167,9 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.configuration_recorder_name;
         // Whether THIS call is the one that turned recording on, which is what owes the
-        // inventory below: a start of a recorder that is already recording changes
+        // observation below: a start of a recorder that is already recording changes
         // nothing, so it takes none.
         let turned_on;
+        // Whether it RESUMED recording — a recorder that had recorded before and was
+        // stopped — rather than turning it on for the first time. The two observe the same
+        // resources and do opposite things with what they find, so they are decided here,
+        // in the critical section that turned recording on.
+        let resumed;
         // The whole decision and the write it makes are one critical section, which ends
         // before the observation below: that observation reads this account's resources
         // through the services that own them, so no guard of this store may be held
@@ -236,6 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Starting a recorder that is already recording changes nothing: the start
             // this recorder is serving is the one already stamped.
             turned_on = !status.recording;
+            resumed = turned_on && status.last_start_time.is_some();
             if turned_on {
                 status.recording = true;
                 status.last_start_time = Some(now);
@@ -246,23 +252,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // materialises.
                 status.status_settles_at = Some(now + crate::state::RECORDER_STATUS_SETTLE_AFTER);
             }
+            if resumed {
+                // What a PREVIOUS resumption found is not what this one finds, and the
+                // state noted below is this one's. Cleared under the guard that turned
+                // recording on, so no observation can be held back by a window that is
+                // already over.
+                store.forget_state_at_resumption();
+            }
         }
         // A recorder that is recording keeps observing this account's resources with no
-        // further call, so the guard is released, the inventory below is taken and the
+        // further call, so the guard is released, the observation below is made and the
         // pump that runs the later passes is started.
         let region = crate::state::request_region(ctx);
-        // Turning recording ON takes an INVENTORY: Config "discovers all the supported
-        // resources in your account and records their configurations" when the
-        // configuration recorder starts recording, so the resources this recorder records
-        // are observed here and each one's current configuration is recorded. That is what
-        // a recorder resumed after a stop catches up with — every resource that came into
-        // existence, changed or went away while it was stopped has its state recorded as it
-        // is NOW (nothing is backfilled for the stopped window, because Config observed
-        // nothing then) — and it is what makes a later change to one of them the SECOND
-        // item of that resource rather than its first. Only the call that TURNED recording
-        // on takes it: a start of a recorder that was already recording changes nothing, so
-        // it records nothing either.
-        if turned_on {
+        // Turning recording on for the FIRST time takes an INVENTORY: Config "discovers all
+        // the supported resources in your account and records their configurations" when
+        // the configuration recorder starts recording, so the resources this recorder
+        // records are observed here and each one's current configuration is recorded — which
+        // is what makes a later change to one of them the SECOND item of that resource
+        // rather than its first.
+        //
+        // RESUMING is the opposite: Config does not record the configuration changes made
+        // while the configuration recorder was stopped, so the state this observation finds
+        // — everything that came into existence, changed or went away in that window — is
+        // noted as the state recording resumed at and recorded NOWHERE, and what the
+        // recorder records from here on are the changes it observes from then on
+        // (`crate::state::resumed_recording`).
+        //
+        // Only the call that TURNED recording on observes at all: a start of a recorder that
+        // was already recording changes nothing, so it observes nothing either.
+        if resumed {
+            crate::state::note_state_recording_resumed_at(
+                ctx.callback(),
+                &*self.engine,
+                &region,
+                &crate::state::OBSERVABLE_RESOURCE_TYPES,
+            )
+            .await;
+        } else if turned_on {
             crate::state::materialise_recorded_types(
                 ctx.callback(),
                 &*self.engine,

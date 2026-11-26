@@ -4,14 +4,15 @@
 //! emulator as `aws_emulator_router::build_router` assembles it.
 //!
 //! The rule under test: a configuration recorder that is recording observes the resources
-//! of the types its recording group covers and records the configuration item of the state
-//! each one is in, so STARTING a recorder takes an inventory of what it records and every
-//! later change to one of those resources is recorded as it happens — and what an operation
-//! that reports those items answers is the state the account held when it was asked, not
-//! whatever some background task last managed to write. A recorder started again after a
-//! stop therefore records the first change made from then on, for a resource that came into
-//! existence while it was stopped as much as for one it had already recorded, and its own
-//! recording event leaves the in-progress status.
+//! of the types its recording group covers and records a configuration item for each state
+//! it OBSERVES them change into, so every change made while it is recording is recorded —
+//! and what an operation that reports those items answers is the state the account held when
+//! it was asked, not whatever some background task last managed to write. Config records no
+//! change made while the recorder was STOPPED, so a recorder started again after a stop
+//! records the first change made from then on — for a resource that came into existence
+//! while it was stopped as much as for one it had already recorded, and with no item
+//! describing either as the stopped window left it — and its own recording event leaves the
+//! in-progress status.
 //!
 //! The suite lives here because no single crate can see the path: Amazon SQS owns the queue
 //! whose change is recorded, IAM holds the recorder's role, Amazon S3 holds the delivery
@@ -581,6 +582,17 @@ async fn a_restarted_recorder_records_what_changes_from_then_on() {
             json!(changed_to),
             "case {case:?}: the first read after the restart reports the state the change \
              left, got {items:?}"
+        );
+        // One item per change the recorder observed, and NONE describing the queue as the
+        // stopped window left it: a queue Config had already recorded holds the item it was
+        // recorded with beside the one the change records, and one it had not holds only the
+        // change's.
+        let expected = usize::from(recorded_before) + 1;
+        assert_eq!(
+            items.len(),
+            expected,
+            "case {case:?}: expected {expected} configuration item(s) and no backfill of the \
+             stopped window, got {items:?}"
         );
 
         // And the restarted recorder's own recording event is processed: it reports that it

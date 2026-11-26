@@ -968,6 +968,67 @@ pub async fn materialise_recorded_types<Eng: Send + Sync + 'static>(
     region: &str,
     resource_types: &[&str],
 ) {
+    observe_inline(
+        callback,
+        engine,
+        region,
+        resource_types,
+        WhatWasObserved::Recorded,
+    )
+    .await;
+}
+
+/// Observe what a recorder that has just RESUMED records, and note what it found as the
+/// state recording resumed at — recording no configuration item for any of it.
+///
+/// Config does not record the configuration changes made while the configuration recorder
+/// was stopped, and the state this observation finds is exactly what that window left
+/// behind: a resource that came into existence, changed or went away while the recorder was
+/// off is in a state no configuration item records, and none is written for it
+/// (`super::resumed_recording`). What the recorder records from here on are the changes it
+/// observes, so the next state such a resource changes into is what its next item records.
+///
+/// Observed the same way, and under the same bound and claim, as a request's own
+/// observation ([`materialise_recorded_types`]): the one difference is what becomes of what
+/// it found.
+pub async fn note_state_recording_resumed_at<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+    resource_types: &[&str],
+) {
+    observe_inline(
+        callback,
+        engine,
+        region,
+        resource_types,
+        WhatWasObserved::NotRecorded,
+    )
+    .await;
+}
+
+/// What becomes of what one inline observation found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatWasObserved {
+    /// It is RECORDED: a configuration item per resource whose state the inventory does not
+    /// already record, and the change notification each one owes.
+    Recorded,
+    /// It is noted as the state recording RESUMED at and recorded nowhere, because Config
+    /// does not record what changed while the recorder was stopped.
+    NotRecorded,
+}
+
+/// ONE inline observation of `resource_types`, performed by the request that needs it.
+///
+/// Both readings of an observation go through here, so what is observed — and the claim and
+/// the bound it is observed under — cannot differ between them.
+async fn observe_inline<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    engine: &Eng,
+    region: &str,
+    resource_types: &[&str],
+    what_was_observed: WhatWasObserved,
+) {
     let Some(state) = service_state(engine) else {
         return;
     };
@@ -995,6 +1056,12 @@ pub async fn materialise_recorded_types<Eng: Send + Sync + 'static>(
         let observed = observed_resources(callback, region, now, observing).await;
         let recorded = {
             let mut store = state.lock();
+            if what_was_observed == WhatWasObserved::NotRecorded {
+                for (resource_type, entries) in observed {
+                    store.note_state_at_resumption(resource_type, entries);
+                }
+                return;
+            }
             let mut recorded = Vec::new();
             for (resource_type, entries) in observed {
                 recorded.extend(store.record_observed(resource_type, entries, now));

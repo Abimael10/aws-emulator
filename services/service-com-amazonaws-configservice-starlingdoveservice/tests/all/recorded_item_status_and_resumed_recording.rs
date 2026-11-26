@@ -9,8 +9,9 @@
 //!    item — the only one an unchanged resource ever has — is stamped
 //!    `ResourceDiscovered`, and a later state records `OK`.
 //! 2. Recording is suspended between `StopConfigurationRecorder` and the next
-//!    `StartConfigurationRecorder` and RESUMES after it: a change made while the
-//!    recorder was stopped is recorded once it runs again.
+//!    `StartConfigurationRecorder`: Config records no configuration change made while the
+//!    recorder was stopped, so what that window did to a resource is never recorded, and
+//!    the next change the recorder OBSERVES is what the resource's next item records.
 //!
 //! The resource every row below is about lives in its OWN service — Config is told
 //! nothing about it — so every configuration item asserted on is one the recorder
@@ -325,46 +326,112 @@ async fn a_changed_resource_records_one_further_item_per_state_it_leaves() {
     }
 }
 
+/// One stop-and-restart cycle: what the stopped window did to the resource, and the change
+/// the recorder then observes.
+struct Resumption {
+    /// What this row is about, named in every assertion.
+    case: &'static str,
+    /// The queue's name, which is also the last segment of its url.
+    queue: &'static str,
+    /// The attributes the queue was created with BEFORE the recorder was stopped, for a
+    /// resource Config had already recorded; `None` for one that came into existence while
+    /// the recorder was stopped.
+    recorded_before: Option<&'static str>,
+    /// What the STOPPED window did: the attribute it left the queue carrying, and that
+    /// value. For a queue created while the recorder was stopped, that is the attribute it
+    /// was created with. No configuration item ever records this value.
+    while_stopped: (&'static str, &'static str),
+    /// The attribute the queue is changed in once the recorder is running again, and the
+    /// value it is changed to. Both are `com.amazonaws.sqs#QueueAttributeName` values a
+    /// queue carries as part of its configuration.
+    then_changed: (&'static str, &'static str),
+}
+
+/// The rows: what the recorder missed while it was stopped — an attribute changed on a
+/// resource it had already recorded, another attribute changed on one, and a resource that
+/// came into existence — each then changed in that SAME attribute once recording resumed,
+/// so the value no item may record is one the later change did not leave behind either.
+fn resumptions() -> [Resumption; 3] {
+    [
+        Resumption {
+            case: "the visibility timeout changed while the recorder was stopped",
+            queue: "paused-queue",
+            recorded_before: Some("31"),
+            while_stopped: ("VisibilityTimeout", "41"),
+            then_changed: ("VisibilityTimeout", "51"),
+        },
+        Resumption {
+            case: "the delay changed while the recorder was stopped",
+            queue: "delayed-while-stopped",
+            recorded_before: Some("31"),
+            while_stopped: ("DelaySeconds", "9"),
+            then_changed: ("DelaySeconds", "7"),
+        },
+        Resumption {
+            case: "a queue created while the recorder was stopped",
+            queue: "created-while-stopped",
+            recorded_before: None,
+            while_stopped: ("VisibilityTimeout", "141"),
+            then_changed: ("VisibilityTimeout", "151"),
+        },
+    ]
+}
+
 #[tokio::test]
-async fn a_change_made_while_the_recorder_was_stopped_is_recorded_once_it_runs_again() {
-    let emulator = Emulator::new();
-    emulator.recording().await;
-    let queue_url =
-        create_queue(&emulator, "paused-queue", &json!({ "VisibilityTimeout": "31" })).await;
-    await_items("the discovery", &emulator, &queue_url, 1).await;
+async fn no_configuration_item_records_a_change_made_while_the_recorder_was_stopped() {
+    for row in resumptions() {
+        let Resumption {
+            case,
+            queue,
+            recorded_before,
+            while_stopped,
+            then_changed,
+        } = row;
+        let (missed_attribute, missed_value) = while_stopped;
+        let (changed_attribute, changed_value) = then_changed;
 
-    // Two stop-and-restart cycles, differing along the attribute changed while the
-    // recorder was stopped: recording resumes every time it is started, not only the
-    // first time.
-    let cycles: [(&str, &str, &str); 2] = [
-        ("the visibility timeout", "VisibilityTimeout", "41"),
-        ("the delay", "DelaySeconds", "9"),
-    ];
+        let emulator = Emulator::new();
+        emulator.recording().await;
 
-    let mut expected = 1;
-    for (case, attribute, updated) in cycles {
+        // A resource Config had already recorded is created and observed while the recorder
+        // is still running; one it had not comes into existence while it is stopped.
+        let mut queue_url = String::new();
+        let mut recorded = 0;
+        if let Some(created_with) = recorded_before {
+            queue_url =
+                create_queue(&emulator, queue, &json!({ "VisibilityTimeout": created_with })).await;
+            await_items(case, &emulator, &queue_url, 1).await;
+            recorded = 1;
+        }
+
         emulator
             .config(
                 "StopConfigurationRecorder",
                 &json!({ "ConfigurationRecorderName": RECORDER_NAME }),
             )
             .await;
-        emulator
-            .sqs(
-                "SetQueueAttributes",
-                &json!({ "QueueUrl": queue_url, "Attributes": { attribute: updated } }),
+        if recorded_before.is_some() {
+            emulator
+                .sqs(
+                    "SetQueueAttributes",
+                    &json!({
+                        "QueueUrl": queue_url,
+                        "Attributes": { missed_attribute: missed_value },
+                    }),
+                )
+                .await;
+        } else {
+            queue_url = create_queue(
+                &emulator,
+                queue,
+                &json!({ missed_attribute: missed_value }),
             )
             .await;
+        }
 
-        // Nothing is recorded while the recorder is stopped: the change is invisible to
-        // Config until it runs again.
-        let items = stays_at(case, &emulator, &queue_url, expected).await;
-        assert_ne!(
-            configuration(case, &items[0])[attribute],
-            json!(updated),
-            "case {case:?}: a stopped recorder records nothing, got {:?}",
-            items[0]
-        );
+        // Nothing is recorded while the recorder is stopped: what the stopped window did is
+        // invisible to Config.
+        stays_at(case, &emulator, &queue_url, recorded).await;
 
         emulator
             .config(
@@ -372,18 +439,58 @@ async fn a_change_made_while_the_recorder_was_stopped_is_recorded_once_it_runs_a
                 &json!({ "ConfigurationRecorderName": RECORDER_NAME }),
             )
             .await;
-        expected += 1;
-        let items = await_items(case, &emulator, &queue_url, expected).await;
+
+        // And it stays invisible AFTER the restart: Config does not record a configuration
+        // change made while the configuration recorder was stopped, so the state the stopped
+        // window left behind is the state recording resumed at and no item records it — a
+        // resource Config holds no item for stays undiscovered.
+        let items = stays_at(case, &emulator, &queue_url, recorded).await;
+        for item in &items {
+            assert_ne!(
+                configuration(case, item)[missed_attribute],
+                json!(missed_value),
+                "case {case:?}: no configuration item records what changed while the \
+                 recorder was stopped, got {item:?}"
+            );
+        }
+
+        // The next change the recorder OBSERVES is recorded, as the item the resource owes:
+        // the first item of a resource Config had never recorded, and a further item of one
+        // it had.
+        emulator
+            .sqs(
+                "SetQueueAttributes",
+                &json!({
+                    "QueueUrl": queue_url,
+                    "Attributes": { changed_attribute: changed_value },
+                }),
+            )
+            .await;
+        let items = await_items(case, &emulator, &queue_url, recorded + 1).await;
         assert_eq!(
-            configuration(case, &items[0])[attribute],
-            json!(updated),
-            "case {case:?}: the restarted recorder records the change it was stopped for, \
-             got {:?}",
+            configuration(case, &items[0])[changed_attribute],
+            json!(changed_value),
+            "case {case:?}: the newest item records the state the change left, got {:?}",
             items[0]
         );
+        assert_eq!(
+            statuses(&items).last().map(String::as_str),
+            Some(RESOURCE_DISCOVERED),
+            "case {case:?}: the oldest item of the resource is its discovery, got {items:?}"
+        );
+        for item in &items {
+            assert_ne!(
+                configuration(case, item)[missed_attribute],
+                json!(missed_value),
+                "case {case:?}: the item the change records is not a backfill of the \
+                 stopped window, got {item:?}"
+            );
+        }
+        // One item per change the recorder OBSERVED, and none for the stopped window.
+        stays_at(case, &emulator, &queue_url, recorded + 1).await;
 
-        // The restarted recorder's own recording event is processed: it reports that it
-        // is recording, and its last status leaves the in-progress value.
+        // The restarted recorder's own recording event is processed: it reports that it is
+        // recording, and its last status leaves the in-progress value.
         let deadline = Instant::now() + CONVERGENCE_BUDGET;
         loop {
             let described = emulator
@@ -404,36 +511,4 @@ async fn a_change_made_while_the_recorder_was_stopped_is_recorded_once_it_runs_a
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
-
-    // A resource CREATED while the recorder was stopped is discovered once it runs
-    // again: resumption is about what the recorder observes from then on, not only about
-    // the resources it had already seen.
-    let case = "a queue created while the recorder was stopped";
-    emulator
-        .config(
-            "StopConfigurationRecorder",
-            &json!({ "ConfigurationRecorderName": RECORDER_NAME }),
-        )
-        .await;
-    let created_while_stopped =
-        create_queue(&emulator, "created-while-stopped", &json!({ "DelaySeconds": "3" })).await;
-    stays_at(case, &emulator, &created_while_stopped, 0).await;
-    emulator
-        .config(
-            "StartConfigurationRecorder",
-            &json!({ "ConfigurationRecorderName": RECORDER_NAME }),
-        )
-        .await;
-    let items = await_items(case, &emulator, &created_while_stopped, 1).await;
-    assert_eq!(
-        statuses(&items),
-        vec![RESOURCE_DISCOVERED.to_string()],
-        "case {case:?}: the item is the resource's discovery, got {items:?}"
-    );
-    assert_eq!(
-        configuration(case, &items[0])["DelaySeconds"],
-        json!("3"),
-        "case {case:?}: the discovery item records the state the resource is in, got {:?}",
-        items[0]
-    );
 }
