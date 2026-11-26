@@ -77,24 +77,50 @@ pub fn resource_scope_denial<E>(
 /// and ahead of [`resource_scope_denial`]: it is the more specific of the two
 /// authorization failures, and a caller can act on it.
 ///
-/// A destination that passes no role at all (an SNS topic) reaches the other decision.
+/// A definition that hands over no such role at all — because every ARN it carries names
+/// some other kind of resource (a log group, a Firehose stream, an SNS topic), a role of
+/// this account, or nothing parsable — reaches the other decision.
+///
+/// WHICH VALUE decides, not which member carries it: the question is what the request hands
+/// this service, so EVERY ARN-bearing member of the definition
+/// ([`passed_arns`]) is read through the one value predicate
+/// [`names_another_accounts_role`]. Keying the scan to member names would make the same
+/// value a refusal in one member and a stored destination in another, which it is not — and
+/// this model's own member documentation crosses the two Firehose members over
+/// (`smithy_query(query="shape",shape="KinesisFirehoseDestination",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`
+/// documents `DeliveryStreamArn` as "the ARN of an IAM role" and `IamRoleArn` as the
+/// Firehose destination), so no member name is evidence of what its value is.
 pub fn pass_role_denial<E>(
     definition: &super::EventDestinationDefinition,
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
+    passed_arns(definition)
+        .any(names_another_accounts_role)
+        .then(cross_account_pass_role)
+}
+
+/// Every ARN the event destination definition hands this service: both members of a
+/// CloudWatch Logs destination, both of a Kinesis Data Firehose one and the SNS topic — the
+/// complete set of string members the three destination shapes declare
+/// (`smithy_query(query="shape",shape="CloudWatchLogsDestination,KinesisFirehoseDestination,SnsDestination",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
+/// so a member added to one of them is the only thing that can change this list.
+///
+/// Absent members and absent destinations yield nothing, which is why a definition that
+/// names no destination target produces an empty scan rather than a refusal.
+fn passed_arns(
+    definition: &super::EventDestinationDefinition,
+) -> impl Iterator<Item = &str> {
+    let cloud_watch_logs = definition.cloud_watch_logs_destination.as_ref();
+    let kinesis_firehose = definition.kinesis_firehose_destination.as_ref();
+    let sns = definition.sns_destination.as_ref();
     [
-        definition
-            .cloud_watch_logs_destination
-            .as_ref()
-            .and_then(|destination| destination.iam_role_arn.as_deref()),
-        definition
-            .kinesis_firehose_destination
-            .as_ref()
-            .and_then(|destination| destination.iam_role_arn.as_deref()),
+        cloud_watch_logs.and_then(|destination| destination.iam_role_arn.as_deref()),
+        cloud_watch_logs.and_then(|destination| destination.log_group_arn.as_deref()),
+        kinesis_firehose.and_then(|destination| destination.delivery_stream_arn.as_deref()),
+        kinesis_firehose.and_then(|destination| destination.iam_role_arn.as_deref()),
+        sns.and_then(|destination| destination.topic_arn.as_deref()),
     ]
     .into_iter()
     .flatten()
-    .any(names_another_accounts_role)
-    .then(cross_account_pass_role)
 }
 
 /// Whether `role_arn` names an IAM role an account OTHER than the one this emulator serves
