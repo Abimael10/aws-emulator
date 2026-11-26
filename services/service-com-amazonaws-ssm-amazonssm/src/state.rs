@@ -2937,8 +2937,9 @@ impl ComAmazonawsSsmAmazonssmState {
     ///
     /// Built from the catalogue's own body, so everything the read reports beyond the
     /// name, the type and the publication dates — the schema version, the description, the
-    /// parameters, the platform types, the hash — is derived by the one content reader
-    /// that reads a created document's content. A published document is already
+    /// parameters, the platform types, the hash, the document format — is derived by the
+    /// one content reader that reads a created document's content. A published document is
+    /// already
     /// registered, so every version of it is `Active` with no transition owed, it is owned
     /// by Amazon rather than by the account reading it, and each version is dated by the
     /// catalogue's own publication date for THAT version
@@ -2946,7 +2947,7 @@ impl ComAmazonawsSsmAmazonssmState {
     /// nobody here created it. The default version is the newest the catalogue publishes
     /// ([`PublishedDocument::default_published_version`]).
     pub fn published_document_record(&self, region: &str, name: &str) -> Option<DocumentRecord> {
-        let (published, parsed, hash) = published_document_projection(name)?;
+        let (published, parsed, hash, document_format) = published_document_projection(name)?;
         Some(DocumentRecord {
             // The id this store minted for the catalogue entry when it came into being;
             // every read of that published document reports it.
@@ -2967,7 +2968,12 @@ impl ComAmazonawsSsmAmazonssmState {
                     version: release.version,
                     display_name: None,
                     version_name: None,
-                    document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
+                    // The format Amazon authored the document in, which is the format the
+                    // catalogue's body for it is written in
+                    // ([`PublishedDocument::document_format`]) rather than the one a create
+                    // that declares none falls back to: a read of a document Amazon
+                    // authored in YAML reports YAML.
+                    document_format: document_format.to_string(),
                     // The target type is the catalogue's own
                     // ([`PublishedDocument::target_type`]): Amazon declares what kinds of
                     // resource a document it publishes runs on, so a read reports it and the

@@ -113,10 +113,10 @@ async fn every_published_document_lists_an_active_version_dated_by_its_publicati
                 json!(entry.default_published_version().to_string()),
                 json!(true),
                 json!("Active"),
-                json!("JSON"),
+                json!(entry.document_format()),
             ),
-            "case {case}: a published document lists its Active, default JSON version, \
-             got {version}"
+            "case {case}: a published document lists its Active, default version in the \
+             format it is authored in, got {version}"
         );
 
         let date = created_date(case, &version);

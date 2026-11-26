@@ -5,7 +5,9 @@
 //!
 //! One file for one concern: a body here is read by nothing but the catalogue table
 //! ([`super::PUBLISHED_DOCUMENTS`]), which is what a read of a published document is
-//! projected from. Each body is written in [`super::DEFAULT_DOCUMENT_FORMAT`] and declares
+//! projected from. Each body is written in the format Amazon AUTHORED that document in —
+//! JSON for most of them, YAML for one Amazon publishes in YAML — and that format is what
+//! a read reports for it ([`super::PublishedDocument::document_format`]); each declares
 //! the parameters the "Systems Manager command document reference" and the "Session
 //! document schema" of the Amazon Web Services Systems Manager User Guide document for
 //! that document, plus the step whose plugin decides the platforms it is compatible with
@@ -149,54 +151,51 @@ pub const INSTALL_POWER_SHELL_MODULE: &str = r#"{
 }"#;
 
 /// Installs the Windows updates a node is missing.
-pub const INSTALL_WINDOWS_UPDATES: &str = r#"{
-  "schemaVersion": "2.2",
-  "description": "Install Windows updates on a managed node, selected by category and severity.",
-  "parameters": {
-    "Action": {
-      "type": "String",
-      "description": "(Required) Whether to install the updates or only scan for them.",
-      "allowedValues": ["Install", "Scan"],
-      "default": "Install"
-    },
-    "AllowReboot": {
-      "type": "String",
-      "description": "(Optional) Whether the node may be rebooted to finish an update.",
-      "allowedValues": ["True", "False"],
-      "default": "True"
-    },
-    "IncludeKbs": {
-      "type": "String",
-      "description": "(Optional) The KB article ids to install, comma separated.",
-      "default": ""
-    },
-    "ExcludeKbs": {
-      "type": "String",
-      "description": "(Optional) The KB article ids to leave out, comma separated.",
-      "default": ""
-    },
-    "Categories": {
-      "type": "String",
-      "description": "(Optional) The update categories to install, comma separated.",
-      "default": ""
-    },
-    "SeverityLevels": {
-      "type": "String",
-      "description": "(Optional) The update severity levels to install, comma separated.",
-      "default": ""
-    }
-  },
-  "mainSteps": [
-    {
-      "name": "installWindowsUpdates",
-      "action": "aws:runPowerShellScript",
-      "inputs": {
-        "commands": ["Install-WindowsUpdates"],
-        "timeoutSeconds": "7200"
-      }
-    }
-  ]
-}"#;
+///
+/// Authored in YAML, which is the format the recorded catalogue reports for this document:
+/// the format a read reports is the format of the body ([`super::PublishedDocument::document_format`]),
+/// so the body carried here is the one Amazon publishes the document in.
+pub const INSTALL_WINDOWS_UPDATES: &str = r#"schemaVersion: "2.2"
+description: Install Windows updates on a managed node, selected by category and severity.
+parameters:
+  Action:
+    type: String
+    description: "(Required) Whether to install the updates or only scan for them."
+    allowedValues:
+      - Install
+      - Scan
+    default: Install
+  AllowReboot:
+    type: String
+    description: "(Optional) Whether the node may be rebooted to finish an update."
+    allowedValues:
+      - "True"
+      - "False"
+    default: "True"
+  IncludeKbs:
+    type: String
+    description: "(Optional) The KB article ids to install, comma separated."
+    default: ""
+  ExcludeKbs:
+    type: String
+    description: "(Optional) The KB article ids to leave out, comma separated."
+    default: ""
+  Categories:
+    type: String
+    description: "(Optional) The update categories to install, comma separated."
+    default: ""
+  SeverityLevels:
+    type: String
+    description: "(Optional) The update severity levels to install, comma separated."
+    default: ""
+mainSteps:
+  - name: installWindowsUpdates
+    action: "aws:runPowerShellScript"
+    inputs:
+      commands:
+        - Install-WindowsUpdates
+      timeoutSeconds: "7200"
+"#;
 
 /// Reports the Windows updates a node is missing, without installing any of them.
 pub const FIND_WINDOWS_UPDATES: &str = r#"{

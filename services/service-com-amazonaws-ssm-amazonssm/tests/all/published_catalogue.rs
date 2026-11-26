@@ -176,9 +176,10 @@ async fn every_published_document_is_projected_from_the_catalogue() {
         );
         assert_eq!(
             identifier["DocumentFormat"].as_str(),
-            Some("JSON"),
-            "case {case}: expected the format the catalogue body is written in, got \
-             {identifier}"
+            Some(entry.document_format()),
+            "case {case}: expected the format the catalogue body is written in ({}), got \
+             {identifier}",
+            entry.document_format()
         );
         assert_eq!(
             identifier["DocumentVersion"].as_str(),

@@ -671,7 +671,17 @@ async fn a_published_document_reports_the_published_content() {
     );
     for published in CATALOGUE {
         let case = published.name;
-        let read = get_ok(&router, case, &json!({ "Name": published.name })).await;
+        // Asked for in the format Amazon authored the document in, which is the format the
+        // catalogue's body for it is written in: a read that asks for THAT format reports
+        // the published bytes verbatim, rather than a re-rendering of them (the format a
+        // request naming none falls back to is pinned by `all/published_document_formats.rs`).
+        let authored = published.document_format();
+        let read = get_ok(
+            &router,
+            case,
+            &json!({ "Name": published.name, "DocumentFormat": authored }),
+        )
+        .await;
         assert_eq!(
             content_of(case, &read),
             published.content,
@@ -680,7 +690,7 @@ async fn a_published_document_reports_the_published_content() {
         for (member, expected) in [
             ("Name", json!(published.name)),
             ("DocumentType", json!(published.document_type)),
-            ("DocumentFormat", json!("JSON")),
+            ("DocumentFormat", json!(authored)),
             ("DocumentVersion", json!(published.default_published_version().to_string())),
             // A published document is already registered, so it is never `Creating`.
             ("Status", json!("Active")),
@@ -698,7 +708,7 @@ async fn a_published_document_reports_the_published_content() {
         &router,
         "eu-west-1",
         "GetDocument",
-        &json!({ "Name": published.name }),
+        &json!({ "Name": published.name, "DocumentFormat": published.document_format() }),
     )
     .await;
     assert_eq!(

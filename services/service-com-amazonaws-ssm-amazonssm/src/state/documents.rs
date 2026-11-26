@@ -494,10 +494,11 @@ pub struct PublishedDocument {
     pub name: &'static str,
     /// A `DocumentType` value (`crate::ops::types::DOCUMENT_TYPE_VALUES`).
     pub document_type: &'static str,
-    /// The document's body, in [`DEFAULT_DOCUMENT_FORMAT`]. Everything a read reports
-    /// beyond the name, the type, the target type and the publication date is derived from
-    /// it by the one content reader ([`parse_document_content`]), exactly as it is for a
-    /// document a caller created.
+    /// The document's body, in the format Amazon authored it in
+    /// ([`PublishedDocument::document_format`]). Everything a read reports beyond the name,
+    /// the type, the target type and the publication date is derived from it by the one
+    /// content reader ([`parse_document_content`]), exactly as it is for a document a caller
+    /// created — the reported `DocumentFormat` included.
     pub content: &'static str,
     /// Which kind of body [`PublishedDocument::content`] is.
     pub body: PublishedBody,
@@ -532,6 +533,25 @@ pub struct PublishedDocument {
 }
 
 impl PublishedDocument {
+    /// The `DocumentFormat` Amazon AUTHORED this document in, which is what every read of
+    /// it reports: "the document format, either JSON or YAML"
+    /// (`DocumentVersionInfo$DocumentFormat`).
+    ///
+    /// A published document was written by Amazon rather than created here, so its format
+    /// is a fact of the catalogue the way its type and its publication date are — and the
+    /// catalogue carries it in the only place it cannot disagree with: the BODY itself. YAML
+    /// 1.2 is a superset of JSON, so a body that reads as JSON is a JSON document and any
+    /// other body this service's one parser reads is a YAML one. Nothing here is the
+    /// format a create of this account's own document falls back to
+    /// ([`DEFAULT_DOCUMENT_FORMAT`]): that is the default of a REQUEST that declares none.
+    pub fn document_format(&self) -> &'static str {
+        if ::serde_json::from_str::<::serde_json::Value>(self.content).is_ok() {
+            DEFAULT_DOCUMENT_FORMAT
+        } else {
+            DOCUMENT_FORMAT_YAML
+        }
+    }
+
     /// The instant this document was published, as the stored record and every projection
     /// of it carry it ([`PublishedDocument::created_date_millis`]).
     pub fn created_date(&self) -> SystemTime {
@@ -905,45 +925,50 @@ pub fn published_document(name: &str) -> Option<&'static PublishedDocument> {
         .find(|published| published.name == name)
 }
 
-/// What each catalogue body yields: the members the content reader derives from it, and
-/// its hash.
+/// What each catalogue body yields: the members the content reader derives from it, its
+/// hash, and the format it is authored in.
 ///
 /// Derived ONCE for the process rather than per read. The bodies are `const`, so two
 /// reads of one published document cannot differ, and no request pays for parsing them.
 /// A body this reader cannot read — a mistake in a `const` of this crate, which the test
 /// suite reads every entry to catch, never a caller's input — yields nothing derived
 /// rather than panicking a live request: the document does exist either way.
-pub(super) static PUBLISHED_PROJECTIONS: ::std::sync::LazyLock<Vec<(ParsedDocumentContent, String)>> =
-    ::std::sync::LazyLock::new(|| {
-        PUBLISHED_DOCUMENTS
-            .iter()
-            .map(|published| {
-                let parsed = parse_document_content(
-                    published.content,
-                    DEFAULT_DOCUMENT_FORMAT,
-                    published.document_type,
-                )
-                .unwrap_or_default();
-                (parsed, document_content_hash(published.content))
-            })
-            .collect()
-    });
+///
+/// Each body is read in ITS OWN format ([`PublishedDocument::document_format`]), so a
+/// document Amazon authored in YAML yields the same description, parameters and platform
+/// types as one it authored in JSON.
+pub(super) static PUBLISHED_PROJECTIONS: ::std::sync::LazyLock<
+    Vec<(ParsedDocumentContent, String, &'static str)>,
+> = ::std::sync::LazyLock::new(|| {
+    PUBLISHED_DOCUMENTS
+        .iter()
+        .map(|published| {
+            let format = published.document_format();
+            let parsed =
+                parse_document_content(published.content, format, published.document_type)
+                    .unwrap_or_default();
+            (parsed, document_content_hash(published.content), format)
+        })
+        .collect()
+});
 
-/// The published document `name` names together with what its body yields, or `None`
-/// when the catalogue holds no document of that name.
+/// The published document `name` names together with what its body yields — the derived
+/// members, the body's hash and the format it is authored in — or `None` when the
+/// catalogue holds no document of that name.
 pub(super) fn published_document_projection(
     name: &str,
 ) -> Option<(
     &'static PublishedDocument,
     &'static ParsedDocumentContent,
     &'static str,
+    &'static str,
 )> {
     let index = PUBLISHED_DOCUMENTS
         .iter()
         .position(|published| published.name == name)?;
     let published = PUBLISHED_DOCUMENTS.get(index)?;
-    let (parsed, hash) = PUBLISHED_PROJECTIONS.get(index)?;
-    Some((published, parsed, hash.as_str()))
+    let (parsed, hash, format) = PUBLISHED_PROJECTIONS.get(index)?;
+    Some((published, parsed, hash.as_str(), format))
 }
 
 /// The hash the system takes over a document's content: "The Sha256 or Sha1 hash created

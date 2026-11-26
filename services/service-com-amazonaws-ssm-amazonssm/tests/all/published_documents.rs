@@ -606,10 +606,19 @@ async fn every_published_document_resolves_without_a_create() {
                 row.case
             );
         }
+        // The format the catalogue's body for the document is written in, which is the
+        // format Amazon authored it in: JSON for most entries, YAML for one Amazon
+        // publishes in YAML.
+        let authored_format = CATALOGUE
+            .iter()
+            .find(|entry| entry.name == row.name)
+            .map(|entry| entry.document_format())
+            .unwrap_or_default();
         assert_eq!(
             document["DocumentFormat"].as_str(),
-            Some("JSON"),
-            "case {}: expected the default document format, got {document}",
+            Some(authored_format),
+            "case {}: expected the format the document is authored in ({authored_format}), \
+             got {document}",
             row.case
         );
         assert_eq!(

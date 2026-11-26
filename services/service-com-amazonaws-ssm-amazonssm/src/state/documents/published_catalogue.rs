@@ -12,8 +12,10 @@
 //! declare and is not in this service's model: the NAME, the `DocumentType`, the
 //! `TargetType` where the catalogue names one, and WHEN Amazon published it. Everything
 //! else a read reports — the description, the schema version, the parameters, the platform
-//! types, the hash — is derived from the entry's body by the one content reader
-//! ([`parse_document_content`]), exactly as it is for a document a caller created.
+//! types, the hash, the `DocumentFormat` the entry is authored in — is derived from the
+//! entry's body by the one content reader ([`parse_document_content`]) and by
+//! [`PublishedDocument::document_format`], exactly as it is for a document a caller
+//! created.
 //!
 //! Two kinds of body appear here ([`PublishedBody`]): the bodies this crate AUTHORS for the
 //! documents whose parameters the Systems Manager references document one by one, and the
