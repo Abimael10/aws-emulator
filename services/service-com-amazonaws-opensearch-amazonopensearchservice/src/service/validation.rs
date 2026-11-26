@@ -1016,12 +1016,10 @@ static PUBLISHED_INSTANCE_TYPES: LazyLock<Vec<&'static str>> =
 /// for the instance types that list is the service's own published catalog
 /// ([`PUBLISHED_INSTANCE_TYPES`], over `crate::state::published_instance_types`) — the record
 /// of which instance types exist, which the operations resolving one against it refuse a
-/// value outside. The `OpenSearchPartitionInstanceType` value set this model carries is an
-/// older SNAPSHOT of that catalog (it stops before the seventh-generation Intel, Graviton4,
-/// dense-storage and second-generation OpenSearch-optimized families the catalog publishes),
-/// so a clause stating the snapshot would tell a caller that instance types the service does
-/// publish are invalid, and would omit the ones it has to choose from. The message is the
-/// only place the accepted list is stated, so it states the catalog.
+/// value outside. The `OpenSearchPartitionInstanceType` value set this model carries holds
+/// the same instance types, so this states the clause off the CATALOG rather than off the
+/// schema the walk happened to report: the catalog is where a type is published, and a
+/// clause that named anything else could offer a caller a type the service then refuses.
 ///
 /// Recognised by the value SET rather than by the member path — the same reading
 /// [`::service_common::validation_message::stated_enum_value_set`] applies — so every member
@@ -1029,14 +1027,6 @@ static PUBLISHED_INSTANCE_TYPES: LazyLock<Vec<&'static str>> =
 /// value and at any depth. Nothing else about the violation moves: the member path, the
 /// echoed value and the requirement's wording stay the framework's, and the ORDER the set is
 /// listed in is still [`in_hashed_enum_order`]'s, applied after this.
-///
-/// WHAT THIS DOES NOT CHANGE, recorded rather than papered over: which values the boundary
-/// ADMITS. The walk in front of a handler checks a member against the enum codegen captured
-/// off the model, so a request naming an instance type only the catalog publishes is still
-/// refused before any handler runs; the admissible set is the model's until the model's enum
-/// carries the catalog, which no refusal wording can decide. The clause states what the
-/// service accepts because that is what the message is for — telling a caller which values
-/// to choose from.
 ///
 /// The set is a CONSTANT of this service (its catalog), so the size of the clause this
 /// states is a constant of this crate rather than anything one request chooses, exactly as

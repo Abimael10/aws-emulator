@@ -45,3 +45,57 @@ All four clusters are replay verdict 'mismatch', service 'es', with matching HTT
 4. Cause 3: replay es-engine-version-and-instance-catalog#task#5 - GET /2021-01-01/opensearch/instanceTypeLimits/<EngineVersion>/t9.nonexistent.search - and diff $.message's enum value set against the recorded one.
 5. Cause 4: replay esdef-create-domain-gp3-server-defaults#task#2 - CreateDomain an OpenSearch_2.19 t3.small.search/gp3 domain, then DescribeDomain and read DomainStatus.ServiceSoftwareOptions.CurrentVersion; the emulator always answers OpenSearch_2_19_R20250101.
 6. Re-replay es-engine-version-and-instance-catalog#task#3, opensearch-domain-version-capacity-and-software-update-management#task#5, es-engine-version-and-instance-catalog#task#5 and esdef-create-domain-gp3-server-defaults#task#2 to confirm all four causes are closed.
+
+## Resolution
+
+Causes 1, 2 and 3 — the catalog's MEMBERSHIP and, with it, the set the service ACCEPTS,
+are fixed. A type the service publishes is a type a caller may name, so the
+instance-type catalog and `OpenSearchPartitionInstanceType` are now one set:
+
+* `INSTANCE_TYPE_CATALOG` publishes both halves of each generation the service offers as
+  a pair — the EBS-backed `r7g` beside the already-published NVMe `r7gd`, and the Intel
+  `i4i` beside the already-published Graviton `im4gn` — the two families this report's
+  recorded evidence names that the table still omitted (16 instance types);
+* the on-disk `OpenSearchPartitionInstanceType` enum was refreshed to the whole catalog
+  (137 added values). Before this, the request boundary admitted only the model's older
+  103-value snapshot, so every current-generation type the listing published — `m7i`,
+  `c8g`, `oi2`, `r7i`, `i8g(e)`, `om2`, `or2`, `r8g(d)`, `r7gd`, `im4gn`, `i7i` — was
+  refused with 400 on `DescribeInstanceTypeLimits`, `CreateDomain`, `UpdateDomainConfig`
+  and every other member targeting that enum: the catalog advertised types the service
+  would not take. The refusal's `Member must satisfy enum value set: [...]` clause states
+  that same set, so it now names every family the recording names.
+
+Still DECLINED, as in 20261114T061447Z, 20261101T032039Z and 20261030T001859Z: the ORDER
+the set is stated in, which is what the `ListInstanceTypeDetails` and
+`DescribeInstanceTypeLimits` replay keys still report. `InstanceTypeDetailsList` carries
+no ordering trait and no documented order; the recorded orders differ between recordings
+of the same operation (one leads with `m7i.2xlarge.search` and places
+`c8g.12xlarge.search`, `oi2.8xlarge.search`, `r7i.12xlarge.search` at 2, 3, 4, another has
+`r7i.12xlarge.search` at 3 and `c8g.8xlarge.search` at 4, a third leads with
+`r5.large.search` and a fourth with `r4.2xlarge.search`), the bracketed set inside the
+refusal message is in a different order again, and the recorded sequences are not the
+walk of a hash table over those values either: the 31-polynomial string hash the front
+door keys a value set by orders none of the recorded positions monotonically at any table
+width from 16 to 4096, with no spread, with the `h ^ (h >>> 16)` spread or with the
+older two-step one. It is neither the modelled value set's order nor a sort of family,
+generation, size or name, so writing those positions in would be a memorised prefix
+rather than a rule.
+
+Cause 4 is DECLINED. `ServiceSoftwareOptions$CurrentVersion` is already derived rather
+than fixed: `state::service_software_release` names the engine version the domain runs
+(`OpenSearch_<major>_<minor>_R<release>`, the bare release label on the legacy
+Elasticsearch line), the label is stable across reads, and a domain still being
+provisioned or torn down publishes none — held over a table of engine versions by
+`tests/all/domain_descriptor_projection.rs`. What diverges is the `R<YYYYMMDD>` stamp
+alone: that is AWS's own service-software release date, published in no model and in no
+machine-readable form, drifting with each release AWS ships, and the recorded value is one
+run's stamp. Deriving it from the engine version would make it less faithful, not more —
+AWS ships one release date across the engine versions it builds for — and copying the
+recorded stamp is writing a single run's timestamp into a response.
+
+Held by `tests/all/published_family_is_whole.rs` (new: a published family is reported by
+the listing, has limits for the roles it serves with the storage its family carries,
+is stated by the accepted-value set, and carries a domain a caller provisions on it, over
+both halves of three generations), with rows added to
+`tests/all/current_generation_instance_types.rs` and
+`tests/all/published_instance_type_value_set.rs`.

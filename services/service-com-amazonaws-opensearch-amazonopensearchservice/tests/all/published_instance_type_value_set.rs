@@ -11,10 +11,9 @@
 //! that type ADMITS, and for an instance type that list is the catalog the SERVICE
 //! publishes — the record of which instance types exist, which every operation resolving
 //! one against it refuses a value outside, and which `ListInstanceTypeDetails` serves. The
-//! `OpenSearchPartitionInstanceType` value set this model carries is an older SNAPSHOT of
-//! that catalog, so a clause stating the snapshot would tell a caller that instance types
-//! the service does publish are invalid and omit the ones it has to choose from. The
-//! message is the only place the accepted list is stated.
+//! `OpenSearchPartitionInstanceType` value set and that catalog are ONE set, so the clause
+//! states every type the service publishes and no type it does not. The message is the
+//! only place the accepted list is stated.
 //!
 //! The set belongs to the TYPE rather than to a member, so the rows span the members that
 //! target it — a URI label and two members nested in a structure, on two operations — and
@@ -36,15 +35,17 @@ use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 /// carries rather than about the release it names.
 const OFFERED_VERSION: &str = "OpenSearch_2.19";
 
-/// Current-generation instance types the checked-in value set does not list, each a FAMILY
-/// the service's catalog publishes: the seventh-generation Intel, Graviton4,
-/// dense-storage and second-generation OpenSearch-optimized families.
+/// Current-generation instance types, each a FAMILY the service's catalog publishes: the
+/// seventh-generation Intel, Graviton4, dense-storage and second-generation
+/// OpenSearch-optimized families, and both halves of a generation the service publishes as
+/// a pair (an EBS-backed family beside its NVMe-backed one, an Intel family beside its
+/// Graviton one).
 ///
 /// Source: the instance types the service's own catalog publishes
 /// (`crate::state::published_instance_types`, which `ListInstanceTypeDetails` serves and
 /// [`super::current_generation_instance_types`] tables), sampled one size per family —
 /// including families the report that asked for this listing did not cite.
-const BEYOND_THE_SNAPSHOT: [&str; 8] = [
+const CURRENT_GENERATIONS: [&str; 10] = [
     "c7i.xlarge.search",
     "m7i.2xlarge.search",
     "c8g.16xlarge.search",
@@ -53,6 +54,8 @@ const BEYOND_THE_SNAPSHOT: [&str; 8] = [
     "om2.8xlarge.search",
     "i7i.8xlarge.search",
     "i8g.24xlarge.search",
+    "i4i.4xlarge.search",
+    "r7g.2xlarge.search",
 ];
 
 /// `DescribeInstanceTypeLimits`:
@@ -162,10 +165,10 @@ async fn an_instance_type_outside_the_published_catalog_is_refused_with_that_cat
 }
 
 /// The MEMBERSHIP half of the rule, stated against the two things the set has to agree
-/// with: it loses nothing the model declares, and it carries the current-generation
-/// families the model's snapshot does not list.
+/// with: it loses nothing the model declares, and it is the catalog the listing serves —
+/// one set, so neither surface can offer a type the other refuses.
 #[tokio::test]
-async fn the_stated_set_is_the_catalog_and_not_the_modelled_snapshot() {
+async fn the_stated_set_is_the_catalog_the_listing_serves() {
     let emulator = Emulator::new();
 
     let answer = limits(&emulator, "t9.nonexistent.search").await;
@@ -177,8 +180,8 @@ async fn the_stated_set_is_the_catalog_and_not_the_modelled_snapshot() {
         .split(", ")
         .collect();
 
-    // Nothing the model declares is dropped: the snapshot is a subset of the catalog, so
-    // a value the boundary admits is always one the stated set names.
+    // Nothing the model declares is dropped: a value the boundary admits is always one
+    // the stated set names.
     for modelled in OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES {
         assert!(
             listed.contains(modelled),
@@ -188,13 +191,9 @@ async fn the_stated_set_is_the_catalog_and_not_the_modelled_snapshot() {
         );
     }
 
-    // And the current generations the snapshot does not list are stated, each of them a
-    // type `ListInstanceTypeDetails` publishes for an offered release.
-    for current in BEYOND_THE_SNAPSHOT {
-        assert!(
-            !OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&current),
-            "case {current:?}: the row must name a type the modelled snapshot does not list"
-        );
+    // And the current generations are stated, each of them a type
+    // `ListInstanceTypeDetails` publishes for an offered release.
+    for current in CURRENT_GENERATIONS {
         assert!(
             listed.contains(current),
             "case {current:?}: a current-generation type the service publishes must be \
@@ -208,12 +207,14 @@ async fn the_stated_set_is_the_catalog_and_not_the_modelled_snapshot() {
         );
     }
 
-    assert!(
-        listed.len() > OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.len(),
-        "the stated set must be the catalog rather than the snapshot, got {} values against \
-         the model's {}",
+    // The stated set IS the published catalog: the same values, neither more nor fewer, so
+    // a caller choosing from the message is choosing from what the listing serves.
+    let published: BTreeSet<&str> = published_instance_types().into_iter().collect();
+    assert_eq!(
+        listed, published,
+        "the stated set must be the published catalog, got {} values against the catalog's {}",
         listed.len(),
-        OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.len()
+        published.len()
     );
 }
 

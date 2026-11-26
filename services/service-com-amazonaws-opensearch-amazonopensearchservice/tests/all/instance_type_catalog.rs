@@ -142,7 +142,10 @@ pub(crate) async fn list(emulator: &Emulator, engine_version: &str, query: &str)
 }
 
 /// The `InstanceTypeDetails` list of an answer, with the case named on failure.
-fn details(answer: &Answer, case: &str) -> Vec<Value> {
+///
+/// Shared with [`super::published_family_is_whole`], which reads a filtered listing back
+/// the same way.
+pub(crate) fn details(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected HTTP 200, got {} {:?}",
@@ -335,22 +338,25 @@ async fn the_listing_is_published_in_the_catalogs_documented_order() {
         }
     }
 
-    // The catalog is the SERVICE's and not the modelled value set: a release that
-    // offers a family the service added after the model was written reports instance
-    // types `OpenSearchPartitionInstanceType` does not list at all, so a listing
-    // derived from that enum cannot produce this answer.
-    for version in ["OpenSearch_2.15", "OpenSearch_2.19"] {
+    // The catalog is the SERVICE's and not the modelled value set: the value set is the
+    // instance types that EXIST, one list for the whole service, while a listing is the
+    // ones one RELEASE offers — so a release's listing is a strict subset of that set and
+    // no listing is the set itself. A listing read off the enum could not answer this.
+    for version in ["OpenSearch_2.15", "OpenSearch_2.19", "Elasticsearch_7.10"] {
         let reported = instance_types(&whole_listing(&emulator, version, "").await);
-        let beyond_the_enum: Vec<&String> = reported
-            .iter()
-            .filter(|instance_type| {
-                !OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type.as_str())
-            })
-            .collect();
+        for instance_type in &reported {
+            assert!(
+                OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type.as_str()),
+                "case {version}: expected every published type to be one the service accepts, \
+                 got {instance_type}"
+            );
+        }
         assert!(
-            !beyond_the_enum.is_empty(),
-            "case {version}: expected the published catalog to carry instance types the \
-             modelled enum does not list, got {reported:?}"
+            reported.len() < OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.len(),
+            "case {version}: expected one release's catalog to be narrower than the whole \
+             accepted set, got {} of {}",
+            reported.len(),
+            OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.len()
         );
     }
 

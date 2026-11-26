@@ -9,22 +9,24 @@
 //! [`super::domain_lifecycle`]; this suite adds no second copy of it.
 //!
 //! The rule asserted here: the catalog a release's listing reports is the catalog the
-//! SERVICE publishes for that release, so it carries every current-generation family
-//! the service accepts an instance type of — not only the families the checked-in
-//! `OpenSearchPartitionInstanceType` value set enumerates, which is an older snapshot
-//! of the same catalog. [`super::instance_type_catalog`] states the listing's shape,
-//! order and feature members over the whole catalog; this suite is the table of the
-//! current-generation families themselves, each row asserting that the family is
-//! published, that the release before its prerequisite does not offer it, that the
-//! `instanceType` filter reports the entry the listing reports, and that the entry
+//! SERVICE publishes for that release, so it carries every current-generation family the
+//! service accepts an instance type of — the whole of `OpenSearchPartitionInstanceType`,
+//! narrowed to the families that release offers. [`super::instance_type_catalog`] states
+//! the listing's shape, order and feature members over the whole catalog; this suite is
+//! the table of the current-generation families themselves, each row asserting that the
+//! family is published, that the release before its prerequisite does not offer it, that
+//! the `instanceType` filter reports the entry the listing reports, and that the entry
 //! carries the node roles an instance of the family serves.
 //!
 //! Source of the table: the instance types the service's own accepted-value list
 //! reports — the value set its refusal of an unknown `instanceType` enumerates, which
 //! is the service's record of what it accepts and carries the seventh-generation Intel,
 //! Graviton3, Graviton4, dense-storage and second-generation OpenSearch-optimized
-//! families the checked-in enum does not list, the Intel and Graviton4 dense-storage
-//! families (`i7i`, `i8g` beside `i8ge`) included. The sizes each family is published in
+//! families, the Intel and Graviton4 dense-storage
+//! families (`i7i`, `i8g` beside `i8ge`) included, and BOTH halves of a generation the
+//! service publishes as a pair — the EBS-backed family beside the NVMe-backed one of a
+//! memory-optimized generation (`r7g` beside `r7gd`), the Intel family beside the
+//! Graviton one of a storage-optimized generation (`i4i` beside `im4gn`). The sizes each family is published in
 //! are the service's published ladder for it, as [`ListInstanceTypeDetails`] reports
 //! them; this suite reads them back from the answer rather than restating them.
 
@@ -50,7 +52,7 @@ const DATA_ONLY: &[&str] = &["data"];
 /// table spans the size ladder as well as the families: the instance type, a release
 /// that offers it, the release before its family's prerequisite, and the roles an
 /// instance of the family serves.
-const CURRENT_GENERATION: [(&str, &str, &str, &[&str]); 15] = [
+const CURRENT_GENERATION: [(&str, &str, &str, &[&str]); 17] = [
     // The seventh-generation Intel families, offered for the OpenSearch engine alone.
     ("c7i.xlarge.search", "OpenSearch_2.13", "OpenSearch_2.11", DATA_MASTER_COORDINATOR),
     ("m7i.2xlarge.search", "OpenSearch_2.13", "OpenSearch_2.11", DATA_MASTER_COORDINATOR),
@@ -67,7 +69,9 @@ const CURRENT_GENERATION: [(&str, &str, &str, &[&str]); 15] = [
     // The Graviton families offered from the Graviton prerequisite onwards, so from an
     // Elasticsearch release and on every OpenSearch one.
     ("im4gn.8xlarge.search", "Elasticsearch_7.9", "Elasticsearch_7.8", DATA_AND_MASTER),
+    ("i4i.16xlarge.search", "Elasticsearch_7.9", "Elasticsearch_7.8", DATA_AND_MASTER),
     ("r7gd.4xlarge.search", "Elasticsearch_7.9", "Elasticsearch_7.8", DATA_MASTER_COORDINATOR),
+    ("r7g.12xlarge.search", "Elasticsearch_7.9", "Elasticsearch_7.8", DATA_MASTER_COORDINATOR),
     // The second OpenSearch-optimized generation.
     ("oi2.4xlarge.search", "OpenSearch_2.17", "OpenSearch_2.15", DATA_ONLY),
     ("om2.8xlarge.search", "OpenSearch_2.17", "OpenSearch_2.15", DATA_ONLY),
@@ -198,33 +202,27 @@ async fn the_catalog_publishes_the_current_generation_families_the_service_accep
 }
 
 #[tokio::test]
-async fn the_published_catalog_is_not_the_modelled_value_set() {
+async fn the_published_catalog_and_the_accepted_value_set_agree() {
     let emulator = Emulator::new();
     let current = instance_types(&details(&list(&emulator, CURRENT_RELEASE, "").await, CURRENT_RELEASE));
     let published: BTreeSet<&str> = current.iter().map(String::as_str).collect();
 
-    // Every row of the table above whose family the checked-in enum does not list is
-    // still published: the listing is the service's catalog, so it is not bounded by the
-    // modelled value set.
-    let mut beyond_the_enum = 0_usize;
+    // Every row of the table above is BOTH published for a current release and a value
+    // the service accepts: a type the catalog offers a caller is a type the caller may
+    // then name, so the catalog and the accepted value set cannot disagree about a
+    // current generation.
     for (instance_type, _, _, _) in CURRENT_GENERATION {
-        if OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type) {
-            continue;
-        }
-        beyond_the_enum += 1;
         assert!(
             published.contains(instance_type),
-            "case {instance_type}: expected a current-generation type the modelled value \
-             set does not list to be published all the same, got {} entries",
+            "case {instance_type}: expected a current-generation type to be published, got \
+             {} entries",
             published.len()
         );
+        assert!(
+            OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type),
+            "case {instance_type}: expected a published type to be one the service accepts"
+        );
     }
-    assert!(
-        beyond_the_enum >= CURRENT_GENERATION.len(),
-        "case the table: expected every current-generation row to name a family the \
-         modelled value set does not list, got {beyond_the_enum} of {}",
-        CURRENT_GENERATION.len()
-    );
 
     // A family is published as a LADDER of sizes, not as the one size the table names,
     // and every size of it carries the family's roles.

@@ -108,6 +108,18 @@ pub(super) const ULTRAWARM_SINCE_ELASTICSEARCH: (u32, u32) = (6, 8);
 /// The Elasticsearch release the Graviton instance families are offered from.
 pub(super) const GRAVITON_SINCE_ELASTICSEARCH: (u32, u32) = (7, 9);
 
+/// The Elasticsearch release the FOURTH generation of the storage-optimized line is
+/// offered from — the NVMe-backed families of that generation, whose Graviton half
+/// (`im4gn`) and Intel half (`i4i`) the service offers alongside each other, so one gate
+/// states the generation rather than one per half.
+///
+/// Its value is the release the Graviton families are gated on
+/// ([`GRAVITON_SINCE_ELASTICSEARCH`]) and is stated apart from it because the generation,
+/// not the processor, is what it gates. Like every other generation gate here the release
+/// itself is the emulator's own statement of published content; what it fixes is that a
+/// release predating the generation offers neither half of it.
+pub(super) const NVME_STORAGE_GEN4_SINCE_ELASTICSEARCH: (u32, u32) = GRAVITON_SINCE_ELASTICSEARCH;
+
 /// The OpenSearch release the OpenSearch-optimized instance family is offered from.
 /// It is an OpenSearch-only family, so this gate is not an Elasticsearch one.
 pub(super) const OPENSEARCH_OPTIMIZED_SINCE: (u32, u32) = (2, 11);
@@ -276,19 +288,26 @@ pub(super) fn catalog_rank(entry: &CatalogFamily) -> (u8, &'static str) {
 /// of the rows below is not itself the order of a listing.
 ///
 /// This is the service's own published content, so it is written out here rather than
-/// derived from `OpenSearchPartitionInstanceType`: the service offers families that
-/// enum does not list at all, and a modelled value set carries neither the engine
-/// releases that offer a family nor the node roles an instance of it serves. It
-/// carries every value of the modelled enum and the current generations the service's
-/// answers add to it.
+/// derived from `OpenSearchPartitionInstanceType`: a modelled value set carries neither
+/// the engine releases that offer a family nor the node roles an instance of it serves,
+/// which is most of what a catalog entry IS. Its membership and that value set's are the
+/// same — every instance type the service publishes is one it accepts, and the model
+/// declares the families below — so a caller offered a type by a listing may name it.
 ///
 /// The current generations are the ones the service's OWN accepted-value list reports —
 /// the list its refusal of an unknown instance type enumerates, which is the service's
-/// record of the types it accepts and carries families the checked-in enum does not:
+/// record of the types it accepts:
 /// the seventh-generation Intel families, the Graviton3 and Graviton4 families, the
 /// dense-storage ones, and the second OpenSearch-optimized generation. A family is in
 /// this table because that list reports it, never because a release's listing happened
 /// to show it.
+///
+/// A generation is published WHOLE, which is what keeps that list and this table in step:
+/// where the service offers a generation as more than one family — the EBS-backed and the
+/// NVMe-backed half of a memory-optimized generation (`r7g` beside `r7gd`, `r8g` beside
+/// `r8gd`), the Graviton and the Intel half of a storage-optimized one (`im4gn` beside
+/// `i4i`, `i8g` beside `i7i`) — every half it reports is a row here, because a caller
+/// choosing an instance type is offered each of them.
 ///
 /// What is NOT published anywhere machine-readable, and is therefore the emulator's own
 /// statement of published content exactly as [`CLASS_HOURLY_RATE_PER_UNIT`] and
@@ -490,6 +509,21 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
     },
     CatalogFamily {
+        family: "r7g",
+        instance_types: &[
+            "r7g.medium.search",
+            "r7g.large.search",
+            "r7g.xlarge.search",
+            "r7g.2xlarge.search",
+            "r7g.4xlarge.search",
+            "r7g.8xlarge.search",
+            "r7g.12xlarge.search",
+            "r7g.16xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
         family: "r7gd",
         instance_types: &[
             "r7gd.medium.search",
@@ -632,6 +666,21 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         releases: OfferedReleases::SinceOpenSearch(SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH),
     },
     CatalogFamily {
+        family: "i4i",
+        instance_types: &[
+            "i4i.large.search",
+            "i4i.xlarge.search",
+            "i4i.2xlarge.search",
+            "i4i.4xlarge.search",
+            "i4i.8xlarge.search",
+            "i4i.12xlarge.search",
+            "i4i.16xlarge.search",
+            "i4i.24xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::SinceElasticsearch(NVME_STORAGE_GEN4_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
         family: "im4gn",
         instance_types: &[
             "im4gn.large.search",
@@ -642,7 +691,7 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
             "im4gn.16xlarge.search",
         ],
         roles: ROLES_DATA_AND_MASTER,
-        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+        releases: OfferedReleases::SinceElasticsearch(NVME_STORAGE_GEN4_SINCE_ELASTICSEARCH),
     },
     CatalogFamily {
         family: "i3",
@@ -865,9 +914,9 @@ pub fn offered_instance_types(version: EngineVersion) -> Vec<&'static str> {
 ///
 /// The service's own accepted-value list — a value outside it names no instance type at
 /// all ([`publishes_instance_type`]) — so it is what a refusal of an unknown instance
-/// type enumerates, and it carries the current-generation families the checked-in
-/// `OpenSearchPartitionInstanceType` value set (an older snapshot of the same catalog)
-/// does not list. [`offered_instance_types`] is the same catalog narrowed to one release;
+/// type enumerates, and it is the `OpenSearchPartitionInstanceType` value set the request
+/// boundary admits, which carries the same families.
+/// [`offered_instance_types`] is the same catalog narrowed to one release;
 /// this is the set membership itself, which no release decides.
 pub fn published_instance_types() -> Vec<&'static str> {
     let mut families: Vec<&'static CatalogFamily> = INSTANCE_TYPE_CATALOG.iter().collect();
@@ -1040,8 +1089,8 @@ pub const LIMIT_DATA_NODES_WITHOUT_MASTER: &str = "MaximumNumberOfDataNodesWitho
 /// The instance families whose data sits on storage built into the instance rather than
 /// on an attached volume, so the only storage type they publish is
 /// [`STORAGE_TYPE_INSTANCE`].
-pub(super) const INSTANCE_STORAGE_FAMILIES: [&str; 11] = [
-    "d2", "i2", "i3", "i7i", "i8g", "i8ge", "im4gn", "r3", "r6gd", "r7gd", "r8gd",
+pub(super) const INSTANCE_STORAGE_FAMILIES: [&str; 12] = [
+    "d2", "i2", "i3", "i4i", "i7i", "i8g", "i8ge", "im4gn", "r3", "r6gd", "r7gd", "r8gd",
 ];
 
 /// The smallest EBS volume, in GiB, every sub-type publishes — the floor a volume size

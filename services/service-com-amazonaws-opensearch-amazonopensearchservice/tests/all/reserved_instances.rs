@@ -265,9 +265,9 @@ async fn the_catalog_carries_one_offering_per_type_term_and_payment_option() {
     let catalog = fetch_catalog(&emulator).await;
 
     // The instance types the catalog prices are the ones the SERVICE publishes
-    // (`published_instance_types`, the one record of which instance types exist — it
-    // carries the current generations the checked-in
-    // `OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES` snapshot does not list), so the
+    // (`published_instance_types`, the one record of which instance types exist, whose
+    // membership is the `OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES` set the boundary
+    // admits), so the
     // catalog is checked against that catalog rather than against a list written
     // beside it.
     for instance_type in published_instance_types() {
