@@ -29,11 +29,24 @@
 //! answered at all).
 //!
 //! Every status, header and byte it answers is computed from what a create or a modify
-//! persisted, and serving traffic moves no status, consumes no quota and bumps no counter.
-//! The ONE thing it writes is the RECORD of the request it has just answered, where the load
-//! balancer's own attributes have it deliver one: its access log ([`super::access_logs`]),
-//! which is the load balancer's own account of what it did with a request and is delivered
-//! for the same reason the web ACL's log beside it is.
+//! persisted, and serving traffic moves no status of a resource, consumes no quota and bumps
+//! no counter a read of one reports. What it DOES write is the load balancer's own account of
+//! its own forwarding, which is the load balancer's and belongs to nothing a client created:
+//!
+//! * the RECORD of the request it has just answered, where the load balancer's own attributes
+//!   have it deliver one: its access log ([`super::access_logs`]), which is the load
+//!   balancer's own account of what it did with a request and is delivered for the same reason
+//!   the web ACL's log beside it is, and the metric datapoints of the same request
+//!   ([`super::request_metrics`]);
+//! * where its own DISTRIBUTION of this request's target group has got to: the rotation
+//!   `load_balancing.algorithm.type` hands the next request out by, and the request this plane
+//!   now has IN FLIGHT to the registration it chose, which `least_outstanding_requests` is
+//!   counted over ([`crate::state::TargetDistribution`], held on the target group's own record
+//!   and reported by no read of it).
+//!
+//! Neither is a fact about a target or a quota of the account: they are what a load balancer
+//! has to remember to distribute the NEXT request the way the attributes a caller wrote say,
+//! and both are bounded by the registrations the group holds.
 //!
 //! # What a request addresses, and how it is resolved
 //!
@@ -1140,11 +1153,15 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                 if let super::web_acl::Decision::Allowed(inserted) = decided {
                     request.insert_headers(inserted);
                 }
-                let store = state.lock();
-                let Some(listener) = store.listeners.get(&listener_arn) else {
+                let mut store = state.lock();
+                // The listener is taken OFF the store, because answering the request moves
+                // the chosen target group's own distribution on
+                // ([`super::target_selection`]) and so writes the records the listener was
+                // read from.
+                let Some(listener) = store.listeners.get(&listener_arn).cloned() else {
                     return rendered(&Served::status(PROVISIONING_STATUS));
                 };
-                answered(&store, listener, &request, now)
+                answered(&mut store, &listener, &request, now)
             }
         };
         matched_rule_priority = matched_priority;
@@ -1153,6 +1170,15 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             // The store's guard is released above, so the function RUNS with no lock of
             // this service's held.
             Performed::Invoke(forwarded) => {
+                // The load balancer has this request IN FLIGHT to the chosen registration
+                // from here until its answer is in, which is what the group's
+                // `least_outstanding_requests` is counted over
+                // ([`crate::state::RequestInFlight`]).
+                let _in_flight = crate::state::RequestInFlight::to(
+                    state.clone(),
+                    forwarded.target_group_arn.clone(),
+                    forwarded.registration.clone(),
+                );
                 // The request's own bytes, which the event the function is invoked with
                 // carries. A body this plane cannot read is not a body it may invent an
                 // empty one for, so the request reaches no function at all.
@@ -1194,6 +1220,13 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             // guard is released above, so the hand-off is made with no lock of this service's
             // held, exactly as a `lambda` target's invocation is.
             Performed::ToTarget(forwarded) => {
+                // In flight to the chosen registration until the target's answer is in, as a
+                // `lambda` target's invocation is.
+                let _in_flight = crate::state::RequestInFlight::to(
+                    state.clone(),
+                    forwarded.target_group_arn.clone(),
+                    forwarded.registration.clone(),
+                );
                 // What this load balancer's own attribute collection has it do to the
                 // request's `X-Forwarded-For` before the target receives it
                 // ([`super::forwarded_for`]). Applied HERE, where the request leaves the load
@@ -1491,7 +1524,7 @@ fn listener_addressed<'s>(
 /// balancer's own access log records it ([`super::access_logs`]) and this is where it is
 /// known: 0 for a request no rule matched, which its listener's default actions answered.
 fn answered(
-    store: &ElbState,
+    store: &mut ElbState,
     listener: &ListenerRecord,
     request: &DataPlaneRequest,
     now: SystemTime,
@@ -1837,7 +1870,7 @@ struct PassedOn {
 /// forward, fixed-response, or redirect" — so the answer is the terminating action with
 /// the highest `Order`, which is the last one performed.
 fn performed(
-    store: &ElbState,
+    store: &mut ElbState,
     listener: &ListenerRecord,
     actions: &[Action],
     request: &DataPlaneRequest,
@@ -2081,50 +2114,94 @@ fn default_port(protocol: &str) -> Option<&'static str> {
     }
 }
 
+/// One target group of a `forward`'s distribution this request could be answered by: the
+/// group, the weight the action gives it, and everything the choice of ONE of its
+/// registrations is made from.
+///
+/// Owned, because the choice MOVES the group's own rotation on
+/// ([`super::target_selection`]): what the records hold is read here, and the store is then
+/// free to be written.
+struct Candidate {
+    /// The target group's own ARN.
+    arn: String,
+    /// The weight the forward action gives it.
+    weight: i32,
+    /// The registrations the load balancer may send this request to, in the group's own
+    /// order.
+    eligible: Vec<crate::state::TargetKey>,
+    /// How the group distributes its requests across them, and what pins a client to one.
+    policy: super::target_selection::Policy,
+    /// The token of each of those registrations, which is what a pin carries.
+    tokens: Vec<String>,
+    /// How many requests the load balancer currently has in flight to each of them.
+    in_flight: Vec<u32>,
+}
+
 /// What a `forward` answers. The target groups it names are this store's own, the DRAW over
 /// the weights it distributes them at decides which of them this request reaches
-/// ([`super::target_group_selection`]), and the registration that group holds decides what
-/// happens next: a `lambda` target group's function is INVOKED ([`super::lambda_target`]), an
-/// `alb` target group's load balancer is the one the request is PASSED ON to, and a target of
-/// any other group names a resource of this account, whose own server answers the request
+/// ([`super::target_group_selection`]), WHICH registration of that group it reaches is the
+/// group's own load balancing algorithm and stickiness to say
+/// ([`super::target_selection`]), and that registration decides what happens next: a
+/// `lambda` target group's function is INVOKED ([`super::lambda_target`]), an `alb` target
+/// group's load balancer is the one the request is PASSED ON to, and a target of any other
+/// group names a resource of this account, whose own server answers the request
 /// ([`super::instance_target`]) — or, for a registration nothing of this emulator stands
 /// behind, the status a load balancer gives for the condition that holds: no target to
 /// choose, or a target chosen whose connection cannot be made.
 fn forward(
-    store: &ElbState,
+    store: &mut ElbState,
     listener: &ListenerRecord,
     action: &Action,
     request: &DataPlaneRequest,
     now: SystemTime,
 ) -> Performed {
     let distribution = super::target_group_selection::distribution(action);
+    let cookies = request.header(super::target_group_selection::COOKIE_HEADER);
     // Every group of the distribution this store holds that has a target to send the request
     // to, with the weight the action gives it. A group whose targets are none the load
     // balancer may send a request to is not one this request can be distributed to, so it
     // takes no share of the action's requests — and a request the action's other groups can
     // answer is answered rather than lost to the draw.
-    let candidates: Vec<(&TargetGroupRecord, &RegisteredTarget, i32)> = distribution
+    let candidates: Vec<Candidate> = distribution
         .groups
         .iter()
         .filter_map(|(arn, weight)| store.target_groups.get(arn).map(|group| (group, *weight)))
         .filter_map(|(group, weight)| {
-            sent_the_request(group, now).map(|target| (group, target, weight))
+            let eligible = sent_the_request(group, now);
+            if eligible.is_empty() {
+                return None;
+            }
+            let tokens = eligible
+                .iter()
+                .map(|key| super::target_selection::target_token(&group.arn, key))
+                .collect();
+            let in_flight = eligible
+                .iter()
+                .map(|key| group.distribution.in_flight(key))
+                .collect();
+            Some(Candidate {
+                arn: group.arn.clone(),
+                weight,
+                policy: super::target_selection::policy(group),
+                eligible,
+                tokens,
+                in_flight,
+            })
         })
         .collect();
     let weights: Vec<i32> = candidates
         .iter()
-        .map(|(_, _, weight)| *weight)
+        .map(|candidate| candidate.weight)
         .collect::<Vec<i32>>();
     // The pin the client carried back, where this action's stickiness minted one and the
     // group it names still takes a share of the action's requests.
     let pinned = distribution
         .sticky
         .then(|| {
-            let token = super::target_group_selection::pinned_token(
-                request.header(super::target_group_selection::COOKIE_HEADER),
-            )?;
-            candidates.iter().position(|(group, _, weight)| {
-                *weight > 0 && super::target_group_selection::group_token(&group.arn) == token
+            let token = super::target_group_selection::pinned_token(cookies)?;
+            candidates.iter().position(|candidate| {
+                candidate.weight > 0
+                    && super::target_group_selection::group_token(&candidate.arn) == token
             })
         })
         .flatten();
@@ -2134,7 +2211,61 @@ fn forward(
     let chosen = pinned.or_else(|| {
         super::target_group_selection::drawn_entry(&weights, ::rand::random::<f64>())
     });
-    let Some((group, target, _)) = chosen.and_then(|index| candidates.get(index)) else {
+    let Some(candidate) = chosen.and_then(|index| candidates.get(index)) else {
+        return Performed::Answered(Served::status(NO_HEALTHY_TARGET_STATUS));
+    };
+    // WHICH registration of that group this request reaches: the one its own pin names,
+    // else the one the group's load balancing algorithm chooses. Choosing MOVES the group's
+    // rotation on — the load balancer's own record of where its distribution has got to,
+    // which is what makes the next request go to the next target — and a request a pin
+    // decided consumes none of it.
+    let pinned_target =
+        super::target_selection::pinned_at(&candidate.policy, &candidate.tokens, cookies);
+    let reached = match pinned_target {
+        Some(at) => Some(at),
+        None => {
+            let rotation = store
+                .target_groups
+                .get_mut(&candidate.arn)
+                .and_then(|group| group.distribution.rotate(candidate.eligible.len()))
+                .unwrap_or_default();
+            super::target_selection::distributed(
+                &candidate.policy,
+                rotation,
+                &candidate.in_flight,
+                ::rand::random::<f64>(),
+                &request.source_address,
+            )
+        }
+    };
+    let Some((registration, token)) = reached
+        .and_then(|at| Some((candidate.eligible.get(at)?, candidate.tokens.get(at)?)))
+    else {
+        return Performed::Answered(Served::status(NO_HEALTHY_TARGET_STATUS));
+    };
+    // The pins the answer hands the client back: the target GROUP's, where the action's own
+    // stickiness minted one, and the REGISTRATION's, where the group's own stickiness did.
+    // Each is minted only for a client that does not hold it already.
+    let mut set_cookies: Vec<String> = Vec::new();
+    if distribution.sticky && pinned.is_none() {
+        set_cookies.push(super::target_group_selection::set_cookie(
+            &candidate.arn,
+            distribution.sticky_duration_seconds,
+        ));
+    }
+    if pinned_target.is_none() {
+        set_cookies.extend(super::target_selection::set_cookies(
+            &candidate.policy,
+            token,
+            listener.terminates_tls(),
+        ));
+    }
+    let registration = registration.clone();
+    let Some((group, target)) = store
+        .target_groups
+        .get(&candidate.arn)
+        .and_then(|group| group.targets.get(&registration).map(|target| (group, target)))
+    else {
         return Performed::Answered(Served::status(NO_HEALTHY_TARGET_STATUS));
     };
     if group.is_lambda() {
@@ -2143,18 +2274,14 @@ fn forward(
         return Performed::Invoke(Box::new(super::lambda_target::Forwarded {
             function_arn: target.id.clone(),
             target_group_arn: group.arn.clone(),
+            registration,
             multi_value_headers: super::lambda_target::multi_value_headers(group),
             protocol: listener.protocol.clone(),
             port: listener.port,
-            // The pin that answer hands back, for a client that does not hold it already:
-            // "requests from a client should be routed to the same target group" is what the
-            // cookie makes true of every later request carrying it.
-            set_cookie: (distribution.sticky && pinned.is_none()).then(|| {
-                super::target_group_selection::set_cookie(
-                    &group.arn,
-                    distribution.sticky_duration_seconds,
-                )
-            }),
+            // The pins that answer hands back, for a client that does not hold them
+            // already: "requests from a client should be routed to the same target group"
+            // is what the cookie makes true of every later request carrying it.
+            set_cookies,
         }));
     }
     if group.is_load_balancer_target() {
@@ -2213,6 +2340,7 @@ fn forward(
         target_group_arn: group.arn.clone(),
         target_type: group.target_type.clone(),
         target_id: target.id.clone(),
+        registration,
         // "the port on which the target is listening" (`TargetDescription$Port`), which is
         // the target group's own port for a registration that names none.
         port: target.port.or(group.port),
@@ -2229,14 +2357,9 @@ fn forward(
             // A load balancer this store no longer holds says nothing about where the
             // connection comes from, which decides nothing either way.
             .unwrap_or_default(),
-        // The pin that answer hands back, for a client that does not hold it already: it
-        // accompanies the response the TARGET produced, as a `lambda` target's does.
-        set_cookie: (distribution.sticky && pinned.is_none()).then(|| {
-            super::target_group_selection::set_cookie(
-                &group.arn,
-                distribution.sticky_duration_seconds,
-            )
-        }),
+        // The pins that answer hands back, for a client that does not hold them already:
+        // they accompany the response the TARGET produced, as a `lambda` target's do.
+        set_cookies,
     }))
 }
 
@@ -2259,36 +2382,43 @@ fn receives_requests(
     )
 }
 
-/// WHICH registration of `group` one request a `forward` performs is sent to, and `None` for a
-/// group that has no target to send it to at all.
+/// WHICH registrations of `group` one request a `forward` performs may be sent to, in the
+/// group's own order — empty for a group that has no target to send it to at all.
 ///
-/// A target whose reported health says the load balancer may send it requests takes it
-/// ([`receives_requests`]). Failing that, the group's UNHEALTHY targets are sent it anyway: a
-/// load balancer whose target group holds only unhealthy targets routes requests across them
-/// rather than answering nothing, so a group whose checks all fail at once keeps serving
-/// instead of blackholing its traffic — the behaviour the target-group health-check
-/// documentation states, and the reason a client can tell "registered but failing" from
-/// "nothing registered" — which is the load balancer's own [`NO_HEALTHY_TARGET_STATUS`]
+/// EVERY target whose reported health says the load balancer may send it requests is one of
+/// them ([`receives_requests`]), because the load balancer distributes the group's requests
+/// ACROSS them rather than picking one and keeping it: which of them this request reaches is
+/// the group's own `load_balancing.algorithm.type` and stickiness to say
+/// ([`super::target_selection`]).
+///
+/// Failing that, the group's UNHEALTHY targets are sent its requests anyway: a load balancer
+/// whose target group holds only unhealthy targets routes requests across them rather than
+/// answering nothing, so a group whose checks all fail at once keeps serving instead of
+/// blackholing its traffic — the behaviour the target-group health-check documentation
+/// states, and the reason a client can tell "registered but failing" from "nothing
+/// registered" — which is the load balancer's own [`NO_HEALTHY_TARGET_STATUS`]
 /// ([`fails_open_to`]).
 ///
-/// Every other state is one no request is sent to, healthy targets or not: a registration still
-/// coming up has no verdict yet, one draining is leaving the group, and one of a group nothing
-/// forwards to is not being checked at all. A group holding only those has no target for this
-/// request.
-fn sent_the_request(
-    group: &TargetGroupRecord,
-    now: SystemTime,
-) -> Option<&RegisteredTarget> {
+/// Every other state is one no request is sent to, healthy targets or not: a registration
+/// still coming up has no verdict yet, one draining is leaving the group, and one of a group
+/// nothing forwards to is not being checked at all. A group holding only those has no target
+/// for this request.
+fn sent_the_request(group: &TargetGroupRecord, now: SystemTime) -> Vec<crate::state::TargetKey> {
+    let eligible: Vec<crate::state::TargetKey> = group
+        .targets
+        .iter()
+        .filter(|(_, target)| receives_requests(group, target, now))
+        .map(|(key, _)| key.clone())
+        .collect();
+    if !eligible.is_empty() {
+        return eligible;
+    }
     group
         .targets
-        .values()
-        .find(|target| receives_requests(group, target, now))
-        .or_else(|| {
-            group
-                .targets
-                .values()
-                .find(|target| fails_open_to(group, target, now))
-        })
+        .iter()
+        .filter(|(_, target)| fails_open_to(group, target, now))
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Whether this registration is one the load balancer FAILS OPEN to: the checks reached the

@@ -165,6 +165,9 @@ pub(super) struct Forwarded {
     /// The target group that registration belongs to, which the event names as the resource
     /// the load balancer forwarded the request to.
     pub(super) target_group_arn: String,
+    /// That registration as its target group KEYS it, which is what counts the request as in
+    /// flight to it ([`crate::state::RequestInFlight`]).
+    pub(super) registration: crate::state::TargetKey,
     /// Whether that group exchanges ARRAYS of header and query-string values with the
     /// function ([`multi_value_headers`]).
     pub(super) multi_value_headers: bool,
@@ -172,11 +175,13 @@ pub(super) struct Forwarded {
     pub(super) protocol: Option<String>,
     /// The port of that listener, when it carries one.
     pub(super) port: Option<i32>,
-    /// The `Set-Cookie` field the answer carries, where the forward action pins the client
+    /// The `Set-Cookie` fields the answer carries, where the forward action pins the client
     /// to the target group this request was distributed to
-    /// ([`super::target_group_selection`]). The load balancer's own, so it accompanies the
-    /// response the FUNCTION produced and no status the load balancer answered instead.
-    pub(super) set_cookie: Option<String>,
+    /// ([`super::target_group_selection`]) and where the target group pins it to the
+    /// registration that answered ([`super::target_selection`]). The load balancer's own, so
+    /// they accompany the response the FUNCTION produced and no status the load balancer
+    /// answered instead.
+    pub(super) set_cookies: Vec<String>,
 }
 
 /// Whether `group` exchanges ARRAYS of header and query-string values with its function:
@@ -358,10 +363,10 @@ async fn invoked(
     }
     match mapped_response(&returned, forwarded.multi_value_headers) {
         Ok(mut served) => {
-            // The target answered, so the pin the forward action mints goes back with its
-            // response — the one answer "requests from a client should be routed to the same
-            // target group" can be made true of.
-            if let Some(field) = forwarded.set_cookie.clone() {
+            // The target answered, so the pins the forward action and the target group mint
+            // go back with its response — the one answer "requests from a client should be
+            // routed to the same target group" can be made true of.
+            for field in forwarded.set_cookies.clone() {
                 served.headers.push((SET_COOKIE_HEADER.to_string(), field));
             }
             // The status the client is answered with is the FUNCTION's own, which is what the
@@ -846,9 +851,13 @@ mod tests {
                                targetgroup/tg/0123456789abcdef"
                 .to_string(),
             multi_value_headers,
+            registration: (
+                "arn:aws:lambda:us-west-2:000000000000:function:f".to_string(),
+                None,
+            ),
             protocol: Some("HTTP".to_string()),
             port: Some(80),
-            set_cookie: None,
+            set_cookies: Vec::new(),
         }
     }
 

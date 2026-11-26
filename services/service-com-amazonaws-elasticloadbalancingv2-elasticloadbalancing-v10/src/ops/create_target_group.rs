@@ -399,6 +399,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attributes: std::collections::HashMap::new(),
             tags: tag_map(input.tags.as_deref()),
             targets: std::collections::BTreeMap::new(),
+            // A group nothing has forwarded a request to yet has distributed none: its
+            // rotation begins at its first target and it has nothing in flight
+            // ([`crate::state::TargetDistribution`]).
+            distribution: crate::state::TargetDistribution::default(),
         };
 
         let mut guard = state.lock();

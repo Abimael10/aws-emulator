@@ -227,6 +227,12 @@ pub use health_check_matcher::{
     matcher_code_message,
 };
 
+/// Where one target group's distribution of requests across its own targets has got to:
+/// its rotation, and the requests in flight to each registration.
+pub mod target_distribution;
+
+pub use target_distribution::{RequestInFlight, TargetDistribution};
+
 /// How many load balancers one target group may be forwarded to by.
 pub mod target_group_association;
 
@@ -2808,6 +2814,13 @@ pub struct TargetGroupRecord {
     /// Registrations keyed by target id and effective port, so registering the same
     /// id on two ports keeps two registrations and re-registering one replaces it.
     pub targets: BTreeMap<TargetKey, RegisteredTarget>,
+    /// Where this group's own distribution of requests ACROSS those registrations has got
+    /// to: its rotation, and how many requests the load balancer currently has in flight to
+    /// each of them ([`target_distribution`]). The load balancer's own state about its own
+    /// forwarding — what `load_balancing.algorithm.type` is performed from
+    /// ([`crate::service::target_selection`]) — and no fact about a target, so no read of
+    /// this group reports it.
+    pub distribution: TargetDistribution,
 }
 
 impl TargetGroupRecord {
@@ -2910,6 +2923,21 @@ impl TargetGroupRecord {
                 Some((spec.key.to_string(), value))
             })
             .collect()
+    }
+
+    /// The value this target group carries for the ONE attribute `key` names: what a caller
+    /// wrote, else the value the catalog carries it at — and `None` for a key no attribute
+    /// of a group of this shape names at all.
+    ///
+    /// Read through the same catalog [`Self::effective_attributes`] reports the whole
+    /// collection from, so one attribute reads the same whether it is read alone or with the
+    /// rest: what the data plane performs is exactly what a read of the group reports.
+    pub fn effective_attribute(&self, key: &str) -> Option<String> {
+        let spec = target_group_attribute(key).filter(|spec| spec.applies_to(self))?;
+        self.attributes
+            .get(key)
+            .cloned()
+            .or_else(|| spec.default_for(self))
     }
 
     /// [`Self::effective_attributes`] as the modelled shape.

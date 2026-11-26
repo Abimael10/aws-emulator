@@ -67,6 +67,9 @@ pub(super) struct Forwarded {
     pub(super) target_type: String,
     /// The registration's id: an instance id, or an address.
     pub(super) target_id: String,
+    /// That registration as its target group KEYS it, which is what counts the request as in
+    /// flight to it ([`crate::state::RequestInFlight`]).
+    pub(super) registration: crate::state::TargetKey,
     /// The port the registration receives traffic on — "the port on which the target is
     /// listening" — which is the target's own port when it carries one and the target group's
     /// otherwise.
@@ -79,11 +82,13 @@ pub(super) struct Forwarded {
     /// The load balancer the connection comes FROM, as an inbound rule of those groups can
     /// name it ([`crate::state::target_reachability::ConnectionSource`]).
     pub(super) connected_from: crate::state::target_reachability::ConnectionSource,
-    /// The `Set-Cookie` field the answer carries, where the forward action pins the client to
-    /// the target group this request was distributed to
-    /// ([`super::target_group_selection`]). The load balancer's own, so it accompanies the
-    /// response the TARGET produced and no status the load balancer answered instead.
-    pub(super) set_cookie: Option<String>,
+    /// The `Set-Cookie` fields the answer carries, where the forward action pins the client
+    /// to the target group this request was distributed to
+    /// ([`super::target_group_selection`]) and where the target group pins it to the
+    /// registration that answered ([`super::target_selection`]). The load balancer's own, so
+    /// they accompany the response the TARGET produced and no status the load balancer
+    /// answered instead.
+    pub(super) set_cookies: Vec<String>,
 }
 
 /// Serve one request with the workload the target `forwarded` names runs, and answer what that
@@ -180,10 +185,10 @@ fn proxied<Eng: Send + Sync + 'static>(
         body: answered.body,
         ..Served::default()
     };
-    // The target answered, so the pin the forward action mints goes back with its response —
-    // the one answer "requests from a client should be routed to the same target group" can be
-    // made true of.
-    if let Some(field) = forwarded.set_cookie.clone() {
+    // The target answered, so the pins the forward action and the target group mint go back
+    // with its response — the one answer "requests from a client should be routed to the same
+    // target group" can be made true of.
+    for field in forwarded.set_cookies.clone() {
         served.headers.push((SET_COOKIE_HEADER.to_string(), field));
     }
     // The status the client is answered with is the TARGET's own, which is what the record

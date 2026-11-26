@@ -142,6 +142,10 @@ pub mod alpn_protocols;
 
 pub mod target_group_selection;
 
+/// WHICH registration of the chosen target group one request reaches: the group's own load
+/// balancing algorithm, and the pin its stickiness hands the client back.
+pub mod target_selection;
+
 pub mod user_authentication;
 
 pub mod web_acl;
