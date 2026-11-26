@@ -4,14 +4,14 @@
 //! `MultiServiceRouter` the emulator serves from, through the shared harness in
 //! `tests/all/kafka_harness.rs`.
 //!
-//! RULE under test: every BROKER NODE of every ACCESS METHOD a cluster publishes answers
-//! on a socket of its OWN, and the pair published for it is that socket's address — so a
-//! bootstrap string lists one `hostname:port` pair per broker node, no two published
-//! addresses of a cluster name one endpoint, and the port of a published address is the
-//! one the core assigned that node's socket. Amazon MSK tells one node of a method from
-//! another by the HOST it publishes it under; this emulator is reached at ONE host, the
-//! interface the core binds its listeners on, so what carries that distinction here is the
-//! port, and a client that splits a string reaches a broker of its own at every pair.
+//! RULE under test: every ACCESS METHOD a cluster publishes is answered on ONE socket,
+//! shared by every BROKER NODE of the cluster, and the pair published for a node is that
+//! socket's address — so a bootstrap string lists one `hostname:port` pair per broker node,
+//! every pair of one string carries the SAME port, and two access methods of a cluster
+//! never share a port. Amazon MSK publishes one port per access method and tells one node
+//! of a method from another by the HOST it publishes it under, which is what lets a client
+//! read the method off the port; this emulator is reached at ONE host, the interface the
+//! core binds its listeners on, so the nodes of a method coincide at its one address.
 //!
 //! Two members of the SAME access method publish the SAME string (an `Ipv6` member is that
 //! method reached over another network layer — one broker endpoint whose record set gains
@@ -42,7 +42,10 @@ use crate::kafka_harness::{poll_until_active, ClusterRequest, Emulator};
 /// Amazon MSK publishes the public and multi-VPC siblings of a scheme separately —
 /// while an `Ipv6` member is the same method as the string it sits beside, since
 /// one broker endpoint answers on both network layers.
-const METHOD_OF_MEMBER: &[(&str, &str)] = &[
+///
+/// `pub(crate)` because the suites that read a published member share this one catalog
+/// rather than each keeping a copy.
+pub(crate) const METHOD_OF_MEMBER: &[(&str, &str)] = &[
     ("bootstrapBrokerString", "plaintext"),
     ("bootstrapBrokerStringIpv6", "plaintext"),
     ("bootstrapBrokerStringTls", "tls"),
@@ -62,7 +65,9 @@ const METHOD_OF_MEMBER: &[(&str, &str)] = &[
 /// The access method the member `member` is served by, or a failure naming a member this
 /// catalog does not know — which is a member of the model this suite would otherwise skip
 /// silently.
-fn method_of(member: &str, case: &str) -> &'static str {
+///
+/// `pub(crate)` for the same reason as [`METHOD_OF_MEMBER`].
+pub(crate) fn method_of(member: &str, case: &str) -> &'static str {
     METHOD_OF_MEMBER
         .iter()
         .find(|(known, _)| *known == member)
@@ -137,7 +142,7 @@ fn rows() -> Vec<Row> {
             brokers: 2,
         },
         Row {
-            // One broker node publishes one pair, so what a pair carries is a node's own
+            // One broker node publishes one pair, so what a pair carries is the method's
             // socket and not an artefact of there being several nodes.
             case: "one broker, plaintext only",
             created: ClusterRequest {
@@ -184,7 +189,7 @@ fn rows() -> Vec<Row> {
 }
 
 #[tokio::test]
-async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own() {
+async fn every_access_method_publishes_one_port_shared_by_its_broker_nodes() {
     let emulator = Emulator::new();
     let rows = rows();
     let mut arns = Vec::new();
@@ -203,7 +208,7 @@ async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own()
             "case {case:?}: a cluster with brokers must publish a bootstrap string"
         );
         // The broker nodes this row provisioned, which is how many pairs each method
-        // publishes below: one per node, each on that node's own port.
+        // publishes below: one per node, all of them on that method's one port.
         let described = emulator.describe(arn).await;
         assert_eq!(
             described.at("/clusterInfo/numberOfBrokerNodes").as_i64(),
@@ -213,7 +218,8 @@ async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own()
             described.body
         );
 
-        // Within ONE string: a pair per broker node, each on a port of its own.
+        // Within ONE string: a pair per broker node, every one of them on the METHOD's own
+        // port.
         let mut ports_of_method: BTreeMap<&str, BTreeSet<u16>> = BTreeMap::new();
         let mut string_of_method: BTreeMap<&str, String> = BTreeMap::new();
         let mut hosts_of_method: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
@@ -235,13 +241,17 @@ async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own()
                     "case {probe:?}: every published host must name this emulator's own \
                      interface, got {pairs:?}"
                 );
-                assert!(
-                    ports.insert(port),
-                    "case {probe:?}: a string must name each address it serves once, got \
-                     {pairs:?}"
-                );
+                ports.insert(port);
                 hosts.insert(host);
             }
+            // The PORT is the method's, shared by every broker node of the cluster: a
+            // client reads the access method off the port of any pair it took.
+            assert_eq!(
+                ports.len(),
+                1,
+                "case {probe:?}: every pair of one string must carry the method's one port, \
+                 got {ports:?} in {pairs:?}"
+            );
             let method = method_of(member, &probe);
             // Two members of the SAME access method publish the same string: an IPv6
             // sibling is that method reached over another network layer.
@@ -258,8 +268,8 @@ async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own()
             hosts_of_method.insert(method, hosts);
         }
 
-        // Across the methods: no port is published twice, so no two of a cluster's
-        // addresses name one endpoint and what a client dials decides both the broker it
+        // Across the methods: no port is published twice, so a port names one access
+        // method of the cluster and what a client dials decides both the brokers it
         // reaches and the scheme it is served over.
         let published_ports: usize = ports_of_method.values().map(BTreeSet::len).sum();
         let distinct_ports: BTreeSet<u16> =
@@ -267,8 +277,8 @@ async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own()
         assert_eq!(
             distinct_ports.len(),
             published_ports,
-            "case {case:?}: expected a port of its own for every broker node of every access \
-             method, got {ports_of_method:?}"
+            "case {case:?}: expected a port of its own for every access method, got \
+             {ports_of_method:?}"
         );
         // And distinct methods publish distinct strings, since their ports differ.
         let strings: BTreeSet<&String> = string_of_method.values().collect();
@@ -299,7 +309,7 @@ async fn every_broker_node_of_every_access_method_answers_on_a_port_of_its_own()
 }
 
 #[tokio::test]
-async fn every_published_address_answers_on_a_socket_of_its_own() {
+async fn every_access_methods_published_port_answers_on_a_socket_of_its_own() {
     let case = "a cluster publishing the plaintext, TLS and both SASL methods";
     let emulator = Emulator::new();
     let cluster = emulator
@@ -328,16 +338,30 @@ async fn every_published_address_answers_on_a_socket_of_its_own() {
 
     // Every published pair is a socket of this emulator's own and answers the protocol on
     // the wire its access method is served over, so a port a cluster publishes is one the
-    // core assigned that broker node for that method and never a number borrowed from
-    // another endpoint. Each pair of every member is dialled, not only the first.
+    // core assigned that method's socket and never a number borrowed from another
+    // endpoint. Each pair of every member is dialled, not only the first; the pairs of one
+    // member share the method's port, so the port is recorded per MEMBER and no two
+    // members may name one.
     let mut dialled: BTreeSet<u16> = BTreeSet::new();
     for (member, pairs) in &members {
+        let (_host, member_port) = split(
+            pairs
+                .first()
+                .unwrap_or_else(|| panic!("case {case:?}: {member} carries no pair")),
+            case,
+        );
+        assert!(
+            dialled.insert(member_port),
+            "case {case:?}: the port {member_port} {member} publishes is already another \
+             access method's"
+        );
         for pair in pairs {
             let probe = format!("{case} / {member} / {pair}");
             let (_host, port) = split(pair, &probe);
-            assert!(
-                dialled.insert(port),
-                "case {probe:?}: the port {port} is already another endpoint's"
+            assert_eq!(
+                port, member_port,
+                "case {probe:?}: every pair of {member} carries the method's one port \
+                 {member_port}, got {port}"
             );
             let mut client = match member.contains("Tls") || member.contains("Sasl") {
                 true => Client::tls(&probe, pair).await,

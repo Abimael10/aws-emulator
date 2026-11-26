@@ -179,7 +179,7 @@ impl Session {
 }
 
 /// RULE: every address `GetBootstrapBrokers` publishes resolves, in the register of the planes
-/// this emulator serves in process, to a plane of this service — one per broker node of the
+/// this emulator serves in process, to a plane of this service — one per access method of the
 /// cluster — and a connection opened on any of those published for the plaintext path carries a
 /// real Kafka session, answered by the same broker a client of the socket reaches, which
 /// reports every published address of the path as the cluster's brokers.
@@ -296,8 +296,8 @@ async fn an_address_no_cluster_was_opened_at_resolves_to_nothing() {
         .unwrap_or_else(|| panic!("case {case:?}: a cluster with brokers publishes an address"));
     let (host, port) = split(published_authority, case);
     // Every port this cluster's planes were opened at, so the row below names one that is
-    // NOT one of them: a cluster publishes a pair per broker node, so the next port up
-    // can belong to another of its brokers.
+    // NOT one of them: a cluster publishes a port per access method, so a neighbouring port
+    // can belong to another of its methods.
     let opened: Vec<u16> = addresses
         .values()
         .flatten()

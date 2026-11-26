@@ -354,8 +354,9 @@ pub struct ServedNode {
     pub path: AccessPath,
     /// WHICH broker node of the cluster answers on this socket: the id it reports itself
     /// under in `Metadata`, and the node it names as the coordinator of a group a client
-    /// asks it for. Every node of a cluster here reads and writes the same log, so which
-    /// one a client reached decides only the identity it is answered with.
+    /// asks it for. Every node of a cluster here reads and writes the same log and shares
+    /// the access method's one socket, so which one a client reached decides only the
+    /// identity it is answered with.
     pub node_id: i32,
 }
 
@@ -1565,7 +1566,8 @@ impl Broker {
     ///
     /// Every broker node the cluster holds is reported, each at the address it is PUBLISHED
     /// at for this access method — the one interface this emulator answers on, on the port
-    /// the core assigned THAT node's own socket — so a client that sizes its connection
+    /// the core assigned that METHOD's socket, which every node of the cluster is reached
+    /// there over — so a client that sizes its connection
     /// pool from the broker list, or re-resolves the cluster from its metadata, reaches this
     /// emulator's own socket for each of them rather than a name nothing serves. Each
     /// partition is placed on as
@@ -2035,25 +2037,16 @@ impl Broker {
     /// ([`OFFSETS_TOPIC_PARTITIONS`]), and the node that partition falls on is the one
     /// leading it, as this plane places every partition ([`topic_metadata`]).
     ///
-    /// The coordinator is reported at ITS OWN published address for the method the client
-    /// dialled, so the client reaches that broker over the method it is already using. A
-    /// node whose socket is not open yet leaves the answer at an address the cluster does
-    /// publish rather than at none.
+    /// The coordinator is reported at the address the method the client dialled is
+    /// published at, so the client reaches that broker over the method it is already using
+    /// — every node of the cluster answers that method there. A method whose socket is not
+    /// open yet leaves the answer at no address rather than at one nothing serves.
     fn coordinator_of(&self, key: &str) -> (i32, String) {
         let store = self.state.lock();
         let nodes = store.broker_node_ids(&self.region, &self.cluster_arn);
         let leading = coordinating_node(key, &nodes).unwrap_or(self.node_id);
         let authority = store
-            .broker_authority_of_node(&self.region, &self.cluster_arn, self.path, leading)
-            .or_else(|| {
-                store.broker_authority_of_node(
-                    &self.region,
-                    &self.cluster_arn,
-                    self.path,
-                    self.node_id,
-                )
-            })
-            .or_else(|| store.broker_authority(&self.region, &self.cluster_arn, self.path))
+            .broker_authority(&self.region, &self.cluster_arn, self.path)
             .unwrap_or_default();
         (leading, authority)
     }

@@ -4,11 +4,11 @@
 //! publishes — and the MSK configuration every one of them runs with.
 //!
 //! RULE under test: a bootstrap string carries ONE `hostname:port` pair per broker node of
-//! the cluster, and every pair is an address THIS emulator answers the Apache Kafka wire
-//! protocol on as THAT node — so a client that splits the string reaches a broker of its
-//! own at each entry, each of them reports the cluster's whole broker list at the same
-//! addresses, and each of them runs the `server.properties` of the configuration revision
-//! the cluster carries: a `CreateTopics` that leaves the placement to the broker
+//! the cluster, every pair being an address THIS emulator answers the Apache Kafka wire
+//! protocol on for that access method — so a client that splits the string reaches a broker
+//! of the cluster at each entry, each of them reports the cluster's whole broker list at
+//! the same addresses, and each of them runs the `server.properties` of the configuration
+//! revision the cluster carries: a `CreateTopics` that leaves the placement to the broker
 //! (`num_partitions`/`replication_factor` of `-1`) is placed with the `num.partitions` and
 //! `default.replication.factor` in force, whichever broker the client asked, while a
 //! request naming its own count keeps it.
@@ -203,13 +203,13 @@ async fn every_published_broker_serves_the_clusters_configuration() {
         let distinct: BTreeSet<&String> = pairs.iter().collect();
         assert_eq!(
             distinct.len(),
-            pairs.len(),
-            "case {case:?}: every pair must name an endpoint of its own, got {pairs:?}"
+            1,
+            "case {case:?}: every pair of one string names the access method's one address, \
+             got {pairs:?}"
         );
 
         // EVERY published pair is dialled: each answers the protocol, reports the whole
         // broker list at the published addresses, and runs the cluster's configuration.
-        let mut reached: BTreeSet<i32> = BTreeSet::new();
         for (index, pair) in pairs.iter().enumerate() {
             let probe = format!("{case} / {pair}");
             let mut client = Client::plaintext(&probe, pair).await;
@@ -219,9 +219,9 @@ async fn every_published_broker_serves_the_clusters_configuration() {
                 "case {probe:?}: every published pair must answer ApiVersions, got error {}",
                 negotiated.error_code
             );
-            // WHICH broker answered: the node this address was published for, so a client
-            // that dials the n-th entry talks to the n-th broker rather than to one of them
-            // over and over.
+            // WHICH brokers the cluster holds: every node of it, reported at the address
+            // this access method is published at, so a client that re-resolves the cluster
+            // from its metadata keeps reaching this emulator's own socket.
             let metadata = client.metadata(&probe).await;
             let reported: Vec<String> = metadata
                 .brokers
@@ -234,37 +234,39 @@ async fn every_published_broker_serves_the_clusters_configuration() {
                 "case {probe:?}: expected Metadata to report the published addresses \
                  {pairs:?}, got {reported:?}"
             );
-            let answered_as = metadata
+            let reached: Vec<i32> = metadata
                 .brokers
                 .iter()
-                .find(|broker| format!("{}:{}", broker.host.as_str(), broker.port) == *pair)
                 .map(|broker| broker.node_id.0)
-                .unwrap_or_else(|| panic!("case {probe:?}: Metadata reported no broker at {pair}"));
-            assert!(
-                reached.insert(answered_as),
-                "case {probe:?}: two published pairs must not name one broker node, got \
-                 {answered_as} again among {reached:?}"
+                .collect();
+            assert_eq!(
+                reached,
+                (1..=i32::try_from(row.brokers).unwrap_or(1)).collect::<Vec<i32>>(),
+                "case {probe:?}: expected the cluster's whole broker membership, got \
+                 {reached:?}"
             );
 
-            // The configuration THIS broker runs with: the cluster's own server
-            // properties, read back from the broker the client reached.
-            let in_force = broker_configuration(&mut client, answered_as, &probe).await;
-            assert_eq!(
-                in_force.get(NUM_PARTITIONS).map(String::as_str),
-                Some(row.partitions.to_string().as_str()),
-                "case {probe:?}: expected broker {answered_as} to report \
-                 {NUM_PARTITIONS}={}, got {in_force:?}",
-                row.partitions
-            );
-            assert_eq!(
-                in_force
-                    .get(DEFAULT_REPLICATION_FACTOR)
-                    .map(String::as_str),
-                Some(row.replication.to_string().as_str()),
-                "case {probe:?}: expected broker {answered_as} to report \
-                 {DEFAULT_REPLICATION_FACTOR}={}, got {in_force:?}",
-                row.replication
-            );
+            // The configuration EVERY broker of the cluster runs with: the cluster's own
+            // server properties, read back from the broker the client reached.
+            for answered_as in &reached {
+                let in_force = broker_configuration(&mut client, *answered_as, &probe).await;
+                assert_eq!(
+                    in_force.get(NUM_PARTITIONS).map(String::as_str),
+                    Some(row.partitions.to_string().as_str()),
+                    "case {probe:?}: expected broker {answered_as} to report \
+                     {NUM_PARTITIONS}={}, got {in_force:?}",
+                    row.partitions
+                );
+                assert_eq!(
+                    in_force
+                        .get(DEFAULT_REPLICATION_FACTOR)
+                        .map(String::as_str),
+                    Some(row.replication.to_string().as_str()),
+                    "case {probe:?}: expected broker {answered_as} to report \
+                     {DEFAULT_REPLICATION_FACTOR}={}, got {in_force:?}",
+                    row.replication
+                );
+            }
 
             // And a topic that leaves the placement to the broker is placed with that
             // configuration, whichever broker of the cluster the client asked.
@@ -388,15 +390,8 @@ async fn every_published_broker_serves_the_clusters_configuration() {
             );
         }
 
-        // Every pair named a broker node of its own, so the string names the cluster's
-        // whole membership.
-        assert_eq!(
-            reached.len(),
-            usize::try_from(row.brokers).unwrap_or_default(),
-            "case {case:?}: expected a broker node per published pair, got {reached:?}"
-        );
-        // Each published pair carries the port the core assigned that node's socket, on the
-        // one interface this emulator answers at.
+        // Each published pair carries the port the core assigned that access method's
+        // socket, on the one interface this emulator answers at.
         let mut ports: BTreeSet<u16> = BTreeSet::new();
         for pair in &pairs {
             let (host, port) = split(pair, case);
@@ -405,10 +400,13 @@ async fn every_published_broker_serves_the_clusters_configuration() {
                 "case {case:?}: every published host must name this emulator's own \
                  interface, got {pair:?}"
             );
-            assert!(
-                ports.insert(port),
-                "case {case:?}: every broker node answers on a port of its own, got {pairs:?}"
-            );
+            ports.insert(port);
         }
+        assert_eq!(
+            ports.len(),
+            1,
+            "case {case:?}: every broker node of the method answers on its one port, got \
+             {ports:?} in {pairs:?}"
+        );
     }
 }

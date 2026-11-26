@@ -7,14 +7,15 @@
 //! RULE under test: every bootstrap string a cluster publishes is "a string containing one
 //! or more hostname:port pairs" (`GetBootstrapBrokers` output members and documentation)
 //! carrying ONE PAIR PER BROKER NODE the cluster was provisioned with, and every pair of it
-//! is an address THIS emulator answers the Apache Kafka wire protocol on as that very node
-//! — named once, on the port the core assigned that node's own socket. So the `Metadata`
+//! is an address THIS emulator answers the Apache Kafka wire protocol on for that access
+//! method — on the one port the core assigned that method's socket, which every broker node
+//! of the cluster is reached at. So the `Metadata`
 //! the broker behind any published pair answers reports the same addresses: one entry per
 //! broker node, each where the string publishes it.
 //!
 //! So a client that splits the string to bootstrap, and then sizes its connection pool,
-//! pins a replication factor to the broker count or fans out per broker, reaches a broker
-//! of its own for every address it took.
+//! pins a replication factor to the broker count or fans out per broker, counts the
+//! cluster's broker nodes and reaches a broker of the cluster at every address it took.
 //!
 //! The rows differ along what the rule generalises over: the number of broker nodes (the
 //! published minimum, two, three, and a count above the subnets it is spread over), the
@@ -151,7 +152,7 @@ fn rows() -> Vec<Row> {
 }
 
 #[tokio::test]
-async fn every_bootstrap_string_names_each_served_address_once() {
+async fn every_bootstrap_string_names_one_pair_per_broker_node_on_the_methods_port() {
     let emulator = Emulator::new();
     let rows = rows();
 
@@ -191,14 +192,9 @@ async fn every_bootstrap_string_names_each_served_address_once() {
                 "case {probe:?}: expected one hostname:port pair per broker node, got \
                  {pairs:?}"
             );
-            // Each address is named ONCE: a string that repeats one address names one
-            // endpoint however many times it names it.
-            let distinct: BTreeSet<&String> = pairs.iter().collect();
-            assert_eq!(
-                distinct.len(),
-                pairs.len(),
-                "case {probe:?}: every pair must name a distinct address, got {pairs:?}"
-            );
+            // Each address is one this emulator serves, and the pairs of one string all
+            // carry the METHOD's port: Amazon MSK shares a method's port across the
+            // cluster's broker nodes, so a client reads the method off any pair it took.
             let mut ports: BTreeSet<u16> = BTreeSet::new();
             for pair in pairs {
                 let (host, port) = split(pair, &probe);
@@ -209,13 +205,11 @@ async fn every_bootstrap_string_names_each_served_address_once() {
                 );
                 ports.insert(port);
             }
-            // And every pair of one string carries the port the core assigned THAT broker
-            // node's own socket, so no two of them name one endpoint.
             assert_eq!(
                 ports.len(),
-                pairs.len(),
-                "case {probe:?}: every broker node answers on a port of its own, got \
-                 {ports:?} in {pairs:?}"
+                1,
+                "case {probe:?}: every pair of one string carries the access method's one \
+                 port, got {ports:?} in {pairs:?}"
             );
         }
     }

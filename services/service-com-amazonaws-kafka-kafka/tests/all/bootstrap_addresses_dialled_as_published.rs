@@ -201,15 +201,21 @@ async fn every_published_bootstrap_address_is_one_a_client_can_reach() {
                 negotiated.error_code
             );
         }
-        // No two access methods are published at one address: the port a pair carries is
-        // what says which method a client reached.
+        // No two access METHODS are published at one address: the port a pair carries is
+        // what says which method a client reached. Within one method the pairs coincide —
+        // one port, shared by every broker node of the cluster — so what is counted here
+        // is the distinct addresses against the distinct methods published.
         let every_address: BTreeSet<&String> =
             members.iter().flat_map(|(_, pairs)| pairs).collect();
-        let published_count: usize = members.iter().map(|(_, pairs)| pairs.len()).sum();
+        let every_method: BTreeSet<&str> = members
+            .iter()
+            .map(|(member, _)| crate::bootstrap_broker_ports::method_of(member, case))
+            .collect();
         assert_eq!(
             every_address.len(),
-            published_count,
-            "case {case:?}: every published address must be distinct, got {members:?}"
+            every_method.len(),
+            "case {case:?}: every access method must be published at an address of its own, \
+             got {members:?}"
         );
     }
 }
