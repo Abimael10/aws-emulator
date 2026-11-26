@@ -77,6 +77,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # and `runcmd` are what the boot performs; yaml-rust2 is the pure-Rust YAML 1.2
 # implementation the other services that read caller-supplied YAML use.
 yaml-rust2 = { version = "0.10", default-features = false }
+# The MIME multipart archive a user data may arrive as: its header block and its parts carry
+# one document each, and reading a MIME message is what `mailparse` does — the same reading
+# the services that read an RFC 5322 message use, rather than a second header parser here.
+mailparse = "0.16"
 # A cloud-config command written as an ARGUMENT VECTOR is run without a shell, so the words
 # are quoted back into the one command line that stands for that vector rather than joined by
 # hand; shell-words is the maintained POSIX word quoter.

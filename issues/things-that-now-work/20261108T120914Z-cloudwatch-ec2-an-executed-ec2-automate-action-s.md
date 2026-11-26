@@ -34,6 +34,24 @@ Traces: cloudwatch__ec2.xsvc-cloudwatch-3-alarm-ec2-reboot-action-reboots-instan
 Cause 1 — Expected: DescribeAlarmHistory(AlarmName=<armed alarm>, HistoryItemType='Action') returns an item whose HistorySummary names the armed instance id (the id quoted, taken from the alarm's InstanceId dimension) alongside the executed action ARN. Actual: 'AssertionError: the Action history item does not name instance \'i-00000000000000001\': \'Successfully executed action arn:aws:automate:us-west-2:ec2:terminate\'' — the summary carries the ARN only. (The instance id and region are per-run/per-lease values; the requirement is that the instance id from the request/state appears in the message.)
 Cause 2 — Expected: after SetAlarmState ALARM on the armed alarm, the armed instance reboots and an Action history item is recorded, while the ActionsEnabled=false twin's instance stays running with no Action item. Actual: 'Error: Check timed out after 180.0s' — no assertion reached; the reboot evidence never appears.
 
+## Resolution
+Cause 1 was already served when this was picked up: the `Action` history item of an executed EC2
+instance action names the instance the action was attempted against, taken from the alarm's own
+watched dimension (`src/state/alarm_actions.rs`, `action_summary`), and its replay key passes.
+
+Cause 2 was not the dispatch: the alarm action path already performs `RebootInstances` against the
+alarm's instance, and the reboot is a real guest boot. What never appeared was the evidence the check
+polls for — a console line the instance's user data prints from inside the guest on EVERY boot. An
+instance's user data is read as the form the DOCUMENT declares itself to be, and each form has the
+cadence cloud-init publishes for it; the reader knew only the `#cloud-config` and `#!` forms, so a
+`#cloud-boothook` (the script form run on every boot) and the archive and compressed forms gave the
+guest no program at all. `services/service-com-amazonaws-ec2-amazonec2/src/state/guest_user_data.rs`
+now reads each of them — a boothook on every boot, a MIME multipart or `#cloud-config-archive` as one
+document per part at each part's own cadence, and a compressed document as the document inside it,
+each bounded before it is read. Covered by
+`services/service-com-amazonaws-ec2-amazonec2/tests/all/instance_guest_user_data_cadence.rs` and that
+module's own tests.
+
 ## Steps to Reproduce
 1. Replay the behavioral suite and read the failures under '### cloudwatch__ec2'.
 2. Cause 1: run two t3.micro instances; PutMetricAlarm twice on a custom namespace with Dimensions=[{Name:'InstanceId',Value:<id>}] and AlarmActions=['arn:aws:automate:<region>:ec2:terminate'], one ActionsEnabled=true and one false; SetAlarmState ALARM on both; read DescribeAlarmHistory(HistoryItemType='Action') for the armed alarm — the recorded HistorySummary names no instance.

@@ -11,6 +11,11 @@
 //!
 //! # The forms read
 //!
+//! A document says WHICH form it is itself — cloud-init reads the form off the document's own
+//! header, never off the request that carried it — and each form has a CADENCE, the boots
+//! cloud-init runs that form's program on, which is what decides whether a restarted guest
+//! runs the program again:
+//!
 //! * a `#cloud-config` document — the YAML form cloud-init documents, read with
 //!   `yaml-rust2`, the pure-Rust YAML 1.2 implementation the other services that read
 //!   caller-supplied YAML use. Its `bootcmd` runs on EVERY boot and its `runcmd` on the
@@ -19,10 +24,24 @@
 //!   its `write_files` names FILES the machine's storage holds — "write arbitrary files",
 //!   written once per instance, with the directories above them made as needed;
 //! * a text that starts with `#!` — a user-data SCRIPT, which cloud-init runs once per
-//!   instance, so its lines are first-boot commands.
+//!   instance, so its lines are first-boot commands;
+//! * a text that starts with `#cloud-boothook` — a BOOTHOOK, the other script form
+//!   cloud-init documents, which it runs "very early in the boot process" and, unlike a
+//!   user-data script, on EVERY boot, so its lines are every-boot commands;
+//! * an ARCHIVE, which is no program of its own but a carrier of several: a MIME multipart
+//!   message, read with `mailparse`, the same reading of a MIME message the services that read
+//!   an RFC 5322 message take, and the `#cloud-config-archive` list of the same documents
+//!   written as YAML. Each
+//!   PART is read as the form its own `Content-Type` (or its `type`) declares — and, for a
+//!   part that declares none this emulator knows a cadence for, as the form the part's own
+//!   text declares — so the program a part carries runs at its own form's cadence beside
+//!   the others;
+//! * COMPRESSED bytes: cloud-init decompresses user data that arrives gzipped, so what the
+//!   guest runs is the document inside, read as whatever form THAT declares.
 //!
-//! Every other form — a MIME multipart archive, an `#include`, gzip-compressed bytes, or
-//! user data that is not UTF-8 text at all — is one this emulator runs NOTHING for: the
+//! The one form left unread is the `#include` family, which names documents to FETCH over
+//! the network: this emulator makes no outbound request, so there is nothing to run. Such a
+//! document — like user data that is not text at all — gives the guest no program, and the
 //! guest's console then carries the boot itself and no user-data output, rather than output
 //! invented for a program nothing read.
 //!
@@ -38,7 +57,12 @@
 //! nests ([`MAX_GUEST_CONFIG_DEPTH`]), and how many commands one boot performs
 //! ([`MAX_GUEST_COMMANDS`]) and how long one of them may be ([`MAX_GUEST_COMMAND_BYTES`]) —
 //! so a document cannot make a boot cost more than a fixed amount of work however it nests,
-//! anchors or aliases.
+//! anchors or aliases. An ARCHIVE is bounded the same way before it is opened: how many bytes
+//! of it are read at all ([`MAX_GUEST_DOCUMENT_BYTES`], which is also what a compressed document may
+//! decompress to), how many parts are read out of it ([`MAX_GUEST_ARCHIVE_PARTS`]) and how deeply
+//! an archive may carry another ([`MAX_GUEST_ARCHIVE_NESTING`], a precondition of EVERY archive
+//! reader rather than of one path into them, and carried through a part so that no part resets
+//! it) — which is what bounds the recursion reading an archive of archives costs.
 
 use ::base64::Engine as _;
 
@@ -82,6 +106,67 @@ pub const MAX_GUEST_CONFIG_NODES: usize = 4_096;
 
 /// The header a `#cloud-config` user data starts with, as cloud-init documents it.
 pub const CLOUD_CONFIG_HEADER: &str = "#cloud-config";
+
+/// The header a BOOTHOOK user data starts with, as cloud-init documents it. Its script runs
+/// on EVERY boot, which is what separates it from the `#!` script form.
+pub const CLOUD_BOOTHOOK_HEADER: &str = "#cloud-boothook";
+
+/// The header a `#cloud-config-archive` user data starts with: an ARCHIVE, a YAML list of the
+/// documents it carries rather than a program of its own.
+pub const CLOUD_CONFIG_ARCHIVE_HEADER: &str = "#cloud-config-archive";
+
+/// The keys of one entry of that list: the `type` the entry is to be read as — the same media
+/// type a MIME part declares — and the `content` it holds.
+const ARCHIVE_ENTRY_TYPE: &str = "type";
+const ARCHIVE_ENTRY_CONTENT: &str = "content";
+
+/// The media types a part of an archive declares its form with, as cloud-init documents them:
+/// the cloud-config and boothook forms, and the script form in each of the cadences it is
+/// published under — once per instance (its default), and once per boot.
+const PART_CLOUD_CONFIG: &str = "text/cloud-config";
+const PART_CLOUD_CONFIG_ARCHIVE: &str = "text/cloud-config-archive";
+const PART_CLOUD_BOOTHOOK: &str = "text/cloud-boothook";
+const PART_SHELLSCRIPT: &str = "text/x-shellscript";
+const PART_SHELLSCRIPT_PER_BOOT: &str = "text/x-shellscript-per-boot";
+const PART_SHELLSCRIPT_PER_INSTANCE: &str = "text/x-shellscript-per-instance";
+const PART_SHELLSCRIPT_PER_ONCE: &str = "text/x-shellscript-per-once";
+
+/// The media type family an ARCHIVE declares itself under, as a part's own `Content-Type` and
+/// as a message's: "multipart/mixed" is the one cloud-init documents, and every subtype of the
+/// family carries parts the same way.
+const MULTIPART_MEDIA_TYPE: &str = "multipart/";
+
+/// The first two bytes of a gzip member (RFC 1952), which is what says a user data arrived
+/// COMPRESSED.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// How many bytes of user data are read at all — before it is opened as an archive, and after
+/// a compressed one is decompressed, so a short document cannot expand past it.
+pub const MAX_GUEST_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// How many parts are read out of ONE archive.
+pub const MAX_GUEST_ARCHIVE_PARTS: usize = 16;
+
+/// How deeply an archive may carry another archive — or a compressed document another — before
+/// it is read no further.
+///
+/// Tested by EVERY reader that opens an archive ([`mime_archive_program`],
+/// [`config_archive_program`]) and by [`document_program`], rather than on one path into them,
+/// and counted once per archive OPENED: a part that carries a document rather than an archive
+/// hands the count on unchanged, so no part is read under a wider budget than its own archive
+/// was.
+pub const MAX_GUEST_ARCHIVE_NESTING: usize = 4;
+
+/// How many documents may DECLARE themselves to be archives inside one MIME message, counted
+/// on its text before anything parses it.
+///
+/// The MIME reader is handed the whole message and builds the part tree itself, which is work
+/// done before any ceiling of this module is consulted — so the declarations are counted first,
+/// the way the YAML reader's nesting is bounded before its load. The ceiling is what a message
+/// inside every other bound can even carry: one declaration per part of every level that may be
+/// read.
+pub const MAX_GUEST_ARCHIVE_DECLARATIONS: usize =
+    MAX_GUEST_ARCHIVE_PARTS * (MAX_GUEST_ARCHIVE_NESTING + 1);
 
 /// The key of the cloud-config module whose commands run on EVERY boot.
 pub const CLOUD_CONFIG_BOOTCMD: &str = "bootcmd";
@@ -162,41 +247,267 @@ impl GuestProgram {
 /// instance", which the API carries base64-encoded), so it is decoded here before it is
 /// read.
 pub fn guest_program(user_data: Option<&str>) -> GuestProgram {
-    let Some(text) = user_data.and_then(decoded_user_data) else {
+    let Some(bytes) = user_data.and_then(decoded_user_data) else {
         return GuestProgram::default();
     };
+    document_program(&bytes, 0)
+}
+
+/// The program the document `bytes` carries, read `nesting` archives deep.
+///
+/// Every bound a reading is given is taken HERE, before the reading: the bytes read at all,
+/// and how deeply an archive or a compressed document may carry another.
+fn document_program(bytes: &[u8], nesting: usize) -> GuestProgram {
+    if nesting > MAX_GUEST_ARCHIVE_NESTING || bytes.len() > MAX_GUEST_DOCUMENT_BYTES {
+        return GuestProgram::default();
+    }
+    // cloud-init decompresses user data that arrives compressed, so what the guest runs is
+    // the document INSIDE, read as whatever form that one declares itself to be.
+    if let Some(decompressed) = decompressed(bytes) {
+        return document_program(&decompressed, nesting + 1);
+    }
+    let Ok(text) = ::std::str::from_utf8(bytes) else {
+        return GuestProgram::default();
+    };
+    text_program(text, nesting)
+}
+
+/// The program the document `text` carries, read as the form its own header declares.
+fn text_program(text: &str, nesting: usize) -> GuestProgram {
     let trimmed = text.trim_start();
+    // An ARCHIVE carries documents rather than commands, so it is recognised before any
+    // program form; the archive header starts with the cloud-config one, so it is read first.
+    if is_mime_archive(trimmed) {
+        return mime_archive_program(trimmed, nesting + 1);
+    }
+    if trimmed.starts_with(CLOUD_CONFIG_ARCHIVE_HEADER) {
+        return config_archive_program(trimmed, nesting + 1);
+    }
     if trimmed.starts_with(CLOUD_CONFIG_HEADER) {
         return cloud_config_program(trimmed);
     }
+    if trimmed.starts_with(CLOUD_BOOTHOOK_HEADER) {
+        // A boothook is run on EVERY boot, so its lines are every-boot commands — the one
+        // way a user-data SCRIPT (rather than a cloud-config module) runs again on a guest
+        // that restarted.
+        return every_boot_program(trimmed);
+    }
     if trimmed.starts_with("#!") {
         // A user-data script is run ONCE per instance, so its lines are the first boot's.
-        return GuestProgram {
-            every_boot: Vec::new(),
-            first_boot: script_commands(trimmed),
-            written_files: Vec::new(),
-        };
+        return first_boot_program(trimmed);
     }
     GuestProgram::default()
 }
 
-/// `user_data` as the text the guest was given, or `None` when it is not base64 at all or
-/// not UTF-8 text once decoded — neither of which is a program this emulator can run.
-fn decoded_user_data(user_data: &str) -> Option<String> {
-    let decoded = ::base64::engine::general_purpose::STANDARD
-        .decode(user_data.trim())
+/// The script `text` as a program run on every boot.
+fn every_boot_program(text: &str) -> GuestProgram {
+    GuestProgram {
+        every_boot: script_commands(text),
+        first_boot: Vec::new(),
+        written_files: Vec::new(),
+    }
+}
+
+/// The script `text` as a program run on the first boot of the instance only.
+fn first_boot_program(text: &str) -> GuestProgram {
+    GuestProgram {
+        every_boot: Vec::new(),
+        first_boot: script_commands(text),
+        written_files: Vec::new(),
+    }
+}
+
+/// `bytes` decompressed, for user data that arrived as a gzip member — `None` for one that did
+/// not, or one whose stream does not decompress to inside [`MAX_GUEST_DOCUMENT_BYTES`].
+///
+/// The output is bounded as it is read rather than after: a short member can expand without
+/// limit, so the reader is handed the ceiling plus one byte and a stream that reaches it is
+/// read no further.
+fn decompressed(bytes: &[u8]) -> Option<Vec<u8>> {
+    use ::std::io::Read as _;
+
+    if !bytes.starts_with(&GZIP_MAGIC) {
+        return None;
+    }
+    let mut decompressed = Vec::new();
+    ::flate2::read::GzDecoder::new(bytes)
+        .take(MAX_GUEST_DOCUMENT_BYTES as u64 + 1)
+        .read_to_end(&mut decompressed)
         .ok()?;
-    String::from_utf8(decoded).ok()
+    (decompressed.len() <= MAX_GUEST_DOCUMENT_BYTES).then_some(decompressed)
+}
+
+/// Whether `line` is a `Content-Type` header declaring a MULTIPART media type — the one
+/// reading of such a line, shared by the scan that tells an archive from a document and the
+/// count that bounds what one message declares.
+fn declares_multipart(line: &str) -> bool {
+    let line = line.trim().to_ascii_lowercase();
+    line.starts_with("content-type:") && line.contains(MULTIPART_MEDIA_TYPE)
+}
+
+/// Whether `text` is a MIME multipart archive: its header block declares one, which is how
+/// cloud-init tells an archive from a document.
+fn is_mime_archive(text: &str) -> bool {
+    text.lines()
+        .take_while(|line| !line.trim().is_empty())
+        .any(declares_multipart)
+}
+
+/// The program a MIME multipart archive carries: each part read as the form its own
+/// `Content-Type` declares, in the order the archive carries them.
+///
+/// The header block and the part bodies are read through `mailparse`, the same reading of a
+/// MIME message the services that read an RFC 5322 message take — which also decodes a part's
+/// own transfer encoding, so a base64 part is the bytes it stands for.
+fn mime_archive_program(text: &str, nesting: usize) -> GuestProgram {
+    // The bound on what the READER builds: it is handed the whole message and builds the part
+    // tree before any ceiling here is consulted, so what the text DECLARES is counted before it
+    // is parsed — the same order the YAML reader's nesting is bounded in. (The nesting bound
+    // itself is [`mime_parts_program`]'s, so it holds for a nested archive too.)
+    if multipart_declarations(text) > MAX_GUEST_ARCHIVE_DECLARATIONS {
+        return GuestProgram::default();
+    }
+    let Ok(message) = ::mailparse::parse_mail(text.as_bytes()) else {
+        return GuestProgram::default();
+    };
+    mime_parts_program(&message.subparts, nesting)
+}
+
+/// The program the PARTS of one MIME archive carry, each read as the form its own
+/// `Content-Type` declares — and a part that declares itself an ARCHIVE read as the parts the
+/// reader has already built for it, one level deeper.
+fn mime_parts_program(parts: &[::mailparse::ParsedMail<'_>], nesting: usize) -> GuestProgram {
+    // The bound on an archive of archives, taken by every reader that opens one.
+    if nesting > MAX_GUEST_ARCHIVE_NESTING {
+        return GuestProgram::default();
+    }
+    let mut program = GuestProgram::default();
+    for part in parts.iter().take(MAX_GUEST_ARCHIVE_PARTS) {
+        let declared = part.ctype.mimetype.trim().to_ascii_lowercase();
+        // A part whose own media type is a multipart one carries PARTS rather than a document,
+        // and the reader built them when it read the message: they are this archive's parts one
+        // level down.
+        if declared.starts_with(MULTIPART_MEDIA_TYPE) {
+            add(&mut program, mime_parts_program(&part.subparts, nesting + 1));
+            continue;
+        }
+        let Ok(body) = part.get_body_raw() else {
+            continue;
+        };
+        add(&mut program, part_program(&declared, &body, nesting));
+    }
+    program
+}
+
+/// How many documents `text` declares to be archives: one `Content-Type` naming a multipart
+/// media type per level and per part that carries one. Counted on the text, parsing nothing.
+fn multipart_declarations(text: &str) -> usize {
+    text.lines().filter(|line| declares_multipart(line)).count()
+}
+
+/// The program a `#cloud-config-archive` carries: the same parts written as a YAML list, each
+/// entry naming the `type` it is to be read as and the `content` it holds — an entry that is
+/// one plain text being the document its own header declares.
+fn config_archive_program(text: &str, nesting: usize) -> GuestProgram {
+    // The bound on an archive of archives, taken by every reader that opens one: this form is
+    // reached both from a document's own header and from a part that declares it, so the
+    // precondition is here rather than on one of those paths.
+    if nesting > MAX_GUEST_ARCHIVE_NESTING {
+        return GuestProgram::default();
+    }
+    let Some(document) = loaded_document(text) else {
+        return GuestProgram::default();
+    };
+    let Some(entries) = document.as_vec() else {
+        return GuestProgram::default();
+    };
+    let mut program = GuestProgram::default();
+    for entry in entries.iter().take(MAX_GUEST_ARCHIVE_PARTS) {
+        let Some(content) = entry[ARCHIVE_ENTRY_CONTENT]
+            .as_str()
+            .or_else(|| entry.as_str())
+        else {
+            continue;
+        };
+        let declared = entry[ARCHIVE_ENTRY_TYPE].as_str().unwrap_or_default();
+        add(
+            &mut program,
+            part_program(declared, content.as_bytes(), nesting),
+        );
+    }
+    program
+}
+
+/// The program ONE part of an archive carries, read as the form the media type `declared`
+/// names — and, for a part declaring a type no cadence is published for, as the form the
+/// part's own document declares.
+///
+/// `nesting` is the count the archive this part came out of was read under: handed on unchanged
+/// for a part carrying a DOCUMENT and raised for one carrying an ARCHIVE, since the count is
+/// one per archive opened and every reader that opens one tests it — so a part is never read
+/// under a wider budget than its own archive was.
+fn part_program(declared: &str, body: &[u8], nesting: usize) -> GuestProgram {
+    let declared = declared.trim().to_ascii_lowercase();
+    // A part's own bytes may be COMPRESSED, as a whole user data may be, and a part is then
+    // the document inside them: that reading is [`document_program`]'s, so a part that is not
+    // text goes there rather than carrying no program.
+    let Ok(text) = ::std::str::from_utf8(body) else {
+        return document_program(body, nesting);
+    };
+    match declared.as_str() {
+        PART_CLOUD_CONFIG => cloud_config_program(text.trim_start()),
+        PART_CLOUD_CONFIG_ARCHIVE => config_archive_program(text.trim_start(), nesting + 1),
+        // The boothook and the per-boot script form are the two run on every boot.
+        PART_CLOUD_BOOTHOOK | PART_SHELLSCRIPT_PER_BOOT => every_boot_program(text),
+        PART_SHELLSCRIPT | PART_SHELLSCRIPT_PER_INSTANCE | PART_SHELLSCRIPT_PER_ONCE => {
+            first_boot_program(text)
+        }
+        _ => document_program(body, nesting),
+    }
+}
+
+/// Add what one part gives the guest to `program`, holding the whole to the bounds ONE
+/// document is held to: an archive of many parts cannot make a boot perform more than a
+/// single document could.
+fn add(program: &mut GuestProgram, part: GuestProgram) {
+    program.every_boot.extend(part.every_boot);
+    program.first_boot.extend(part.first_boot);
+    program.written_files.extend(part.written_files);
+    program.every_boot.truncate(MAX_GUEST_COMMANDS);
+    program.first_boot.truncate(MAX_GUEST_COMMANDS);
+    program.written_files.truncate(MAX_GUEST_WRITTEN_FILES);
+}
+
+/// `user_data` as the BYTES the guest was given, or `None` when it is not base64 at all —
+/// "the user data to make available to the instance", which the API carries base64-encoded.
+fn decoded_user_data(user_data: &str) -> Option<Vec<u8>> {
+    ::base64::engine::general_purpose::STANDARD
+        .decode(user_data.trim())
+        .ok()
 }
 
 /// The commands a `#cloud-config` document names, from its `bootcmd` and its `runcmd`.
-///
-/// Nothing is loaded until the text is known to be inside every bound a load is given: its
-/// size, how deeply it nests (the shared pre-parse scan, which parses nothing) and what its
-/// own event stream reports ([`within_load_budget`]).
 fn cloud_config_program(text: &str) -> GuestProgram {
-    if text.len() > MAX_GUEST_CONFIG_BYTES {
+    let Some(document) = loaded_document(text) else {
         return GuestProgram::default();
+    };
+    GuestProgram {
+        every_boot: module_commands(&document, CLOUD_CONFIG_BOOTCMD),
+        first_boot: module_commands(&document, CLOUD_CONFIG_RUNCMD),
+        written_files: module_files(&document),
+    }
+}
+
+/// `text` loaded as the YAML document it is — `None` for one outside any bound a load is
+/// given, which is a document nothing is read out of.
+///
+/// Nothing is loaded until the text is known to be inside every one of those bounds: its
+/// size, how deeply it nests (the shared pre-parse scan, which parses nothing) and what its
+/// own event stream reports ([`within_load_budget`]). The ONE load in this module, shared by
+/// the cloud-config form and the `#cloud-config-archive` list of documents.
+fn loaded_document(text: &str) -> Option<::yaml_rust2::Yaml> {
+    if text.len() > MAX_GUEST_CONFIG_BYTES {
+        return None;
     }
     // The ONE pre-parse nesting bound this workspace states, taken on the TEXT: a parser
     // costs a level of recursion per nested collection, so the depth is bounded before the
@@ -204,25 +515,16 @@ fn cloud_config_program(text: &str) -> GuestProgram {
     if ::service_common::yaml_nesting::nesting_depth_bound(text, MAX_GUEST_CONFIG_TEXT_NESTING)
         > MAX_GUEST_CONFIG_TEXT_NESTING
     {
-        return GuestProgram::default();
+        return None;
     }
     if !within_load_budget(text) {
-        return GuestProgram::default();
+        return None;
     }
-    let Ok(documents) = ::yaml_rust2::YamlLoader::load_from_str(text) else {
-        return GuestProgram::default();
-    };
-    let Some(document) = documents.first() else {
-        return GuestProgram::default();
-    };
-    if !within_depth(document, MAX_GUEST_CONFIG_DEPTH) {
-        return GuestProgram::default();
-    }
-    GuestProgram {
-        every_boot: module_commands(document, CLOUD_CONFIG_BOOTCMD),
-        first_boot: module_commands(document, CLOUD_CONFIG_RUNCMD),
-        written_files: module_files(document),
-    }
+    let document = ::yaml_rust2::YamlLoader::load_from_str(text)
+        .ok()?
+        .into_iter()
+        .next()?;
+    within_depth(&document, MAX_GUEST_CONFIG_DEPTH).then_some(document)
 }
 
 /// The files the `write_files` module names, each as the path it goes to and the content it
@@ -484,13 +786,89 @@ mod tests {
         ::base64::engine::general_purpose::STANDARD.encode(text)
     }
 
+    /// The same, for user data that is not text at all.
+    fn encoded_bytes(bytes: &[u8]) -> String {
+        ::base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// `text` as the gzip member a compressed user data arrives as.
+    fn compressed(text: &str) -> Vec<u8> {
+        use ::std::io::Write as _;
+
+        let mut encoder =
+            ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
+        encoder
+            .write_all(text.as_bytes())
+            .expect("a gzip member of the document");
+        encoder.finish().expect("the finished gzip member")
+    }
+
+    /// The PARTS section of an archive bounded by `boundary`: the delimited parts, with no
+    /// header block of its own — which is also exactly what the body of a part that is itself an
+    /// archive carries.
+    fn mime_parts(boundary: &str, parts: &[(&str, &str)]) -> String {
+        let mut text = String::new();
+        for (declared, body) in parts {
+            text.push_str(&format!("--{boundary}\n"));
+            if !declared.is_empty() {
+                text.push_str(&format!("Content-Type: {declared}\n"));
+            }
+            text.push('\n');
+            text.push_str(body);
+            text.push('\n');
+        }
+        text.push_str(&format!("--{boundary}--\n"));
+        text
+    }
+
+    /// A MIME multipart archive carrying `parts`, each as `(the media type it declares, its
+    /// body)` — the form a client assembles one in. `boundary` is the delimiter the archive
+    /// separates its parts with, so an archive carrying another names its own.
+    fn mime_archive_bounded_by(boundary: &str, parts: &[(&str, &str)]) -> String {
+        format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\nMIME-Version: 1.0\n\n{}",
+            mime_parts(boundary, parts)
+        )
+    }
+
+    /// The same archive under the one boundary a suite that nests nothing needs.
+    fn mime_archive(parts: &[(&str, &str)]) -> String {
+        mime_archive_bounded_by("==BOUNDARY==", parts)
+    }
+
+    /// A MIME archive nested `levels` deep below its top level, whose innermost part is a
+    /// boothook running `command`.
+    ///
+    /// Each level is a PART that declares the multipart media type and a boundary of its own,
+    /// carrying the next level's parts — which is how a client nests archives, and what makes
+    /// the reader build the tree rather than this helper repeating a header block in a body.
+    fn nested_mime_archive(levels: usize, command: &str) -> String {
+        /// `(the boundary this level is delimited by, its parts section)`.
+        fn level(at: usize, levels: usize, command: &str) -> (String, String) {
+            let boundary = format!("==LEVEL-{at}==");
+            if at >= levels {
+                let parts = mime_parts(&boundary, &[("text/cloud-boothook", command)]);
+                return (boundary, parts);
+            }
+            let (inner, carried) = level(at + 1, levels, command);
+            let declared = format!("multipart/mixed; boundary=\"{inner}\"");
+            let parts = mime_parts(&boundary, &[(declared.as_str(), carried.as_str())]);
+            (boundary, parts)
+        }
+
+        let (boundary, parts) = level(0, levels, command);
+        format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\nMIME-Version: 1.0\n\n{parts}"
+        )
+    }
+
     /// RULE: a `#cloud-config` document's `bootcmd` runs on every boot and its `runcmd` on
-    /// the first, a `#!` script runs once, and every other form of user data gives the guest
-    /// nothing to run.
+    /// the first, a `#cloud-boothook` script runs on every boot, a `#!` script runs once, and
+    /// every other form of user data gives the guest nothing to run.
     #[test]
     fn the_program_is_what_the_user_data_names() {
         // (case, the user data, its every-boot commands, its first-boot commands)
-        let rows: [(&str, String, Vec<&str>, Vec<&str>); 8] = [
+        let rows: [(&str, String, Vec<&str>, Vec<&str>); 11] = [
             (
                 "a cloud-config with both modules",
                 encoded(
@@ -529,6 +907,25 @@ mod tests {
                 encoded("#!/bin/sh\necho from-the-script\n"),
                 vec![],
                 vec!["echo from-the-script"],
+            ),
+            (
+                // A boothook is the OTHER script form, and cloud-init runs it on every boot.
+                "a boothook, whose script runs on every boot",
+                encoded("#cloud-boothook\n#!/bin/sh\necho from-the-boothook\n"),
+                vec!["echo from-the-boothook"],
+                vec![],
+            ),
+            (
+                "a boothook that carries no interpreter line",
+                encoded("#cloud-boothook\necho bare\necho again\n"),
+                vec!["echo bare", "echo again"],
+                vec![],
+            ),
+            (
+                "a boothook whose header is not the first byte",
+                encoded("\n#cloud-boothook\necho after-a-blank-line\n"),
+                vec!["echo after-a-blank-line"],
+                vec![],
             ),
             (
                 "an include form this emulator runs nothing for",
@@ -743,6 +1140,282 @@ mod tests {
             program.every_boot,
             ["echo inside the budget"],
             "expected a document inside the budget to be read, got {program:?}"
+        );
+    }
+
+    /// RULE: an ARCHIVE carries documents rather than commands — a MIME multipart message or
+    /// the `#cloud-config-archive` list of the same — and each part is run at the cadence of
+    /// the form its own part declares, beside the other parts' programs.
+    #[test]
+    fn an_archive_runs_each_part_at_its_own_form_s_cadence() {
+        // The same three documents, written as a MIME archive and as a cloud-config archive:
+        // a boothook (every boot), a script (once per instance) and a cloud-config carrying
+        // one module of each cadence.
+        let mime = mime_archive(&[
+            ("text/cloud-boothook", "#!/bin/sh\necho from-the-boothook"),
+            ("text/x-shellscript", "#!/bin/sh\necho from-the-script"),
+            (
+                "text/cloud-config",
+                "#cloud-config\nbootcmd:\n  - echo from-the-config-every\nruncmd:\n  - echo from-the-config-once",
+            ),
+        ]);
+        let config_archive = concat!(
+            "#cloud-config-archive\n",
+            "- type: text/cloud-boothook\n",
+            "  content: |\n",
+            "    #!/bin/sh\n",
+            "    echo from-the-boothook\n",
+            "- type: text/x-shellscript\n",
+            "  content: |\n",
+            "    #!/bin/sh\n",
+            "    echo from-the-script\n",
+            // An entry that declares no type is the document its own header declares.
+            "- content: |\n",
+            "    #cloud-config\n",
+            "    bootcmd:\n",
+            "      - echo from-the-config-every\n",
+            "    runcmd:\n",
+            "      - echo from-the-config-once\n",
+        )
+        .to_string();
+        // (case, the archive, its every-boot commands, its first-boot commands)
+        let rows = [
+            (
+                "a MIME multipart archive",
+                mime,
+                vec!["echo from-the-boothook", "echo from-the-config-every"],
+                vec!["echo from-the-script", "echo from-the-config-once"],
+            ),
+            (
+                "a cloud-config archive",
+                config_archive,
+                vec!["echo from-the-boothook", "echo from-the-config-every"],
+                vec!["echo from-the-script", "echo from-the-config-once"],
+            ),
+            (
+                // A part whose own type is the per-boot script form runs on every boot, and
+                // one whose type names a form that would have to be FETCHED runs nothing.
+                "parts declaring the other published script cadences",
+                mime_archive(&[
+                    ("text/x-shellscript-per-boot", "#!/bin/sh\necho per-boot"),
+                    (
+                        "text/x-shellscript-per-instance",
+                        "#!/bin/sh\necho per-instance",
+                    ),
+                    ("text/x-include-url", "https://example.invalid/program"),
+                ]),
+                vec!["echo per-boot"],
+                vec!["echo per-instance"],
+            ),
+            (
+                // A part that declares no type at all is read as whatever its own text says
+                // it is, which is how cloud-init reads a bare document.
+                "a part that declares no type",
+                mime_archive(&[("", "#cloud-boothook\necho untyped")]),
+                vec!["echo untyped"],
+                vec![],
+            ),
+        ];
+        for (case, archive, every_boot, first_boot) in rows {
+            let program = guest_program(Some(&encoded(&archive)));
+            assert_eq!(
+                program.every_boot, every_boot,
+                "case {case:?}: expected the every-boot commands {every_boot:?}, got {:?}",
+                program.every_boot
+            );
+            assert_eq!(
+                program.first_boot, first_boot,
+                "case {case:?}: expected the first-boot commands {first_boot:?}, got {:?}",
+                program.first_boot
+            );
+        }
+    }
+
+    /// RULE: user data that arrives COMPRESSED is the document inside it, read as whatever
+    /// form that document declares itself to be.
+    #[test]
+    fn a_compressed_user_data_is_the_document_inside_it() {
+        // (case, the document that was compressed, its every-boot commands, its first-boot
+        // commands)
+        let rows = [
+            (
+                "a compressed cloud-config",
+                "#cloud-config\nbootcmd:\n  - echo decompressed\n",
+                vec!["echo decompressed"],
+                vec![],
+            ),
+            (
+                "a compressed boothook",
+                "#cloud-boothook\necho decompressed-boothook\n",
+                vec!["echo decompressed-boothook"],
+                vec![],
+            ),
+            (
+                "a compressed script",
+                "#!/bin/sh\necho decompressed-script\n",
+                vec![],
+                vec!["echo decompressed-script"],
+            ),
+        ];
+        for (case, document, every_boot, first_boot) in rows {
+            let program = guest_program(Some(&encoded_bytes(&compressed(document))));
+            assert_eq!(
+                program.every_boot, every_boot,
+                "case {case:?}: expected the every-boot commands {every_boot:?}, got {:?}",
+                program.every_boot
+            );
+            assert_eq!(
+                program.first_boot, first_boot,
+                "case {case:?}: expected the first-boot commands {first_boot:?}, got {:?}",
+                program.first_boot
+            );
+        }
+        // Bytes that are neither text nor a stream that decompresses to any carry no program.
+        assert!(
+            guest_program(Some(&encoded_bytes(&[0x1f, 0x8b, 0x08, 0x00, 0x00])))
+                .is_empty(),
+            "a truncated compressed stream must give the guest no program"
+        );
+        assert!(
+            guest_program(Some(&encoded_bytes(&[0xff, 0xfe, 0x00, 0x01]))).is_empty(),
+            "user data that is not text at all must give the guest no program"
+        );
+    }
+
+    /// RULE: a part is the document its OWN bytes carry — read through the transfer encoding
+    /// the part declares, and decompressed where those bytes are compressed — so a client may
+    /// send a part either way.
+    #[test]
+    fn a_part_is_read_through_its_own_transfer_encoding() {
+        let archive = format!(
+            "Content-Type: multipart/mixed; boundary=\"==PART==\"\nMIME-Version: 1.0\n\n\
+             --==PART==\nContent-Type: application/octet-stream\n\
+             Content-Transfer-Encoding: base64\n\n{}\n--==PART==--\n",
+            encoded_bytes(&compressed(
+                "#cloud-config\nbootcmd:\n  - echo compressed-part\n"
+            ))
+        );
+        let program = guest_program(Some(&encoded(&archive)));
+        assert_eq!(
+            program.every_boot,
+            ["echo compressed-part"],
+            "expected the compressed part's own document to be read, got {program:?}"
+        );
+    }
+
+    /// RULE: an archive is bounded like the one document it stands in for — how many parts are
+    /// read out of it, how deeply it may carry another archive, and how many commands the
+    /// whole comes to.
+    #[test]
+    fn what_is_read_out_of_one_archive_is_bounded() {
+        let parts: Vec<(String, String)> = (0..super::MAX_GUEST_ARCHIVE_PARTS * 2)
+            .map(|index| {
+                (
+                    "text/cloud-boothook".to_string(),
+                    format!("echo part-{index}"),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(declared, body)| (declared.as_str(), body.as_str()))
+            .collect();
+        let program = guest_program(Some(&encoded(&mime_archive(&borrowed))));
+        assert_eq!(
+            program.every_boot.len(),
+            super::MAX_GUEST_ARCHIVE_PARTS,
+            "expected the parts to stop at the bound, got {:?}",
+            program.every_boot
+        );
+
+        // One archive carrying another is read; one nested past the ceiling is not. Each level
+        // is a PART declaring the multipart type and a boundary of its own, so the reader builds
+        // the tree — the way a client nests archives.
+        let program = guest_program(Some(&encoded(&nested_mime_archive(
+            super::MAX_GUEST_ARCHIVE_NESTING - 1,
+            "echo nested",
+        ))));
+        assert_eq!(
+            program.every_boot,
+            ["echo nested"],
+            "expected an archive inside the nesting bound to be read, got {program:?}"
+        );
+        assert!(
+            guest_program(Some(&encoded(&nested_mime_archive(
+                super::MAX_GUEST_ARCHIVE_NESTING + 1,
+                "echo nested",
+            ))))
+            .is_empty(),
+            "expected an archive nested past the bound to run nothing"
+        );
+        // A part that declares no archive type of its own, carrying a whole archive DOCUMENT as
+        // its body, is that document — the other way one archive reaches another.
+        let carried = mime_archive_bounded_by("==INNER==", &[("text/cloud-boothook", "echo carried")]);
+        let program = guest_program(Some(&encoded(&mime_archive(&[("", carried.as_str())]))));
+        assert_eq!(
+            program.every_boot,
+            ["echo carried"],
+            "expected a part carrying an archive document to be read as that document, got \
+             {program:?}"
+        );
+
+        // The SAME bound on the other archive form, reached through a part that declares
+        // itself to be one: an entry of a `#cloud-config-archive` whose `type` names that form
+        // again, so the recursion runs between the two readers rather than through a document.
+        let config_archive_level = |carried: &str| {
+            let indented: String = carried
+                .lines()
+                .map(|line| format!("      {line}\n"))
+                .collect();
+            format!(
+                "#cloud-config-archive\n- type: text/cloud-config-archive\n  content: |\n{indented}"
+            )
+        };
+        let innermost = concat!(
+            "#cloud-config-archive\n",
+            "- type: text/cloud-boothook\n",
+            "  content: |\n",
+            "    echo nested-config-archive\n",
+        )
+        .to_string();
+        let mut nested = innermost.clone();
+        for _ in 0..2 {
+            nested = config_archive_level(&nested);
+        }
+        let program = guest_program(Some(&encoded(&nested)));
+        assert_eq!(
+            program.every_boot,
+            ["echo nested-config-archive"],
+            "expected a cloud-config archive inside the nesting bound to be read, got \
+             {program:?}"
+        );
+        let mut too_deep = innermost;
+        for _ in 0..super::MAX_GUEST_ARCHIVE_NESTING + 2 {
+            too_deep = config_archive_level(&too_deep);
+        }
+        assert!(
+            guest_program(Some(&encoded(&too_deep))).is_empty(),
+            "expected a cloud-config archive nested past the bound to run nothing"
+        );
+
+        // What a MIME message DECLARES is counted before it is parsed, so a message carrying
+        // more archive declarations than every other bound admits is not read at all — not
+        // even its first part, which would otherwise give the guest a command.
+        let mut declarations: Vec<(&str, &str)> = vec![("text/cloud-boothook", "echo declared")];
+        declarations.extend(
+            (0..super::MAX_GUEST_ARCHIVE_DECLARATIONS)
+                .map(|_| ("multipart/mixed", "Content-Type: multipart/mixed\n")),
+        );
+        assert!(
+            guest_program(Some(&encoded(&mime_archive(&declarations)))).is_empty(),
+            "expected a message declaring more archives than the bound admits to run nothing"
+        );
+        // The same first part, in a message inside that bound, IS read.
+        let program = guest_program(Some(&encoded(&mime_archive(&declarations[..1]))));
+        assert_eq!(
+            program.every_boot,
+            ["echo declared"],
+            "expected a message inside the declaration bound to be read, got {program:?}"
         );
     }
 }

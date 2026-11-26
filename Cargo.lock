@@ -14327,6 +14327,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "jpeg-encoder",
+ "mailparse",
  "md-5 0.10.6",
  "pkcs1",
  "pkcs8 0.10.2",
