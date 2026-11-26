@@ -198,6 +198,10 @@ pub struct Run<'a> {
     pub client_context: Option<&'a str>,
     /// The `TenantId` the caller passed.
     pub tenant_id: Option<&'a str>,
+    /// The Amazon Cognito identity the invocation was made BY
+    /// ([`super::super::caller_cognito_identity`]), and `None` for one made by a credential no
+    /// identity pool vended — whose handler reads no identity off its context.
+    pub cognito_identity: Option<&'a crate::state::InvocationIdentity>,
     /// What this run may spend.
     pub budget: Budget,
     /// The engine's allocation ceiling: the function's `MemorySize`, in bytes.
@@ -1181,6 +1185,12 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
         "invokedFunctionArn": request.invoked_function_arn,
         "clientContext": client_context,
         "tenantId": request.tenant_id,
+        // The IDENTITY the invocation was made by, under the member names the runtime
+        // interface carries it in ([`crate::state::InvocationIdentity`]), and `null` for an
+        // invocation made by no Amazon Cognito identity.
+        "cognitoIdentity": crate::state::InvocationIdentity::runtime_member(
+            request.cognito_identity,
+        ),
         "nodeMajor": node_major(request.runtime),
         "nodeVersion": node_version(request.runtime),
         // The platform this process really runs on, and the architecture the FUNCTION is
@@ -1649,6 +1659,9 @@ mod tests {
                             "arn:aws:lambda:us-west-2:000000000000:function:probe",
                         client_context: None,
                         tenant_id: None,
+                        // These runs report on the engine itself, so they are the runs of no
+                        // caller's credential and carry no Cognito identity.
+                        cognito_identity: None,
                         budget,
                         heap_bytes: 128 * 1024 * 1024,
                         aws: None,

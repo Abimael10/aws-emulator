@@ -186,6 +186,10 @@ pub struct Served {
     pub client_context: Option<String>,
     /// The `TenantId` the caller sent.
     pub tenant_id: Option<String>,
+    /// The Amazon Cognito identity this invocation was made BY
+    /// ([`super::super::caller_cognito_identity`]), and `None` for one made by a credential no
+    /// identity pool vended.
+    pub cognito_identity: Option<crate::state::InvocationIdentity>,
     /// What this invocation may spend.
     pub budget: Budget,
     /// How its handler reaches the rest of this emulator.
@@ -212,6 +216,7 @@ impl Served {
             invoked_function_arn: &self.invoked_function_arn,
             client_context: self.client_context.as_deref(),
             tenant_id: self.tenant_id.as_deref(),
+            cognito_identity: self.cognito_identity.as_ref(),
             budget: self.budget,
             aws: self.aws.as_ref(),
             durable: self.durable.as_ref(),

@@ -271,6 +271,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.function_name,
             None,
         )?;
+        // WHO this invocation is made by, as the runtime reports it to the handler in
+        // `context.identity`: the Amazon Cognito identity the credential this request was
+        // signed with was vended to, and `None` for a credential no identity pool vended
+        // (`crate::state::caller_cognito_identity`). Read before the store is taken, like
+        // every other fact of the request.
+        let cognito_identity = crate::state::caller_cognito_identity(&*self.engine, ctx, now);
         let mut store = state.lock();
 
         // `InvokeAsync` carries no `Qualifier` parameter of its own, so the only
@@ -414,6 +420,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // invoked it named one.
                 client_context: None,
                 tenant_id: None,
+                // The identity the CALLER of this accepting call was vended, which is the
+                // identity the delivery's own run reports: the event is invoked on behalf of
+                // the caller that queued it.
+                cognito_identity: cognito_identity.clone(),
                 request_id: request_id.clone(),
                 // The X-Ray trace context this invocation runs with: the chain the caller
                 // named, under the rule the function's `TracingConfig` mode gives

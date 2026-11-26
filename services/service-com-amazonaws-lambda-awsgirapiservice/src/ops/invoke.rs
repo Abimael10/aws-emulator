@@ -464,6 +464,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
+        // WHO this invocation is made by, as the runtime reports it to the handler in
+        // `context.identity`: the Amazon Cognito identity the CALLER's credential was vended
+        // to, resolved off the credential this request was signed with
+        // (`crate::state::caller_cognito_identity`). `None` for a credential no identity pool
+        // vended — an IAM user's key, an assumed-role session, the account's own — whose
+        // handler reads no identity off its context. Read once, off this request.
+        let cognito_identity =
+            crate::state::caller_cognito_identity(&*self.engine, ctx, now);
         // The tracing header the CALLER supplied, which is both what the recursive-loop
         // guardrail names this request's chain by and what the run's own trace context
         // continues (`crate::state::execution::trace_context`). Read once, off this
@@ -777,6 +785,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     payload: payload.clone(),
                     client_context: client_context.clone(),
                     tenant_id: input.tenant_id.clone(),
+                    // The identity the CALLER of this accepting call was vended, which is
+                    // the identity the delivery's own run reports: the event is invoked on
+                    // behalf of the caller that queued it.
+                    cognito_identity: cognito_identity.clone(),
                     request_id: crate::service::request_id_header::starting_invocation(),
                     // The X-Ray trace context the queued invocation runs with: the chain
                     // its CALLER named, read off this request's own tracing header, under
@@ -975,6 +987,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             payload,
             client_context: client_context.clone(),
             tenant_id: input.tenant_id.clone(),
+            // The Amazon Cognito identity this call was signed by, which the run reports to
+            // the handler as `context.identity`.
+            cognito_identity: cognito_identity.clone(),
             // The invocation this call runs is the one its answer names: the id the run
             // reports as `context.aws_request_id`, writes into its `START`/`END`/`REPORT`
             // lines and carries in the error document of a handler that raised (see

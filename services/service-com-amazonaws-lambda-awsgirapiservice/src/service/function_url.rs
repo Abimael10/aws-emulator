@@ -681,9 +681,12 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             layer_zips: crate::state::layer_archives(&resolved_config.layers),
             payload: self.event_for(target, incoming, ctx, &trace.header),
             // A function URL request carries no `ClientContext` and no `TenantId`: both are
-            // members of the `Invoke` API, which this plane is not.
+            // members of the `Invoke` API, which this plane is not. Neither does it carry an
+            // Amazon Cognito identity for the context: what a URL request reports about its
+            // caller is in the EVENT it hands the handler, not in `context.identity`.
             client_context: None,
             tenant_id: None,
+            cognito_identity: None,
             request_id: request_id.to_string(),
             trace: Some(trace),
             // Which kind of environment serves it is the admission's to decide, once this

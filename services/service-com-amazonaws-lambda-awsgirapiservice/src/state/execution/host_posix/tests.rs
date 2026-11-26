@@ -64,6 +64,9 @@ fn ran(source: &str, event: &str) -> Finished {
                 invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",
                 client_context: None,
                 tenant_id: None,
+                // These runs report on the host surface, so they are the runs of no caller's
+                // credential and carry no Cognito identity.
+                cognito_identity: None,
                 budget: budget(),
                 // These runs are the interpreter's own surface: no emulator stands behind
                 // them, so there is no SDK seam either.

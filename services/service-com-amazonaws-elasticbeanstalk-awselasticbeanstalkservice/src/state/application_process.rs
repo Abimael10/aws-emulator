@@ -304,6 +304,9 @@ fn run_in_process(
         invoked_function_arn: String::new(),
         client_context: None,
         tenant_id: Some(process.owner.clone()),
+        // Nor an Amazon Cognito identity: the request an application process serves is no
+        // invocation a pool vended a caller credentials for.
+        cognito_identity: None,
         budget,
         aws: None,
         durable: None,

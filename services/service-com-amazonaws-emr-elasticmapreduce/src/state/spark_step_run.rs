@@ -716,6 +716,9 @@ async fn run_application(
                     invoked_function_arn: "",
                     client_context: None,
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: a Spark application is this service's
+                    // own run, made by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget,
                     aws: access.as_ref(),
                     // A Spark step is no Lambda durable execution's run, so it takes no step

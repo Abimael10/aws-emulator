@@ -318,6 +318,13 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             input.qualifier.as_deref(),
         );
 
+        // WHO this invocation is made by, as the runtime reports it to the handler in
+        // `context.identity`: the Amazon Cognito identity the credential this request was
+        // signed with was vended to, and `None` for a credential no identity pool vended
+        // (`crate::state::caller_cognito_identity`). Read with no store guard held, like
+        // every other fact of the request.
+        let cognito_identity = crate::state::caller_cognito_identity(&*self.engine, ctx, now);
+
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held.
         let (mut invocation, function_name, metered, kms_key_arn, stopped, qualifier) = {
@@ -470,6 +477,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             payload: payload.to_vec(),
             client_context,
             tenant_id: input.tenant_id.clone(),
+            cognito_identity,
             // The run's own id, minted here with the rest of what the run needs. It is
             // stated as the invocation this answer names once the invocation is ADMITTED
             // below, so a request refused instead keeps a response id of its own (see

@@ -990,6 +990,9 @@ async fn run_application(
                     invoked_function_arn: "",
                     client_context: None,
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: a job run is this service's own run,
+                    // made by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget,
                     aws: access.as_ref(),
                     durable: None,
@@ -1452,6 +1455,7 @@ mod tests {
                             invoked_function_arn: "",
                             client_context: None,
                             tenant_id: None,
+                            cognito_identity: None,
                             budget: workload_budget(DEFAULT_EXECUTION_TIMEOUT_MINUTES),
                             // No seam: what this row establishes is the ENGINE's answer, and
                             // an application making no call needs none.

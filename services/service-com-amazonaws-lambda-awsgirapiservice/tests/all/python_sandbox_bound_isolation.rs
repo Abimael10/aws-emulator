@@ -127,6 +127,9 @@ fn ran(source: &str, budget: Budget, clock: &Clock, case: &str) -> Finished {
                     invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",
                     client_context: None,
                     tenant_id: None,
+                    // These runs report on the interpreter's own bounds, so they are the runs
+                    // of no caller's credential and carry no Cognito identity.
+                    cognito_identity: None,
                     budget,
                     // The run's own containment and bounds are what these rows are about,
                     // and no emulator stands behind them: there is no SDK seam either.

@@ -548,6 +548,9 @@ async fn run_cell(
                     // report. What scopes the run is passed beside it: the role session its own
                     // AWS calls are made as, built from the session's `Role`.
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: a cell is this service's own run, made
+                    // by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget,
                     aws: access.as_ref(),
                     // A cell is no Lambda durable execution's run.

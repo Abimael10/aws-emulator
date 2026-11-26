@@ -180,6 +180,9 @@ pub async fn run_python(
                 invoked_function_arn: "",
                 client_context: None,
                 tenant_id: None,
+                // Nor an Amazon Cognito identity: a session's program is this service's own
+                // run, made by no identity a pool vended credentials to.
+                cognito_identity: None,
                 budget,
                 // The program reaches no other service of this emulator: this run is given
                 // no seam to dispatch an AWS call on.

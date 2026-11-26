@@ -906,6 +906,25 @@ class CognitoIdentity:
         self.cognito_identity_pool_id = None
 
 
+def _cognito_identity(document):
+    """The identity object for the identity ``document`` names, as `context.identity`.
+
+    The members are the two the invocation carries the caller's Amazon Cognito identity in,
+    read off that document by name: an invocation made with credentials an identity pool
+    vended names the identity and the pool, and one made with any other credential carries no
+    such document at all — whose identity object is then the one above, with ``None`` on each
+    member. So a handler always has an object to read, and what it reads says whether the
+    caller is an Amazon Cognito identity.
+    """
+
+    built = CognitoIdentity()
+    if document is None:
+        return built
+    built.cognito_identity_id = document.get("cognitoIdentityId")
+    built.cognito_identity_pool_id = document.get("cognitoIdentityPoolId")
+    return built
+
+
 class Client:
     """The mobile CLIENT a client context names, as `context.client_context.client`."""
 
@@ -1008,7 +1027,7 @@ class LambdaContext:
         self.function_name = environment.get("AWS_LAMBDA_FUNCTION_NAME")
         self.function_version = environment.get("AWS_LAMBDA_FUNCTION_VERSION")
         self.memory_limit_in_mb = environment.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
-        self.identity = CognitoIdentity()
+        self.identity = _cognito_identity(request["cognitoIdentity"])
         self.client_context = _client_context(request["clientContext"])
         self.tenant_id = request["tenantId"]
         # When this invocation's own run is up, which the host answers when the invoke
@@ -1446,7 +1465,14 @@ def _bind(request):
             "the execution environment has no prepared request to bind an invocation on",
             [],
         )
-    for member in ("event", "requestId", "invokedFunctionArn", "clientContext", "tenantId"):
+    for member in (
+        "event",
+        "requestId",
+        "invokedFunctionArn",
+        "clientContext",
+        "tenantId",
+        "cognitoIdentity",
+    ):
         prepared[member] = request.get(member)
     environment = request.get("environment")
     if environment is not None:

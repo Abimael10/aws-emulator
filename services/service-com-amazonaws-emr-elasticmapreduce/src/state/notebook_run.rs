@@ -608,6 +608,9 @@ async fn run_notebook_cells(
                 invoked_function_arn: "",
                 client_context: None,
                 tenant_id: None,
+                // Nor an Amazon Cognito identity: a notebook execution is this service's own
+                // run, made by no identity a pool vended credentials to.
+                cognito_identity: None,
                 budget,
                 // The cells reach no other service of this emulator: a notebook
                 // execution is given no seam to dispatch an AWS call on.

@@ -4883,6 +4883,11 @@ pub use code_signing::{
     CODE_SIGNING_POLICY_ENFORCE, CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE,
 };
 
+/// The AMAZON COGNITO IDENTITY an invocation was made by, resolved off the credential it was
+/// signed with — what the runtime reports in `context.identity`; see the module's own header.
+pub mod caller_cognito_identity;
+pub use caller_cognito_identity::{caller_cognito_identity, InvocationIdentity};
+
 /// WHICH values a member whose `@pattern` alternates whole-value branches admits — the "an
 /// ARN, or nothing at all" members no request boundary judges as a whole value; see the
 /// module's own header.

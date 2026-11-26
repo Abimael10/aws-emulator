@@ -270,6 +270,9 @@ pub async fn run(code: String, calculation_execution_id: String) -> Completion {
                     invoked_function_arn: "",
                     client_context: None,
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: a calculation is this service's own run,
+                    // made by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget: calculation_budget(),
                     // A calculation makes no AWS SDK call through the engine's seam: what it
                     // reads and writes of this emulator is what its own session's results

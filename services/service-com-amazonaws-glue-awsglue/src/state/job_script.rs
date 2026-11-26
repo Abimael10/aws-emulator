@@ -1230,6 +1230,10 @@ async fn run_script(
                     // ([`JobScriptPlan::role_arn`]), and the Region of the endpoint the
                     // start arrived at, both of which reach the guest through `aws`.
                     tenant_id: None,
+                    // Nor the Amazon Cognito identity an AWS Lambda invocation reports as
+                    // `context.identity`: a job run is this service's own run, made by no
+                    // identity an identity pool vended credentials to.
+                    cognito_identity: None,
                     budget,
                     aws: access.as_ref(),
                     // A job script is no Lambda durable execution's run, so it takes no step

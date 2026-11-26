@@ -749,6 +749,11 @@ pub struct Invocation {
     pub client_context: Option<String>,
     /// The `TenantId` the caller sent.
     pub tenant_id: Option<String>,
+    /// The AMAZON COGNITO IDENTITY this invocation was made BY, resolved off the credential
+    /// the invoking call was signed with ([`super::caller_cognito_identity`]), and `None` for
+    /// an invocation made by a credential no identity pool vended — which is what the runtime
+    /// reports as a `context.identity` carrying no identity at all.
+    pub cognito_identity: Option<crate::state::InvocationIdentity>,
     /// This invocation's request id.
     pub request_id: String,
     /// The X-Ray TRACE CONTEXT this invocation runs with, which the run reports in
@@ -1246,6 +1251,7 @@ pub async fn run_invocation(
                         invoked_function_arn: invocation.invoked_function_arn.clone(),
                         client_context: invocation.client_context.clone(),
                         tenant_id: invocation.tenant_id.clone(),
+                        cognito_identity: invocation.cognito_identity.clone(),
                         budget,
                         aws: invocation.aws.clone(),
                         durable,
@@ -1263,6 +1269,7 @@ pub async fn run_invocation(
                     invoked_function_arn: &invocation.invoked_function_arn,
                     client_context: invocation.client_context.as_deref(),
                     tenant_id: invocation.tenant_id.as_deref(),
+                    cognito_identity: invocation.cognito_identity.as_ref(),
                     budget,
                     heap_bytes,
                     aws: invocation.aws.as_ref(),
@@ -2584,6 +2591,7 @@ mod tests {
             payload: Vec::new(),
             client_context: None,
             tenant_id: None,
+            cognito_identity: None,
             request_id: "11111111-2222-3333-4444-555555555555".to_string(),
             trace: None,
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
@@ -3211,6 +3219,7 @@ mod tests {
                     invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",
                     client_context: None,
                     tenant_id: None,
+                    cognito_identity: None,
                     budget: run_budget(
                         5,
                         MIN_MEMORY_SIZE_MB as i32,

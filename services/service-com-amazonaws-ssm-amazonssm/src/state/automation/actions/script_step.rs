@@ -176,6 +176,10 @@ pub async fn run(claimed: &ClaimedAction, access: Option<AwsAccess>) -> ActionOu
                         // endpoint the start arrived at, both of which reach the guest
                         // through `aws`.
                         tenant_id: None,
+                        // Nor the Amazon Cognito identity an AWS Lambda invocation reports as
+                        // `context.identity`: a script step is this service's own run, made by
+                        // no identity an identity pool vended credentials to.
+                        cognito_identity: None,
                         budget: script_budget(),
                         aws: access.as_ref(),
                         // A script step is no Lambda durable execution's run, so it takes no

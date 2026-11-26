@@ -285,6 +285,10 @@ pub struct Run<'a> {
     pub client_context: Option<&'a str>,
     /// The `TenantId` the caller passed.
     pub tenant_id: Option<&'a str>,
+    /// The Amazon Cognito identity the invocation was made BY
+    /// ([`super::super::caller_cognito_identity`]), and `None` for one made by a credential no
+    /// identity pool vended — whose handler reads a `context.identity` carrying no identity.
+    pub cognito_identity: Option<&'a crate::state::InvocationIdentity>,
     /// What this run may spend.
     pub budget: Budget,
     /// How the handler reaches the rest of this emulator through the AWS SDK this runtime
@@ -1705,6 +1709,12 @@ fn runtime_input(request: &Run<'_>, session: &Session) -> Result<String, String>
         "invokedFunctionArn": request.invoked_function_arn,
         "clientContext": request.client_context,
         "tenantId": request.tenant_id,
+        // The IDENTITY the invocation was made by, under the member names the runtime
+        // interface carries it in ([`crate::state::InvocationIdentity`]), and `null` for an
+        // invocation made by no Amazon Cognito identity.
+        "cognitoIdentity": crate::state::InvocationIdentity::runtime_member(
+            request.cognito_identity,
+        ),
         // The EPHEMERAL STORAGE of the environment: how large the `/tmp` the runtime's own
         // filesystem serves is ([`super::guest_ephemeral`]), and how much of it this host
         // really holds ([`super::MAX_EPHEMERAL_HELD_BYTES`]) — a function configured for more
@@ -1749,6 +1759,11 @@ fn invocation_input(request: &Run<'_>) -> Result<String, String> {
         "invokedFunctionArn": request.invoked_function_arn,
         "clientContext": request.client_context,
         "tenantId": request.tenant_id,
+        // The identity the invocation was made by, as above: it is ONE invocation's own, so
+        // the environment serving a second invocation is bound that one's identity instead.
+        "cognitoIdentity": crate::state::InvocationIdentity::runtime_member(
+            request.cognito_identity,
+        ),
     });
     ::serde_json::to_string(&document).map_err(|error| error.to_string())
 }
@@ -3336,6 +3351,9 @@ mod tests {
                             "arn:aws:lambda:us-west-2:000000000000:function:probe",
                         client_context: None,
                         tenant_id: None,
+                        // These runs report on the interpreter itself, so they are the runs
+                        // of no caller's credential and carry no Cognito identity.
+                        cognito_identity: None,
                         budget,
                         // These runs are the interpreter's own containment and bounds: no
                         // emulator is standing behind them, so there is no SDK seam either.

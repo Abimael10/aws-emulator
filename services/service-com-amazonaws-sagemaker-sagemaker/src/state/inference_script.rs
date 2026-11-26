@@ -374,6 +374,9 @@ pub fn run_inference_script(
                     invoked_function_arn: "",
                     client_context: None,
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: an inference script is this service's
+                    // own run, made by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget: python::Budget {
                         wall_clock: INFERENCE_SCRIPT_RUN_CEILING,
                         steps: MAX_SCRIPT_STEPS,

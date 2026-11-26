@@ -829,6 +829,7 @@ mod tests {
             payload: br#"{"fail":true,"seq":0}"#.to_vec(),
             client_context: None,
             tenant_id: None,
+            cognito_identity: None,
             request_id: "11111111-2222-3333-4444-555555555555".to_string(),
             trace: None,
             initialization_type: super::super::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,

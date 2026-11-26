@@ -616,6 +616,11 @@ kafka-protocol = { version = "0.18", default-features = false, features = [
     "broker",
     "client",
 ] }
+# The identity POOL whose vend hands a caller the credentials an invocation is signed with,
+# mounted beside lambda on ONE engine: the pool, the identity and the session an invocation
+# reports in `context.identity` are the ones that service's own CreateIdentityPool, GetId and
+# GetCredentialsForIdentity really made.
+service-com-amazonaws-cognitoidentity-awscognitoidentityservice = { workspace = true }
 
 [lints]
 workspace = true

@@ -2430,7 +2430,9 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             awsRequestId: input.requestId,
             logGroupName: environment.AWS_LAMBDA_LOG_GROUP_NAME,
             logStreamName: environment.AWS_LAMBDA_LOG_STREAM_NAME,
-            identity: undefined,
+            identity: input.cognitoIdentity === null || input.cognitoIdentity === undefined
+                ? undefined
+                : input.cognitoIdentity,
             clientContext: input.clientContext === null ? undefined : input.clientContext,
             tenantId: input.tenantId === null ? undefined : input.tenantId,
             getRemainingTimeInMillis: function () {

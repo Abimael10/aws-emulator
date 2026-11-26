@@ -754,6 +754,9 @@ fn performed(
                         invoked_function_arn: "",
                         client_context: None,
                         tenant_id: None,
+                        // Nor an Amazon Cognito identity: the machine's program is this
+                        // service's own run, made by no identity a pool vended credentials to.
+                        cognito_identity: None,
                         budget: run_budget(),
                         // How the program reaches the rest of this emulator through the AWS
                         // SDK the interpreter supplies: the MACHINE's own seam, signed as the

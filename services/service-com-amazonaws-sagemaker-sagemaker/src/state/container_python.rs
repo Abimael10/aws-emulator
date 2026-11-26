@@ -383,6 +383,9 @@ pub fn run_python_container_program(
                     invoked_function_arn: "",
                     client_context: None,
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: a container program is this service's
+                    // own run, made by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget: python::Budget {
                         wall_clock: CONTAINER_PROGRAM_RUN_CEILING,
                         steps: MAX_CONTAINER_PROGRAM_STEPS,

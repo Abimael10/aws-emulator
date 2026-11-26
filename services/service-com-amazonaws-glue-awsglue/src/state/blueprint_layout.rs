@@ -527,6 +527,9 @@ async fn run_layout(
                     // run is passed beside it: the role session its own AWS calls are made as,
                     // built from the start's `RoleArn`.
                     tenant_id: None,
+                    // Nor an Amazon Cognito identity: a layout is this service's own run,
+                    // made by no identity a pool vended credentials to.
+                    cognito_identity: None,
                     budget,
                     aws: access.as_ref(),
                     // A layout is no Lambda durable execution's run.
