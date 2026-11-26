@@ -241,7 +241,7 @@ pub fn deliver(
         // The delay the accepting call recorded on the entry, waited for here rather than
         // inside the request that queued the event, so a caller that looks straight after
         // that call still sees the event queued. No store guard is held across it.
-        ::tokio::time::sleep(first_attempt_in(&state, &function_name, &request_id)).await;
+        wait_until_attempt_due(&state, &function_name, &request_id).await;
         // How many attempts RAN the handler, and how many found no capacity to run it at
         // all: the two are bounded by different published rules, so the attempts are counted
         // apart (`super::async_delivery`).
@@ -340,7 +340,7 @@ pub fn deliver(
                              asynchronous invocation, so the event goes back on the queue"
                         );
                         requeue(&state, &function_name, &request_id, again);
-                        ::tokio::time::sleep(again).await;
+                        wait_until_attempt_due(&state, &function_name, &request_id).await;
                         continue;
                     }
                     // The window the event is retained for is spent, so this is what ENDED
@@ -411,6 +411,30 @@ pub fn deliver(
                     claimed.allowed,
                 )
             };
+            // And an attempt the retry policy has is only MADE while the event is still
+            // retained: "the maximum age of a request that Lambda sends to a function for
+            // processing" (`FunctionEventInvokeConfig$MaximumEventAgeInSeconds`) bounds the
+            // whole time the event spends queued, waits between attempts included, so a retry
+            // that would fall due past that window is one Lambda never makes. Such an event
+            // ended on its AGE rather than on the attempts it was allowed, which is what the
+            // record a destination reads reports
+            // (`super::async_completion_delivery::Ending`).
+            let again = match again {
+                Some(again) => {
+                    let retention = event_retention_of(&state, &function_name, &request_id);
+                    if super::async_delivery::attempt_inside_retention(
+                        accepted.elapsed(),
+                        again,
+                        retention,
+                    ) {
+                        Some(again)
+                    } else {
+                        ending = super::async_completion_delivery::Ending::AgeExceeded;
+                        None
+                    }
+                }
+                None => None,
+            };
             let Some(again) = again else {
                 settle(&state, &function_name, &request_id, outcome);
                 // The event's deliveries to the FUNCTION are over, so what the configuration
@@ -444,9 +468,12 @@ pub fn deliver(
                 }
                 return;
             };
-            // The event has another attempt, so the entry is left as the one it is being
-            // delivered under rather than carrying an outcome a later attempt may replace.
-            ::tokio::time::sleep(again).await;
+            // The event has another attempt, and "Lambda returns the event to the queue"
+            // until it falls due: the instant the retry policy puts it at goes on the entry
+            // and is waited for there, so the entry carries the attempt still to come rather
+            // than an outcome a later attempt may replace.
+            requeue(&state, &function_name, &request_id, again);
+            wait_until_attempt_due(&state, &function_name, &request_id).await;
         }
     });
 }
@@ -462,18 +489,49 @@ struct Claimed {
     qualifier: String,
 }
 
-/// How long [`deliver`] waits before its FIRST attempt: until the instant the accepting
-/// call recorded on the entry ([`AsyncInvocationRecord::attempt_due`]).
+/// How long between two looks at the instant an event's next delivery attempt falls due; see
+/// [`wait_until_attempt_due`].
+const ATTEMPT_DUE_LOOK_AGAIN: Duration = Duration::from_millis(50);
+
+/// Wait until the instant the entry says its next delivery attempt falls due
+/// ([`AsyncInvocationRecord::attempt_due`]).
+///
+/// The ENTRY is the one place that instant lives, and this is a look at it rather than a span
+/// fixed when the last attempt ended: the queueing delay the accepting call recorded, the
+/// documented wait the retry policy puts after an errored handler
+/// ([`super::async_delivery::retry_delay`]) and the window a throttled event goes back on the
+/// queue for ([`super::async_delivery::next_throttled_attempt_in`]) are all written there and
+/// waited for here, so an attempt is made when the event it belongs to says it is due.
+///
+/// Nothing sleeps inside a request — this runs on [`deliver`]'s own task — and no store guard
+/// is held across a look.
+async fn wait_until_attempt_due(
+    state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
+    function: &str,
+    request_id: &str,
+) {
+    loop {
+        let left = attempt_due_in(state, function, request_id);
+        if left.is_zero() {
+            return;
+        }
+        ::tokio::time::sleep(left.min(ATTEMPT_DUE_LOOK_AGAIN)).await;
+    }
+}
+
+/// How long is left until the instant the entry `request_id` names on `function` says its
+/// next delivery attempt falls due ([`AsyncInvocationRecord::attempt_due`]).
 ///
 /// That instant is the queueing delay for an event accepted for a function that was already
-/// invocable, and the instant the function BECOMES invocable for one accepted while it was
-/// still being provisioned ([`FunctionRecord::queue_async_invocation`]) — so this is the one
+/// invocable, the instant the function BECOMES invocable for one accepted while it was
+/// still being provisioned ([`FunctionRecord::queue_async_invocation`]), and the wait the
+/// retry policy put between two attempts for one being delivered again — so this is the one
 /// place the wait is read, and a queued event is never handed to a function the model says
 /// cannot be invoked yet.
 ///
 /// Zero once that instant has passed, and for an entry the store no longer holds, which the
 /// attempt's own claim then reports as nothing to deliver to.
-fn first_attempt_in(
+fn attempt_due_in(
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     function: &str,
     request_id: &str,
@@ -538,8 +596,10 @@ pub fn event_retention_of(
 }
 
 /// Put the entry `request_id` names back on the QUEUE, with its next attempt due `next_in`
-/// from now: what a throttled attempt leaves behind, because "Lambda returns the event to
-/// the queue and attempts to run the function again".
+/// from now: what an attempt the event is to be made again after leaves behind, because
+/// "Lambda returns the event to the queue and attempts to run the function again" — a
+/// throttled attempt, and an errored handler the retry policy has another attempt for
+/// ([`super::async_delivery::next_attempt_in`]).
 ///
 /// The entry keeps its pending mark, so the instant the attempt falls due is the attempt's
 /// to act on and not an outcome the clock writes.

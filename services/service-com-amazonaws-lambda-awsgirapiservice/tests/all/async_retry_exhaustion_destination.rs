@@ -38,6 +38,7 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::async_retry_backoff_interval::make_next_attempt_due;
 use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction`, `Invoke` and `AddPermission` are bound.
@@ -453,6 +454,10 @@ async fn published_to_a_subscribed_function(
 /// attempted more often than its retry allowance without the allowance being spent. How many
 /// times the function really RAN is what the record reports, and that is where each row
 /// asserts it.
+///
+/// Every look brings a scheduled attempt FORWARD ([`make_next_attempt_due`]), so the ladder
+/// runs out inside this wait instead of this suite sleeping through the published wait before
+/// each retry — which is what waiting would do, without waiting.
 async fn settled(
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -488,6 +493,7 @@ async fn settled(
             "case {case:?}: every event accepted for {function:?} must settle within \
              {BUDGET:?}, got {entries:?}"
         );
+        make_next_attempt_due(engine);
         tokio::time::sleep(LOOK_AGAIN).await;
     }
 }

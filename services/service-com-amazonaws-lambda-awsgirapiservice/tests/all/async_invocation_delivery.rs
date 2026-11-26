@@ -39,6 +39,7 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::async_retry_backoff_interval::make_next_attempt_due;
 use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction` is bound.
@@ -271,7 +272,8 @@ async fn only_the_allowed_attempts_are_made(function: &str, retries: i64) {
     }
 
     // Every attempt the events have, waited for rather than slept through: an entry still
-    // queued or being delivered has an attempt under way.
+    // queued or being delivered has an attempt under way, and the published wait before a
+    // retried attempt is brought FORWARD on every look rather than waited out.
     let deadline = Instant::now() + SETTLE_BUDGET;
     let settled = loop {
         let entries = held(&engine, function);
@@ -293,6 +295,7 @@ async fn only_the_allowed_attempts_are_made(function: &str, retries: i64) {
                 .map(|entry| (entry.attempts, entry.outcome.clone()))
                 .collect::<Vec<_>>()
         );
+        make_next_attempt_due(&engine);
         tokio::time::sleep(POLL_INTERVAL).await;
     };
 

@@ -82,6 +82,9 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::MAX_ASYNC_DELIVERY_ATT
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
+// Bringing the published wait before a RETRIED attempt forward, rather than sleeping through
+// it, is the move every suite that drives a ladder of attempts makes; see that module.
+use crate::lambda_async_attempt_clock::make_next_attempt_due;
 use crate::query_wire::{elements, form_encode, physical_ids_of};
 
 /// The Region every request here is signed for, and so the Region every queue, role, function
@@ -301,13 +304,17 @@ const RELAYS: &[Relay] = &[
 
 /// The emulator as it is ASSEMBLED, on one engine: a handler's own SDK call is dispatched back
 /// into this same router, so the queue it writes is the queue this suite reads.
-fn build_router() -> MultiServiceRouter {
+///
+/// The engine is answered beside the router, because the waits Lambda's asynchronous event
+/// queue puts between two attempts are brought forward on it ([`make_next_attempt_due`])
+/// rather than slept through.
+fn build_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = aws_emulator_router::build_router(engine);
+    let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     // The signature is never checked here, as in every other suite of this crate; the
     // credential scope is what routes a request.
     router.set_request_authentication(false);
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service`, which is what routes
@@ -726,8 +733,17 @@ async fn wait_until_active(router: &MultiServiceRouter, name: &str) {
 ///
 /// `wanted` is how many the caller expects: the loop looks again until it has them, so a host
 /// slow to make a message available cannot decide the outcome. A caller expecting none keeps
-/// looking for the short quiet window instead, so a delivery that did happen is seen.
-async fn drained(router: &MultiServiceRouter, case: &str, url: &str, wanted: usize) -> Vec<Value> {
+/// looking for the short quiet window instead, so a delivery that did happen is seen. Every
+/// look brings the wait before a retried asynchronous attempt forward
+/// ([`make_next_attempt_due`]), so a ladder runs out inside the loop rather than this suite
+/// sleeping through the published waits.
+async fn drained(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    url: &str,
+    wanted: usize,
+) -> Vec<Value> {
     let mut held: Vec<Value> = Vec::new();
     let looks = if wanted == 0 { QUIET_LOOKS } else { LOOKS };
     for look in 0..looks {
@@ -769,6 +785,7 @@ async fn drained(router: &MultiServiceRouter, case: &str, url: &str, wanted: usi
         if held.len() >= wanted.max(1) || look + 1 == looks {
             break;
         }
+        make_next_attempt_due(engine);
         tokio::time::sleep(LOOK).await;
     }
     held
@@ -845,7 +862,7 @@ fn assert_invocation(
 /// follows that decision.
 #[tokio::test]
 async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
-    let router = build_router();
+    let (router, engine) = build_router();
     let physical = deploy(&router).await;
 
     let good_url = resolved_queue(&router, GOOD_QUEUE).await;
@@ -894,7 +911,7 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
 
         // The witness write every role is granted took effect, so the handler RAN and its
         // runtime did supply the SDK it imports at module scope.
-        let witnessed = drained(&router, case, &witness_url, 1).await;
+        let witnessed = drained(&router, &engine, case, &witness_url, 1).await;
         assert_eq!(
             witnessed,
             vec![json!({"relay": relay.function, "event": payload})],
@@ -906,6 +923,7 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
         // where it was refused.
         let delivered = drained(
             &router,
+            &engine,
             case,
             if relay.delivers() {
                 &good_url
@@ -955,7 +973,7 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
     // ([`Relay::runs`]) — one for the handler that returns, and the whole attempt ladder for
     // each handler that raises on the write its role does not allow.
     let ladders: usize = RELAYS.iter().map(Relay::runs).sum();
-    let witnessed = drained(&router, "handed over", &witness_url, ladders).await;
+    let witnessed = drained(&router, &engine, "handed over", &witness_url, ladders).await;
     assert_eq!(
         witnessed.len(),
         ladders,
@@ -999,7 +1017,7 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
 
     // And the ladders are SPENT: every relay's attempts are accounted for above, so the quiet
     // window that follows them finds no further run of any handler.
-    let beyond = drained(&router, "handed over", &witness_url, 0).await;
+    let beyond = drained(&router, &engine, "handed over", &witness_url, 0).await;
     assert!(
         beyond.is_empty(),
         "handed over: expected no run past the attempts each relay's handover earns, got \
@@ -1007,7 +1025,7 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
     );
 
     // The permitted relay's handover DELIVERED, exactly once, carrying what was published…
-    let delivered = drained(&router, "handed over", &good_url, 1).await;
+    let delivered = drained(&router, &engine, "handed over", &good_url, 1).await;
     assert_eq!(
         delivered.len(),
         1,
@@ -1027,7 +1045,7 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
 
     // …and every under-permissioned relay's did not, which is read AFTER that delivery, so the
     // quiet window was open while this topology was demonstrably delivering.
-    let refused = drained(&router, "handed over", &denied_url, 0).await;
+    let refused = drained(&router, &engine, "handed over", &denied_url, 0).await;
     assert!(
         refused.is_empty(),
         "handed over: expected the queue the under-permissioned relays address to stay empty, \

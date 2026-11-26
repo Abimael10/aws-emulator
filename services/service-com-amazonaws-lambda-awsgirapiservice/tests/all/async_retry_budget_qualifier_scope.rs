@@ -354,5 +354,5 @@ async fn a_failing_event_spends_the_budget_of_the_qualifier_it_was_addressed_to(
         });
     }
 
-    assert_each_ladder(&router, &wired).await;
+    assert_each_ladder(&router, &engine, &wired).await;
 }

@@ -70,6 +70,10 @@ use crate::event_source_poll_authorization::wait_until_active;
 // The one stream of invocations the suites of this target that RUN handlers share; see the
 // module documentation above.
 use crate::invoke_request_id::one_invocation_stream_at_a_time;
+// Bringing the published wait before a retried attempt FORWARD, rather than sleeping through
+// it, is the same move every suite that drives a ladder of attempts makes, so this one makes
+// it with the helper that suite publishes.
+use crate::async_retry_backoff_interval::make_next_attempt_due;
 
 /// Where `CreateFunction` is bound.
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
@@ -405,6 +409,10 @@ fn reached(event: &AsyncInvocationRecord) -> String {
 /// what makes this wait independent of how fast the host runs — the spans a delivery spends
 /// waiting for this process's run capacity, and the attempts a throttled event is made again
 /// for, are the emulator's to choose and are simply waited for.
+///
+/// The one span it does not wait out is the published wait before a RETRIED attempt (one
+/// minute, then two): every look brings that attempt forward
+/// ([`make_next_attempt_due`]), which is what waiting would do, without waiting.
 pub(crate) async fn settled_newest(
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -425,6 +433,7 @@ pub(crate) async fn settled_newest(
              {NO_PROGRESS_CEILING:?} — no attempt was made for it and it did not settle — \
              and it stands at {standing}"
         );
+        make_next_attempt_due(engine);
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
@@ -456,6 +465,7 @@ pub(crate) async fn settled_all(
              {NO_PROGRESS_CEILING:?} — no attempt was made for any of them and none settled — \
              and they stand at [{standing}]"
         );
+        make_next_attempt_due(engine);
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }

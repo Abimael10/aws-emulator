@@ -195,5 +195,5 @@ async fn a_failing_event_spends_the_budget_its_stored_configuration_holds() {
         });
     }
 
-    assert_each_ladder(&router, &wired).await;
+    assert_each_ladder(&router, &engine, &wired).await;
 }

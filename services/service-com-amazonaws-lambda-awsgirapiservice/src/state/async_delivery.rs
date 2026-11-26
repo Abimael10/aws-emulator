@@ -68,32 +68,32 @@ pub fn attempts_allowed(maximum_retry_attempts: Option<i32>) -> u32 {
 
 /// How long after the FIRST delivery attempt of an event the second one is made.
 ///
-/// An EMULATOR-CHOSEN span, like [`crate::state::ACTIVATION_DELAY`]: the wait before a
-/// retried attempt is work the CLOCK owes off every response path, and no operation takes it
-/// as a parameter or reports it back — what a client reads the retry policy through is how
-/// many attempts its event gets, the age each attempt meters
-/// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]) and the record the last of them earns at the
-/// configured destination, none of which is the length of the idle between two attempts.
+/// A duration AWS DOCUMENTS for this policy, so it keeps its published value — like the
+/// retention window below ([`DEFAULT_ASYNC_EVENT_RETENTION`]) and unlike the spans this crate
+/// picks for its own transitions ([`crate::state::ACTIVATION_DELAY`]): "If the function
+/// returns an error, by default Lambda retries the invocation two more times. […] Between the
+/// first and second attempt, Lambda waits one minute" (the asynchronous invocation page of
+/// Lambda's developer guide).
 ///
-/// Compressed from the pacing AWS states for it — "between the first and second attempt,
-/// Lambda waits one minute", and two minutes before the third — because those spans put the
-/// LAST attempt of a fully retried event three minutes past the accepting call, outside the
-/// window a client waits for its own attempts and its invocation record in, which is the
-/// part of the policy that IS the contract. The compression is held to that same window: a
-/// client that invokes asynchronously and then watches for the attempts its budget allows
-/// sees ALL of them inside the few seconds it waits, so the whole ladder — this span plus the
-/// doubled one after it ([`SECOND_ASYNC_RETRY_DELAY`]) — stays inside a handful of seconds
-/// rather than outlasting the look. It stays non-zero, so a client that looks between two
-/// attempts still sees the event being delivered rather than done.
-pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// The wait is part of what a client reads the retry policy through, and not an idle only
+/// this process can see: the age an attempt meters
+/// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]) is the time its event spent queued, so a
+/// retried event's largest age is this wait; and a `MaximumEventAgeInSeconds` SHORTER than it
+/// is what discards an event before its retry ([`event_retention`]). A wait of seconds would
+/// report an age no asynchronous invocation can have and leave that window unenforceable.
+///
+/// Nothing waits it out inside a request: the accepting call answers before the first attempt
+/// is even made, and the wait belongs to the delivery task
+/// ([`super::async_invocation::deliver`]).
+pub const FIRST_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(60);
 
-/// How long after the SECOND delivery attempt the third one is made: twice the span above,
-/// keeping the doubling AWS's own pacing has (one minute, then two), so a client watching
-/// the age of its event
+/// How long after the SECOND delivery attempt the third one is made: the two minutes the same
+/// documented pacing publishes for it ("Between the second and third attempt, Lambda waits two
+/// minutes"), so a client watching the age of its event
 /// ([`super::metrics::ASYNC_EVENT_AGE_METRIC`]) sees the wait GROW with the attempts spent.
 /// It is the wait after every later attempt too, because the policy allows no attempt past
 /// the third ([`MAX_ASYNC_DELIVERY_ATTEMPTS`]).
-pub const SECOND_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
+pub const SECOND_ASYNC_RETRY_DELAY: Duration = Duration::from_secs(120);
 
 /// The wait before the attempt that FOLLOWS the one numbered `attempts_made`; see the two
 /// spans above.
@@ -162,6 +162,21 @@ pub fn event_retention(maximum_event_age_in_seconds: Option<i32>) -> Duration {
         let clamped = seconds.clamp(MIN_EVENT_AGE_SECONDS, MAX_EVENT_AGE_SECONDS);
         Duration::from_secs(u64::try_from(clamped).unwrap_or_default())
     })
+}
+
+/// Whether the attempt an errored handler's event still has, due `wait` from now, falls inside
+/// the window that event is RETAINED for ([`event_retention`]), its age so far being `age`.
+///
+/// "The maximum age of a request that Lambda sends to a function for processing"
+/// (`FunctionEventInvokeConfig$MaximumEventAgeInSeconds`) bounds the whole time an event spends
+/// queued, and the waits this module puts between two attempts are part of that time — so a
+/// retry that would fall due past the window is one Lambda never makes, however many attempts
+/// the event's `MaximumRetryAttempts` still allows. An event ended that way ended on its AGE,
+/// which is a different condition from the attempts it was allowed being spent
+/// ([`super::async_completion_delivery::Ending`]).
+#[must_use]
+pub fn attempt_inside_retention(age: Duration, wait: Duration, retention: Duration) -> bool {
+    age.saturating_add(wait) < retention
 }
 
 /// The wait before the next attempt of an event whose attempt found no capacity, and the
@@ -344,6 +359,106 @@ mod tests {
             assert_eq!(
                 allowed, *expected,
                 "case {case:?}: expected {expected} attempts, got {allowed}"
+            );
+        }
+    }
+
+    /// RULE: the wait before a retried delivery attempt is the one AWS publishes for the
+    /// asynchronous invocation queue — one minute before the first retry, two minutes before
+    /// the second — so the rows span the attempts the policy has waits for, including one
+    /// past the last of them.
+    #[test]
+    fn the_wait_before_a_retried_attempt_is_the_published_one() {
+        // (case, the attempts made so far, the published wait before the next one)
+        let rows: &[(&str, u32, Duration)] = &[
+            ("before the first retry", 1, Duration::from_secs(60)),
+            ("before the second retry", 2, Duration::from_secs(120)),
+            (
+                "before an attempt past the ones the policy allows",
+                MAX_ASYNC_DELIVERY_ATTEMPTS,
+                Duration::from_secs(120),
+            ),
+            ("with no attempt counted yet", 0, Duration::from_secs(60)),
+        ];
+        for (case, attempts_made, expected) in rows {
+            let answered = retry_delay(*attempts_made);
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected a wait of {expected:?}, got {answered:?}"
+            );
+        }
+        // The pacing GROWS with the attempts spent, which is what a client watching the age
+        // of its event sees.
+        assert!(
+            SECOND_ASYNC_RETRY_DELAY > FIRST_ASYNC_RETRY_DELAY,
+            "expected the second wait to be longer than the first, got \
+             {SECOND_ASYNC_RETRY_DELAY:?} after {FIRST_ASYNC_RETRY_DELAY:?}"
+        );
+    }
+
+    /// RULE: a retry is made only while the event is still retained, so the rows span a window
+    /// with room for the wait, one with exactly none, one already spent, and the published
+    /// bounds of `MaximumEventAgeInSeconds` against each published wait.
+    #[test]
+    fn a_retry_past_the_retention_window_is_not_made() {
+        // (case, the age so far, the wait before the attempt, the window, whether it is made)
+        let rows: &[(&str, Duration, Duration, Duration, bool)] = &[
+            (
+                "the default window has room for the first retry",
+                Duration::from_secs(1),
+                FIRST_ASYNC_RETRY_DELAY,
+                DEFAULT_ASYNC_EVENT_RETENTION,
+                true,
+            ),
+            (
+                "the default window has room for the second retry",
+                FIRST_ASYNC_RETRY_DELAY,
+                SECOND_ASYNC_RETRY_DELAY,
+                DEFAULT_ASYNC_EVENT_RETENTION,
+                true,
+            ),
+            (
+                "the smallest window the model admits has no room for the first retry",
+                Duration::from_secs(1),
+                FIRST_ASYNC_RETRY_DELAY,
+                Duration::from_secs(u64::try_from(MIN_EVENT_AGE_SECONDS).unwrap_or_default()),
+                false,
+            ),
+            (
+                "a window with exactly the wait left makes the attempt one past it",
+                Duration::ZERO,
+                FIRST_ASYNC_RETRY_DELAY,
+                FIRST_ASYNC_RETRY_DELAY,
+                false,
+            ),
+            (
+                "a window with a second more than the wait has room",
+                Duration::ZERO,
+                FIRST_ASYNC_RETRY_DELAY,
+                FIRST_ASYNC_RETRY_DELAY.saturating_add(Duration::from_secs(1)),
+                true,
+            ),
+            (
+                "a window already spent has no room",
+                Duration::from_secs(900),
+                FIRST_ASYNC_RETRY_DELAY,
+                Duration::from_secs(900),
+                false,
+            ),
+            (
+                "the largest window the model admits has room for the whole ladder",
+                FIRST_ASYNC_RETRY_DELAY,
+                SECOND_ASYNC_RETRY_DELAY,
+                Duration::from_secs(u64::try_from(MAX_EVENT_AGE_SECONDS).unwrap_or_default()),
+                true,
+            ),
+        ];
+        for (case, age, wait, retention, expected) in rows {
+            let answered = attempt_inside_retention(*age, *wait, *retention);
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected the attempt inside the window to be {expected}, got \
+                 {answered}"
             );
         }
     }

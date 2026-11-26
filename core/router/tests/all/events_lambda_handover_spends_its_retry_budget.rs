@@ -46,6 +46,9 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::MAX_ASYNC_DELIVERY_ATT
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
+// Bringing the published wait before a RETRIED attempt forward, rather than sleeping through
+// it, is the move every suite that drives a ladder of attempts makes; see that module.
+use crate::lambda_async_attempt_clock::make_next_attempt_due;
 use crate::query_wire::{elements, form_encode};
 
 /// The Region every request here is signed for, and so the Region every queue, role, function
@@ -224,13 +227,17 @@ const ROWS: &[Row] = &[
 
 /// The emulator as it is ASSEMBLED, on one engine: a handler's own SDK call is dispatched back
 /// into this same router, so the queue it writes is the queue this suite reads.
-fn build_router() -> MultiServiceRouter {
+///
+/// The engine is answered beside the router, because the waits the asynchronous event queue
+/// puts between two attempts are brought forward on it ([`make_next_attempt_due`]) rather than
+/// slept through.
+fn build_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = aws_emulator_router::build_router(engine);
+    let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     // The signature is never checked here, as in every other suite of this crate; the
     // credential scope is what routes a request.
     router.set_request_authentication(false);
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service`, which is what routes
@@ -603,8 +610,17 @@ async fn configure_budget(router: &MultiServiceRouter, row: &Row, retries: i64) 
 ///
 /// `wanted` is how many the caller expects: the loop looks again until it has them, so a host
 /// slow to run a handler cannot decide the outcome. A caller expecting none keeps looking for
-/// the short quiet window instead, so a run that did happen is seen.
-async fn drained(router: &MultiServiceRouter, case: &str, url: &str, wanted: usize) -> Vec<Value> {
+/// the short quiet window instead, so a run that did happen is seen. Every look brings the wait
+/// before a retried attempt forward ([`make_next_attempt_due`]), so a ladder runs out inside
+/// the loop and an attempt no policy allows would arrive inside the quiet window rather than
+/// after it.
+async fn drained(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    url: &str,
+    wanted: usize,
+) -> Vec<Value> {
     let mut held: Vec<Value> = Vec::new();
     let looks = if wanted == 0 { QUIET_LOOKS } else { LOOKS };
     for look in 0..looks {
@@ -644,6 +660,7 @@ async fn drained(router: &MultiServiceRouter, case: &str, url: &str, wanted: usi
         if held.len() >= wanted.max(1) || look + 1 == looks {
             break;
         }
+        make_next_attempt_due(engine);
         tokio::time::sleep(LOOK).await;
     }
     held
@@ -653,7 +670,7 @@ async fn drained(router: &MultiServiceRouter, case: &str, url: &str, wanted: usi
 /// force on it allows, each run handed the very event that was published.
 #[tokio::test]
 async fn a_handover_runs_the_handler_once_per_attempt_its_policy_allows() {
-    let router = build_router();
+    let (router, engine) = build_router();
     deploy(&router).await;
     let witness = witness_url(&router).await;
     for row in ROWS {
@@ -689,7 +706,7 @@ async fn a_handover_runs_the_handler_once_per_attempt_its_policy_allows() {
     // Every run of every handler leaves one witness message, so the whole ladder of every row is
     // waited for and then read: a count, never an arrival.
     let ladders: usize = ROWS.iter().map(Row::runs).sum();
-    let witnessed = drained(&router, "every row", &witness, ladders).await;
+    let witnessed = drained(&router, &engine, "every row", &witness, ladders).await;
     let mut runs_of: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
     for written in &witnessed {
         let probe = written[PROBE_MEMBER].as_str().unwrap_or_default();
@@ -736,7 +753,7 @@ async fn a_handover_runs_the_handler_once_per_attempt_its_policy_allows() {
 
     // And the ladders are SPENT: every attempt the policies allow is accounted for above, so the
     // quiet window that follows them finds no further run of any handler.
-    let beyond = drained(&router, "every row", &witness, 0).await;
+    let beyond = drained(&router, &engine, "every row", &witness, 0).await;
     assert!(
         beyond.is_empty(),
         "every row: expected no run past the attempts each policy allows, got {beyond:?}"

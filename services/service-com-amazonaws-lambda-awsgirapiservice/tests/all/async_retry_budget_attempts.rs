@@ -43,6 +43,7 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::async_retry_backoff_interval::make_next_attempt_due;
 use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction` and `Invoke` are bound.
@@ -93,10 +94,10 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 /// How long this suite keeps watching every queue AFTER every row has the attempts its
 /// configuration allows and its record.
 ///
-/// Twice the LONGEST wait the service puts between two attempts
-/// ([`SECOND_ASYNC_RETRY_DELAY`]), so an attempt past the budget — or a second record for one
-/// event — would be delivered inside this window rather than after it.
-const QUIET_WINDOW: Duration = SECOND_ASYNC_RETRY_DELAY.saturating_mul(2);
+/// Every look inside it brings a scheduled attempt FORWARD ([`make_next_attempt_due`]), so an
+/// attempt past the budget — or a second record for one event — would be delivered inside this
+/// window rather than after it, however long the wait the retry policy put before it is.
+const QUIET_WINDOW: Duration = Duration::from_secs(2);
 
 /// The handler every function below runs: it writes ONE counting message — the event's own
 /// marker, and the request id of the invocation it is running under — and then raises, so
@@ -458,7 +459,7 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
         });
     }
 
-    assert_each_ladder(&router, &wired).await;
+    assert_each_ladder(&router, &engine, &wired).await;
 }
 
 /// Assert the RULE over every wired row whose event has been queued: the handler is entered
@@ -471,8 +472,15 @@ async fn a_failing_event_enters_the_handler_once_plus_the_retries_it_is_allowed(
 /// a ladder of attempts have ONE reader of what it leaves behind. Every wait looks again until
 /// what it waits for is there or [`BUDGET`] passes, so a loaded host — where an attempt that
 /// finds no capacity to run the function is made again rather than counted — is waited for,
-/// and only something that never arrives fails a row.
-pub(crate) async fn assert_each_ladder(router: &MultiServiceRouter, ladders: &[Ladder]) {
+/// and only something that never arrives fails a row. The published wait before a retried
+/// attempt (one minute, then two) is brought FORWARD on every look
+/// ([`make_next_attempt_due`]) rather than slept through, which is what waiting would do,
+/// without waiting.
+pub(crate) async fn assert_each_ladder(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    ladders: &[Ladder],
+) {
     // What has been taken off each row's two queues so far, one entry per ladder.
     let mut counted: Vec<Vec<Value>> = ladders.iter().map(|_| Vec::new()).collect();
     let mut records: Vec<Vec<Value>> = ladders.iter().map(|_| Vec::new()).collect();
@@ -512,6 +520,7 @@ pub(crate) async fn assert_each_ladder(router: &MultiServiceRouter, ladders: &[L
             "expected every row's attempts and its invocation record within {BUDGET:?}, got \
              {progress:?}"
         );
+        make_next_attempt_due(engine);
         tokio::time::sleep(LOOK_AGAIN).await;
     }
 
@@ -534,6 +543,7 @@ pub(crate) async fn assert_each_ladder(router: &MultiServiceRouter, ladders: &[L
                 "case {case:?}: expected exactly one invocation record, got another {again:?}"
             );
         }
+        make_next_attempt_due(engine);
         tokio::time::sleep(LOOK_AGAIN).await;
     }
 
