@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLabelDetection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLabelDetection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLabelDetection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored-video label-detection job a `StartLabelDetection` call recorded: the
+//! job's status as the clock owes it, the request it was started with, and its results a page
+//! at a time. Resolving a job, its status and its pages is one rule for the whole `Get…`
+//! family, so it is run from [`crate::state::video_report`].
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +149,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+// Every modelled error this handler answers with is built through this trait, so each one
+// carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+use crate::state::video_jobs::JobStatus;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -228,18 +230,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLabelDetection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLabelDetectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLabelDetection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLabelDetectionErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+
+        // Reporting a stored-video analysis job is one sequence for the whole `Get…` family —
+        // the identifier resolved to a job of THIS analysis, the status the clock owes it, then
+        // the page of results asked for — so it is run from [`crate::state::video_report`]
+        // rather than written out here. Nothing is written: this operation reports a job, and a
+        // job's status is the same for the caller that polls it and the caller that does not.
+        let reported =
+            crate::state::video_report::report(&state, ANALYSIS, &input.job_id, SystemTime::now())
+                .map_err(not_reported)?;
+
+        // "An array of labels detected in the video" — and nothing in this process decodes a
+        // video, so this analysis measured no label in the media and the array it reports is
+        // EMPTY rather than carrying a detection nothing measured. The page is still computed,
+        // because WHICH results a caller is served is the request's to say: a `NextToken` no
+        // page of this analysis minted is refused whatever the results hold.
+        let detected: Vec<LabelDetection> = Vec::new();
+        let page = crate::state::video_report::results_page(
+            ANALYSIS,
+            &detected,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(not_reported)?;
+
+        // "To get the results of the label detection operation, first check that the status
+        // value published to the Amazon SNS topic is SUCCEEDED": the results of an analysis
+        // that is still running are not reported, and neither is a cursor into them.
+        let (labels, next_token) = match reported.status {
+            JobStatus::Succeeded => (Some(page.results), page.next_token),
+            JobStatus::InProgress => (None, None),
+        };
+
+        Ok(GetLabelDetectionOutput {
+            // "The current status of the label detection job", which is the clock's answer.
+            job_status: Some(reported.status.modeled().to_string()),
+            // "If the job fails, StatusMessage provides a descriptive error message": no job
+            // of this service fails, so nothing describes one.
+            status_message: None,
+            // `VideoMetadata` is a measurement OF the media — its codec, duration, frame rate
+            // and pixel dimensions — and no decoder here measures one, so it stays absent
+            // rather than reporting a property of a video nothing read.
+            video_metadata: None,
+            next_token,
+            labels,
+            // "Version number of the label detection model that was used to detect labels":
+            // no such model ran, so there is no version of one to report.
+            label_model_version: None,
+            // The job's own identity, as the start that minted it recorded it.
+            job_id: Some(reported.job.job_id.clone()),
+            video: Some(reported.job.video.modeled()),
+            job_tag: reported.job.job_tag.clone(),
+            // "Information about the paramters used when getting a response": the sorting and
+            // the aggregation THIS request chose, each defaulted where it chose none.
+            get_request_metadata: Some(GetLabelDetectionRequestMetadata {
+                sort_by: Some(input.sort_by.unwrap_or_else(|| DEFAULT_SORT_BY.to_string())),
+                aggregate_by: Some(
+                    input
+                        .aggregate_by
+                        .unwrap_or_else(|| DEFAULT_AGGREGATE_BY.to_string()),
+                ),
+            }),
+        })
     }
+}
+
+/// The analysis whose jobs this operation reports: the `Start…` operation that minted them.
+///
+/// "The label detection operation is started by a call to StartLabelDetection which returns a
+/// job identifier (JobId)", so the jobs this operation can report are that operation's, and an
+/// identifier minted by another analysis of the family names none of them.
+const ANALYSIS: &str = "StartLabelDetection";
+
+/// The sorting this operation reports when the request chose none: "use TIMESTAMP to sort array
+/// elements by the time labels are detected … The default sort is by TIMESTAMP" (`SortBy`'s own
+/// documentation), one of the two values `LabelDetectionSortBy` admits.
+const DEFAULT_SORT_BY: &str = "TIMESTAMP";
+
+/// The aggregation this operation reports when the request chose none: "the default aggregation
+/// method is TIMESTAMPS" (this operation's own documentation), one of the two values
+/// `LabelDetectionAggregateBy` admits.
+const DEFAULT_AGGREGATE_BY: &str = "TIMESTAMPS";
+
+/// The modelled answer for a job this operation did not report: one modelled error per reason,
+/// each carrying the reason's own message.
+fn not_reported(reason: crate::state::video_report::NotReported) -> GetLabelDetectionError {
+    use crate::state::video_report::NotReported;
+
+    let message = reason.message().to_string();
+    match reason {
+        NotReported::UnknownJob(_) => GetLabelDetectionErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException::with_message(message),
+        ),
+        NotReported::InvalidPaginationToken(_) => {
+            GetLabelDetectionErrorModeled::InvalidPaginationTokenException(
+                InvalidPaginationTokenException::with_message(message),
+            )
+        }
+    }
+    .into()
 }

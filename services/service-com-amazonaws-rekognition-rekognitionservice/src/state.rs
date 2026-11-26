@@ -70,9 +70,11 @@
 //! own Amazon S3 that the object it was given is served ([`video_source`]), records the
 //! request as a job of [`video_jobs`] and hands back the identifier the matching `Get…`
 //! operation reads that job by, with the job's status owed by the clock. That start is one
-//! sequence for the whole family, so it lives once in [`video_analysis`]. The analysis
-//! RESULTS belong to the `Get…` operation that reports them, and the ones that would report
-//! them stay unimplemented 501s.
+//! sequence for the whole family, so it lives once in [`video_analysis`], and REPORTING the
+//! job a start recorded is one sequence too, so it lives once in [`video_report`]: a `Get…`
+//! operation resolves the identifier to a job of its own analysis, reports the status the
+//! clock owes it and serves its results a page at a time. Those results are EMPTY — nothing
+//! in this process decodes a video, so no detection is reported that nothing measured.
 //!
 //! The one comparison this emulator can make about two STORED faces is IDENTITY:
 //! [`image_signature`] digests what an image is, so two indexed faces can be told to have
@@ -93,6 +95,7 @@ pub mod project_policies;
 pub mod user_search;
 pub mod video_analysis;
 pub mod video_jobs;
+pub mod video_report;
 pub mod video_source;
 
 use std::collections::BTreeMap;

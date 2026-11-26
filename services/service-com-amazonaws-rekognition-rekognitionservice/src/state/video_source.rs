@@ -24,7 +24,7 @@
 
 use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-use crate::ops::types::Video;
+use crate::ops::types::{S3Object, Video};
 
 /// Why the video a request named cannot be analysed. Each variant has exactly one modelled
 /// answer.
@@ -71,6 +71,24 @@ pub struct VideoLocation {
     pub name: String,
     /// `S3Object.Version` — the object version the request pinned, when it pinned one.
     pub version: Option<String>,
+}
+
+impl VideoLocation {
+    /// This address as the modelled `Video` the request named it with.
+    ///
+    /// The `Get…` operations of the stored-video family report "the video file stored in an
+    /// Amazon S3 bucket" their job runs on, and the object this address names IS that video:
+    /// the bucket and the key the start was given, and the version only where the request
+    /// pinned one.
+    pub fn modeled(&self) -> Video {
+        Video {
+            s3_object: Some(S3Object {
+                bucket: Some(self.bucket.clone()),
+                name: Some(self.name.clone()),
+                version: self.version.clone(),
+            }),
+        }
+    }
 }
 
 /// The video object `video` names, once the object store has confirmed it serves it.

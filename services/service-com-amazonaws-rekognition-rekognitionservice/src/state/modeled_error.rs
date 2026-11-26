@@ -285,6 +285,21 @@ pub fn video_job_concurrency_limit_message() -> String {
     )
 }
 
+/// The fixed text a `JobId` naming no stored-video analysis job of the operation it was given
+/// to is refused with: the request's own identifier between two pieces of fixed text.
+///
+/// A job is the resource a `Get…` operation of the stored-video family is given, and
+/// `ResourceNotFoundException` — "the resource specified in the request cannot be found" — is
+/// the class those operations declare for it. No refusal of this condition is recorded, so,
+/// like [`video_job_concurrency_limit_message`], the wording is this service's own: it is
+/// worded the way this service words every other "the id you named is not one this store
+/// holds" ("The collection id: … does not exist", "The user id: … does not exist"), and it
+/// names the KIND of identifier that resolved to nothing. One wording for the whole family,
+/// since the rule is one.
+pub fn video_job_not_found_message(job_id: &str) -> String {
+    format!("The job id: {job_id} does not exist")
+}
+
 /// The fixed text a project policy document that is not a policy at all is refused with.
 ///
 /// It is the `Message` a recorded AWS `PutProjectPolicy` refusal of an unparseable document
