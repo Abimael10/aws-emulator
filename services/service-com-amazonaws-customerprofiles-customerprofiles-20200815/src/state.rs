@@ -62,8 +62,9 @@ pub mod segment_definitions;
 pub mod event_streams;
 
 pub use event_streams::{
-    event_stream_arn, event_stream_exists, event_stream_not_found, StoredEventStream,
-    EVENT_STREAM_DESTINATION_HEALTHY, EVENT_STREAM_STATE_RUNNING, MAX_EVENT_STREAMS_PER_DOMAIN,
+    event_stream_arn, event_stream_domain_not_found, event_stream_exists, event_stream_not_found,
+    StoredEventStream, EVENT_STREAM_DESTINATION_HEALTHY, EVENT_STREAM_STATE_RUNNING,
+    MAX_EVENT_STREAMS_PER_DOMAIN,
 };
 
 pub use segment_definitions::{

@@ -158,7 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let store = state.lock();
             let domain = store
                 .domain(&region, &input.domain_name)
-                .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+                .ok_or_else(|| {
+                    not_found(crate::state::event_stream_domain_not_found(
+                        &input.domain_name,
+                    ))
+                })?;
             let listed = domain
                 .event_streams
                 .iter()

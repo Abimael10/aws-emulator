@@ -63,6 +63,18 @@ impl StoredEventStream {
         EVENT_STREAM_STATE_RUNNING.to_string()
     }
 
+    /// `Tags` as an event-stream projection reports it: the tag map this stream carries,
+    /// PRESENT and empty for a stream that carries none, exactly as
+    /// [`super::Domain::reported_tags`] reports a domain's and
+    /// [`super::StoredSegmentDefinition::reported_tags`] a segment definition's.
+    ///
+    /// Unlike `StoppedSince`, absent from a read because no such instant exists, the tag
+    /// map is always reported, so a caller that indexes `Tags` can tell "this stream
+    /// carries no tags" from "tags were not reported".
+    pub fn reported_tags(&self) -> Option<HashMap<String, String>> {
+        Some(self.tags.clone().unwrap_or_default())
+    }
+
     /// `DestinationDetails` as `GetEventStream` reports it: the destination this stream
     /// was created with and its status. `Message` is left unset — the member is "The
     /// human-readable string that corresponds to the error or success while enabling the
@@ -122,6 +134,18 @@ pub fn event_stream_arn(region: &str, domain_name: &str, event_stream_name: &str
 /// the same absent name reads the same whichever of them was called.
 pub fn event_stream_not_found(event_stream_name: &str, domain_name: &str) -> String {
     format!("The EventStream with name {event_stream_name} not found for domain {domain_name}")
+}
+
+/// The `ResourceNotFoundException` message the EVENT-STREAM operations word an absent
+/// domain with: the operations bound under `/domains/{DomainName}/event-streams` report
+/// that absence in their own fixed sentence, which names the resource kind, says the name
+/// is a name, and ends "not found" — whose only variable part is the `DomainName` the
+/// request's URI label carried. Shared by every operation of this surface, so the same
+/// absent name reads the same whichever of them was called, and distinct from the sentence
+/// the domain operations themselves ([`super::domain_not_found`]) and the upload-job
+/// surface ([`super::upload_job_domain_not_found`]) word the same absence with.
+pub fn event_stream_domain_not_found(domain_name: &str) -> String {
+    format!("Domain with name {domain_name} not found")
 }
 
 /// The `BadRequestException` message for an event stream name the domain already holds:

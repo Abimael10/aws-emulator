@@ -147,7 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let domain = store
             .domain_mut(&region, &input.domain_name)
-            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+            .ok_or_else(|| {
+                not_found(crate::state::event_stream_domain_not_found(
+                    &input.domain_name,
+                ))
+            })?;
 
         // The name is the stream's identity within the domain, so removing the entry
         // removes the whole stream. A name the domain does not hold is nothing to delete,

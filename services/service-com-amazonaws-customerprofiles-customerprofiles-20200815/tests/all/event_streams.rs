@@ -172,11 +172,13 @@ async fn a_created_event_stream_reads_back_as_it_was_stored() {
             "case {case:?}: expected EventStreamArn {arn:?}, got {:?}",
             created.get("EventStreamArn")
         );
+        // `Tags` is reported either way: the map the request carried, or an empty map for
+        // a create that carried none.
+        let expected_tags = request.get("Tags").cloned().unwrap_or_else(|| json!({}));
         assert_eq!(
             created.get("Tags"),
-            request.get("Tags"),
-            "case {case:?}: expected the Tags the request carried ({:?}), got {:?}",
-            request.get("Tags"),
+            Some(&expected_tags),
+            "case {case:?}: expected Tags {expected_tags:?}, got {:?}",
             created.get("Tags")
         );
 
@@ -205,9 +207,8 @@ async fn a_created_event_stream_reads_back_as_it_was_stored() {
         }
         assert_eq!(
             read.get("Tags"),
-            request.get("Tags"),
-            "case {case:?}: expected the stored Tags ({:?}), got {:?}",
-            request.get("Tags"),
+            Some(&expected_tags),
+            "case {case:?}: expected the stored Tags {expected_tags:?}, got {:?}",
             read.get("Tags")
         );
         // Nothing stopped the stream and nothing found its destination unhealthy, so
@@ -454,11 +455,12 @@ async fn an_event_stream_name_identifies_one_stream_in_its_domain() {
             winner.get("Uri"),
             read.get("DestinationDetails").and_then(|d| d.get("Uri"))
         );
+        let expected_tags = winner.get("Tags").cloned().unwrap_or_else(|| json!({}));
         assert_eq!(
             read.get("Tags"),
-            winner.get("Tags"),
-            "case {case:?}: the refused create must leave the winner's Tags ({:?}), got {:?}",
-            winner.get("Tags"),
+            Some(&expected_tags),
+            "case {case:?}: the refused create must leave the winner's Tags \
+             ({expected_tags:?}), got {:?}",
             read.get("Tags")
         );
     }
@@ -582,7 +584,7 @@ async fn an_absent_domain_or_event_stream_is_not_found() {
                 "case {case:?}: expected ResourceNotFoundException from {operation}, got \
                  {refused:?}"
             );
-            let expected = format!("Domain {domain} is not found");
+            let expected = format!("Domain with name {domain} not found");
             assert_eq!(
                 error_message(&refused),
                 expected,

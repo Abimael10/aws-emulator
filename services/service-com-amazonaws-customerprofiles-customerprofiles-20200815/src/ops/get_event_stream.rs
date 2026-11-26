@@ -161,7 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let domain = store
             .domain(&region, &input.domain_name)
-            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+            .ok_or_else(|| {
+                not_found(crate::state::event_stream_domain_not_found(
+                    &input.domain_name,
+                ))
+            })?;
         let stored = domain
             .event_streams
             .get(&input.event_stream_name)
@@ -175,7 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every member is the stored record's, so two reads of one stream answer alike
         // and a read answers what the create reported. `StoppedSince` is "The timestamp
         // when the State changed to STOPPED" and nothing of this surface stops a stream,
-        // so there is no such instant to report (`crate::state::event_streams`).
+        // so there is no such instant to report (`crate::state::event_streams`). `Tags` is
+        // reported either way, empty for a stream that carries none
+        // ([`crate::state::StoredEventStream::reported_tags`]).
         Ok(GetEventStreamOutput {
             domain_name: domain.name.clone(),
             event_stream_arn: stored.arn.clone(),
@@ -183,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: stored.state(),
             stopped_since: None,
             destination_details: stored.destination_details(),
-            tags: stored.tags.clone(),
+            tags: stored.reported_tags(),
         })
     }
 }

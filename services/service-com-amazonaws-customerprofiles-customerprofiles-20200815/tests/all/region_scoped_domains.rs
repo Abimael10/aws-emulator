@@ -160,7 +160,7 @@ struct Row {
 /// Every domain-scoped operation this service implements, as a request against [`DOMAIN`]
 /// and the sentence it words an absent domain with. The rows span the shape of the request
 /// (GET, POST, PUT, DELETE; with and without a body), the resource underneath the domain the
-/// request addresses, and all three sentences this service uses for an absent domain.
+/// request addresses, and every sentence this service uses for an absent domain.
 ///
 /// `profile_id` is a profile of the domain, so a row addressing one names a profile that
 /// really is there when the request reaches the Region the domain lives in.
@@ -225,7 +225,7 @@ fn domain_scoped_rows(profile_id: &str) -> Vec<Row> {
             method: "GET",
             path: format!("/domains/{DOMAIN}/event-streams"),
             body: None,
-            message: Some(format!("Domain {DOMAIN} is not found")),
+            message: Some(format!("Domain with name {DOMAIN} not found")),
         },
         Row {
             case: "CreateUploadJob",

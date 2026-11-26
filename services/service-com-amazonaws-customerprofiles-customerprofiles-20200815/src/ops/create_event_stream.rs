@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created in — the same Region the ARN minted below names.
         let domain = store
             .domain_mut(&region, &input.domain_name)
-            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+            .ok_or_else(|| {
+                not_found(crate::state::event_stream_domain_not_found(
+                    &input.domain_name,
+                ))
+            })?;
 
         // The name identifies the stream within the domain, so a name the domain already
         // holds is a conflict and never an overwrite — this surface has no operation that
@@ -212,11 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The response is the record that was just stored, so it is the same stream the
-        // readers serve: the ARN minted for it and the tag map it was created with, so a
-        // stream created with no tags reports none.
+        // readers serve: the ARN minted for it and the tag map it was created with,
+        // present and empty for a stream created with no tags
+        // ([`crate::state::StoredEventStream::reported_tags`]).
         let output = CreateEventStreamOutput {
             event_stream_arn: stored.arn.clone(),
-            tags: stored.tags.clone(),
+            tags: stored.reported_tags(),
         };
 
         domain.event_streams.insert(stored.name.clone(), stored);
