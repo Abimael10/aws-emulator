@@ -1022,9 +1022,12 @@ impl Owner {
                 .await
             }
             // A task-definition revision cannot be CHANGED: Amazon ECS publishes no call that
-            // edits one, so a changed declaration registers a new revision rather than
-            // reaching this ([`ecs_task_definition::update`]).
-            Self::EcsTaskDefinition => Ok(ecs_task_definition::update()),
+            // edits one, so every property that travels to its registration is create-only and
+            // a declaration stating one differently replaces the revision instead of reaching
+            // the arm. What does reach it is a change to the resource's TAGS, which are
+            // reconciled on the revision's ARN by the tagging pair ([`ecs_task_definition`]'s
+            // own `update` and `retag`).
+            Self::EcsTaskDefinition => ecs_task_definition::update(resource, declared),
             // Each of these Amazon EC2 types takes a changed property through the call that
             // service publishes for changing it on the resource that exists — a gateway
             // attachment's gateway through the detach and attach pair, a route's target
@@ -1249,9 +1252,14 @@ impl Owner {
             // that already exists are reconciled by no arm here yet
             // ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::CloudFrontResource(_) => Ok(()),
-            // A task-definition revision's tags are the ones its registration carried, and no
-            // deployment changes a revision, so nothing is asked about them.
-            Self::EcsTaskDefinition => Ok(()),
+            // A task-definition revision's tags are Amazon ECS's own
+            // `TagResource`/`UntagResource` on its ARN: `RegisterTaskDefinition`'s `tags` list
+            // applies to the revision that call registers and to no revision that already
+            // exists, so this is where the set a revision is to end up carrying is reconciled
+            // ([`ecs_task_definition::retag`]).
+            Self::EcsTaskDefinition => {
+                ecs_task_definition::retag(ctx, region, resource, declared, propagated).await
+            }
             // The tags of an Amazon EC2 resource that already exists are that service's own
             // `CreateTags` and `DeleteTags`: a create's tagging call applies to the resource it
             // created and to no resource that already exists, and no call that changes one of

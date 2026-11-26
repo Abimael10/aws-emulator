@@ -2621,8 +2621,8 @@ pub fn stored_scale(requested: Option<&Scale>) -> Scale {
 pub fn unable_to_place_message(service_name: &str, reason: &str) -> String {
     format!(
         "(service {service_name}) was unable to place a task because no container instance \
-         met all of its requirements. The reason for failure is {reason} For more \
-         information, see the Troubleshooting section of the Amazon ECS Developer Guide."
+         met all of its requirements. The reason for failure is {reason} \
+         {TROUBLESHOOTING_GUIDE}"
     )
 }
 

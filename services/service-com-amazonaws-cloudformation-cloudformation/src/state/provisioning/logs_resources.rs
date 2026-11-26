@@ -1206,31 +1206,16 @@ fn type_name(kind: Kind) -> &'static str {
 /// ([`super::handler_failure_reason`]).
 ///
 /// These providers are written against the CloudFormation resource-provider plugin, so a
-/// refusal of the REQUEST is re-raised as that plugin's invalid-request exception: its
-/// wording names the TYPE the handler manages and carries the SDK exception it wrapped —
-/// that service's own sentence plus its SDK's diagnostic of the call ([`super::sdk_message`])
-/// — so the reason reads `Invalid request provided: AWS::Logs::MetricFilter. <the SDK
-/// exception>`. A refusal of any OTHER class is passed on as that service worded it: a group
-/// whose name is already taken, or a group a declaration names that is not there, reaches the
-/// event as that service's sentence alone.
-///
-/// The class is the one CloudFormation reports the failure under
-/// ([`super::handler_error_code`]) — decided by the error CODE that service answered, never by
-/// message text a request can influence — so this wording and the `HandlerErrorCode` the event
-/// carries cannot disagree.
+/// refusal of the REQUEST is re-raised as that plugin's invalid-request exception
+/// ([`super::invalid_request_exception`]) with the TYPE the handler manages as its label: its
+/// wording carries that type and the SDK exception it wrapped — that service's own sentence
+/// plus its SDK's diagnostic of the call ([`super::sdk_message`]) — so the reason reads
+/// `Invalid request provided: AWS::Logs::MetricFilter. <the SDK exception>`. A refusal of any
+/// OTHER class is passed on as that service worded it: a group whose name is already taken, or
+/// a group a declaration names that is not there, reaches the event as that service's sentence
+/// alone.
 fn provider_exception(kind: Kind, refusal: Refusal) -> Refusal {
-    if super::handler_error_code(&refusal.code) != super::HANDLER_ERROR_INVALID_REQUEST {
-        return refusal;
-    }
-    Refusal {
-        message: format!(
-            "{}{}. {}",
-            crate::state::provisioner::INVALID_REQUEST_PROVIDED,
-            type_name(kind),
-            refusal.message,
-        ),
-        code: refusal.code,
-    }
+    super::invalid_request_exception(&format!("{}. ", type_name(kind)), refusal)
 }
 
 /// Call one Amazon CloudWatch Logs operation on the awsJson1_1 wire its model declares.

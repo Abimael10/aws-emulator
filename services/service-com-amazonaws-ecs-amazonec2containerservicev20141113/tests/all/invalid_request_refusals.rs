@@ -98,6 +98,36 @@ fn no_configuration(cpu: &str, memory: &str) -> String {
     )
 }
 
+/// The refusal a task-level SETTING that names nothing Fargate offers carries: ECS names the
+/// member to fix, quoted as its model spells it, and points the caller at the published guide
+/// without echoing a value of the request.
+fn invalid_setting(member: &str) -> String {
+    format!(
+        "Invalid '{member}' setting for task. For more information, see the Troubleshooting \
+         section of the Amazon ECS Developer Guide."
+    )
+}
+
+/// The task CPU sizes Fargate publishes a configuration for, in CPU units.
+///
+/// Source: the `RegisterTaskDefinition$memory` doc's own list of legal pairs, whose
+/// "Available cpu values" are these seven. The catalog is keyed by them, so a `cpu` outside
+/// this set names no task size whatever memory is asked beside it.
+const FARGATE_TASK_CPU_UNITS: [i64; 7] = [256, 512, 1024, 2048, 4096, 8192, 16384];
+
+/// Which refusal a row's rejected pair earns: the member-naming sentence where the `cpu` names
+/// none of the published CPU sizes ([`FARGATE_TASK_CPU_UNITS`]) — a value no size is keyed by,
+/// including one that spells no number of units at all — and the no-configuration sentence,
+/// naming both values, where it names one and the `memory` beside it is not a memory that size
+/// supports.
+fn size_refusal(cpu: &str, memory: &str) -> String {
+    let units: Option<i64> = stored_size(cpu).parse().ok();
+    match units.is_some_and(|units| FARGATE_TASK_CPU_UNITS.contains(&units)) {
+        true => no_configuration(&stored_size(cpu), &stored_size(memory)),
+        false => invalid_setting("cpu"),
+    }
+}
+
 #[tokio::test]
 async fn a_registration_whose_identity_is_not_vouched_for_is_refused() {
     let router = service();
@@ -373,9 +403,11 @@ async fn a_fargate_task_definition_takes_only_a_documented_cpu_memory_pair() {
             code, CLIENT_EXCEPTION,
             "case {case:?}: expected a {CLIENT_EXCEPTION}, got {code:?} with {message:?}"
         );
-        assert!(
-            message.starts_with("No Fargate configuration exists for given values:"),
-            "case {case:?}: expected the no-configuration refusal, got {message:?}"
+        assert_eq!(
+            message,
+            size_refusal(cpu, memory),
+            "case {case:?}: expected {:?}, got {message:?}",
+            size_refusal(cpu, memory)
         );
         // Nothing was registered for it: the family holds no revision.
         let listed = ok(
@@ -391,19 +423,40 @@ async fn a_fargate_task_definition_takes_only_a_documented_cpu_memory_pair() {
         );
     }
 
-    // The refusal states the values the request asked for, in the units they name.
-    for (case, cpu, memory, stated_cpu, stated_memory) in [
-        ("cpu units and MiB", "256", "4096", "256", "4096"),
-        ("vCPU and GB", "1 vCPU", "1GB", "1024", "1024"),
-        ("a cpu that names no number", "a lot", "4096", "a lot", "4096"),
-        ("a negative cpu", "-256", "4096", "-256", "4096"),
-        ("a cpu that is not a finite number", "inf vCPU", "4096", "inf vCPU", "4096"),
+    // A pair whose `cpu` IS a published size states the values the request asked for, in the
+    // units they name; a `cpu` that names no published size at all is the member-naming refusal,
+    // which carries no value of the request.
+    for (case, cpu, memory, expected) in [
+        (
+            "cpu units and MiB",
+            "256",
+            "4096",
+            no_configuration("256", "4096"),
+        ),
+        (
+            "vCPU and GB",
+            "1 vCPU",
+            "1GB",
+            no_configuration("1024", "1024"),
+        ),
+        (
+            "a cpu that names no number",
+            "a lot",
+            "4096",
+            invalid_setting("cpu"),
+        ),
+        ("a negative cpu", "-256", "4096", invalid_setting("cpu")),
+        (
+            "a cpu that is not a finite number",
+            "inf vCPU",
+            "4096",
+            invalid_setting("cpu"),
+        ),
         (
             "a memory no task size reaches",
             "256",
             "99999GB",
-            "256",
-            "99999GB",
+            no_configuration("256", "99999GB"),
         ),
     ] {
         let (_, message) = refusal(
@@ -421,10 +474,8 @@ async fn a_fargate_task_definition_takes_only_a_documented_cpu_memory_pair() {
         )
         .await;
         assert_eq!(
-            message,
-            no_configuration(stated_cpu, stated_memory),
-            "case {case:?}: expected {:?}, got {message:?}",
-            no_configuration(stated_cpu, stated_memory)
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 

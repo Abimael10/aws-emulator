@@ -213,7 +213,9 @@ pub(super) async fn create(
     if !tags.is_empty() {
         request.insert("tags".to_string(), ecs_tag_list(&tags));
     }
-    let answered = call_ecs(ctx, region, "RegisterTaskDefinition", &Value::Object(request)).await?;
+    let answered = call_ecs(ctx, region, REGISTER_TASK_DEFINITION, &Value::Object(request))
+        .await
+        .map_err(provider_exception)?;
     let Some(arn) = answered
         .get("taskDefinition")
         .and_then(|definition| definition.get(TASK_DEFINITION_ARN_MEMBER))
@@ -258,13 +260,117 @@ pub(super) fn removal() -> Removal {
 
 /// Apply a CHANGED declaration to the revision the stack already has.
 ///
-/// `Ok(None)` always: a task-definition revision is IMMUTABLE — Amazon ECS publishes no call
-/// that edits one, and every property of the type requires the resource to be replaced
-/// ([`super::super::template::replacement_properties`] names them all), so a deployment that
-/// states one differently registers a NEW revision rather than reaching this. Answering
-/// `None` is what keeps a change this arm cannot make from being reported as applied.
-pub(super) fn update() -> Option<Created> {
-    None
+/// A task-definition revision is IMMUTABLE: Amazon ECS publishes no call that edits one, and
+/// `RegisterTaskDefinition` is the only way to state a configuration — "the revision is a
+/// version number of a task definition in a family", incremented per registration. Every
+/// property that travels to that call is therefore create-only
+/// ([`super::super::template::replacement_properties`] names them all), so a declaration
+/// stating one of them differently asks for a NEW revision and the deployment carries that out
+/// as a replacement — registering the next revision beside the one in force, and taking the
+/// superseded revision down under its `UpdateReplacePolicy` — rather than reaching this arm at
+/// all.
+///
+/// What is left to reach here is the one part of the declaration that is NOT create-only: the
+/// resource's `Tags`. Those are Amazon ECS's own `TagResource`/`UntagResource` on the
+/// revision's ARN, which is where the set the revision is to end up carrying is reconciled
+/// ([`retag`]) — so the configuration half asks nothing of that service, and the revision keeps
+/// the identity, and the ARN, that every reference to it resolves to.
+///
+/// The declaration is still held to what this arm APPLIES ([`refuse_unapplied_properties`]): a
+/// property it does not carry fails the resource rather than being reported as applied.
+pub(super) fn update(
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    refuse_unapplied_properties(declared, &resource.resource_type)?;
+    Ok(Some(Created::default()))
+}
+
+/// Bring the tag set of the revision the stack already has into line with what the deployment
+/// now asks for, through Amazon ECS's own `TagResource` and `UntagResource`.
+///
+/// `RegisterTaskDefinition`'s own `tags` list applies to the revision that call registers and
+/// to no revision that already exists, and no other call of that service carries a tag — so
+/// this is where the set a revision is to end up carrying is reconciled. The set is the
+/// declared `Tags` plus the ones CloudFormation gives the resource, less the keys in AWS's
+/// reserved namespace, exactly as the registration's is.
+///
+/// What the revision holds is read from that service's own `ListTagsForResource` rather than
+/// from the stack's record, so the set it ends up with is the declared one whatever else
+/// touched it, and a revision whose tags already agree has nothing called about it — which is
+/// what makes this idempotent across deployments.
+pub(super) async fn retag(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let arn = resource.physical_resource_id.clone();
+    let wanted = applicable_tags(&tags_of(declared, propagated));
+    let held = listed_tags(ctx, region, &arn).await?;
+    let removed: Vec<Value> = held
+        .keys()
+        .filter(|key| !wanted.iter().any(|(wanted, _)| wanted == *key))
+        .map(|key| Value::String(key.clone()))
+        .collect();
+    let added: Vec<(String, String)> = wanted
+        .iter()
+        .filter(|(key, value)| held.get(key) != Some(value))
+        .cloned()
+        .collect();
+    if !removed.is_empty() {
+        let request = serde_json::json!({
+            TAG_RESOURCE_ARN_MEMBER: arn,
+            "tagKeys": Value::Array(removed),
+        });
+        call_ecs(ctx, region, "UntagResource", &request).await?;
+    }
+    if !added.is_empty() {
+        let request = serde_json::json!({
+            TAG_RESOURCE_ARN_MEMBER: arn,
+            "tags": ecs_tag_list(&added),
+        });
+        call_ecs(ctx, region, "TagResource", &request).await?;
+    }
+    Ok(())
+}
+
+/// The member Amazon ECS's tagging calls address a resource by
+/// (`TagResource$resourceArn`/`UntagResource$resourceArn`/`ListTagsForResource$resourceArn`,
+/// each `@required`), which for this type is the revision's own ARN.
+const TAG_RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// The tags Amazon ECS reports for the revision `arn` names, as the key-to-value map a
+/// reconciliation compares against ([`retag`]).
+///
+/// A read that service REFUSES fails the change, exactly as a refused tagging call does: the
+/// set the revision carries is what the calls to make are computed from, so a reconciliation
+/// that could not read it would be guessing at which keys to take away. An answer reporting no
+/// tags at all is the empty set, which is a revision with nothing to take away.
+async fn listed_tags(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    arn: &str,
+) -> Result<BTreeMap<String, String>, Refusal> {
+    let request = serde_json::json!({ TAG_RESOURCE_ARN_MEMBER: arn });
+    let answered = call_ecs(ctx, region, "ListTagsForResource", &request).await?;
+    let mut held = BTreeMap::new();
+    for tag in answered
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let (Some(key), Some(value)) = (
+            tag.get(TAG_MEMBERS.0).and_then(Value::as_str),
+            tag.get(TAG_MEMBERS.1).and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        held.insert(key.to_string(), value.to_string());
+    }
+    Ok(held)
 }
 
 /// Deregister the revision a stack registered, addressed by the ARN Amazon ECS knows it by.
@@ -431,6 +537,28 @@ fn refuse_unapplied_properties(properties: &Value, resource_type: &str) -> Resul
         });
     }
     Ok(())
+}
+
+/// The call that REGISTERS a revision, which is the only call that states a configuration.
+const REGISTER_TASK_DEFINITION: &str = "RegisterTaskDefinition";
+
+/// The label this type's provider puts on the registration it was making when Amazon ECS
+/// refused it, between the plugin's wording and that service's sentence.
+const CREATE_TASK_DEFINITION: &str = "Create TaskDefinition: ";
+
+/// One refusal Amazon ECS answered the REGISTRATION with, as the EXCEPTION this type's
+/// provider raises for it — which is what CloudFormation quotes on the failed resource's
+/// event ([`super::handler_failure_reason`]).
+///
+/// This provider is written against the CloudFormation resource-provider plugin, so a refusal
+/// of the REQUEST is re-raised as that plugin's invalid-request exception
+/// ([`super::invalid_request_exception`], which every provider written against it words), with
+/// the CALL the handler was making as its label: the reason reads `Invalid request provided:
+/// Create TaskDefinition: <the SDK exception>`, as the recorded `ResourceStatusReason` of a
+/// revision whose declared Fargate task size that service has no configuration for carries it
+/// (the check cited in [`super::sdk_diagnostics::SDK_SERVICE_NAMES`]'s entry for this service).
+fn provider_exception(refusal: Refusal) -> Refusal {
+    super::invalid_request_exception(CREATE_TASK_DEFINITION, refusal)
 }
 
 /// Call one Amazon ECS operation on the awsJson1_1 wire its model declares.

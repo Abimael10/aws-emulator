@@ -189,6 +189,16 @@ pub fn stated_units(value: &str, units: Option<i64>) -> String {
     }
 }
 
+/// Whether `cpu` is one of the task CPU sizes Fargate publishes a configuration for at all
+/// ([`FARGATE_TASK_SIZES`]), whatever memory is asked beside it.
+///
+/// The catalog pairs each CPU size with the memory it supports, so the two values fail
+/// differently: a `cpu` NOT in this set names no Fargate task size whatever the memory is,
+/// while one in it names a size whose memory list the request has to meet.
+pub fn is_fargate_task_cpu(cpu: i64) -> bool {
+    FARGATE_TASK_SIZES.iter().any(|size| size.cpu == cpu)
+}
+
 /// `ClientException$message` for a task size Fargate has no configuration for: the pair
 /// is stated as the units it stands for ([`stated_units`]) and the caller is pointed at
 /// the published catalog, so nothing of the request but the two values the caller has to
@@ -203,6 +213,20 @@ pub fn fargate_task_size_message(cpu: &str, memory: &str) -> String {
         stated_units(cpu, cpu_units(cpu)),
         stated_units(memory, memory_mib(memory))
     )
+}
+
+/// The sentence Amazon ECS closes a refusal of a task's own configuration with, which points
+/// the caller at the published guide rather than at a value — the same clause the scheduler's
+/// account of a placement it could not make carries
+/// ([`crate::state::unable_to_place_message`]).
+pub const TROUBLESHOOTING_GUIDE: &str =
+    "For more information, see the Troubleshooting section of the Amazon ECS Developer Guide.";
+
+/// `ClientException$message` for a task-level SETTING that names nothing this platform
+/// offers: Amazon ECS names the MEMBER the caller has to fix, quoted as its model spells it,
+/// and carries none of the request's values.
+pub fn invalid_task_setting_message(member: &str) -> String {
+    format!("Invalid '{member}' setting for task. {TROUBLESHOOTING_GUIDE}")
 }
 
 /// The task-level `cpu` a registration STORES for the value the request named, or `None`
@@ -248,10 +272,29 @@ pub fn is_fargate_configuration(cpu: &str, memory: &str, os_family: &str) -> boo
 
 /// The refusal a REGISTERED task size earns when Fargate has no configuration for it on
 /// the operating system the revision declares, or `None` when it names one.
+///
+/// WHICH refusal depends on which of the two values names nothing Fargate offers, because
+/// the catalog is keyed by the CPU size: a `cpu` that is none of the published task CPU
+/// sizes ([`is_fargate_task_cpu`]) — including a value that spells no number of units at
+/// all — is a setting of the task that names nothing, and the refusal names that member
+/// ([`invalid_task_setting_message`]); a `cpu` that names a published size carries a
+/// `memory` that size has to support, and a pair the catalog does not hold is refused as the
+/// configuration it asks for, naming both values
+/// ([`fargate_task_size_message`]) — which is also the refusal a published pair outside the
+/// WINDOWS configurations earns, since its CPU size is one Fargate publishes.
 pub fn fargate_task_size_violation(cpu: &str, memory: &str, os_family: &str) -> Option<String> {
-    (!is_fargate_configuration(cpu, memory, os_family))
-        .then(|| fargate_task_size_message(cpu, memory))
+    if is_fargate_configuration(cpu, memory, os_family) {
+        return None;
+    }
+    if !cpu_units(cpu).is_some_and(is_fargate_task_cpu) {
+        return Some(invalid_task_setting_message(CPU_MEMBER));
+    }
+    Some(fargate_task_size_message(cpu, memory))
 }
+
+/// The member a task's CPU size travels in (`RegisterTaskDefinition$cpu`), as a refusal of
+/// that setting names it.
+const CPU_MEMBER: &str = "cpu";
 
 /// The smallest task `cpu`, in CPU units, a WINDOWS container on Fargate runs at.
 ///

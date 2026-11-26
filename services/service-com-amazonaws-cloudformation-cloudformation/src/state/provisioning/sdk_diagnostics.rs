@@ -231,6 +231,20 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // ID: …; Proxy: null)" (RequestToken: …, HandlerErrorCode: AlreadyExists)`). Every type
     // this emulator provisions over this signing name is that service's.
     ("ec2", "Ec2", SdkDiagnostic::Proxied),
+    // Amazon ECS's SDK names it `AmazonECS` — the name that service's own SDK client carries,
+    // which is neither its signing name (`ecs`) nor its `sdkId` (`ECS`, with
+    // `cloudFormationName: ECS`, `smithy_query(query="service_info")` on that service's model)
+    // — and words the PROXIED shape, naming the error code the call was refused with and
+    // closing with the proxy it was made through, exactly as Amazon EC2's above does. Read from
+    // the recorded `ResourceStatusReason` of an `AWS::ECS::TaskDefinition` whose declared
+    // Fargate task size that service has no configuration for (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `cloudformation__ecs.deploy-ecs-task-definition-invalid-fargate-cpu-rejected`, whose
+    // reason quotes `<the provider's and the service's sentence> (Service: AmazonECS; Status
+    // Code: 400; Error Code: ClientException; Request ID: …; Proxy: null)`). Every type this
+    // emulator provisions over this signing name is that service's (the task definition, the
+    // cluster and its capacity providers, the service and its task sets).
+    ("ecs", "AmazonECS", SdkDiagnostic::Proxied),
     // Amazon EFS's SDK names it `Efs` — that model's own `sdkId` (`EFS`,
     // `smithy_query(query="service_info")` on that service's model) with only the initial
     // capitalised, exactly as Amazon EC2's above and Amazon EMR's below are. The shape is the
@@ -1535,6 +1549,35 @@ pub(in crate::state) fn handler_error_code(code: &str) -> &'static str {
         .iter()
         .find(|(_, fragments)| fragments.iter().any(|fragment| code.contains(fragment)))
         .map_or(HANDLER_ERROR_INVALID_REQUEST, |(class, _)| *class)
+}
+
+/// One refusal of the REQUEST as the resource-provider plugin's own invalid-request exception
+/// words it: `Invalid request provided: <label><the service's sentence and its SDK's diagnostic
+/// of the call>`.
+///
+/// A provider written against that plugin re-raises such a refusal as that exception, and
+/// states inside it what IT was doing — the type it manages, or the call it was making — which
+/// is `label`, carrying its own separator. A refusal of any OTHER class is passed on as the
+/// owning service worded it, because the wording belongs to that one exception class.
+///
+/// The class is the one CloudFormation reports the failure under ([`handler_error_code`]) —
+/// decided by the error CODE that service answered, never by message text a request can
+/// influence — so this wording and the `HandlerErrorCode` the event carries cannot disagree.
+///
+/// Spelled once for every provider that words it ([`logs_resources`], [`ecs_task_definition`]),
+/// so the class guard and the wording cannot drift between them.
+pub(super) fn invalid_request_exception(label: &str, refusal: Refusal) -> Refusal {
+    if handler_error_code(&refusal.code) != HANDLER_ERROR_INVALID_REQUEST {
+        return refusal;
+    }
+    Refusal {
+        message: format!(
+            "{}{label}{}",
+            crate::state::provisioner::INVALID_REQUEST_PROVIDED,
+            refusal.message,
+        ),
+        code: refusal.code,
+    }
 }
 
 /// The `ResourceStatusReason` the event for a resource its provider refused to act on
