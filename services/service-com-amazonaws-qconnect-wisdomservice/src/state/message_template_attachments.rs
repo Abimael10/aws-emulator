@@ -27,19 +27,33 @@ use crate::ops::types::MessageTemplateAttachment;
 /// presentation every stored attachment carries.
 pub const CONTENT_DISPOSITION_ATTACHMENT: &str = "ATTACHMENT";
 
-/// The fixed text for a request addressed to an attachment the message template does not
-/// hold, worded as this endpoint words the other not-found resources of this family
-/// ([`MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND`]), with the resource token spelled as the API
-/// itself names the resource.
+/// The fixed text for a request that reports an attachment the message template does not
+/// hold as the MISSING RESOURCE, worded as this endpoint words the other not-found
+/// resources of this family ([`MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND`]), with the resource
+/// token spelled as the API itself names the resource.
 ///
-/// `DeleteMessageTemplateAttachment` carries it in the CONFLICT class rather than the
-/// not-found one: the message template the route names exists, and it is the state that
-/// template is in — holding no file under the id — that the request cannot be processed
-/// against, which is what `ConflictException` states ("The request could not be processed
-/// because of conflict in the current state of the resource",
-/// `smithy_query(query="shape",shape="ConflictException")`).
+/// It belongs to the not-found class (HTTP 404 `ResourceNotFoundException`) alone: a
+/// refusal of the CONFLICT class states the conflict rather than a missing resource, and
+/// carries [`MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_DELETE_CONFLICT`] instead.
 pub const MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_NOT_FOUND: &str =
     "Message template attachment does not exist.";
+
+/// The fixed text `DeleteMessageTemplateAttachment` refuses an `attachmentId` the
+/// template's `$LATEST` working copy holds no file under with.
+///
+/// The refusal is the CONFLICT class rather than the not-found one: the message template
+/// the route names exists, and it is the state that template is in — holding no file under
+/// the id — that the request cannot be processed against, which is what
+/// `ConflictException` states ("The request could not be processed because of conflict in
+/// the current state of the resource",
+/// `smithy_query(query="shape",shape="ConflictException")`). The sentence therefore names
+/// the operation that could not be carried out and the conflict class itself, and
+/// interpolates nothing from the request or from state: no attachment, template or
+/// knowledge-base id, no name, no limit and no member name, so every such refusal of this
+/// operation reads alike.
+pub const MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_DELETE_CONFLICT: &str =
+    "Unable to delete message template attachment: there is conflict in the current state \
+     of resource";
 
 /// The most attachments one message template's working copy may hold at a time; an upload
 /// beyond it is refused with the modelled `ServiceQuotaExceededException` (HTTP 402),

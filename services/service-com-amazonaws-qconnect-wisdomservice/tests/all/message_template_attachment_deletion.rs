@@ -17,6 +17,8 @@
 //! * attachments on published versions "remain unchanged": a delete reaches the working
 //!   copy alone, so a version-addressed read reports the attachments its snapshot was
 //!   published with and their locators still serve those files;
+//! * a successful delete answers the status this service puts on the wire for this
+//!   operation, with no document, whatever the request named;
 //! * an `attachmentId` the working copy holds no file under — one no template ever held,
 //!   one a previous delete already removed, one another template holds, and one only a
 //!   published version still carries — is the modelled `ConflictException` (HTTP 409),
@@ -41,9 +43,24 @@ const CONTENT_DISPOSITION: &str = "ATTACHMENT";
 /// The fixed sentences this endpoint answers the resources of this family with when it
 /// holds none, written out here rather than imported from the implementation, so the
 /// assertions pin what a client reads.
-const MESSAGE_ATTACHMENT_NOT_FOUND: &str = "Message template attachment does not exist.";
-const MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND: &str = "MessageTemplate does not exist.";
-const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
+pub(crate) const MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND: &str = "MessageTemplate does not exist.";
+pub(crate) const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
+
+/// The fixed sentence a delete of an `attachmentId` the working copy holds no file under
+/// is refused with: the CONFLICT class's own wording, which states the conflict with the
+/// state the template is in rather than reporting a missing resource. It interpolates
+/// nothing from the request or from state, so every row compares it for equality.
+pub(crate) const MESSAGE_ATTACHMENT_DELETE_CONFLICT: &str =
+    "Unable to delete message template attachment: there is conflict in the current state \
+     of resource";
+
+/// The status a successful delete of one attachment answers with, written out here rather
+/// than imported from the implementation: the status this service puts on the wire for this
+/// operation, which is not the code its model's `@http` member declares
+/// (`smithy_query(query="operation",operation="DeleteMessageTemplateAttachment")`: `code:
+/// 204`). The response structure declares no members either way, so the body is empty and
+/// the status is the whole of the success answer.
+pub(crate) const DELETED_STATUS: u16 = 200;
 
 /// The two managed version qualifiers the read's own documentation names
 /// (`smithy_query(query="doc",shape="GetMessageTemplate")`: "either an actual version
@@ -366,8 +383,8 @@ async fn a_delete_removes_exactly_the_attachment_its_id_names() {
         )
         .await;
         assert_eq!(
-            deleted.status, 204,
-            "case {case:?}: expected HTTP 204 for the delete, got HTTP {} with body {}",
+            deleted.status, DELETED_STATUS,
+            "case {case:?}: expected HTTP {DELETED_STATUS} for the delete, got HTTP {} with body {}",
             deleted.status, deleted.body
         );
         // A response whose output structure declares no members carries no document.
@@ -462,7 +479,7 @@ async fn a_delete_removes_exactly_the_attachment_its_id_names() {
             "case {case:?}: expected error type ConflictException, got {:?}",
             again.error_type
         );
-        let expected_message = MESSAGE_ATTACHMENT_NOT_FOUND;
+        let expected_message = MESSAGE_ATTACHMENT_DELETE_CONFLICT;
         assert_eq!(
             again.string("/message"),
             expected_message,
@@ -476,9 +493,9 @@ async fn a_delete_removes_exactly_the_attachment_its_id_names() {
             let removed =
                 delete_attachment(&emulator, &knowledge_base_id, &message_template_id, id).await;
             assert_eq!(
-                removed.status, 204,
-                "case {case:?}: expected HTTP 204 deleting the remaining {id:?}, got HTTP {} with \
-                 body {}",
+                removed.status, DELETED_STATUS,
+                "case {case:?}: expected HTTP {DELETED_STATUS} deleting the remaining {id:?}, got \
+                 HTTP {} with body {}",
                 removed.status, removed.body
             );
         }
@@ -557,8 +574,8 @@ async fn a_delete_leaves_published_versions_untouched() {
         )
         .await;
         assert_eq!(
-            deleted.status, 204,
-            "case {case:?}: expected HTTP 204 for the delete, got HTTP {} with body {}",
+            deleted.status, DELETED_STATUS,
+            "case {case:?}: expected HTTP {DELETED_STATUS} for the delete, got HTTP {} with body {}",
             deleted.status, deleted.body
         );
 
@@ -626,7 +643,7 @@ async fn a_delete_leaves_published_versions_untouched() {
              working copy, got HTTP {} with body {}",
             again.status, again.body
         );
-        let expected_message = MESSAGE_ATTACHMENT_NOT_FOUND;
+        let expected_message = MESSAGE_ATTACHMENT_DELETE_CONFLICT;
         assert_eq!(
             again.string("/message"),
             expected_message,
@@ -767,7 +784,7 @@ async fn a_delete_addressed_to_nothing_this_account_holds_is_refused() {
             "case {case:?}: expected error type ConflictException, got {:?}",
             refused.error_type
         );
-        let expected_message = MESSAGE_ATTACHMENT_NOT_FOUND;
+        let expected_message = MESSAGE_ATTACHMENT_DELETE_CONFLICT;
         assert_eq!(
             refused.string("/message"),
             expected_message,

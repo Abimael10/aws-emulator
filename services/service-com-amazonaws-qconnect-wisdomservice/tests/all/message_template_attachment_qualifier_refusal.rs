@@ -22,7 +22,7 @@
 
 use super::message_template::content_for;
 use super::message_template_attachment_deletion::{
-    attachment_ids, delete_attachment, get_template, upload,
+    attachment_ids, delete_attachment, get_template, upload, DELETED_STATUS,
 };
 use super::message_template_qualifier::MESSAGE_QUALIFIER_NOT_ACCEPTED;
 use super::message_template_versions::{knowledge_base, message_template, publish};
@@ -185,7 +185,7 @@ async fn a_qualified_message_template_label_is_refused_as_a_pattern_violation() 
     for (index, (form, written)) in forms.iter().enumerate() {
         let accepted = delete_attachment(&emulator, &knowledge_base_id, written, &ids[index]).await;
         assert_eq!(
-            accepted.status, 204,
+            accepted.status, DELETED_STATUS,
             "case {form:?}: the unqualified label carries no pattern violation, so the delete must \
              be served, got HTTP {} with body {}",
             accepted.status, accepted.body

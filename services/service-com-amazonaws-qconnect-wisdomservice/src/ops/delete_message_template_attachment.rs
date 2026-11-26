@@ -17,7 +17,8 @@
 //! An `attachmentId` the working copy holds no file under is refused as a CONFLICT with the
 //! state that template is in rather than as a missing resource: the template the route
 //! names exists, so there is nothing to report as not found, which is why a repeated delete
-//! of one file is answered 409 rather than 404.
+//! of one file is answered 409 rather than 404, with the conflict class's own wording
+//! rather than a sentence about a missing resource.
 //!
 //! ## Shape of an operation
 //!
@@ -188,7 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteMessageTemplateAttachment";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_MESSAGE_TEMPLATE_ATTACHMENT_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_MESSAGE_TEMPLATE_ATTACHMENT_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    // The status this operation answers a successful delete with is the one the service
+    // puts on the wire, which is the 200 that announces an answer rather than the 204 the
+    // model's `@http` member declares: the two disagree for this operation, and what a
+    // client reads is the wire. The response structure declares no members either way, so
+    // the body stays empty and the status is the whole of the success answer; it does not
+    // vary with the knowledge base, the template or the attachment the route names.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -252,10 +259,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An id the working copy holds no file under — one the template never held, one a
         // previous delete already removed, or one only a published version's snapshot still
         // carries — names nothing to remove: the request conflicts with the state this
-        // template is in rather than being answered 204 for work nothing did.
+        // template is in rather than being answered a success for work nothing did. The
+        // refusal states that conflict, which is what its class is about, and not that a
+        // resource is missing: the template the route names exists.
         if !stored.remove_attachment(&input.attachment_id) {
             return Err(conflict(
-                crate::state::MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_NOT_FOUND,
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_ATTACHMENT_DELETE_CONFLICT,
             ));
         }
         // The attachments are part of what the template's content checksum is calculated

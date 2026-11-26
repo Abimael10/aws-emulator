@@ -33,7 +33,9 @@
 use serde_json::{json, Map, Value};
 
 use super::message_template::content_for;
-use super::message_template_attachment_deletion::{delete_attachment, get_template, upload};
+use super::message_template_attachment_deletion::{
+    delete_attachment, get_template, upload, DELETED_STATUS,
+};
 use super::resource_tags::{label, wisdom_arn, Emulator, Reply, REGION};
 
 /// The channel subtype every template in this suite is created with: attachments are
@@ -418,8 +420,9 @@ async fn a_render_reports_the_attachments_the_working_copy_holds_as_date_time_st
             )
             .await;
             assert_eq!(
-                deleted.status, 204,
-                "case {case:?}: expected HTTP 204 for the delete of {:?}, got HTTP {} with body {}",
+                deleted.status, DELETED_STATUS,
+                "case {case:?}: expected HTTP {DELETED_STATUS} for the delete of {:?}, got HTTP {} \
+                 with body {}",
                 uploads[target].name, deleted.status, deleted.body
             );
             live.retain(|index| *index != target);
@@ -556,8 +559,8 @@ async fn a_render_of_a_published_version_keeps_the_attachments_it_was_published_
         )
         .await;
         assert_eq!(
-            deleted.status, 204,
-            "case {case:?}: expected HTTP 204 for the delete, got HTTP {} with body {}",
+            deleted.status, DELETED_STATUS,
+            "case {case:?}: expected HTTP {DELETED_STATUS} for the delete, got HTTP {} with body {}",
             deleted.status, deleted.body
         );
 
