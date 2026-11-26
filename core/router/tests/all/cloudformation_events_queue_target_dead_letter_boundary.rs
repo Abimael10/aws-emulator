@@ -15,8 +15,8 @@
 //! and the want of access without saying which holds — nothing is
 //! enqueued on the target, and — because the target carries a `DeadLetterConfig` — the
 //! envelope is written to that queue instead with the message attributes `RULE_ARN`,
-//! `TARGET_ARN`, `ERROR_CODE` and `ERROR_MESSAGE`, under the resource class
-//! (`NO_RESOURCE`) that answer belongs to and with no retries. None of that depends on how
+//! `TARGET_ARN`, `ERROR_CODE` and `ERROR_MESSAGE`, under the permission class
+//! (`NO_PERMISSIONS`) a withheld delivery falls in and with no retries. None of that depends on how
 //! the rule, its target or the queue policy came to exist: a stack's `AWS::Events::Rule` and
 //! `AWS::SQS::QueuePolicy` leave behind the same rule, target and document a client's own
 //! `PutRule`/`PutTargets`/`SetQueueAttributes` do, and a stack UPDATE that adds the missing
@@ -106,10 +106,11 @@ const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 const RETRY_ATTEMPTS_ATTRIBUTE: &str = "RETRY_ATTEMPTS";
 const EXHAUSTED_RETRY_CONDITION_ATTRIBUTE: &str = "EXHAUSTED_RETRY_CONDITION";
 
-/// The class EventBridge records for a delivery the target's own document refused, which is
-/// the class Amazon SQS's answer to such a send belongs to: that service answers it under its
-/// own not-found code rather than disclosing a queue it will not let the caller write to.
-const NO_RESOURCE: &str = "NO_RESOURCE";
+/// The class EventBridge records for a delivery the target's own document refused: the
+/// permission class, since a document in force over the target withheld the call — whatever
+/// code that service words its answer under, which for Amazon SQS is its own not-found one,
+/// because it does not disclose a queue it will not let the caller write to.
+const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The error code and status that answer carries
 /// (`smithy_query(query="shape", shape="QueueDoesNotExist",
@@ -770,7 +771,7 @@ async fn a_deployed_queue_target_without_a_policy_dead_letters_until_an_update_g
         for (name, expected) in [
             (RULE_ARN_ATTRIBUTE, rule_arn.clone()),
             (TARGET_ARN_ATTRIBUTE, target_arn.clone()),
-            (ERROR_CODE_ATTRIBUTE, NO_RESOURCE.to_string()),
+            (ERROR_CODE_ATTRIBUTE, NO_PERMISSIONS.to_string()),
         ] {
             let actual = attribute(parked, name);
             assert_eq!(

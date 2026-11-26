@@ -291,7 +291,7 @@ pub use export_tasks::{
     export_task_not_found_message, export_task_quota_message,
     invalid_export_only_message, invalid_export_source_arn_message,
     invalid_export_source_state_message, invalid_s3_bucket_message, kms_key_not_accessible_message,
-    partial_export_warning, ExportTaskRecord,
+    partial_export_warning, target_kms_key_not_accessible_message, ExportTaskRecord,
     COMPLETE_PERCENT_PROGRESS, EXPORT_SOURCE_DB_CLUSTER, EXPORT_SOURCE_DB_CLUSTER_SNAPSHOT,
     EXPORT_SOURCE_DB_SNAPSHOT, EXPORT_SOURCE_TYPE_CLUSTER, EXPORT_SOURCE_TYPE_SNAPSHOT,
     EXPORT_TASK_QUOTA_PER_REGION, EXPORT_TASK_STATUS_CANCELED, EXPORT_TASK_STATUS_CANCELING,

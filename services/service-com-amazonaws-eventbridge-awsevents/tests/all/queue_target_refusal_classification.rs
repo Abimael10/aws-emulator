@@ -10,17 +10,18 @@
 //! destination queue's own resource policy is what authorizes the delivery
 //! (`PutTargets`: "for Lambda functions, Amazon SNS topics and Amazon SQS queues,
 //! EventBridge relies on resource-based policies"), and the dead letter's
-//! `ERROR_CODE` is EventBridge's classification OF THE ANSWER the target's service
-//! gave — never a verdict this service reaches on its own. Amazon SQS does not
-//! disclose a queue it will not let the caller write to: it models no authorization
+//! `ERROR_CODE` is EventBridge's classification of WHY the delivery failed: a document
+//! in force over the queue withheld the send (`NO_PERMISSIONS`), or the queue was not
+//! there at all (`NO_RESOURCE`). The ANSWER beside the class is the target service's
+//! own, and it does not distinguish the two by code: Amazon SQS does not
+//! disclose a queue it will not let the caller write to — it models no authorization
 //! failure on `SendMessage` at all (`smithy_query(query="operation",
 //! operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
 //! and answers a send no document in force over the queue permits under its own
-//! not-found code, so every form of withholding lands in the resource class
-//! (`NO_RESOURCE`) — the class a target that is not there lands in too, under that
-//! service's OTHER sentence for the same code. Each row therefore states the
-//! SENTENCE its answer must carry beside the class, so the two kinds of answer stay
+//! not-found code, the code it answers an absent queue under too, with a different
+//! SENTENCE for each. Each row therefore states the
+//! sentence its answer must carry beside the class, so the two kinds of answer stay
 //! told apart by what that service said.
 //!
 //! The table spans both kinds rather than one case: the rows differ along the FORM
@@ -48,7 +49,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -232,58 +233,58 @@ fn attribute(message: &Value, name: &str) -> String {
         .to_string()
 }
 
-/// The dead-letter `ERROR_CODE` is the class the target service's OWN answer puts
-/// the failure in, over every form a withheld delivery and an absent target take —
-/// and the sentence beside it is the one that service worded for its own answer.
+/// The dead-letter `ERROR_CODE` is the class of WHY the delivery failed, over every
+/// form a withheld delivery and an absent target take — and the sentence beside it is
+/// the one the target service worded for its own answer.
 #[tokio::test]
 async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
     let rows = [
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose document states no statement",
             setup: Setup::Queue(Some(no_statements)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(granting_then_denying)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceAccount to another account",
             setup: Setup::Queue(Some(granting_another_account)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose grant names another queue as its resource",
             setup: Setup::Queue(Some(granting_another_resource)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
@@ -399,8 +400,8 @@ async fn the_queue_a_withheld_delivery_names_receives_once_its_policy_grants_the
     );
     let code = attribute(&dead_lettered[0], ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        code, NO_RESOURCE,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
+        code, NO_PERMISSIONS,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
          {code:?} in {:?}",
         dead_lettered[0]
     );

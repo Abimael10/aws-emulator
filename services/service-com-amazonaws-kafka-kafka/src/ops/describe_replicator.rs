@@ -210,21 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 std::time::SystemTime::now(),
             );
             let Some(settled) = settled else {
-                // The two absences the registry tells apart: an ARN naming a
-                // replicator this Region HELD and released is reported as a
-                // fault of the parameter that still names it, while every other
-                // ARN this endpoint resolves no replicator for — whatever its
-                // name and identifier segments spell — gets the service's fixed
-                // sentence alone. Both name the input member in
-                // `invalidParameter`, and neither says anything about this
-                // endpoint's own state.
-                let at_fault = crate::state::replicator_reference_at_fault(
-                    &state,
-                    &region,
-                    &input.replicator_arn,
-                );
+                // Every replicator reference this endpoint resolves nothing for
+                // is worded one way by this family of operations: the fixed
+                // not-found sentence behind the framing that names the parameter
+                // carrying it, with that member in `invalidParameter` as well.
+                // Nothing of this endpoint's own state is reported.
                 return Err(DescribeReplicatorErrorModeled::NotFoundException(
-                    crate::state::replicator_resolves_to_nothing(at_fault),
+                    crate::state::replicator_resolves_to_nothing(),
                 )
                 .into());
             };

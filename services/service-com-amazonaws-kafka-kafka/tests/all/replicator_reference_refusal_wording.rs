@@ -4,15 +4,14 @@
 //! to end over the same router the emulator serves from (the shared `kafka_harness`).
 //!
 //! RULE: a replicator reference that resolves to nothing is HTTP 404 `NotFoundException`
-//! whose WHOLE message is the service's one fixed sentence, with the input member at fault in
-//! `invalidParameter` and nothing of the request in the text. How a well-formed replicator
-//! ARN SPELLS the replicator it names — the name segment, the identifier segment, the Region
-//! and account it names — is not read: a reference this endpoint holds no replicator for is
-//! absent whether or not those segments resemble ones this registry mints, so the service
-//! says the same thing about all of them. The one reference the replicator APIs frame as the
-//! parameter's fault is a replicator this endpoint HELD and released: a resource of the
-//! service's own that is gone, which earns the same sentence behind the
-//! `Invalid parameter <member>: ` framing those APIs put before it.
+//! whose message is the service's one fixed not-found sentence behind the
+//! `Invalid parameter <member>: ` framing the replicator family of this service puts before
+//! it, with that same input member in `invalidParameter` and nothing of the request in the
+//! text. How a well-formed replicator ARN SPELLS the replicator it names — the name segment,
+//! the identifier segment, the Region and account it names — is not read, and neither is
+//! whether this endpoint ever HELD a replicator under it: a reference this endpoint resolves
+//! no replicator for is answered the same way whether it was never minted or was created
+//! here and released, so the service says the same thing about all of them.
 //!
 //! The rows differ along what the rule generalises over: the NAME segment (names the modelled
 //! `@pattern` admits — alphanumeric, hyphenated, digits-only, the longest one its `@length`
@@ -22,9 +21,9 @@
 //! crossed with the Region the ARN names, this endpoint's and another's, and with both
 //! replicator operations that resolve an ARN on their own path.
 //!
-//! The second test is the boundary: one replicator this endpoint really held, released by its
-//! own delete, whose ARN is of exactly the form the first test's rows take — so what tells the
-//! two forms apart is the release, not how the ARN is spelled.
+//! The second test is the other end of that generalisation: one replicator this endpoint
+//! really held, released by its own delete, whose ARN is of exactly the form the first test's
+//! rows take — answered in the same words, so the release changes nothing about the wording.
 
 use serde_json::json;
 
@@ -52,32 +51,16 @@ fn replicator_arn(region: &str, name: &str, identifier: &str) -> String {
     format!("arn:aws:kafka:{region}:{ACCOUNT}:replicator/{name}/{identifier}")
 }
 
-/// Which of the two forms a reference earns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Worded {
-    /// The service's one fixed sentence: a replicator this endpoint holds none of.
-    AsAbsent,
-    /// The same sentence behind the `Invalid parameter <member>: ` framing: a replicator of
-    /// this endpoint's own that is gone.
-    AsTheParametersFault,
+/// The whole message every one of these refusals carries: the service's fixed sentence
+/// behind the `Invalid parameter <member>: ` framing the replicator family puts before it.
+fn expected_message() -> String {
+    format!("Invalid parameter {REPLICATOR_ARN_MEMBER}: {RESOURCE_NOT_FOUND}")
 }
 
-impl Worded {
-    /// The whole message a reply must carry.
-    fn message(self) -> String {
-        match self {
-            Self::AsAbsent => RESOURCE_NOT_FOUND.to_string(),
-            Self::AsTheParametersFault => {
-                format!("Invalid parameter {REPLICATOR_ARN_MEMBER}: {RESOURCE_NOT_FOUND}")
-            }
-        }
-    }
-}
-
-/// Assert `reply` is the 404 the rule calls for: the form `worded` names, the member at fault
+/// Assert `reply` is the 404 the rule calls for: that one message, the member at fault
 /// in `invalidParameter`, and nothing of the request — the ARN, the Region, the account — in
 /// the message.
-fn assert_not_found(reply: &Reply, case: &str, reference: &str, worded: Worded) {
+fn assert_not_found(reply: &Reply, case: &str, reference: &str) {
     assert_eq!(
         (reply.status, reply.error_code()),
         (404, "NotFoundException"),
@@ -87,9 +70,9 @@ fn assert_not_found(reply: &Reply, case: &str, reference: &str, worded: Worded) 
     );
     assert_eq!(
         reply.error_message(),
-        worded.message(),
+        expected_message(),
         "case {case}: expected {:?}, got {:?}",
-        worded.message(),
+        expected_message(),
         reply.error_message()
     );
     assert_eq!(
@@ -108,8 +91,8 @@ fn assert_not_found(reply: &Reply, case: &str, reference: &str, worded: Worded) 
 }
 
 /// Address `arn` through each replicator operation that resolves one on its own path, and
-/// assert every answer takes the form `worded` names.
-async fn assert_every_path(emulator: &Emulator, case: &str, arn: &str, worded: Worded) {
+/// assert every answer takes that one form.
+async fn assert_every_path(emulator: &Emulator, case: &str, arn: &str) {
     for (operation, method) in [("DescribeReplicator", "GET"), ("DeleteReplicator", "DELETE")] {
         let reply = emulator
             .call(
@@ -118,7 +101,7 @@ async fn assert_every_path(emulator: &Emulator, case: &str, arn: &str, worded: W
                 None,
             )
             .await;
-        assert_not_found(&reply, &format!("{operation}: {case}"), arn, worded);
+        assert_not_found(&reply, &format!("{operation}: {case}"), arn);
     }
 }
 
@@ -213,20 +196,20 @@ fn rows() -> Vec<Row> {
 }
 
 /// The rule: whatever a well-formed replicator ARN spells, a reference this endpoint resolves
-/// no replicator for is the service's one fixed sentence.
+/// no replicator for is the service's fixed sentence behind the parameter framing.
 #[tokio::test]
 async fn a_replicator_reference_that_resolves_to_nothing_is_one_fixed_sentence() {
     let emulator = Emulator::new();
     for row in rows() {
-        assert_every_path(&emulator, &row.case, &row.arn, Worded::AsAbsent).await;
+        assert_every_path(&emulator, &row.case, &row.arn).await;
     }
 }
 
-/// The boundary: a replicator this endpoint HELD and released is the one reference those APIs
-/// frame as the parameter's fault — an ARN of exactly the form the rows above carry, so the
-/// release is what tells the two forms apart.
+/// The other end of the generalisation: a replicator this endpoint HELD and released is
+/// answered in exactly those words too — an ARN of exactly the form the rows above carry, so
+/// neither the release nor the spelling changes the wording.
 #[tokio::test]
-async fn a_replicator_this_endpoint_released_is_the_parameters_fault() {
+async fn a_replicator_this_endpoint_released_is_worded_the_same_way() {
     let emulator = Emulator::new();
     let one = emulator
         .create_ok(&ClusterRequest::named("wording-source"))
@@ -289,7 +272,6 @@ async fn a_replicator_this_endpoint_released_is_the_parameters_fault() {
         &emulator,
         "a replicator this endpoint held and released",
         &held,
-        Worded::AsTheParametersFault,
     )
     .await;
 }

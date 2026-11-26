@@ -10,8 +10,8 @@
 //! The RULE asserted here: what EventBridge reports for a failed delivery is the
 //! answer the TARGET's service gave it — the sentence that service worded, inside
 //! the metadata block naming that service, the status and the error code it answered
-//! with — and the `ERROR_CODE` beside it is this service's classification of that
-//! code, so the two can never name different failures. Amazon SQS models no
+//! with — beside the `ERROR_CODE` that classifies WHY the delivery failed. Amazon SQS
+//! models no
 //! authorization failure on `SendMessage` at all
 //! (`smithy_query(query="operation", operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
@@ -21,8 +21,9 @@
 //! under the fixed sentence "The specified queue does not exist or you do not have
 //! access to it.", which names neither the principal, nor the action, nor the queue.
 //! A queue that is NOT THERE is answered under that same code with that service's
-//! OTHER sentence ("The specified queue does not exist."). So both are the RESOURCE
-//! class, and what tells them apart is the SENTENCE each carries.
+//! OTHER sentence ("The specified queue does not exist."). One code, two reasons: the
+//! withheld send is the PERMISSION class and the absent queue the RESOURCE class, and
+//! what tells the two answers apart is the SENTENCE each carries.
 //!
 //! The first table spans the class rather than the one case the defect was found on:
 //! its rows differ along the FORM the withholding takes (no document at all, a
@@ -48,7 +49,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -184,11 +185,21 @@ enum Answer {
 
 impl Answer {
     /// The sentence that service words for that answer, which is what tells the two
-    /// reasons apart — the code, and so the class beside it, being one for both.
+    /// reasons apart — the code being one for both.
     fn sentence(self) -> &'static str {
         match self {
             Self::Withheld => QUEUE_NOT_DISCLOSED_SENTENCE,
             Self::Absent => QUEUE_ABSENT_SENTENCE,
+        }
+    }
+
+    /// The class EventBridge dead-letters that delivery under: a send a document in
+    /// force over the queue withheld is the permission class, and a queue that is not
+    /// there the resource one.
+    fn class(self) -> &'static str {
+        match self {
+            Self::Withheld => NO_PERMISSIONS,
+            Self::Absent => NO_RESOURCE,
         }
     }
 }
@@ -318,9 +329,11 @@ async fn a_withheld_queue_delivery_reports_the_answer_that_service_gave() {
         let parked = one_dead_letter(&emulator, case, &dead_letter_url).await;
         let class = attribute(&parked, ERROR_CODE_ATTRIBUTE);
         assert_eq!(
-            class, NO_RESOURCE,
-            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, \
-             got {class:?} in {parked:?}"
+            class,
+            row.answer.class(),
+            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {:?}, \
+             got {class:?} in {parked:?}",
+            row.answer.class()
         );
         let reported = attribute(&parked, ERROR_MESSAGE_ATTRIBUTE);
         assert!(

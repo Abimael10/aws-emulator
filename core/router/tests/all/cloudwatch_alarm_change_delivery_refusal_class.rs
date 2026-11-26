@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! An alarm-configuration-change event that an Amazon SQS target will not take is dead-lettered
-//! under the class of the answer THAT SERVICE gave the send — end to end over the real
+//! under the class of WHY the delivery failed, with the answer THAT SERVICE gave beside it — end
+//! to end over the real
 //! `MultiServiceRouter` with CloudWatch, EventBridge, Amazon SQS and KMS on one engine, so the
 //! event is produced by the write a client makes and the outcome is read where a client reads it:
 //! off the message attributes of the dead letter on the target's `DeadLetterConfig` queue.
 //!
 //! The RULE asserted here: EventBridge assumes no role for a queue target — "for Lambda
 //! functions, Amazon SNS topics and Amazon SQS queues, EventBridge relies on resource-based
-//! policies" (`PutTargets`) — so the documents in force over the destination decide the send, and
-//! the dead letter's `ERROR_CODE` is EventBridge's OWN classification of the refusal that
-//! destination's service answered, with that whole answer beside it in `ERROR_MESSAGE`. Amazon SQS
+//! policies" (`PutTargets`) — so the documents in force over the destination decide the send, and a
+//! send they withheld is the PERMISSION class whatever code that destination's service words its
+//! refusal under, with that whole answer beside it in `ERROR_MESSAGE`. Amazon SQS
 //! models no authorization failure on `SendMessage` at all — its errors are `InvalidAddress`,
 //! `InvalidMessageContents`, `InvalidSecurity`, the `Kms*` family, `QueueDoesNotExist`,
 //! `RequestThrottled` and `UnsupportedOperation` (`smithy_query(query="operation",
@@ -19,10 +20,11 @@
 //! — because it does not disclose a queue it will not let the caller write to: every send the
 //! queue's own document withheld, however it withheld it, is answered `QueueDoesNotExist`, HTTP
 //! 400 under the `awsQueryError` code `AWS.SimpleQueueService.NonExistentQueue`
-//! (`smithy_query(query="shape", shape="QueueDoesNotExist", model_path="...")`), so such a
-//! delivery lands in the RESOURCE class. The one refusal of a send that service does answer as an
+//! (`smithy_query(query="shape", shape="QueueDoesNotExist", model_path="...")`). The one refusal
+//! of a send that service answers as an
 //! authorization failure is the key an encrypted queue's messages are encrypted under, which it
-//! relays under `KMS.AccessDeniedException`, and that one lands in the PERMISSION class.
+//! relays under `KMS.AccessDeniedException` — a second document withholding the same send, and so
+//! the same class.
 //!
 //! The producer is CloudWatch's own emission rather than a client's `PutEvents`: a write that
 //! replaces an alarm's configuration publishes one `aws.cloudwatch` / `CloudWatch Alarm
@@ -35,8 +37,8 @@
 //! withholds the send (no document at all, an explicit `Deny` scoped by `aws:SourceArn` to the
 //! delivering rule, a grant to another service principal, a grant scoped to another rule, a grant
 //! of another action) and WHICH service answers the refusal (the queue's own document, or the key
-//! the queue is encrypted under) — and the class each row expects is DERIVED from the error code
-//! inside its own `ERROR_MESSAGE` through one table, so a row whose class and answer disagreed
+//! the queue is encrypted under) — and each row states both the class it expects and the code the
+//! answer inside its own `ERROR_MESSAGE` must carry, so a row whose class and answer disagreed
 //! would fail whichever of the two was wrong.
 //!
 //! Every row also pins the two facts around that one: the SAME event reaches the healthy sibling
@@ -77,10 +79,8 @@ const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 
-/// The two delivery conditions a refused handover is classified into: the class of every answer a
-/// target's service gives under its NOT-FOUND code, and the class of an answer that refuses the
-/// identity the call was made as.
-const NO_RESOURCE: &str = "NO_RESOURCE";
+/// The class EventBridge reports for a delivery a document in force over the target withheld —
+/// stated here in the test rather than read from any implementation.
 const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The name Amazon SQS's own error metadata carries, and the answer it gives a sender no document
@@ -100,16 +100,16 @@ const QUEUE_NOT_DISCLOSED_SENTENCE: &str =
 const KEY_WITHHELD_CODE: &str = "KMS.AccessDeniedException";
 const DATA_KEY_ACTION: &str = "kms:GenerateDataKey";
 
-/// WHICH class each code a queue target's service answers belongs to, stated here in the test: the
-/// two answers above, plus the authorization codes a service that DOES refuse an identity answers
-/// — so a delivery reported under one of those where the row expects the resource class fails
-/// here.
-const CLASS_OF_CODE: [(&str, &str); 5] = [
-    (QUEUE_NOT_DISCLOSED_CODE, NO_RESOURCE),
-    ("QueueDoesNotExist", NO_RESOURCE),
-    (KEY_WITHHELD_CODE, NO_PERMISSIONS),
-    ("AccessDenied", NO_PERMISSIONS),
-    ("AccessDeniedException", NO_PERMISSIONS),
+/// WHICH codes a queue target's service answers a withheld send under, stated here in the test:
+/// the two answers above — the not-found code it gives a sender it has not authorized, because it
+/// does not disclose such a queue, and the authorization code it relays for the key an encrypted
+/// queue is encrypted under. Both are deliveries a document withheld, so both are the PERMISSION
+/// class whichever of the codes the answer carries; a code outside this list is a refusal no
+/// service of a queue delivery answers.
+const WITHHELD_SEND_CODES: [&str; 3] = [
+    QUEUE_NOT_DISCLOSED_CODE,
+    "QueueDoesNotExist",
+    KEY_WITHHELD_CODE,
 ];
 
 /// What opens and closes the metadata block an AWS error carries.
@@ -610,13 +610,10 @@ fn is_request_id(request_id: &str) -> bool {
     request_id.split('-').map(str::len).eq([8, 4, 4, 4, 12])
 }
 
-/// The class the code `code` belongs to, by this suite's own table — `None` for a code the table
-/// does not name, which is a refusal no target service of a queue delivery answers.
-fn class_of(code: &str) -> Option<&'static str> {
-    CLASS_OF_CODE
-        .iter()
-        .find(|(named, _)| *named == code)
-        .map(|(_, class)| *class)
+/// Whether `code` is one a queue target's service answers a send its documents withheld under,
+/// by this suite's own list — false for a code no service of a queue delivery answers.
+fn is_withheld_send_code(code: &str) -> bool {
+    WITHHELD_SEND_CODES.contains(&code)
 }
 
 /// The `Sum` of the AWS/Events counter `metric` for the rule `rule` of the default bus, over a
@@ -700,10 +697,10 @@ struct Row {
 }
 
 /// RULE: a configuration change CloudWatch publishes that a queue target will not take is
-/// dead-lettered under the class of the answer that target's own service gave the send — the
-/// resource class for every send the queue's own document withheld, because that service answers
-/// such a send under its not-found code without disclosing the queue, and the permission class
-/// only where a service really refused the identity — while the same event still reaches a healthy
+/// dead-lettered under the class of WHY the delivery failed — the permission class for every send
+/// a document in force over the queue withheld, whether that service answers it under its
+/// not-found code without disclosing the queue or relays the key's own authorization refusal —
+/// while the same event still reaches a healthy
 /// sibling rule's queue and the destination repaired afterwards takes the next change.
 #[tokio::test]
 async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_answer() {
@@ -721,7 +718,7 @@ async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_an
             },
             encrypted: false,
             answer: Answer::QueueNotDisclosed,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a document denying the send outright beside a grant of it",
@@ -733,14 +730,14 @@ async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_an
             },
             encrypted: false,
             answer: Answer::QueueNotDisclosed,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue carrying no document at all",
             policy: |_, _, _| None,
             encrypted: false,
             answer: Answer::QueueNotDisclosed,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a grant of the send to another service principal",
@@ -755,7 +752,7 @@ async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_an
             },
             encrypted: false,
             answer: Answer::QueueNotDisclosed,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a grant of the send scoped by aws:SourceArn to another rule",
@@ -770,7 +767,7 @@ async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_an
             },
             encrypted: false,
             answer: Answer::QueueNotDisclosed,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a grant of another action of the same service",
@@ -785,7 +782,7 @@ async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_an
             },
             encrypted: false,
             answer: Answer::QueueNotDisclosed,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue granting the send, encrypted under a key admitting nobody",
@@ -975,16 +972,15 @@ async fn an_alarm_change_a_queue_target_withholds_is_classed_by_that_services_an
             }
         }
         let class = attribute(letter, ERROR_CODE_ATTRIBUTE);
-        let derived = class_of(&answered.code).unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: no service of a queue delivery answers the code {:?}, read from \
-                 {message:?}",
-                answered.code
-            )
-        });
+        assert!(
+            is_withheld_send_code(&answered.code),
+            "case {case:?}: no service of a queue delivery answers the code {:?}, read from \
+             {message:?}",
+            answered.code
+        );
         assert_eq!(
-            (class.as_str(), derived),
-            (row.class, row.class),
+            class.as_str(),
+            row.class,
             "case {case:?}: expected the {ERROR_CODE_ATTRIBUTE} {:?} for the answer {message:?}",
             row.class
         );

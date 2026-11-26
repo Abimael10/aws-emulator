@@ -5,14 +5,15 @@
 //! from, which bus carried it, what the target's `RetryPolicy` allows, and whether a
 //! sibling target of the same rule was delivered.
 //!
-//! RULE: the dead letter's `ERROR_CODE` is EventBridge's own classification OF THE ANSWER
-//! the target's service gave the refused call — the answer the sibling `ERROR_MESSAGE`
-//! carries in full — so it is read off that answer's error code and from nothing else.
-//! Two consequences this suite pins:
+//! RULE: the dead letter's `ERROR_CODE` is EventBridge's own classification of WHY the
+//! delivery failed, and the sibling `ERROR_MESSAGE` carries the answer the target's service
+//! gave the refused call in full. Two consequences this suite pins:
 //!
-//! * the two attributes always name the SAME class, because one answer fills both; and
-//! * for a queue target whose documents withheld the `sqs:SendMessage`, that answer is
-//!   Amazon SQS's own not-found refusal: that service models no authorization failure on
+//! * a delivery the documents in force over the target withheld is the PERMISSION class
+//!   wherever the event came from; and
+//! * for a queue target whose documents withheld the `sqs:SendMessage`, the answer beside
+//!   that class is Amazon SQS's own not-found refusal: that service models no authorization
+//!   failure on
 //!   `SendMessage` at all (its errors are `InvalidAddress`, `InvalidMessageContents`,
 //!   `InvalidSecurity`, the `KMS.*` family, `QueueDoesNotExist`, `RequestThrottled` and
 //!   `UnsupportedOperation`, `smithy_query(query="operation", operation="SendMessage",
@@ -20,13 +21,12 @@
 //!   and does not disclose a queue it will not let the caller write to, so it answers
 //!   `QueueDoesNotExist` — HTTP 400 under the `awsQueryError` code
 //!   `AWS.SimpleQueueService.NonExistentQueue` (`smithy_query(query="shape",
-//!   shape="QueueDoesNotExist", model_path="…")`) — which is the RESOURCE class, whatever
-//!   the delivery that earned it was.
+//!   shape="QueueDoesNotExist", model_path="…")`) — so the code in the message is not what
+//!   the class is read from.
 //!
 //! The class is therefore NOT a reading of whether the queue is there: that the queue
 //! existed all along is something a client sees by repairing the policy and watching the
-//! next event arrive on the same queue url, which the second test here does, not something
-//! the dead-letter class tells it.
+//! next event arrive on the same queue url, which the second test here does.
 //!
 //! The rows differ along what the rule generalises over, and the recorded case that
 //! motivated this suite is one of them: the ORIGIN of the event (a CloudTrail-derived
@@ -109,10 +109,8 @@ const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 
-/// EventBridge's two classes for a delivery a target's service ANSWERED: the class of
-/// every answer given under that service's not-found code, and the class of one given
-/// under its authorization code.
-const NO_RESOURCE: &str = "NO_RESOURCE";
+/// EventBridge's class for a delivery a document in force over the target withheld, and the
+/// one for a target it could not address at all.
 const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The fixed sentence Amazon SQS answers a send the documents in force over the queue do
@@ -122,31 +120,27 @@ const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 const QUEUE_NOT_DISCLOSED_SENTENCE: &str =
     "The specified queue does not exist or you do not have access to it.";
 
-/// One answering service's refusal class, as the dead letter's two attributes carry it:
-/// the error code that answer quotes, the status beside it, and the class EventBridge puts
-/// such an answer in.
+/// One answering service's refusal, as the dead letter's `ERROR_MESSAGE` carries it: the
+/// error code that answer quotes and the status beside it.
 struct AnswerClass {
     code: &'static str,
     status: u16,
-    class: &'static str,
 }
 
-/// The two classes a refused delivery to a queue target can be reported under.
+/// The two answers a refused delivery to a queue target can read.
 ///
 /// `AWS.SimpleQueueService.NonExistentQueue` is `QueueDoesNotExist`'s `awsQueryError` code
 /// and `AccessDenied` the code an authorization refusal is answered under; a dead letter
-/// quoting one of them may only carry that one's class, which is what makes a pair naming
-/// two classes a failure of this suite rather than a detail it ignores.
+/// has to quote exactly one of them, which is what makes an answer naming two a failure of
+/// this suite rather than a detail it ignores.
 const ANSWER_CLASSES: [AnswerClass; 2] = [
     AnswerClass {
         code: "AWS.SimpleQueueService.NonExistentQueue",
         status: 400,
-        class: NO_RESOURCE,
     },
     AnswerClass {
         code: "AccessDenied",
         status: 403,
-        class: NO_PERMISSIONS,
     },
 ];
 
@@ -728,12 +722,13 @@ fn assert_is_the_event(case: &str, message: &Value, origin: Origin, token: &str)
     }
 }
 
-/// Assert the dead letter's two attributes name ONE class, and that it is the class of the
-/// answer Amazon SQS gives a send its queue's documents withheld.
+/// Assert the dead letter's two attributes name ONE failure: the class of a delivery a
+/// document in force over the target withheld, and the answer Amazon SQS gives such a send.
 ///
 /// The pair is read the way a consumer reads it: the error code quoted in `ERROR_MESSAGE`
-/// is looked up in [`ANSWER_CLASSES`], and `ERROR_CODE` has to be that entry's class. So a
-/// letter whose code and sentence belong to different classes fails here however plausible
+/// has to be one answer of [`ANSWER_CLASSES`], with the status that answer carries, and
+/// `ERROR_CODE` has to be the permission class. So a
+/// letter whose halves belong to different failures fails here however plausible
 /// each half is on its own.
 fn assert_withheld_class(case: &str, message: &Value) {
     let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
@@ -754,17 +749,11 @@ fn assert_withheld_class(case: &str, message: &Value) {
         answer.code
     );
     let class = attribute(message, ERROR_CODE_ATTRIBUTE);
+    // A send the queue's own documents withheld: the permission class, with that service's
+    // own fixed sentence beside it, which it answers under its not-found code.
     assert_eq!(
-        class, answer.class,
-        "case {case:?}: expected the {ERROR_CODE_ATTRIBUTE} {:?} the answer {reported:?} is \
-         classified as, got {class:?}",
-        answer.class
-    );
-    // And WHICH of the two it is, for a send the queue's own documents withheld: that
-    // service answers it under its own not-found code, carrying its fixed sentence.
-    assert_eq!(
-        class, NO_RESOURCE,
-        "case {case:?}: expected the class of Amazon SQS's own answer to a withheld send, got \
+        class, NO_PERMISSIONS,
+        "case {case:?}: expected the class of a send the queue's documents withheld, got \
          {class:?} with {reported:?}"
     );
     assert!(

@@ -26,7 +26,18 @@ use serde_json::{json, Value};
 
 use crate::farm_queue_job::{absent_id, error_code, string_at, Emulator};
 use crate::fleet::{create_fleet, get_fleet_path};
-use crate::status_conflict_wording::status_conflict_message;
+
+/// The whole sentence `DeleteQueueFleetAssociation` refuses an association that has not
+/// stopped with, spelled out here rather than imported, so the wording is pinned by the
+/// suite instead of by the code under test: the association's KIND, as the model spells the
+/// shape, and the status it is in, with neither the ids of the path nor the status the
+/// delete would be accepted in.
+///
+/// `pub(crate)` so the suite that spans this service's status-conflict class reads the one
+/// wording from here.
+pub(crate) fn not_deletable_message(status: &str) -> String {
+    format!("QueueFleetAssociation is in {status} status and cannot be deleted.")
+}
 
 /// Long enough for the `STOP_SCHEDULING_AND_* -> STOPPED` move to have come due: the
 /// service owes it a few seconds after the update that asks for the stop, and nothing in
@@ -180,11 +191,7 @@ async fn delete_queue_fleet_association_refuses_an_association_that_has_not_stop
             ),
             (
                 "ConflictException".to_string(),
-                status_conflict_message(
-                    case,
-                    &association_id(&farm_id, &queue_id, &fleet_id),
-                    &["STOPPED"],
-                ),
+                not_deletable_message(case),
                 "STATUS_CONFLICT".to_string(),
                 "queue-fleet-association".to_string(),
                 association_id(&farm_id, &queue_id, &fleet_id)

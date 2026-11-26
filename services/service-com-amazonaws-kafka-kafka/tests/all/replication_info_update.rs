@@ -39,9 +39,12 @@ const ABSENT_MESSAGE: &str =
     "The replication info specified with the kafka cluster aliases does not exist.";
 
 /// The message a replicator operation refuses an ARN it cannot resolve with: the
-/// service's one fixed not-found sentence (whose apostrophe is U+2019) and
-/// nothing else — the input member at fault travels in `invalidParameter`.
-const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
+/// service's one fixed not-found sentence (whose apostrophe is U+2019) behind the
+/// `Invalid parameter <member>: ` framing the replicator family puts before it,
+/// and nothing else — the input member at fault travels in `invalidParameter` as
+/// well.
+const NOT_FOUND_MESSAGE: &str =
+    "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
 
 /// Sleep past the emulator's own span into `RUNNING`, so a later read sees a
 /// settled replicator. `std::thread::sleep` because the workspace's tokio carries

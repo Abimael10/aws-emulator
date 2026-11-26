@@ -3170,19 +3170,19 @@ pub fn target_policy_decision(
 /// The condition EventBridge reports for a delivery whose target did not take the
 /// event because it could not be addressed: the target is not THERE.
 ///
-/// Distinct from [`NO_PERMISSIONS`], which is about the call a target that IS
-/// there refused under its own authorization code: this one is the class of every
-/// answer a target service gives under its NOT-FOUND code, whether that service
-/// answers it for a resource that is really gone or for one it declines to
-/// disclose to the caller. It is read off the answer the delivery got from that
-/// service's own API rather than from a verdict this service reaches about the
-/// target: Amazon SQS answers a `sqs:SendMessage` no document in force over the
-/// queue permits under that same not-found code
-/// ([`queue_access_refusal`]), so such a delivery is this class. The two
-/// conditions are this service's OWN classification of a failed delivery and
-/// never the target service's error code, which the dead letter reports in its
-/// `ERROR_MESSAGE` beside the condition: one answer fills both, so the class and
-/// the sentence beside it can never name two different failures.
+/// Distinct from [`NO_PERMISSIONS`], which is the class of a delivery withheld
+/// because the documents in force over the target do not authorize the call this
+/// service makes on it — whatever CODE the target's service answers that refusal
+/// under. Amazon SQS answers a `sqs:SendMessage` no document in force over the
+/// queue permits under its own not-found code, because it does not disclose a
+/// queue it will not let the caller write to ([`queue_access_refusal`]), and that
+/// delivery is still the permission class: the two conditions are this service's
+/// OWN classification of WHY the delivery failed, never the target service's error
+/// code, which the dead letter reports in its `ERROR_MESSAGE` beside the condition.
+/// So this class is the one for a target that is not there at all — an answer a
+/// target service gives under its not-found code for a resource this service held
+/// no verdict about: one answer fills the condition and the sentence beside it, so
+/// the two can never name two different failures.
 pub const NO_RESOURCE: &str = "NO_RESOURCE";
 
 /// The service name Amazon SQS's own error metadata carries. `pub(crate)`
@@ -3221,7 +3221,8 @@ const SQS_QUEUE_UNDISCLOSED_MESSAGE: &str =
 
 /// The answer a delivery READS from Amazon SQS when the documents in force over
 /// the queue target grant this service nothing: that service's not-found refusal,
-/// inside the metadata block an AWS error carries.
+/// inside the metadata block an AWS error carries, as the one sentence a dead
+/// letter reports for it.
 ///
 /// The queue's own policy is what governs the delivery
 /// ([`target_policy_decision`]) — the only document in force over a queue target
@@ -3232,14 +3233,16 @@ const SQS_QUEUE_UNDISCLOSED_MESSAGE: &str =
 /// [`SQS_QUEUE_UNDISCLOSED_MESSAGE`], which names neither the principal, nor the
 /// action, nor the queue.
 ///
-/// The CONDITION reported beside it is whatever this service's own classifier
-/// makes of that code (`crate::ops::put_events`), as it is for every other
-/// delivery, so the class a dead letter carries and the answer beside it cannot
-/// disagree: this code is the not-found class, so the delivery is
-/// [`NO_RESOURCE`], while [`NO_PERMISSIONS`] stays the class of the services that
-/// DO answer an authorization refusal — a topic's `AuthorizationError`, a
-/// function's and a log group's `AccessDeniedException`, the role a target names,
-/// and the key an encrypted queue's messages are encrypted under.
+/// The CONDITION reported beside it is the class of WHY the delivery failed, and
+/// this delivery failed because the documents in force over the target do not
+/// authorize the call: [`NO_PERMISSIONS`], the same class a topic's
+/// `AuthorizationError`, a function's and a log group's `AccessDeniedException`,
+/// the role a target names and the key an encrypted queue's messages are encrypted
+/// under all earn. The sentence beside it is the answer above, as the dead letter
+/// reports every answer a target's own service gave: the class says why the event
+/// was not delivered, the message says what the delivery was told, and neither is
+/// read off the other. [`NO_RESOURCE`] stays the class of a target that was not
+/// there at all.
 ///
 /// The request id is MINTED here and nowhere else: it identifies the one refused
 /// call, so it is drawn fresh rather than derived from the event or the target,
@@ -3249,21 +3252,18 @@ const SQS_QUEUE_UNDISCLOSED_MESSAGE: &str =
 /// around the sentence from the tree's one rendering of a caught service exception
 /// (`::service_common::relayed_refusal::caught_exception_message`), so this service
 /// reports neither in a form no other service reports.
-pub fn queue_access_refusal() -> (&'static str, String) {
+pub fn queue_access_refusal() -> String {
     let request_id = ::service_common::query_error_envelope::new_request_id();
-    (
-        SQS_QUEUE_UNDISCLOSED_CODE,
-        ::service_common::relayed_refusal::caught_exception_message(
-            "",
-            "",
-            SQS_QUEUE_UNDISCLOSED_MESSAGE,
-            ::service_common::relayed_refusal::CaughtCall {
-                service: SQS_SERVICE_NAME,
-                status: SQS_QUEUE_UNDISCLOSED_STATUS,
-                code: SQS_QUEUE_UNDISCLOSED_CODE,
-                request_id: &request_id,
-            },
-        ),
+    ::service_common::relayed_refusal::caught_exception_message(
+        "",
+        "",
+        SQS_QUEUE_UNDISCLOSED_MESSAGE,
+        ::service_common::relayed_refusal::CaughtCall {
+            service: SQS_SERVICE_NAME,
+            status: SQS_QUEUE_UNDISCLOSED_STATUS,
+            code: SQS_QUEUE_UNDISCLOSED_CODE,
+            request_id: &request_id,
+        },
     )
 }
 

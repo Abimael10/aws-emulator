@@ -8,11 +8,12 @@
 //! `CopyDBSnapshot` and `CopyDBClusterSnapshot` — take "the key ARN, key ID, alias ARN, or
 //! alias name for the KMS key" in `KmsKeyId` and model the one
 //! `KMSKeyNotAccessibleFault` (HTTP 400, `Error/Type` `Sender`) for a key that cannot
-//! encrypt the copy. The copy paths word that fault their OWN way: the sentence opens
-//! "Specified KMS key [", carries the `KmsKeyId` exactly as the request spelled it, and
-//! closes with the three reasons the single fault covers — unlike the creates, whose
-//! sentence opens "The specified KMS key [" (pinned by
-//! `encryption_key_accessibility.rs`).
+//! encrypt the copy. Each copy path words that fault its OWN way, and the opener is what
+//! tells them apart: `CopyDBSnapshot` states it about the key the copy is TARGETED at ("The
+//! target KMS key [") and `CopyDBClusterSnapshot` about the key the request SPECIFIED
+//! ("Specified KMS key ["), while the creates open "The specified KMS key [" (pinned by
+//! `encryption_key_accessibility.rs`). All three carry the `KmsKeyId` exactly as the request
+//! spelled it and close with the three reasons the single fault covers.
 //!
 //! Asserted over a TABLE crossing
 //!
@@ -55,11 +56,20 @@ const SOURCE_CLUSTER: &str = "emu-copy-key-source-cluster";
 /// The DB cluster snapshot every `CopyDBClusterSnapshot` row copies.
 const SOURCE_CLUSTER_SNAPSHOT: &str = "emu-copy-key-source-cluster-snap";
 
-/// The sentence a snapshot copy answers `KMSKeyNotAccessibleFault` with, spelled out here so
-/// the wording is pinned by the test rather than by the code under test.
-fn copy_key_not_accessible(key_id: &str) -> String {
+/// The sentence `CopyDBClusterSnapshot` answers `KMSKeyNotAccessibleFault` with, spelled out
+/// here so the wording is pinned by the test rather than by the code under test.
+fn specified_key_not_accessible(key_id: &str) -> String {
     format!(
         "Specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
+         permissions to access it."
+    )
+}
+
+/// The sentence `CopyDBSnapshot` answers the same fault with: the same three reasons behind
+/// its own opener, which states the fault about the key the copy is targeted at.
+fn target_key_not_accessible(key_id: &str) -> String {
+    format!(
+        "The target KMS key [{key_id}] does not exist, is not enabled or you do not have \
          permissions to access it."
     )
 }
@@ -158,6 +168,9 @@ struct CopyRow {
     /// The member the describe reports the copy's encryption under: a DB snapshot publishes
     /// `Encrypted`, a DB cluster snapshot `StorageEncrypted`.
     encrypted_member: &'static str,
+    /// The whole `KMSKeyNotAccessibleFault` sentence THIS copy words, around the `KmsKeyId`
+    /// the request carried.
+    sentence: fn(&str) -> String,
 }
 
 /// Both operations of this service that copy a snapshot under a caller-named key.
@@ -173,6 +186,7 @@ fn copy_rows() -> Vec<CopyRow> {
             identifier_member: "DBSnapshotIdentifier",
             not_found_code: "DBSnapshotNotFound",
             encrypted_member: "Encrypted",
+            sentence: target_key_not_accessible,
         },
         CopyRow {
             case: "CopyDBClusterSnapshot",
@@ -184,6 +198,7 @@ fn copy_rows() -> Vec<CopyRow> {
             identifier_member: "DBClusterSnapshotIdentifier",
             not_found_code: "DBClusterSnapshotNotFoundFault",
             encrypted_member: "StorageEncrypted",
+            sentence: specified_key_not_accessible,
         },
     ]
 }
@@ -259,7 +274,7 @@ async fn a_snapshot_copy_under_an_unusable_key_is_refused_with_the_copy_sentence
                     ],
                 )
                 .await,
-                &copy_key_not_accessible(&key_row.key_id),
+                &(row.sentence)(&key_row.key_id),
             );
 
             // The refusal is a decision about the request, answered before the copy is
@@ -303,7 +318,7 @@ async fn the_same_copy_succeeds_once_kms_re_enables_the_key() {
         expect_refusal(
             row.case,
             call(&fixture.router, row.action, &params).await,
-            &copy_key_not_accessible(&named),
+            &(row.sentence)(&named),
         );
 
         // The identical call, once the key performs cryptographic operations again.

@@ -24,8 +24,10 @@
 //!   disabled, named both by its key id and by its ARN.
 //!
 //! Each row's `<Message>` is asserted in full: a create is refused with the sentence that
-//! opens "The specified KMS key [", and a copy with the copy paths' own wording, which
-//! opens "Specified KMS key [".
+//! opens "The specified KMS key [", `CopyDBClusterSnapshot` with the one that opens
+//! "Specified KMS key [", and `CopyDBSnapshot` with the one that opens "The target KMS
+//! key [" — one wording per path, pinned here as well as by
+//! `copy_snapshot_kms_key_sentence.rs`.
 //!
 //! A control suite then pins the other side: under a key KMS holds ENABLED, not one of the
 //! same calls is refused with that fault, and an encrypted DB instance and an encrypted
@@ -74,8 +76,8 @@ fn key_not_accessible(key_id: &str) -> String {
     )
 }
 
-/// The sentence a snapshot COPY answers the same fault with: the copy paths' own wording,
-/// which drops the leading "The" the creates carry.
+/// The sentence `CopyDBClusterSnapshot` answers the same fault with: that copy path's own
+/// wording, which drops the leading "The" the creates carry.
 fn copy_key_not_accessible(key_id: &str) -> String {
     format!(
         "Specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
@@ -222,6 +224,15 @@ fn accessible_keys(fixture: &Fixture) -> Vec<KeyRow> {
     ]
 }
 
+/// The sentence `CopyDBSnapshot` answers it with: the same reasons behind that path's own
+/// opener, which states the fault about the key the copy is targeted at.
+fn target_key_not_accessible(key_id: &str) -> String {
+    format!(
+        "The target KMS key [{key_id}] does not exist, is not enabled or you do not have \
+         permissions to access it."
+    )
+}
+
 /// One operation of the table: what it is called, the member that names its encryption key,
 /// the resource the call would create, and the rest of its request.
 struct OperationRow {
@@ -230,9 +241,10 @@ struct OperationRow {
     /// `KmsKeyId` on the instance and snapshot paths, `KMSKeyId` on the custom engine
     /// version and the integration — the two spellings the model uses.
     key_member: &'static str,
-    /// Whether this operation is a snapshot COPY, which Amazon RDS answers the fault with
-    /// its own wording for, rather than a create.
-    copy: bool,
+    /// The whole sentence THIS operation words the fault with, around the key the request
+    /// named: one wording per path, since the two snapshot copies do not share theirs with
+    /// each other or with the creates.
+    sentence: fn(&str) -> String,
     /// The name the call would create its resource under, and the describe it would join:
     /// what the "nothing was created" assertion reads back.
     created: Created,
@@ -264,7 +276,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateDBInstance with storage encryption turned on",
             action: "CreateDBInstance",
             key_member: "KmsKeyId",
-            copy: false,
+            sentence: key_not_accessible,
             created: Created {
                 describe: "DescribeDBInstances",
                 member: "DBInstanceIdentifier",
@@ -282,7 +294,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateDBInstanceReadReplica of an encrypted replica",
             action: "CreateDBInstanceReadReplica",
             key_member: "KmsKeyId",
-            copy: false,
+            sentence: key_not_accessible,
             created: Created {
                 describe: "DescribeDBInstances",
                 member: "DBInstanceIdentifier",
@@ -297,7 +309,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CopyDBSnapshot under a key of the caller's",
             action: "CopyDBSnapshot",
             key_member: "KmsKeyId",
-            copy: true,
+            sentence: target_key_not_accessible,
             created: Created {
                 describe: "DescribeDBSnapshots",
                 member: "DBSnapshotIdentifier",
@@ -312,7 +324,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CopyDBClusterSnapshot under a key of the caller's",
             action: "CopyDBClusterSnapshot",
             key_member: "KmsKeyId",
-            copy: true,
+            sentence: copy_key_not_accessible,
             created: Created {
                 describe: "DescribeDBClusterSnapshots",
                 member: "DBClusterSnapshotIdentifier",
@@ -333,7 +345,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateCustomDBEngineVersion, whose media the key encrypts",
             action: "CreateCustomDBEngineVersion",
             key_member: "KMSKeyId",
-            copy: false,
+            sentence: key_not_accessible,
             created: Created {
                 describe: "DescribeDBEngineVersions",
                 member: "EngineVersion",
@@ -348,7 +360,7 @@ fn operation_rows(tag: &str) -> Vec<OperationRow> {
             case: "CreateIntegration, whose data the key encrypts",
             action: "CreateIntegration",
             key_member: "KMSKeyId",
-            copy: false,
+            sentence: key_not_accessible,
             created: Created {
                 describe: "DescribeIntegrations",
                 member: "IntegrationName",
@@ -383,11 +395,7 @@ async fn a_kms_key_that_cannot_encrypt_refuses_every_create_that_names_it() {
             let case = format!("{} with {}", row.case, key_row.case);
             let mut params = row.params.clone();
             params.push((row.key_member, key_row.key_id.clone()));
-            let expected = if row.copy {
-                copy_key_not_accessible(&key_row.key_id)
-            } else {
-                key_not_accessible(&key_row.key_id)
-            };
+            let expected = (row.sentence)(&key_row.key_id);
             expect_refusal(
                 &case,
                 call(&fixture.router, row.action, &params).await,

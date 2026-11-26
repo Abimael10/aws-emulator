@@ -7,13 +7,14 @@
 //! Amazon Web Services resource received during a time range that you choose", and
 //! two rules are asserted here:
 //!
-//! 1. A `TimeWindow` WAF can serve is one whose ends are both strictly after the
-//!    sampling horizon's start, three hours before the call: "you can specify any time
-//!    range in the previous three hours". The reported `TimeWindow` is the requested
-//!    range, carried no further forward than the call instant ("GetSampledRequests
-//!    returns a time range, which is usually the time range that you specified"), and a
-//!    window reaching back past the horizon is refused with the one sentence WAF states
-//!    that bound in (recorded behaviour).
+//! 1. A `TimeWindow` is the range the caller asks about, NARROWED to the range WAF can
+//!    serve: "you can specify any time range in the previous three hours", and "if you
+//!    specify a start time that's earlier than three hours ago, WAF sets it to three
+//!    hours ago". The reported `TimeWindow` is therefore the requested range with its
+//!    start raised to the horizon's start and its end carried no further forward than
+//!    the call instant ("GetSampledRequests returns a time range, which is usually the
+//!    time range that you specified") — a window outside the horizon is narrowed, never
+//!    refused.
 //! 2. The sample, and the `PopulationSize` it was drawn from, report the requests
 //!    this service inspected for the named rule dimension inside that window. This
 //!    emulator serves WAF's control plane only — no web request is routed through a
@@ -41,12 +42,6 @@ use crate::web_acl_lifecycle::{
 /// `GetSampledRequests$TimeWindow`). Written out here rather than imported, so the
 /// table does not restate the code under test.
 const SAMPLING_HORIZON_SECS: f64 = 3.0 * 60.0 * 60.0;
-
-/// The sentence WAF states that bound in, as recorded. Spelled out here independently
-/// of the service's own constant, so this suite pins the wording and not merely its
-/// reuse.
-const WINDOW_OUTSIDE_HORIZON: &str =
-    "Start time and end time must be strictly after current time - 3 hours";
 
 /// The region a CLOUDFRONT-scoped resource's ARN carries whatever the caller signed
 /// for: "API and SDKs - For all calls, use the Region endpoint us-east-1" (`Scope`'s
@@ -136,22 +131,23 @@ enum Reported {
     /// The end is later than the call instant, so it comes back as the call instant;
     /// the start comes back as requested.
     EndAtCallInstant,
-    /// An end of the requested range is not strictly after the horizon's start, so WAF
-    /// refuses the call: it holds no sample of that range.
-    Refused,
+    /// The start reaches back past the horizon's start, so it comes back AT that
+    /// instant; the end comes back as requested where it lies inside the horizon, and
+    /// at that same instant where it is before it too, because the pair is a range.
+    StartAtHorizon,
 }
 
 /// A window inside the three-hour sampling horizon is reported as the range WAF
-/// sampled over, and a window reaching back past it is refused.
+/// sampled over, and one reaching back past it is narrowed to that horizon.
 ///
 /// One row per way a requested range can fall relative to that horizon — wholly
 /// inside, a minute inside its start, zero-length, a minute / an hour / a week before
 /// it, wholly before it, and ending after the call instant — run in both scopes. A row
 /// inside the horizon must come back exactly as requested, except for an end after the
-/// call instant, which comes back at it; a row crossing the horizon's start must be
-/// refused with the one sentence WAF states that bound in.
+/// call instant, which comes back at it; a row crossing the horizon's start must come
+/// back starting at it.
 #[tokio::test]
-async fn a_window_inside_the_horizon_is_reported_and_one_before_it_is_refused() {
+async fn a_window_inside_the_horizon_is_reported_and_one_before_it_is_narrowed() {
     let rows: &[(&str, f64, f64, Reported)] = &[
         (
             "wholly inside the horizon",
@@ -179,25 +175,25 @@ async fn a_window_inside_the_horizon_is_reported_and_one_before_it_is_refused() 
             "a minute before the horizon's start",
             -(SAMPLING_HORIZON_SECS + 60.0),
             -60.0,
-            Reported::Refused,
+            Reported::StartAtHorizon,
         ),
         (
             "an hour before the horizon's start",
             -(SAMPLING_HORIZON_SECS + 3600.0),
             -600.0,
-            Reported::Refused,
+            Reported::StartAtHorizon,
         ),
         (
             "a week before the horizon's start",
             -(7.0 * 86_400.0),
             -1.0,
-            Reported::Refused,
+            Reported::StartAtHorizon,
         ),
         (
             "wholly before the horizon",
             -(SAMPLING_HORIZON_SECS + 7200.0),
             -(SAMPLING_HORIZON_SECS + 3600.0),
-            Reported::Refused,
+            Reported::StartAtHorizon,
         ),
         (
             "ending ten minutes after the call",
@@ -233,23 +229,6 @@ async fn a_window_inside_the_horizon_is_reported_and_one_before_it_is_refused() 
             let base = now_secs();
             let request =
                 sampled_request(scope, arn, "sampled-rule", base, *start_offset, *end_offset, 500);
-            if matches!(reported, Reported::Refused) {
-                let body = waf
-                    .refused(
-                        "GetSampledRequests",
-                        request,
-                        "WAFInvalidParameterException",
-                        &case,
-                    )
-                    .await;
-                assert_eq!(
-                    body["message"].as_str(),
-                    Some(WINDOW_OUTSIDE_HORIZON),
-                    "case {case:?}: expected the sentence WAF states the horizon in, \
-                     got {body}"
-                );
-                continue;
-            }
             let body = waf.ok("GetSampledRequests", request).await;
             let start = window_end(&body, "StartTime");
             let end = window_end(&body, "EndTime");
@@ -296,8 +275,20 @@ async fn a_window_inside_the_horizon_is_reported_and_one_before_it_is_refused() 
                          reported at it, got {end}"
                     );
                 }
-                // Answered above.
-                Reported::Refused => unreachable!("a refused row is asserted above"),
+                // The narrowed range: the start at the horizon, and the end as
+                // requested where that lies inside it.
+                Reported::StartAtHorizon => {
+                    assert!(
+                        (start - horizon_start).abs() <= CLOCK_SLACK_SECS,
+                        "case {case:?}: a start before the horizon must be reported at it \
+                         ({horizon_start}), got {start}"
+                    );
+                    let expected_end = requested_end.max(start);
+                    assert!(
+                        (end - expected_end).abs() <= CLOCK_SLACK_SECS,
+                        "case {case:?}: expected the end at {expected_end}, got {end}"
+                    );
+                }
             }
 
             assert_empty_sample(&body, &case);

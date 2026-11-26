@@ -1304,9 +1304,8 @@ impl ComAmazonawsKafkaKafkaState {
     }
 
     /// Remove the replicator `arn` names from every index, handing it back. The
-    /// one removal path, for the same reason — and the one place a release is
-    /// remembered ([`Self::replicator_was_held`]), so a reference to a replicator
-    /// this registry knew and let go is never answered as one it never minted.
+    /// one removal path, so no index can keep pointing at a record the registry
+    /// no longer holds.
     pub fn unregister_replicator(&mut self, arn: &str) -> Option<Replicator> {
         let replicator = self.replicators.remove(arn)?;
         self.replicator_arn_by_name
@@ -1319,22 +1318,7 @@ impl ComAmazonawsKafkaKafkaState {
                 }
             }
         }
-        self.released_replicators.remember(&replicator.region, arn);
         Some(replicator)
-    }
-
-    /// Whether this registry once held the replicator `arn` names in `region` and
-    /// holds it no longer.
-    ///
-    /// A replicator operation that cannot resolve its ARN asks this to tell the
-    /// two absences apart, the way the channel surface does
-    /// ([`Self::channel_was_held`]): a replicator this region held and released
-    /// is a resource of the service's own that is gone, while an ARN of this
-    /// registry it never minted is a reference the caller may yet create, and the
-    /// replicator APIs word the two differently. The record it reads is bounded
-    /// and Region-scoped by [`replicator_releases::ReleasedReplicators`].
-    pub fn replicator_was_held(&self, region: &str, arn: &str) -> bool {
-        self.released_replicators.was_held(region, arn)
     }
 
     /// Every topic the cluster `cluster_arn` names reports to a reader at `now`:

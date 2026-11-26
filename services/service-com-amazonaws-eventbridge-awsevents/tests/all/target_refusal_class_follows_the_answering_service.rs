@@ -8,11 +8,10 @@
 //! letter the target's `DeadLetterConfig` queue received.
 //!
 //! The RULE asserted here: "for Lambda functions, Amazon SNS topics and Amazon SQS
-//! queues, EventBridge relies on resource-based policies" (`PutTargets`), and the
-//! dead letter's `ERROR_CODE` is EventBridge's classification of the ANSWER that
-//! target's service gave the withheld call — so the class follows the refusal the
-//! service really answers, and is NOT one verdict this service reaches for every
-//! failed delivery:
+//! queues, EventBridge relies on resource-based policies" (`PutTargets`), and a delivery
+//! those documents withheld is dead-lettered under the PERMISSION class whatever code
+//! the target's own service words its refusal under — while the ANSWER beside the class
+//! is that service's own, and the two services do not word it the same way:
 //!
 //! * Amazon SQS models no authorization failure on `SendMessage` at all
 //!   (`smithy_query(query="operation", operation="SendMessage",
@@ -21,21 +20,22 @@
 //!   queue's own document does not permit is answered `QueueDoesNotExist` (HTTP 400,
 //!   `awsQueryError` code `AWS.SimpleQueueService.NonExistentQueue`) — the same code
 //!   that service answers for a queue that is not THERE, under its own sentence for
-//!   each of the two — so both land in the RESOURCE class;
+//!   each of the two. The sentence is what tells them apart: the withheld send is the
+//!   PERMISSION class, and the queue that is not there the RESOURCE class;
 //! * Amazon SNS answers a publish its topic's policy does not permit with
 //!   `AuthorizationErrorException` (HTTP 403, `awsQueryError` code
 //!   `AuthorizationError`,
 //!   `smithy_query(query="shape", shape="AuthorizationErrorException",
 //!   model_path="services/service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/com-amazonaws-sns-amazonsimplenotificationservice.json")`)
-//!   — an authorization refusal, so a topic whose policy withheld the publish is the
-//!   PERMISSION class too.
+//!   — an authorization refusal, and the same PERMISSION class.
 //!
 //! The table's rows therefore differ along the target's SERVICE, along the FORM the
 //! withholding takes (no document at all, an explicit `Deny` beside a grant, the
 //! document that service generates for the resource's owner) and along whether the
 //! target is there at all, each row stating both the class and what the message must
-//! name of that service's answer — so a class read off anything but the answer, or one
-//! collapsed for every failed delivery, fails here. A control row whose queue DOES grant the
+//! name of that service's answer — so a class collapsed for every failed delivery, or one
+//! that cannot tell a withheld delivery from an absent target, fails here. A control row
+//! whose queue DOES grant the
 //! send receives the event and parks no dead letter, so no row passes because nothing
 //! was delivered anywhere.
 //!
@@ -206,20 +206,20 @@ async fn given_target(
     }
 }
 
-/// The class a withheld delivery is dead-lettered under is the class of the code the
-/// TARGET's service answered with, which is not the same class for every service.
+/// The class a withheld delivery is dead-lettered under is the PERMISSION one whatever
+/// code the TARGET's service answered with, and an absent target is the RESOURCE class.
 #[tokio::test]
-async fn a_withheld_deliverys_class_is_the_class_of_the_answering_services_code() {
+async fn a_withheld_deliverys_class_is_the_permission_one_whatever_the_service_answered() {
     let rows = [
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            expected: Some((QUEUE_NOT_DISCLOSED_SENTENCE, NO_RESOURCE)),
+            expected: Some((QUEUE_NOT_DISCLOSED_SENTENCE, NO_PERMISSIONS)),
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(queue_denying)),
-            expected: Some((QUEUE_NOT_DISCLOSED_SENTENCE, NO_RESOURCE)),
+            expected: Some((QUEUE_NOT_DISCLOSED_SENTENCE, NO_PERMISSIONS)),
         },
         Row {
             case: "a queue ARN no queue was created for",

@@ -75,10 +75,11 @@ const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 
-/// The class a dead letter carries when the refusal was Amazon SQS's own: that service
-/// discloses neither a queue whose document withholds the send nor one that is not there, so
-/// both refusals come back under its not-found code and both are the RESOURCE class. Stated
+/// The classes a dead letter carries for the two ways a queue target refuses a delivery: a
+/// send a document in force over the queue withheld is the permission class, and a queue that
+/// is not there at all the resource one. Stated
 /// here rather than imported for the same reason the source and detail-type above are.
+const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 const NO_RESOURCE: &str = "NO_RESOURCE";
 
 /// The EC2 API version an ec2Query body carries.
@@ -489,11 +490,19 @@ impl Wiring {
                     "case {case:?}: the dead letter names the rule {}, got {letter}",
                     self.rule_arn
                 );
+                // The class states WHY this target's delivery failed: the queue that granted
+                // this service nothing withheld the send, while the ARN no queue was created
+                // for could not be addressed at all.
+                let expected_class = if target_arn.ends_with("ec2-state-never-created") {
+                    NO_RESOURCE
+                } else {
+                    NO_PERMISSIONS
+                };
                 assert_eq!(
                     attribute(letter, ERROR_CODE_ATTRIBUTE),
-                    NO_RESOURCE,
-                    "case {case:?}: a send Amazon SQS would not take is the {NO_RESOURCE} \
-                     class, got {letter}"
+                    expected_class,
+                    "case {case:?}: expected the dead letter for {target_arn} to carry the \
+                     {expected_class} class, got {letter}"
                 );
                 assert!(
                     !attribute(letter, ERROR_MESSAGE_ATTRIBUTE).is_empty(),

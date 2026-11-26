@@ -278,8 +278,8 @@ async fn a_sample_reports_the_requests_the_web_acl_evaluated_for_that_dimension(
     }
 
     // The reported window never leaves the sampling horizon: an end after the call
-    // instant becomes the call instant, and a window reaching back further than the
-    // horizon is refused rather than sampled over a range WAF never held.
+    // instant becomes the call instant, and a start reaching back further than the
+    // horizon becomes the horizon's own start rather than a range WAF never held.
     let clamped = sampled(&waf, &arn, "deny-orders", now - 1_800, now + 86_400, 50).await;
     let window = &clamped["TimeWindow"];
     let start = window["StartTime"].as_f64().unwrap_or_default() as i64;
@@ -290,34 +290,16 @@ async fn a_sample_reports_the_requests_the_web_acl_evaluated_for_that_dimension(
          [{}, {now}], got [{start}, {end}]",
         now - 1_800
     );
-    let (status, refused) = waf
-        .call(
-            "GetSampledRequests",
-            json!({
-                "WebAclArn": &arn,
-                "RuleMetricName": "deny-orders",
-                "Scope": "REGIONAL",
-                "MaxItems": 50,
-                "TimeWindow": { "StartTime": now - 86_400, "EndTime": now + 86_400 },
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 400,
-        "case a window wider than the sampling horizon: expected the window refusal, \
-         got status {status} and body {refused}"
-    );
-    assert_eq!(
-        refused["__type"].as_str().map(|code| code.ends_with("WAFInvalidParameterException")),
-        Some(true),
-        "case a window wider than the sampling horizon: expected the modelled parameter \
-         refusal, got {refused}"
-    );
-    assert_eq!(
-        refused["message"].as_str(),
-        Some("Start time and end time must be strictly after current time - 3 hours"),
-        "case a window wider than the sampling horizon: expected the sentence WAF states \
-         that bound in, got {refused}"
+    let widest = sampled(&waf, &arn, "deny-orders", now - 86_400, now + 86_400, 50).await;
+    let window = &widest["TimeWindow"];
+    let start = window["StartTime"].as_f64().unwrap_or_default() as i64;
+    let end = window["EndTime"].as_f64().unwrap_or_default() as i64;
+    // Three hours is the horizon the operation documents samples are retained for.
+    let horizon_start = now - 3 * 60 * 60;
+    assert!(
+        (start - horizon_start).abs() <= 60 && end <= now + 5,
+        "case a window wider than the sampling horizon: expected it narrowed into \
+         [{horizon_start}, {now}], got [{start}, {end}]"
     );
 }
 

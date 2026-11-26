@@ -17,9 +17,9 @@
 //! (`smithy_query(query="operation",
 //! operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
-//! — and EventBridge classifies that answer, so the class is the resource one
-//! (`NO_RESOURCE`) and the sentence beside it is that service's own fixed text, which
-//! states the absence and the want of access without saying which holds. Such an
+//! — and EventBridge reports it beside the class of WHY the delivery failed, the
+//! permission one (`NO_PERMISSIONS`), the answer's own fixed text stating the absence
+//! and the want of access without saying which holds. Such an
 //! answer is the
 //! same however often it is asked for, so nothing retries the handover: ONE attempt
 //! is counted, ONE dead letter is parked, and the letter accounts for no retry
@@ -50,7 +50,7 @@ use service_com_amazonaws_eventbridge_awsevents::state::retry_bounds::{
 };
 use service_com_amazonaws_eventbridge_awsevents::state::{
     rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_SENT_TO_DLQ_METRIC,
-    INVOCATION_ATTEMPTS_METRIC, NO_RESOURCE, SERVICE_PRINCIPAL,
+    INVOCATION_ATTEMPTS_METRIC, NO_PERMISSIONS, SERVICE_PRINCIPAL,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
 };
 
@@ -293,12 +293,12 @@ async fn a_withheld_queue_delivery_is_attempted_once_under_every_retry_policy() 
             "case {case:?}: expected exactly one dead letter, got {parked:?}"
         );
         let message = &parked[0];
-        // The class is the one the ANSWER belongs to: that service answered under its
-        // own not-found code, which is the resource class.
+        // The class is the one the delivery failed FOR: a document in force over the
+        // queue withheld the send, which is the permission class.
         let class = attribute(message, ERROR_CODE_ATTRIBUTE);
         assert_eq!(
-            class, NO_RESOURCE,
-            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, \
+            class, NO_PERMISSIONS,
+            "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, \
              got {class:?} in {message:?}"
         );
         // The sentence beside it is that service's own answer, in full: its fixed text

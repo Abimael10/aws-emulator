@@ -1946,20 +1946,36 @@ fn status_does_not_permit(
 /// An association that is not [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`] is still holding
 /// the queue's work on the fleet — scheduling it (`ACTIVE`) or draining it (the two
 /// `STOP_SCHEDULING_AND_*` statuses) — so the association itself is the resource in
-/// conflict and that one status is the whole of the valid-status list this refusal states.
-/// See [`status_does_not_permit`] for the class.
+/// conflict, reported in `resourceId`/`resourceType` and under the `STATUS_CONFLICT`
+/// reason like every other conflict of a status.
+///
+/// Recorded behavior: this operation does NOT word the refusal the way
+/// [`status_does_not_permit`] words the class. It states the association's KIND, spelled as
+/// the model spells the shape, and the status it is in — "QueueFleetAssociation is in
+/// <status> status and cannot be deleted." — naming neither the three ids of the path nor
+/// the statuses the delete would be accepted in. The one variable part is the status, read
+/// from the stored association and never from the request.
 pub fn queue_fleet_association_not_deletable(
     farm_id: &str,
     queue_id: &str,
     fleet_id: &str,
     status: &str,
 ) -> crate::ops::types::ConflictException {
-    status_does_not_permit(
-        RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION,
-        &queue_fleet_association_id(farm_id, queue_id, fleet_id),
-        status,
-        &[QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED],
-    )
+    crate::ops::types::ConflictException {
+        message: queue_fleet_association_not_deletable_message(status),
+        reason: "STATUS_CONFLICT".to_string(),
+        resource_id: queue_fleet_association_id(farm_id, queue_id, fleet_id),
+        resource_type: RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION.to_string(),
+        context: None,
+    }
+}
+
+/// The sentence [`queue_fleet_association_not_deletable`] carries, with the status the
+/// stored association is in as its one variable part.
+///
+/// Private: the refusal constructor above owns this wording, and nothing else words it.
+fn queue_fleet_association_not_deletable_message(status: &str) -> String {
+    format!("QueueFleetAssociation is in {status} status and cannot be deleted.")
 }
 
 /// The 409 this service answers when a queue-limit association is deleted before it has

@@ -18,9 +18,14 @@
 //! the same text and the same id it sees against AWS.
 //!
 //! The rows below span the class rather than the one operation a divergence was observed on:
-//! every modelled worker status a delete is refused in, and the two composite associations
-//! whose own status refuses their delete, so both the per-operation valid-status list and the
-//! per-resource id are asserted. The last test closes the loop the message opens — every
+//! every modelled worker status a delete is refused in, and the queue-limit association
+//! whose own status refuses its delete, so both the per-operation valid-status list and the
+//! per-resource id are asserted. The queue-FLEET association is the boundary: its delete is
+//! refused in the same `STATUS_CONFLICT` class, with the same `resourceId`/`resourceType`,
+//! but AWS words that one refusal its own way
+//! (`queue_fleet_association::not_deletable_message`, spanned by
+//! `tests/all/queue_fleet_association.rs`), so it is asserted here NOT to carry this class's
+//! sentence. The last test closes the loop the message opens — every
 //! status the sentence lists as valid is a status the delete really accepts — so the list
 //! cannot drift into advertising a status the service would then refuse.
 //!
@@ -155,15 +160,9 @@ async fn an_association_delete_refusal_is_worded_the_same_way() {
     let emulator = Emulator::new();
     let farm_id = emulator.farm("associations").await;
 
-    // The rows are the two composite resources whose own status refuses their delete: both
-    // are named by the three ids of their path rather than by an id of their own, and both
-    // carry their own one-status valid list, so the same sentence is asserted across two
-    // operations and two resource types.
-    let fleet_queue_id = emulator.queue(&farm_id, "scheduling queue").await;
-    let fleet_id = create_fleet(&emulator, &farm_id, "the fleet").await;
-    crate::queue_fleet_association::associate(&emulator, &farm_id, &fleet_queue_id, &fleet_id)
-        .await;
-
+    // The queue-limit association is the composite resource this class covers: it is named
+    // by the three ids of its path rather than by an id of its own, and carries its own
+    // one-status valid list.
     let limit_queue_id = emulator.queue(&farm_id, "limited queue").await;
     let limit_id = create_limit(
         &emulator,
@@ -174,52 +173,76 @@ async fn an_association_delete_refusal_is_worded_the_same_way() {
     crate::queue_limit_association::associate_ok(&emulator, &farm_id, &limit_queue_id, &limit_id)
         .await;
 
-    let cases: Vec<(&str, String, String, &str)> = vec![
-        (
-            "a queue-fleet association still scheduling the queue's work",
-            crate::queue_fleet_association::association_path(
-                &farm_id,
-                &fleet_queue_id,
-                &fleet_id,
-            ),
-            crate::queue_fleet_association::association_id(&farm_id, &fleet_queue_id, &fleet_id),
-            "queue-fleet-association",
-        ),
-        (
-            "a queue-limit association still subjecting the queue's work to the limit",
-            crate::queue_limit_association::association_path(
-                &farm_id,
-                &limit_queue_id,
-                &limit_id,
-            ),
-            crate::queue_limit_association::association_id(&farm_id, &limit_queue_id, &limit_id),
-            "queue-limit-association",
-        ),
-    ];
+    let case = "a queue-limit association still subjecting the queue's work to the limit";
+    let path = crate::queue_limit_association::association_path(&farm_id, &limit_queue_id, &limit_id);
+    let resource_id =
+        crate::queue_limit_association::association_id(&farm_id, &limit_queue_id, &limit_id);
 
-    for (case, path, resource_id, resource_type) in cases {
-        let (status, body) = emulator.call("DELETE", &path, None, None).await;
-        assert_eq!(
-            (
-                status,
-                error_code(&body),
-                string_at(&body, "message"),
-                string_at(&body, "reason"),
-                string_at(&body, "resourceType"),
-                string_at(&body, "resourceId"),
-            ),
-            (
-                409,
-                "ConflictException".to_string(),
-                status_conflict_message("ACTIVE", &resource_id, ASSOCIATION_VALID_STATUSES),
-                "STATUS_CONFLICT".to_string(),
-                resource_type.to_string(),
-                resource_id.clone(),
-            ),
-            "case {case:?}: expected the refusal to state the association's status, its id \
-             and the statuses the delete is valid in, got {status} with {body}"
-        );
-    }
+    let (status, body) = emulator.call("DELETE", &path, None, None).await;
+    assert_eq!(
+        (
+            status,
+            error_code(&body),
+            string_at(&body, "message"),
+            string_at(&body, "reason"),
+            string_at(&body, "resourceType"),
+            string_at(&body, "resourceId"),
+        ),
+        (
+            409,
+            "ConflictException".to_string(),
+            status_conflict_message("ACTIVE", &resource_id, ASSOCIATION_VALID_STATUSES),
+            "STATUS_CONFLICT".to_string(),
+            "queue-limit-association".to_string(),
+            resource_id.clone(),
+        ),
+        "case {case:?}: expected the refusal to state the association's status, its id \
+         and the statuses the delete is valid in, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_queue_fleet_association_refusal_is_the_same_class_in_its_own_words() {
+    let emulator = Emulator::new();
+    let farm_id = emulator.farm("associations").await;
+
+    // The boundary of the class: the same 409, the same `STATUS_CONFLICT` reason and the
+    // same resource naming, but the sentence AWS words for THIS refusal — which states the
+    // association's kind and the status it is in, and neither the ids of the path nor the
+    // statuses the delete would be accepted in.
+    let queue_id = emulator.queue(&farm_id, "scheduling queue").await;
+    let fleet_id = create_fleet(&emulator, &farm_id, "the fleet").await;
+    crate::queue_fleet_association::associate(&emulator, &farm_id, &queue_id, &fleet_id).await;
+
+    let path = crate::queue_fleet_association::association_path(&farm_id, &queue_id, &fleet_id);
+    let resource_id =
+        crate::queue_fleet_association::association_id(&farm_id, &queue_id, &fleet_id);
+
+    let (status, body) = emulator.call("DELETE", &path, None, None).await;
+    assert_eq!(
+        (
+            status,
+            error_code(&body),
+            string_at(&body, "message"),
+            string_at(&body, "reason"),
+            string_at(&body, "resourceType"),
+            string_at(&body, "resourceId"),
+        ),
+        (
+            409,
+            "ConflictException".to_string(),
+            crate::queue_fleet_association::not_deletable_message("ACTIVE"),
+            "STATUS_CONFLICT".to_string(),
+            "queue-fleet-association".to_string(),
+            resource_id.clone(),
+        ),
+        "expected the queue-fleet association's own refusal wording, got {status} with {body}"
+    );
+    assert_ne!(
+        string_at(&body, "message"),
+        status_conflict_message("ACTIVE", &resource_id, ASSOCIATION_VALID_STATUSES),
+        "expected this operation NOT to word its refusal the way the class words it, got {body}"
+    );
 }
 
 #[tokio::test]

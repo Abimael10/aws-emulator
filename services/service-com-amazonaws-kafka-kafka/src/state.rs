@@ -244,9 +244,6 @@ pub use arn_vocabulary::*;
 /// version rather than of anything this module holds, so it sits beside this one.
 mod cluster_policy;
 pub use cluster_policy::*;
-/// The bounded record of the replicators this registry held and released, which
-/// is what tells a replicator that is GONE from one that never existed.
-pub mod replicator_releases;
 pub use kafka_versions::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -998,53 +995,27 @@ pub fn resource_not_found(member: &str) -> crate::ops::types::NotFoundException 
 }
 
 /// The same refusal for a REPLICATOR reference, which the replicator APIs word
-/// by what this endpoint ONCE HELD under the ARN.
+/// as a fault of the PARAMETER that carries it.
 ///
-/// `at_fault` says whether the ARN names a replicator this Region held and
-/// released ([`replicator_reference_at_fault`]): a resource of the service's own
-/// that is gone, which those APIs report as a fault of the parameter that still
-/// names it — the `Invalid parameter <member>` framing, before the same fixed
-/// sentence. Every OTHER reference the lookup cannot resolve is simply absent and
-/// gets that sentence as its WHOLE message: how the segments of a well-formed
-/// replicator ARN are spelled is not something the service reads, so an ARN whose
-/// name or identifier looks nothing like one this registry would have minted is
-/// told the same thing as any other replicator the caller may yet create. Both
-/// carry the member at fault in `invalidParameter` and nothing of the request in
-/// the text.
+/// Recorded behavior: the replicator family of this service is worded unlike its
+/// other resources. Where a cluster, a topic, a channel or a VPC connection this
+/// endpoint resolves nothing for is answered [`RESOURCE_NOT_FOUND_MESSAGE`] as
+/// its whole message, every replicator reference that resolves to nothing — one
+/// this endpoint never minted just as much as one it held and released — is
+/// answered that same sentence behind the `Invalid parameter <member>: ` framing,
+/// with the member at fault in `invalidParameter` as well. Nothing of the request
+/// is in the text: how the segments of a well-formed replicator ARN are spelled,
+/// and whether this endpoint ever held one under it, are not something the
+/// message reports.
 ///
 /// Built here, from one place, so every operation that resolves a replicator by
 /// ARN answers one form for one condition instead of describing its own state.
-pub fn replicator_resolves_to_nothing(at_fault: bool) -> crate::ops::types::NotFoundException {
+pub fn replicator_resolves_to_nothing() -> crate::ops::types::NotFoundException {
     let mut refusal = resource_not_found(REPLICATOR_ARN_MEMBER);
-    if at_fault {
-        refusal.message = Some(format!(
-            "Invalid parameter {REPLICATOR_ARN_MEMBER}: {RESOURCE_NOT_FOUND_MESSAGE}"
-        ));
-    }
+    refusal.message = Some(format!(
+        "Invalid parameter {REPLICATOR_ARN_MEMBER}: {RESOURCE_NOT_FOUND_MESSAGE}"
+    ));
     refusal
-}
-
-/// Whether a replicator reference that resolved to nothing is the PARAMETER's
-/// fault rather than a resource that is merely absent.
-///
-/// ONE reading, about what this endpoint HELD under that ARN: the ARN names a
-/// replicator this Region held and let go
-/// ([`ComAmazonawsKafkaKafkaState::replicator_was_held`]) — a resource of the
-/// service's own that is gone, the same distinction the channel surface draws
-/// between a channel that went missing and an ARN that never named one.
-///
-/// Every other replicator ARN the lookup cannot resolve is the plain not-found: a
-/// resource the caller may yet create, or already has elsewhere. How such an ARN
-/// SPELLS the replicator — the name segment, the identifier segment, the Region
-/// and account it names — is not read here: a reference this endpoint holds
-/// nothing for is absent whether or not its segments resemble ones this registry
-/// mints, and the service says the same thing about all of them.
-pub fn replicator_reference_at_fault(
-    state: &ComAmazonawsKafkaKafkaState,
-    endpoint_region: &str,
-    arn: &str,
-) -> bool {
-    state.replicator_was_held(endpoint_region, arn)
 }
 
 /// The message Amazon MSK answers a request whose value for `member` is not one
@@ -3051,17 +3022,6 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding replicator ARNs, so each replicator gets a
     /// distinct identity.
     pub next_replicator_suffix: u64,
-    /// The replicators this registry HELD and holds no longer, bounded and
-    /// Region-scoped by [`replicator_releases::ReleasedReplicators`].
-    ///
-    /// What makes a replicator that is GONE distinguishable from one that never
-    /// existed, exactly as [`Self::removed_channel_arns`] does for a channel: the
-    /// replicator APIs report a reference to a replicator they knew and released
-    /// differently from one they never minted, so the two absences are told
-    /// apart. The store carries its own ceiling, so the record of removals cannot
-    /// grow however many replicators a caller creates and deletes, and under
-    /// however many Region names.
-    pub released_replicators: replicator_releases::ReleasedReplicators,
     /// Every live VPC connection, keyed by ARN. `BTreeMap` so the readers have
     /// one total order to walk.
     pub vpc_connections: BTreeMap<String, VpcConnection>,

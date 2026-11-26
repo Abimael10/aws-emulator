@@ -9,7 +9,8 @@
 //!
 //! The RULE asserted here: a delivery fails when the documents in force over the
 //! target do not authorize the call, and the class EventBridge reports for it is the
-//! class of the ANSWER that target's service gave — not of what really went wrong.
+//! PERMISSION one (`NO_PERMISSIONS`) — the class of why the delivery failed, not of the
+//! code the target's service answered under.
 //! For a queue target the authorizing document is the queue's own `Policy` alone
 //! ("for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
 //! relies on resource-based policies", `PutTargets`), and a grant scoped by
@@ -20,11 +21,10 @@
 //! because it does not disclose a queue it will not let the caller write to: it
 //! answers `QueueDoesNotExist` (HTTP 400, `awsQueryError` code
 //! `AWS.SimpleQueueService.NonExistentQueue`) under the fixed sentence that states the
-//! absence and the want of access without saying which holds. So the class of a
-//! queue-target authorization failure is the RESOURCE one (`NO_RESOURCE`), the same
-//! one a target the delivery could not address at all earns, and what tells the two
-//! apart is the SENTENCE that service worded. The class and the sentence come from the
-//! ONE refusal, so they can never name two different failures.
+//! absence and the want of access without saying which holds. A target the delivery
+//! could not address at all comes back under that same code with that service's other
+//! sentence, and is the RESOURCE class (`NO_RESOURCE`) — so the class states which of
+//! the two happened and the SENTENCE states what the delivery was told.
 //!
 //! `ERROR_CODE`/`ERROR_MESSAGE` are message attributes EventBridge adds to a
 //! dead-letter message and no shape models (`Target$DeadLetterConfig` is documented
@@ -54,7 +54,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -138,13 +138,13 @@ fn attribute(message: &Value, name: &str) -> String {
 }
 
 /// Assert the dead letter `message` reports the withheld send on `queue_arn` by the
-/// rule `rule`: the resource class, and beside it that service's answer for a queue it
+/// rule `rule`: the permission class, and beside it that service's answer for a queue it
 /// will not disclose, whose id is the only part of the sentence that varies at all.
 fn assert_withheld(case: &str, message: &Value, queue_arn: &str, rule: &str) {
     let class = attribute(message, ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        class, NO_RESOURCE,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
+        class, NO_PERMISSIONS,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
          {class:?} in {message:?}"
     );
     let head = withheld_answer_head();

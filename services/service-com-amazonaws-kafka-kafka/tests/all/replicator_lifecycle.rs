@@ -45,17 +45,14 @@ const INVALID_CLUSTER_MESSAGE: &str =
     "The specified Amazon MSK Cluster does not exist. Cluster ARN: ";
 
 /// The message a replicator operation refuses an ARN it cannot resolve with:
-/// the service's ONE fixed not-found sentence (whose apostrophe is U+2019) and
-/// nothing else — the member at fault travels in `invalidParameter`, and nothing
-/// about the serving endpoint, neither the region that looked nor the ARN itself,
-/// is in the text. Written out here rather than built from the handler's own
-/// helper, so the form is pinned by the suite instead of by the code under test.
-const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
-
-/// The same refusal for a replicator this region HELD and released: the
-/// replicator APIs report a reference of their own that is gone as a fault of the
-/// parameter that still names it, in this framing around the same sentence.
-const RELEASED_MESSAGE: &str =
+/// the service's one fixed not-found sentence (whose apostrophe is U+2019) behind
+/// the `Invalid parameter <member>: ` framing the replicator family puts before
+/// it, and nothing else — the member at fault travels in `invalidParameter` as
+/// well, and nothing about the serving endpoint, neither the region that looked
+/// nor the ARN itself, is in the text. Written out here rather than built from the
+/// handler's own helper, so the form is pinned by the suite instead of by the code
+/// under test.
+const NOT_FOUND_MESSAGE: &str =
     "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
 
 /// Sleep past the emulator's own `CREATING` -> `RUNNING` span, so a later read sees
@@ -1502,18 +1499,18 @@ async fn a_deleted_replicator_is_gone_from_every_reader() {
                 read_again.error_code(),
                 read_again.error_message()
             ),
-            (404, "NotFoundException", RELEASED_MESSAGE),
-            "case {case}: a deleted replicator must read as a reference the service released, \
-             got {} {}",
+            (404, "NotFoundException", NOT_FOUND_MESSAGE),
+            "case {case}: a deleted replicator must read as a reference that resolves to \
+             nothing, got {} {}",
             read_again.status,
             read_again.body
         );
         let twice = delete(&emulator, &arn, None).await;
         assert_eq!(
             (twice.status, twice.error_code(), twice.error_message()),
-            (404, "NotFoundException", RELEASED_MESSAGE),
-            "case {case}: a repeated delete must answer as for a replicator the service \
-             released, got {} {}",
+            (404, "NotFoundException", NOT_FOUND_MESSAGE),
+            "case {case}: a repeated delete must answer as for a replicator that resolves to \
+             nothing, got {} {}",
             twice.status,
             twice.body
         );

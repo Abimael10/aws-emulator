@@ -44,9 +44,11 @@ const TARGET_UNNAMED_MESSAGE: &str =
 
 /// The message this service's replicator APIs refuse an ARN they cannot resolve
 /// with: the service's one fixed not-found sentence (whose apostrophe is U+2019,
-/// as the service writes it) and nothing else — the input member at fault travels
-/// in `invalidParameter`.
-const NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
+/// as the service writes it) behind the `Invalid parameter <member>: ` framing
+/// that family puts before it — the input member at fault travels in
+/// `invalidParameter` as well.
+const NOT_FOUND_MESSAGE: &str =
+    "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
 
 /// A well-formed Amazon MSK cluster ARN in the signing region that no cluster
 /// holds — enough for a request that is refused on its BODY, which never resolves

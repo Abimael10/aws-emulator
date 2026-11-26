@@ -572,17 +572,14 @@ impl ImportedCertificate {
 /// its own encoding ([`certificate_chain`]) and nothing else. Nothing here verifies a
 /// signature: no key of the issuing authority is reachable from this service.
 ///
-/// The validity WINDOW is read but is not, with one exception, what an import is refused
-/// on: this operation judges the MATERIAL the request carries, and never turns a call it
-/// would have admitted into a refusal because the HOST clock has advanced past a date
-/// inside that material. A client's certificate is fixed while the clock runs, so such a
-/// refusal would make one unchanged request succeed today and fail tomorrow with nothing
-/// in the request or in this store having changed. The bounds are read out of the
-/// certificate and REPORTED on the record (`NotBefore`, `NotAfter`), which is where a
-/// client reads the window of an imported certificate and judges whether it has passed.
-/// The exception is material whose window has NOT OPENED ([`certificate_not_yet_valid`]):
-/// such a certificate is unusable at the instant of the call and no earlier call could
-/// have been admitted either, so refusing it is never a refusal the clock created.
+/// The validity WINDOW is the one admissibility rule read against the CLOCK: "the current
+/// time must be between the Not Before and Not After certificate fields"
+/// (`ImportCertificate`'s own guidelines), so material whose window has not opened
+/// ([`certificate_not_yet_valid`]) and material whose window has closed
+/// ([`certificate_expired`]) are both refused, each in the service's own words for that
+/// side of the bound. An admitted certificate's bounds are also read out of its DER and
+/// REPORTED on the record (`NotBefore`, `NotAfter`), which is where a client reads the
+/// window of a certificate it imported and judges how much of it is left.
 ///
 /// Every refusal here is a defect of the MATERIAL the request carries rather than of a
 /// parameter naming what to operate on, so each is the modelled constraint failure for
@@ -617,8 +614,9 @@ fn imported_certificate(
     let not_before = tbs.validity.not_before.to_system_time();
     let not_after = tbs.validity.not_after.to_system_time();
     match validity_at(not_before, not_after, now) {
-        Validity::Open | Validity::Closed => {}
+        Validity::Open => {}
         Validity::NotYetOpen => return Err(certificate_not_yet_valid()),
+        Validity::Closed => return Err(certificate_expired()),
     }
 
     // The name set the certificate covers: its subject common name first, then the DNS
@@ -680,13 +678,11 @@ const PEM_BEGIN: &str = "-----BEGIN ";
 ///   private key, and certificate chain must be PEM-encoded") of certificates, a
 ///   well-formed PEM of any other type being a different object rather than a damaged
 ///   chain;
-/// * no certificate it carries may have a validity window that has NOT OPENED yet, the
-///   one window reading the imported certificate itself is held to
-///   ([`imported_certificate`]): an authority that is not usable at the instant of the
-///   call is one no client could verify the leaf against, and that answer is the same at
-///   every earlier instant. A member whose window has CLOSED is stored as sent, for the
-///   reason that reading gives — the host clock moving past a date in the caller's own
-///   material never turns an admitted import into a refusal.
+/// * no certificate it carries may be outside its validity window at the instant of the
+///   call, the one window reading the imported certificate itself is held to
+///   ([`imported_certificate`]): an authority that is not usable then is one no client
+///   could verify the leaf against. Which SIDE of the window the member fell on is what
+///   the sentence names, as it is for the certificate being imported.
 ///
 /// The refusal is the modelled constraint failure for supplied input, under the sentence
 /// that names what the body is not.
@@ -714,8 +710,9 @@ fn certificate_chain(
             validity.not_after.to_system_time(),
             now,
         ) {
-            Validity::Open | Validity::Closed => {}
+            Validity::Open => {}
             Validity::NotYetOpen => return Err(chain_certificate_not_yet_valid()),
+            Validity::Closed => return Err(chain_certificate_expired()),
         }
     }
 
@@ -726,13 +723,11 @@ fn certificate_chain(
 /// certificate carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Validity {
-    /// Before `Not Before`: the window has not opened yet, which is the one state an
-    /// import is refused in.
+    /// Before `Not Before`: the window has not opened yet.
     NotYetOpen,
-    /// Inside the window.
+    /// Inside the window: the one state an import is admitted in.
     Open,
-    /// After `Not After`: the window has closed, which the record REPORTS rather than
-    /// refuses ([`imported_certificate`]).
+    /// After `Not After`: the window has closed.
     Closed,
 }
 
@@ -753,14 +748,23 @@ fn validity_at(
     }
 }
 
-/// The refusal for a `Certificate` whose own validity window has NOT OPENED yet: the one
-/// side of the window an import is refused on. Fixed text, as recorded against the
-/// service: nothing of the request is interpolated, and the sentence alone is what tells
-/// this defect of the material apart from the others.
+/// The refusal for a `Certificate` whose own validity window has NOT OPENED yet: one of
+/// the two sides of the window an import is refused on. Fixed text, as recorded against
+/// the service: nothing of the request is interpolated, and the sentence alone is what
+/// tells this defect of the material apart from the others.
 fn certificate_not_yet_valid() -> ImportCertificateError {
     validation_exception(
         "The certificate is not valid yet. You can Import a certificate only during its \
          validity period.",
+    )
+}
+
+/// The refusal for a `Certificate` whose own validity window has CLOSED: the other side
+/// of the same bound, in the service's own words for it. Fixed text for the same reason.
+fn certificate_expired() -> ImportCertificateError {
+    validation_exception(
+        "The certificate is expired. You can Import a certificate only during its validity \
+         period.",
     )
 }
 
@@ -771,6 +775,15 @@ fn chain_certificate_not_yet_valid() -> ImportCertificateError {
     validation_exception(
         "A certificate in the chain is not valid yet. You can Import a certificate only \
          during its validity period.",
+    )
+}
+
+/// The refusal for a `CertificateChain` carrying a certificate whose validity window has
+/// CLOSED, which names the chain the same way.
+fn chain_certificate_expired() -> ImportCertificateError {
+    validation_exception(
+        "A certificate in the chain is expired. You can Import a certificate only during \
+         its validity period.",
     )
 }
 

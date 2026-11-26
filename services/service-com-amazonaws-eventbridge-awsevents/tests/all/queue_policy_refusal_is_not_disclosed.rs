@@ -7,22 +7,23 @@
 //! dead-letter queue reads it: off the message attributes of the dead letter the
 //! target's `DeadLetterConfig` queue received.
 //!
-//! The RULE asserted here: EventBridge classifies a failed delivery by the ANSWER the
-//! target's own service gave it, and for a queue target that answer is Amazon SQS's.
-//! A queue target is reached with `sqs:SendMessage` as the service principal and no
+//! The RULE asserted here: EventBridge classifies a failed delivery by WHY it failed,
+//! and reports the ANSWER the target's own service gave beside that class. A queue target
+//! is reached with `sqs:SendMessage` as the service principal and no
 //! role ("for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
-//! relies on resource-based policies", `PutTargets`), and that service does not
-//! disclose a queue it will not let the caller write to: `SendMessage` models no
-//! authorization failure at all (`smithy_query(query="operation",
+//! relies on resource-based policies", `PutTargets`), so a send the documents in force
+//! over the queue do not authorize is the PERMISSION class (`NO_PERMISSIONS`) — and the
+//! answer beside it is the one that service gives a sender it has not authorized, which
+//! discloses nothing: `SendMessage` models no authorization failure at all
+//! (`smithy_query(query="operation",
 //! operation="SendMessage",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`)
-//! and a send no document in force over the queue permits is answered
-//! `QueueDoesNotExist` — HTTP 400 under the `awsQueryError` code
-//! `AWS.SimpleQueueService.NonExistentQueue` — carrying the fixed sentence that states
-//! the absence and the want of access without saying which holds. So the dead letter
-//! carries the RESOURCE class (`NO_RESOURCE`) with that answer beside it, and a queue
-//! ARN nothing was created for carries the same class with that service's OTHER
-//! sentence for the same code.
+//! and such a send is answered `QueueDoesNotExist` — HTTP 400 under the `awsQueryError`
+//! code `AWS.SimpleQueueService.NonExistentQueue` — carrying the fixed sentence that
+//! states the absence and the want of access without saying which holds. A queue ARN
+//! nothing was created for is the other class (`NO_RESOURCE`): no document decided that
+//! delivery, the target was simply not there, and that service's OTHER sentence for the
+//! same code says so.
 //!
 //! The table spans the class rather than the one case the defect was found on: its rows
 //! differ along the FORM the withholding takes (no document at all, a document with no
@@ -42,7 +43,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -190,47 +191,47 @@ async fn given_withheld_target(
     }
 }
 
-/// A delivery the destination queue's own documents withheld carries the class of the
-/// answer that service gave — which it gives without disclosing the queue — over every
-/// form the withholding takes, and a queue that was never there carries the same class
-/// under that service's own sentence for an absence.
+/// A delivery the destination queue's own documents withheld is the PERMISSION class with
+/// the answer that service gave — which it gives without disclosing the queue — beside it,
+/// over every form the withholding takes; a queue that was never there is the RESOURCE
+/// class, under that service's own sentence for an absence.
 #[tokio::test]
 async fn a_queue_policy_refusal_is_dead_lettered_under_the_answer_that_service_gave() {
     let rows = [
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose document states no statement",
             setup: Setup::Queue(Some(no_statements)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(granting_then_denying)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
         },
         Row {
@@ -308,8 +309,9 @@ async fn a_queue_policy_refusal_is_dead_lettered_under_the_answer_that_service_g
              in {message:?}",
             row.class
         );
-        // The answer beside the class is the one the refused send read, and the class
-        // is the class of the code INSIDE it, so the two cannot name two failures.
+        // The answer beside the class is the one the refused send read, so a reader of
+        // the dead letter is told both why the event was not delivered and what the
+        // delivery was told.
         let reported = attribute(message, ERROR_MESSAGE_ATTRIBUTE);
         for stated in [QUEUE_NOT_DISCLOSED_CODE, row.sentence] {
             assert!(
@@ -387,8 +389,8 @@ async fn the_refusal_clears_when_the_queues_policy_grants_the_send() {
     );
     let class = attribute(&parked[0], ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        class, NO_RESOURCE,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
+        class, NO_PERMISSIONS,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
          {class:?} in {:?}",
         parked[0]
     );

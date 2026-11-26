@@ -3508,14 +3508,15 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 ///
 /// A refusal is the delivery FAILING rather than one nobody attempted, so it is
 /// dead-lettered and counted on `FailedInvocations` like any other failed
-/// invocation (see [`deliver`]), under the condition and sentence the refusing
-/// service's own answer gives it ([`crate::state::queue_access_refusal`] for the
-/// policy, [`queue_key_send_refusal`] for the key) — each one's condition read off
-/// that answer's error code through the one classifier every answered refusal goes
-/// through ([`delivery_condition`]), which is what puts the two in DIFFERENT
-/// classes: Amazon SQS does not disclose a queue whose documents withhold the send,
-/// so that answer is its not-found code, while the key's refusal comes back as that
-/// service's `KMS.AccessDeniedException`.
+/// invocation (see [`deliver`]), carrying the sentence the refusing service's own
+/// answer gives it ([`crate::state::queue_access_refusal`] for the policy,
+/// [`queue_key_send_refusal`] for the key). Both are the PERMISSION class
+/// ([`crate::state::NO_PERMISSIONS`]): a document in force over the target
+/// withheld the call, which is why the delivery failed, whatever code the
+/// answering service words its refusal under — Amazon SQS does not disclose a
+/// queue whose documents withhold the send, so its answer carries that service's
+/// not-found code, while the key's refusal comes back as its
+/// `KMS.AccessDeniedException`.
 ///
 /// The attributes are read through the queue's own `GetQueueAttributes`, so what
 /// decides a delivery is what a client's last write left on the queue — a policy
@@ -3555,10 +3556,13 @@ fn queue_delivery_refusal(
             "an EventBridge delivery was withheld: the queue's own policy does not allow this \
              service to send it a message"
         );
-        let (code, message) = crate::state::queue_access_refusal();
         return Some(crate::state::InvocationOutcome::Failed {
-            code: delivery_condition(code).to_string(),
-            message,
+            // The delivery was withheld because the documents in force over the
+            // target do not authorize the call, which is the PERMISSION class
+            // whatever code that service words its refusal under — the sentence
+            // beside it carries that answer in full.
+            code: crate::state::NO_PERMISSIONS.to_string(),
+            message: crate::state::queue_access_refusal(),
         });
     }
     queue_key_refusal(kms, attributes, region, resource, handover)
@@ -3912,10 +3916,10 @@ const SNS_AUTHORIZATION_ERROR_STATUS: u16 = 403;
 /// service, the status, the error code and the id of the refused request. That
 /// answer's code is an AUTHORIZATION one, so the class read off it
 /// ([`answered_refusal`]) names the PERMISSION
-/// ([`crate::state::NO_PERMISSIONS`]) rather than the resource — unlike a queue's
-/// refusal, which that service answers under its own not-found code
-/// ([`crate::state::queue_access_refusal`]), each dead letter carrying the class of
-/// the answer beside it.
+/// ([`crate::state::NO_PERMISSIONS`]) rather than the resource — the same class a
+/// queue's policy refusal carries, which that service answers under its own
+/// not-found code instead ([`crate::state::queue_access_refusal`]): one class for
+/// one reason a delivery failed, whichever code the answering service chose.
 fn topic_publish_refusal(topic_arn: &str) -> (String, String) {
     answered_refusal(
         &::service_common::iam_authorization::not_authorized_by_resource_policy(

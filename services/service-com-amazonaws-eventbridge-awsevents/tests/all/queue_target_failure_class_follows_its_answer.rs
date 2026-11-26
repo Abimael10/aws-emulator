@@ -6,11 +6,11 @@
 //! pair is read where a client reads it: off the message attributes of the dead letter
 //! the target's `DeadLetterConfig` queue received.
 //!
-//! The RULE asserted here: EventBridge classifies a failed delivery from the refusal
-//! the target's own service answered, and the `ERROR_MESSAGE` beside the class is that
-//! same answer — so the class is always the class of the error code INSIDE the
-//! message, and the two can never name two different failures. For a queue target the
-//! send is authorized by the queue's own resource policy alone ("for Lambda functions,
+//! The RULE asserted here: a dead letter's two attributes come from one failed
+//! delivery — the `ERROR_MESSAGE` is the refusal the target's own service answered, in
+//! full, and the `ERROR_CODE` is EventBridge's classification of WHY that delivery
+//! failed. For a queue target the send is authorized by the queue's own resource policy
+//! alone ("for Lambda functions,
 //! Amazon SNS topics and Amazon SQS queues, EventBridge relies on resource-based
 //! policies", `PutTargets`), and Amazon SQS models no authorization failure on
 //! `SendMessage` at all (`smithy_query(query="operation", operation="SendMessage",
@@ -20,24 +20,19 @@
 //! `QueueDoesNotExist`, HTTP 400 under `AWS.SimpleQueueService.NonExistentQueue`
 //! (`smithy_query(query="shape", shape="QueueDoesNotExist",
 //! model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-//! each under its own sentence — so the class of both is the resource one. The one
-//! refusal that service DOES answer as an authorization failure is the key an
-//! encrypted queue's messages are encrypted under, which it relays as
-//! `KMS.AccessDeniedException` and which is the permission class; that code is in the
-//! table below, so a message naming it where the row expects the resource class fails
-//! here (the encrypted-queue rule itself is
-//! `tests/all/encrypted_queue_target_key_policy.rs`'s).
+//! each under its own sentence. One code, two classes: the withheld send is the
+//! PERMISSION class because a document decided it, and the queue that is not there is
+//! the RESOURCE class — so the class is not read off the answer's code, and the SENTENCE
+//! inside the answer is what tells the two apart.
 //!
 //! The table spans that rule rather than one case: its rows differ along the FORM a
 //! refusal takes (no document at all, an explicit `Deny`, a grant scoped by
 //! `aws:SourceArn` to another rule, one scoped by `aws:SourceAccount` to another
 //! account, a grant of another action, a grant to another service principal) and
 //! along the FORM an absence takes (an ARN no queue was created for, a queue deleted
-//! after the target was written). The expected class of each row is DERIVED from the
-//! error code the row's message carries, through the one table below, so a row whose
-//! two attributes disagreed would fail whichever of them was wrong — and the row also
-//! states the class and the sentence it expects, so the derivation cannot pass
-//! vacuously.
+//! after the target was written). Each row states the code, the sentence and the class
+//! it expects, so a row whose attributes disagreed would fail whichever of them was
+//! wrong.
 //!
 //! The condition operators and keys the rows use are IAM's own, because a queue's
 //! `Policy` is an IAM policy document
@@ -80,13 +75,6 @@ const TARGET_ARN_ATTRIBUTE: &str = "TARGET_ARN";
 /// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`).
 /// No row here encrypts its queue, so no row may read it.
 const KEY_ACCESS_DENIED: &str = "KMS.AccessDeniedException";
-
-/// Which class each error code a queue target's service answers belongs to. Source:
-/// the two refusals above, as the services that answer them publish them.
-const CLASS_OF_CODE: [(&str, &str); 2] = [
-    (QUEUE_NOT_DISCLOSED_CODE, NO_RESOURCE),
-    (KEY_ACCESS_DENIED, NO_PERMISSIONS),
-];
 
 /// The account every resource below belongs to.
 fn account() -> &'static str {
@@ -199,20 +187,6 @@ fn attribute(message: &Value, name: &str) -> String {
         .to_string()
 }
 
-/// The class [`CLASS_OF_CODE`] puts the error code named inside `reported` in — or
-/// `None` where that message names no code the table knows, or more than one, in
-/// which case the answer does not place the failure at all.
-fn class_of(reported: &str) -> Option<&'static str> {
-    let mut named = CLASS_OF_CODE
-        .into_iter()
-        .filter(|(code, _)| reported.contains(code));
-    let found = named.next()?;
-    if named.next().is_some() {
-        return None;
-    }
-    Some(found.1)
-}
-
 /// The ARN the row's target names, and the url of its queue when the row has one.
 async fn given_target(
     emulator: &Emulator,
@@ -246,7 +220,7 @@ async fn given_target(
 }
 
 /// Every form a failed delivery to a queue target takes reports the answer that
-/// service gave, and the class beside it is the class of the code inside that answer.
+/// service gave, with the class of WHY the delivery failed beside it.
 #[tokio::test]
 async fn a_dead_letters_class_and_message_come_from_one_answer() {
     let rows = [
@@ -255,42 +229,42 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
             setup: Setup::Queue(None),
             code: QUEUE_NOT_DISCLOSED_CODE,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(denying)),
             code: QUEUE_NOT_DISCLOSED_CODE,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
             code: QUEUE_NOT_DISCLOSED_CODE,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceAccount to another account",
             setup: Setup::Queue(Some(granting_another_account)),
             code: QUEUE_NOT_DISCLOSED_CODE,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
             code: QUEUE_NOT_DISCLOSED_CODE,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
             code: QUEUE_NOT_DISCLOSED_CODE,
             sentence: QUEUE_NOT_DISCLOSED_SENTENCE,
-            class: NO_RESOURCE,
+            class: NO_PERMISSIONS,
         },
         Row {
             case: "a queue ARN no queue was created for",
@@ -353,16 +327,14 @@ async fn a_dead_letters_class_and_message_come_from_one_answer() {
                  {reported:?}"
             );
         }
-        // The class is the class of the code inside that very answer, so the pair
-        // cannot name two failures.
-        let derived = class_of(&reported);
+        // The class is EventBridge's own reading of why the delivery failed, and the
+        // answer beside it is the target service's: a withheld send and a queue that is
+        // not there come back under ONE code, so the class cannot have been read off it.
         let class = attribute(message, ERROR_CODE_ATTRIBUTE);
-        assert_eq!(
-            derived,
-            Some(row.class),
-            "case {case:?}: expected the answer's own code to be the {:?} class, got \
-             {derived:?} from {reported:?}",
-            row.class
+        assert!(
+            !reported.contains(KEY_ACCESS_DENIED),
+            "case {case:?}: no row here encrypts its queue, so {KEY_ACCESS_DENIED:?} must not \
+             appear in {reported:?}"
         );
         assert_eq!(
             class,

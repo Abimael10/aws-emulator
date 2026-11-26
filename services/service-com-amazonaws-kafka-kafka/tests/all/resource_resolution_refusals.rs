@@ -9,13 +9,16 @@
 //! which kind of resource it names, and how the reference fails to resolve:
 //!
 //! 1. A reference this endpoint resolves no resource for is ONE refusal: HTTP 404
-//!    `NotFoundException` whose WHOLE message is the service's single fixed
-//!    sentence, with the request member at fault carried in `invalidParameter` —
+//!    `NotFoundException` whose message is the service's single fixed sentence,
+//!    with the request member at fault carried in `invalidParameter` —
 //!    by the camelCase wire name the request itself uses — and nothing of the
 //!    request or of this endpoint's own state (no ARN, no region, no account) in
 //!    the text. It holds for the operation that CREATES a resource against
 //!    another one too: `CreateVpcConnection` cannot connect to a cluster that is
-//!    not there, which is a missing resource and not a malformed body.
+//!    not there, which is a missing resource and not a malformed body. The
+//!    replicator family of operations words that one sentence its own way — behind
+//!    the `Invalid parameter <member>: ` framing — for every reference it resolves
+//!    nothing for, whether or not this endpoint ever held one.
 //! 2. A reference is resolved BEFORE the rest of the body is read, so a request
 //!    that both names a resource this endpoint holds none of and carries a member
 //!    the service would not accept is answered about the RESOURCE.
@@ -43,6 +46,22 @@ use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION
 /// for with (the apostrophe is U+2019, as the service writes it): one fixed
 /// sentence, which is why every row below asserts it EQUAL rather than contained.
 const RESOURCE_NOT_FOUND: &str = "The requested resource doesn\u{2019}t exist.";
+
+/// The wire name of the member every replicator operation carries its target's ARN in.
+const REPLICATOR_ARN_MEMBER: &str = "replicatorArn";
+
+/// The WHOLE message a refusal that resolved nothing for `member` carries: the service's one
+/// fixed sentence, which the replicator family of operations puts the
+/// `Invalid parameter <member>: ` framing before — the one difference in wording this
+/// service's resource families draw, and one this suite states rather than reads from the
+/// code under test.
+fn not_found_message(member: &str) -> String {
+    if member == REPLICATOR_ARN_MEMBER {
+        format!("Invalid parameter {member}: {RESOURCE_NOT_FOUND}")
+    } else {
+        RESOURCE_NOT_FOUND.to_string()
+    }
+}
 
 /// The whole message the tagging operations answer a well-formed `ResourceArn` they cannot
 /// accept as the ARN of a taggable MSK resource with. Also fixed end to end.
@@ -91,8 +110,8 @@ fn assert_not_found(reply: &Reply, case: &str, member: &str, reference: &str) {
     );
     assert_eq!(
         reply.error_message(),
-        RESOURCE_NOT_FOUND,
-        "case {case}: expected the service's one not-found sentence, got {:?}",
+        not_found_message(member),
+        "case {case}: expected the service's not-found sentence for {member}, got {:?}",
         reply.error_message()
     );
     for leaked in [reference, REGION, ACCOUNT] {
@@ -265,15 +284,14 @@ async fn an_unresolvable_resource_reference_is_one_fixed_not_found_refusal() {
     }
 }
 
-/// RULE 1, the replicator surface's own wording: the replicator APIs tell the two
-/// absences apart. A replicator this region HELD and released — one that was
-/// deleted — is reported as a fault of the parameter that still names it, in the
-/// `Invalid parameter <member>` framing those APIs use before the same fixed
-/// sentence; an ARN this region never minted is the bare sentence. Both are the
-/// same 404 `NotFoundException`, both name `replicatorArn` in
-/// `invalidParameter`, and neither carries anything of the request.
+/// RULE 1, the replicator surface's own wording: the replicator APIs word every
+/// reference they resolve nothing for the same way — in the
+/// `Invalid parameter <member>` framing before the same fixed sentence — whether
+/// the ARN names a replicator this region HELD and released or one it never
+/// minted. Both are the same 404 `NotFoundException`, both name `replicatorArn`
+/// in `invalidParameter`, and neither carries anything of the request.
 #[tokio::test]
-async fn a_released_replicator_is_told_apart_from_one_that_never_existed() {
+async fn a_released_replicator_is_worded_like_one_that_never_existed() {
     let emulator = Emulator::new();
     let one = emulator
         .create_ok(&ClusterRequest::named("released-one"))
@@ -322,10 +340,10 @@ async fn a_released_replicator_is_told_apart_from_one_that_never_existed() {
         deleted.status, deleted.body
     );
 
-    // The parameter-framed sentence the replicator APIs answer for a reference of
-    // their own that is gone: fixed text around the member's wire name, with no
+    // The parameter-framed sentence the replicator APIs answer for every reference
+    // they resolve nothing for: fixed text around the member's wire name, with no
     // part of the ARN in it.
-    let released_message = format!("Invalid parameter replicatorArn: {RESOURCE_NOT_FOUND}");
+    let released_message = not_found_message(REPLICATOR_ARN_MEMBER);
 
     // The rows differ along which operation addresses the released replicator —
     // its reader, its delete and the replication update, which is every operation
@@ -387,8 +405,9 @@ async fn a_released_replicator_is_told_apart_from_one_that_never_existed() {
         );
     }
 
-    // An ARN of the same shape this region never minted is the OTHER absence: the
-    // bare sentence, from the same operations.
+    // An ARN of the same shape this region never minted is answered in exactly the
+    // same words, from the same operations: the release is not something the
+    // wording reports.
     let never = ghost_replicator("released-never-minted");
     for (case, method, uri) in [
         (

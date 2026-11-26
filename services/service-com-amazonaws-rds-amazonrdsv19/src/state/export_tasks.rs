@@ -198,19 +198,37 @@ pub fn kms_key_not_accessible_message(key_id: &str) -> String {
     )
 }
 
-/// The same fault on a snapshot COPY, where the key the request names is the key the COPY
-/// is encrypted under rather than the only key in the request.
+/// The same fault on a CLUSTER snapshot copy, where the key the request names is the key
+/// the COPY is encrypted under rather than the only key in the request.
 ///
-/// Recorded behavior: the copy paths answer the fault in their own wording — the sentence
-/// opens `Specified KMS key [` rather than the create paths' `The specified KMS key [` and
-/// is otherwise identical to [`kms_key_not_accessible_message`]. It covers every condition
-/// the one fault reports on a copy (the account holds no such key, holds it disabled, or
-/// withholds its use), names neither the source key nor the reason, and its one variable
-/// part is the `KmsKeyId` echoed exactly as the request spelled it (key id, key ARN, alias
-/// name or alias ARN).
+/// Recorded behavior: each copy path answers the fault in its OWN wording, and this is
+/// `CopyDBClusterSnapshot`'s — the sentence opens `Specified KMS key [`, rather than the
+/// create paths' `The specified KMS key [` ([`kms_key_not_accessible_message`]) or the DB
+/// snapshot copy's `The target KMS key [`
+/// ([`target_kms_key_not_accessible_message`]), and is otherwise identical to both. It
+/// covers every condition the one fault reports on a copy (the account holds no such key,
+/// holds it disabled, or withholds its use), names neither the source key nor the reason,
+/// and its one variable part is the `KmsKeyId` echoed exactly as the request spelled it
+/// (key id, key ARN, alias name or alias ARN).
 pub fn copy_kms_key_not_accessible_message(key_id: &str) -> String {
     format!(
         "Specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
+         permissions to access it."
+    )
+}
+
+/// The same fault on a DB SNAPSHOT copy, which words it as a statement about the key the
+/// copy is TARGETED at.
+///
+/// Recorded behavior: `CopyDBSnapshot` opens the sentence `The target KMS key [` — neither
+/// the create paths' `The specified KMS key [` ([`kms_key_not_accessible_message`]) nor the
+/// cluster snapshot copy's `Specified KMS key [`
+/// ([`copy_kms_key_not_accessible_message`]) — and closes it with the same three reasons
+/// the single fault covers. Its one variable part is the `KmsKeyId` echoed exactly as the
+/// request spelled it (key id, key ARN, alias name or alias ARN).
+pub fn target_kms_key_not_accessible_message(key_id: &str) -> String {
+    format!(
+        "The target KMS key [{key_id}] does not exist, is not enabled or you do not have \
          permissions to access it."
     )
 }
