@@ -272,12 +272,24 @@ pub fn data_download_failed(channel: &str, uri: &str, detail: &str) -> String {
     format!("ClientError: Data download failed:{detail} for channel {channel} at {uri}")
 }
 
-/// What [`data_download_failed`] carries for a read the execution role is not allowed to
-/// make: the Amazon S3 answer such a read gets, named by its own error code and status.
+/// What [`data_download_failed`] carries for a call the execution role is not allowed to
+/// make: the Amazon S3 answer such a call gets, as the SDK inside the job's container reports
+/// one — the MESSAGE Amazon S3 answered with FIRST, then the envelope naming the service, the
+/// HTTP status and the error code.
+///
+/// The leading field is the error's own MESSAGE and not its code repeated: Amazon S3's list of
+/// error responses pairs the code `AccessDenied` with the message "Access Denied", and that
+/// message is what says WHY the call was refused — an operator reading a job's
+/// `FailureReason` for an authorization failure is looking for exactly that sentence, which a
+/// reason carrying the code twice never states.
 #[must_use]
 pub fn access_denied_detail() -> String {
-    "AccessDenied (Service: Amazon S3; Status Code: 403; Error Code: AccessDenied)".to_string()
+    format!("{ACCESS_DENIED_MESSAGE} (Service: Amazon S3; Status Code: 403; Error Code: AccessDenied)")
 }
+
+/// The message Amazon S3 answers a refused call with, from its own list of error responses:
+/// the code `AccessDenied` and the message "Access Denied", HTTP 403.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 
 /// What [`data_download_failed`] carries for a location holding no object at all.
 const NO_OBJECT_DETAIL: &str = "no object was found at the S3 location";
@@ -385,6 +397,45 @@ pub fn container_inputs(channels: &[ChannelData]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The directories the SERVICE creates in a training job's container before its entrypoint is
+/// invoked, so each exists for the program whether or not any object was placed in it.
+///
+/// "SageMaker makes the data available in the `/opt/ml/input/data/<channel_name>` directory"
+/// (so every channel the request declares has its own directory, and an empty channel has an
+/// empty one), "a SageMaker container stores your trained model artifacts in the
+/// /opt/ml/model directory" (so that directory is there for the container to write into), and
+/// `CheckpointConfig$LocalPath` is "the local directory where checkpoints are written. The
+/// default directory is /opt/ml/checkpoints/" — the same promise for a job that asked for
+/// checkpoints. A program that lists its channel, or writes its model without creating the
+/// directory first, therefore finds the directory SageMaker prepared for it.
+#[must_use]
+pub fn container_directories(request: &CreateTrainingJobInput) -> Vec<String> {
+    let channels = request
+        .input_data_config
+        .iter()
+        .flatten()
+        .map(|channel| format!("{INPUT_DATA_DIRECTORY}/{}", channel.channel_name));
+    let checkpoints = request.checkpoint_config.as_ref().map(|config| {
+        config
+            .local_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .unwrap_or(super::DEFAULT_CHECKPOINT_DIRECTORY)
+            .to_string()
+    });
+    let mut prepared: Vec<String> = channels
+        .chain([super::MODEL_DIRECTORY.to_string()])
+        .chain(checkpoints)
+        .map(|path| path.trim_end_matches('/').to_string())
+        // A path that walks out of the directory it appears to be under is no directory of the
+        // container's storage, the way a placed file's is not ([`container_inputs`]).
+        .filter(|path| path.starts_with('/') && !path.split('/').any(|part| part == ".."))
+        .collect();
+    prepared.sort();
+    prepared.dedup();
+    prepared
+}
+
 /// A fitted linear model: `prediction = link(intercept + weights · features)`, in the
 /// caller's own scale.
 ///
@@ -474,72 +525,98 @@ pub async fn absent_input_objects(
     region: &str,
     request: &CreateTrainingJobInput,
 ) -> Option<String> {
-    let partition = arn_partition(&request.role_arn);
-    let client = s3_client(ctx, region);
     for channel in request.input_data_config.iter().flatten() {
         let Some(source) = channel.data_source.s3_data_source.as_ref() else {
             continue;
         };
-        let Some(location) = S3Location::parse(&source.s3_uri) else {
-            continue;
-        };
-        let refusal = |s3_error: Option<&str>| {
-            crate::state::no_s3_objects_found(
-                &source.s3_uri,
-                region,
-                &request.role_arn,
-                &location.bucket,
-                s3_error,
-            )
-        };
-        let bucket_arn = location.bucket_arn(&partition);
-        if ::service_common::iam_role::role_withholds_action(
+        if let Some(refusal) =
+            unlistable_input_location(ctx, region, &request.role_arn, &source.s3_uri).await
+        {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// Why SageMaker will not accept a create whose resource reads the input data source at
+/// `s3_uri` AS `role_arn`: that location names no object the role can list — and `None` when it
+/// answers at least one, which is also the answer wherever nothing was LEARNED.
+///
+/// The ONE reading every create that resolves an input data source takes of ONE of its
+/// locations, so no two of them refuse the same fact differently: a training job's channels
+/// ([`absent_input_objects`]), and a processing job's SageMaker-managed `S3Input`s, each ask
+/// this per location and refuse with the sentence it answers
+/// ([`crate::state::no_s3_objects_found`]).
+///
+/// Two conditions produce it and the sentence states both, because the service itself cannot
+/// tell them apart: the prefix holds nothing, or the role may not list the bucket. Which it was
+/// is carried by the clause naming what Amazon S3 ANSWERED — the identity-based refusal for a
+/// listing authorization withheld, and the sentence Amazon S3 wrote for a location whose bucket
+/// or key it answered is not there ([`super::s3_access::NoObjectAnswer`]); a listing that
+/// answered and merely held nothing refused nothing, so it carries no clause at all.
+///
+/// Only what was ANSWERED refuses: a listing that could not be made at all — no Amazon S3 to
+/// ask — teaches nothing about the location, so it refuses nothing. A value that names no
+/// Amazon S3 bucket names no location to list either, so it is left to the member's own
+/// constraint rather than refused here.
+pub async fn unlistable_input_location(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    s3_uri: &str,
+) -> Option<String> {
+    let location = S3Location::parse(s3_uri)?;
+    let partition = arn_partition(role_arn);
+    let refusal = |s3_error: Option<&str>| {
+        crate::state::no_s3_objects_found(s3_uri, region, role_arn, &location.bucket, s3_error)
+    };
+    let bucket_arn = location.bucket_arn(&partition);
+    if ::service_common::iam_role::role_withholds_action(
+        ctx,
+        region,
+        role_arn,
+        LIST_BUCKET_ACTION,
+        &bucket_arn,
+    )
+    .await
+    {
+        // The listing was refused by AUTHORIZATION, so what Amazon S3 ANSWERED about it is
+        // part of what the caller is told: the two conditions this one sentence covers are
+        // told apart by that clause (see [`crate::state::no_s3_objects_found`]). WHICH of
+        // IAM's rules withheld it is part of the answer too — a statement that denies the
+        // listing is a different fact from no statement allowing it — so the narrower
+        // reading is asked only once the wider one has answered, and the clause follows it.
+        let reason = if ::service_common::iam_role::role_denies_action(
             ctx,
             region,
-            &request.role_arn,
+            role_arn,
             LIST_BUCKET_ACTION,
             &bucket_arn,
         )
         .await
         {
-            // The listing was refused by AUTHORIZATION, so what Amazon S3 ANSWERED about it is
-            // part of what the caller is told: the two conditions this one sentence covers are
-            // told apart by that clause (see [`crate::state::no_s3_objects_found`]). WHICH of
-            // IAM's rules withheld it is part of the answer too — a statement that denies the
-            // listing is a different fact from no statement allowing it — so the narrower
-            // reading is asked only once the wider one has answered, and the clause follows it.
-            let reason = if ::service_common::iam_role::role_denies_action(
-                ctx,
-                region,
-                &request.role_arn,
-                LIST_BUCKET_ACTION,
-                &bucket_arn,
-            )
-            .await
-            {
-                ::service_common::iam_authorization::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
-            } else {
-                ::service_common::iam_authorization::no_identity_policy_allows(LIST_BUCKET_ACTION)
-            };
-            return Some(refusal(Some(&crate::state::s3_listing_refusal(
-                &request.role_arn,
-                &bucket_arn,
-                &partition,
-                &reason,
-            ))));
-        }
-        // A listing that ANSWERED, with no object under the prefix, is the refusal, and so is
-        // an answer that NAMES the absence of the bucket or the key itself; one that could not
-        // be made at all says nothing (see the doc above). The reading is the one this service
-        // takes of every Amazon S3 location ([`super::location_no_object`]), and it carries
-        // WHICH answer Amazon S3 gave: the clause reporting what Amazon S3 itself said carries
-        // that sentence for an answer that named the absence, and nothing for a listing that
-        // answered and merely held nothing, which Amazon S3 refused nothing about.
-        if let Some(answer) = super::s3_access::location_no_object(&client, &location).await {
-            return Some(refusal(answer.s3_error()));
-        }
+            ::service_common::iam_authorization::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
+        } else {
+            ::service_common::iam_authorization::no_identity_policy_allows(LIST_BUCKET_ACTION)
+        };
+        return Some(refusal(Some(&crate::state::s3_listing_refusal(
+            role_arn,
+            &bucket_arn,
+            &partition,
+            &reason,
+        ))));
     }
-    None
+    // A listing that ANSWERED, with no object under the prefix, is the refusal, and so is
+    // an answer that NAMES the absence of the bucket or the key itself; one that could not
+    // be made at all says nothing (see the doc above). The reading is the one this service
+    // takes of every Amazon S3 location ([`super::location_no_object`]), and it carries
+    // WHICH answer Amazon S3 gave: the clause reporting what Amazon S3 itself said carries
+    // that sentence for an answer that named the absence, and nothing for a listing that
+    // answered and merely held nothing, which Amazon S3 refused nothing about.
+    let client = s3_client(ctx, region);
+    super::s3_access::location_no_object(&client, &location)
+        .await
+        .map(|answer| refusal(answer.s3_error()))
 }
 
 /// Run one accepted training job: read its channels, fit a model on them, write the model
@@ -547,11 +624,18 @@ pub async fn absent_input_objects(
 ///
 /// Answers a [`TrainingRunOutcome`] rather than an error channel, for the reason the module
 /// docs give: the run is the job's own work.
+///
+/// `container_access` is the seam an AWS SDK call the job's own CONTAINER PROGRAM makes travels
+/// on, which is the session of the job's execution role
+/// ([`crate::state::ContainerAwsAccess`]): a training container runs with that role's
+/// credentials, so code inside it that reads or writes Amazon S3 itself makes that call as
+/// that role.
 pub async fn run_training_job(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     job_name: &str,
     request: &CreateTrainingJobInput,
+    container_access: Option<crate::state::ContainerAwsAccess>,
 ) -> TrainingRunOutcome {
     let Some(output) = S3Location::parse(&request.output_data_config.s3_output_path) else {
         return TrainingRunOutcome::failed(model_upload_failed(
@@ -685,6 +769,10 @@ pub async fn run_training_job(
                 &image,
                 request.environment.as_ref(),
                 &container_inputs(&channels),
+                // The directories SageMaker prepares in the container before the entrypoint
+                // is invoked: each channel's own, the model directory and the checkpoint one.
+                &container_directories(request),
+                container_access,
             )
             .await;
             match outcome {

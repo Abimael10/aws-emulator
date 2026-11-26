@@ -356,6 +356,67 @@ pub async fn upload_processing_outputs(
     None
 }
 
+/// The directories the SERVICE creates in a processing job's container before its entrypoint
+/// is invoked, so each exists for the program whether or not any object was placed in it.
+///
+/// `ProcessingS3Output$LocalPath` is "the local path of a directory where you want Amazon
+/// SageMaker to upload its contents to Amazon S3 … This directory will be created by the
+/// platform and exist when your container's entrypoint is invoked", and
+/// `ProcessingS3Input$LocalPath` is "the local path in your container where you want Amazon
+/// SageMaker to write input data to" — a directory the platform likewise prepares for the
+/// download. So every SageMaker-managed `LocalPath` the request declares is a directory of the
+/// container's storage from the program's first line, which is what makes a program that LISTS
+/// its input directory, or writes into its output directory, find one.
+///
+/// Only the paths of the container's own tree ([`is_container_directory`]) are prepared, which
+/// is the same reading the two legs of the job's data movement take of a declared `LocalPath`:
+/// nothing a request names places a directory outside that tree. An `AppManaged` input or
+/// output is the application's own work, so the service prepares no directory for it.
+///
+/// The tree itself is prepared whatever the request declares: a processing container reads its
+/// data under [`PROCESSING_INPUT_DIRECTORY`] and writes its results under
+/// [`PROCESSING_OUTPUT_DIRECTORY`] — the two directories of the processing container's own
+/// contract, which is why a declared `LocalPath` "must begin with `/opt/ml/processing/`" — so
+/// both are there for a program that lists its input directory or writes into its output
+/// directory before any `LocalPath` of its own is resolved.
+#[must_use]
+pub fn processing_container_directories(
+    inputs: Option<&[ProcessingInput]>,
+    config: Option<&ProcessingOutputConfig>,
+) -> Vec<String> {
+    let declared_inputs = inputs
+        .unwrap_or_default()
+        .iter()
+        .filter(|input| !input.app_managed.unwrap_or(false))
+        .filter_map(|input| input.s3_input.as_ref())
+        .filter_map(|source| source.local_path.as_deref());
+    let declared_outputs = config
+        .map(|config| config.outputs.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|output| !output.app_managed.unwrap_or(false))
+        .filter_map(|output| output.s3_output.as_ref())
+        .filter_map(|destination| destination.local_path.as_deref());
+    let mut prepared: Vec<String> = declared_inputs
+        .chain(declared_outputs)
+        .chain([PROCESSING_INPUT_DIRECTORY, PROCESSING_OUTPUT_DIRECTORY])
+        .filter(|path| is_container_directory(path))
+        .map(|path| path.trim_end_matches('/').to_string())
+        .collect();
+    prepared.sort();
+    prepared.dedup();
+    prepared
+}
+
+/// The directory of the processing container's tree its input data is under, and the one its
+/// results are written to: the two directories a processing container's own contract names
+/// below [`PROCESSING_LOCAL_PATH_PREFIX`] (`ProcessingS3Input$LocalPath` "must begin with
+/// `/opt/ml/processing/`", and SageMaker's own processing images read
+/// `/opt/ml/processing/input/…` and write `/opt/ml/processing/output/…`).
+pub const PROCESSING_INPUT_DIRECTORY: &str = "/opt/ml/processing/input";
+/// See [`PROCESSING_INPUT_DIRECTORY`].
+pub const PROCESSING_OUTPUT_DIRECTORY: &str = "/opt/ml/processing/output";
+
 // The name one object carries under the directory its location is placed at is the ONE reading
 // every placement in this service takes of it (`super::s3_access::object_name_under`), reached
 // here through `use super::*`.

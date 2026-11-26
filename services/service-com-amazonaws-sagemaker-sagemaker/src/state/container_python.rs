@@ -319,11 +319,24 @@ pub fn program_stopped(bound: &str) -> String {
 ///
 /// `environment` is the job's own declared environment, which is what the program reads out of
 /// `os.environ` — nothing of this process's.
+///
+/// `aws` is the SEAM the program's own AWS SDK calls are dispatched on: a SageMaker container
+/// runs with the credentials of the job's execution role, so a program that builds a client
+/// and reads or writes Amazon S3 — the commonest thing a processing or training container's
+/// code does — makes that call AS that role. `None` is a run given no seam at all, for which
+/// such a call is refused by the SDK the run supplies rather than dispatched anywhere.
+///
+/// `directories` are the directories the PLATFORM creates in that storage before the
+/// entrypoint is invoked ([`super::container_run`] names which, per job kind): they exist for
+/// the program whether or not a file was placed in one, so a program that lists its input
+/// directory or writes into its output directory finds it there.
 #[must_use]
 pub fn run_python_container_program(
     program: &[String],
     environment: Option<&HashMap<String, String>>,
     files: &[(String, String)],
+    directories: &[String],
+    aws: Option<super::ContainerAwsAccess>,
 ) -> ContainerOutcome {
     let interpreter = python_interpreter(program).unwrap_or_default().to_string();
     let Some(form) = python_program(program) else {
@@ -331,7 +344,7 @@ pub fn run_python_container_program(
             reason: no_python_program(&interpreter),
         };
     };
-    let Some(event) = run_event(&interpreter, &form, files) else {
+    let Some(event) = run_event(&interpreter, &form, files, directories) else {
         return ContainerOutcome::NotPerformed {
             reason: INTERNAL_FAILURE_REASON.to_string(),
         };
@@ -395,10 +408,11 @@ pub fn run_python_container_program(
                         response_bytes: MAX_CONTAINER_PROGRAM_ANSWER_BYTES,
                         recursion_limit: MAX_CONTAINER_PROGRAM_RECURSION,
                     },
-                    // A job's container reaches no other service of this emulator from inside
-                    // its program: the run is given no seam to dispatch an AWS call on, and the
-                    // data it works over is what the service placed in its storage.
-                    aws: None,
+                    // The seam the program's own AWS SDK calls travel on: the job's execution
+                    // role's session, which is the credential a SageMaker container is given
+                    // (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` in a real one). A run handed
+                    // none dispatches nothing, and the SDK it was given says so.
+                    aws: aws.as_ref(),
                     // It is no Lambda durable execution's run either, so it takes no step of one
                     // and checkpoints nothing onto one.
                     durable: None,
@@ -428,13 +442,15 @@ pub fn run_python_container_program(
     }
 }
 
-/// The EVENT one run is handed: the program to run, its command line, and the files the
-/// container's storage holds before it runs. Every file travels as base64, so bytes that are
-/// not text reach the program exactly as the service placed them.
+/// The EVENT one run is handed: the program to run, its command line, the files the
+/// container's storage holds before it runs and the directories the platform created in it.
+/// Every file travels as base64, so bytes that are not text reach the program exactly as the
+/// service placed them.
 fn run_event(
     interpreter: &str,
     form: &PythonProgram,
     files: &[(String, String)],
+    directories: &[String],
 ) -> Option<String> {
     let held: ::serde_json::Map<String, ::serde_json::Value> = files
         .iter()
@@ -451,6 +467,7 @@ fn run_event(
         "source": form.source(),
         "arguments": form.arguments(),
         "files": held,
+        "directories": directories,
         "streamCharacters": MAX_CONTAINER_PROGRAM_STREAM_CHARACTERS,
     });
     ::serde_json::to_string(&event).ok()
@@ -684,12 +701,16 @@ class _Storage(object):
     """The container's own storage: the files the service placed in it, and the ones the
     program writes. Held in this run's own memory and nowhere else."""
 
-    def __init__(self, files, cwd):
+    def __init__(self, files, cwd, directories=()):
         self._files = {}
         self._directories = set(["/"])
         self._cwd = cwd
         for path in files:
             self.put(_path_of(path, cwd), files[path])
+        # The directories the PLATFORM creates before the entrypoint is invoked, which exist
+        # whether or not any file of the job's own data was placed in one.
+        for named in directories:
+            self._hold(_path_of(named, cwd))
         self._hold(cwd)
 
     def _hold(self, directory):
@@ -805,8 +826,99 @@ class _Storage(object):
                 matched.append(entry)
         return matched
 
+    def stat(self, named, **kept):
+        """What `os.stat` answers for a path of this tree: the kind and the size of what the
+        tree holds there, which is what a program asking about a path reads off it."""
+        path = self.path(named)
+        if path in self._files:
+            return _Stat(_FILE_MODE, len(self._files[path]))
+        if path in self._directories:
+            return _Stat(_DIRECTORY_MODE, 0)
+        raise FileNotFoundError(2, "No such file or directory", path)
+
+    def scandir(self, named="."):
+        """What `os.scandir` answers for a directory of this tree: one entry per name it
+        holds, which is how `pathlib` and the directory walks built on it read a directory."""
+        path = self.path(named)
+        return _Scan(
+            [_Entry(self, name, posixpath.join(path, name)) for name in self.names(path)]
+        )
+
     def entries(self):
         return dict(self._files)
+
+
+# The kind bits `os.stat` reports for a directory and for a regular file, which is what the
+# `stat` module's own predicates read (`S_ISDIR`, `S_ISREG`).
+_DIRECTORY_MODE = 0o040755
+_FILE_MODE = 0o100644
+
+
+class _Stat(object):
+    """What `os.stat` answers about one path of the container's storage."""
+
+    def __init__(self, mode, size):
+        self.st_mode = mode
+        self.st_size = size
+        self.st_nlink = 1
+        self.st_ino = 0
+        self.st_dev = 0
+        self.st_uid = 0
+        self.st_gid = 0
+        self.st_atime = 0.0
+        self.st_mtime = 0.0
+        self.st_ctime = 0.0
+
+
+class _Entry(object):
+    """One entry `os.scandir` answered: the name it holds, the path it is at, and what kind of
+    thing the tree holds there."""
+
+    def __init__(self, storage, name, path):
+        self.name = name
+        self.path = path
+        self._storage = storage
+
+    def __fspath__(self):
+        return self.path
+
+    def is_dir(self, follow_symlinks=True):
+        return self._storage.isdir(self.path)
+
+    def is_file(self, follow_symlinks=True):
+        return self._storage.isfile(self.path)
+
+    def is_symlink(self):
+        return False
+
+    def inode(self):
+        return 0
+
+    def stat(self, follow_symlinks=True):
+        return self._storage.stat(self.path)
+
+
+class _Scan(object):
+    """What `os.scandir` answers: an iterator over the entries of one directory, which a
+    caller may also use as a context manager the way the real one is used."""
+
+    def __init__(self, entries):
+        self._entries = iter(entries)
+
+    def __iter__(self):
+        return self._entries
+
+    def __next__(self):
+        return next(self._entries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *kept):
+        return False
+
+    def close(self):
+        return None
 
 
 class _Writer(object):
@@ -817,7 +929,7 @@ class _Writer(object):
         self._storage = storage
         self._path = path
         self._binary = binary
-        self._encoding = encoding or "utf-8"
+        self._encoding = _text_encoding(encoding)
         self._errors = errors or "strict"
         self._held = bytearray(storage.held(path) if append else b"")
         self.name = path
@@ -865,6 +977,21 @@ class _Writer(object):
         return False
 
 
+def _text_encoding(named):
+    """The codec a text file is read and written in: the one the caller named, and the
+    container's own otherwise.
+
+    A caller that named NONE leaves the encoding to the environment, and so does one that asked
+    for "locale" — the spelling the standard library passes down for exactly that (what
+    `io.text_encoding` answers when a caller named none, which is what `pathlib`'s own
+    `read_text` and `write_text` hand `open`). The container's environment is UTF-8, so both
+    mean UTF-8 here rather than a codec nothing provides.
+    """
+    if not named or named == "locale":
+        return "utf-8"
+    return named
+
+
 def _opener(storage):
     """`open` over the container's storage: the only filesystem the program sees."""
 
@@ -888,7 +1015,7 @@ def _opener(storage):
         held = storage.read(path)
         if binary:
             return io.BytesIO(held)
-        return io.StringIO(held.decode(encoding or "utf-8", errors or "strict"))
+        return io.StringIO(held.decode(_text_encoding(encoding), errors or "strict"))
 
     return open_file
 
@@ -911,6 +1038,14 @@ def _install(storage):
     os.replace = storage.rename
     os.walk = storage.walk
     os.getcwd = storage.cwd
+    # The readings a program reaches a path through besides `open` and `listdir`: `pathlib`
+    # and the directory walks built on it read a directory through `scandir`, and anything
+    # asking what kind of thing a path holds reads `stat`. They answer out of the SAME tree,
+    # so a program that walks its input directory with `pathlib` sees what one that lists it
+    # with `os.listdir` sees.
+    os.scandir = storage.scandir
+    os.stat = storage.stat
+    os.lstat = storage.stat
     os.path.exists = storage.exists
     os.path.lexists = storage.exists
     os.path.isfile = storage.isfile
@@ -930,7 +1065,9 @@ def _files_of(event):
 
 
 def run(event, context):
-    storage = _Storage(_files_of(event), _WORKING_DIRECTORY)
+    storage = _Storage(
+        _files_of(event), _WORKING_DIRECTORY, event.get("directories") or []
+    )
     _install(storage)
     _count_waits()
     limit = event["streamCharacters"]
@@ -1154,7 +1291,7 @@ mod tests {
                 .iter()
                 .map(|word| (*word).to_string())
                 .collect();
-            let outcome = run_python_container_program(&program, None, &inputs);
+            let outcome = run_python_container_program(&program, None, &inputs, &[], None);
             let ContainerOutcome::Performed {
                 status,
                 error_tail,
@@ -1200,7 +1337,7 @@ mod tests {
             .iter()
             .map(|word| (*word).to_string())
             .collect();
-        let outcome = run_python_container_program(&program, None, &[]);
+        let outcome = run_python_container_program(&program, None, &[], &[], None);
         let ContainerOutcome::NotPerformed { reason } = &outcome else {
             panic!("expected a program stopped on a bound, got {outcome:?}");
         };
@@ -1241,7 +1378,7 @@ mod tests {
             .iter()
             .map(|word| (*word).to_string())
             .collect();
-        let outcome = run_python_container_program(&program, None, &[]);
+        let outcome = run_python_container_program(&program, None, &[], &[], None);
         assert_eq!(
             outcome.failure_reason(),
             None,
@@ -1270,7 +1407,7 @@ mod tests {
         .iter()
         .map(|word| (*word).to_string())
         .collect();
-        let outcome = run_python_container_program(&program, Some(&environment), &[]);
+        let outcome = run_python_container_program(&program, Some(&environment), &[], &[], None);
         assert_eq!(
             outcome.failure_reason(),
             Some(algorithm_error("", 4)),

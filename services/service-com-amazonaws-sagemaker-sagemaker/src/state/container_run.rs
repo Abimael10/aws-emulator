@@ -328,20 +328,39 @@ pub fn performable_program(program: &[String]) -> Option<&str> {
 /// Two kinds of program are performed, and the choice is made on the program's own name: the
 /// PYTHON interpreter the SageMaker images provide, whose program is run in the contained
 /// interpreter this workspace embeds ([`super::container_python`]), and the session's own
-/// catalog of shell utilities. Either way this is pure computation over the caller's own words:
-/// no process is started, no host file is opened and no network is reached.
+/// catalog of shell utilities. Either way the program's own work is computation over the
+/// caller's own words: no process is started, no host file is opened and no socket is reached —
+/// an AWS call the program makes travels on the seam below, in process, and reaches this
+/// emulator's own services and nothing else.
 ///
 /// The CONTAINER is this call's own, whichever engine performs the program: the session below is
 /// constructed here and dropped when this call returns, the interpreter is stood up for the run
 /// and torn down with it, and the storage tree holds `inputs` and what this program wrote and
 /// nothing else. No state is carried between two calls, so one job's program can neither read
 /// nor name a file of another job's container.
+///
+/// `aws` is the SEAM an AWS SDK call the program itself makes is dispatched on, which is the
+/// session of the job's execution role ([`ContainerAwsAccess`]): a SageMaker container runs
+/// with that role's credentials, so a program that reads or writes Amazon S3 itself makes that
+/// call as that role. It reaches the engine that performs CODE; the shell session's catalog
+/// holds no program that makes one.
+///
+/// `directories` are the directories the SERVICE creates in that storage before the
+/// entrypoint is invoked, which EXIST for the program whether or not any file was placed in
+/// one: a processing job's declared `LocalPath`s — "this directory will be created by the
+/// platform and exist when your container's entrypoint is invoked"
+/// (`ProcessingS3Output$LocalPath`) — a training job's channel directories, and the model
+/// directory a training container writes its artifacts to. So a program that lists its input
+/// directory, or writes into its output directory, finds the directory the service promised it
+/// rather than one that is missing because the job's own data happened to be empty.
 #[must_use]
 pub fn run_container_program(
     program: &[String],
     image: &str,
     environment: Option<&HashMap<String, String>>,
     inputs: &[(String, String)],
+    directories: &[String],
+    aws: Option<ContainerAwsAccess>,
 ) -> ContainerOutcome {
     if program.is_empty() {
         return ContainerOutcome::NotPerformed {
@@ -355,6 +374,8 @@ pub fn run_container_program(
             program,
             environment,
             inputs,
+            directories,
+            aws,
         );
     }
     let Some(name) = performable_program(program) else {
@@ -436,16 +457,66 @@ pub async fn run_container_program_off_worker(
     image: &str,
     environment: Option<&HashMap<String, String>>,
     inputs: &[(String, String)],
+    directories: &[String],
+    aws: Option<ContainerAwsAccess>,
 ) -> Option<ContainerOutcome> {
     let program = program.to_vec();
     let image = image.to_string();
     let environment = environment.cloned();
     let inputs = inputs.to_vec();
+    let directories = directories.to_vec();
     ::tokio::task::spawn_blocking(move || {
-        run_container_program(&program, &image, environment.as_ref(), &inputs)
+        run_container_program(
+            &program,
+            &image,
+            environment.as_ref(),
+            &inputs,
+            &directories,
+            aws,
+        )
     })
     .await
     .ok()
+}
+
+/// What a job's container program reaches the rest of this emulator through: the seam an AWS
+/// SDK call the program makes is dispatched on, signed as the SESSION of the job's own
+/// execution role.
+///
+/// A SageMaker container is handed the execution role's credentials — "the Amazon Resource Name
+/// of an IAM role that Amazon SageMaker can assume to perform tasks on your behalf" — and the
+/// code inside it uses them: a processing script that reads its input from Amazon S3 or writes
+/// a report back with `boto3` is making an ordinary AWS call as that role. This is the ONE seam
+/// this workspace builds for work another service runs as a role
+/// (`…lambda…::state::function_sdk_access`), so such a call is authorized, answered and
+/// recorded by the service that serves it exactly as any other in-process call is.
+pub type ContainerAwsAccess =
+    ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::AwsAccess;
+
+/// The seam a job's container program running as `role_arn` is given
+/// ([`ContainerAwsAccess`]), or `None` where this process can dispatch no call at all — in
+/// which case the program is given no SDK rather than one signed by someone else.
+///
+/// It is built where the REQUEST's own context is, because the session is minted with that
+/// context's credential store and the call travels on that context's callback. The session is
+/// opened under the name SageMaker opens an execution role's session under
+/// ([`crate::state::EXECUTION_ROLE_SESSION`]), so the principal a service names when it
+/// refuses one of the container's calls is the same assumed-role session this service's own
+/// reads are authorized as ([`crate::state::s3_listing_refusal`]).
+#[must_use]
+pub fn container_aws_access<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<ContainerAwsAccess> {
+    ::service_com_amazonaws_lambda_awsgirapiservice::state::function_sdk_access(
+        engine,
+        ctx,
+        region,
+        role_arn,
+        crate::state::EXECUTION_ROLE_SESSION,
+    )
 }
 
 #[cfg(test)]
@@ -490,7 +561,7 @@ mod tests {
 
         for (case, program, expected) in rows {
             let words: Vec<String> = program.iter().map(|word| (*word).to_string()).collect();
-            let outcome = run_container_program(&words, IMAGE, None, &[]);
+            let outcome = run_container_program(&words, IMAGE, None, &[], &[], None);
             let ContainerOutcome::Performed {
                 status, error_tail, ..
             } = &outcome
@@ -539,7 +610,7 @@ mod tests {
             ),
         ];
         for (case, program, fragment) in rows {
-            let outcome = run_container_program(&program, IMAGE, None, &[]);
+            let outcome = run_container_program(&program, IMAGE, None, &[], &[], None);
             let ContainerOutcome::NotPerformed { reason } = &outcome else {
                 panic!("case {case:?}: expected nothing to be performed, got {outcome:?}");
             };
@@ -621,7 +692,7 @@ mod tests {
             .iter()
             .map(|word| (*word).to_string())
             .collect();
-        let outcome = run_container_program(&program, IMAGE, Some(&environment), &[]);
+        let outcome = run_container_program(&program, IMAGE, Some(&environment), &[], &[], None);
         assert_eq!(
             outcome.failure_reason(),
             Some(algorithm_error("", 4)),
@@ -646,7 +717,7 @@ mod tests {
         .iter()
         .map(|word| (*word).to_string())
         .collect();
-        let outcome = run_container_program(&program, IMAGE, None, &[]);
+        let outcome = run_container_program(&program, IMAGE, None, &[], &[], None);
         assert_eq!(
             outcome.failure_reason(),
             None,
@@ -743,13 +814,13 @@ mod tests {
             let words = |program: &[&'static str]| -> Vec<String> {
                 program.iter().map(|word| (*word).to_string()).collect()
             };
-            let first = run_container_program(&words(&row.first), IMAGE, None, &placed);
+            let first = run_container_program(&words(&row.first), IMAGE, None, &placed, &[], None);
             assert_eq!(
                 first.file("/opt/ml/model/first.txt").map(str::trim),
                 Some("private"),
                 "case {case:?}: the first run leaves what it wrote, got {first:?}"
             );
-            let second = run_container_program(&words(&row.second), IMAGE, None, &[]);
+            let second = run_container_program(&words(&row.second), IMAGE, None, &[], &[], None);
             assert_eq!(
                 second.file("/opt/ml/model/second.txt").map(str::trim),
                 Some("mine"),

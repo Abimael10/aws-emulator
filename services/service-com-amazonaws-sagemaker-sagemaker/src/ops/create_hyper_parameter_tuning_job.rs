@@ -860,6 +860,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &child.request.training_job_name,
                 &child.request,
+                // Each launched training job's container runs as that job's own execution
+                // role, which is the credential an AWS call its program makes is signed with.
+                crate::state::container_aws_access(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &child.request.role_arn,
+                ),
             )
             .await;
             let reported_at = ::std::time::SystemTime::now();

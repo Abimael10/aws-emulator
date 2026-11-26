@@ -3,7 +3,9 @@
 //! @op CreateProcessingJob
 //! IMPLEMENTED: registers a processing job in `crate::state` under its
 //! `ProcessingJobName`, minting the `ProcessingJobArn` from the request's region, after
-//! refusing a `RoleArn` SageMaker cannot assume (see `crate::state::admission`) and the
+//! refusing a `RoleArn` SageMaker cannot assume (see `crate::state::admission`), an input data
+//! source that names no object that role can list (`crate::state::unlistable_input_location`)
+//! and the
 //! request shapes the model's prose rules out, and applying the defaults it
 //! documents. The job is accepted in `InProgress`; the move out of it is owed by the
 //! clock (`crate::state::ProcessingJob::settle_status`) and materialised by
@@ -234,6 +236,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         validate_output_config(input.processing_output_config.as_ref())?;
         let processing_resources = resolve_resources(&input.processing_resources)?;
 
+        // The job's work READS the input data sources the request names, as the role it runs
+        // as, so each of those locations is settled SYNCHRONOUSLY here: a location that names
+        // no object the role can list backs no run of this job, and the create is refused for
+        // it rather than accepted into a job that could only fail. It is the same reading, and
+        // the same sentence, every create that resolves an input data source takes
+        // (`crate::state::unlistable_input_location`, which `CreateTrainingJob` asks per
+        // channel and `CreateTransformJob` per dataset), asked with no store guard held.
+        for source in input
+            .processing_inputs
+            .iter()
+            .flatten()
+            // An `AppManaged` input is downloaded by the application itself, so SageMaker
+            // resolves no location for it.
+            .filter(|named| !named.app_managed.unwrap_or(false))
+            .filter_map(|named| named.s3_input.as_ref())
+        {
+            if let Some(refusal) = crate::state::unlistable_input_location(
+                ctx,
+                &region,
+                &input.role_arn,
+                &source.s3_uri,
+            )
+            .await
+            {
+                return Err(refuse(refusal));
+            }
+        }
+
         let arn =
             crate::state::resource_arn(&region, "processing-job", &input.processing_job_name);
 
@@ -251,6 +281,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read from STS's and IAM's own records — other services' stores on the same engine
         // — BEFORE this service's store is reached.
         let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+        // The seam the container's own AWS SDK calls are dispatched on, built HERE where this
+        // request's context is: the SESSION of the job's execution role, which is the
+        // credential a SageMaker container is handed (see `crate::state::ContainerAwsAccess`).
+        let container_access = crate::state::container_aws_access(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.role_arn,
+        );
         // The environment the declared program is given: the job's own, and nothing of this
         // process's. Taken before the request's members are moved into the stored job.
         let environment = input.environment.clone();
@@ -375,6 +414,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &image_uri,
                     environment.as_ref(),
                     &placed,
+                    // The declared `LocalPath`s, which the platform creates before the
+                    // entrypoint is invoked (see `crate::state::processing_run`).
+                    &crate::state::processing_container_directories(
+                        declared_inputs.as_deref(),
+                        declared_outputs.as_ref(),
+                    ),
+                    // The container runs with the credentials of the job's execution role, so
+                    // an AWS call the program itself makes is made AS that role (see
+                    // `crate::state::ContainerAwsAccess`).
+                    container_access,
                 )
                 .await
             }

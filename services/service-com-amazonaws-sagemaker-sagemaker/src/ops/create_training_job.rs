@@ -706,8 +706,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_name: input.training_job_name.clone(),
             reported: false,
         };
-        let outcome =
-            crate::state::run_training_job(ctx, &region, &input.training_job_name, &input).await;
+        let outcome = crate::state::run_training_job(
+            ctx,
+            &region,
+            &input.training_job_name,
+            &input,
+            // The container runs with the credentials of the job's execution role, so an AWS
+            // call the algorithm's own program makes is made AS that role (see
+            // `crate::state::ContainerAwsAccess`).
+            crate::state::container_aws_access(&*self.engine, ctx, &region, &input.role_arn),
+        )
+        .await;
         recorder.report(outcome);
         drop(recorder);
 
