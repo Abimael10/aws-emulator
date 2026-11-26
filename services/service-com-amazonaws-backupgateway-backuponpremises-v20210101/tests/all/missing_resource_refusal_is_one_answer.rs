@@ -25,7 +25,10 @@
 //! `smithy_query(query="shape",shape="GatewayArn")`); then the same for the hypervisor end
 //! of the one operation whose own `errors` list declares no `ResourceNotFoundException`;
 //! then the tagging operations crossed with every resource type this service's ARNs can
-//! name, which is the one member that has to tell them apart.
+//! name, which is the one member that has to tell them apart; and last, those same
+//! operations crossed with resource-type segments this service has no resource type for at
+//! all — the one arm whose refusal keeps the status the modelled shape declares and names
+//! no kind of resource in an `ErrorCode`.
 
 use std::collections::BTreeSet;
 
@@ -495,5 +498,160 @@ async fn the_tagging_operations_answer_for_the_resource_type_the_arn_names() {
                 refused.body
             );
         }
+    }
+}
+
+/// The status `ResourceNotFoundException`'s own `@httpError` declares, which the refusal of
+/// an ARN naming a resource type this service has none of KEEPS
+/// (`smithy_query(query="operation",operation="TagResource")` lists the shape as
+/// `httpError: 404`); every resource type this service does name overrides it with 400.
+const MODELLED_NOT_FOUND_STATUS: u16 = 404;
+
+/// Resource-type segments this service has no resource type for — neither its
+/// `GATEWAY_RESOURCE_TYPE`, nor its `HYPERVISOR_RESOURCE_TYPE`, nor its
+/// `VIRTUAL_MACHINE_RESOURCE_TYPE` — each admitted by the modelled `ResourceArn` pattern,
+/// which accepts any non-empty `[a-zA-Z-0-9]+` in that segment
+/// (`smithy_query(query="operation",operation="TagResource")`).
+///
+/// The rows differ in the one thing the rule reads — that segment — rather than in the id
+/// or the region beside it: a type this service has no concept of, a type it names only as
+/// a concept, a type this service DOES name spelled in another case, one pluralised, one
+/// whose name merely begins with a modelled one, and a one-character type at each published
+/// bound of the modelled `@length(min: 50, max: 500)`
+/// (`smithy_query(query="shape",shape="ResourceArn")`).
+fn arns_of_types_this_service_has_none_of() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a type this service has no concept of",
+            arn_of("tape", "tp-1111111111111111"),
+        ),
+        (
+            "a type this service names only as a concept",
+            arn_of("activation-key", "ak-2222222222222222"),
+        ),
+        (
+            "a type this service does name, spelled in another case",
+            arn_of("Gateway", "bgw-3333333333333333"),
+        ),
+        (
+            "a type this service does name, pluralised",
+            arn_of("hypervisors", "hv-4444444444444444"),
+        ),
+        (
+            "a type whose name only begins with one this service names",
+            arn_of("vmfolder", "vmf-5555555555555555"),
+        ),
+        (
+            "a one-character type at the modelled 50-character minimum length",
+            arn_of_length(50),
+        ),
+        (
+            "a one-character type at the modelled 500-character maximum length",
+            arn_of_length(500),
+        ),
+    ]
+}
+
+/// The one arm the rule carves out, over the whole class and not one ARN: an ARN whose
+/// resource-type segment names no resource type this service has is refused with the status
+/// the modelled shape declares, with NO `ErrorCode` member — there is no kind of resource
+/// for a code to name — and with the one sentence that words the condition around the ARN
+/// asked for, the same from all three operations that can be handed such an ARN.
+#[tokio::test]
+async fn a_resource_type_this_service_has_none_of_keeps_the_status_the_shape_declares() {
+    let engine = build_engine();
+    let router = build_router(&engine);
+
+    for (case, arn) in arns_of_types_this_service_has_none_of() {
+        let expected = Refusal {
+            status: MODELLED_NOT_FOUND_STATUS,
+            shape: Some("ResourceNotFoundException".to_string()),
+            error_code: None,
+            message: format!("The resource '{arn}' was not found."),
+        };
+
+        let mut answers: Vec<(&str, Refusal)> = Vec::new();
+        for (operation, body) in tagging_requests(&arn) {
+            let refused = call(&router, operation, &body).await;
+            let answer = refusal_of(&refused);
+            assert_eq!(
+                answer, expected,
+                "case {case:?}: {operation} on an ARN of a resource type this service has \
+                 none of must answer {expected:?}, got {answer:?}"
+            );
+            assert!(
+                answer.error_code.is_none(),
+                "case {case:?}: {operation} must state no ErrorCode where no kind of \
+                 resource is named, got {answer:?}"
+            );
+            assert_ne!(
+                answer.shape.as_deref(),
+                Some("ValidationException"),
+                "case {case:?}: {operation} must not re-tell a missing resource as an \
+                 invalid parameter, got {answer:?}"
+            );
+            answers.push((operation, answer));
+        }
+
+        // Stated as the invariant too: a status or wording that drifted in only some of the
+        // three fails here even if the expectation above was updated with it.
+        let distinct: BTreeSet<&Refusal> = answers.iter().map(|(_, answer)| answer).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "case {case:?}: one condition must be answered one way by all three tagging \
+             operations, got {distinct:?}"
+        );
+    }
+}
+
+/// And the carve-out really is ONE arm rather than the answer for everything: the very same
+/// member, handed a resource this store holds, tags it and reads the pair back — before and
+/// after every refusal of the table above, none of which writes.
+#[tokio::test]
+async fn the_carve_out_leaves_the_resource_types_this_service_does_have_served() {
+    let engine = build_engine();
+    let router = build_router(&engine);
+
+    let gateway = create(&router, "gw-type-carve-out").await;
+    let hypervisor = import(&router, "hv-type-carve-out", "198.51.100.42").await;
+    let live = [("a gateway", &gateway), ("a hypervisor", &hypervisor)];
+
+    for (case, arn) in live {
+        let tagged = call(
+            &router,
+            "TagResource",
+            &json!({ "ResourceARN": arn, "Tags": [{ "Key": "env", "Value": "live" }] }),
+        )
+        .await;
+        assert_eq!(
+            tagged.status, 200,
+            "case {case:?}: TagResource on a resource this store holds must answer 200, got \
+             {} {:?}",
+            tagged.status, tagged.body
+        );
+    }
+
+    for (case, arn) in arns_of_types_this_service_has_none_of() {
+        for (operation, body) in tagging_requests(&arn) {
+            let refused = call(&router, operation, &body).await;
+            assert_eq!(
+                refused.status, MODELLED_NOT_FOUND_STATUS,
+                "case {case:?}: {operation} must still refuse the ARN, got {} {:?}",
+                refused.status, refused.body
+            );
+        }
+    }
+
+    for (case, arn) in live {
+        let listed = call(&router, "ListTagsForResource", &json!({ "ResourceArn": arn })).await;
+        assert_eq!(
+            (listed.status, listed.tags().get("env").map(String::as_str)),
+            (200, Some("live")),
+            "case {case:?}: the pair written before the refusals must still read back, got \
+             {} {:?}",
+            listed.status,
+            listed.body
+        );
     }
 }

@@ -164,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // machine against the clock exactly as `GetVirtualMachine` does — and an ARN with
         // no record behind it takes the refusal that resource type carries: the same
         // modelled `ResourceNotFoundException` shape throughout, answered 400 with the
-        // `ErrorCode` naming the resource type that was not found
+        // `ErrorCode` naming the resource type that was not found, and — for a resource
+        // type this service has none of, which only a member that takes ANY resource can
+        // carry — at the status the shape declares with no `ErrorCode`
         // (`crate::state::MissingResource`).
         let resolved = if in_request_region {
             state.resource_tags(&input.resource_arn, ::std::time::SystemTime::now())

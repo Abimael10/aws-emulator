@@ -3307,10 +3307,16 @@ pub enum DisassociationRefusal {
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.
 ///
-/// Every such refusal is the modelled `ResourceNotFoundException`, answered at HTTP 400 —
-/// the status AWS is recorded giving every client refusal of this service, whatever status
-/// the error shape's `@httpError` declares — and carrying the `ErrorCode` that names WHICH
-/// kind of resource was not found, paired with the fixed sentence AWS states for that kind.
+/// Every such refusal is the modelled `ResourceNotFoundException`. For each KIND of
+/// resource this service names, it is answered at HTTP 400 — the status AWS is recorded
+/// giving those client refusals, whatever status the error shape's `@httpError` declares —
+/// and carries the `ErrorCode` that names WHICH kind of resource was not found, paired with
+/// the fixed sentence AWS states for that kind. The one arm that names no kind of this
+/// service's resources at all ([`Self::Other`]) is the carve-out, not an omission: this
+/// service states no `ErrorCode` for it and no refusal of AWS's is recorded for it, so it
+/// keeps the status its error shape declares and carries no `ErrorCode` member —
+/// [`Self::status_override`] and [`Self::error_code`] both answer `None` for that one arm
+/// deliberately, and `tests/all/missing_resource_refusal_is_one_answer.rs` pins it.
 /// All three parts of a refusal — the status, the code and the sentence ([`Self::message`])
 /// — are read off this one value, so they cannot be chosen apart, and no handler composes a
 /// sentence of its own for an ARN it could not resolve.
