@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScheduledAudits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScheduledAudits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScheduledAudits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the account's scheduled audits: ONE PAGE of the records `CreateScheduledAudit`
+//! persisted ([`crate::state::ScheduledAudit`]), each projected as the members
+//! `ScheduledAuditMetadata` declares, in the store's own ascending order by name — which
+//! is what makes the `@paginated` boundary this listing issues meaningful.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +68,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The page size a `ListScheduledAudits` request that names no `maxResults` gets.
+///
+/// `ListScheduledAudits$maxResults` documents it: "The maximum number of results to
+/// return at one time. The default is 25."
+const DEFAULT_SCHEDULED_AUDIT_PAGE_SIZE: i32 = 25;
+
+/// The listing this operation's page markers belong to.
+///
+/// A scheduled-audit listing takes no filter, so the scope is the listing itself: a marker
+/// another listing of this service issued does not resume this one from the middle.
+const LISTING_SCOPE: &str = "scheduled-audits";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +151,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScheduledAudits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScheduledAuditsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScheduledAudits"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListScheduledAuditsErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let store = state.lock();
+        // The store IS keyed by the scheduled audit's name, so the listing's total order is
+        // that key's ascending order: `@paginated`, and a page boundary is only meaningful
+        // over a stable one.
+        let names: Vec<String> = store.scheduled_audits.keys().cloned().collect();
+
+        // One page of that order, resumed after the position the caller's own token names
+        // ([`crate::state::page_of`]) — the same paging every other `@paginated` listing of
+        // this service uses, so a token is read one way, and a token this listing did not
+        // issue is refused with the modelled `InvalidRequestException` ("The request is not
+        // valid", HTTP 400) rather than resuming another listing from the middle.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(resume_after) = crate::state::decode_page_marker(token, LISTING_SCOPE)
+                else {
+                    return Err(ListScheduledAuditsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "nextToken is not a token this listing issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                Some(resume_after)
+            }
+        };
+        // `maxResults` is "The maximum number of results to return at one time. The default
+        // is 25", which is the page size a request that names none gets; the clamp keeps a
+        // named one inside the modelled `MaxResults` range (1..250) without depending on a
+        // validation performed outside this module.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_SCHEDULED_AUDIT_PAGE_SIZE, |max_results| {
+                max_results.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+            }) as usize;
+        let (page, next_token) =
+            crate::state::page_of(names, LISTING_SCOPE, resume_after.as_deref(), page_size);
+
+        // Each entry is projected from the stored record, so what a listing reports and
+        // what `DescribeScheduledAudit` reports cannot drift. An account holding no
+        // scheduled audit is answered an EMPTY list, not an absent one.
+        Ok(ListScheduledAuditsOutput {
+            scheduled_audits: Some(
+                page.into_iter()
+                    .filter_map(|scheduled_audit_name| {
+                        store
+                            .scheduled_audits
+                            .get(&scheduled_audit_name)
+                            .map(crate::state::ScheduledAudit::to_metadata)
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

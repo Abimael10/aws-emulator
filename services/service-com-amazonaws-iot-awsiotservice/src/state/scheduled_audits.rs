@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ops::types::DescribeScheduledAuditOutput;
+use crate::ops::types::{DescribeScheduledAuditOutput, ScheduledAuditMetadata};
 
 /// How many scheduled audits this emulator keeps for the account.
 ///
@@ -221,6 +221,24 @@ impl ScheduledAudit {
             target_check_names: Some(self.target_check_names.clone()),
             scheduled_audit_name: Some(self.scheduled_audit_name.clone()),
             scheduled_audit_arn: Some(self.scheduled_audit_arn.clone()),
+        }
+    }
+
+    /// The record as a listing of the account's scheduled audits reports it.
+    ///
+    /// `ScheduledAuditMetadata` is "Information about the scheduled audit"
+    /// (`smithy_query(query="shape",shape="ScheduledAuditMetadata")`) and declares the
+    /// name, the ARN, the frequency and the day the schedule names — and NOT the checks it
+    /// targets, which only the single-audit reader reports. Every member is projected from
+    /// this same stored record, so a listing and a `DescribeScheduledAudit` of one name
+    /// cannot disagree.
+    pub fn to_metadata(&self) -> ScheduledAuditMetadata {
+        ScheduledAuditMetadata {
+            scheduled_audit_name: Some(self.scheduled_audit_name.clone()),
+            scheduled_audit_arn: Some(self.scheduled_audit_arn.clone()),
+            frequency: Some(self.frequency.clone()),
+            day_of_month: self.day_of_month.clone(),
+            day_of_week: self.day_of_week.clone(),
         }
     }
 }
