@@ -242,8 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // A DELETED cluster is still a cluster: "Clusters with an INACTIVE status may
             // remain discoverable in your account for a period of time", so its tombstone
-            // is described rather than reported as a MISSING failure.
-            match guard.clusters.get(&name) {
+            // is described rather than reported as a MISSING failure. A cluster of ANOTHER
+            // Region is not one this endpoint holds at all — Amazon ECS is regional — so a
+            // name only another Region holds is reported as the missing cluster it is here,
+            // under the ARN this Region would carry for it.
+            match guard.cluster(&region, &name) {
                 Some(cluster) => clusters.push(guard.cluster_view(cluster, fields)),
                 None => failures.push(crate::state::missing_failure(
                     &crate::state::cluster_arn(&region, &name),

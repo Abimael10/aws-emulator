@@ -219,6 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        // Amazon ECS is regional, so the cluster this listing reads is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
@@ -231,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only a reference that resolves to NO record at all leaves the listing nothing to
         // answer about, which is what `ClusterNotFoundException` states
         // ([`crate::state::holds_cluster`], the check `DescribeServices` makes too).
-        if !guard.holds_cluster(&cluster_name) {
+        if !guard.holds_cluster(&region, &cluster_name) {
             return Err(ListServicesErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),

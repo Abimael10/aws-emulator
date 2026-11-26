@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only a reference that resolves to no record at all leaves nothing to report on,
         // which is what `ClusterNotFoundException` states
         // ([`crate::state::holds_cluster`]).
-        if !guard.holds_cluster(&cluster_name) {
+        if !guard.holds_cluster(&region, &cluster_name) {
             return Err(
                 DescribeContainerInstancesErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {

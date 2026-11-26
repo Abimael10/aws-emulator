@@ -135,7 +135,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             let cluster_arn = self
                 .container_instances
                 .get(&arn)
-                .and_then(|instance| self.clusters.get(&instance.cluster_name))
+                // The instance's own ARN carries the Region it was registered in, which is
+                // the Region its cluster lives in ([`super::cluster_region_of_arn`]).
+                .and_then(|instance| {
+                    self.cluster(
+                        super::cluster_region_of_arn(&instance.arn),
+                        &instance.cluster_name,
+                    )
+                })
                 .map(|cluster| cluster.arn.clone());
             let detail = container_instance_state_change_detail(&view, cluster_arn, at);
             observed.push((

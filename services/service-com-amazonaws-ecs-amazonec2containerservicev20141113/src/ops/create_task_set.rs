@@ -391,11 +391,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.advance_clock(now);
         guard.record_subnet_placements(placements);
 
-        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+        let Some(cluster) = guard.active_cluster(&region, &cluster_name) else {
             return Err(CreateTaskSetErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )
@@ -643,7 +643,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has none either, the task set runs on the EC2 capacity registered to it.
         let effective_strategy = if requested_strategy.is_empty() {
             guard
-                .active_cluster(&cluster_name)
+                .active_cluster(&region, &cluster_name)
                 .map(|cluster| cluster.default_capacity_provider_strategy.clone())
                 .unwrap_or_default()
         } else {

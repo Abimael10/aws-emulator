@@ -177,6 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+        // Amazon ECS is regional, so the cluster this call acts in is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         // The settings and the configuration are checked the same way whichever
         // operation carries them.
@@ -207,20 +210,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A deleted cluster is not one this operation may act in ("The cluster has been
         // deleted"), so a tombstone is refused under the same error code a name that
         // never existed earns — with the sentence that says it is still there, inactive.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(UpdateClusterErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )
             .into());
         }
-        let cluster = guard
-            .clusters
-            .get_mut(&cluster_name)
-            .expect("the active cluster was just found in the store");
+        // The record to write, resolved under the SAME Region and name the liveness check
+        // above resolved — and answered with that same refusal rather than a panic for a
+        // caller-supplied Region that names no cluster of this endpoint.
+        let Some(cluster) = guard.cluster_mut(&region, &cluster_name) else {
+            return Err(UpdateClusterErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
 
         // Each member of the request is a field of the cluster this call SETS; a member
         // the request omits leaves the stored value where it was.

@@ -752,11 +752,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The sentence the refusal carries is read off the cluster's OWN stored state —
         // a deleted record is still there and reported as inactive, a name that resolves
         // to nothing as not found — so a client can tell the two apart.
-        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+        let Some(cluster) = guard.active_cluster(&region, &cluster_name) else {
             return Err(CreateServiceErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

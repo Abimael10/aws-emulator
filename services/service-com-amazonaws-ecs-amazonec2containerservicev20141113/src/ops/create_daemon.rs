@@ -355,11 +355,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+        let Some(cluster) = guard.active_cluster(&region, &cluster_name) else {
             return Err(CreateDaemonErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

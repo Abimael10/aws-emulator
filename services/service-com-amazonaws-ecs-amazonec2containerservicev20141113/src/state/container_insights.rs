@@ -192,22 +192,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // A series of a cluster or a service this store no longer holds reports nothing more,
         // so what it last reported is forgotten with it ([`super::container_usage`]).
         self.prune_insights_baselines();
-        let cluster_names: Vec<String> = self
+        // Each cluster is taken with the Region it is held under, so the write-back below
+        // reaches the same record this pass read ([`super::cluster_scope`]).
+        let cluster_keys: Vec<(String, String)> = self
             .clusters
-            .values()
-            .filter(|cluster| self.container_insights_on(cluster))
-            .filter(|cluster| {
+            .iter()
+            .filter(|(_, cluster)| self.container_insights_on(cluster))
+            .filter(|(_, cluster)| {
                 let spacing_elapsed = cluster
                     .insights_published_at
                     .is_none_or(|last| now.duration_since(last).unwrap_or_default() >= PUBLISH_SPACING);
                 spacing_elapsed
                     || cluster.insights_published_tally != Some(self.cluster_insights_tally(&cluster.name))
             })
-            .map(|cluster| cluster.name.clone())
+            .map(|(key, _)| key.clone())
             .collect();
         let mut published = Vec::new();
         let mut collected: Vec<ClusterPerformance> = Vec::new();
-        for cluster_name in cluster_names {
+        for (cluster_region, cluster_name) in cluster_keys {
             let tally = self.tally(&cluster_name);
             let instances = self.registered_container_instances(&cluster_name);
             let mut counts: Vec<(BTreeMap<String, String>, &str, f64, &str)> = Vec::new();
@@ -385,7 +387,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     None => cluster_telemetry.push(document),
                 }
             }
-            if let Some(cluster) = self.clusters.get_mut(&cluster_name) {
+            if let Some(cluster) = self.cluster_mut(&cluster_region, &cluster_name) {
                 cluster.insights_published_at = Some(now);
                 cluster.insights_published_tally =
                     Some((tally.running, tally.active_services, instances));

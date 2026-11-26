@@ -235,11 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The agent plane states a missing cluster with the same fixed sentence every
         // cluster-resolving operation does, under the error code this operation answers
         // it with.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(SubmitContainerStateChangeErrorModeled::ClientException(
                 ClientException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

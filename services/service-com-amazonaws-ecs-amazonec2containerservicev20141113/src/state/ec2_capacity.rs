@@ -432,8 +432,9 @@ fn apply_registrations(
 ) {
     let mut registered_into: Vec<String> = Vec::new();
     for registration in registrations {
-        // An agent configured for a cluster the account does not hold registers nowhere.
-        if !store.has_active_cluster(&registration.cluster_name) {
+        // An agent configured for a cluster the account does not hold in the instance's own
+        // Region registers nowhere: a cluster belongs to the Region it was created in.
+        if !store.has_active_cluster(&registration.region, &registration.cluster_name) {
             continue;
         }
         let existing = store

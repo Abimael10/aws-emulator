@@ -382,7 +382,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::RequestedClusterArguments`]). A DELETED cluster is only a
         // tombstone, though ("The cluster has been deleted"), so its name is free again
         // and this call creates a new, ACTIVE cluster over it.
-        if let Some(existing) = guard.clusters.get(&name) {
+        if let Some(existing) = guard.cluster(&region, &name) {
             if existing.status != crate::state::CLUSTER_INACTIVE {
                 if let Some(message) = requested_arguments.inconsistency(existing) {
                     return Err(CreateClusterErrorModeled::InvalidParameterException(
@@ -399,10 +399,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     payload: CreateClusterOutput {
                         cluster: Some(view),
                     },
-                    cluster_count: guard.cluster_count_for(&name),
+                    cluster_count: guard.cluster_count_for(&region, &name),
                     member: &CLUSTER_COUNT_MEMBER,
                 });
             }
+        // The whole `clusters` map, every Region's clusters together, is what the bound is
+        // over: the Region a call is signed for adds a KEY to that one budget and never a
+        // budget of its own, so a caller that varies the Region cannot grow the store past
+        // [`crate::state::MAX_CLUSTERS`] records.
         } else if guard.clusters.len() >= crate::state::MAX_CLUSTERS {
             return Err(CreateClusterErrorModeled::ClientException(ClientException {
                 message: Some(format!(
@@ -460,11 +464,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.start_attachments_update(now);
         }
         let view = guard.cluster_mutation_view(&record, true);
-        guard.clusters.insert(name.clone(), record);
+        // The only growth of the cluster map, and it is reached only past the bound checked
+        // above, so this insert is capped however many Regions a caller signs its calls for.
+        guard.insert_cluster(&region, record);
 
         // `clusterCount` is read AFTER the create landed, so it counts the cluster this
         // call just added.
-        let cluster_count = guard.cluster_count_for(&name);
+        let cluster_count = guard.cluster_count_for(&region, &name);
         // A create that ASSOCIATES capacity providers is what gives a managed-scaling
         // provider the cluster it reserves capacity for, so the target-tracking policy
         // Amazon ECS manages for such a provider follows this call exactly as it follows a

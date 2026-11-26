@@ -221,11 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the agent reports into has to be one this account holds, and this operation
         // models no cluster-specific error, so a cluster that is not there is the client
         // error for an identifier that names nothing.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(DiscoverPollEndpointErrorModeled::ClientException(
                 ClientException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

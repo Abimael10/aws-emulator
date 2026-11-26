@@ -216,6 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under a cluster that IS there and names no stored revision is the `MISSING`
         // failure below ([`crate::state::names_a_missing_cluster`]).
         if guard.names_a_missing_cluster(
+            &crate::state::request_region(_ctx),
             input.service_revision_arns.iter().map(String::as_str),
             crate::state::SERVICE_REVISION_RESOURCE_TYPE,
         ) {

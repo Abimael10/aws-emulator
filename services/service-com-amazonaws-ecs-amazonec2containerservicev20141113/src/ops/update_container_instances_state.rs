@@ -291,12 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The short name or full Amazon Resource Name (ARN) of the cluster that hosts the
         // container instance to update": a cluster this account does not hold hosts none,
         // and the sentence is selected by the stored record as it is everywhere else.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(
                 UpdateContainerInstancesStateErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
                         message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
+                            guard.cluster(&region, &cluster_name),
                         )),
                     },
                 )

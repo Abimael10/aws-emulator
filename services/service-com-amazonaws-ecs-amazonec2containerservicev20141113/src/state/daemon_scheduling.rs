@@ -608,9 +608,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// when it is not there — `ClusterNotFoundException`, the refusal every cluster-scoped
     /// operation of this service answers ([`cluster_refusal_message`]). A pure read of one
     /// daemon takes the ARN as the whole identifier instead ([`Self::daemon_from_arn`]).
-    pub fn daemon_arn_cluster_refusal(&self, reference: &str) -> Option<String> {
+    pub fn daemon_arn_cluster_refusal(&self, region: &str, reference: &str) -> Option<String> {
         let (cluster_name, _) = Self::daemon_arn_parts(reference)?;
-        (!self.has_active_cluster(&cluster_name)).then_some(cluster_name)
+        // "Amazon ECS daemons are cluster specific and Region specific": the cluster is
+        // resolved in the Region the request was addressed to, which is the only Region's
+        // clusters this endpoint holds.
+        (!self.has_active_cluster(region, &cluster_name)).then_some(cluster_name)
     }
 
     /// The stored daemon a `daemonArn` names, or `None` when no daemon of this account

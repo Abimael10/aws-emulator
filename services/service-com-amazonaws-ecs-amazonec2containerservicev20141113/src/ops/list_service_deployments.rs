@@ -299,11 +299,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        if !guard.has_active_cluster(&cluster_name) {
+        // Amazon ECS is regional, so the cluster this listing reads is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(ListServiceDeploymentsErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

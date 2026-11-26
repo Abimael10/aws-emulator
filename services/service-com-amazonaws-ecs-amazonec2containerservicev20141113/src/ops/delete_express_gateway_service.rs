@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteExpressGatewayServiceErrorModeled::ServerException(ServerException {
@@ -175,6 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
+        // Amazon ECS is regional, so the cluster the `serviceArn` names is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -186,10 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => String::new(),
         };
         let cluster_message =
-            crate::state::cluster_refusal_message(guard.clusters.get(&referenced_cluster));
+            crate::state::cluster_refusal_message(guard.cluster(&region, &referenced_cluster));
 
         let stored = guard
-            .express_gateway_service_mut(&input.service_arn)
+            .express_gateway_service_mut(&region, &input.service_arn)
             .map_err(|refusal| match refusal {
                 crate::state::ExpressGatewayRefusal::ClusterNotFound => {
                     DeleteExpressGatewayServiceErrorModeled::ClusterNotFoundException(

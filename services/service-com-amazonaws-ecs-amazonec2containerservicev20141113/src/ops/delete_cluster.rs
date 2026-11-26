@@ -227,11 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+        // Amazon ECS is regional, so the cluster this call deletes is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        let Some(stored) = guard.clusters.get(&cluster_name).cloned() else {
+        let Some(stored) = guard.cluster(&region, &cluster_name).cloned() else {
             return Err(DeleteClusterErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
@@ -249,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 payload: DeleteClusterOutput {
                     cluster: Some(view),
                 },
-                cluster_count: guard.cluster_count_for(&cluster_name),
+                cluster_count: guard.cluster_count_for(&region, &cluster_name),
                 member: &CLUSTER_COUNT_MEMBER,
             });
         }
@@ -259,8 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before they can be updated." The delete is refused until the update lands,
         // which is what `UpdateInProgressException` is modelled here for.
         if guard
-            .clusters
-            .get(&cluster_name)
+            .cluster(&region, &cluster_name)
             .is_some_and(crate::state::ClusterRecord::attachments_updating)
         {
             return Err(DeleteClusterErrorModeled::UpdateInProgressException(
@@ -342,10 +344,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .retain(|_, instance| instance.cluster_name != cluster_name);
         // The cluster itself is KEPT as a tombstone: "Clusters with an INACTIVE status
         // may remain discoverable in your account for a period of time."
-        let record = guard
-            .clusters
-            .get_mut(&cluster_name)
-            .expect("the cluster was just found in the store");
+        // The record to tombstone, resolved under the SAME Region and name the lookup above
+        // resolved — and answered with the refusal a cluster this endpoint does not hold
+        // earns rather than a panic.
+        let Some(record) = guard.cluster_mut(&region, &cluster_name) else {
+            return Err(DeleteClusterErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
         record.status = crate::state::CLUSTER_INACTIVE.to_string();
         let record = record.clone();
         // `DeleteCluster` takes neither `tags` nor an `include`, so the response reports
@@ -354,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clusterCount` is read AFTER the delete landed, so the cluster this call
         // deleted is no longer counted: a tombstone is not a live cluster.
-        let cluster_count = guard.cluster_count_for(&cluster_name);
+        let cluster_count = guard.cluster_count_for(&region, &cluster_name);
         // A provider the deleted cluster was the association of reserves capacity for no
         // cluster any more, so the target-tracking policy Amazon ECS managed for it goes with
         // the cluster ([`crate::state::settle_managed_scaling_policies`]). Taken with this

@@ -313,6 +313,11 @@ pub use task_overrides::*;
 /// The whole in-memory store: every operation's reads and writes against the maps below.
 mod store;
 
+/// Which Region's clusters an endpoint resolves: the `(region, clusterName)` key the
+/// cluster map is held under and the accessors every cluster lookup goes through.
+mod cluster_scope;
+pub use cluster_scope::*;
+
 /// The deployment circuit breaker: the failed launches it counts for a rollout, the
 /// terminal `FAILED` it moves that rollout to, and the rollback it starts.
 mod circuit_breaker;
@@ -932,8 +937,11 @@ pub const MAX_NAME_LENGTH: usize = 255;
 /// records for an operator-initiated stop.
 pub const DEFAULT_STOPPED_REASON: &str = "Task stopped by user";
 
-/// How many clusters this emulator holds. EMULATOR-CHOSEN, so a caller cannot grow the
-/// in-memory store without limit.
+/// How many clusters this emulator holds, across EVERY Region together. EMULATOR-CHOSEN, so
+/// a caller cannot grow the in-memory store without limit — and counted over the whole map
+/// rather than per Region, so a caller that varies the Region its calls are signed for adds a
+/// key to the same budget rather than a budget of its own
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_capacity_reached`]).
 pub const MAX_CLUSTERS: usize = 64;
 
 /// How many task-definition revisions this emulator holds, across every family.
@@ -4613,8 +4621,18 @@ impl TaskRecord {
 /// Per-service state for com-amazonaws-ecs-amazonec2containerservicev20141113. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
-    /// `clusterName` -> the cluster.
-    pub clusters: HashMap<String, ClusterRecord>,
+    /// `(region, clusterName)` -> the cluster.
+    ///
+    /// A cluster is a REGIONAL resource of Amazon ECS — "Amazon ECS clusters are Region
+    /// specific", it is created against one Region's endpoint and every ARN that endpoint
+    /// reports carries that Region — so the Region is part of the key, exactly as it is for
+    /// `task_definitions`: one cluster name is a cluster of each Region separately, a cluster
+    /// created in one Region resolves in that Region alone, and the clusters of one Region are
+    /// the only ones its listings report. Reached through
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster`] and the accessors
+    /// beside it, so no caller assembles the key itself and none of them can read across
+    /// Regions.
+    pub clusters: HashMap<(String, String), ClusterRecord>,
     /// `capacityProviderName` -> the capacity provider. Provider names are unique within
     /// the account ("The name of the capacity provider" identifies it, and a
     /// `capacityProviderStrategy` entry names one by that name alone), which is exactly

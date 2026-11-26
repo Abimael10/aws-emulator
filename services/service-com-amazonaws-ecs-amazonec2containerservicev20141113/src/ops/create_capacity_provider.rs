@@ -405,12 +405,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused too — as the inactive cluster it is, which is what tells it apart from a
         // name that never existed.
         if let Some(cluster_name) = cluster_name.as_deref() {
-            if !guard.has_active_cluster(cluster_name) {
+            if !guard.has_active_cluster(&region, cluster_name) {
                 return Err(
                     CreateCapacityProviderErrorModeled::ClusterNotFoundException(
                         ClusterNotFoundException {
                             message: Some(crate::state::cluster_refusal_message(
-                                guard.clusters.get(cluster_name),
+                                guard.cluster(&region, cluster_name),
                             )),
                         },
                     )

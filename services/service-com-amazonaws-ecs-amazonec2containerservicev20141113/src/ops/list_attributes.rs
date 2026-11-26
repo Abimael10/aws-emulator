@@ -229,17 +229,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        // Amazon ECS is regional, so the cluster this listing reads is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         // Nothing this listing reports moves on the clock — an attribute is written by
         // the call that reports the resource carrying it — so this read takes the store
         // as it stands.
         let guard = state.lock();
 
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(ListAttributesErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

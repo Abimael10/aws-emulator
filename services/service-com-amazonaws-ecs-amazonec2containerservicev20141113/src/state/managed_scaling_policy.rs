@@ -204,14 +204,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// is the group's and so is shared, which is why Amazon ECS publishes the reservation per
     /// `(provider, cluster)` pair and a provider is meant to back one cluster's capacity.
     fn capacity_provider_cluster(&self, provider: &CapacityProviderRecord) -> Option<String> {
+        // The provider's own ARN carries the Region it was created in, and a cluster belongs
+        // to the Region it was created in, so the cluster behind a provider is one of that
+        // Region's ([`super::cluster_region_of_arn`]).
+        let region = super::cluster_region_of_arn(&provider.arn);
         if let Some(cluster) = provider.cluster.as_deref() {
             return self
-                .has_active_cluster(cluster)
+                .has_active_cluster(region, cluster)
                 .then(|| cluster.to_string());
         }
         let mut associated: Vec<&str> = self
-            .clusters
-            .values()
+            .clusters_of_region(region)
             .filter(|cluster| cluster.status == CLUSTER_ACTIVE)
             .filter(|cluster| {
                 cluster

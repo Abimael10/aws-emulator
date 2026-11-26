@@ -287,12 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A deleted cluster is not one this operation may act in ("The cluster has been
         // deleted"), so a tombstone is refused under the same error code a name that
         // never existed earns — with the sentence that says it is still there, inactive.
-        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+        let Some(cluster) = guard.active_cluster(&region, &cluster_name) else {
             return Err(
                 PutClusterCapacityProvidersErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
                         message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
+                            guard.cluster(&region, &cluster_name),
                         )),
                     },
                 )
@@ -393,10 +393,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let cluster = guard
-            .clusters
-            .get_mut(&cluster_name)
-            .expect("the cluster was just read out of the map under this lock");
+        // The record to write, resolved under the SAME Region and name the lookup above
+        // resolved — and answered with the refusal a cluster this endpoint does not hold
+        // earns rather than a panic.
+        let Some(cluster) = guard.cluster_mut(&region, &cluster_name) else {
+            return Err(
+                PutClusterCapacityProvidersErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
         // "You must specify both the available capacity providers and a default capacity
         // provider strategy for the cluster": what the request carries REPLACES the
         // association, rather than being merged into it.

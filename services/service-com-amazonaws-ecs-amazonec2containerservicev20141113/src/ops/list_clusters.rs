@@ -2,10 +2,14 @@
 
 //! @op ListClusters
 //!
-//! Reports the ARNs of the clusters STORED for this account.
+//! Reports the ARNs of the clusters STORED for this account in the Region the request was
+//! addressed to.
 //!
 //! Every ARN comes from the `clusters` map in [`crate::state`] — the records
-//! `CreateCluster` wrote — in a total order, paged at `maxResults`. A cluster
+//! `CreateCluster` wrote, keyed by the Region that created them — in a total order, paged at
+//! `maxResults`. Amazon ECS is a REGIONAL service ("Amazon ECS clusters are Region
+//! specific"), so this endpoint reports its own Region's clusters and none of any other's. A
+//! cluster
 //! `DeleteCluster` tombstoned is NOT one of the account's existing clusters: the
 //! operation "Returns a list of existing clusters" and the `Cluster$status` doc reads
 //! `INACTIVE` as "The cluster has been deleted", so a tombstone is left to the readers
@@ -177,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListClustersErrorModeled::ServerException(ServerException {
@@ -219,13 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // authenticated under this store's own secret ([`crate::state::page_tokens`]): it
         // discloses no cluster of the account, and a value this listing never minted names
         // no page — the bad parameter it is, rather than some insertion point in the
-        // sequence.
+        // sequence. The position is a cluster ARN, so a cursor whose Region is not this
+        // endpoint's names a cluster of a Region this listing does not walk and names no page
+        // of it either ([`crate::state::names_another_region`]).
+        let region = crate::state::request_region(ctx);
         let page_scope = crate::state::listing_scope(Self::NAME, &[]);
         let token_key = guard.page_token_key();
         let resume_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                match crate::state::decode_page_token(&token_key, &page_scope, token) {
+                match crate::state::decode_page_token(&token_key, &page_scope, token)
+                    .filter(|cursor| !crate::state::names_another_region(cursor, &region))
+                {
                     Some(cursor) => Some(cursor),
                     None => {
                         return Err(ListClustersErrorModeled::InvalidParameterException(
@@ -239,12 +248,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "Returns a list of existing clusters" — every stored cluster the caller has not
-        // deleted, which is what `crate::state`'s `active_cluster` means by a cluster an
-        // operation may act in.
+        // "Returns a list of existing clusters" — every stored cluster of THIS endpoint's
+        // Region that the caller has not deleted. Amazon ECS is regional ("Amazon ECS
+        // clusters are Region specific"), so a cluster created against another Region's
+        // endpoint is not one this listing reports, and every ARN it answers carries the
+        // Region the request was addressed to ([`crate::state::request_region`]); which of
+        // this Region's clusters still EXIST is what `crate::state`'s `active_cluster` means
+        // by a cluster an operation may act in.
         let mut matching: Vec<String> = guard
-            .clusters
-            .values()
+            .clusters_of_region(&region)
             .filter(|cluster| cluster.status != crate::state::CLUSTER_INACTIVE)
             .map(|cluster| cluster.arn.clone())
             .collect();

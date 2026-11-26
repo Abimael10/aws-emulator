@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // went with the delete, so each id comes back as a `MISSING` failure below. Only a
         // reference that resolves to no record at all leaves nothing to report on, which is
         // what `ClusterNotFoundException` states ([`crate::state::holds_cluster`]).
-        if !guard.holds_cluster(&cluster_name) {
+        if !guard.holds_cluster(&region, &cluster_name) {
             return Err(DescribeTasksErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),

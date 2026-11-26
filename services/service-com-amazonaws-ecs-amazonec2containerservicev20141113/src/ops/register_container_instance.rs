@@ -371,11 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "this cluster is gone". Which SENTENCE that class carries is selected by the
         // stored record, exactly as it is for the operations that answer the
         // cluster-specific error.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(
                 RegisterContainerInstanceErrorModeled::ClientException(ClientException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 })
                 .into(),

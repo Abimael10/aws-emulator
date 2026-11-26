@@ -178,6 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        // Amazon ECS is regional, so the cluster this call acts in is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         // The state each entry reports is one the agent plane accepts: Amazon ECS takes the
@@ -206,11 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster holds, so the cluster is resolved first. The agent plane states a
         // missing cluster with the same fixed sentence every cluster-resolving operation
         // does, under the error code this operation answers it with.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(
                 SubmitAttachmentStateChangesErrorModeled::ClientException(ClientException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 })
                 .into(),

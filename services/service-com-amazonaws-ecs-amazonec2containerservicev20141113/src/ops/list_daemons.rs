@@ -231,6 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster_arn.as_deref());
+        // Amazon ECS is regional ("Amazon ECS daemons are cluster specific and Region
+        // specific"), so the cluster this listing reads is the one of THIS endpoint's Region.
+        let region = crate::state::request_region(ctx);
         // The filter is a caller-supplied list, so it is bounded HERE, before the set it
         // is read into is built: the daemons of one cluster deploy onto the providers that
         // cluster holds, which are at most this many.
@@ -274,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set of cluster ARNs, some of them since deleted, completes. A reference that is
         // not a cluster ARN at all (a bare name) names no cluster to filter by, and keeps
         // the cluster-resolution refusal every other cluster-scoped read answers.
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             let filtered_by_arn = input
                 .cluster_arn
                 .as_deref()
@@ -283,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(ListDaemonsErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
                         message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
+                            guard.cluster(&region, &cluster_name),
                         )),
                     },
                 )

@@ -179,6 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+        // Amazon ECS is regional, so the cluster this call acts in is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         if let Err(message) = crate::state::validate_cluster_settings(&input.settings) {
             return Err(
@@ -199,8 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // STATE rather than its absence, and it is reported as the state error it is —
         // not as the not-found refusal a name this account never held earns.
         if guard
-            .clusters
-            .get(&cluster_name)
+            .cluster(&region, &cluster_name)
             .is_some_and(|cluster| cluster.status != crate::state::CLUSTER_ACTIVE)
         {
             return Err(UpdateClusterSettingsErrorModeled::ClientException(
@@ -210,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(
                 UpdateClusterSettingsErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
@@ -220,10 +222,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        let cluster = guard
-            .clusters
-            .get_mut(&cluster_name)
-            .expect("the active cluster was just found in the store");
+        // The record to write, resolved under the SAME Region and name the liveness check
+        // above resolved — and answered with that same refusal rather than a panic for a
+        // caller-supplied Region that names no cluster of this endpoint.
+        let Some(cluster) = guard.cluster_mut(&region, &cluster_name) else {
+            return Err(
+                UpdateClusterSettingsErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
 
         // A cluster whose attachments are mid-update cannot be updated: the busy-state
         // refusal `UpdateInProgressException` is what this operation models for it.

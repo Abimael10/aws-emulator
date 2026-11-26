@@ -938,12 +938,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// and their own open issues, so they adopt this call as those are fixed rather than
     /// having their answers changed from here.
     pub fn ensure_default_cluster(&mut self, region: &str) {
-        if self.clusters.contains_key(DEFAULT_CLUSTER_NAME) {
+        if self.cluster(region, DEFAULT_CLUSTER_NAME).is_some() {
+            return;
+        }
+        // The store holds at most [`MAX_CLUSTERS`] clusters across every Region together, so
+        // materialising the default cluster of a Region is subject to the same bound as
+        // creating one: a caller cannot grow the store by naming Region after Region.
+        if self.cluster_capacity_reached() {
             return;
         }
         let settings = self.captured_cluster_settings(&[]);
-        self.clusters.insert(
-            DEFAULT_CLUSTER_NAME.to_string(),
+        self.insert_cluster(
+            region,
             ClusterRecord {
                 name: DEFAULT_CLUSTER_NAME.to_string(),
                 arn: cluster_arn(region, DEFAULT_CLUSTER_NAME),
@@ -982,10 +988,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// The three Express operations that address a service by ARN alone resolve it the
     /// same way, so the cluster the ARN names is checked before the service it names: a
-    /// cluster that is not there is reported as that, exactly as it is for the operations
-    /// that take a `cluster` member.
+    /// cluster that is not there — including one only ANOTHER Region holds, since a cluster
+    /// belongs to the Region it was created in — is reported as that, exactly as it is for
+    /// the operations that take a `cluster` member.
     pub fn express_gateway_key(
         &self,
+        region: &str,
         reference: &str,
     ) -> Result<(String, String), ExpressGatewayRefusal> {
         let Some((cluster_name, name)) = express_gateway_reference(reference) else {
@@ -993,7 +1001,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // the same answer as a cluster that holds no service of that name.
             return Err(ExpressGatewayRefusal::NotFound);
         };
-        if !self.has_active_cluster(&cluster_name) {
+        if !self.has_active_cluster(region, &cluster_name) {
             return Err(ExpressGatewayRefusal::ClusterNotFound);
         }
         let key = (cluster_name, name);
@@ -1006,9 +1014,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// The stored Express service a `serviceArn` names, for a reporting operation.
     pub fn express_gateway_service(
         &self,
+        region: &str,
         reference: &str,
     ) -> Result<&ExpressGatewayServiceRecord, ExpressGatewayRefusal> {
-        let key = self.express_gateway_key(reference)?;
+        let key = self.express_gateway_key(region, reference)?;
         self.express_gateway_services
             .get(&key)
             .ok_or(ExpressGatewayRefusal::NotFound)
@@ -1017,9 +1026,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// The stored Express service a `serviceArn` names, for an operation that changes it.
     pub fn express_gateway_service_mut(
         &mut self,
+        region: &str,
         reference: &str,
     ) -> Result<&mut ExpressGatewayServiceRecord, ExpressGatewayRefusal> {
-        let key = self.express_gateway_key(reference)?;
+        let key = self.express_gateway_key(region, reference)?;
         self.express_gateway_services
             .get_mut(&key)
             .ok_or(ExpressGatewayRefusal::NotFound)
@@ -2958,7 +2968,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .is_none()
                     .then(|| capacity_provider_not_found_message(&item.capacity_provider))
             })
-            .or_else(|| self.unassociated_capacity_provider_refusal(strategy, cluster_name))
+            .or_else(|| self.unassociated_capacity_provider_refusal(strategy, region, cluster_name))
     }
 
     /// The refusal a `capacityProviderStrategy` earns when an entry names a capacity
@@ -2975,11 +2985,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub fn unassociated_capacity_provider_refusal(
         &self,
         strategy: &[CapacityProviderStrategyItem],
+        region: &str,
         cluster_name: &str,
     ) -> Option<String> {
         let held: Vec<String> = self
-            .clusters
-            .get(cluster_name)
+            .cluster(region, cluster_name)
             .map(|cluster| {
                 cluster
                     .capacity_providers
@@ -2995,44 +3005,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 !held.contains(&name)
             })
             .then(|| CAPACITY_PROVIDER_NOT_ASSOCIATED_MESSAGE.to_string())
-    }
-
-    /// The cluster an operation may act IN: one that exists and has not been deleted.
-    ///
-    /// A tombstone (`status` [`CLUSTER_INACTIVE`]) is not one — the `Cluster$status` doc:
-    /// "The cluster has been deleted" — so every operation that resolves a `cluster` to
-    /// work in refuses it with the same error code it answers for a name that never
-    /// existed, and with the sentence that condition carries
-    /// ([`Self::cluster_not_found_message`]). The three operations that own the tombstone
-    /// read `clusters` directly instead: `DescribeClusters` reports it, `DeleteCluster`
-    /// answers idempotently with it, and `CreateCluster` creates a new cluster over it —
-    /// and a describe that reports its answers per NAME resolves it through
-    /// [`Self::holds_cluster`], since a name it cannot resolve is a failure it reports
-    /// rather than a call it refuses.
-    pub fn active_cluster(&self, cluster_name: &str) -> Option<&ClusterRecord> {
-        self.clusters
-            .get(cluster_name)
-            .filter(|cluster| cluster.status != CLUSTER_INACTIVE)
-    }
-
-    /// Whether [`Self::active_cluster`] names one — the existence check an operation that
-    /// only needs to know the cluster is there makes.
-    pub fn has_active_cluster(&self, cluster_name: &str) -> bool {
-        self.active_cluster(cluster_name).is_some()
-    }
-
-    /// Whether this store HOLDS a cluster record under `cluster_name` at all, whatever
-    /// status it is in — the existence check a READ of the records that cluster held makes.
-    ///
-    /// The tombstone a delete leaves is still a record this account holds
-    /// (`Cluster$status`: "Clusters with an INACTIVE status may remain discoverable in
-    /// your account for a period of time"), and a read of what it held reports per record:
-    /// a describe answers each name it cannot resolve in its `failures` channel, and a
-    /// listing answers with the records that are still there to list. Only a reference that
-    /// resolves to NO record leaves such a read nothing to answer about, which is the
-    /// condition `ClusterNotFoundException` reports ([`CLUSTER_NOT_FOUND_MESSAGE`]).
-    pub fn holds_cluster(&self, cluster_name: &str) -> bool {
-        self.clusters.contains_key(cluster_name)
     }
 
     /// The Cloud Map namespace `service`'s tasks are registered in through Service
@@ -3055,7 +3027,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         match named {
             Some(namespace) => Some(namespace.to_string()),
             None => self
-                .active_cluster(&service.cluster_name)
+                .cluster_of_arn(&service.cluster_arn)
+                .filter(|cluster| cluster.status != CLUSTER_INACTIVE)
                 .and_then(|cluster| cluster.service_connect_defaults.as_ref())
                 .and_then(|defaults| defaults.namespace.clone()),
         }
@@ -4620,10 +4593,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// else the account holds beside the cluster the call named — which is what every
     /// recorded `clusterCount` carries, including the ones recorded while a second,
     /// untouched cluster was live.
-    pub fn cluster_count_for(&self, cluster_name: &str) -> i32 {
+    pub fn cluster_count_for(&self, region: &str, cluster_name: &str) -> i32 {
         i32::from(
-            self.clusters
-                .get(cluster_name)
+            self.cluster(region, cluster_name)
                 .is_some_and(|cluster| cluster.status != CLUSTER_INACTIVE),
         )
     }

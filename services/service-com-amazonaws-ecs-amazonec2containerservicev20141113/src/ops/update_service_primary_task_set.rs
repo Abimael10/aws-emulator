@@ -196,16 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = arn_cluster
             .unwrap_or_else(|| crate::state::cluster_name_from_reference(Some(&input.cluster)));
         let now = ::std::time::SystemTime::now();
+        // Amazon ECS is regional, so the cluster this call acts in is the one of THIS
+        // endpoint's Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        if !guard.has_active_cluster(&cluster_name) {
+        if !guard.has_active_cluster(&region, &cluster_name) {
             return Err(
                 UpdateServicePrimaryTaskSetErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
                         message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
+                            guard.cluster(&region, &cluster_name),
                         )),
                     },
                 )

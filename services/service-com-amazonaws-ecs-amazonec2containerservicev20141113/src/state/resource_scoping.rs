@@ -155,14 +155,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// account holds: a read cannot report on the resources of a cluster that was never
     /// created, which is the condition `ClusterNotFoundException` states with one fixed
     /// sentence naming no cluster — so the ANSWER is the condition and not the name.
+    /// The Region is the REQUEST's own ([`super::request_region`]) and not the ARN's: an
+    /// endpoint resolves the clusters of its own Region, so a reference that carries another
+    /// Region's segment names no cluster of this endpoint by its Region rather than by its
+    /// name, and what the read answers for it is decided per entry below.
     pub fn names_a_missing_cluster<'a>(
         &self,
+        region: &str,
         references: impl IntoIterator<Item = &'a str>,
         resource_type: &str,
     ) -> bool {
         references.into_iter().any(|reference| {
             cluster_from_scoped_arn(reference.trim(), resource_type)
-                .is_some_and(|cluster_name| !self.holds_cluster(&cluster_name))
+                .is_some_and(|cluster_name| !self.holds_cluster(region, &cluster_name))
         })
     }
 }

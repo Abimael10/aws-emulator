@@ -348,11 +348,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the updated daemon": the update ACTS in the daemon's cluster, so that cluster is
         // resolved once the request's own parameters are settled, and a cluster this account
         // does not hold is what the call is refused about.
-        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&input.daemon_arn) {
+        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&region, &input.daemon_arn) {
             return Err(UpdateDaemonErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )

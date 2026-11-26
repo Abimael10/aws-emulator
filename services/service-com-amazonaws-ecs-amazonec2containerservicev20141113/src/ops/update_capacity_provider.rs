@@ -286,6 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cluster
             .as_deref()
             .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
+        // Amazon ECS is regional, so a cluster this call names is the one of THIS endpoint's
+        // Region ([`crate::state::request_region`]).
+        let region = crate::state::request_region(ctx);
 
         let mut guard = state.lock();
         let now = ::std::time::SystemTime::now();
@@ -295,12 +298,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleted"), so a tombstone is refused under the same error code a name that never
         // existed earns — with the sentence that says it is still there, inactive.
         if let Some(cluster_name) = cluster_name.as_deref() {
-            if !guard.has_active_cluster(cluster_name) {
+            if !guard.has_active_cluster(&region, cluster_name) {
                 return Err(
                     UpdateCapacityProviderErrorModeled::ClusterNotFoundException(
                         ClusterNotFoundException {
                             message: Some(crate::state::cluster_refusal_message(
-                                guard.clusters.get(cluster_name),
+                                guard.cluster(&region, cluster_name),
                             )),
                         },
                     )
@@ -444,7 +447,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::drive_managed_scaling_clock(
             ctx,
             &self.engine,
-            &crate::state::request_region(ctx),
+            &region,
         );
 
         Ok(UpdateCapacityProviderOutput {

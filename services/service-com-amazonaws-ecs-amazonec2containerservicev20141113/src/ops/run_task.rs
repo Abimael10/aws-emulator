@@ -477,11 +477,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+        let Some(cluster) = guard.active_cluster(&region, &cluster_name) else {
             return Err(RunTaskErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )
@@ -533,7 +533,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whatever the name resolves to in the account
         // ([`crate::state::unassociated_capacity_provider_refusal`]), where a create states
         // an unresolvable name in the account's.
-        if let Some(message) = guard.unassociated_capacity_provider_refusal(&strategy, &cluster_name)
+        if let Some(message) =
+            guard.unassociated_capacity_provider_refusal(&strategy, &region, &cluster_name)
         {
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {

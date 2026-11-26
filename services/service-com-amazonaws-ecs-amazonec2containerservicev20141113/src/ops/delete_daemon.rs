@@ -203,6 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // Amazon ECS is regional ("Amazon ECS daemons are cluster specific and Region
+        // specific"), so the cluster this call acts in is the one of THIS endpoint's Region.
+        let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -210,11 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instances. Amazon ECS drains existing container instances": the delete ACTS in
         // the daemon's cluster, so that cluster is resolved first and a cluster this
         // account does not hold is what the call is refused about.
-        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&input.daemon_arn) {
+        if let Some(cluster_name) = guard.daemon_arn_cluster_refusal(&region, &input.daemon_arn) {
             return Err(DeleteDaemonErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
+                        guard.cluster(&region, &cluster_name),
                     )),
                 },
             )
@@ -259,7 +262,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owed by the clock, and each status is an `ECS Task State Change` event published
         // as it falls due ([`crate::state::publish_task_state_changes`]) — which is also
         // what carries the delete itself out with no further call from anybody.
-        let region = crate::state::request_region(ctx);
         crate::state::publish_task_state_changes(ctx, &self.engine, &region);
         Ok(answer)
     }
