@@ -55,6 +55,11 @@ const SUBNET_CIDR: &str = "10.42.1.0/24";
 const ZONE: &str = "us-west-2a";
 const SECURITY_GROUP: &str = "xsvc-elasticache-invpc-group";
 
+/// The port the caches of this suite accept connections on — the Valkey / Redis OSS client
+/// port, which neither create names, so it is the engine's own default and the port the
+/// inbound rule admitting the cache's clients names.
+const CACHE_PORT: &str = "6379";
+
 /// The cache resources every row addresses.
 const SUBNET_GROUP: &str = "xsvc-ec-invpc-subnets";
 const CLUSTER: &str = "xsvc-ec-invpc-cluster";
@@ -335,9 +340,25 @@ async fn ec2_network(router: &MultiServiceRouter) -> Network {
         .await,
         "groupId",
     );
+    // The inbound rule that admits the cache's clients: a cache placed in the account's VPC is
+    // reached through an interface this group governs, and a connection no inbound rule of it
+    // admits is dropped rather than served. The source is the group ITSELF — the group the
+    // function's own interface carries too — which is how a client admits its own workloads to
+    // its cache, and the port is the one the cache's engine accepts connections on.
+    ec2(
+        router,
+        "AuthorizeSecurityGroupIngress",
+        &[
+            ("GroupId", group.as_str()),
+            ("IpPermissions.1.IpProtocol", "tcp"),
+            ("IpPermissions.1.FromPort", CACHE_PORT),
+            ("IpPermissions.1.ToPort", CACHE_PORT),
+            ("IpPermissions.1.Groups.1.GroupId", group.as_str()),
+        ],
+    )
+    .await;
     Network { vpc, subnet, group }
 }
-
 /// An `(address, port)` pair read out of the block `scope` of an answer.
 fn endpoint_of(body: &str, scope: &str, what: &str) -> (String, u64) {
     let block = block_of(body, scope)
@@ -378,7 +399,7 @@ async fn plant_the_caches(
             ("CacheNodeType", "cache.t3.micro"),
             ("NumCacheNodes", "1"),
             ("CacheSubnetGroupName", SUBNET_GROUP),
-            ("SecurityGroupIds.member.1", network.group.as_str()),
+            ("SecurityGroupIds.SecurityGroupId.1", network.group.as_str()),
         ],
     )
     .await;
@@ -398,7 +419,7 @@ async fn plant_the_caches(
             ("TransitEncryptionEnabled", "true"),
             ("AuthToken", AUTH_TOKEN),
             ("CacheSubnetGroupName", SUBNET_GROUP),
-            ("SecurityGroupIds.member.1", network.group.as_str()),
+            ("SecurityGroupIds.SecurityGroupId.1", network.group.as_str()),
         ],
     )
     .await;

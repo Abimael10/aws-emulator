@@ -829,6 +829,89 @@ impl Emulator {
             .expect("EC2 must delete the security group");
     }
 
+    /// One inbound rule, as `ec2:AuthorizeSecurityGroupIngress` /
+    /// `ec2:RevokeSecurityGroupIngress` carry it: a protocol, a port range where the rule
+    /// states one, and a source — an address range, another security group, or both.
+    ///
+    /// The ONE place a suite of this crate builds such a permission, so the rule a case
+    /// authorizes and the rule it revokes are the same rule.
+    pub fn ingress_permission(
+        protocol: &str,
+        ports: Option<(i32, i32)>,
+        cidr: Option<&str>,
+        source_group: Option<&str>,
+    ) -> ::aws_sdk_ec2::types::IpPermission {
+        let mut permission = ::aws_sdk_ec2::types::IpPermission::builder().ip_protocol(protocol);
+        if let Some((from, to)) = ports {
+            permission = permission.from_port(from).to_port(to);
+        }
+        if let Some(cidr) = cidr {
+            permission = permission.ip_ranges(
+                ::aws_sdk_ec2::types::IpRange::builder()
+                    .cidr_ip(cidr)
+                    .build(),
+            );
+        }
+        if let Some(group_id) = source_group {
+            permission = permission.user_id_group_pairs(
+                ::aws_sdk_ec2::types::UserIdGroupPair::builder()
+                    .group_id(group_id)
+                    .build(),
+            );
+        }
+        permission.build()
+    }
+
+    /// Write `permission` as an inbound rule of the security group `group_id`, through
+    /// `ec2:AuthorizeSecurityGroupIngress` — the call a client makes so the clients of a
+    /// resource that group guards can reach it.
+    ///
+    /// The rule lands where the service under test reads it: the owner of security groups, in
+    /// the account's own inventory.
+    pub async fn authorize_ingress(
+        &self,
+        group_id: &str,
+        permission: ::aws_sdk_ec2::types::IpPermission,
+    ) {
+        self.ec2(REGION)
+            .authorize_security_group_ingress()
+            .group_id(group_id)
+            .ip_permissions(permission)
+            .send()
+            .await
+            .expect("EC2 must authorize the ingress rule");
+    }
+
+    /// Take `permission` back off the security group `group_id`, through
+    /// `ec2:RevokeSecurityGroupIngress`, and answer what EC2 reported for the revoke
+    /// (`Return`).
+    pub async fn revoke_ingress(
+        &self,
+        group_id: &str,
+        permission: ::aws_sdk_ec2::types::IpPermission,
+    ) -> bool {
+        self.ec2(REGION)
+            .revoke_security_group_ingress()
+            .group_id(group_id)
+            .ip_permissions(permission)
+            .send()
+            .await
+            .expect("EC2 must answer the revoke")
+            .r#return()
+            .unwrap_or(false)
+    }
+
+    /// Authorize TCP on `port` from every address, on the security group `group_id`: the rule
+    /// a client writes so the clients of the cache that group guards can open a connection to
+    /// it at all.
+    pub async fn authorize_tcp_ingress_from_anywhere(&self, group_id: &str, port: i32) {
+        self.authorize_ingress(
+            group_id,
+            Self::ingress_permission("tcp", Some((port, port)), Some("0.0.0.0/0"), None),
+        )
+        .await;
+    }
+
     /// Send one KMS call through the same router and answer its HTTP status and
     /// parsed body.
     ///

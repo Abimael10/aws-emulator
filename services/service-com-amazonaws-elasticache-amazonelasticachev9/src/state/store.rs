@@ -198,6 +198,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             dns_token,
             endpoint_address,
             endpoint_port: new.port,
+            // The port the ENGINE accepts connections on, which the socket's own port never
+            // replaces: see [`CacheClusterRecord::engine_port`].
+            engine_port: new.port,
             availability_zones: new.availability_zones,
             az_mode: new.az_mode,
             preferred_maintenance_window: new.preferred_maintenance_window,

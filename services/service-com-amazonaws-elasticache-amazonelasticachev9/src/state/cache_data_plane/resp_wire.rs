@@ -33,6 +33,7 @@ use ::emulator_server::{ListenerConn, NativeHandler};
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::access_control::AccessRules;
+use super::node_admission::{self, CacheNetwork};
 use super::resp_frame::{encoded, next_command, FrameError, Reply};
 use super::slot_routing;
 use super::slow_log::{SlowLogEntry, UNKNOWN_CLIENT_ADDRESS};
@@ -67,9 +68,45 @@ pub struct CacheSocket {
             ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::ComAmazonawsCloudwatchlogsLogs20140328State,
         >,
     >,
+    /// The account's own network, where the security groups guarding this cache are read
+    /// ([`node_admission`]). `None` on an engine that holds no Amazon EC2 inventory, where no
+    /// group of the account can be read at all.
+    pub network: Option<CacheNetwork>,
+    /// The account's own credential records, where the credential an IAM authentication token
+    /// names is resolved ([`node_admission`]'s sibling [`super::iam_authentication`]). `None`
+    /// on an engine that holds no IAM records.
+    pub credentials:
+        Option<::engine::ServiceState<super::iam_authentication::AccountCredentials>>,
 }
 
 impl CacheSocket {
+    /// Whether the connection being served is one the cache's own VPC security groups admit:
+    /// the gate on WHO reaches a cache at the endpoint the control plane published for it.
+    ///
+    /// Asked ONCE per connection, as a stateful filter judges one — the rules are read at the
+    /// instant the connection is established, so a session already open is not cut by a
+    /// revoke and the next connection is judged by the rules as they stand then. Where the
+    /// connection comes FROM is what its client stated when it opened it; the reading itself,
+    /// and what an unstated source decides, are [`node_admission`]'s.
+    ///
+    /// A cache in no VPC of the account, and one whose guarding groups cannot be read at all,
+    /// are behind no such filter and keep answering every client.
+    fn admits_this_connection(&self) -> bool {
+        let Some(network) = self.network.as_ref() else {
+            return true;
+        };
+        // This service's guard is taken and RELEASED before the account's network is asked:
+        // no two store guards are ever held at once ([`node_admission`]).
+        let placement = node_admission::node_placement(&self.state.lock(), &self.identity);
+        let Some(placement) = placement else {
+            return true;
+        };
+        network.admits(
+            &placement,
+            ::service_common::dialable_data_planes::connected_from(),
+        )
+    }
+
     /// The cache as it is now: what the session's next command is judged against.
     fn facts(&self) -> CacheFacts {
         super::cache_facts(&self.settled_store(), &self.identity)
@@ -118,6 +155,15 @@ impl NativeHandler for RespWire {
     fn serve(&self, conn: ListenerConn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let socket = self.socket.clone();
         Box::pin(async move {
+            // A connection the cache's security groups do not admit never reaches the engine:
+            // it is DROPPED — closed with nothing written and no command read — because a
+            // packet no rule names is dropped rather than refused, so the client is answered
+            // with nothing at all and whatever it was about to send leaves no trace in the
+            // keyspace ([`CacheSocket::admits_this_connection`]).
+            if !socket.admits_this_connection() {
+                drop(conn);
+                return;
+            }
             let id = socket.next_connection_id.fetch_add(1, Ordering::Relaxed);
             let mut session = Session::new(socket, id);
             session.run(conn).await;
@@ -489,8 +535,13 @@ impl Session {
         let wanted = user_name
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_USER_NAME.to_string());
-        match super::authenticate_cache_user(&self.socket.settled_store(), facts, &wanted, &secret)
-        {
+        match super::authenticate_cache_user(
+            &self.socket.settled_store(),
+            self.socket.credentials.as_ref(),
+            facts,
+            &wanted,
+            &secret,
+        ) {
             Some(identity) => {
                 self.identity = Some(Identity {
                     user_name: identity.user_name,

@@ -53,6 +53,28 @@ impl ComAmazonawsEc2Amazonec2State {
         })
     }
 
+    /// Whether any group of `group_ids` admits a packet of `protocol` arriving at `port` from
+    /// ANY source its rules name, which is the reading for a packet whose SOURCE cannot be
+    /// established.
+    ///
+    /// The half of the question that does not depend on the sender is still decidable: a
+    /// filter no rule of which names the protocol and the port admits that packet from
+    /// NOWHERE, so one arriving there is dropped whoever sent it, while a rule that does name
+    /// them leaves only the sender undecided. A group id this store holds no group for admits
+    /// nothing, for the reason [`Self::security_groups_admit_ingress`] gives.
+    pub fn security_groups_admit_ingress_from_any_source(
+        &self,
+        group_ids: &[String],
+        protocol: &str,
+        port: u16,
+    ) -> bool {
+        group_ids.iter().any(|group_id| {
+            self.security_groups
+                .get(group_id)
+                .is_some_and(|group| group_admits_ingress_from_any_source(group, protocol, port))
+        })
+    }
+
     /// Whether any group of `group_ids` lets a packet of `protocol` to `port` LEAVE the
     /// interface for an address beyond this account's own network — the shape of a call an
     /// agent inside a guest makes to a service endpoint.
@@ -149,6 +171,30 @@ pub fn group_admits_ingress(
         .iter()
         .any(|permission| {
             permission_admits(permission, protocol, port, source_ip, source_groups)
+        })
+}
+
+/// Whether one of `group`'s own INBOUND rules names a packet of `protocol` arriving at `port`
+/// from any source at all — the source left open; see
+/// [`ComAmazonawsEc2Amazonec2State::security_groups_admit_ingress_from_any_source`].
+///
+/// A rule has to name a peer to be a grant of anything ([`names_a_peer`]), exactly as an
+/// outbound one does: a rule naming no source names no traffic.
+#[must_use]
+pub fn group_admits_ingress_from_any_source(
+    group: &SecurityGroup,
+    protocol: &str,
+    port: u16,
+) -> bool {
+    group
+        .ip_permissions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|permission| {
+            protocol_admits(permission.ip_protocol.as_deref(), protocol)
+                && port_admits(permission, port)
+                && names_a_peer(permission)
         })
 }
 
@@ -378,6 +424,175 @@ mod tests {
         assert!(
             !group_admits_ingress(&empty, "udp", 53, "10.91.1.7", &source_groups),
             "case \"a group carrying no rule\": expected the packet to be dropped"
+        );
+    }
+
+    /// RULE: a packet whose source is unknown is admitted only where one inbound rule of the
+    /// group names its protocol, its port AND a source of some kind — so a filter that names
+    /// neither drops it whoever sent it.
+    ///
+    /// The rows span what the reading generalises over: the protocol (the one named, another
+    /// one, every protocol), the port (inside the range, each bound, one past each bound, the
+    /// all-values sentinel), the kind of source a rule names (an address range, another
+    /// security group, an IPv6 range, a prefix list, none at all), and how many rules the
+    /// group holds.
+    #[test]
+    fn a_packet_of_an_unknown_source_is_admitted_only_where_a_rule_names_its_protocol_and_port() {
+        // One row: what it is, the group's inbound rules, the protocol and port of the packet,
+        // and whether any source could be admitted there.
+        let rows: &[(&str, Vec<IpPermission>, &str, u16, bool)] = &[
+            (
+                "the protocol and port the rule names",
+                vec![permission("tcp", Some((6379, 6379)), Some("10.0.0.0/8"), None)],
+                "tcp",
+                6379,
+                true,
+            ),
+            (
+                "another protocol on the same port",
+                vec![permission("udp", Some((6379, 6379)), Some("10.0.0.0/8"), None)],
+                "tcp",
+                6379,
+                false,
+            ),
+            (
+                "a rule on every protocol",
+                vec![permission("-1", None, Some("10.0.0.0/8"), None)],
+                "tcp",
+                6379,
+                true,
+            ),
+            (
+                "the low bound of the range",
+                vec![permission("tcp", Some((6000, 7000)), Some("0.0.0.0/0"), None)],
+                "tcp",
+                6000,
+                true,
+            ),
+            (
+                "the high bound of the range",
+                vec![permission("tcp", Some((6000, 7000)), Some("0.0.0.0/0"), None)],
+                "tcp",
+                7000,
+                true,
+            ),
+            (
+                "one port below the range",
+                vec![permission("tcp", Some((6000, 7000)), Some("0.0.0.0/0"), None)],
+                "tcp",
+                5999,
+                false,
+            ),
+            (
+                "one port above the range",
+                vec![permission("tcp", Some((6000, 7000)), Some("0.0.0.0/0"), None)],
+                "tcp",
+                7001,
+                false,
+            ),
+            (
+                "a rule whose range is the all-values sentinel",
+                vec![permission("tcp", Some((-1, -1)), Some("0.0.0.0/0"), None)],
+                "tcp",
+                6379,
+                true,
+            ),
+            (
+                "a source naming another security group",
+                vec![permission(
+                    "tcp",
+                    Some((6379, 6379)),
+                    None,
+                    Some("sg-00000000000000001"),
+                )],
+                "tcp",
+                6379,
+                true,
+            ),
+            (
+                "a rule naming no source at all",
+                vec![permission("tcp", Some((6379, 6379)), None, None)],
+                "tcp",
+                6379,
+                false,
+            ),
+            (
+                "two rules, the second of which names the packet",
+                vec![
+                    permission("tcp", Some((80, 80)), Some("0.0.0.0/0"), None),
+                    permission("tcp", Some((6379, 6379)), Some("10.0.0.0/8"), None),
+                ],
+                "tcp",
+                6379,
+                true,
+            ),
+            ("no inbound rule at all", Vec::new(), "tcp", 6379, false),
+        ];
+        for (case, rules, protocol, port, expected) in rows {
+            let group = SecurityGroup {
+                ip_permissions: Some(rules.clone()),
+                ..SecurityGroup::default()
+            };
+            let admitted = group_admits_ingress_from_any_source(&group, protocol, *port);
+            assert_eq!(
+                admitted, *expected,
+                "case {case:?}: expected admitted={expected}, got {admitted}"
+            );
+        }
+        // An IPv6 range and a prefix list are sources too, and an OUTBOUND rule for the same
+        // protocol and port says nothing about what arrives.
+        for (case, permission, expected) in [
+            (
+                "an IPv6 source range",
+                IpPermission {
+                    ip_protocol: Some("tcp".to_string()),
+                    from_port: Some(6379),
+                    to_port: Some(6379),
+                    ipv6_ranges: Some(vec![crate::ops::types::Ipv6Range {
+                        cidr_ipv6: Some("::/0".to_string()),
+                        ..crate::ops::types::Ipv6Range::default()
+                    }]),
+                    ..IpPermission::default()
+                },
+                true,
+            ),
+            (
+                "a prefix-list source",
+                IpPermission {
+                    ip_protocol: Some("tcp".to_string()),
+                    from_port: Some(6379),
+                    to_port: Some(6379),
+                    prefix_list_ids: Some(vec![crate::ops::types::PrefixListId {
+                        prefix_list_id: Some("pl-00000000000000001".to_string()),
+                        ..crate::ops::types::PrefixListId::default()
+                    }]),
+                    ..IpPermission::default()
+                },
+                true,
+            ),
+        ] {
+            let group = SecurityGroup {
+                ip_permissions: Some(vec![permission]),
+                ..SecurityGroup::default()
+            };
+            let admitted = group_admits_ingress_from_any_source(&group, "tcp", 6379);
+            assert_eq!(
+                admitted, expected,
+                "case {case:?}: expected admitted={expected}, got {admitted}"
+            );
+        }
+        let outbound_only = SecurityGroup {
+            ip_permissions_egress: Some(vec![permission(
+                "tcp",
+                Some((6379, 6379)),
+                Some("0.0.0.0/0"),
+                None,
+            )]),
+            ..SecurityGroup::default()
+        };
+        assert!(
+            !group_admits_ingress_from_any_source(&outbound_only, "tcp", 6379),
+            "case \"an outbound rule only\": expected the packet to be dropped"
         );
     }
 

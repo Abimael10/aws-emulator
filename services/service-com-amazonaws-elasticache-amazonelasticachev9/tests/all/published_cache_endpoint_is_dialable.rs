@@ -42,6 +42,22 @@ use crate::cache_data_plane::{
 };
 use crate::harness::{assert_own_endpoint, params, poll_until, Emulator, Reply, REGION};
 
+/// The rule a client writes on the security group guarding its cache so the clients of that
+/// cache can open a connection to its endpoint at all: a cache placed in the account's VPC is
+/// reached through an interface its security groups govern, and a connection no inbound rule of
+/// them admits is dropped — which is
+/// [`crate::cache_endpoint_security_group_gate`]'s own subject. The port is the one the engines
+/// of this suite accept connections on, read off the handler's own default rather than spelled
+/// again here.
+async fn admit_the_caches_clients(emulator: &Emulator, security_group: &str) {
+    emulator
+        .authorize_tcp_ingress_from_anywhere(
+            security_group,
+            ::service_com_amazonaws_elasticache_amazonelasticachev9::state::default_port("redis"),
+        )
+        .await;
+}
+
 /// The node type every cache in this suite runs on.
 const NODE_TYPE: &str = "cache.t3.micro";
 
@@ -283,6 +299,7 @@ async fn every_endpoint_a_cache_publishes_is_dialled_as_published_and_answers_re
     let emulator = Emulator::new();
     subnet_group(&emulator).await;
     let security_group = emulator.security_group_named("dialable-cache").await;
+    admit_the_caches_clients(&emulator, &security_group).await;
 
     for row in ROWS {
         let described = available_cache(&emulator, row, &security_group).await;
@@ -343,6 +360,7 @@ async fn a_cluster_restored_from_a_snapshot_serves_what_the_source_held_at_the_e
     let emulator = Emulator::new();
     subnet_group(&emulator).await;
     let security_group = emulator.security_group_named("restore-flow-cache").await;
+    admit_the_caches_clients(&emulator, &security_group).await;
     let placed = |id: &str, extra: &[(&str, &str)]| {
         let mut pairs = params(&[
             ("CacheClusterId", id),
@@ -521,6 +539,7 @@ async fn withdrawing_a_user_from_the_attached_group_refuses_its_auth_at_the_publ
     let emulator = Emulator::new();
     subnet_group(&emulator).await;
     let security_group = emulator.security_group_named("revocation-flow-cache").await;
+    admit_the_caches_clients(&emulator, &security_group).await;
 
     for (case, id, secret) in MEMBERS {
         let mut request = params(&[

@@ -50,10 +50,18 @@
 //! that reads the endpoint out of the control plane and dials it is code this emulator
 //! itself runs — the handler of a function attached to that VPC — and what answers it is
 //! this cache's own server over this cache's own keyspace, not a second one.
+//!
+//! WHICH client is served there is the cache's own SECURITY GROUPS' to say, read on every
+//! connection ([`node_admission`]): a cache placed in a VPC of the account is reached through
+//! an interface those groups govern, so a connection no inbound rule of them admits is dropped
+//! — closed with nothing served — rather than answered, and a rule authorized or revoked
+//! changes what the next connection gets while the sessions already open carry on.
 
 pub mod access_control;
 pub mod commands;
+pub mod iam_authentication;
 pub mod keyspace;
+pub mod node_admission;
 pub mod resp_frame;
 pub mod resp_wire;
 pub mod slot_routing;
@@ -822,9 +830,12 @@ pub fn default_identity(
 /// A user authenticates with one of the passwords it holds; a user that requires no
 /// password authenticates with any; an `off` user authenticates with none, and neither
 /// does a user of a group this cache does not serve — which is what makes removing a user
-/// from the group take its access away.
+/// from the group take its access away. An IAM-authenticated user authenticates with an IAM
+/// authentication token for itself, held to everything [`iam_authentication`] can establish
+/// about one, which is why the account's own credential records are read here.
 pub fn authenticate_cache_user(
     store: &super::ComAmazonawsElasticacheAmazonelasticachev9State,
+    credentials: Option<&::engine::ServiceState<iam_authentication::AccountCredentials>>,
     facts: &CacheFacts,
     user_name: &str,
     secret: &str,
@@ -845,7 +856,7 @@ pub fn authenticate_cache_user(
     let accepted = match user.authentication.r#type.as_str() {
         token if token == super::authentication_type::NO_PASSWORD => true,
         token if token == super::authentication_type::IAM => {
-            iam_token_authenticates(secret, user)
+            iam_authentication::token_authenticates(secret, user, credentials, SystemTime::now())
         }
         _ => rules.no_password || user.authentication.password_digests.contains(&digest),
     };
@@ -853,39 +864,6 @@ pub fn authenticate_cache_user(
         user_name: user.user_name.clone(),
         rules,
     })
-}
-
-/// Whether `token` is an IAM AUTHENTICATION TOKEN for `user`.
-///
-/// Such a token is a SIGNED request to connect as the user — a presigned query carrying
-/// `Action=connect`, the `User` it is for, and the SigV4 fields of the signature — so what
-/// makes it a credential for this user is that it names this user and is signed. The
-/// SIGNATURE itself is not checked: this emulator verifies no caller's identity for any
-/// request it serves, and inventing a verdict on a signature would be a claim about an
-/// identity it never established. A credential that is NOT such a token (a password, an
-/// empty string, a token for another user) authenticates nobody.
-fn iam_token_authenticates(token: &str, user: &super::UserRecord) -> bool {
-    let query = token.split_once('?').map_or(token, |(_, query)| query);
-    let mut connects = false;
-    let mut names_the_user = false;
-    let mut signed = false;
-    for pair in query.split('&') {
-        let Some((field, value)) = pair.split_once('=') else {
-            continue;
-        };
-        match field {
-            "Action" => connects = value.eq_ignore_ascii_case("connect"),
-            // ElastiCache requires an IAM-authenticated user's id and name to be
-            // identical, so either is the name the token may carry.
-            "User" => {
-                names_the_user = value.eq_ignore_ascii_case(&user.user_name)
-                    || value.eq_ignore_ascii_case(&user.user_id);
-            }
-            "X-Amz-Signature" => signed = !value.is_empty(),
-            _ => {}
-        }
-    }
-    connects && names_the_user && signed
 }
 
 /// The member of the user group `group_id` whose user NAME is `user_name`.
@@ -968,6 +946,14 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
         // socket is opened: the HANDLE is to the one shared store, so a group created later
         // is still the group a record lands in.
         logs: ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::service_state(engine),
+        // The account's own network, where the security groups guarding this cache are read
+        // on every connection ([`node_admission`]): a handle on the one shared store, so a
+        // rule authorized or revoked later is the rule the next connection is judged by.
+        network: node_admission::CacheNetwork::of(engine),
+        // And the account's own credential records, where the credential an IAM authentication
+        // token names is resolved ([`iam_authentication`]), read the same way: a key created
+        // or deactivated later is the record the next `AUTH` is judged against.
+        credentials: iam_authentication::account_credentials(engine),
     }));
     // The handshake an in-process connection meets at byte 0: a cache with in-transit
     // encryption is terminated by the CORE on its socket, so the core's own server runs the

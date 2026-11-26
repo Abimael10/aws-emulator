@@ -117,6 +117,10 @@ const AFTER_THE_SNAPSHOT: &str = "written-after-the-snapshot";
 
 /// The placement a row sends: the account's first two subnets and one security group of
 /// its own, asked of Amazon EC2 — the service that owns both — rather than written here.
+///
+/// The group carries the inbound rule that admits the cache's clients to the endpoint it will
+/// publish, because a cache placed in the account's subnets serves only the connections its
+/// security groups admit ([`crate::cache_endpoint_security_group_gate`]).
 async fn placement(emulator: &Emulator, flow: &Flow) -> Vec<(String, String)> {
     if !flow.placed {
         return Vec::new();
@@ -127,6 +131,19 @@ async fn placement(emulator: &Emulator, flow: &Flow) -> Vec<(String, String)> {
         .await
         .pop()
         .expect("EC2 must mint the security group the cache is guarded by");
+    emulator
+        .authorize_tcp_ingress_from_anywhere(
+            &group,
+            // A serverless cache carries no `Port` member: it answers on the engine's own
+            // client port, which is the port a rule guarding it names.
+            ::service_com_amazonaws_elasticache_amazonelasticachev9::state::default_port(
+                flow.engine
+                    .iter()
+                    .find(|(member, _)| *member == "Engine")
+                    .map_or("valkey", |(_, engine)| engine),
+            ),
+        )
+        .await;
     let mut pairs = subnet_pairs("SubnetId", &subnets[..2]);
     pairs.push(("SecurityGroupIds.SecurityGroupId.1".to_string(), group));
     pairs

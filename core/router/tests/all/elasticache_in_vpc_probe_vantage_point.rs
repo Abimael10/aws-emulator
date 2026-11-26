@@ -68,6 +68,11 @@ const ELASTICACHE_API_VERSION: &str = "2015-02-02";
 /// The network the cache and the function share.
 const VPC_CIDR: &str = "10.151.0.0/16";
 
+/// The port the cache of this suite accepts connections on — the Valkey / Redis OSS client
+/// port, which the create does not name, so it is the engine's own default and the port the
+/// inbound rule admitting the cache's clients names.
+const CACHE_PORT: &str = "6379";
+
 /// The two subnets that network spans — one per Availability Zone, so the cache's node and the
 /// function's interfaces are placed in subnets this suite knows the block of — each with its
 /// zone and with ONE address of its own block that no resource here holds, which is what a route
@@ -474,6 +479,23 @@ async fn ec2_network(router: &MultiServiceRouter) -> Network {
         .await,
         "groupId",
     );
+    // The inbound rule that admits the cache's clients: a cache placed in the account's VPC is
+    // reached through an interface this group governs, and a connection no inbound rule of it
+    // admits is dropped rather than served. The source is the group ITSELF, which the
+    // function's own interface carries too — how a client admits its own workloads to its
+    // cache — and the port is the one the cache's engine accepts connections on.
+    ec2(
+        router,
+        "AuthorizeSecurityGroupIngress",
+        &[
+            ("GroupId", group.as_str()),
+            ("IpPermissions.1.IpProtocol", "tcp"),
+            ("IpPermissions.1.FromPort", CACHE_PORT),
+            ("IpPermissions.1.ToPort", CACHE_PORT),
+            ("IpPermissions.1.Groups.1.GroupId", group.as_str()),
+        ],
+    )
+    .await;
     Network {
         vpc,
         subnets,
@@ -552,7 +574,7 @@ async fn plant_the_cache(router: &MultiServiceRouter, network: &Network) -> (Str
             ("TransitEncryptionEnabled", "true"),
             ("AuthToken", AUTH_TOKEN),
             ("CacheSubnetGroupName", SUBNET_GROUP),
-            ("SecurityGroupIds.member.1", network.group.as_str()),
+            ("SecurityGroupIds.SecurityGroupId.1", network.group.as_str()),
         ],
     )
     .await;

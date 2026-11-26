@@ -274,7 +274,17 @@ async fn placement(emulator: &Emulator) -> String {
         "CreateCacheSubnetGroup must answer 200, got {} {}",
         created.status, created.body
     );
-    emulator.security_group_named("attach-flow-cache").await
+    let security_group = emulator.security_group_named("attach-flow-cache").await;
+    // The inbound rule that admits the group's clients to the endpoint it will publish: a cache
+    // placed in the account's VPC serves only the connections its security groups admit
+    // ([`crate::cache_endpoint_security_group_gate`]).
+    emulator
+        .authorize_tcp_ingress_from_anywhere(
+            &security_group,
+            ::service_com_amazonaws_elasticache_amazonelasticachev9::state::default_port("redis"),
+        )
+        .await;
+    security_group
 }
 
 /// Create every member of [`MEMBERS`], each with the credential form its row is about.

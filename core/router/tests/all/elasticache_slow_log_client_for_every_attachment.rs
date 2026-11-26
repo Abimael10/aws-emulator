@@ -150,6 +150,11 @@ struct Case {
 /// The zones the subnets of a row are placed in, in order.
 const ZONES: [&str; 2] = ["us-west-2a", "us-west-2b"];
 
+/// The port the cache of a row accepts connections on — the Valkey / Redis OSS client port,
+/// which no create below names, so it is the engine's own default and the port the inbound rule
+/// admitting the cache's client names.
+const CACHE_PORT: &str = "6379";
+
 /// A SigV4 `Authorization` header whose credential scope names `service`, which is what routes
 /// the request. The signature itself is never checked here.
 fn authorization(service: &str) -> String {
@@ -321,6 +326,23 @@ async fn ec2_network(router: &MultiServiceRouter, case: &Case) -> Network {
         .await,
         "groupId",
     );
+    // The inbound rule that admits the cache's client: a cache placed in the account's VPC is
+    // reached through an interface this group governs, and a connection no inbound rule of it
+    // admits is dropped rather than served. The source is the group ITSELF, which the
+    // function's own interfaces carry too — how a client admits its own workloads to its cache
+    // — and the port is the one the cache's engine accepts connections on.
+    ec2(
+        router,
+        "AuthorizeSecurityGroupIngress",
+        &[
+            ("GroupId", group.as_str()),
+            ("IpPermissions.1.IpProtocol", "tcp"),
+            ("IpPermissions.1.FromPort", CACHE_PORT),
+            ("IpPermissions.1.ToPort", CACHE_PORT),
+            ("IpPermissions.1.Groups.1.GroupId", group.as_str()),
+        ],
+    )
+    .await;
     Network { subnets, group }
 }
 
@@ -403,7 +425,7 @@ async fn planted_cache(
             ("NumCacheNodes", "1"),
             ("CacheSubnetGroupName", subnet_group.as_str()),
             ("CacheParameterGroupName", parameters.as_str()),
-            ("SecurityGroupIds.member.1", network.group.as_str()),
+            ("SecurityGroupIds.SecurityGroupId.1", network.group.as_str()),
             (&format!("{prefix}.LogType"), "slow-log"),
             (&format!("{prefix}.DestinationType"), "cloudwatch-logs"),
             (

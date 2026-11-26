@@ -111,6 +111,21 @@ pub(crate) async fn open_in_vpc(
     address: &str,
     port: &str,
 ) -> Session {
+    open_in_vpc_from(emulator, case, address, port, None).await
+}
+
+/// [`open_in_vpc`] for a client that STATES the address its own traffic reaches the cache
+/// from — the private address a function attached to the VPC carries there, which the security
+/// groups guarding the cache are read against.
+///
+/// `from` of `None` is a client that states none, exactly as [`open_in_vpc`] opens one.
+pub(crate) async fn open_in_vpc_from(
+    emulator: &Emulator,
+    case: &str,
+    address: &str,
+    port: &str,
+    from: Option<::std::net::SocketAddr>,
+) -> Session {
     let port: u16 = port
         .parse()
         .unwrap_or_else(|_| panic!("case {case}: the published port must be a port, got {port:?}"));
@@ -132,7 +147,7 @@ pub(crate) async fn open_in_vpc(
     });
     let conn = dialed
         .plane
-        .dial(None)
+        .dial(from)
         .await
         .unwrap_or_else(|error| panic!("case {case}: {address}:{port} must answer, got {error}"));
     Box::new(conn)
@@ -887,23 +902,80 @@ async fn a_command_frame_that_is_not_a_flat_multibulk_is_a_protocol_error() {
     );
 }
 
-/// An IAM authentication token for the user `iam-user`: the presigned request to connect
-/// as that user an IAM-authenticated client sends as its credential
-/// (`Action=connect&User=<user>` plus the SigV4 fields of the signature). The signature is
-/// not a real one — this emulator verifies no caller's identity — and nothing in the token
-/// is secret.
-const IAM_TOKEN: &str = "rbac-cache/?Action=connect&User=iam-user\
-                         &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=900\
-                         &X-Amz-SignedHeaders=host&X-Amz-Signature=0123456789abcdef";
+/// The access key id of the ACCOUNT credential the IAM tokens below are signed with: the one
+/// [`given_account_access_key`] records, so a token naming it names a credential this emulator
+/// issued.
+const CLIENT_KEY_ID: &str = "AKIAEXAMPLECACHECLIENT";
 
-/// The same token made out for ANOTHER user, which is not a credential for `iam-user`.
-const OTHER_IAM_TOKEN: &str = "rbac-cache/?Action=connect&User=somebody-else\
-                               &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=900\
-                               &X-Amz-SignedHeaders=host&X-Amz-Signature=0123456789abcdef";
+/// An access key id of the form a credential carries that the account holds NO record of, so a
+/// token signed with it is signed by nobody this emulator issued a credential to.
+const UNHELD_KEY_ID: &str = "AKIAEXAMPLENOTTHEACCOUNTS";
+
+/// An IAM authentication token for the cache user `user`, signed under the credential
+/// `key_id`: the presigned request to connect as that user an IAM-authenticated client sends
+/// as its credential — `Action=connect`, the `User` it is made out for, and the SigV4 fields of
+/// the signature, whose credential scope names the key that signed it and the service it was
+/// signed for (the separators percent-encoded, as a presigned URL writes them).
+///
+/// The signature itself is not a real one — nothing on a cache's socket verifies one — and
+/// nothing in the token is secret.
+fn iam_token(user: &str, key_id: &str) -> String {
+    format!(
+        "rbac-cache/?Action=connect&User={user}\
+         &X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential={key_id}%2F20260101%2F{REGION}%2Felasticache%2Faws4_request\
+         &X-Amz-Date=20260101T000000Z&X-Amz-Expires=900\
+         &X-Amz-SignedHeaders=host&X-Amz-Signature=0123456789abcdef"
+    )
+}
+
+/// Record `key_id` as an access key of the account, the way `iam:CreateUser` and
+/// `iam:CreateAccessKey` record one.
+///
+/// An IAM authentication token is a request SIGNED with a credential of the account, so the
+/// tokens above name a key the account really holds: the records are the IAM service's own, in
+/// the same shared engine, which is where the cache's socket resolves the credential a token
+/// names.
+fn given_account_access_key(emulator: &Emulator, key_id: &str) {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    let user_name = "cache-client";
+    let minted = ::aws_smithy_types::DateTime::from_secs(0);
+    let store = iam::service_state(&**emulator.engine()).expect("the engine holds IAM records");
+    let mut store = store.lock();
+    store.users.insert(
+        iam::name_key(user_name),
+        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User {
+            path: "/".to_string(),
+            user_name: user_name.to_string(),
+            user_id: "AIDAEXAMPLECACHECLIENT".to_string(),
+            arn: format!(
+                "arn:aws:iam::{}:user/{user_name}",
+                ::engine::emulator_account_id()
+            ),
+            create_date: minted,
+            password_last_used: None,
+            permissions_boundary: None,
+            tags: None,
+        },
+    );
+    store.access_keys.insert(
+        key_id.to_string(),
+        iam::AccessKeyRecord {
+            user_key: iam::name_key(user_name),
+            status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
+            create_date: minted,
+        },
+    );
+}
 
 #[tokio::test]
 async fn a_user_group_decides_who_a_session_is_and_which_keys_it_may_reach() {
-    let emulator = Emulator::new();
+    // IAM is mounted beside this service on the one shared engine, the way the assembled
+    // emulator mounts it: the credential an IAM authentication token names is resolved against
+    // the account's own records, so a suite about an IAM-authenticated user needs them.
+    let emulator = Emulator::with_identity();
+    given_account_access_key(&emulator, CLIENT_KEY_ID);
     // The RBAC pattern AWS documents: the group's `default`-named member is the caller's
     // OWN user with no access, so unauthenticated traffic is served nothing, and the users
     // that do the work authenticate by name.
@@ -1034,14 +1106,19 @@ async fn a_user_group_decides_who_a_session_is_and_which_keys_it_may_reach() {
 
     // The axis: who the session authenticates as, which command it sends and which key it
     // names. Each row is the reply that user gets.
-    type AuthorizationCase = (
+    type AuthorizationCase<'a> = (
         &'static str,
         &'static str,
-        &'static str,
+        &'a str,
         &'static [&'static str],
         Option<&'static str>,
     );
-    let rows: [AuthorizationCase; 12] = [
+    // The IAM tokens the rows present: the user's own, one made out for another user, and one
+    // signed under a credential the account holds no record of.
+    let own_token = iam_token("iam-user", CLIENT_KEY_ID);
+    let other_users_token = iam_token("somebody-else", CLIENT_KEY_ID);
+    let unheld_credential_token = iam_token("iam-user", UNHELD_KEY_ID);
+    let rows: [AuthorizationCase<'_>; 13] = [
         ("the wrong password", "app", "no", &["GET", "app:key"], Some("WRONGPASS")),
         ("a user the group does not hold", "stranger", "the-application-password", &["GET", "app:key"], Some("WRONGPASS")),
         ("the application user writing its own keys", "app", "the-application-password", &["SET", "app:key", "value"], None),
@@ -1049,12 +1126,14 @@ async fn a_user_group_decides_who_a_session_is_and_which_keys_it_may_reach() {
         ("the application user outside its pattern", "app", "the-application-password", &["GET", "other:key"], Some("NOPERM")),
         ("the read-only user reading", "readonly", "the-read-only-password", &["GET", "app:key"], None),
         ("the read-only user writing", "readonly", "the-read-only-password", &["SET", "app:key", "other"], Some("NOPERM")),
-        // An IAM user's credential is an IAM authentication token for itself: a signed
-        // request to connect as that user. A password is not one, and neither is a token
-        // naming somebody else.
-        ("the IAM user with a token of its own", "iam-user", IAM_TOKEN, &["GET", "app:key"], None),
+        // An IAM user's credential is an IAM authentication token for itself: a request to
+        // connect as that user, signed under a credential of the account. A password is not
+        // one, a token naming somebody else is not one, and neither is a token signed under a
+        // credential this emulator never issued.
+        ("the IAM user with a token of its own", "iam-user", own_token.as_str(), &["GET", "app:key"], None),
         ("the IAM user with a password", "iam-user", "the-application-password", &["GET", "app:key"], Some("WRONGPASS")),
-        ("the IAM user with another user's token", "iam-user", OTHER_IAM_TOKEN, &["GET", "app:key"], Some("WRONGPASS")),
+        ("the IAM user with another user's token", "iam-user", other_users_token.as_str(), &["GET", "app:key"], Some("WRONGPASS")),
+        ("the IAM user with a token signed by a credential the account does not hold", "iam-user", unheld_credential_token.as_str(), &["GET", "app:key"], Some("WRONGPASS")),
         // The direction a pattern was granted in is honoured: a read of a key the user may
         // read is served, a write of the same key is not.
         ("the read-scoped user reading", "scoped", "the-scoped-password", &["GET", "app:key"], None),

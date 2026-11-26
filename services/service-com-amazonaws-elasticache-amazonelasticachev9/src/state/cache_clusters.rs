@@ -183,6 +183,18 @@ pub struct CacheClusterRecord {
     pub dns_token: String,
     pub endpoint_address: String,
     pub endpoint_port: i32,
+    /// The port the cluster's cache ENGINE accepts connections on: the `Port` the
+    /// create was given, or the engine's own default port where it named none
+    /// (`CreateCacheCluster$Port`, "the port number on which each of the cache
+    /// nodes accepts connections").
+    ///
+    /// Kept BESIDE [`endpoint_port`](Self::endpoint_port), which carries the port
+    /// of the socket this emulator serves the cluster on
+    /// ([`Self::publish_served_endpoint`]): a VPC security group rule guards the
+    /// port the engine listens on, so that is the port the rules guarding this
+    /// cluster are read against ([`crate::state::node_admission`]), and it is not
+    /// the port the core assigned a socket of this machine.
+    pub engine_port: i32,
     /// The address this emulator's OWN socket for this cluster answers on, when
     /// it opened one — the data plane [`crate::state::cache_data_plane`] serves.
     ///

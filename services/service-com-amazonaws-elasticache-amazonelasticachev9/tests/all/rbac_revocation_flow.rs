@@ -177,7 +177,10 @@ fn replication_group_report() -> Vec<(String, String)> {
 
 /// Place the flow's network the way the recorded run places it: a cache subnet group over
 /// three subnets of ONE VPC the account has, and a security group minted by the service that
-/// owns security groups. Answers the security group id the cache is created with.
+/// owns security groups — carrying the inbound rule that admits the group's clients to the
+/// endpoint it will publish, because a cache placed in the account's VPC serves only the
+/// connections its security groups admit ([`crate::cache_endpoint_security_group_gate`]).
+/// Answers the security group id the cache is created with.
 async fn placement(emulator: &Emulator) -> String {
     let subnets = emulator.account_subnets().await;
     let vpc = subnets
@@ -215,9 +218,15 @@ async fn placement(emulator: &Emulator) -> String {
         "CreateCacheSubnetGroup must answer 200, got {} {}",
         created.status, created.body
     );
-    emulator.security_group_named("revocation-cache").await
+    let security_group = emulator.security_group_named("revocation-cache").await;
+    emulator
+        .authorize_tcp_ingress_from_anywhere(
+            &security_group,
+            ::service_com_amazonaws_elasticache_amazonelasticachev9::state::default_port("redis"),
+        )
+        .await;
+    security_group
 }
-
 /// Create the two members of [`MEMBERS`], each with the credential form its row is about.
 async fn create_members(emulator: &Emulator) {
     for (case, id, secret) in MEMBERS {
