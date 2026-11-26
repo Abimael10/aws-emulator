@@ -147,9 +147,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // This operation is @readonly: it projects the stored record and writes nothing.
         // `systemArn`'s length and `Arn` pattern are modelled, so a malformed one is
-        // already refused with a 400 `ValidationException` before this handler runs. A
-        // well-formed ARN that names no stored system is a 404.
+        // already refused with a 400 `ValidationException` before this handler runs. WHAT
+        // the ARN names is settled next — a value that pattern admits may name no system of
+        // this service at all, which is a fault in the request (see
+        // `crate::state::arn_shape`) — and only an ARN that does name a system of this
+        // service and is not stored is a 404.
         let store = state.lock();
+        if let Some(invalid) = crate::state::system_arn_rejection(&input.system_arn) {
+            return Err(GetSystemErrorModeled::ValidationException(invalid).into());
+        }
         let Some(system) = store.system_view(&input.system_arn) else {
             return Err(GetSystemErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(

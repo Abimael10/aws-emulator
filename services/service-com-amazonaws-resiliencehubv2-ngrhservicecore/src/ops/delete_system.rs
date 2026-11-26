@@ -151,9 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // `systemArn`'s length and `Arn` pattern are modelled, so a malformed one is
-        // already refused with a 400 `ValidationException` before this handler runs. A
-        // well-formed ARN that names no stored system is a 404 — including the ARN of a
-        // system this call already removed, so a repeated delete is not a second success.
+        // already refused with a 400 `ValidationException` before this handler runs. WHAT
+        // the ARN names is settled next — a value that pattern admits may name no system of
+        // this service at all, which is a fault in the request (see
+        // `crate::state::arn_shape`). A well-formed system ARN that names no stored system
+        // is a 404 — including the ARN of a system this call already removed, so a repeated
+        // delete is not a second success.
+        if let Some(invalid) = crate::state::system_arn_rejection(&input.system_arn) {
+            return Err(DeleteSystemErrorModeled::ValidationException(invalid).into());
+        }
         let Some(record) = store.systems.get(&input.system_arn) else {
             return Err(DeleteSystemErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(

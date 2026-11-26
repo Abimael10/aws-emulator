@@ -198,6 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation is @readonly: it projects the stored records and writes nothing.
         let store = state.lock();
 
+        // WHAT the `systemArn` names is settled before anything is looked up: the modelled
+        // `Arn` pattern admits a value naming no system of this service, which is a fault in
+        // the request (see `crate::state::arn_shape`).
+        if let Some(invalid) = crate::state::system_arn_rejection(&input.system_arn) {
+            return Err(ListUserJourneysErrorModeled::ValidationException(invalid).into());
+        }
+
         // A token is valid only if it names a position this store actually handed out
         // (positions start at 1), so a well-formed token this service never issued is
         // refused rather than answered with a page.

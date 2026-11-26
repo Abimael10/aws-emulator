@@ -54,6 +54,10 @@
 //! policies reach one service — its own, and those of the user journeys it is associated
 //! through — and how their targets fold into the values it reports.
 //!
+//! [`arn_shape`] holds the verdict that comes BEFORE that lookup: whether an ARN a request
+//! supplies names the kind of resource the member it arrived on requires at all, and the
+//! refusal of one that does not.
+//!
 //! [`not_found`] holds the refusal every operation that resolves an ARN answers with when
 //! the ARN names nothing stored, so the whole crate words it once, [`conflicts`] holds the
 //! `ConflictException` wordings a create answers with, [`availability_slo`] holds the
@@ -62,6 +66,7 @@
 //! the one tag map projection and the write path `TagResource` reaches a tagged resource
 //! through, whichever of this store's resources an ARN names.
 
+mod arn_shape;
 mod assertions;
 mod availability_slo;
 mod conflicts;
@@ -77,6 +82,9 @@ mod systems;
 mod tagging;
 mod user_journeys;
 
+pub use arn_shape::{
+    arn_validation_error, names_resource_kind, system_arn_rejection, ARN_VALIDATION_MESSAGE,
+};
 pub use assertions::{
     assertion_not_found, mint_assertion_id, AssertionIdempotencyRecord, AssertionRecord,
     ASSERTION_RESOURCE_TYPE, ASSERTION_SOURCE_USER, MAX_ASSERTIONS_PER_SERVICE,

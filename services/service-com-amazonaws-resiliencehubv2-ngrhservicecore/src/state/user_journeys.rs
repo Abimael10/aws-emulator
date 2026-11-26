@@ -120,6 +120,21 @@ impl SystemRecord {
         journeys.sort_by_key(|journey| journey.sequence);
         journeys
     }
+
+    /// Remove the journey stored under `user_journey_id`, with the `clientToken` entries
+    /// that named it, and answer the record that was removed.
+    ///
+    /// No token may replay into a journey that no longer exists — the same cleanup a deleted
+    /// system takes with it
+    /// ([`remove_system`](super::ComAmazonawsResiliencehubv2NgrhservicecoreState::remove_system))
+    /// — so a repeat of the create that first used the token creates a new journey instead
+    /// of answering the deleted one.
+    pub fn remove_user_journey(&mut self, user_journey_id: &str) -> Option<UserJourneyRecord> {
+        let record = self.user_journeys.remove(user_journey_id)?;
+        self.user_journey_idempotency
+            .retain(|_, consumed| consumed.user_journey_id != record.user_journey_id);
+        Some(record)
+    }
 }
 
 /// A fresh `userJourneyId`.

@@ -169,6 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let system_arn = input.system_arn;
 
+        // WHAT the ARN names is settled before WHETHER it is stored: `Arn`'s modelled
+        // pattern admits a value that names another service's resource, another kind of this
+        // service's resource, or no resource kind at all, and such a value is a fault in the
+        // request rather than a system that has gone — so it is refused 400 here, before any
+        // lookup (see `crate::state::arn_shape`).
+        if let Some(invalid) = crate::state::system_arn_rejection(&system_arn) {
+            return Err(CreateUserJourneyErrorModeled::ValidationException(invalid).into());
+        }
+
         // A journey is created WITHIN a system, so the parent must exist before anything is
         // stored: a `systemArn` naming no system is a 404, not a journey with no system.
         // Every refusal below reads the system first, so nothing is minted or consumed until

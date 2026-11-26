@@ -604,8 +604,10 @@ async fn a_name_already_taken_is_refused_as_a_conflict() {
 #[tokio::test]
 async fn an_arn_naming_no_stored_system_is_not_found() {
     // Rows differ along the ARN's form: a system id this emulator never minted, another
-    // Region's, another account's, and well-formed ARNs of the store's other two resource
-    // types. Each satisfies `Arn`'s modelled pattern, so each reaches the handler.
+    // Region's and another account's. Each IS a system ARN of this service — the partition,
+    // Region and account say where the system would live — so each reaches the store and
+    // resolves to nothing. An ARN that names no system of this service AT ALL is a
+    // different answer, pinned in `user_journey_deletion`.
     let router = emulator();
     // One stored system, so the refusals are about the ARN rather than an empty store.
     let (status, body) = create_system(&router, json!({"name": "A-Live-System"})).await;
@@ -614,8 +616,6 @@ async fn an_arn_naming_no_stored_system_is_not_found() {
         format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{SYSTEM_RESOURCE}/missing"),
         format!("arn:aws:resiliencehub:eu-central-1:{ACCOUNT}:{SYSTEM_RESOURCE}/absent"),
         format!("arn:aws:resiliencehub:{REGION}:210987654321:{SYSTEM_RESOURCE}/elsewhere"),
-        format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{SERVICE_RESOURCE}/not-a-system"),
-        format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{POLICY_RESOURCE}/not-a-system"),
     ];
     for arn in arns {
         let (status, body) = get_system(&router, &arn).await;
@@ -632,8 +632,7 @@ async fn an_arn_naming_no_stored_system_is_not_found() {
         // The refusal identifies the system by its `systemId` — the id the ARN carries
         // after the `system/` qualifier, which is the identifier `System$systemId` reports
         // for a system that IS there — under the type the model's shape for a system
-        // carries. An ARN whose resource segment names another kind of resource has no
-        // such id to strip, so the whole segment identifies what the caller addressed.
+        // carries.
         let resource_id = system_id_of_arn(&arn);
         assert_eq!(
             body["resourceId"].as_str(),
@@ -939,12 +938,8 @@ async fn an_update_or_delete_of_an_absent_system_is_not_found() {
     // One stored system, so the refusals are about the ARN rather than an empty store.
     let (live_arn, _) = system_named(&router, "A-Live-System").await;
     let absent = format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{SYSTEM_RESOURCE}/absent");
-    let other_kind = format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{SERVICE_RESOURCE}/not-a-system");
 
-    for (case, arn) in [
-        ("an id this store never minted", absent.as_str()),
-        ("an ARN of another resource kind", other_kind.as_str()),
-    ] {
+    for (case, arn) in [("an id this store never minted", absent.as_str())] {
         for (operation, answer) in [
             ("UpdateSystem", update_system(&router, json!({"systemArn": arn, "description": "x"})).await),
             ("DeleteSystem", delete_system(&router, arn).await),

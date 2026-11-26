@@ -163,7 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming no stored system is reported as that missing system rather than as a
         // missing journey, because the caller addressed a system that is not there. Both
         // addressing members' lengths and patterns are modelled, so a malformed one is
-        // already refused with a 400 `ValidationException` before this handler runs.
+        // already refused with a 400 `ValidationException` before this handler runs — and
+        // WHAT the ARN names is settled before WHETHER it is stored, since the modelled
+        // pattern admits a value naming no system of this service at all (see
+        // `crate::state::arn_shape`).
+        if let Some(invalid) = crate::state::system_arn_rejection(&input.system_arn) {
+            return Err(UpdateUserJourneyErrorModeled::ValidationException(invalid).into());
+        }
         let Some(system) = store.systems.get_mut(&input.system_arn) else {
             return Err(UpdateUserJourneyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(

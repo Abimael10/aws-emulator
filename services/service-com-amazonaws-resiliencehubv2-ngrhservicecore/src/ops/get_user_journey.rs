@@ -153,6 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused with a 400 `ValidationException` before this handler runs.
         let store = state.lock();
 
+        // WHAT the `systemArn` names is settled before WHETHER it is stored: a value the
+        // modelled `Arn` pattern admits but which names no system of this service is a fault
+        // in the request, refused 400 (see `crate::state::arn_shape`).
+        if let Some(invalid) = crate::state::system_arn_rejection(&input.system_arn) {
+            return Err(GetUserJourneyErrorModeled::ValidationException(invalid).into());
+        }
+
         // A journey lives WITHIN its system, so a `systemArn` naming no system is reported
         // as the missing system rather than as a missing journey: the caller addressed a
         // system that is not there.
