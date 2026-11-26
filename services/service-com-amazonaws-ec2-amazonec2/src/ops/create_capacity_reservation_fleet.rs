@@ -360,9 +360,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // capacity" / "The ID of the Availability Zone in which [it] reserves the
             // capacity": the two name one zone two ways, so a specification gives one of
             // them, and the zone has to be one the signed Region has.
+            // An optional member carrying the EMPTY STRING names no value, so a specification
+            // that left either member empty names no zone under it — the pair rule below sees
+            // the members the request really gave.
             let zone = match (
-                specification.availability_zone.as_deref(),
-                specification.availability_zone_id.as_deref(),
+                specification
+                    .availability_zone
+                    .as_deref()
+                    .filter(|zone_name| !zone_name.is_empty()),
+                specification
+                    .availability_zone_id
+                    .as_deref()
+                    .filter(|zone_id| !zone_id.is_empty()),
             ) {
                 (Some(_), Some(_)) => {
                     return Err(Scaffolded::invalid_parameter_combination(

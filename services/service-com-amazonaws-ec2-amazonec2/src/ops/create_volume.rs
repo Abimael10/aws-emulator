@@ -252,9 +252,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region has — the naming rule for those zones lives in one place,
         // `availability_zones_in_region`.
         let zones = availability_zones_in_region(&region);
+        // An optional member carrying the EMPTY STRING names no value, so a request that left
+        // either member empty names no zone under it — the same reading
+        // `CreateCapacityReservation` and `CreateDefaultSubnet` give an empty zone, so one
+        // spelling of "no zone" cannot be served differently from the other.
         let zone = match (
-            input.availability_zone.as_deref(),
-            input.availability_zone_id.as_deref(),
+            input
+                .availability_zone
+                .as_deref()
+                .filter(|zone_name| !zone_name.is_empty()),
+            input
+                .availability_zone_id
+                .as_deref()
+                .filter(|zone_id| !zone_id.is_empty()),
         ) {
             (Some(_), Some(_)) => {
                 return Err(Scaffolded::invalid_parameter_combination(

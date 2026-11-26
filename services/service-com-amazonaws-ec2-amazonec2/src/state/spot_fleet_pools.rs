@@ -144,7 +144,13 @@ pub fn spot_fleet_template_pools<E>(
                     return Err(invalid_subnet_id_not_found(subnet_id));
                 }
             }
-            if let Some(zone_name) = over.and_then(|over| over.availability_zone.as_deref()) {
+            if let Some(zone_name) = over
+                .and_then(|over| over.availability_zone.as_deref())
+                // An optional member carrying the EMPTY STRING names no value, so there is no
+                // zone to resolve: the override names none, exactly as one that omitted the
+                // member does.
+                .filter(|zone_name| !zone_name.is_empty())
+            {
                 availability_zone_of_region(zones, region, "availabilityZone", zone_name, |zone| {
                     zone.zone_name.as_str()
                 })?;

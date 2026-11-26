@@ -365,6 +365,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .placement
             .as_ref()
             .and_then(|placement| placement.availability_zone.as_deref())
+            // An optional member carrying the EMPTY STRING names no value, so there is no
+            // zone to resolve: "if you specify neither one, Amazon EC2 automatically selects
+            // an Availability Zone for you" (`Placement$AvailabilityZone`), which is what a
+            // specification that left the member empty asked for.
+            .filter(|requested| !requested.is_empty())
         {
             crate::state::availability_zone_of_region(
                 &zones,

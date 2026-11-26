@@ -14,7 +14,10 @@
 //!    a `Subnet` one, that VPC's for a `VPC` one, and never an interface of another subnet or
 //!    another VPC.
 //! 2. THE RECORD IS WRITTEN IN THE FLOW LOG'S OWN `LogFormat`: the fields the format names, in
-//!    the order it names them, separated by the format's own text, with the no-value symbol
+//!    the order it names them, separated by the single space the format separates them with
+//!    ("specify the fields using the `${field-id}` format, separated by spaces",
+//!    `CreateFlowLogsRequest$LogFormat`, which is why a format that joins its markers with a
+//!    separator of its own is refused rather than delivered), with the no-value symbol
 //!    for a field the record has no value for ("If a field is not applicable or could not be
 //!    computed for a specific record, the record displays a '-' symbol for that entry", Amazon
 //!    VPC User Guide, "Flow log records") and the `version` the fields the format names imply.
@@ -781,10 +784,13 @@ async fn a_record_follows_the_log_format_the_flow_log_was_created_with() {
     }
 }
 
-/// RULE: the separators of a record are the format's OWN text, so a format that separates its
-/// fields with something other than a space writes records separated that way.
+/// RULE: a record format lays out ONE field per space-separated token — "specify the fields
+/// using the `${field-id}` format, separated by spaces"
+/// (`CreateFlowLogsRequest$LogFormat`) — so a format that joins its markers with a separator
+/// of its own gives one token that names no published field: the create is REFUSED and the
+/// log group it would have published to is left with nothing at all.
 #[tokio::test]
-async fn the_separators_of_a_record_are_the_formats_own_text() {
+async fn a_format_that_does_not_separate_its_fields_with_spaces_is_refused() {
     let emulator = Emulator::new();
     let case = "a comma-separated format";
     let vpc = emulator.given_vpc(case, "10.82.0.0/16").await;
@@ -795,27 +801,31 @@ async fn the_separators_of_a_record_are_the_formats_own_text() {
         .await;
     let log_group = "/aws/vpc/flow-logs/separators";
     emulator.given_log_group(case, log_group).await;
-    created_flow_log(
-        &emulator,
-        case,
-        &FlowLogRequest {
-            resource_type: "NetworkInterface",
-            resource_id: &interface,
-            log_group,
-            role_arn: &role,
-            log_format: Some("${interface-id},${action},${log-status}"),
-            traffic_type: "ALL",
-        },
-    )
-    .await;
-
-    let events = emulator.polled_events(case, log_group, 1).await;
-    let (_, record) = &events[0];
+    let (status, body) = emulator
+        .ec2_call(
+            "CreateFlowLogs",
+            &[
+                param("ResourceType", "NetworkInterface"),
+                param("ResourceId.1", &interface),
+                param("TrafficType", "ALL"),
+                param("LogDestinationType", "cloud-watch-logs"),
+                param("LogGroupName", log_group),
+                param("DeliverLogsPermissionArn", &role),
+                param("LogFormat", "${interface-id},${action},${log-status}"),
+            ],
+        )
+        .await;
     assert_eq!(
-        *record,
-        format!("{interface},{NO_VALUE},{NODATA}"),
-        "case {case:?}: the record must be written with the format's own separators, got \
-         {record:?}"
+        status, 400,
+        "case {case:?}: expected HTTP 400 for a format that names no field, got {status} with \
+         body {body}"
+    );
+    // Nothing was turned on, so nothing publishes: the group a served create would have
+    // delivered to holds no record at all.
+    let held = emulator.events(case, log_group).await;
+    assert!(
+        held.is_empty(),
+        "case {case:?}: a refused create must publish nothing, got {held:?}"
     );
 }
 

@@ -119,6 +119,27 @@ pub const FLOW_LOG_RECORD_FIELDS: [&str; 58] = [
 /// separator names a tag rather than a field of the record, and is read as one.
 const FLOW_LOG_TAG_FIELD_SEPARATOR: char = ':';
 
+/// The field one SPACE-SEPARATED token of a log format NAMES: the text its leading `${` and
+/// trailing `}` enclose, and `None` for a token that is not one such marker.
+///
+/// "Specify the fields using the `${field-id}` format, separated by spaces"
+/// (`CreateFlowLogsRequest$LogFormat`): a format lays out ONE field per space-separated token,
+/// each written as a single `${field-id}` marker — so a token that glues two markers together
+/// with a separator of its own, or that carries text beside the marker, is not a marker and
+/// names no field. The text between the markers of such a token is part of the name it tried
+/// to give, which is why a marker's text may not carry `$`, `{` or `}` itself.
+fn flow_log_format_token_field(token: &str) -> Option<&str> {
+    flow_log_format_token_text(token).filter(|field| !field.contains(['$', '{', '}']))
+}
+
+/// The text a token encloses between a leading `${` and a trailing `}` — the field name it
+/// tried to give, whether or not that text is one marker's.
+fn flow_log_format_token_text(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+}
+
 /// The `${field-id}` tokens of `log_format`, in the order the format names them.
 ///
 /// "Specify the fields using the `${field-id}` format, separated by spaces"
@@ -138,20 +159,30 @@ pub fn flow_log_format_fields(log_format: &str) -> Vec<&str> {
     fields
 }
 
-/// The `${field-id}` tokens of `log_format` that name no field a flow log record has, each
-/// listed once and in the order the format names them.
+/// The tokens of `log_format` that name no field a flow log record has, each listed once and
+/// in the order the format names them — as the refusal spells them back to the caller.
 ///
-/// A token is recognised when it names an entry of [`FLOW_LOG_RECORD_FIELDS`], or when it
-/// reads a tag of the monitored resource ([`FLOW_LOG_TAG_FIELD_SEPARATOR`], whose tag key is
-/// the caller's and so is not in any published table). Every other token names a field that
-/// does not exist, and the create that carries it is refused with
-/// [`unknown_flow_log_fields`].
+/// The format is read as the member documents it: one field per SPACE-SEPARATED token
+/// ([`flow_log_format_token_field`]). A token is recognised when it is a single marker whose
+/// text names an entry of [`FLOW_LOG_RECORD_FIELDS`], or reads a tag of the monitored resource
+/// ([`FLOW_LOG_TAG_FIELD_SEPARATOR`], whose tag key is the caller's and so is not in any
+/// published table). Every other token names a field that does not exist — a misspelled id, a
+/// field this service does not publish, and a run of markers the format did not separate with
+/// a space alike — and the create that carries it is refused with [`unknown_flow_log_fields`],
+/// which names the text the token tried to give as a field: what its outermost `${`…`}`
+/// enclose where it has them, and the token itself where it has none.
 pub fn unknown_flow_log_format_fields(log_format: &str) -> Vec<&str> {
     let mut unknown: Vec<&str> = Vec::new();
-    for field in flow_log_format_fields(log_format) {
-        let recognised = FLOW_LOG_RECORD_FIELDS.contains(&field)
-            || field.contains(FLOW_LOG_TAG_FIELD_SEPARATOR);
-        if !recognised && !unknown.contains(&field) {
+    for token in log_format.split_whitespace() {
+        let recognised = flow_log_format_token_field(token).is_some_and(|field| {
+            FLOW_LOG_RECORD_FIELDS.contains(&field)
+                || field.contains(FLOW_LOG_TAG_FIELD_SEPARATOR)
+        });
+        if recognised {
+            continue;
+        }
+        let field = flow_log_format_token_text(token).unwrap_or(token);
+        if !unknown.contains(&field) {
             unknown.push(field);
         }
     }
@@ -427,10 +458,11 @@ fn value_fits_one_field(value: &str) -> bool {
 /// token replaced by what this record reports for it.
 ///
 /// "Specify the fields using the `${field-id}` format, separated by spaces"
-/// (`CreateFlowLogsRequest$LogFormat`) — the separators are the format's own text, so a
-/// format that separates its fields with anything else writes records separated that way, and
-/// the FIELD ORDER is the order the format names them in. An unterminated `${` opens no token
-/// ([`flow_log_format_fields`]), so what follows it is literal text.
+/// (`CreateFlowLogsRequest$LogFormat`) — the separators are the format's own text, which the
+/// create holds to spaces ([`unknown_flow_log_format_fields`] refuses a format whose tokens
+/// are anything but one marker each), and the FIELD ORDER is the order the format names them
+/// in. An unterminated `${` opens no token ([`flow_log_format_fields`]), so what follows it is
+/// literal text.
 #[must_use]
 pub fn flow_log_record_line(log_format: &str, facts: &FlowLogRecordFacts<'_>) -> String {
     let mut line = String::with_capacity(log_format.len());

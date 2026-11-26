@@ -490,6 +490,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 launch_overlaid_with_template(input, &data)?
             }
         };
+        // An OPTIONAL member carrying the EMPTY STRING names no value: it is read as the
+        // member being absent, so what the launch runs under is that member's documented
+        // default rather than the empty text resolved as a zone or an address. That is how
+        // this launch already reads its key pair name, its placement group name and its host
+        // id, and how every other operation of this service reads a zone a request leaves
+        // empty, so the two members below are read the same way — on the RESOLVED launch, so
+        // a member a launch template left empty is read as absent too.
+        //
+        // "The Availability Zone of the instance. On input, you can specify
+        // `AvailabilityZone` or `AvailabilityZoneId`, but not both. If you specify neither
+        // one, Amazon EC2 automatically selects an Availability Zone for you"
+        // (`Placement$AvailabilityZone`): a launch that leaves it empty names no zone,
+        // so the zone is chosen below exactly as for a launch that omitted the member.
+        if let Some(placement) = input.placement.as_mut() {
+            if placement
+                .availability_zone
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                placement.availability_zone = None;
+            }
+        }
+        // "The primary IPv4 address. You must specify a value from the IPv4 address range of
+        // the subnet" (`RunInstancesRequest$PrivateIpAddress`) — a launch that leaves it empty
+        // names no address, so the subnet picks one as it does for a launch that omitted the
+        // member, rather than the empty text being refused as an address it is not.
+        if input
+            .private_ip_address
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            input.private_ip_address = None;
+        }
         // Whether this launch is a PROBE: `DryRun` "checks whether you have the required
         // permissions for the action, WITHOUT ACTUALLY MAKING THE REQUEST, and provides an
         // error response. If you have the required permissions, the error response is

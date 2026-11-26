@@ -916,9 +916,14 @@ fn resolve_pools(
             // "Either `AvailabilityZone` or `AvailabilityZoneId` must be specified in the
             // request, but not both" (`$AvailabilityZone`), and the zone has to be one the
             // signed Region has.
+            // An optional member carrying the EMPTY STRING names no value, so an override that
+            // left either member empty names no zone at all — the pair rule below does not
+            // fire for it, and nothing is resolved for it.
             let zone = match (
-                over.and_then(|over| over.availability_zone.as_deref()),
-                over.and_then(|over| over.availability_zone_id.as_deref()),
+                over.and_then(|over| over.availability_zone.as_deref())
+                    .filter(|zone_name| !zone_name.is_empty()),
+                over.and_then(|over| over.availability_zone_id.as_deref())
+                    .filter(|zone_id| !zone_id.is_empty()),
             ) {
                 (Some(_), Some(_)) => {
                     return Err(Scaffolded::invalid_parameter_combination(
