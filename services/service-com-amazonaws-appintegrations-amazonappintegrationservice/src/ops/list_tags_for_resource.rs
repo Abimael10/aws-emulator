@@ -13,11 +13,15 @@
 //! resource reports the EMPTY map rather than an absent member (see
 //! [`crate::state::modeled_tags`]), so a client can tell "no tags" from "not reported".
 //!
-//! An ARN this account holds no taggable resource under is refused with
-//! `ResourceNotFoundException` (HTTP 404), worded by
-//! [`crate::state::tagged_resource_not_found`] — the ARN the request sent and no
-//! resource type, because this operation is handed an arbitrary ARN and resolves no
-//! type before refusing.
+//! An ARN this account holds no taggable resource under is refused with the code the
+//! tag READ answers rather than the modelled one: HTTP 404 `NotFoundException` with the
+//! constant message [`crate::scaffolded::TAG_READ_NOT_FOUND_MESSAGE`], which names
+//! nothing from the request. The two tag WRITES refuse the same ARN with the modelled
+//! `ResourceNotFoundException` and the ARN-bearing sentence
+//! [`crate::state::tagged_resource_not_found`] states, so the code is how a caller tells
+//! "the tag read found no resource" from "the tag write found no resource". Neither
+//! refusal names a resource type: a tagging operation is handed an arbitrary ARN and
+//! resolves no type before refusing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,11 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        let tags = state.tags_of(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::tagged_resource_not_found(&input.resource_arn)),
-            })
-        })?;
+        // The tag read's own not-found refusal: the code and the constant message the
+        // recorded response carries, which the model does not declare — so it travels
+        // through the error channel's unmodeled variant rather than as the modelled
+        // `ResourceNotFoundException` the two tag writes answer.
+        let Some(tags) = state.tags_of(&input.resource_arn) else {
+            return Err(crate::scaffolded::Scaffolded::tag_read_not_found());
+        };
 
         Ok(ListTagsForResourceOutput {
             tags: Some(crate::state::modeled_tags(tags)),
