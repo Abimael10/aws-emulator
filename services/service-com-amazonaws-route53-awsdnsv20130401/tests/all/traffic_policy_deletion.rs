@@ -560,44 +560,48 @@ async fn an_id_or_version_the_account_does_not_hold_is_refused() {
     near_miss.pop();
     near_miss.push(if id.ends_with('0') { '1' } else { '0' });
 
-    let rows: Vec<(&str, String, String)> = vec![
+    let rows: Vec<(&str, String, String, bool)> = vec![
         (
             "an id in the minted form that no policy carries",
             "00000000-0000-0000-0000-000000000000".to_string(),
             "1".to_string(),
+            false,
         ),
         (
             "an id one character off the held one",
             near_miss,
             "1".to_string(),
+            false,
         ),
         (
             "an id that is not in the minted form at all",
             "x".to_string(),
             "1".to_string(),
+            false,
         ),
         (
             "a version the policy has never reached",
             id.clone(),
             "3".to_string(),
+            true,
         ),
         (
             "the highest version a policy may carry, which this one does not",
             id.clone(),
             "1000".to_string(),
+            true,
         ),
     ];
 
-    for (case, requested_id, version) in &rows {
+    for (case, requested_id, version, policy_is_held) in &rows {
         let reply = delete_policy(&case_router, requested_id, version).await;
         // Which body the one error class carries is decided by the half of the
         // pair that named nothing: an id the account holds no policy under is the
         // refusal's identity alone, while a version of the policy it DOES hold
         // states that the policy does not exist.
-        if *requested_id == id {
-            assert_no_such_traffic_policy_version(&reply, case);
-        } else {
-            assert_no_such_traffic_policy(&reply, case);
+        match policy_is_held {
+            true => assert_no_such_traffic_policy_version(&reply, case),
+            false => assert_no_such_traffic_policy(&reply, case),
         }
     }
 
@@ -779,6 +783,8 @@ async fn no_traffic_policy_instance_is_created_from_a_deleted_version() {
     );
 
     let refused = create_instance(&router, &zone, "one.example.net", 60, &id, 1).await;
+    // The policy record is still there, so what the request named and the account
+    // does not hold is the VERSION.
     assert_no_such_traffic_policy_version(&refused, case);
 
     // The version that was NOT deleted still serves an instance, so the refusal

@@ -346,30 +346,35 @@ async fn an_id_or_version_the_store_does_not_hold_is_refused() {
             "an id in the minted form that no policy carries",
             "00000000-0000-0000-0000-000000000000".to_string(),
             VERSION_MIN.to_string(),
+            false,
         ),
         (
             "an id one character off the held one",
             near_miss,
             VERSION_MIN.to_string(),
+            false,
         ),
         (
             "an id that is not in the minted form at all",
             "x".to_string(),
             VERSION_MIN.to_string(),
+            false,
         ),
         (
             "a version one past the highest the policy holds",
             held.id.clone(),
             "4".to_string(),
+            true,
         ),
         (
             "the highest version the model allows, which this policy does not hold",
             held.id.clone(),
             VERSION_MAX.to_string(),
+            true,
         ),
     ];
 
-    for (case, id, version) in &rows {
+    for (case, id, version, policy_is_held) in &rows {
         let reply = update_comment(&router, id, version, "a comment for nothing").await;
         assert_eq!(
             reply.status, 404,
@@ -380,10 +385,9 @@ async fn an_id_or_version_the_store_does_not_hold_is_refused() {
         // One error class, two conditions: an id the account holds no policy
         // under is reported by its code alone, while a version of the policy it
         // DOES hold states that the policy does not exist.
-        if *id == held.id {
-            assert_no_such_traffic_policy_version(&reply, case);
-        } else {
-            assert_no_such_traffic_policy(&reply, case);
+        match policy_is_held {
+            true => assert_no_such_traffic_policy_version(&reply, case),
+            false => assert_no_such_traffic_policy(&reply, case),
         }
     }
 

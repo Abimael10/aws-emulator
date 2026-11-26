@@ -4,9 +4,9 @@
 //! Persists ONE event source mapping in [`crate::state`]: the event source the request
 //! names, the function it resolves, and every polling, filtering, destination and
 //! logging setting the request stated, under a UUID and an ARN minted once. The operation
-//! answers 202, so every mapping it accepts answers `Creating`, and the move to the state
-//! its `Enabled` setting asks for — `Enabled` for one asked to be active, `Disabled` for
-//! one asked for with polling paused — is owed by the CLOCK (see
+//! answers 202, so a mapping it accepts with POLLING asked for answers `Creating`, and the
+//! move to `Enabled` is owed by the CLOCK; a mapping asked for with polling paused has no
+//! poller to stand up and answers the terminal `Disabled` it asked for (see
 //! [`crate::state::created_event_source_mapping_state`] and
 //! [`crate::state::EventSourceMappingRecord::materialize`]).
 //!
@@ -1062,17 +1062,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
-            // This call only STARTS what the mapping needs — it answers 202 Accepted — so
-            // the mapping is `Creating` whichever polling setting it was asked for with,
-            // and the move to the state that setting asks for is owed by the clock at
-            // `settled_due`; nothing waits for it (see
+            // Only the POLLING a create asks for has to be stood up, so what this call
+            // answers depends on whether it asked for any: a mapping asked to be active is
+            // `Creating` until the clock settles it at `settled_due`, and one asked to be
+            // paused is the terminal `Disabled` the request asked for straight away —
+            // nothing is being stood up for it (see
             // [`crate::state::created_event_source_mapping_state`]).
-            state: crate::state::created_event_source_mapping_state().to_string(),
+            state: crate::state::created_event_source_mapping_state(enabled).to_string(),
             state_transition_reason: crate::state::event_source_mapping_transition_reason(
                 event_source_arn.as_deref(),
             )
             .to_string(),
-            settled_due: now + crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY,
+            // A paused mapping is already in the state it was asked for, so the clock owes
+            // it no transition and the instant is the creation instant itself.
+            settled_due: if enabled {
+                now + crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY
+            } else {
+                now
+            },
             // Nobody has deleted this mapping, so no removal is owed.
             removal_due: None,
             last_modified: now,

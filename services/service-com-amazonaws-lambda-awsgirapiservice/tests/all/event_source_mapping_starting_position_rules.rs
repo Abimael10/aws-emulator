@@ -34,9 +34,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::event_source_mappings::{
-    await_mapping_state, create_function, create_mapping, create_request, get_mapping, router_on,
-    Answer, NO_RECORDS_PROCESSED, STATE_CREATING, STATE_DISABLED, STATE_ENABLED, USER_ACTION,
-    USER_INITIATED,
+    await_mapping_state, create_function, create_mapping, create_request, created_state,
+    get_mapping, router_on, Answer, NO_RECORDS_PROCESSED, STATE_DISABLED, STATE_ENABLED,
+    USER_ACTION, USER_INITIATED,
 };
 
 /// The modelled refusal of a request this operation cannot accept
@@ -406,18 +406,20 @@ async fn every_accepted_create_is_transitional_and_settles_into_its_polling_sett
             answered.status,
             answered.text()
         );
-        // The create is accepted rather than applied, so the mapping it answers is the one
-        // being stood up — whichever polling setting the row stated.
+        // Only polling has to be stood up, so the create answers the transitional state for
+        // a mapping asked to be active and the terminal one the row asked for when it asked
+        // for polling to be paused.
+        let created_state = created_state(&row.extras);
         assert_eq!(
             (
                 answered.string("State"),
                 answered.string("StateTransitionReason")
             ),
             (
-                Some(STATE_CREATING.to_string()),
+                Some(created_state.to_string()),
                 Some(row.reason.to_string())
             ),
-            "case {case:?}: expected State {STATE_CREATING} and StateTransitionReason {}, \
+            "case {case:?}: expected State {created_state} and StateTransitionReason {}, \
              got {}",
             row.reason,
             answered.text()

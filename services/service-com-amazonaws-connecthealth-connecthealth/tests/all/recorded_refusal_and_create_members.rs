@@ -379,18 +379,17 @@ async fn every_refusal_reports_its_detail_text_in_the_modelled_member() {
 }
 
 #[tokio::test]
-async fn delete_domain_refuses_every_unresolvable_id_by_its_allocation_history() {
+async fn delete_domain_refuses_every_unresolvable_id_with_the_modelled_not_found() {
     let emulator = Emulator::new("us-east-1");
 
     // Every way a well-formed `domainId` can name no domain this Region holds, spanning what
     // the rule generalises over: ids no account was ever allocated (both modelled prefixes,
     // both ends of the modelled length, digits, repeated letters and a pronounceable id),
     // an id this service minted whose domain it has since purged, and one that is live in
-    // another Region. An id with an allocation history reaches the component that owns the
-    // domain and earns the one error the operation models
+    // another Region. Each one names a resource this endpoint does not have, which is the
+    // ONE error this operation models
     // (`smithy_query(query="operation",operation="DeleteDomain")` reports
-    // `ResourceNotFoundException` alone); an id with none resolves no ARN for the front door
-    // to authorize and is refused there, with no detail at all.
+    // `ResourceNotFoundException` alone), so the id's own history cannot change the answer.
     let mut rows: Vec<(String, bool, String)> = Vec::new();
     for (label, id) in [
         (
@@ -451,22 +450,7 @@ async fn delete_domain_refuses_every_unresolvable_id_by_its_allocation_history()
             let (status, body) = emulator
                 .send("DELETE", &format!("/domain/{domain_id}"), None)
                 .await;
-            let case = format!("{case} ({domain_id}), attempt {attempt}");
-            if !allocated {
-                assert_eq!(
-                    (status, error_code(&body).as_str()),
-                    (403, "AuthorizerConfigurationException"),
-                    "case {case:?}: expected the front door's refusal of an id with no \
-                     allocation history, got {status} with {body}"
-                );
-                assert_eq!(
-                    body.get(MODEL_MEMBER_DETAIL),
-                    Some(&serde_json::Value::Null),
-                    "case {case:?}: that refusal carries no detail at all, so the member is \
-                     an explicit null, got {body}"
-                );
-                continue;
-            }
+            let case = format!("{case} ({domain_id}), allocated={allocated}, attempt {attempt}");
             assert_eq!(
                 (status, error_code(&body).as_str()),
                 (404, "ResourceNotFoundException"),

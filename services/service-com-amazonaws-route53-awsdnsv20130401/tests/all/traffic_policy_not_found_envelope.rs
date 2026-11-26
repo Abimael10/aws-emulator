@@ -28,7 +28,9 @@
 //! instance id can name nothing — an id nobody minted, an id of another entity
 //! kind, an id of no minted form at all, the shortest id the model admits, a
 //! version a policy never reached, the published maximum version, and a resource
-//! that existed until it was deleted.
+//! that existed until it was deleted. The two halves are also asked SIDE BY SIDE over
+//! policies of different heights ([`the_missing_half_of_the_pair_decides_the_wording`]), so
+//! a build that worded both halves alike fails whichever wording it chose.
 //!
 //! The other half of the rules is asserted too: a refusal of the SAME operations
 //! that is neither of these two carries its own message, so the body shape
@@ -77,6 +79,18 @@ const VERSION_MAX: &str = "1000";
 /// The DNS name every traffic policy instance in this suite is applied to.
 const INSTANCE_NAME: &str = "www.example.com";
 
+/// Ids no traffic policy of this account carries, each in a different form the model's
+/// `TrafficPolicyId` (`len 1..36`,
+/// smithy_query(query="shape",shape="TrafficPolicyId")) admits.
+const UNMINTED_IDS: &[(&str, &str)] = &[
+    (
+        "an unminted id of the minted form",
+        "00000000-0000-0000-0000-000000000000",
+    ),
+    ("an id of no recognised form", "not-a-policy"),
+    ("the shortest id the model admits", "x"),
+];
+
 /// Assert that `reply` reports a refusal by its identity alone: HTTP 404, the
 /// `Error` element carrying `Type` `Sender` and the expected `Code`, and no
 /// `Message` element anywhere in the body.
@@ -89,9 +103,9 @@ pub(crate) fn assert_identity_only(reply: &Reply, case: &str, code: &str) {
     assert_identity_only_at(reply, case, 404, code);
 }
 
-/// Assert that `reply` is the traffic-policy not-found refusal: HTTP 404, the `Error`
-/// element carrying `Type` `Sender`, the code `NoSuchTrafficPolicy`, and no `Message`
-/// element at all.
+/// Assert that `reply` is the traffic-policy not-found refusal of an `Id` the account holds
+/// NO policy under: HTTP 404, the `Error` element carrying `Type` `Sender`, the code
+/// `NoSuchTrafficPolicy`, and no `Message` element at all.
 ///
 /// `pub(crate)` for the same reason [`assert_identity_only`] is: every suite that drives
 /// this refusal asserts its body through this one check.
@@ -302,6 +316,70 @@ async fn each_half_of_a_pair_the_account_does_not_hold_is_refused_for_that_half(
         let case = format!("{operation:?} on a version a delete flagged");
         let reply = operation.send(&router, &zone, &deleted, "1").await;
         assert_no_such_traffic_policy_version(&reply, &case);
+    }
+}
+
+#[tokio::test]
+async fn the_missing_half_of_the_pair_decides_the_wording() {
+    let router = router();
+    let zone = create_zone_ok(&router, "example.com", "ref-missing-half").await;
+
+    // One policy per height, so "a version the policy does not hold" is asked of policies
+    // holding one version and several.
+    let one_version = policy_id(&router, "missing-half-one").await;
+    let three_versions = policy_id(&router, "missing-half-three").await;
+    for further in 2..=3 {
+        let added = create_version(
+            &router,
+            &three_versions,
+            &document_with_start_endpoint("A", "192.0.2.2"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            added.status, 201,
+            "version {further} must be created, got {} with body {}",
+            added.status, added.body
+        );
+    }
+
+    let rows: [(&str, &str, &[&str]); 2] = [
+        (
+            "a one-version policy",
+            one_version.as_str(),
+            &["2", "9", VERSION_MAX],
+        ),
+        (
+            "a three-version policy",
+            three_versions.as_str(),
+            &["4", VERSION_MAX],
+        ),
+    ];
+
+    for (policy_case, held, versions) in rows {
+        for version in versions {
+            for operation in POLICY_OPERATIONS
+                .iter()
+                .filter(|operation| operation.addresses_version())
+                .copied()
+            {
+                // The policy RECORD is held, so the VERSION is the missing half and the
+                // refusal states why.
+                let case = format!("{operation:?} on {policy_case} at version {version}");
+                let reply = operation.send(&router, &zone, held, version).await;
+                assert_no_such_traffic_policy_version(&reply, &case);
+
+                // The SAME version under an id holding no policy record: the other half is
+                // missing, so the same operation answers the code alone.
+                for (id_case, unminted) in UNMINTED_IDS {
+                    let case = format!(
+                        "{operation:?} on {id_case} at version {version} (beside {policy_case})"
+                    );
+                    let reply = operation.send(&router, &zone, unminted, version).await;
+                    assert_no_such_traffic_policy(&reply, &case);
+                }
+            }
+        }
     }
 }
 
@@ -525,6 +603,9 @@ async fn the_refusal_reports_the_half_of_the_pair_that_named_nothing_whatever_it
                  (seed {PAIR_SEED:#x}, draw {draw})"
             );
             let reply = operation.send(&router, &zone, &held, &unheld_version).await;
+            // The policy RECORD is there, so what is missing is the VERSION the
+            // request named, and the refusal states why — in the same fixed
+            // sentence whatever version was drawn.
             assert_no_such_traffic_policy_version(&reply, &case);
         }
     }

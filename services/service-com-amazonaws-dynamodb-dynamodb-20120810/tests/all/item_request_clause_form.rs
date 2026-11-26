@@ -7,10 +7,10 @@
 //! refused 400 `ValidationException`, inside the envelope that counts the clauses, and the
 //! clause is worded in the ONE form the served operation gives THAT member:
 //!
-//! * a KEYED READ, and a batched or transactional item request, names the member by its WIRE
-//!   spelling and echoes NO value (`Value at 'Limit' failed to satisfy constraint: Member must
-//!   have value greater than or equal to 1`);
-//! * a CONTROL-PLANE listing, and the table walk's own page size, names it by the lowerCamel
+//! * an ITEM REQUEST — a keyed read, a table walk, a batched or transactional request — names
+//!   the member by its WIRE spelling and echoes NO value (`Value at 'Limit' failed to satisfy
+//!   constraint: Member must have value greater than or equal to 1`);
+//! * a CONTROL-PLANE listing names it by the lowerCamel
 //!   path the request validator builds and DOES echo the rejected value (`Value '0' at 'limit'
 //!   failed to satisfy constraint: …`).
 //!
@@ -114,9 +114,8 @@ async fn refusal(
     message(&body)
 }
 
-/// RULE: the keyed read states its page size in the wire form that echoes no value — whatever
-/// value was rejected — while the table walk states that same member, breaking that same bound,
-/// by the validator's path with the value echoed.
+/// RULE: both item reads state the page size they share in the wire form that echoes no value
+/// — whatever value was rejected.
 #[tokio::test]
 async fn an_item_requests_page_size_is_stated_by_its_wire_name_whatever_the_value() {
     let router = seeded().await;
@@ -125,25 +124,22 @@ async fn an_item_requests_page_size_is_stated_by_its_wire_name_whatever_the_valu
     // below, and the smallest value a 32-bit member carries.
     for rejected in [0_i64, -1, -9, -2_147_483_648] {
         let expected = wire_form("Limit", &at_least(1));
-        let stated = refusal(&router, "a keyed read", "Query", keyed(rejected)).await;
-        assert_eq!(
-            stated, expected,
-            "case \"a keyed read\" (Query, Limit {rejected}): expected the message \
-             {expected:?}, got {stated:?}"
-        );
-        assert!(
-            !stated.contains(&format!("'{rejected}'")),
-            "case \"a keyed read\" (Query, Limit {rejected}): expected the rejected value \
-             absent from the message, got {stated:?}"
-        );
-
-        let expected = echoing_form("limit", rejected, &at_least(1));
-        let stated = refusal(&router, "a table walk", "Scan", walk(rejected)).await;
-        assert_eq!(
-            stated, expected,
-            "case \"a table walk\" (Scan, Limit {rejected}): expected the message \
-             {expected:?}, got {stated:?}"
-        );
+        for (case, operation, request) in [
+            ("a keyed read", "Query", keyed(rejected)),
+            ("a table walk", "Scan", walk(rejected)),
+        ] {
+            let stated = refusal(&router, case, operation, request).await;
+            assert_eq!(
+                stated, expected,
+                "case {case:?} ({operation}, Limit {rejected}): expected the message \
+                 {expected:?}, got {stated:?}"
+            );
+            assert!(
+                !stated.contains(&format!("'{rejected}'")),
+                "case {case:?} ({operation}, Limit {rejected}): expected the rejected value \
+                 absent from the message, got {stated:?}"
+            );
+        }
     }
 }
 

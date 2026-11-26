@@ -315,9 +315,9 @@ async fn a_domain_whose_deletion_is_still_in_flight_keeps_its_slot_until_the_pur
 }
 
 /// Why a well-formed `domainId` resolves no domain in the Region a request is signed
-/// for, which is what the refusal of a DELETE turns on: an id this service never
-/// allocated names no resource an ARN can be resolved for, while one it allocated and no
-/// longer holds here is a resource this account had and has lost.
+/// for — which is what the rows below span, and what the refusal is the SAME for: an id
+/// this service never allocated, and one it allocated and no longer holds here, are both
+/// a resource this endpoint does not have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unresolvable {
     /// No allocation history at all.
@@ -327,8 +327,12 @@ enum Unresolvable {
 }
 
 /// Assert how `DeleteDomain` refuses an id that resolves nothing: the modelled 404 naming
-/// the requested id for an id this service allocated, and the front door's own
-/// detail-less refusal for one it never did.
+/// the requested id, whatever the id's own allocation history.
+///
+/// `kind` is carried by the rows so each case NAMES the history it was driven with; it
+/// does not change what is asserted, which is the point — `smithy_query(query="operation",
+/// operation="DeleteDomain")` lists `ResourceNotFoundException` as this operation's only
+/// error, so there is no second refusal for an unresolvable id to take.
 fn assert_delete_refusal(
     case: &str,
     kind: Unresolvable,
@@ -336,38 +340,20 @@ fn assert_delete_refusal(
     status: u16,
     body: &Value,
 ) {
-    match kind {
-        Unresolvable::AllocatedAndLost => {
-            assert_eq!(
-                (status, error_code(body).as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: expected the modelled not-found, got {status} {body:?}"
-            );
-            assert_eq!(
-                detail_text(case, body),
-                format!("Domain not found: {domain_id}"),
-                "case {case:?}: the not-found must name the requested id, got {body:?}"
-            );
-        }
-        Unresolvable::NeverAllocated => {
-            assert_eq!(
-                (status, error_code(body).as_str()),
-                (403, "AuthorizerConfigurationException"),
-                "case {case:?}: expected the front door's refusal of an id with no \
-                 allocation history, got {status} {body:?}"
-            );
-            assert_eq!(
-                body.get("message"),
-                Some(&Value::Null),
-                "case {case:?}: that refusal carries no detail at all, so the member is an \
-                 explicit null, got {body:?}"
-            );
-        }
-    }
+    assert_eq!(
+        (status, error_code(body).as_str()),
+        (404, "ResourceNotFoundException"),
+        "case {case:?} ({kind:?}): expected the modelled not-found, got {status} {body:?}"
+    );
+    assert_eq!(
+        detail_text(case, body),
+        format!("Domain not found: {domain_id}"),
+        "case {case:?} ({kind:?}): the not-found must name the requested id, got {body:?}"
+    );
 }
 
 #[tokio::test]
-async fn delete_domain_refuses_every_unresolvable_id_by_its_allocation_history() {
+async fn delete_domain_refuses_every_unresolvable_id_with_the_modelled_not_found() {
     let emulator = Emulator::new("us-east-1");
 
     // Every way a well-formed `domainId` can resolve no domain in the Region a request is
@@ -488,29 +474,33 @@ fn remember_allocation(emulator: &Emulator, domain_id: &str) {
     store.lock().record_domain_allocation(domain_id);
 }
 
-/// Assert that a refusal states no detail text at all, under either of the keys this
-/// service's planes write it under — the ABSENCE of the detail is what the front door's
-/// own refusal carries, so reading `message` must yield a value a client cannot mistake
-/// for a sentence.
-fn assert_no_detail_stated(case: &str, body: &Value) {
-    for member in crate::domain_subscription_lifecycle::DETAIL_MEMBERS {
-        assert!(
-            body.get(member).and_then(Value::as_str).is_none(),
-            "case {case:?}: this refusal states no detail text, so {member:?} carries no \
-             sentence, got {body:?}"
-        );
-    }
+/// Assert that a refusal states its detail text under exactly ONE of the keys this
+/// service's planes write it under: the control plane's own `message`, and no second
+/// sentence beside it.
+fn assert_one_detail_stated(case: &str, body: &Value) {
+    let stated: Vec<&str> = crate::domain_subscription_lifecycle::DETAIL_MEMBERS
+        .iter()
+        .filter(|member| body.get(**member).and_then(Value::as_str).is_some())
+        .copied()
+        .collect();
+    assert_eq!(
+        stated.len(),
+        1,
+        "case {case:?}: this refusal states its sentence once, got it under {stated:?} in \
+         {body:?}"
+    );
 }
 
 #[tokio::test]
-async fn delete_domain_splits_one_and_the_same_id_on_its_allocation_history_alone() {
+async fn delete_domain_answers_one_and_the_same_id_alike_whatever_its_allocation_history() {
     let emulator = Emulator::new("us-east-1");
     // The rows differ along everything the modelled `DomainId` generalises over — both
     // prefixes, both ends of the 20..25 length range, and digits-only, letters-only and
     // mixed bodies. Each one is driven TWICE: once with no allocation history anywhere,
     // then with that same id remembered as allocated and still resolving no domain. The
-    // request is identical in both passes, so whatever the answers differ by is the
-    // history and nothing about the id's own form.
+    // request is identical in both passes, and so is the answer: what the operation
+    // reports is that this endpoint holds no such domain, which the id's own history
+    // cannot change.
     let rows = [
         (
             "the shortest dom- id (20), letters only",
@@ -536,15 +526,15 @@ async fn delete_domain_splits_one_and_the_same_id_on_its_allocation_history_alon
 
     for (row, domain_id) in &rows {
         let path = format!("/domain/{domain_id}");
-        // An id with no allocation history names no resource an ARN can be resolved for,
-        // so the call is refused ahead of this service's own answer, with no detail. The
-        // repeat is answered identically: the model declares the operation `@idempotent`
-        // and a refused delete writes nothing.
+        // An id with no allocation history anywhere: the resource the request asks to
+        // delete is not here, which is the one error this operation models. The repeat is
+        // answered identically: the model declares the operation `@idempotent` and a
+        // refused delete writes nothing.
         for attempt in 1..=2 {
             let case = format!("{row} ({domain_id}), never allocated, attempt {attempt}");
             let (status, body) = emulator.send("DELETE", &path, None).await;
             assert_delete_refusal(&case, Unresolvable::NeverAllocated, domain_id, status, &body);
-            assert_no_detail_stated(&case, &body);
+            assert_one_detail_stated(&case, &body);
             assert!(
                 status < 500,
                 "case {case:?}: the condition lies in the request's own id and is \
@@ -554,17 +544,18 @@ async fn delete_domain_splits_one_and_the_same_id_on_its_allocation_history_alon
         }
 
         // The SAME id, now remembered as allocated and still resolving no domain here: a
-        // resource this account had and has lost, which is the ONE error the operation
-        // models.
+        // resource this account had and has lost is the same missing resource, answered
+        // the same way.
         remember_allocation(&emulator, domain_id);
         for attempt in 1..=2 {
             let case = format!("{row} ({domain_id}), once allocated, attempt {attempt}");
             let (status, body) = emulator.send("DELETE", &path, None).await;
             assert_delete_refusal(&case, Unresolvable::AllocatedAndLost, domain_id, status, &body);
+            assert_one_detail_stated(&case, &body);
         }
 
-        // The READ resolves the domain itself rather than an ARN for the front door, so
-        // the history leaves its answer alone: the modelled 404 either way.
+        // The READ resolves the same domain, so it answers the same way too: the modelled
+        // 404 either way.
         let case = format!("{row} ({domain_id}), read back");
         let (status, read) = emulator.send("GET", &path, None).await;
         assert_eq!(

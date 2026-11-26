@@ -30,8 +30,9 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsg
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    await_mapping_state, call, create_function, create_mapping, create_request, get_mapping,
-    router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE, STATE_CREATING,
+    await_mapping_state, call, create_function, create_mapping, create_request, created_state,
+    get_mapping, router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
+    STATE_CREATING,
 };
 
 /// The `State` a mapping whose accepted update changed its CONFIGURATION carries, from
@@ -234,28 +235,32 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
             .unwrap_or_else(|| panic!("case {label:?}: the create answers an ARN"));
 
         // The mapping is not available while it is still being created, which is the
-        // model's own example of `ResourceInUseException`. The create is ACCEPTED rather
-        // than applied, so every mapping has that window whichever polling setting it was
-        // asked for, and the create answered it as `STATE_CREATING`.
+        // model's own example of `ResourceInUseException`. That window belongs to the
+        // poller stand-up a create ASKS for, so a mapping asked to be active is answered in
+        // it and a mapping asked for with polling paused is answered in the terminal state
+        // it asked for and has no such window at all.
+        let created_as = created_state(&case.create_extras);
         assert_eq!(
             created.string("State"),
-            Some(STATE_CREATING.to_string()),
-            "case {label:?}: the create must answer {STATE_CREATING}, got {}",
+            Some(created_as.to_string()),
+            "case {label:?}: the create must answer {created_as}, got {}",
             created.text()
         );
-        let too_early = update_mapping(&router, &uuid, &case.update).await;
-        assert_eq!(
-            too_early.status,
-            400,
-            "case {label:?}: an update inside the create window is refused, got {} {}",
-            too_early.status,
-            too_early.text()
-        );
-        assert!(
-            too_early.error_code().contains("ResourceInUseException"),
-            "case {label:?}: expected ResourceInUseException, got {}",
-            too_early.error_code()
-        );
+        if created_as == STATE_CREATING {
+            let too_early = update_mapping(&router, &uuid, &case.update).await;
+            assert_eq!(
+                too_early.status,
+                400,
+                "case {label:?}: an update inside the create window is refused, got {} {}",
+                too_early.status,
+                too_early.text()
+            );
+            assert!(
+                too_early.error_code().contains("ResourceInUseException"),
+                "case {label:?}: expected ResourceInUseException, got {}",
+                too_early.error_code()
+            );
+        }
 
         // The settle out of the create window is owed by the CLOCK, so this waits for the
         // mapping to REPORT the state its create asked for rather than for a span of its own.

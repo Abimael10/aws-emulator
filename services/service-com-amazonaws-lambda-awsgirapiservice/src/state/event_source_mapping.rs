@@ -60,20 +60,24 @@ pub const EVENT_SOURCE_MAPPING_STATE_ENABLING: &str = "Enabling";
 /// turns polling OFF — the PAUSE, which is in force once the mapping reports `Disabled`.
 pub const EVENT_SOURCE_MAPPING_STATE_DISABLING: &str = "Disabling";
 
-/// The `State` a mapping `CreateEventSourceMapping` has just accepted is in.
+/// The `State` a mapping `CreateEventSourceMapping` has just accepted is in, for a create
+/// that asked for polling as `enabled` says.
 ///
-/// `CreateEventSourceMapping` is ACCEPTED rather than applied — it answers 202 — so what
-/// it answers with is the mapping Lambda is standing up, whichever polling setting the
-/// request asked for: the mapping is `Creating` until the stand-up is finished, and the
-/// move to the terminal state its `Enabled` setting asks for ("When true, the event
-/// source mapping is active. When false, Lambda pauses polling and invocation") is owed by
-/// the CLOCK ([`EventSourceMappingRecord::materialize`]), which settles it into `Enabled`
-/// or `Disabled`. So a client that polls a mapping it has just created until the state
-/// leaves `Creating` sees that window whether it asked for an active mapping or a paused
-/// one, and never a terminal state the record has not reached yet.
+/// What a create has to STAND UP is the polling: `Enabled` is "when true, the event source
+/// mapping is active. When false, Lambda pauses polling and invocation", so a create that
+/// asks for an active mapping is ACCEPTED rather than applied — it answers 202 — and the
+/// mapping is `Creating` until the poller is up, the move to `Enabled` being owed by the
+/// CLOCK ([`EventSourceMappingRecord::materialize`]). A create that asks for a PAUSED
+/// mapping asks for no poller at all: there is nothing to stand up and nothing for a
+/// client to wait for, so the mapping is in the state that create asked for — the terminal
+/// `Disabled` — from the answer onwards, which is what every later read of it reports too.
 #[must_use]
-pub fn created_event_source_mapping_state() -> &'static str {
-    EVENT_SOURCE_MAPPING_STATE_CREATING
+pub fn created_event_source_mapping_state(enabled: bool) -> &'static str {
+    if enabled {
+        EVENT_SOURCE_MAPPING_STATE_CREATING
+    } else {
+        EVENT_SOURCE_MAPPING_STATE_DISABLED
+    }
 }
 
 /// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
