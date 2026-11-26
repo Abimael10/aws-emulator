@@ -449,20 +449,33 @@ fn addresses_this_process(host: &str) -> bool {
 /// The ENDPOINT PREFIX an AWS-shaped host names, which is what a request to that service is
 /// signed for.
 ///
-/// AWS names a service's own endpoint `<prefix>.<region>.amazonaws.com` and a RESOURCE's own
-/// host either `<resource>.<region>.<prefix>.amazonaws.com` (a search domain) or
-/// `<resource>.<prefix>.<region>.amazonaws.com` (a bucket), so the prefix is the label
+/// AWS names a service's own endpoint `<prefix>.<region>.<zone>` and a RESOURCE's own
+/// host either `<resource>.<region>.<prefix>.<zone>` (a search domain) or
+/// `<resource>.<prefix>.<region>.<zone>` (a bucket), so the prefix is the label
 /// NEXT TO the Region one ([`region_of`]) — after it when the Region is the last label
-/// before `amazonaws.com`, and before it otherwise. A host naming no Region at all is a
-/// global endpoint, whose prefix is the label before `amazonaws.com`.
+/// before the zone, and before it otherwise. A host naming no Region at all is a
+/// global endpoint, whose prefix is the label before the zone.
+///
+/// `<zone>` is any of the DNS zones AWS publishes its own service endpoints in, read from the
+/// one list of them this tree holds
+/// (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`): a service is reached
+/// in a partition's own zone (`amazonaws.com`, `amazonaws.com.cn`) and under the suffixes AWS
+/// serves its dual-stack and short-form endpoints at (`api.aws`, `on.aws`) — which is where an
+/// SDK addresses a service whose endpoint rules resolve to one of them, rather than in the
+/// partition zone.
 ///
 /// `None` for a host that is not AWS's own naming — this emulator's own endpoint, an
 /// address of anything else — which names no service this way.
 fn endpoint_prefix_of(host: &str) -> Option<String> {
-    let labels: Vec<&str> = host.split('.').collect();
-    let [service @ .., "amazonaws", "com"] = labels.as_slice() else {
+    let lowered = host.to_ascii_lowercase();
+    let zone = ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES
+        .iter()
+        .find(|suffix| lowered.ends_with(*suffix))?;
+    let named = &lowered[..lowered.len() - zone.len()];
+    if named.is_empty() {
         return None;
-    };
+    }
+    let service: Vec<&str> = named.split('.').collect();
     let at = service.iter().position(|label| region_shaped(label));
     let prefix = match at {
         Some(at) if at + 1 < service.len() => service[at + 1],
@@ -1457,6 +1470,18 @@ mod tests {
                 case: "a search domain's own endpoint",
                 url: "https://search-things-abc.eu-west-1.es.amazonaws.com/index/_search?q=a",
                 expected: Some(("es", "/index/_search?q=a", "eu-west-1")),
+            },
+            Addressing {
+                // The dual-stack zone AWS publishes a service endpoint in, which is where an
+                // SDK whose endpoint rules resolve to it addresses the service.
+                case: "a service's own endpoint in the dual-stack zone",
+                url: "https://s3vectors.us-west-2.api.aws/CreateIndex",
+                expected: Some(("s3vectors", "/CreateIndex", "us-west-2")),
+            },
+            Addressing {
+                case: "a service's own endpoint in another partition's zone",
+                url: "https://dynamodb.cn-north-1.amazonaws.com.cn/",
+                expected: Some(("dynamodb", "/", "cn-north-1")),
             },
             Addressing {
                 case: "this emulator's endpoint, with the plane named in the path",

@@ -42,6 +42,7 @@ pub(super) fn modules() -> Vec<(&'static str, &'static str)> {
         ("urllib3/exceptions.py", EXCEPTIONS_SOURCE),
         ("urllib3/util/__init__.py", UTIL_INIT_SOURCE),
         ("urllib3/util/url.py", UTIL_URL_SOURCE),
+        ("urllib3/util/ssl_.py", UTIL_SSL_SOURCE),
         ("urllib3/util/timeout.py", UTIL_TIMEOUT_SOURCE),
         ("urllib3/util/retry.py", UTIL_RETRY_SOURCE),
         ("urllib3/util/request.py", UTIL_REQUEST_SOURCE),
@@ -73,10 +74,11 @@ from urllib3.connectionpool import (
 from urllib3.exceptions import HTTPWarning
 from urllib3.fields import RequestField
 from urllib3.filepost import encode_multipart_formdata
-from urllib3.poolmanager import PoolManager
+from urllib3.poolmanager import PoolManager, ProxyManager, proxy_from_url
 from urllib3.response import BaseHTTPResponse, HTTPHeaderDict, HTTPResponse
 from urllib3.util.request import SKIP_HEADER, SKIPPABLE_HEADERS, make_headers
 from urllib3.util.retry import Retry
+from urllib3.util.ssl_ import SSLContext
 from urllib3.util.timeout import Timeout
 from urllib3.util.url import Url, parse_url
 
@@ -90,11 +92,13 @@ __all__ = [
     "HTTPSConnection",
     "HTTPSConnectionPool",
     "PoolManager",
+    "ProxyManager",
     "RequestField",
     "RequestMethods",
     "Retry",
     "SKIPPABLE_HEADERS",
     "SKIP_HEADER",
+    "SSLContext",
     "Timeout",
     "Url",
     "VerifiedHTTPSConnection",
@@ -104,6 +108,7 @@ __all__ = [
     "exceptions",
     "make_headers",
     "parse_url",
+    "proxy_from_url",
     "request",
 ]
 
@@ -379,18 +384,261 @@ const UTIL_INIT_SOURCE: &str = r#"
 
 from urllib3.util.request import SKIP_HEADER, SKIPPABLE_HEADERS, make_headers
 from urllib3.util.retry import Retry
+from urllib3.util.ssl_ import (
+    ALPN_PROTOCOLS,
+    HAS_NEVER_CHECK_COMMON_NAME,
+    IS_PYOPENSSL,
+    IS_SECURETRANSPORT,
+    SSLContext,
+    assert_fingerprint,
+    create_urllib3_context,
+    is_ipaddress,
+    resolve_cert_reqs,
+    resolve_ssl_version,
+    ssl_wrap_socket,
+)
 from urllib3.util.timeout import Timeout
 from urllib3.util.url import Url, parse_url
 
 __all__ = [
+    "ALPN_PROTOCOLS",
+    "HAS_NEVER_CHECK_COMMON_NAME",
+    "IS_PYOPENSSL",
+    "IS_SECURETRANSPORT",
     "SKIPPABLE_HEADERS",
     "SKIP_HEADER",
+    "SSLContext",
     "Retry",
     "Timeout",
     "Url",
+    "assert_fingerprint",
+    "create_urllib3_context",
+    "is_ipaddress",
     "make_headers",
     "parse_url",
+    "resolve_cert_reqs",
+    "resolve_ssl_version",
+    "ssl_wrap_socket",
 ]
+"#;
+
+/// `urllib3.util.ssl_`: the TLS settings a connection of this client is made with.
+const UTIL_SSL_SOURCE: &str = r#"
+"""The TLS settings a connection is made with.
+
+Every one of them is the standard library's own TLS layer: a context built here IS an
+`ssl.SSLContext`, so a connection made with it is verified and negotiated by that layer
+rather than by anything of this library's own.
+"""
+
+import hashlib
+import ipaddress
+import ssl
+from ssl import (
+    CERT_NONE,
+    CERT_OPTIONAL,
+    CERT_REQUIRED,
+    HAS_NEVER_CHECK_COMMON_NAME,
+    HAS_SNI,
+    OP_NO_COMPRESSION,
+    OP_NO_SSLv2,
+    OP_NO_SSLv3,
+    OP_NO_TICKET,
+    PROTOCOL_TLS,
+    PROTOCOL_TLS_CLIENT,
+    SSLContext,
+    SSLError,
+    TLSVersion,
+)
+
+# Neither of the two optional TLS backends the library can be built on is here: the layer is
+# the standard library's own.
+IS_PYOPENSSL = False
+IS_SECURETRANSPORT = False
+
+# What this client offers in the protocol negotiation of a TLS handshake.
+ALPN_PROTOCOLS = ["http/1.1"]
+
+# The ciphers the library has always asked for where a caller names none; the layer's own
+# default list is used when this is not set on a context.
+DEFAULT_CIPHERS = ":".join(
+    [
+        "ECDHE+AESGCM",
+        "ECDHE+CHACHA20",
+        "DHE+AESGCM",
+        "DHE+CHACHA20",
+        "ECDH+AESGCM",
+        "DH+AESGCM",
+        "ECDH+AES",
+        "DH+AES",
+        "RSA+AESGCM",
+        "RSA+AES",
+        "!aNULL",
+        "!eNULL",
+        "!MD5",
+        "!DSS",
+        "!AESCCM",
+    ]
+)
+
+_SSL_VERSIONS = {
+    "PROTOCOL_TLS": PROTOCOL_TLS,
+    "PROTOCOL_TLS_CLIENT": PROTOCOL_TLS_CLIENT,
+}
+
+
+def resolve_cert_reqs(candidate):
+    """The verification mode `candidate` names: the strictest where it names none, the mode
+    itself where it is one, and the mode of that name otherwise."""
+    if candidate is None:
+        return CERT_REQUIRED
+    if isinstance(candidate, str):
+        named = getattr(ssl, candidate, None)
+        if named is None:
+            named = getattr(ssl, "CERT_" + candidate, None)
+        if named is None:
+            raise ValueError("No such certificate requirement: %s" % candidate)
+        return named
+    return candidate
+
+
+def resolve_ssl_version(candidate):
+    """The protocol `candidate` names, with the client default where it names none."""
+    if candidate is None:
+        return PROTOCOL_TLS_CLIENT
+    if isinstance(candidate, str):
+        named = getattr(ssl, candidate, None)
+        if named is None:
+            named = getattr(ssl, "PROTOCOL_" + candidate, None)
+        if named is None:
+            raise ValueError("No such protocol: %s" % candidate)
+        return named
+    return candidate
+
+
+def assert_fingerprint(cert, fingerprint):
+    """Check the certificate `cert` really has the fingerprint `fingerprint` states."""
+    if cert is None:
+        raise SSLError("No certificate for the peer.")
+    fingerprint = fingerprint.replace(":", "").lower()
+    digest_length = len(fingerprint)
+    hashfunc = {32: hashlib.md5, 40: hashlib.sha1, 64: hashlib.sha256}.get(digest_length)
+    if hashfunc is None:
+        raise SSLError("Fingerprint of invalid length: %s" % fingerprint)
+    fingerprint_bytes = bytes.fromhex(fingerprint)
+    cert_digest = hashfunc(cert).digest()
+    if not _equal_digests(cert_digest, fingerprint_bytes):
+        raise SSLError(
+            'Fingerprints did not match. Expected "%s", got "%s".'
+            % (fingerprint, cert_digest.hex())
+        )
+
+
+def _equal_digests(first, second):
+    """Whether two digests are the same, compared without telling how far they matched."""
+    import hmac
+
+    return hmac.compare_digest(first, second)
+
+
+def create_urllib3_context(
+    ssl_version=None,
+    cert_reqs=None,
+    options=None,
+    ciphers=None,
+    ssl_minimum_version=None,
+    ssl_maximum_version=None,
+):
+    """A TLS context with the settings this library asks of one."""
+    if ssl_version is not None and ssl_minimum_version is not None:
+        raise TypeError(
+            "Can't specify both 'ssl_version' and either 'ssl_minimum_version' or "
+            "'ssl_maximum_version'"
+        )
+    context = SSLContext(resolve_ssl_version(ssl_version))
+    if ssl_minimum_version is not None:
+        context.minimum_version = ssl_minimum_version
+    if ssl_maximum_version is not None:
+        context.maximum_version = ssl_maximum_version
+    if ciphers is not None:
+        context.set_ciphers(ciphers)
+    if options is None:
+        # The two retired protocol versions are never negotiated, and neither is
+        # compression, which is what the library's own default options state.
+        options = 0
+        options |= OP_NO_SSLv2
+        options |= OP_NO_SSLv3
+        options |= OP_NO_COMPRESSION
+        options |= OP_NO_TICKET
+    context.options |= options
+    if hasattr(context, "post_handshake_auth"):
+        context.post_handshake_auth = True
+    cert_reqs = resolve_cert_reqs(cert_reqs)
+    context.verify_mode = cert_reqs
+    context.check_hostname = cert_reqs != CERT_NONE
+    if hasattr(context, "set_alpn_protocols"):
+        try:
+            context.set_alpn_protocols(ALPN_PROTOCOLS)
+        except NotImplementedError:
+            pass
+    return context
+
+
+def ssl_wrap_socket(
+    sock,
+    keyfile=None,
+    certfile=None,
+    cert_reqs=None,
+    ca_certs=None,
+    server_hostname=None,
+    ssl_version=None,
+    ciphers=None,
+    ssl_context=None,
+    ca_cert_dir=None,
+    key_password=None,
+    ca_cert_data=None,
+    tls_in_tls=False,
+):
+    """`sock` wrapped in TLS, with the certificates and the hostname a caller named."""
+    context = ssl_context
+    if context is None:
+        context = create_urllib3_context(ssl_version, cert_reqs, ciphers=ciphers)
+    if ca_certs or ca_cert_dir or ca_cert_data:
+        context.load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)
+    elif ssl_context is None and hasattr(context, "load_default_certs"):
+        context.load_default_certs()
+    if certfile:
+        if key_password is None:
+            context.load_cert_chain(certfile, keyfile)
+        else:
+            context.load_cert_chain(certfile, keyfile, key_password)
+    if server_hostname is not None and is_ipaddress(server_hostname):
+        # A certificate is not verified against an address, so the name is not sent.
+        context.check_hostname = False
+        return context.wrap_socket(sock)
+    return context.wrap_socket(sock, server_hostname=server_hostname)
+
+
+def is_ipaddress(hostname):
+    """Whether `hostname` is an ADDRESS rather than a name, which decides whether it is sent
+    in the handshake and verified against the certificate."""
+    if isinstance(hostname, bytes):
+        hostname = hostname.decode("ascii")
+    text = str(hostname).strip("[]")
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_key_file_encrypted(key_file):
+    """Whether the key in `key_file` is one a password has to be given for."""
+    with open(key_file, "r") as reading:
+        for line in reading:
+            if "ENCRYPTED" in line:
+                return True
+    return False
 "#;
 
 /// `urllib3.util.url`: a URL in the parts a request is built from.
@@ -1645,24 +1893,124 @@ const POOLMANAGER_SOURCE: &str = r#"
 
 from urllib.parse import urljoin
 
+import collections
+import functools
+
 from urllib3._request_methods import RequestMethods
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
-from urllib3.exceptions import LocationValueError, MaxRetryError, URLSchemeUnknown
+from urllib3.exceptions import (
+    LocationValueError,
+    MaxRetryError,
+    ProxyError,
+    URLSchemeUnknown,
+)
 from urllib3.response import HTTPHeaderDict
 from urllib3.util.retry import Retry
 from urllib3.util.url import parse_url
 
+__all__ = ["PoolManager", "ProxyManager", "proxy_from_url"]
+
 pool_classes_by_scheme = {"http": HTTPConnectionPool, "https": HTTPSConnectionPool}
+
+# The settings that are only a TLS connection's, which a plain `http` pool is never given.
+SSL_KEYWORDS = (
+    "key_file",
+    "cert_file",
+    "cert_reqs",
+    "ca_certs",
+    "ca_cert_data",
+    "ssl_version",
+    "ssl_minimum_version",
+    "ssl_maximum_version",
+    "ca_cert_dir",
+    "ssl_context",
+    "key_password",
+    "server_hostname",
+)
+
+# WHICH pool a request is made through is decided by these fields of it: two requests whose
+# every field matches share a pool, and one that differs in any of them gets its own. A caller
+# that adds a setting of its own adds a field here, which is why the key is a type.
+_key_fields = (
+    "key_scheme",
+    "key_host",
+    "key_port",
+    "key_timeout",
+    "key_retries",
+    "key_block",
+    "key_source_address",
+    "key_key_file",
+    "key_key_password",
+    "key_cert_file",
+    "key_cert_reqs",
+    "key_ca_certs",
+    "key_ca_cert_data",
+    "key_ssl_version",
+    "key_ssl_minimum_version",
+    "key_ssl_maximum_version",
+    "key_ca_cert_dir",
+    "key_ssl_context",
+    "key_maxsize",
+    "key_headers",
+    "key__proxy",
+    "key__proxy_headers",
+    "key__proxy_config",
+    "key_socket_options",
+    "key__socks_options",
+    "key_assert_hostname",
+    "key_assert_fingerprint",
+    "key_server_hostname",
+    "key_blocksize",
+)
+
+PoolKey = collections.namedtuple("PoolKey", _key_fields)
+
+
+def _default_key_normalizer(key_class, request_context):
+    """The pool key `request_context` states, as `key_class` holds one.
+
+    Every value of the key has to be one that can be HELD in a mapping, so the mappings and
+    the lists among them are frozen first; a field the context does not state is empty.
+    """
+    context = dict(request_context)
+    if context.get("scheme") is not None:
+        context["scheme"] = context["scheme"].lower()
+    if context.get("host") is not None:
+        context["host"] = context["host"].lower()
+    for key in ("headers", "_proxy_headers", "_socks_options"):
+        if key in context and context[key] is not None:
+            context[key] = frozenset(dict(context[key]).items())
+    socket_options = context.get("socket_options")
+    if socket_options is not None:
+        context["socket_options"] = tuple(socket_options)
+    for key in list(context.keys()):
+        context["key_" + key] = context.pop(key)
+    for field in key_class._fields:
+        if field not in context:
+            context[field] = None
+    if context.get("key_block") is None:
+        context["key_block"] = False
+    return key_class(**context)
+
+
+key_fn_by_scheme = {
+    "http": functools.partial(_default_key_normalizer, PoolKey),
+    "https": functools.partial(_default_key_normalizer, PoolKey),
+}
 
 
 class PoolManager(RequestMethods):
     """The pools every request of one caller is made through, one per host addressed."""
+
+    proxy = None
+    proxy_config = None
 
     def __init__(self, num_pools=10, headers=None, **connection_pool_kw):
         RequestMethods.__init__(self, headers)
         self.num_pools = num_pools
         self.connection_pool_kw = connection_pool_kw
         self.pools = {}
+        self.key_fn_by_scheme = key_fn_by_scheme.copy()
 
     def __enter__(self):
         return self
@@ -1678,23 +2026,64 @@ class PoolManager(RequestMethods):
         pool_class = pool_classes_by_scheme[scheme]
         settings = dict(self.connection_pool_kw)
         if request_context:
-            settings.update(request_context)
+            settings = dict(request_context)
+        for named in ("scheme", "host", "port"):
+            settings.pop(named, None)
+        if scheme == "http":
+            # A TLS setting is no setting of a plain connection, so it is not handed to one.
+            for named in SSL_KEYWORDS:
+                settings.pop(named, None)
         return pool_class(host, port=port, **settings)
 
     def connection_from_host(self, host, port=None, scheme="http", pool_kwargs=None):
         """The pool for one host, made on the first request addressed to it."""
         if not host:
             raise LocationValueError("No host specified.")
-        scheme = (scheme or "http").lower()
-        if scheme not in pool_classes_by_scheme:
+        request_context = self._merge_pool_kwargs(pool_kwargs)
+        request_context["scheme"] = (scheme or "http").lower()
+        if request_context["scheme"] not in pool_classes_by_scheme:
+            raise URLSchemeUnknown(request_context["scheme"])
+        request_context["port"] = port or port_by_scheme.get(
+            request_context["scheme"], 80
+        )
+        request_context["host"] = host
+        return self.connection_from_context(request_context)
+
+    def connection_from_context(self, request_context):
+        """The pool the settings `request_context` states is served by."""
+        scheme = request_context.get("scheme")
+        pool_key_constructor = self.key_fn_by_scheme.get(scheme)
+        if not pool_key_constructor:
             raise URLSchemeUnknown(scheme)
-        port = port or port_by_scheme.get(scheme, 80)
-        key = (scheme, host.lower(), port)
-        held = self.pools.get(key)
-        if held is None:
-            held = self._new_pool(scheme, host, port, request_context=pool_kwargs)
-            self.pools[key] = held
+        pool_key = pool_key_constructor(request_context)
+        return self.connection_from_pool_key(pool_key, request_context=request_context)
+
+    def connection_from_pool_key(self, pool_key, request_context=None):
+        """The pool held under `pool_key`, made on the first request that needs it."""
+        held = self.pools.get(pool_key)
+        if held is not None:
+            return held
+        context = request_context or {}
+        held = self._new_pool(
+            context.get("scheme"),
+            context.get("host"),
+            context.get("port"),
+            request_context=request_context,
+        )
+        self.pools[pool_key] = held
         return held
+
+    def _merge_pool_kwargs(self, override):
+        """This manager's own settings with `override` applied: a value stated there wins,
+        and one stated as nothing takes the setting away."""
+        merged = dict(self.connection_pool_kw)
+        if override:
+            for key, value in override.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+        return merged
 
     def connection_from_url(self, url, pool_kwargs=None):
         parsed = parse_url(url)
@@ -1744,6 +2133,75 @@ class PoolManager(RequestMethods):
         kw["redirect"] = redirect
         retries.sleep_for_retry(answered)
         return self.urlopen(method, redirected, **kw)
+
+
+class ProxyManager(PoolManager):
+    """The pools every request of one caller is made through a PROXY with.
+
+    A caller that configures a proxy is given one of these, as the published library gives
+    one, and the proxy it names is the one it states (`proxy`, `proxy_headers`). What this
+    runtime cannot do is REACH one: a request of a handler is carried into this same emulator
+    rather than onto a network, so there is nothing that forwards a request on a proxy's
+    behalf. A request made through this manager is therefore reported as one that was not
+    made, naming the proxy, rather than sent directly to the destination — which would be a
+    request the caller did not ask for.
+    """
+
+    def __init__(
+        self,
+        proxy_url,
+        num_pools=10,
+        headers=None,
+        proxy_headers=None,
+        proxy_ssl_context=None,
+        use_forwarding_for_https=False,
+        proxy_assert_hostname=None,
+        proxy_assert_fingerprint=None,
+        **connection_pool_kw
+    ):
+        if isinstance(proxy_url, HTTPConnectionPool):
+            scheme = "https" if isinstance(proxy_url, HTTPSConnectionPool) else "http"
+            proxy_url = "%s://%s:%i" % (scheme, proxy_url.host, proxy_url.port)
+        proxy = parse_url(proxy_url)
+        if proxy.scheme not in ("http", "https"):
+            raise ProxyError(
+                "Unable to determine proxy scheme from %s" % proxy_url, None
+            )
+        if not proxy.port:
+            port = port_by_scheme.get(proxy.scheme, 80)
+            proxy = proxy._replace(port=port)
+        self.proxy = proxy
+        self.proxy_headers = proxy_headers or {}
+        self.proxy_ssl_context = proxy_ssl_context
+        self.proxy_config = None
+        PoolManager.__init__(self, num_pools, headers, **connection_pool_kw)
+
+    def connection_from_host(self, host, port=None, scheme="http", pool_kwargs=None):
+        return PoolManager.connection_from_host(
+            self, host, port, scheme, pool_kwargs=pool_kwargs
+        )
+
+    def _set_proxy_headers(self, url, headers=None):
+        """The headers a request through a proxy carries beside its own."""
+        headers_ = {"Accept": "*/*"}
+        host = parse_url(url).netloc
+        if host:
+            headers_["Host"] = host
+        if headers:
+            headers_.update(headers)
+        return headers_
+
+    def urlopen(self, method, url, redirect=True, **kw):
+        raise ProxyError(
+            "this runtime reaches no proxy, so the request to %s was not made through %s"
+            % (url, self.proxy.url),
+            None,
+        )
+
+
+def proxy_from_url(url, **kw):
+    """The pools a caller makes every request through the proxy `url` names with."""
+    return ProxyManager(proxy_url=url, **kw)
 "#;
 
 /// `urllib3.fields`: one field of a form a request carries.

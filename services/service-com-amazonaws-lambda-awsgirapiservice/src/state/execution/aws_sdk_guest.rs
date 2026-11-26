@@ -58,6 +58,15 @@
 //!   sends a request with `urllib3.PoolManager()` — which is how AWS's own documented
 //!   custom-resource response code answers CloudFormation — reaches this emulator over the
 //!   same seam the standard library's own client rides.
+//! * The SDK is an INSTALLATION rather than two packages, so the distributions that
+//!   installation requires are on the import path beside it — the HTTP client above and the
+//!   managed transfer library the SDK's own S3 customizations import ([`s3transfer`]) and the
+//!   query language its data-driven interfaces are written over ([`jmespath`]) and the date and
+//!   time library every timestamp of the wire is read with ([`dateutil`]). A
+//!   managed runtime preinstalls all of them, which is what lets a deployment package bundle
+//!   the SDK itself and still import: the package's own copy of `boto3` or `botocore` wins
+//!   over the runtime's, while a dependency it did not bundle resolves from the runtime behind
+//!   it.
 //! * The SDK reports the GENERATION it implements, under the names the SDK reports its own
 //!   version under (`boto3.__version__`, `botocore.__version__`), because a handler that logs
 //!   or branches on the SDK it was given reads them. No release of the published SDK is here
@@ -120,6 +129,18 @@ mod waiter;
 /// The HTTP client the SDK is built on, which a managed runtime ships beside it.
 mod urllib3;
 
+/// The managed transfer library the SDK's own S3 customizations are built on, which the same
+/// installation carries.
+mod s3transfer;
+
+/// The query language the SDK's own data-driven interfaces are written over, which the same
+/// installation carries.
+mod jmespath;
+
+/// The date and time library every timestamp of the wire is read with, which the same
+/// installation carries.
+mod dateutil;
+
 /// The modules this runtime puts on a Python handler's import path, as the SDK it ships.
 ///
 /// Resolved AFTER the deployment package's own entries and after the content the function's
@@ -146,6 +167,9 @@ pub fn runtime_modules() -> Vec<PackageModule> {
     .chain(waiter::modules())
     .chain(dynamodb::modules())
     .chain(urllib3::modules())
+    .chain(s3transfer::modules())
+    .chain(jmespath::modules())
+    .chain(dateutil::modules())
     .map(|(path, source)| PackageModule {
         path: path.to_string(),
         source: source.to_string(),

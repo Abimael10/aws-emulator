@@ -53,13 +53,17 @@ use super::sdk_call::{insert_flag, insert_number, insert_text, insert_timestamp}
 /// operations that act on its objects as a set.
 mod bucket;
 
+/// The multipart half of this seam: one object stored as several parts, and the upload those
+/// parts belong to.
+mod multipart;
+
 /// The provider name the signing identity carries: it names this runtime rather than any
 /// AWS credential source, and never travels on the wire.
 const PROVIDER_NAME: &str = "aws-lambda-execution-role";
 
 /// The member an object's own bytes travel in, in both directions (`GetObject$Body`,
 /// `PutObject$Body`).
-const BODY_MEMBER: &str = "Body";
+pub(super) const BODY_MEMBER: &str = "Body";
 
 /// The operations of Amazon S3 this seam binds, in the order a refusal lists them.
 ///
@@ -79,6 +83,16 @@ pub const BOUND_OPERATIONS: &[&str] = &[
     "GetObjectTagging",
     "PutObjectTagging",
     "DeleteObjectTagging",
+    // One object stored as several PARTS ([`multipart`]): the upload those parts belong to,
+    // each part sent or copied under it, and the completion or the abort that ends it — which
+    // is how the managed transfer library a managed runtime ships sends anything over its own
+    // threshold, and how a handler cleans up after an interrupted one.
+    "CreateMultipartUpload",
+    "UploadPart",
+    "UploadPartCopy",
+    "CompleteMultipartUpload",
+    "AbortMultipartUpload",
+    "ListMultipartUploads",
     // The bucket-wide half ([`bucket`]): what a handler administering a bucket calls —
     // probing whether the bucket is there and usable, listing the account's buckets,
     // reading the Region a bucket resides in,
@@ -130,6 +144,20 @@ pub async fn call(
         "PutObjectTagging" => put_object_tagging(&client, &input, &observed).await,
         "DeleteObjectTagging" => delete_object_tagging(&client, &input, &observed).await,
         "ListObjectsV2" => list_objects_v2(&client, &input, &observed).await,
+        "CreateMultipartUpload" => {
+            multipart::create_multipart_upload(&client, &input, &observed).await
+        }
+        "UploadPart" => multipart::upload_part(&client, &input, &observed).await,
+        "UploadPartCopy" => multipart::upload_part_copy(&client, &input, &observed).await,
+        "CompleteMultipartUpload" => {
+            multipart::complete_multipart_upload(&client, &input, &observed).await
+        }
+        "AbortMultipartUpload" => {
+            multipart::abort_multipart_upload(&client, &input, &observed).await
+        }
+        "ListMultipartUploads" => {
+            multipart::list_multipart_uploads(&client, &input, &observed).await
+        }
         "HeadBucket" => bucket::head_bucket(&client, &input, &observed).await,
         "ListBuckets" => bucket::list_buckets(&client, &input, &observed).await,
         "GetBucketLocation" => bucket::get_bucket_location(&client, &input, &observed).await,
