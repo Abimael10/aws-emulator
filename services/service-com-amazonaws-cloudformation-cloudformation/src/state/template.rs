@@ -3136,6 +3136,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_NAMESPACE,
     crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP,
     crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT,
+    // The Amazon AppFlow connector profile, publishing the ARN that service mints for it and
+    // the handle it holds the profile's credentials under.
+    crate::state::provisioner::appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE,
     "AWS::DynamoDB::Table",
     EC2_DHCP_OPTIONS,
     EC2_INTERNET_GATEWAY,

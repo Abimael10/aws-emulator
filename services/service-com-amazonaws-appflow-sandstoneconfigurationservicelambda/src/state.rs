@@ -28,6 +28,14 @@ use crate::ops::types::{
 /// WHO a write of a flow is attributed to: the principal the request's credential
 /// speaks for.
 mod caller_identity;
+/// The CONNECTOR PROFILES of this account: the instance of a connector a flow reads from
+/// or writes to.
+mod connector_profiles;
+/// The Amazon Web Services Secrets Manager secret this service manages one connector profile's
+/// credentials in.
+mod managed_credentials_secret;
+/// WHICH credential a call this service makes OF ITS OWN presents.
+mod service_principal_call;
 /// What a flow RUN does: the transfer `StartFlow` performs between the source and the
 /// destination a flow's definition names.
 mod flow_run;
@@ -35,6 +43,9 @@ mod flow_run;
 mod refusals;
 
 pub use caller_identity::*;
+pub use connector_profiles::*;
+pub use managed_credentials_secret::*;
+pub use service_principal_call::*;
 pub use flow_run::*;
 pub use refusals::*;
 
@@ -771,10 +782,11 @@ pub struct ComAmazonawsAppflowSandstoneconfigurationservicelambdaState {
     /// flow's unique name. `BTreeMap`, so `ListFlows` pages in a stable order, and
     /// bounded by [`MAX_FLOWS_PER_ACCOUNT`].
     pub flows: BTreeMap<String, Flow>,
-    /// Reserved for the connector-profile slice (`CreateConnectorProfile`,
-    /// `DescribeConnectorProfiles`), which is still scaffolded — nothing writes this
-    /// yet, and the slice that does must bound it the way [`Flow`] storage is bounded.
-    pub connector_profiles: BTreeMap<String, crate::ops::types::ConnectorProfile>,
+    /// Every connector profile in the account, keyed by `connectorProfileName` — which
+    /// AppFlow treats as the profile's unique name. `BTreeMap`, so
+    /// `DescribeConnectorProfiles` pages in a stable order, and bounded by
+    /// [`MAX_CONNECTOR_PROFILES_PER_ACCOUNT`].
+    pub connector_profiles: BTreeMap<String, ConnectorProfileRecord>,
     /// Reserved for the connector-registration slice (`RegisterConnector`), which is
     /// still scaffolded. Keyed by `connectorLabel`.
     pub registered_connectors: BTreeMap<String, crate::ops::types::ConnectorDetail>,
@@ -794,6 +806,45 @@ impl ComAmazonawsAppflowSandstoneconfigurationservicelambdaState {
         self.flows
             .values()
             .find(|flow| flow.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The connector profile a repeated `CreateConnectorProfile` `@idempotencyToken` already
+    /// stored, if any.
+    ///
+    /// Scans the profiles, which [`MAX_CONNECTOR_PROFILES_PER_ACCOUNT`] bounds, instead of
+    /// consulting a store-wide token map that nothing would ever reclaim — the same reading
+    /// [`Self::flow_for_client_token`] takes of a flow's token.
+    pub fn connector_profile_for_client_token(
+        &self,
+        client_token: &str,
+    ) -> Option<&ConnectorProfileRecord> {
+        self.connector_profiles
+            .values()
+            .find(|profile| profile.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The flow of this account that USES the connector profile `connector_profile_name`
+    /// names, if any: the first one whose definition names it as its source or as one of its
+    /// destinations.
+    ///
+    /// What `DeleteConnectorProfile`'s `forceDelete` is about — "indicates whether Amazon
+    /// AppFlow should delete the profile, even if it is currently in use in one or more flows"
+    /// — so the unforced delete of a profile a flow still names is refused with the flow it
+    /// would have broken.
+    pub fn flow_using_connector_profile(&self, connector_profile_name: &str) -> Option<&str> {
+        self.flows
+            .values()
+            .find(|flow| {
+                ::std::iter::once(flow.source_flow_config.connector_profile_name.as_deref())
+                    .chain(
+                        flow.destination_flow_config_list
+                            .iter()
+                            .map(|config| config.connector_profile_name.as_deref()),
+                    )
+                    .flatten()
+                    .any(|named| named == connector_profile_name)
+            })
+            .map(|flow| flow.flow_name.as_str())
     }
 
     /// The connector profile a flow definition names that this account does NOT hold, in
@@ -923,7 +974,7 @@ pub fn connector_arn(region: &str, connector_label: &str) -> String {
 /// A value the codec cannot render answers `None` — the comparison is then impossible
 /// rather than false, which the caller reports as a server fault instead of blaming the
 /// request.
-fn rendered_shape(
+pub(crate) fn rendered_shape(
     schema: &::aws_smithy_schema::Schema,
     value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
 ) -> Option<::serde_json::Value> {

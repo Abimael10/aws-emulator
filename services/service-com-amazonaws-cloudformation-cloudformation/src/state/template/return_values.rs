@@ -43,6 +43,11 @@ pub(super) use crate::state::provisioner::lake_formation_permissions::{
 // cannot name the same attribute differently.
 pub(super) use crate::state::provisioner::redshift_serverless;
 
+// The Amazon AppFlow connector profile: its own NAME and the attributes it publishes live
+// beside the arms that provision it
+// ([`crate::state::provisioner::appflow_connector_profiles`]), for the same reason.
+pub(super) use crate::state::provisioner::appflow_connector_profiles;
+
 // The three Amazon EFS types: their own NAMES and the names of the attributes each publishes
 // live beside the arms that provision them
 // ([`crate::state::provisioning::efs_resources`]), for the same reason.
@@ -499,6 +504,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         }
         redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT => {
             redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT_ATTRIBUTE_NAMES
+        }
+        // An Amazon AppFlow connector profile publishes the ARN that service minted for it and
+        // the handle it holds the profile's credentials under, the catalogue living beside the
+        // arms that read them off that service's own answer.
+        appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE => {
+            appflow_connector_profiles::CONNECTOR_PROFILE_ATTRIBUTE_NAMES
         }
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_THEME => AMPLIFYUIBUILDER_TIMED_ATTRIBUTES,
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,

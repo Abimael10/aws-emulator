@@ -735,6 +735,20 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // `UpdateConnectorProfile` re-configures the connector profile the stack created, by
+            // the name Amazon AppFlow holds it under, taking the connection mode and the whole
+            // `connectorProfileConfig` — so a changed declaration of one of those is applied to
+            // that profile rather than replacing it. (The type publishes no `Tags` property, so
+            // it has no arm in [`Self::retag`].)
+            // BOXED, for the reason the other heavy arms of this match are: the call's future is
+            // the owning service's whole handler — which here makes a nested call of its own, to
+            // the service that holds the profile's credentials — and holding one of those inline
+            // in this match's state machine is what takes a deployment past the thread's stack.
+            Self::AppFlowConnectorProfile => {
+                Box::pin(update_appflow_connector_profile(ctx, region, resource, declared))
+                    .await
+                    .map(Some)
+            }
             // `UpdateRule` reconfigures the retention rule the stack created, by the
             // identifier Recycle Bin minted for it, taking the description, the retention
             // period and either resource selection — so a changed declaration of one of those

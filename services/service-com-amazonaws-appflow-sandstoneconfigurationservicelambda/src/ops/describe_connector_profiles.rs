@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnectorProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnectorProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnectorProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +146,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnectorProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectorProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnectorProfiles"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeConnectorProfilesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the AppFlow emulator holds no state on this engine".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The cursor names the profile the next page starts at. A token this listing did not
+        // mint is refused rather than silently served from the beginning.
+        let start_at = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_cursor(crate::state::CONNECTOR_PROFILE_CURSOR, token)
+                    .ok_or_else(|| {
+                        DescribeConnectorProfilesErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    "nextToken is not a cursor this operation issued".to_string(),
+                                ),
+                            },
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let page_size = crate::state::page_size_or(
+            input.max_results,
+            crate::state::DEFAULT_CONNECTOR_PROFILE_PAGE_SIZE,
+        );
+        // "Both input lists are optional, and you can use them to filter the result. If no
+        // names or connector-types are provided, returns all connector profiles in a
+        // paginated form." Every filter the request states has to hold, so a profile is
+        // reported only when it matches all of them.
+        let wanted_names: Option<::std::collections::BTreeSet<&str>> = input
+            .connector_profile_names
+            .as_ref()
+            .map(|names| names.iter().map(String::as_str).collect());
+
+        let store = state.lock();
+        // Seek to the cursor rather than walking the keys before it, so the work one request
+        // does is proportional to the page it answers with. A cursor whose own profile has
+        // since been deleted still resumes correctly: the key ORDERS the listing rather than
+        // identifying a row, so the walk resumes at the first remaining name at or after it.
+        let matching = store
+            .connector_profiles
+            .range::<str, _>((
+                match start_at.as_deref() {
+                    Some(start) => ::std::ops::Bound::Included(start),
+                    None => ::std::ops::Bound::Unbounded,
+                },
+                ::std::ops::Bound::Unbounded,
+            ))
+            .filter(|(name, profile)| {
+                wanted_names
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(name.as_str()))
+                    && input
+                        .connector_type
+                        .as_deref()
+                        .is_none_or(|connector_type| profile.connector_type == connector_type)
+                    && input.connector_label.as_deref().is_none_or(|label| {
+                        profile.connector_label.as_deref() == Some(label)
+                    })
+            });
+        // One profile past the page is the cursor; a cursor is issued only when a profile is
+        // actually left over, so the last page ends the listing instead of handing back an
+        // empty one.
+        let page: Vec<(&String, &crate::state::ConnectorProfileRecord)> =
+            matching.take(page_size + 1).collect();
+        let next_token = page
+            .get(page_size)
+            .map(|(name, _)| crate::state::encode_cursor(crate::state::CONNECTOR_PROFILE_CURSOR, name));
+        let details: Vec<ConnectorProfile> = page[..page.len().min(page_size)]
+            .iter()
+            .map(|(_, profile)| profile.reported())
+            .collect();
+
+        Ok(DescribeConnectorProfilesOutput {
+            connector_profile_details: Some(details),
+            next_token,
+        })
     }
 }

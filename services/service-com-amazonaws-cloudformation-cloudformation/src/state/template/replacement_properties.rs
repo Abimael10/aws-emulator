@@ -474,6 +474,16 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_SNAPSHOT => {
             &["NamespaceName", "RetentionPeriod", "Tags"]
         }
+        // An Amazon AppFlow CONNECTOR PROFILE keeps the connector it is an instance of, that
+        // connector's label and the key its credentials are encrypted with: `connectorType`,
+        // `connectorLabel` and `kmsArn` are members of `CreateConnectorProfile` and of no member
+        // of `UpdateConnectorProfile` (which takes the connection mode and the whole
+        // `connectorProfileConfig`), so a declaration restating one asks for a different
+        // profile. (Its NAME is create-only through [`name_is_create_only`]: no call of that
+        // service renames a profile.)
+        crate::state::provisioner::appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE => {
+            &["ConnectorType", "ConnectorLabel", "KMSArn"]
+        }
         // A Cloud Map SERVICE lives in the namespace its `NamespaceId` names, is of the kind
         // its `Type` states and has the custom health check its create configured: each is a
         // member of `CreateService` and of no member of `ServiceChange` (`UpdateService` takes

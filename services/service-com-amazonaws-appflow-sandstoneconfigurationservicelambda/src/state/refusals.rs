@@ -20,6 +20,16 @@
 /// ([`CONCURRENT_RUN_CONFLICT`]) — states the race itself and carries no resource at all.
 const CONFLICT_OPENING: &str = "Conflict executing request: ";
 
+/// One conflict message: [`CONFLICT_OPENING`] followed by the conflict this request is in.
+///
+/// The ONE place the opening is written, so an operation that states a conflict of its own —
+/// a second connector profile of one name
+/// ([`super::connector_profile_name_already_exists`]) — cannot open it differently from the
+/// sentences below.
+pub fn conflict(detail: &str) -> String {
+    format!("{CONFLICT_OPENING}{detail}")
+}
+
 /// The message of the `ResourceNotFoundException` every operation that ADDRESSES a flow by
 /// name answers when the account holds no such flow.
 ///

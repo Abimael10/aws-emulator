@@ -935,6 +935,12 @@ impl Provisioner {
             Self::CustomerProfilesDomain => {
                 describe_customer_profiles_domain(ctx, region, physical_resource_id).await
             }
+            // Amazon AppFlow's own read of the connector profile, by the name the stack
+            // published for it. Boxed for the reason the other heavy arms of this match are.
+            Self::AppFlowConnectorProfile => {
+                Box::pin(describe_appflow_connector_profile(ctx, region, physical_resource_id))
+                    .await
+            }
             // Recycle Bin's own read of the rule, by the identifier it minted for it.
             Self::RbinRule => describe_rbin_rule(ctx, region, physical_resource_id).await,
             // Amazon Data Lifecycle Manager's own read of the policy, by the id it minted for it.

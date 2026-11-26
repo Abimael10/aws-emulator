@@ -352,6 +352,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon AppFlow, for the `AWS::AppFlow::ConnectorProfile` a stack really creates there, so
+    // a suite that deploys one reads the profile back through that service's own wire by the name
+    // the stack publishes — and the credentials secret AppFlow creates for it resolves in the
+    // Secrets Manager mounted above.
+    router.register_service(
+        service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // CloudWatch Application Signals, for the
     // `AWS::ApplicationSignals::ServiceLevelObjective`, the
     // `AWS::ApplicationSignals::GroupingConfiguration` and the

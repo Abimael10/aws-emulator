@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnectorProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnectorProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnectorProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +133,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnectorProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectorProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnectorProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteConnectorProfileErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the AppFlow emulator holds no state on this engine".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        // The profile is taken out of the store under its guard, and the secret it published is
+        // deleted with the guard released: that delete is an in-process call to the service that
+        // holds the secret.
+        let removed = {
+            let mut store = state.lock();
+            let Some(held) = store.connector_profiles.get(&input.connector_profile_name) else {
+                return Err(
+                    DeleteConnectorProfileErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::no_such_connector_profile(
+                                &input.connector_profile_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let profile_arn = held.connector_profile_arn.clone();
+            let credentials_arn = held.credentials_arn.clone();
+
+            // A profile a flow still names is one whose removal would break that flow, so an
+            // UNFORCED delete of it is refused and names the flow in the way: `forceDelete`
+            // "indicates whether Amazon AppFlow should delete the profile, even if it is
+            // currently in use in one or more flows".
+            if !input.force_delete {
+                if let Some(flow_name) = store
+                    .flow_using_connector_profile(&input.connector_profile_name)
+                    .map(ToString::to_string)
+                {
+                    return Err(DeleteConnectorProfileErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(crate::state::connector_profile_is_in_use(
+                                &input.connector_profile_name,
+                                &flow_name,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // The profile goes with the `@idempotencyToken` that created it, which the record
+            // holds — so nothing of a deleted profile is left behind for a later create to
+            // collide with.
+            store
+                .connector_profiles
+                .remove(&input.connector_profile_name);
+            (profile_arn, credentials_arn)
+        };
+
+        // And its CREDENTIALS go with it: the secret they were held in is deleted in the service
+        // that holds it, so nothing is left behind holding credentials nothing can reach. Best
+        // effort, because the profile is already gone and the answer to the caller is decided.
+        let (profile_arn, credentials_arn) = removed;
+        // BOXED: the call's future is the whole handler of the service that holds the secret, and
+        // this handler is itself commonly served inside another one (a CloudFormation deployment
+        // calls it in process), so holding that future inline in this handler's state machine is
+        // what takes a nested request past the thread's stack.
+        Box::pin(crate::state::release_orphaned_credentials_secret(
+            &*self.engine,
+            ctx,
+            &region,
+            &profile_arn,
+            &credentials_arn,
+        ))
+        .await;
+        Ok(DeleteConnectorProfileOutput {})
     }
 }

@@ -3002,6 +3002,23 @@ pub(crate) fn return_values(
                 "Snapshot.SnapshotName",
             ),
         ),
+        // Amazon AppFlow's own control plane: the connector profile an
+        // `AWS::AppFlow::ConnectorProfile` declares. "Ref returns the connector profile name",
+        // which is the handle every call of that service on a profile takes, so the physical id
+        // is that name; `Fn::GetAtt` reads the ARN that service minted for the profile and the
+        // handle it holds the profile's credentials under. Both are values only that service
+        // produces, so each is a STAND-IN here, which `super::provisioning` re-points at what
+        // that service really reported
+        // ([`super::provisioner::Provisioner::AppFlowConnectorProfile`]).
+        appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE => {
+            for attribute in appflow_connector_profiles::CONNECTOR_PROFILE_ATTRIBUTE_NAMES {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (name.to_string(), attributes)
+        }
         // AWS Amplify's own control plane: the app an `AWS::Amplify::App` declares. "Ref
         // returns the ARN of the app"; `Fn::GetAtt` reads [`AMPLIFY_APP_ATTRIBUTES`]. Every
         // one of those is a value only that service can produce — the `appId` it mints, the

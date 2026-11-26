@@ -1683,6 +1683,14 @@ pub(super) enum Provisioner {
     /// served here, so a declaration restating the retention replaces the snapshot
     /// ([`super::template::replacement_properties`]).
     RedshiftServerlessSnapshot,
+    /// `AWS::AppFlow::ConnectorProfile`: the instance of a connector Amazon AppFlow's own
+    /// `CreateConnectorProfile` makes under the name the template states,
+    /// `UpdateConnectorProfile` re-configures and `DeleteConnectorProfile` removes. That name IS
+    /// the handle every call of that service on a profile takes, so it is the physical id the
+    /// naming rules already compute for the type, and the two values the type publishes — the
+    /// ARN that service minted and the handle it holds the profile's credentials under — are
+    /// read off its own report of the profile ([`appflow_connector_profiles`]).
+    AppFlowConnectorProfile,
     /// `AWS::BackupGateway::Hypervisor`: the on-premises hypervisor Backup Gateway's own
     /// `ImportHypervisorConfiguration` connects to, `UpdateHypervisor` reconfigures and
     /// `DeleteHypervisor` removes. That service MINTS the `HypervisorArn` — the import takes no
@@ -2075,6 +2083,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         REDSHIFT_SERVERLESS_NAMESPACE => Some(Provisioner::RedshiftServerlessNamespace),
         REDSHIFT_SERVERLESS_WORKGROUP => Some(Provisioner::RedshiftServerlessWorkgroup),
         REDSHIFT_SERVERLESS_SNAPSHOT => Some(Provisioner::RedshiftServerlessSnapshot),
+        APPFLOW_CONNECTOR_PROFILE => Some(Provisioner::AppFlowConnectorProfile),
         RBIN_RULE => Some(Provisioner::RbinRule),
         DLM_LIFECYCLE_POLICY => Some(Provisioner::DlmLifecyclePolicy),
         // Each AWS Network Security Manager entity names which of the four it is, so the one
@@ -3101,6 +3110,15 @@ impl Provisioner {
             Self::RedshiftServerlessSnapshot => {
                 delete_redshift_serverless_snapshot(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the connector profile by the NAME it was created under,
+            // which is this resource's physical id. BOXED, for the reason the other heavy arms
+            // of this match are: the call's future is the owning service's whole handler — which
+            // here makes a nested call of its own, to the service that holds the profile's
+            // credentials — and holding one of those inline in this match's state machine is
+            // what takes a deployment past the thread's stack.
+            Self::AppFlowConnectorProfile => {
+                Box::pin(delete_appflow_connector_profile(ctx, region, physical_resource_id)).await
+            }
             // The delete addresses the hypervisor by the ARN Backup Gateway minted for it,
             // which is this resource's physical id.
             Self::BackupGatewayHypervisor => {
@@ -3278,6 +3296,13 @@ mod neptune_graphs;
 /// stack publishes. Visible to the rest of this service's state because the three types' own
 /// NAMES and the attributes each publishes live here, beside the arms that provision them.
 pub(in crate::state) mod redshift_serverless;
+/// The Amazon AppFlow CONNECTOR PROFILE arms: the instance of a connector an
+/// `AWS::AppFlow::ConnectorProfile` declares, created in the service that owns it so a client's
+/// own `DescribeConnectorProfiles` resolves the name the stack publishes and a flow can be
+/// defined over it. Visible to the rest of this service's state because the type's own NAME and
+/// the attributes it publishes live here, beside the arms that provision it.
+pub(in crate::state) mod appflow_connector_profiles;
+use appflow_connector_profiles::*;
 /// The AWS Glue TABLE OPTIMIZER arms: the optimizer an `AWS::Glue::TableOptimizer` declares
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.

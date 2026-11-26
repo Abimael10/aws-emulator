@@ -306,6 +306,11 @@ service-com-amazonaws-neptunegraph-amazonneptunegraph = { workspace = true }
 # refused and the stack fails — and the namespace, the workgroup and the snapshot the stack
 # published are read back through that service's own wire.
 service-com-amazonaws-redshiftserverless-redshiftserverless = { workspace = true }
+# Amazon AppFlow, for the `AWS::AppFlow::ConnectorProfile` a stack really creates there
+# (`state::provisioner::appflow_connector_profiles`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails —
+# and the profile the stack published is read back through that service's own wire.
+service-com-amazonaws-appflow-sandstoneconfigurationservicelambda = { workspace = true }
 # CloudWatch Application Signals, for the `AWS::ApplicationSignals::ServiceLevelObjective`,
 # `::GroupingConfiguration` and `::InstrumentationConfig` a stack really creates there
 # (`state::provisioner::application_signals`): a suite that deploys one must have its owning

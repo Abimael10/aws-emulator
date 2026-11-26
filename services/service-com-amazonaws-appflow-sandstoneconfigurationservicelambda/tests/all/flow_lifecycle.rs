@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorProfile;
+use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorProfileConfig;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
-    service_state, ExecutionStatus, Flow, FlowExecution, FlowStatus, MAX_EXECUTIONS_PER_FLOW,
-    MAX_FLOWS_PER_ACCOUNT, RUN_SUCCEEDED_MESSAGE,
+    connector_profile_arn, connector_profile_credentials_secret_name, new_credentials_secret_id,
+    service_state, ExecutionStatus, Flow, FlowExecution, FlowStatus, ConnectorProfileRecord,
+    MAX_EXECUTIONS_PER_FLOW, MAX_FLOWS_PER_ACCOUNT, RUN_SUCCEEDED_MESSAGE,
 };
 use service_com_amazonaws_s3_amazons3::state as object_store;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::EmulatedService;
@@ -198,12 +199,33 @@ pub(crate) fn appflow_with_engine() -> (MultiServiceRouter, Arc<engine::InMemory
     if let Some(state) = service_state(&*engine) {
         let mut store = state.lock();
         for (connector_profile_name, connector_type) in FIXTURE_CONNECTOR_PROFILES {
+            let credentials_secret_id = new_credentials_secret_id();
             store.connector_profiles.insert(
                 connector_profile_name.to_string(),
-                ConnectorProfile {
-                    connector_profile_name: Some(connector_profile_name.to_string()),
-                    connector_type: Some(connector_type.to_string()),
-                    ..ConnectorProfile::default()
+                ConnectorProfileRecord {
+                    connector_profile_arn: connector_profile_arn(
+                        REGION,
+                        connector_profile_name,
+                    ),
+                    connector_profile_name: connector_profile_name.to_string(),
+                    connector_type: connector_type.to_string(),
+                    connector_label: None,
+                    connection_mode: "Public".to_string(),
+                    // The fixture profiles are seeded rather than created, so no secret was
+                    // minted for them: the handle is the NAME such a secret carries, which is
+                    // what these cases never read.
+                    credentials_arn: connector_profile_credentials_secret_name(
+                        &credentials_secret_id,
+                    ),
+                    connector_profile_properties: ConnectorProfileConfig::default()
+                        .connector_profile_properties,
+                    connector_profile_credentials: None,
+                    kms_arn: String::new(),
+                    credentials_secret_id,
+                    client_token: None,
+                    last_update_client_token: None,
+                    created_at: SystemTime::now(),
+                    last_updated_at: SystemTime::now(),
                 },
             );
         }

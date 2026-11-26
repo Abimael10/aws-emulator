@@ -10512,6 +10512,7 @@ dependencies = [
 name = "service-com-amazonaws-appflow-sandstoneconfigurationservicelambda"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -10519,6 +10520,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-secretsmanager",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -10531,6 +10533,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
@@ -12123,6 +12126,7 @@ dependencies = [
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-appconfig-amazonappconfig",
+ "service-com-amazonaws-appflow-sandstoneconfigurationservicelambda",
  "service-com-amazonaws-applicationautoscaling-anyscalefrontendservice",
  "service-com-amazonaws-applicationsignals-applicationsignals",
  "service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice",

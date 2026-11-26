@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnectorProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnectorProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnectorProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnectorProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectorProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnectorProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConnectorProfileErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the AppFlow emulator holds no state on this engine".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // The same pre-flight the create makes, so one of the two cannot accept a
+        // configuration the other would refuse: a profile pointed at an IAM role this
+        // account's IAM shows AppFlow cannot take on is refused rather than stored. Judged
+        // before the store's guard is taken, because the question is put to IAM.
+        if let Some(reason) = crate::state::unusable_connector_profile_role(
+            ctx,
+            &region,
+            crate::state::UPDATE_CONNECTOR_PROFILE_REQUEST,
+            &input.connector_profile_config.connector_profile_properties,
+        )
+        .await
+        {
+            return Err(UpdateConnectorProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // What the credentials secret has to be re-valued WITH, and the profile it belongs to,
+        // read under the store's guard and then decided on with the guard released: putting a new
+        // version into that secret is an in-process call to the service that holds it.
+        enum Decided {
+            /// The `@idempotencyToken` names the update already applied: nothing changes.
+            Retried(String),
+            /// The update applied, with the profile's ARN, the secret to re-value and the
+            /// credential document to put into it (`None` when the update restated none).
+            Applied {
+                connector_profile_arn: String,
+                credentials_arn: String,
+                credentials: Option<String>,
+            },
+        }
+        let decided = {
+            let mut store = state.lock();
+            let Some(stored) = store
+                .connector_profiles
+                .get_mut(&input.connector_profile_name)
+            else {
+                return Err(
+                    UpdateConnectorProfileErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::no_such_connector_profile(
+                                &input.connector_profile_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // A retried update carrying the same `@idempotencyToken` is answered without
+            // re-applying it: the token "ensures that your UpdateConnectorProfile request
+            // completes only once", so the second call reports the ARN of the profile the first
+            // one re-configured and changes nothing — the stamp the profile carries included.
+            if input.client_token.is_some()
+                && stored.last_update_client_token == input.client_token
+            {
+                Decided::Retried(stored.connector_profile_arn.clone())
+            } else {
+                // What the call carries IS the new configuration: `UpdateConnectorProfile` takes
+                // the connection mode and the whole `connectorProfileConfig`, addressed by the
+                // name the profile is held under. The connector type, its label and the
+                // encryption key are members of the CREATE alone, so they are left exactly as
+                // the create stored them.
+                stored.connection_mode = input.connection_mode;
+                stored.connector_profile_properties = input
+                    .connector_profile_config
+                    .connector_profile_properties;
+                // Credentials the update does not restate are the ones already in force: the
+                // profile is the instance of the connector they belong to, and an update of the
+                // properties alone does not revoke them.
+                let restated = input
+                    .connector_profile_config
+                    .connector_profile_credentials
+                    .map(|credentials| {
+                        let document = crate::state::credentials_document(Some(&credentials));
+                        stored.connector_profile_credentials = Some(credentials);
+                        document
+                    });
+                stored.last_update_client_token = input.client_token;
+                // Stamped strictly after the instant the profile already carried, so a reader
+                // can order a profile's own writes even where two of them land inside one
+                // reported millisecond.
+                stored.last_updated_at = crate::state::stamped_after(now, stored.last_updated_at);
+                Decided::Applied {
+                    connector_profile_arn: stored.connector_profile_arn.clone(),
+                    credentials_arn: stored.credentials_arn.clone(),
+                    credentials: restated,
+                }
+            }
+        };
+
+        let (connector_profile_arn, credentials_arn, credentials) = match decided {
+            Decided::Retried(connector_profile_arn) => {
+                return Ok(UpdateConnectorProfileOutput {
+                    connector_profile_arn: Some(connector_profile_arn),
+                })
+            }
+            Decided::Applied {
+                connector_profile_arn,
+                credentials_arn,
+                credentials,
+            } => (connector_profile_arn, credentials_arn, credentials),
+        };
+        // Restated credentials go into the secret the profile already publishes, as a new
+        // version: the profile keeps the `credentialsArn` the create answered, so a client that
+        // read that handle before the update reads the same secret after it.
+        if let Some(credentials) = credentials {
+            // BOXED: the call's future is the whole handler of the service that holds the secret,
+            // and this handler is itself commonly served inside another one (a CloudFormation
+            // deployment calls it in process), so holding that future inline in this handler's
+            // state machine is what takes a nested request past the thread's stack.
+            Box::pin(crate::state::store_connector_profile_credentials(
+                &*self.engine,
+                ctx,
+                &region,
+                &connector_profile_arn,
+                &credentials_arn,
+                &credentials,
+            ))
+            .await
+            .map_err(|message| {
+                UpdateConnectorProfileErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+        }
+
+        Ok(UpdateConnectorProfileOutput {
+            connector_profile_arn: Some(connector_profile_arn),
+        })
     }
 }

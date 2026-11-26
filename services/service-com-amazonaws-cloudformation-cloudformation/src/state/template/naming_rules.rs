@@ -592,6 +592,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         | crate::state::provisioner::redshift_serverless::REDSHIFT_SERVERLESS_WORKGROUP => {
             rules(64, Characters::LowercaseAlphanumeric)
         }
+        // Amazon AppFlow `CreateConnectorProfile.connectorProfileName`: `ConnectorProfileName`,
+        // `@length(min: 0, max: 256)` with pattern `^[\w/!@#+=.-]+$` (that service's own Smithy
+        // model), which a generated name is already inside — letters, digits, the underscore
+        // and the hyphen are all admitted — but may be longer than.
+        crate::state::provisioner::appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE => {
+            rules(256, Characters::AsGenerated)
+        }
         _ => None,
     }
 }

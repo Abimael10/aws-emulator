@@ -28,8 +28,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorProfile;
-use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::service_state;
+use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorProfileProperties;
+use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
+    connector_profile_arn, connector_profile_credentials_secret_name, new_credentials_secret_id,
+    service_state, ConnectorProfileRecord,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request here is signed for, and the one the buckets are created in.
@@ -44,11 +47,11 @@ const EVERY_RUN_ACTION: [&str; 3] = ["s3:ListBucket", "s3:GetObject", "s3:PutObj
 
 /// The connector profile this account HOLDS, and the connector it is a profile for.
 ///
-/// Seeded into the store directly because `CreateConnectorProfile` is still a scaffold
-/// stub: a flow definition that names a profile is served only in an account that holds it
-/// ("You must create a connector profile before calling this API" —
-/// `smithy_query(query="doc", shape="CreateFlow")`), so the positive rows need one profile
-/// to be there while every negative row names one that is not.
+/// Seeded into the store directly rather than created over the wire, because what these rows
+/// are about is the LOOKUP a flow definition makes: a flow definition that names a profile is
+/// served only in an account that holds it ("You must create a connector profile before calling
+/// this API" — `smithy_query(query="doc", shape="CreateFlow")`), so the positive rows need one
+/// profile to be there while every negative row names one that is not.
 const HELD_PROFILE: &str = "salesforce-profile";
 const HELD_PROFILE_CONNECTOR_TYPE: &str = "Salesforce";
 
@@ -112,12 +115,28 @@ impl Emulator {
             Arc::clone(&engine),
         ));
         if let Some(state) = service_state(&*engine) {
+            let credentials_secret_id = new_credentials_secret_id();
             state.lock().connector_profiles.insert(
                 HELD_PROFILE.to_string(),
-                ConnectorProfile {
-                    connector_profile_name: Some(HELD_PROFILE.to_string()),
-                    connector_type: Some(HELD_PROFILE_CONNECTOR_TYPE.to_string()),
-                    ..ConnectorProfile::default()
+                ConnectorProfileRecord {
+                    connector_profile_arn: connector_profile_arn(REGION, HELD_PROFILE),
+                    connector_profile_name: HELD_PROFILE.to_string(),
+                    connector_type: HELD_PROFILE_CONNECTOR_TYPE.to_string(),
+                    connector_label: None,
+                    connection_mode: "Public".to_string(),
+                    // The profile is seeded rather than created, so no secret was minted for it:
+                    // the handle is the NAME such a secret carries, which no row here reads.
+                    credentials_arn: connector_profile_credentials_secret_name(
+                        &credentials_secret_id,
+                    ),
+                    connector_profile_properties: ConnectorProfileProperties::default(),
+                    connector_profile_credentials: None,
+                    kms_arn: String::new(),
+                    credentials_secret_id,
+                    client_token: None,
+                    last_update_client_token: None,
+                    created_at: std::time::SystemTime::now(),
+                    last_updated_at: std::time::SystemTime::now(),
                 },
             );
         }

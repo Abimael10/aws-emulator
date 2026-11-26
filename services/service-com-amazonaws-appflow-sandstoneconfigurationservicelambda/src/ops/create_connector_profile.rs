@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnectorProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnectorProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnectorProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +173,252 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnectorProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnectorProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectorProfileErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the AppFlow emulator holds no state on this engine".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // Every IAM role the configuration names that AppFlow itself would have to take on
+        // has to be one this account's IAM shows it CAN take on, so a profile that could
+        // never reach the connector is refused when it is defined rather than stored.
+        // Judged before the store's guard is taken, because the question is put to IAM.
+        if let Some(reason) = crate::state::unusable_connector_profile_role(
+            ctx,
+            &region,
+            crate::state::CREATE_CONNECTOR_PROFILE_REQUEST,
+            &input.connector_profile_config.connector_profile_properties,
+        )
+        .await
+        {
+            return Err(CreateConnectorProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let connector_profile_arn =
+            crate::state::connector_profile_arn(&region, &input.connector_profile_name);
+        // The configuration this service cannot render is a fault in the service, not in the
+        // request, so it is reported as one rather than as a rejected input.
+        let unrenderable = || {
+            CreateConnectorProfileErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the AppFlow emulator could not render this connector profile configuration \
+                     for comparison"
+                        .to_string(),
+                ),
+            })
+        };
+        // Everything the STORE decides, decided under its guard once and then released: the
+        // credentials secret is created in the service that owns it, which is an in-process call
+        // this handler cannot make while holding the guard.
+        enum Decided {
+            /// The `@idempotencyToken` names a profile already stored: its ARN is the answer.
+            Retried(String),
+            /// Nothing holds this name yet, and the key the credentials are encrypted with.
+            Admitted(String),
+        }
+        let decided = {
+            let mut store = state.lock();
+            // The key the profile's credentials are encrypted with, resolved BEFORE the
+            // configuration is compared, so a retry carrying the same body renders the same
+            // configuration the first call stored.
+            let kms_arn = match input.kms_arn.clone() {
+                Some(requested) => requested,
+                None => store.managed_kms_key_arn(&region),
+            };
+            let requested = crate::state::connector_profile_descriptor(
+                &input.connector_profile_name,
+                &input.connector_type,
+                input.connector_label.as_deref(),
+                &input.connection_mode,
+                &kms_arn,
+                &input.connector_profile_config,
+            )
+            .ok_or_else(unrenderable)?;
+
+            // A retried create carrying the same `@idempotencyToken` answers with the FIRST
+            // result rather than the conflict a second create would raise — unless its INPUT
+            // differs from that first request, which the contract calls an error ("If you
+            // specify input parameters that differ from your first request, an error occurs").
+            // The whole configuration is compared, not just the name, so a retry that would
+            // have stored something else is refused instead of being answered 200 with a
+            // profile nobody persisted.
+            if let Some(stored) = input
+                .client_token
+                .as_deref()
+                .and_then(|token| store.connector_profile_for_client_token(token))
+            {
+                let held = crate::state::connector_profile_descriptor(
+                    &stored.connector_profile_name,
+                    &stored.connector_type,
+                    stored.connector_label.as_deref(),
+                    &stored.connection_mode,
+                    &stored.kms_arn,
+                    &crate::ops::types::ConnectorProfileConfig {
+                        connector_profile_properties: stored
+                            .connector_profile_properties
+                            .clone(),
+                        connector_profile_credentials: stored
+                            .connector_profile_credentials
+                            .clone(),
+                    },
+                )
+                .ok_or_else(unrenderable)?;
+                if held != requested {
+                    return Err(CreateConnectorProfileErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "clientToken was already used to create the connector profile \
+                                 {} with a different configuration",
+                                stored.connector_profile_name
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Decided::Retried(stored.connector_profile_arn.clone())
+            } else {
+                already_held(&store, &input.connector_profile_name)?;
+                Decided::Admitted(kms_arn)
+            }
+        };
+        let kms_arn = match decided {
+            Decided::Retried(connector_profile_arn) => {
+                return Ok(CreateConnectorProfileOutput {
+                    connector_profile_arn: Some(connector_profile_arn),
+                })
+            }
+            Decided::Admitted(kms_arn) => kms_arn,
+        };
+
+        // The credentials the request carried are STORED where AppFlow stores them: a secret of
+        // this account that Secrets Manager holds, created as the AppFlow service principal
+        // acting for this profile. The ARN that service allocated is the `credentialsArn` the
+        // profile reports — so a client that reads the handle can resolve it there. A create
+        // that cannot store the credentials creates no profile at all.
+        let credentials_secret_id = crate::state::new_credentials_secret_id();
+        // BOXED: the call's future is the whole handler of the service that holds the secret, and
+        // this handler is itself commonly served inside another one (a CloudFormation deployment
+        // calls it in process), so holding that future inline in this handler's state machine is
+        // what takes a nested request past the thread's stack.
+        let credentials_arn = Box::pin(crate::state::mint_connector_profile_credentials_secret(
+            &*self.engine,
+            ctx,
+            &region,
+            &connector_profile_arn,
+            &credentials_secret_id,
+            &crate::state::credentials_document(
+                input
+                    .connector_profile_config
+                    .connector_profile_credentials
+                    .as_ref(),
+            ),
+        ))
+        .await
+        .map_err(|message| {
+            CreateConnectorProfileErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+        })?;
+
+        let connector_profile_name = input.connector_profile_name.clone();
+        let record = crate::state::ConnectorProfileRecord {
+            connector_profile_arn,
+            connector_profile_name: connector_profile_name.clone(),
+            connector_type: input.connector_type,
+            connector_label: input.connector_label,
+            connection_mode: input.connection_mode,
+            credentials_arn,
+            connector_profile_properties: input
+                .connector_profile_config
+                .connector_profile_properties,
+            connector_profile_credentials: input
+                .connector_profile_config
+                .connector_profile_credentials,
+            kms_arn,
+            credentials_secret_id,
+            client_token: input.client_token,
+            last_update_client_token: None,
+            created_at: now,
+            last_updated_at: now,
+        };
+
+        let output = CreateConnectorProfileOutput {
+            connector_profile_arn: Some(record.connector_profile_arn.clone()),
+        };
+        // The guard was released while the secret was created, so the name and the quota are
+        // decided again here: a create that lost the race leaves nothing behind, neither a
+        // profile nor the secret it had already minted.
+        let orphaned_profile_arn = record.connector_profile_arn.clone();
+        let orphaned_credentials_arn = record.credentials_arn.clone();
+        let lost = {
+            let mut store = state.lock();
+            match already_held(&store, &connector_profile_name) {
+                Err(refusal) => Some(refusal),
+                Ok(()) => {
+                    store
+                        .connector_profiles
+                        .insert(connector_profile_name, record);
+                    None
+                }
+            }
+        };
+        if let Some(refusal) = lost {
+            Box::pin(crate::state::release_orphaned_credentials_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &orphaned_profile_arn,
+                &orphaned_credentials_arn,
+            ))
+            .await;
+            return Err(refusal);
+        }
+        Ok(output)
     }
+}
+
+/// Why this account cannot take another connector profile of the name `connector_profile_name`:
+/// it already holds one ("the name is unique for each `ConnectorProfile` in the Amazon Web
+/// Services account"), or it already holds the documented quota of them.
+///
+/// Both decisions are the STORE's, and both are made twice — once before the credentials secret
+/// is created and once before the profile is inserted — so one reading of them lives here rather
+/// than being written out twice.
+fn already_held(
+    store: &crate::state::ComAmazonawsAppflowSandstoneconfigurationservicelambdaState,
+    connector_profile_name: &str,
+) -> Result<(), CreateConnectorProfileError> {
+    if store.connector_profiles.contains_key(connector_profile_name) {
+        return Err(CreateConnectorProfileErrorModeled::ConflictException(
+            ConflictException {
+                message: Some(crate::state::connector_profile_name_already_exists(
+                    connector_profile_name,
+                )),
+            },
+        )
+        .into());
+    }
+    // The account's documented connector-profile quota, which also bounds the store: a profile
+    // past it is refused rather than stored.
+    if store.connector_profiles.len() >= crate::state::MAX_CONNECTOR_PROFILES_PER_ACCOUNT {
+        return Err(
+            CreateConnectorProfileErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} connector profiles",
+                        crate::state::MAX_CONNECTOR_PROFILES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    Ok(())
 }

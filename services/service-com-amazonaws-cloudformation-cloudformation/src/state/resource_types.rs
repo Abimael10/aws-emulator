@@ -78,6 +78,7 @@
 //! template to this catalogue would refuse types the expansion would have produced. Such a
 //! template is admitted, and its resources are recorded as declared.
 
+use super::provisioner::appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE;
 use super::provisioner::client_vpn::{
     EC2_CLIENT_VPN_AUTHORIZATION_RULE, EC2_CLIENT_VPN_ENDPOINT,
 };
@@ -270,6 +271,12 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::AppConfig::Extension",
     "AWS::AppConfig::ExtensionAssociation",
     "AWS::AppConfig::HostedConfigurationVersion",
+    // Amazon AppFlow. The CONNECTOR PROFILE is the instance of a connector a flow reads from
+    // or writes to, and it is created in the owning service (`super::provisioner`):
+    // `CreateConnectorProfile` POST /create-connector-profile. The namespace's other published
+    // type has no entry yet — a catalogued type with no provisioner deploys as declared-only,
+    // which would report a stack resource nothing created.
+    APPFLOW_CONNECTOR_PROFILE, // CreateConnectorProfile
     // AWS App Mesh
     "AWS::AppMesh::GatewayRoute",
     "AWS::AppMesh::Mesh",

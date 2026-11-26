@@ -1218,6 +1218,16 @@ impl Provisioner {
             // holds a project's tags through its own `TagResource` and the type declares only
             // the project's name — so no tags are propagated to one.
             Self::RekognitionProject => create_rekognition_project(ctx, region, resource).await,
+            // `AWS::AppFlow::ConnectorProfile` publishes no `Tags` property either — Amazon
+            // AppFlow holds a connector profile's tags through its own `TagResource` and
+            // `CreateConnectorProfile` takes none — so no tags are propagated to one.
+            // BOXED, for the reason the other heavy arms of this match are: the call's future is
+            // the owning service's whole handler — which here makes a nested call of its own, to
+            // the service that holds the profile's credentials — and holding one of those inline
+            // in this match's state machine is what takes a deployment past the thread's stack.
+            Self::AppFlowConnectorProfile => {
+                Box::pin(create_appflow_connector_profile(ctx, region, resource)).await
+            }
             // `AWS::Rekognition::Dataset` publishes `Tags`, which `CreateDataset` takes as a
             // `TagMap` of its own, so a dataset a stack creates carries the tags
             // CloudFormation gives it beside the ones the declaration asks for.
