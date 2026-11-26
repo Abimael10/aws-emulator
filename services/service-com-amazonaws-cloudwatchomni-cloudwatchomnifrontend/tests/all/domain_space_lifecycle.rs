@@ -2012,29 +2012,26 @@ const OTHER_IDC_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-fedcba098765
 /// `Domain.customEndpointUrls` is "Additional endpoint URLs derived from the domain
 /// name", against `domainEndpointUrl`'s "The HTTPS endpoint URL for accessing the
 /// domain", which [`create_domain_persists_a_record_get_domain_returns_it_verbatim`]
-/// already pins to the domain's ID. Each is an `https` URL whose LEFTMOST HOST LABEL is that
-/// identity, under the suffix read off the address THIS emulator is reached at — which for an
-/// in-process call is the unserved base ([`smithy_server_runtime::UNSERVED_URL_BASE`]) this
-/// suite drives the handlers through.
+/// already pins to the domain's ID. Each is an `https` URL on the address THIS emulator was
+/// reached at — which for an in-process call is the unserved base
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]) this suite drives the handlers through —
+/// with that identity in the path this emulator serves the domain under.
 fn custom_endpoint_url(name: &str) -> String {
-    announced_endpoint_url(name)
+    announced_endpoint_url(&omni::state::domain_name_endpoint_path(name))
 }
 
 /// The endpoint URL a domain of this ID is addressed by, read the same way.
 fn domain_endpoint_url(domain_id: &str) -> String {
-    announced_endpoint_url(domain_id)
+    announced_endpoint_url(&omni::state::domain_endpoint_path(domain_id))
 }
 
-/// The URL an endpoint of the identity `identity` is announced as, for the unserved base this
-/// suite's in-process calls are answered on.
-fn announced_endpoint_url(identity: &str) -> String {
+/// The URL the endpoint served at `path` is announced as, for the unserved base this suite's
+/// in-process calls are answered on.
+fn announced_endpoint_url(path: &str) -> String {
     let unserved = smithy_server_runtime::UNSERVED_URL_BASE
         .split_once("://")
         .map_or(smithy_server_runtime::UNSERVED_URL_BASE, |(_, rest)| rest);
-    format!(
-        "https://{}",
-        omni::state::announced_endpoint_authority(unserved, identity)
-    )
+    format!("https://{unserved}{path}")
 }
 
 /// The members of a domain that `UpdateDomain`'s input cannot name, rendered for

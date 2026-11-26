@@ -92,11 +92,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The endpoint a domain reports (`domainEndpointUrl`, and every `customEndpointUrls`
         // entry) is opened by whatever browser, probe or test holds that URL: anonymously,
         // with no credential scope and no target header naming this service — only the
-        // address this service itself minted, whose host's first label names one of this
-        // emulator's own domains or whose path sits under the plane segment that is this
-        // service's alone. A fetch of such an address is therefore claimed here, so the
+        // address this service itself minted, whose path sits under the plane segment that is
+        // this service's alone. A fetch of such an address is therefore claimed here, so the
         // domain is reachable at the address it was advertised on. See [`domain_endpoint`].
-        if domain_endpoint::claimed(&*self.engine, parts) {
+        if domain_endpoint::claimed(parts) {
             return true;
         }
         // Claim a request whose resolved route key is this service's signing

@@ -5,11 +5,12 @@
 //! `Domain.customEndpointUrls` entry ("Additional endpoint URLs derived from the domain
 //! name").
 //!
-//! The RULE this suite asserts: a URL this service hands a caller to OPEN carries the
-//! resource's identity as its host's LEFTMOST LABEL, under a suffix read off the
+//! The RULE this suite asserts: a URL this service hands a caller to OPEN is rooted on the
 //! `host[:port]` THIS emulator was reached at for the request being answered — never a host
-//! in a zone AWS publishes its own endpoints in, which resolves nowhere near this process.
-//! It follows that
+//! in a zone AWS publishes its own endpoints in, and never a name of this emulator's own
+//! invention beneath that address, neither of which resolves anywhere near this process — and
+//! it names WHICH domain it belongs to in the path this emulator serves that domain under. It
+//! follows that
 //!
 //! * the announced address FOLLOWS the request: two requests that reached this emulator on
 //!   two addresses are answered their own address, and the value is composed per read rather
@@ -243,12 +244,13 @@ fn unserved_authority() -> String {
         .to_string()
 }
 
-/// Assert that `domain` announces both endpoint members under the suffix read off
-/// `authority`, with the domain's id labelling one host and its name the other.
+/// Assert that `domain` announces both endpoint members on `authority` — the address this
+/// emulator was reached at — with the domain's id in the path of one and its name in the path
+/// of the other.
 fn assert_announced_on(case: &str, domain: &Domain, authority: &str) {
     let expected_id_endpoint = format!(
-        "https://{}",
-        omni::state::announced_endpoint_authority(authority, &domain.domain_id)
+        "https://{authority}{}",
+        omni::state::domain_endpoint_path(&domain.domain_id)
     );
     assert_eq!(
         domain.domain_endpoint_url, expected_id_endpoint,
@@ -260,8 +262,8 @@ fn assert_announced_on(case: &str, domain: &Domain, authority: &str) {
         .clone()
         .unwrap_or_else(|| panic!("case {case:?}: the created domain reports its name"));
     let expected_custom = vec![format!(
-        "https://{}",
-        omni::state::announced_endpoint_authority(authority, &name)
+        "https://{authority}{}",
+        omni::state::domain_name_endpoint_path(&name)
     )];
     let custom = domain.custom_endpoint_urls.clone().unwrap_or_default();
     assert_eq!(
@@ -427,10 +429,9 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
         .cloned()
         .expect("the create reports an endpoint derived from its name");
 
-    // Rows differ along which announced endpoint is opened and how: the id-labelled URL as
-    // handed out, the name-labelled one, the id-labelled host with the trailing slash a
-    // browser normalises a bare address to, a HEAD that asks only what is there, and the
-    // local path the same page is also served under for a client that resolves no name.
+    // Rows differ along which announced endpoint is opened and how: the id-addressed URL as
+    // handed out, the name-addressed one, the id-addressed URL with the trailing slash a
+    // browser normalises an address to, and a HEAD that asks only what is there.
     for (case, method, url) in [
         (
             "the id-addressed endpoint",
@@ -449,18 +450,18 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
             created.domain_endpoint_url.clone(),
         ),
         (
-            "the local path of the id-addressed endpoint",
+            "the id-addressed endpoint on another address of this emulator",
             "GET",
             format!(
-                "https://127.0.0.1:9297{}",
+                "https://localhost:19297{}",
                 omni::state::domain_endpoint_path(&created.domain_id)
             ),
         ),
         (
-            "the local path of the name-derived endpoint",
+            "the name-derived endpoint on another address of this emulator",
             "GET",
             format!(
-                "https://127.0.0.1:9297{}",
+                "https://localhost:19297{}",
                 omni::state::domain_name_endpoint_path(&name)
             ),
         ),
@@ -491,32 +492,18 @@ async fn a_fetch_of_an_announced_endpoint_reaches_the_stored_domain() {
 
     // Rows differ along what the address of this shape names: a domain id this emulator holds
     // nothing under and a domain name it holds nothing under — neither of which may render a
-    // domain, at the announced host or at the local path the same page is served under.
+    // domain.
     let announced_authority = "127.0.0.1:9297";
     for (case, url) in [
         (
-            "an announced host whose label names no domain",
-            format!(
-                "https://{}",
-                omni::state::announced_endpoint_authority(announced_authority, "d-doesnotexist")
-            ),
-        ),
-        (
-            "an announced host whose label names no domain by name",
-            format!(
-                "https://{}",
-                omni::state::announced_endpoint_authority(announced_authority, "omni-nothing")
-            ),
-        ),
-        (
-            "a local path with an id this emulator holds no domain under",
+            "an id this emulator holds no domain under",
             format!(
                 "https://{announced_authority}{}",
                 omni::state::domain_endpoint_path("d-doesnotexist")
             ),
         ),
         (
-            "a local path with a name this emulator holds no domain under",
+            "a name this emulator holds no domain under",
             format!(
                 "https://{announced_authority}{}",
                 omni::state::domain_name_endpoint_path("omni-nothing")

@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for WHERE a CloudWatchOmni domain's identity sits in the endpoint URLs it
-//! publishes — `Domain.domainEndpointUrl` ("The HTTPS endpoint URL for accessing the domain",
-//! required) and `Domain.customEndpointUrls` ("Additional endpoint URLs derived from the
-//! domain name"), with `Domain.domainId` patterned `^d-[0-9a-z]{1,25}$` and `Domain.name`
+//! End-to-end cover for WHERE a CloudWatchOmni domain's identity label sits in the endpoint
+//! URLs it publishes — `Domain.domainEndpointUrl` ("The HTTPS endpoint URL for accessing the
+//! domain", required) and `Domain.customEndpointUrls` ("Additional endpoint URLs derived from
+//! the domain name"), with `Domain.domainId` patterned `^d-[0-9a-z]{1,25}$` and `Domain.name`
 //! patterned `^[a-z0-9]+(-[a-z0-9]+)*$` at 3-63 characters
 //! (`smithy_query(query="shape",shape="Domain")`).
 //!
-//! The RULE this suite asserts: each of those members is an `https` URL whose LEFTMOST HOST
-//! LABEL is the resource identity it belongs to — the domain's id for `domainEndpointUrl`,
-//! the domain's name for each `customEndpointUrls` entry — and both carry the SAME host
-//! suffix and port after that first label. A domain carrying a name publishes exactly one
-//! custom endpoint, and the identity is in the HOST: the URL addresses the root of that host
-//! rather than naming the resource in a path. It follows that a rename moves only the
-//! name-derived label: the id-labelled `domainEndpointUrl`, `domainArn` and `createdAt` are
-//! unchanged, and the renamed domain's custom endpoint's first label becomes the new name
-//! while its suffix stays the one the id endpoint uses.
+//! The RULE this suite asserts: each of those members is an `https` URL whose AUTHORITY is
+//! the address this emulator answered the request on — nothing added in front of it and no
+//! name invented beneath it — and whose PATH names the resource it belongs to: the domain's
+//! id for `domainEndpointUrl`, the domain's name for each `customEndpointUrls` entry. A
+//! domain carrying a name publishes exactly one custom endpoint, and both members share that
+//! one authority. It follows that a rename moves only the name-derived address: the
+//! id-addressed `domainEndpointUrl`, `domainArn` and `createdAt` are unchanged, and the
+//! renamed domain's custom endpoint carries the new name while its authority stays the one
+//! the id endpoint uses.
 //!
 //! The rows of each table differ along what the rule generalises over: the address this
 //! emulator was reached at (an IPv4 address with a port, a loopback name, a bracketed IPv6
@@ -31,20 +31,15 @@ use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 use omni::ops::types::Domain;
 
 /// How this suite READS an announced endpoint URL — the same reading a client does: the
-/// scheme, the host's leftmost label, the suffix after that label, the port and the path.
+/// scheme, the authority it dials, and the path it addresses there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AnnouncedEndpoint {
     scheme: String,
-    label: String,
-    suffix: String,
-    port: Option<u16>,
+    authority: String,
     path: String,
 }
 
 /// `url` read as an announced endpoint, through the URL parser this crate already depends on.
-///
-/// The leftmost label and the suffix are the two halves of the hostname at its FIRST `.`,
-/// which is how a client recovers which resource an endpoint belongs to.
 fn announced_endpoint(case: &str, url: &str) -> AnnouncedEndpoint {
     let parsed = ::url::Url::parse(url)
         .unwrap_or_else(|error| panic!("case {case:?}: {url:?} is not a URL: {error}"));
@@ -52,14 +47,13 @@ fn announced_endpoint(case: &str, url: &str) -> AnnouncedEndpoint {
         .host_str()
         .unwrap_or_else(|| panic!("case {case:?}: {url:?} names no host"))
         .to_string();
-    let (label, suffix) = host
-        .split_once('.')
-        .unwrap_or_else(|| panic!("case {case:?}: the host of {url:?} carries one label only"));
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
     AnnouncedEndpoint {
         scheme: parsed.scheme().to_string(),
-        label: label.to_string(),
-        suffix: suffix.to_string(),
-        port: parsed.port(),
+        authority,
         path: parsed.path().to_string(),
     }
 }
@@ -77,9 +71,9 @@ fn the_custom_endpoint(case: &str, domain: &Domain) -> String {
     urls.into_iter().next().unwrap_or_default()
 }
 
-/// Assert the whole rule over one reported `domain`: the id labels one host, the name labels
-/// the other, both share a suffix and a port, and neither names the resource in a path.
-fn assert_identity_is_the_first_label(case: &str, domain: &Domain) {
+/// Assert the whole rule over one reported `domain`: the id names the path of one endpoint,
+/// the name the path of the other, and both are dialled at one authority.
+fn assert_identity_is_in_the_path(case: &str, domain: &Domain) {
     let id_endpoint = announced_endpoint(case, &domain.domain_endpoint_url);
     let name = domain
         .name
@@ -89,26 +83,22 @@ fn assert_identity_is_the_first_label(case: &str, domain: &Domain) {
     let name_endpoint = announced_endpoint(case, &custom);
 
     assert_eq!(
-        id_endpoint.label, domain.domain_id,
-        "case {case:?}: the domain endpoint's first label must be the domain id {:?}, got {:?} \
-         in {:?}",
-        domain.domain_id, id_endpoint.label, domain.domain_endpoint_url
+        id_endpoint.path,
+        omni::state::domain_endpoint_path(&domain.domain_id),
+        "case {case:?}: the domain endpoint's path must name the domain id {:?}, got {:?}",
+        domain.domain_id,
+        domain.domain_endpoint_url
     );
     assert_eq!(
-        name_endpoint.label, name,
-        "case {case:?}: the custom endpoint's first label must be the domain name {name:?}, got \
-         {:?} in {custom:?}",
-        name_endpoint.label
+        name_endpoint.path,
+        omni::state::domain_name_endpoint_path(&name),
+        "case {case:?}: the custom endpoint's path must name the domain name {name:?}, got \
+         {custom:?}"
     );
     assert_eq!(
-        name_endpoint.suffix, id_endpoint.suffix,
-        "case {case:?}: both endpoints must share one host suffix, got {:?} and {:?}",
-        id_endpoint.suffix, name_endpoint.suffix
-    );
-    assert_eq!(
-        name_endpoint.port, id_endpoint.port,
-        "case {case:?}: both endpoints must be dialled on one port, got {:?} and {:?}",
-        id_endpoint.port, name_endpoint.port
+        name_endpoint.authority, id_endpoint.authority,
+        "case {case:?}: both endpoints must be dialled at one authority, got {:?} and {:?}",
+        id_endpoint.authority, name_endpoint.authority
     );
     for (member, endpoint, url) in [
         ("domainEndpointUrl", &id_endpoint, &domain.domain_endpoint_url),
@@ -118,31 +108,22 @@ fn assert_identity_is_the_first_label(case: &str, domain: &Domain) {
             endpoint.scheme, "https",
             "case {case:?}: {member} must be an https URL, got {url:?}"
         );
-        assert_eq!(
-            endpoint.path, "/",
-            "case {case:?}: {member} addresses the root of its host, so the identity is in no \
-             path, got {url:?}"
-        );
-        assert!(
-            !endpoint.suffix.contains('/') && !endpoint.suffix.is_empty(),
-            "case {case:?}: {member} must carry a host suffix after its first label, got {url:?}"
-        );
         for identity in [domain.domain_id.as_str(), name.as_str()] {
             assert!(
-                !endpoint.suffix.contains(identity),
-                "case {case:?}: {member}'s suffix must name no resource identity, got {url:?}"
+                !endpoint.authority.contains(identity),
+                "case {case:?}: {member}'s authority must name no resource identity \
+                 ({identity:?}), got {url:?}"
             );
         }
     }
 }
 
-/// RULE: every operation that reports a domain announces both endpoint members with the
-/// identity as the leftmost host label and one shared suffix, whatever address the request
-/// reached this emulator at and whatever name the domain carries.
+/// RULE: every operation that reports a domain announces both endpoint members at the one
+/// authority this emulator answered the request on, with the identity in the path, whatever
+/// address the request reached this emulator at and whatever name the domain carries.
 #[tokio::test]
-async fn an_announced_endpoint_names_its_identity_in_the_first_host_label() {
-    // The longest name the model admits is 63 characters, which is also the most octets one
-    // DNS label may hold; the shortest is 3.
+async fn an_announced_endpoint_names_its_identity_in_its_path() {
+    // The longest name the model admits is 63 characters; the shortest is 3.
     let longest_name = format!("omni-{}", "x".repeat(58));
     // Rows pair an address this emulator is reached at with a name shape the domain carries.
     let rows: Vec<(&str, Option<&str>, &str, String)> = vec![
@@ -195,11 +176,11 @@ async fn an_announced_endpoint_names_its_identity_in_the_first_host_label() {
         let omni = Omni::new();
         let parts = signed_parts(host, uri);
         let created = omni.create_domain(&parts, &name).await;
-        assert_identity_is_the_first_label(&format!("{case} (CreateDomain)"), &created);
+        assert_identity_is_in_the_path(&format!("{case} (CreateDomain)"), &created);
 
         // The read and the patch project the same envelope, so the rule holds through both.
         let fetched = omni.get_domain(&parts, &created.domain_id).await;
-        assert_identity_is_the_first_label(&format!("{case} (GetDomain)"), &fetched);
+        assert_identity_is_in_the_path(&format!("{case} (GetDomain)"), &fetched);
         assert_eq!(
             (
                 fetched.domain_endpoint_url.as_str(),
@@ -215,15 +196,15 @@ async fn an_announced_endpoint_names_its_identity_in_the_first_host_label() {
     }
 }
 
-/// RULE: a rename moves ONLY the name-derived label — the id-labelled endpoint, the ARN and
-/// the creation instant are unchanged, and the custom endpoint's suffix stays the one the id
-/// endpoint uses.
+/// RULE: a rename moves ONLY the name-derived address — the id-addressed endpoint, the ARN and
+/// the creation instant are unchanged, and the custom endpoint keeps the authority the id
+/// endpoint is dialled at.
 #[tokio::test]
 async fn a_rename_moves_only_the_name_derived_endpoint() {
     let omni = Omni::new();
     let parts = signed_parts(Some("127.0.0.1:9297"), MODELLED_TARGET);
     let created = omni.create_domain(&parts, "omni-rename-first").await;
-    assert_identity_is_the_first_label("the created domain", &created);
+    assert_identity_is_in_the_path("the created domain", &created);
 
     // Rows differ along the shape of the name the domain is renamed to: a short one, a
     // multi-segment hyphenated one, one of the longest the model admits, and back to a short
@@ -240,7 +221,7 @@ async fn a_rename_moves_only_the_name_derived_endpoint() {
         let renamed = omni
             .rename_domain(&parts, &created.domain_id, &new_name)
             .await;
-        assert_identity_is_the_first_label(case, &renamed);
+        assert_identity_is_in_the_path(case, &renamed);
         assert_eq!(
             renamed.name.as_deref(),
             Some(new_name.as_str()),
@@ -251,15 +232,16 @@ async fn a_rename_moves_only_the_name_derived_endpoint() {
         let custom = announced_endpoint(case, &the_custom_endpoint(case, &renamed));
         let id_endpoint = announced_endpoint(case, &renamed.domain_endpoint_url);
         assert_eq!(
-            custom.label, new_name,
-            "case {case:?}: the custom endpoint's first label must become the new name, got {:?}",
-            custom.label
+            custom.path,
+            omni::state::domain_name_endpoint_path(&new_name),
+            "case {case:?}: the custom endpoint's path must name the new name, got {:?}",
+            custom.path
         );
         assert_eq!(
-            custom.suffix, id_endpoint.suffix,
+            custom.authority, id_endpoint.authority,
             "case {case:?}: the renamed domain's custom endpoint must keep the id endpoint's \
-             suffix {:?}, got {:?}",
-            id_endpoint.suffix, custom.suffix
+             authority {:?}, got {:?}",
+            id_endpoint.authority, custom.authority
         );
         assert_eq!(
             (
@@ -295,21 +277,22 @@ async fn a_rename_moves_only_the_name_derived_endpoint() {
     }
 }
 
-/// RULE: an announced endpoint is one this emulator SERVES at the host it announced — a fetch
-/// of either label renders the stored domain, a label naming no domain of this emulator
-/// renders none, and after a rename the new label is served where the old one no longer is.
+/// RULE: an announced endpoint is one this emulator SERVES at the address it announced — a
+/// fetch of either member renders the stored domain, an address of the same shape naming no
+/// domain of this emulator renders none, and after a rename the new address is served where
+/// the old one no longer is.
 #[tokio::test]
-async fn an_announced_host_is_served_from_the_stored_domain() {
+async fn an_announced_endpoint_is_served_from_the_stored_domain() {
     let omni = Omni::new();
     let parts = signed_parts(Some("127.0.0.1:9297"), MODELLED_TARGET);
     let created = omni.create_domain(&parts, "omni-host-served").await;
     let first_custom = the_custom_endpoint("the created domain", &created);
 
-    // Rows differ along which announced host is opened: the id-labelled one and the
-    // name-labelled one.
+    // Rows differ along which announced endpoint is opened: the id-addressed one and the
+    // name-addressed one.
     for (case, url) in [
-        ("the id-labelled host", created.domain_endpoint_url.clone()),
-        ("the name-labelled host", first_custom.clone()),
+        ("the id-addressed endpoint", created.domain_endpoint_url.clone()),
+        ("the name-addressed endpoint", first_custom.clone()),
     ] {
         let (status, media_type, body) = omni.fetch("GET", &url).await;
         assert_eq!(
@@ -328,23 +311,22 @@ async fn an_announced_host_is_served_from_the_stored_domain() {
         }
     }
 
-    // A host of the same shape whose first label names no domain of this emulator is not this
-    // service's address at all, so nothing there renders a domain.
+    // An address of the same shape naming no domain of this emulator renders no domain.
     let unknown = created
         .domain_endpoint_url
         .replace(&created.domain_id, "d-nothinghere");
     let (status, _media_type, body) = omni.fetch("GET", &unknown).await;
     assert_ne!(
         status, 200,
-        "case \"a label naming no domain\": fetching {unknown:?} answered {status}: {body:?}"
+        "case \"an id naming no domain\": fetching {unknown:?} answered {status}: {body:?}"
     );
     assert!(
         !body.contains(REGION),
-        "case \"a label naming no domain\": expected no domain page, got {body:?}"
+        "case \"an id naming no domain\": expected no domain page, got {body:?}"
     );
 
-    // After a rename the NEW name's host is served and the old one is not: the custom endpoint
-    // really moved, rather than both labels answering.
+    // After a rename the NEW name's address is served and the old one is not: the custom
+    // endpoint really moved, rather than both addresses answering.
     let renamed = omni
         .rename_domain(&parts, &created.domain_id, "omni-host-moved")
         .await;
