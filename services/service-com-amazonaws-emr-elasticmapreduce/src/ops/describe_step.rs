@@ -166,6 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .await;
+        // And, before the same store is taken: a step whose work resolves a table in the
+        // cluster's Hive metastore is owed the DECISION of whether the role it runs as may
+        // reach that catalog (`crate::state::step_catalog_access`) — an IAM call, which may
+        // not happen under this service's lock. Such a step does not END until it has been
+        // answered, so nothing reports a step COMPLETED for a catalog read nobody authorized.
+        crate::state::resolve_due_step_catalog_access(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.cluster_id,
+        )
+        .await;
         // Reporting only, and before this service's store is taken: a step the cluster has
         // started is OWED the run of the application it submitted, which was owed at this
         // instant whether or not anybody described the step, and neither the Amazon S3 read

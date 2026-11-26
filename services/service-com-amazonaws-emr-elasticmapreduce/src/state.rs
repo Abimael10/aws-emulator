@@ -287,6 +287,12 @@ pub use command_step_run::*;
 mod instance_profile_credentials;
 pub use instance_profile_credentials::*;
 
+/// WHETHER that work may reach the cluster's Hive metastore — the Glue Data Catalog calls it
+/// makes, decided against the permissions in force on the role it runs as — split out and
+/// re-exported the same way.
+mod step_catalog_access;
+pub use step_catalog_access::*;
+
 /// The EventBridge events a step's state changes are published as, split out and
 /// re-exported the same way.
 mod step_events;

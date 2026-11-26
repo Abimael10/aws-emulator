@@ -149,6 +149,11 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
     // once for this call: the credential a step carrying no runtime role of its own presents,
     // which is nothing at all where that profile carries no role those instances may assume.
     let instance_credentials = cluster_step_credentials(ctx, region, &job_flow_role).await;
+    // The ROLE those instances run as, resolved once for this call as well: the permissions in
+    // force on it are what decide the catalog calls a command line's statements make
+    // (`step_catalog_access`). Nothing resolved is nothing known about those permissions,
+    // which withholds no call.
+    let instance_role = work_role_arn(ctx, region, &job_flow_role).await;
     // What this CALL may spend performing them: a further command is started only while a
     // whole one still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
@@ -190,12 +195,21 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         let cli = step_object_cli(engine, ctx, region, &credentials, &plan.step_id);
         // The cluster's SQL client, built per command for the same reason: the statements it
         // runs read the relations' data through that same program, so one command's reads and
-        // writes share its budget and its credential.
+        // writes share its budget and its credential. What it may read and change in the
+        // cluster's metastore is decided against the role the step runs as, which is the same
+        // role its calls are signed as.
+        let access = match plan.execution_role_arn.as_deref() {
+            Some(role_arn) => work_role_arn(ctx, region, role_arn).await,
+            None => instance_role.clone(),
+        };
         let sql = step_sql_cli(
             engine,
             metastore_is_the_catalog,
             cli.clone(),
             configuration.clone(),
+            access
+                .as_deref()
+                .and_then(|role_arn| step_catalog_access(ctx, region, role_arn, &plan.step_id)),
         );
         // The NODE the command line runs on: its local disk, which the session starts with and
         // is left holding what the command wrote, and the programs the cluster's applications

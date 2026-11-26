@@ -27,6 +27,12 @@
 //! [`SQL_CLIENT_FAILURE_STATUS`] when one of them was refused, carrying the driver's own
 //! error.
 //!
+//! Reaching that metastore is an AWS call of the ROLE the step's work runs as, so what the
+//! client may read and change there is decided against the permissions in force on that role
+//! ([`super::step_catalog_access`]): a statement whose table those permissions deny the
+//! resolution of is refused with the catalog's own error, so the client exits non-zero and its
+//! step FAILS rather than printing an answer the role may not have.
+//!
 //! Not everything an invocation carries is a statement for the metastore: `set` is a command
 //! of the CLIENT, which it answers out of the configuration its own session holds
 //! ([`super::step_session_config`]) — the cluster's recorded configuration, with whatever this
@@ -127,6 +133,11 @@ pub struct StepSqlCli {
     /// ([`SessionConfiguration::of_cluster`]): one session per invocation, so nothing a
     /// command set outlives it.
     configuration: ::std::collections::BTreeMap<String, String>,
+    /// What the permissions in force on the role this command's step runs as say about the
+    /// metastore calls its statements make ([`super::step_catalog_access`]): reaching the
+    /// catalog is a call of that role, so each table is decided as the client resolves it.
+    /// `None` where nothing is known about those permissions, which withholds nothing.
+    access: Option<StepCatalogAccess>,
     /// The driver error the last refused statement of this command answered, shared with the
     /// caller that reports the step: a step whose command line's client was refused reports
     /// that error rather than only the status the command exited with.
@@ -150,12 +161,15 @@ impl ::std::fmt::Debug for StepSqlCli {
 /// nothing of a statement for that metastore and the step reports that its work was not run.
 /// `configuration` is what that cluster's launch recorded as its configuration
 /// ([`configuration_properties`]), which is what the client's own `set` command reads.
+/// `access` is what the role the step runs as may do in that metastore
+/// ([`super::step_catalog_access`]).
 #[must_use]
 pub fn step_sql_cli<Eng: Send + Sync + 'static>(
     engine: &Eng,
     metastore_is_the_catalog: bool,
     objects: Option<StepObjectCli>,
     configuration: ::std::collections::BTreeMap<String, String>,
+    access: Option<StepCatalogAccess>,
 ) -> StepSqlCli {
     StepSqlCli {
         catalog: metastore_is_the_catalog
@@ -163,6 +177,7 @@ pub fn step_sql_cli<Eng: Send + Sync + 'static>(
             .flatten(),
         objects,
         configuration,
+        access,
         failure: Arc::new(Mutex::new(None)),
     }
 }
@@ -284,6 +299,7 @@ impl EnvironmentPrograms for StepSqlCli {
             match step_sql_engine::run_statement(
                 catalog,
                 self.objects.as_ref(),
+                self.access.as_ref(),
                 statement,
                 &database,
                 now,

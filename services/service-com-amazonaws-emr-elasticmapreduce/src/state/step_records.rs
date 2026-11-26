@@ -40,6 +40,13 @@ pub struct StepRecord {
     /// submitted ([`read_step_work`]), and `None` when the command submits none this
     /// service can account for.
     pub work: Option<StepWork>,
+    /// What the permissions in force on the role this step runs as say about the catalog
+    /// calls its work makes ([`resolve_due_step_catalog_access`]), and `None` while nothing
+    /// has been answered. A step whose work reaches the metastore does not END until it has
+    /// been answered ([`Self::awaits_catalog_access`]): the call the work makes is authorized
+    /// against that role, so a step reported `COMPLETED` before anything decided it would be
+    /// a success for a catalog read nobody authorized.
+    pub catalog_access: Option<CatalogAccess>,
     /// What that work ANSWERED, once the step runner has resolved it against the state the
     /// work depends on ([`run_due_steps`]) — which is what the step ends in instead of the
     /// not-executed failure every other step ends in. `None` while nothing has been
@@ -173,6 +180,7 @@ impl StepRecord {
             stop_due_at: None,
             stop_state: None,
             work,
+            catalog_access: None,
             outcome: None,
             application,
             submission,
@@ -244,6 +252,26 @@ impl StepRecord {
         self.work
             .as_ref()
             .is_some_and(|work| work.accountable && !work.changes.is_empty())
+            && self.outcome.is_none()
+            && !self.is_terminal()
+            && self.stop_due_at.is_none()
+    }
+
+    /// Whether this step is still owed the DECISION of whether its work may reach the
+    /// cluster's Hive metastore: that work resolves a table there or changes it, nothing has
+    /// been answered about it yet, and the step is neither terminal nor stopping.
+    ///
+    /// Such a step does not end ([`Self::run_between`]) for the same reason one awaiting its
+    /// command does not: the calls its work makes are authorized against the role it runs as
+    /// ([`step_catalog_access`]), so it stays `RUNNING` until IAM has answered rather than
+    /// being reported COMPLETED for a catalog read nothing decided. Work that reaches no
+    /// table at all — a statement naming none — needs no decision and is owed none.
+    #[must_use]
+    pub fn awaits_catalog_access(&self) -> bool {
+        self.work.as_ref().is_some_and(|work| {
+            work.accountable && !(work.tables.is_empty() && work.changes.is_empty())
+        })
+            && self.catalog_access.is_none()
             && self.outcome.is_none()
             && !self.is_terminal()
             && self.stop_due_at.is_none()
@@ -396,11 +424,15 @@ impl StepRecord {
         }
         if now >= end {
             // A step whose application has not run yet, whose command has not been
-            // performed yet, or whose metastore change has not been applied yet does not
-            // end: what it ends in is what that run, that command or the metastore answers
+            // performed yet, whose metastore change has not been applied yet, or whose
+            // catalog access nothing has decided yet does not end: what it ends in is what
+            // that run, that command, the metastore or that decision answers
             // ([`Self::awaits_application`], [`Self::awaits_command`],
-            // [`Self::awaits_metastore_change`]).
-            if self.awaits_application() || self.awaits_command() || self.awaits_metastore_change()
+            // [`Self::awaits_metastore_change`], [`Self::awaits_catalog_access`]).
+            if self.awaits_application()
+                || self.awaits_command()
+                || self.awaits_metastore_change()
+                || self.awaits_catalog_access()
             {
                 self.state = step_state::RUNNING.to_string();
                 self.start_date_time = Some(start);

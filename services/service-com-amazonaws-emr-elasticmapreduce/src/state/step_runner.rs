@@ -32,6 +32,11 @@
 //!   statement that writes, defines or drops anything else leaves state behind that this
 //!   emulator does not apply, and reporting it `COMPLETED` would make a discarded write look
 //!   like a stored one.
+//! * Reaching that catalog is an AWS call of the ROLE the step's work runs as, so what the
+//!   work may read and change there is decided against the permissions in force on that role
+//!   ([`super::step_catalog_access`]): a step whose resolution those permissions deny ends
+//!   `FAILED` carrying the metastore client's own refusal, and no step is resolved or applied
+//!   at all until that decision has been made ([`StepRecord::awaits_catalog_access`]).
 //!
 //! So a read whose every table resolves ends `COMPLETED` ("for a step to be considered
 //! complete, the main function must exit with a zero exit code", `AddJobFlowSteps` doc), one
@@ -570,6 +575,10 @@ fn resolve_cluster_outcomes<Eng: Send + Sync + 'static>(engine: &Eng, cluster: &
         .iter()
         .enumerate()
         .filter(|(_, step)| step.outcome.is_none() && !step.is_terminal())
+        // A step whose catalog access nothing has decided yet resolves nothing: the calls
+        // that resolution makes are authorized against the role the step runs as, and that
+        // answer is the reporting operation's to get ([`resolve_due_step_catalog_access`]).
+        .filter(|(_, step)| !step.awaits_catalog_access())
         .filter(|(_, step)| {
             step.work
                 .as_ref()
@@ -589,7 +598,14 @@ fn resolve_cluster_outcomes<Eng: Send + Sync + 'static>(engine: &Eng, cluster: &
         unresolved
             .into_iter()
             .filter_map(|index| {
-                let work = cluster.steps[index].work.as_ref()?;
+                let step = &cluster.steps[index];
+                // A statement the role may not read the catalog for was never resolved
+                // against it: the metastore client's own refusal is what the step ends in
+                // ([`super::step_catalog_access`]).
+                if let Some(CatalogAccess::Refused(failure)) = step.catalog_access.as_ref() {
+                    return Some((index, refused_outcome(failure.clone())));
+                }
+                let work = step.work.as_ref()?;
                 Some((index, resolve_outcome(&catalog, &catalog_id, work)))
             })
             .collect()
@@ -629,6 +645,10 @@ fn apply_due_metastore_changes<Eng: Send + Sync + 'static>(
         .iter()
         .enumerate()
         .filter(|(_, step)| step.awaits_metastore_change() && step.start_date_time.is_some())
+        // As the read above: a change whose catalog access nothing has decided yet is applied
+        // by nothing, because the write it makes is authorized against the role the step runs
+        // as ([`resolve_due_step_catalog_access`]).
+        .filter(|(_, step)| !step.awaits_catalog_access())
         .map(|(index, _)| index)
         .collect();
     if owed.is_empty() {
@@ -653,7 +673,14 @@ fn apply_due_metastore_changes<Eng: Send + Sync + 'static>(
         let catalog_id = glue_state::resolve_catalog_id(None);
         owed.into_iter()
             .filter_map(|index| {
-                let work = cluster.steps[index].work.clone()?;
+                let step = &cluster.steps[index];
+                // A change the role may not make was applied to nothing: the metastore
+                // client's own refusal is what the step ends in, and the catalog is left
+                // exactly as it was.
+                if let Some(CatalogAccess::Refused(failure)) = step.catalog_access.as_ref() {
+                    return Some((index, refused_outcome(failure.clone())));
+                }
+                let work = step.work.clone()?;
                 Some((
                     index,
                     performed_outcome(&mut catalog, &catalog_id, &work, now),
@@ -699,6 +726,23 @@ fn performed_outcome(
     StepOutcome {
         state: step_state::COMPLETED.to_string(),
         failure: None,
+        log: None,
+    }
+}
+
+/// What a statement the catalog REFUSED the access for answers: the modelled failure state
+/// carrying the metastore client's own error for that refusal
+/// ([`super::step_catalog_access`]).
+///
+/// It is an answer about the submitted work — the client asked the catalog and the catalog
+/// said no — so it applies the step's `ActionOnFailure` like every other failure the work
+/// answered ([`StepRecord::work_answered`]).
+fn refused_outcome(failure: StepFailure) -> StepOutcome {
+    StepOutcome {
+        state: step_state::FAILED.to_string(),
+        failure: Some(failure),
+        // The call was made by the cluster's metastore client rather than by an engine of this
+        // emulator, so no console stream and no exit status of it exists to report.
         log: None,
     }
 }

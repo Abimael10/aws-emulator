@@ -108,16 +108,24 @@ impl SqlFault {
 ///
 /// `database` is the session's current database, which an unqualified name resolves in;
 /// `objects` is the store the relations' data is read from, and a statement that needs it
-/// where there is none is performed by nothing.
+/// where there is none is performed by nothing. `access` is what the role the step runs as may
+/// do in the metastore ([`super::step_catalog_access`]): reaching the catalog is a call of
+/// that role, so a table whose resolution its permissions deny — and a change they deny — is
+/// refused with the catalog's own error BEFORE anything is read or written, exactly as the
+/// metastore client is refused.
 pub(super) fn run_statement(
     catalog: &::engine::ServiceState<glue_state::ComAmazonawsGlueAwsglueState>,
     objects: Option<&StepObjectCli>,
+    access: Option<&StepCatalogAccess>,
     statement: &Statement,
     database: &str,
     now: SystemTime,
 ) -> Result<StatementAnswer, SqlFault> {
     let catalog_id = glue_state::resolve_catalog_id(None);
     if let Some(change) = metastore_change(statement, database) {
+        if let Some(refused) = access.and_then(|access| access.change_refusal(&change)) {
+            return Err(SqlFault::Driver(refused));
+        }
         return match apply_metastore_change(&mut catalog.lock(), &catalog_id, &change, now) {
             Ok(()) => Ok(StatementAnswer::Applied),
             Err(failure) => Err(SqlFault::Driver(failure)),
@@ -125,6 +133,15 @@ pub(super) fn run_statement(
     }
     if !reads_only(statement) {
         return Err(SqlFault::NotPerformed);
+    }
+    if let Some(access) = access {
+        // Every table the read resolves, in the order the client resolves them: the first one
+        // the role may not read is where the client stops.
+        for reference in statement_tables(statement, database) {
+            if let Some(refused) = access.table_refusal(&reference) {
+                return Err(SqlFault::Driver(refused));
+            }
+        }
     }
     answer_query(catalog, &catalog_id, objects, statement, database)
 }

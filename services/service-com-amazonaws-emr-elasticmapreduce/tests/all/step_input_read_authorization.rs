@@ -180,7 +180,16 @@ async fn object(router: &MultiServiceRouter, key: &str) -> Option<String> {
 }
 
 /// One awsQuery IAM call of a row's setup, which must be served.
-async fn iam_ok(router: &MultiServiceRouter, case: &str, action: &str, params: &[(&str, String)]) {
+///
+/// `pub(crate)` because the catalog-authorization suite builds its instance profiles the same
+/// way (`crate::step_catalog_authorization`): the fixtures of this crate's tests are one
+/// binary, so one reading of an IAM call serves both rather than a copy each.
+pub(crate) async fn iam_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    action: &str,
+    params: &[(&str, String)],
+) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -212,8 +221,8 @@ async fn iam_ok(router: &MultiServiceRouter, case: &str, action: &str, params: &
 }
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC 3986's
-/// unreserved characters literal.
-fn form_encoded(value: &str) -> String {
+/// unreserved characters literal. `pub(crate)` for the reason [`iam_ok`] is.
+pub(crate) fn form_encoded(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -228,7 +237,8 @@ fn form_encoded(value: &str) -> String {
 
 /// The trust policy every fixture role carries: an instance obtains a credential for its
 /// profile's role only where that role admits the Amazon EC2 service principal.
-fn trust_policy() -> String {
+/// `pub(crate)` for the reason [`iam_ok`] is.
+pub(crate) fn trust_policy() -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -240,13 +250,15 @@ fn trust_policy() -> String {
     .to_string()
 }
 
-/// One identity-policy document holding `statements`.
-fn policy(statements: Vec<Value>) -> String {
+/// One identity-policy document holding `statements`. `pub(crate)` for the reason [`iam_ok`]
+/// is.
+pub(crate) fn policy(statements: Vec<Value>) -> String {
     json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
 }
 
-/// A statement of `effect` over `action` and `resource`.
-fn statement(effect: &str, action: &str, resource: Value) -> Value {
+/// A statement of `effect` over `action` and `resource`. `pub(crate)` for the reason
+/// [`iam_ok`] is.
+pub(crate) fn statement(effect: &str, action: &str, resource: Value) -> Value {
     json!({ "Effect": effect, "Action": action, "Resource": resource })
 }
 
