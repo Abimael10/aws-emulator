@@ -83,9 +83,9 @@ const BAD_REQUEST_MESSAGE: &str = "Bad Request";
 /// The header AppConfig's own api binds `Configuration$ConfigurationVersion` onto.
 const CONFIGURATION_VERSION_HEADER: &str = "configuration-version";
 
-/// The reserved data-plane path segments an api's endpoint is published under on the address
-/// this emulator serves that plane at: `/_aws/execute-api/{api-id}`.
-const LOCAL_MARKER: &str = "_aws/execute-api";
+/// The labels an api's endpoint is published under on the address this emulator serves that
+/// plane at: `{api-id}.execute-api.{region}.{zone}`, the api's own `execute-api` host.
+const ENDPOINT_LABEL: &str = "execute-api";
 
 /// The state AppConfig reports for a deployment that has finished rolling out, and the longest
 /// a poll waits for one to reach it.
@@ -1453,8 +1453,8 @@ async fn every_field_of_an_answer_at_the_published_endpoint_carries_its_canonica
         .map(|(authority, path)| (authority.to_string(), format!("/{path}")))
         .unwrap_or_else(|| (announced.clone(), String::new()));
     // The api is published on an address of its own DATA PLANE rather than on the endpoint the
-    // control call reached, and the api it serves is named by the path it was announced
-    // under — the addressing every reader of that value places an api by.
+    // control call reached, and the api it serves is named by the leading labels of the host it
+    // was announced under — the addressing every reader of that value places an api by.
     let front_door = endpoint
         .split_once("://")
         .map_or(endpoint.as_str(), |(_scheme, rest)| rest)
@@ -1466,9 +1466,19 @@ async fn every_field_of_an_answer_at_the_published_endpoint_carries_its_canonica
          {announced:?}"
     );
     assert_eq!(
-        base_path,
-        format!("/{LOCAL_MARKER}/{api_id}"),
-        "case {case:?}: expected the announced path to name the api, got {announced:?}"
+        authority
+            .rsplit_once(':')
+            .map_or(authority.as_str(), |(host, _port)| host)
+            .split('.')
+            .take(2)
+            .collect::<Vec<&str>>(),
+        vec![api_id.as_str(), ENDPOINT_LABEL],
+        "case {case:?}: expected the announced host to name the api, got {announced:?}"
+    );
+    assert_eq!(
+        base_path, "",
+        "case {case:?}: expected the announced endpoint to carry no path of its own, got \
+         {announced:?}"
     );
 
     for (row, deployed) in rows.iter().zip(&deployed) {

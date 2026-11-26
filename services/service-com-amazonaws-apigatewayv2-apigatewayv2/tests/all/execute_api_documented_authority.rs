@@ -13,9 +13,9 @@
 //! > emulator serves that plane on, so a client that resolves that name to this emulator and
 //! > appends `/{stageName}/{routePath}` reaches the api's route. An authority whose leading
 //! > label names no api of the account reaches no api, and the `execute-api` endpoint space
-//! > answers it itself; so does one that names the api in a zone AWS does not publish it in,
-//! > because no resolver but AWS's answers for the zone it does, and a name any other
-//! > resolver could point at this address is the one the core's `Host` allowlist refuses.
+//! > answers it itself; so does one that names the api in a zone neither AWS publishes it in
+//! > nor this emulator announces it in, because a name any other resolver could point at this
+//! > address is the one the core's `Host` allowlist refuses.
 //!
 //! The rows span what the rule generalises over: the address the request is made to (the
 //! `host:port` the api's own data-plane socket is published at, and this emulator's own front
@@ -23,15 +23,16 @@
 //! whether the client wrote the port it connected on, the stage the path names (the reserved
 //! `$default` stage that serves the api's root, and a named one), and the authorities that
 //! reach no api (an api id the account does not hold, a host that is no `execute-api` endpoint
-//! at all, the api's name in a zone AWS does not publish it in — which only somebody else's
-//! resolver could point at this address — and a path that would resolve out of the api); and
+//! at all, the api's name in a zone neither AWS publishes it in nor this emulator announces it
+//! in — which only somebody else's resolver could point at this address — and a path that
+//! would resolve out of the api); and
 //! the operation that MINTED the api (`CreateApi`, `ImportApi`, `ReimportApi`).
 //!
 //! What an api's endpoint member ANNOUNCES is a different question — an announced address is
 //! one the caller DIALS, so it is an address OF THIS EMULATOR
 //! (`http_api_published_invoke_address`, `api_endpoint_documented_form`) — and this suite
-//! asserts only that the published address serves the documented addressing as well, which is
-//! what a client that resolves the documented name needs.
+//! asserts that the published address serves the documented addressing in AWS's own zone as
+//! well, which is what a client that resolves the documented name needs.
 
 use std::sync::Arc;
 
@@ -210,11 +211,18 @@ async fn the_published_address_serves_the_documented_execute_api_authority() {
     let deployed = deployed_api(&emulator, case, "documented-authority").await;
     let (authority, published_path) = announced_parts(&deployed.api_endpoint);
 
-    // The published address is an address OF THIS EMULATOR: a client dials it as it stands.
-    assert!(
-        authority.starts_with("127.0.0.1:") || authority.starts_with("localhost:"),
-        "case {case:?}: the published endpoint must name an address of this emulator, got \
-         {:?}",
+    // The published address is an address OF THIS EMULATOR: the api's own `execute-api` host
+    // in the zone RFC 6761 reserves for the loopback interface this emulator's listeners are
+    // bound on, carrying the port the socket landed on, so a client dials it as it stands.
+    assert_eq!(
+        authority,
+        format!(
+            "{}.execute-api.{REGION}.localhost:{}",
+            deployed.api_id,
+            crate::published_invoke_socket_front_door::dialable_port(case, &authority)
+        ),
+        "case {case:?}: the published endpoint must name the api on an address of this \
+         emulator, got {:?}",
         deployed.api_endpoint
     );
 
@@ -257,8 +265,17 @@ async fn the_published_address_serves_the_documented_execute_api_authority() {
             FORBIDDEN,
         ),
         (
+            // The loopback zone is the one this emulator ANNOUNCES the api's endpoint in:
+            // RFC 6761 reserves it and every name under it for the loopback interface the
+            // core binds on, so no resolver somebody else controls can point it here either.
             "the same api named in the loopback zone".to_string(),
             format!("{api}.execute-api.{REGION}.localhost"),
+            ROUTE_PATH.to_string(),
+            SERVED,
+        ),
+        (
+            "the same api named deeper inside the loopback zone".to_string(),
+            format!("{api}.execute-api.{REGION}.sub.localhost"),
             ROUTE_PATH.to_string(),
             FORBIDDEN,
         ),
@@ -509,13 +526,19 @@ async fn the_published_endpoint_is_the_one_every_reader_reports() {
         deployed.api_id,
         "case {case:?}: GetApi must report the api the create minted, got {fetched}"
     );
-    // And the value is a URL with an authority a client can dial and the api named in it,
-    // which is what makes the documented addressing above reachable at all.
+    // And the value is a URL with an authority a client can dial that NAMES the api in its
+    // leading label, which is what makes the documented addressing above reachable at all.
     let (authority, path) = announced_parts(&deployed.api_endpoint);
     assert!(
-        authority.contains(':') && path.contains(&deployed.api_id),
+        authority.starts_with(&format!("{}.", deployed.api_id)) && authority.contains(':'),
         "case {case:?}: the published endpoint must name the api on an address this emulator \
          answers on, got {:?}",
+        deployed.api_endpoint
+    );
+    assert_eq!(
+        path, "",
+        "case {case:?}: the published endpoint carries no path of its own, so appending the \
+         stage name to it is the whole invoke path, got {:?}",
         deployed.api_endpoint
     );
 }

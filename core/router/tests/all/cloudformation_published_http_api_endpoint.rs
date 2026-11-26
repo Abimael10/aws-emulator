@@ -3,17 +3,17 @@
 //! The invoke address a CloudFormation stack PUBLISHES for the HTTP api it deployed, and what
 //! a client that dials exactly that address is served.
 //!
-//! RULE: **an api's `ApiEndpoint` is an address THIS emulator serves that api's data plane at,
-//! whichever request minted the api — so the value a stack publishes through
-//! `Fn::GetAtt <api>.ApiEndpoint` is the one API Gateway v2 really minted (the address this
-//! emulator opens for that plane, with the api behind the reserved data-plane path, for an
-//! emulator served on a port, and the api's own `{api-id}.execute-api.{region}.amazonaws.com`
-//! host, which the front door claims as well, for one served on no port), it is what every later
-//! reporter of the api reports, and the invoke URL a client builds from it (that value with the
-//! stage name appended, the reserved stage that serves the api's root being reached with no
-//! stage segment at all) resolves to the route's own integration. An api whose
-//! `DisableExecuteApiEndpoint` is set publishes the same address and serves nothing of the api
-//! on it.**
+//! RULE: **an api's `ApiEndpoint` is the api's OWN `execute-api` host — its id, the
+//! `execute-api` label and its Region as the leading labels — on an address THIS emulator serves
+//! that api's data plane at, whichever request minted the api. So the value a stack publishes
+//! through `Fn::GetAtt <api>.ApiEndpoint` is the one API Gateway v2 really minted (that host in
+//! the zone that leads back to this emulator, on the port it opens for that plane, for an
+//! emulator served on a port, and that host in the zone AWS publishes it in, which the front
+//! door claims as well, for one served on no port), it is what every later reporter of the api
+//! reports, and the invoke URL a client builds from it (that value with the stage name appended,
+//! the reserved stage that serves the api's root being reached with no stage segment at all)
+//! resolves to the route's own integration. An api whose `DisableExecuteApiEndpoint` is set
+//! publishes the same address and serves nothing of the api on it.**
 //!
 //! `Api$ApiEndpoint` is "the URI of the API, of the form
 //! `{api-id}.execute-api.{region}.amazonaws.com`. The stage name is typically appended to this
@@ -71,8 +71,7 @@ use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
 // suite that owns the reading of a default endpoint that serves nothing.
 use crate::cloudformation_http_api_disabled_default_endpoint::{
     apigatewayv2, apigatewayv2_at, assert_serves_its_route, assert_serves_nothing, cloudformation,
-    emulator as assembled_emulator, request, Answered, CREATE_COMPLETE, LOCAL_ENDPOINT_PREFIX,
-    REGION,
+    emulator as assembled_emulator, request, Answered, CREATE_COMPLETE, REGION,
 };
 use crate::query_wire::outputs_of;
 
@@ -314,13 +313,14 @@ fn emulator(served_base: Option<&str>) -> MultiServiceRouter {
 }
 
 /// The authority and base path an api of `api_id` must be published on, for an emulator served
-/// at `served_base`: a loopback address of the SOCKET this emulator publishes an api's data
-/// plane on, with the api behind the reserved data-plane path — whose port this suite cannot
-/// predict, so the authority is left for [`assert_dialable_authority`] — and, for an emulator
-/// served on no port at all, the api's own documented `execute-api` host.
+/// at `served_base`: the api's OWN `execute-api` host — its id, the endpoint label and its
+/// Region as the leading labels — in the zone that leads back to this emulator, on the port of
+/// the SOCKET this emulator publishes an api's data plane on, whose port this suite cannot
+/// predict, so the authority is left for [`assert_published_host`]; and, for an emulator served
+/// on no port at all, that same host in the zone AWS publishes it in, carrying no port.
 fn expected_published_parts(served_base: Option<&str>, api_id: &str) -> (Option<String>, String) {
     match served_base {
-        Some(_base) => (None, format!("{LOCAL_ENDPOINT_PREFIX}/{api_id}")),
+        Some(_base) => (None, String::new()),
         None => (
             Some(format!("{api_id}.execute-api.{REGION}.amazonaws.com")),
             String::new(),
@@ -328,12 +328,13 @@ fn expected_published_parts(served_base: Option<&str>, api_id: &str) -> (Option<
     }
 }
 
-/// Assert `authority` is an address ON THIS MACHINE a client can dial: a loopback host with a
-/// port, which is what every address this emulator opens for a data plane of its own is.
+/// Assert `authority` is the address this emulator publishes the api of `api_id` at: the api's
+/// own `execute-api` host in the zone RFC 6761 reserves for the loopback interface this
+/// emulator's listeners are bound on, carrying a port a client can dial.
 ///
 /// The PORT is the core's to choose, so it is not predicted here; that the address is one this
 /// emulator answers the api on is read by the invoke that follows.
-fn assert_dialable_authority(case: &str, authority: &str) {
+fn assert_published_host(case: &str, api_id: &str, authority: &str) {
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host, port),
         None => panic!("case {case:?}: expected a published host:port, got {authority:?}"),
@@ -342,11 +343,17 @@ fn assert_dialable_authority(case: &str, authority: &str) {
         port.parse::<u16>().is_ok_and(|port| port > 0),
         "case {case:?}: expected a port a client can dial, got {authority:?}"
     );
-    assert!(
-        ::emulator_server::is_loopback_host(host.trim_start_matches('[').trim_end_matches(']')),
-        "case {case:?}: expected an address on this machine, got {authority:?}"
+    assert_eq!(
+        host,
+        format!("{api_id}.execute-api.{REGION}.{ANNOUNCED_ZONE}"),
+        "case {case:?}: expected the api's own execute-api host in the zone that leads back to \
+         this emulator, got {authority:?}"
     );
 }
+
+/// The zone this emulator writes a name of its own in: RFC 6761 reserves `localhost` and every
+/// name under it for the loopback interface the core binds its listeners on.
+const ANNOUNCED_ZONE: &str = "localhost";
 
 /// One output of the settled stack, which every api of the table publishes two of.
 fn output(case: &str, outputs: &BTreeMap<String, String>, key: &str) -> String {
@@ -423,7 +430,7 @@ async fn assert_row(row: &Row) {
                 "case {case:?}: the stack must publish the api on {expected_authority}, got \
                  {published:?}"
             ),
-            None => assert_dialable_authority(&case, &authority),
+            None => assert_published_host(&case, &api_id, &authority),
         }
         assert_eq!(
             base_path, expected_base_path,

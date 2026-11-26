@@ -4606,7 +4606,28 @@ pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> 
 /// addressed under this host — at any address this emulator serves the plane on — is served
 /// as the api it names (`crate::service::invoke`, `crate::service::invoke_plane_socket`).
 pub fn execute_api_host(api_id: &str, region: &str) -> String {
-    format!("{api_id}.{EXECUTE_API_LABEL}.{region}.{EXECUTE_API_DNS_ZONE}")
+    execute_api_host_in_zone(api_id, region, EXECUTE_API_DNS_ZONE)
+}
+
+/// The default execute-api host of an api written over `zone`: the api's own id, the
+/// [`EXECUTE_API_LABEL`] label and the api's Region as the three leading labels, then the
+/// zone the name is published in — `{api-id}.execute-api.{region}.{zone}`.
+///
+/// The ONE place that spells the LAYOUT `Api$ApiEndpoint` documents ("The URI of the API, of
+/// the form `{api-id}.execute-api.{region}.amazonaws.com`"), so every host this service
+/// publishes for an api carries the api in its first label, the endpoint label behind it and
+/// the Region behind that, whichever zone it is written in: that layout is what lets a client
+/// recover the api's identity and Region from the address it was given, and it is the layout
+/// the data planes read a host back by (`crate::service::data_plane::api_id_of_host`).
+///
+/// WHICH zone the name is written in is the caller's to say: AWS's own
+/// ([`EXECUTE_API_DNS_ZONE`]) for the name AWS itself answers for ([`execute_api_host`]), and
+/// the zone this emulator may announce a name of its own in for the address an api is
+/// ANNOUNCED at ([`invoke_plane_transport::announced_endpoint`], which folds each label it
+/// fills in to one DNS label first, so no value a request carried can make an announced
+/// address name an authority the caller chose).
+pub fn execute_api_host_in_zone(api_id: &str, region: &str, zone: &str) -> String {
+    format!("{api_id}.{EXECUTE_API_LABEL}.{region}.{zone}")
 }
 
 /// The DNS zone AWS publishes an `execute-api` endpoint in —
@@ -4614,6 +4635,25 @@ pub fn execute_api_host(api_id: &str, region: &str) -> String {
 /// host AWS itself would answer for sits in, and never one this emulator may announce a name
 /// of its own in.
 pub const EXECUTE_API_DNS_ZONE: &str = "amazonaws.com";
+
+/// Whether `zone` is a zone an api's own `execute-api` host is SERVED under here: the zone
+/// AWS publishes that endpoint in ([`EXECUTE_API_DNS_ZONE`]), and the loopback zone RFC 6761
+/// reserves for the interface the core binds its listeners on
+/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`), which is the zone this emulator
+/// ANNOUNCES an api's endpoint in ([`invoke_plane_transport::announced_endpoint`]).
+///
+/// The two zones a name of this form can only lead back to: AWS answers for one and nobody
+/// else may, and the other is reserved against resolution anywhere but the loopback
+/// interface, so no resolver somebody else controls can point either at this machine. A name
+/// in any other zone is one only such a resolver could place here, which is the rebinding the
+/// core's own `Host` allowlist exists to refuse, so this admits none
+/// (`crate::service::invoke_plane_socket`).
+///
+/// A DNS name is case-insensitive (RFC 4343), so the comparison is.
+pub fn serves_execute_api_zone(zone: &str) -> bool {
+    zone.eq_ignore_ascii_case(EXECUTE_API_DNS_ZONE)
+        || zone.eq_ignore_ascii_case(::service_common::data_plane_addressing::LOOPBACK_ZONE)
+}
 
 /// The address THIS EMULATOR serves an api's data plane at, which is what an api ANNOUNCES
 /// for a caller to invoke it at — `Api$ApiEndpoint` included.

@@ -236,9 +236,9 @@ fn grant(emulator: &Started, name: &str, api_id: &str) {
 /// connection is MADE to, the `Host` the request carries, and the base path ahead of the stage.
 struct Addressing {
     case: &'static str,
-    /// The authority dialled — for the address the api itself published, the authority of that
-    /// value, which is a listener of this emulator's own and not the address the harness knows
-    /// it by.
+    /// The authority dialled — for the address the api itself published, the loopback interface
+    /// that address's name resolves to on the port it names, which is a listener of this
+    /// emulator's own and not the address the harness knows it by.
     dialled: String,
     host: String,
     base_path: String,
@@ -246,9 +246,13 @@ struct Addressing {
 
 /// Both addressings a client reaches an HTTP api's data plane at:
 ///
-/// * the endpoint the api itself ANNOUNCED (`Api$ApiEndpoint`), DIALLED as published — the one
-///   value a client of a deployed api is handed, which on an emulator served on a port is an
-///   address of this emulator's own with the api behind the reserved data-plane path;
+/// * the endpoint the api itself ANNOUNCED (`Api$ApiEndpoint`) — the one value a client of a
+///   deployed api is handed, which on an emulator served on a port is the api's own
+///   `execute-api` host in the zone RFC 6761 reserves for the loopback interface this
+///   emulator's listeners are bound on, on the port its data plane is served at. The
+///   connection is made to that interface, which is where the name resolves, and the published
+///   authority is what the request NAMES — the address is the api's and the interface is this
+///   emulator's;
 /// * the api's own documented `execute-api` host
 ///   (`{api-id}.execute-api.{region}.amazonaws.com`) at this emulator's front door, which is
 ///   the addressing a client that resolves AWS's own names uses.
@@ -258,10 +262,14 @@ fn addressings(emulator: &Started, api_id: &str, announced: &str) -> Vec<Address
     // ([`announced_parts`]), so this suite takes it rather than writing a second one.
     let (authority, base_path) = announced_parts(announced);
     let base_path = base_path.trim_end_matches('/').to_string();
+    let port = authority
+        .rsplit_once(':')
+        .map(|(_host, port)| port.to_string())
+        .unwrap_or_default();
     vec![
         Addressing {
-            case: "the endpoint the api announced, dialled as published",
-            dialled: authority.clone(),
+            case: "the endpoint the api announced, named as published",
+            dialled: format!("127.0.0.1:{port}"),
             host: authority,
             base_path,
         },
@@ -274,13 +282,19 @@ fn addressings(emulator: &Started, api_id: &str, announced: &str) -> Vec<Address
     ]
 }
 
-/// Assert the endpoint an api announced is an address of this emulator's OWN, which is what
-/// makes the first addressing above dialable at all. Read once, before the rows run.
-fn assert_announced_is_this_emulators(announced: &str) {
+/// Assert the endpoint an api announced is the api's OWN `execute-api` host in the zone RFC
+/// 6761 reserves for the loopback interface this emulator's listeners are bound on, carrying
+/// the port the socket it is served on landed on — which is what makes the first addressing
+/// above both the documented form and dialable at all. Read once, before the rows run.
+fn assert_announced_is_this_emulators(api_id: &str, announced: &str) {
     let (authority, _base_path) = announced_parts(announced);
+    let (host, port) = authority.rsplit_once(':').unwrap_or((authority.as_str(), ""));
     assert!(
-        announced.starts_with("https://") && authority.starts_with("127.0.0.1:"),
-        "setup: an api must announce an address of this emulator's own, got {announced:?}"
+        announced.starts_with("https://")
+            && host == format!("{api_id}.execute-api.{REGION}.localhost")
+            && port.parse::<u16>().is_ok(),
+        "setup: an api must announce its own execute-api host on an address of this emulator's \
+         own, got {announced:?}"
     );
 }
 
@@ -401,7 +415,7 @@ fn a_started_emulator_serves_a_pinned_stage_its_own_deployments_snapshot() {
     );
     let api_id = as_str("CreateApi", &api, "apiId");
     let announced = as_str("CreateApi", &api, "apiEndpoint");
-    assert_announced_is_this_emulators(&announced);
+    assert_announced_is_this_emulators(&api_id, &announced);
     grant(&emulator, FIRST_FUNCTION, &api_id);
     grant(&emulator, SECOND_FUNCTION, &api_id);
     let integration = apigatewayv2(

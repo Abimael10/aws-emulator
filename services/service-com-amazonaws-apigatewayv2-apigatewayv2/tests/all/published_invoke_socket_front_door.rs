@@ -152,12 +152,7 @@ pub(crate) async fn request(
     host: &str,
     headers: &[(&str, &str)],
 ) -> Answered {
-    let port = authority
-        .parse::<std::net::SocketAddr>()
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: the published address {authority:?} is no address: {error}")
-        })
-        .port();
+    let port = dialable_port(case, authority);
     let mut stream = tokio::time::timeout(
         ANSWER_DEADLINE,
         TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
@@ -198,6 +193,26 @@ pub(crate) async fn request(
         headers,
         body: body.to_string(),
     }
+}
+
+/// The PORT a client dials `authority` on: the port the published authority names, which is
+/// the one the socket this plane is published on landed on.
+///
+/// A published authority is a NAME and a port (`{api-id}.execute-api.{region}.localhost:{port}`,
+/// [`announced_parts`]) rather than an address literal, and the name is in the zone RFC 6761
+/// reserves for the loopback interface the core binds on — so a client resolving it reaches
+/// this machine, and the connection below is opened on that interface. Resolving it is the
+/// resolver's job and not this test's, which is why the port is read off the authority here.
+///
+/// `pub(crate)`: the suites that drive this address read the port off a published authority the
+/// same way.
+pub(crate) fn dialable_port(case: &str, authority: &str) -> u16 {
+    authority
+        .rsplit_once(':')
+        .and_then(|(_host, port)| port.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the published address {authority:?} names no port to dial")
+        })
 }
 
 /// [`request`], as a plain `GET path` at the published address with nothing else sent.
@@ -341,8 +356,11 @@ pub(crate) fn member(case: &str, answer: &Value, name: &str) -> String {
 }
 
 /// The authority and base path a client builds the invoke URL from, asserted to be the address
-/// this emulator publishes an api's data plane at: a loopback socket it can dial, with the api
-/// behind the reserved data-plane path.
+/// this emulator publishes an api's data plane at: the api's OWN `execute-api` host — its id,
+/// the endpoint label and its Region as the three leading labels, the form `Api$ApiEndpoint`
+/// documents — in the zone RFC 6761 reserves for the loopback interface this emulator's
+/// listeners are bound on, carrying the port the socket landed on and no path of its own, so
+/// appending the stage name to it is the complete path to a deployed stage.
 pub(crate) fn announced_parts(case: &str, api_id: &str, announced: &str) -> (String, String) {
     let rest = announced.strip_prefix("https://").unwrap_or_else(|| {
         panic!("case {case:?}: an HTTP api must announce an https endpoint, got {announced:?}")
@@ -351,15 +369,31 @@ pub(crate) fn announced_parts(case: &str, api_id: &str, announced: &str) -> (Str
         Some(at) => (rest[..at].to_string(), rest[at..].to_string()),
         None => (rest.to_string(), String::new()),
     };
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority.as_str(), |(host, _port)| host);
+    assert_eq!(
+        host.split('.').take(3).collect::<Vec<&str>>(),
+        vec![api_id, "execute-api", REGION],
+        "case {case:?}: expected the api, the endpoint label and the Region as the leading host \
+         labels, got {announced:?}"
+    );
+    assert_eq!(
+        host.split('.').skip(3).collect::<Vec<&str>>(),
+        vec!["localhost"],
+        "case {case:?}: expected the published host in the zone that leads back to this \
+         emulator, got {announced:?}"
+    );
     assert!(
-        authority.parse::<std::net::SocketAddr>().is_ok(),
+        authority.rsplit_once(':').is_some_and(|(_host, port)| port
+            .parse::<u16>()
+            .is_ok_and(|port| port != 0)),
         "case {case:?}: a served emulator must announce an address a client can dial, got \
          {announced:?}"
     );
     assert_eq!(
-        base,
-        format!("/_aws/execute-api/{api_id}"),
-        "case {case:?}: expected the api behind the reserved data-plane path, got {announced:?}"
+        base, "",
+        "case {case:?}: expected an announced endpoint with no path of its own, got {announced:?}"
     );
     (authority, base)
 }
@@ -436,12 +470,19 @@ async fn a_disabled_default_endpoint_refuses_at_the_address_it_published() {
         stage,
     )
     .await;
-    // One socket serves the account's apis, each behind its own id, so both addresses are the
-    // same authority.
-    assert_eq!(
+    // One socket serves the account's apis, each under its own `execute-api` host, so the two
+    // addresses differ in the api each names and are dialled on the one port.
+    assert_ne!(
         target.authority, twin.authority,
-        "case {case:?}: expected both apis published on one address, got {} and {}",
-        target.authority, twin.authority
+        "case {case:?}: expected each api published under its own host, got {} for both",
+        target.authority
+    );
+    assert_eq!(
+        dialable_port(case, &target.authority),
+        dialable_port(case, &twin.authority),
+        "case {case:?}: expected both apis published on one socket, got {} and {}",
+        target.authority,
+        twin.authority
     );
 
     // Both apis are served by the function to begin with, in every form a client builds the

@@ -267,9 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // scheme — the same value `CreateApi` reports for an HTTP api: the address
             // this emulator serves the api id this import minted at.
             api_endpoint: match published_plane.as_deref() {
-                Some(authority) => {
-                    crate::state::invoke_plane_transport::announced_endpoint(authority, &api_id)
-                }
+                Some(authority) => crate::state::invoke_plane_transport::announced_endpoint(
+                    authority, &api_id, &region,
+                ),
                 None => crate::state::emulator_served_api_endpoint(
                     &api_id,
                     &region,
