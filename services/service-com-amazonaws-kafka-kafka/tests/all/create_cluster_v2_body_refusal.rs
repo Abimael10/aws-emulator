@@ -4,14 +4,15 @@
 //! its place in the order of decisions.
 //!
 //! The rule under test: the two cluster-type members are ALTERNATIVES, so a `CreateClusterV2`
-//! body naming BOTH asks for two clusters at once and cannot be read as a create of either
-//! kind: it is refused on the BODY — HTTP 400 `BadRequestException` carrying the service's
-//! invalid-body sentence, with NO
+//! body naming BOTH is refused on the SELECTION — HTTP 400 `BadRequestException` with NO
 //! `invalidParameter`, because either member would have fixed the request and no single one is
-//! at fault. That decision is taken on the SELECTION alone, so it comes BEFORE every decision
-//! taken on a member's value or on the registry: a body naming both kinds reads the same
-//! sentence whether one of the blocks would itself have been refused and whether the cluster
-//! name is one the account already holds.
+//! at fault — and the sentence it carries is decided by the two blocks alone: two blocks the
+//! service would each have built a cluster from state two creates at once, which reads the
+//! mutual-exclusion sentence, while a block the service would NOT have built leaves a body
+//! that reads as a create of neither kind, which is the invalid-body sentence. That decision
+//! is taken on the request alone, so it comes BEFORE every decision taken on the registry: a
+//! body naming both kinds reads the same sentence whether or not the cluster name is one the
+//! account already holds.
 //!
 //! The two neighbouring classes are driven alongside it, so what the rows pin is the class
 //! and not the operation: a body naming NEITHER kind names no cluster type and is refused
@@ -26,7 +27,7 @@
 //! unsupported `KafkaVersion`, a broker type the service does not offer, a serverless block
 //! naming no VPC configuration) and whether the name is free or already taken.
 //!
-//! The other half of the rule — that the sentence is FIXED TEXT, identical for every such
+//! The other half of the rule — that each sentence is FIXED TEXT, identical for every such
 //! body and carrying no part of the request — is driven by
 //! `create_cluster_v2_invalid_body_message`, which reuses the bodies and the assertion this
 //! suite exports.
@@ -36,11 +37,18 @@ use serde_json::{json, Value};
 use crate::kafka_harness::{assert_name_already_exists, Emulator, Reply};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
 
-/// MSK's sentence for a create whose body names both cluster types, written out here rather
-/// than read from the service's own constant, so the wording is pinned by this suite instead
-/// of by the code under test: the two members are ALTERNATIVES, so such a body asks for two
-/// clusters at once and the service reports the BODY as invalid, naming neither member.
-const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+/// MSK's sentence for a create whose body names both cluster types with two blocks the service
+/// would each have built a cluster from, written out here rather than read from the service's
+/// own constant, so the wording is pinned by this suite instead of by the code under test: the
+/// two members are ALTERNATIVES, so such a body asks for two clusters at once and the service
+/// states the rule rather than naming either member.
+pub(crate) const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
+
+/// MSK's sentence for a create naming both cluster types whose body it cannot read as a create
+/// of either kind — one of the two blocks is not one the service would have built — written
+/// out here for the same reason.
+pub(crate) const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// MSK's fixed sentence for a create that names NO cluster type, and the parameter it blames.
 const NO_CLUSTER_TYPE_MESSAGE: &str =
@@ -72,11 +80,11 @@ pub(crate) fn serverless(configurations: usize) -> Value {
     })
 }
 
-/// The bodies that name both cluster types: how the case is named and the body itself, under
-/// the cluster name the caller supplies. The rows vary what the two blocks say — including
-/// whether a named block would itself have been refused, which the selection refusal is taken
-/// ahead of.
-pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
+/// The bodies that name both cluster types: how the case is named, the body itself under the
+/// cluster name the caller supplies, and the sentence the selection refusal carries for it.
+/// The rows vary what the two blocks say — including whether a named block is one the service
+/// would itself have refused, which is what decides between the two sentences.
+pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value, &'static str)> {
     vec![
         (
             "a minimal block of each kind",
@@ -85,6 +93,7 @@ pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
                 "provisioned": provisioned(OFFERED_VERSION, 1),
                 "serverless": serverless(1),
             }),
+            ONE_CLUSTER_TYPE_MESSAGE,
         ),
         (
             "larger blocks, with tags",
@@ -94,6 +103,7 @@ pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
                 "provisioned": provisioned("3.9.x", 6),
                 "serverless": serverless(3),
             }),
+            ONE_CLUSTER_TYPE_MESSAGE,
         ),
         (
             "a provisioned block naming broker software the service does not offer",
@@ -102,6 +112,7 @@ pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
                 "provisioned": provisioned("0.0.0-not-a-version", 2),
                 "serverless": serverless(1),
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
         (
             "a serverless block naming no VPC configuration",
@@ -110,6 +121,7 @@ pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
                 "provisioned": provisioned(OFFERED_VERSION, 2),
                 "serverless": { "vpcConfigs": [] },
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
         (
             "a provisioned block naming a broker type the service does not offer",
@@ -125,6 +137,7 @@ pub(crate) fn both_cluster_type_rows(name: &str) -> Vec<(&'static str, Value)> {
                 },
                 "serverless": serverless(1),
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
     ]
 }
@@ -144,20 +157,19 @@ fn both_kinds_outside_a_modelled_bound(name: &str) -> Value {
     })
 }
 
-/// Assert `reply` is the SELECTION refusal: MSK's sentence for a body that names two cluster
-/// types, HTTP 400 `BadRequestException`, and no member named.
-pub(crate) fn assert_invalid_request_body(reply: &Reply, case: &str) {
+/// Assert `reply` is the SELECTION refusal carrying `expected`: HTTP 400
+/// `BadRequestException`, that sentence as the WHOLE message, and no member named.
+pub(crate) fn assert_selection_refusal(reply: &Reply, case: &str, expected: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
-        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
-        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, \
-         got {} {}",
+        (400, "BadRequestException", expected),
+        "case {case}: expected a 400 BadRequestException {expected:?}, got {} {}",
         reply.status,
         reply.body
     );
     assert!(
         reply.at("/invalidParameter").is_null(),
-        "case {case}: expected the body refusal to name no member, got {}",
+        "case {case}: expected the selection refusal to name no member, got {}",
         reply.body
     );
 }
@@ -188,15 +200,15 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
     listed_names_in(emulator, crate::kafka_harness::REGION).await
 }
 
-/// RULE: a body naming both cluster types is refused on the SELECTION, whatever the two blocks
-/// say — and the two neighbouring classes keep their own answers.
+/// RULE: a body naming both cluster types is refused on the SELECTION, in the sentence the two
+/// blocks decide — and the two neighbouring classes keep their own answers.
 #[tokio::test]
 async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
     let emulator = Emulator::new();
 
-    for (case, body) in both_cluster_type_rows("both-kinds-free") {
+    for (case, body, expected) in both_cluster_type_rows("both-kinds-free") {
         let reply = emulator.create_cluster_v2(body).await;
-        assert_invalid_request_body(&reply, case);
+        assert_selection_refusal(&reply, case, expected);
     }
 
     // A body naming NEITHER kind is the other class: a different sentence, and a member named.
@@ -218,9 +230,18 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
          got {}",
         reply.body
     );
+    for (which, other) in [
+        ("the mutual-exclusion sentence", ONE_CLUSTER_TYPE_MESSAGE),
+        ("the invalid-body sentence", INVALID_REQUEST_BODY_MESSAGE),
+    ] {
+        assert_ne!(
+            NO_CLUSTER_TYPE_MESSAGE, other,
+            "naming no cluster type and {which} must read different sentences"
+        );
+    }
     assert_ne!(
-        NO_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
-        "the two ways of getting the cluster type wrong must read different sentences"
+        ONE_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
+        "the two ways of naming both cluster types must read different sentences"
     );
 
     // A body the MODEL does not admit never reaches the decision above: a `numberOfBrokerNodes`
@@ -298,9 +319,9 @@ async fn the_body_refusal_precedes_the_registry() {
 
     // Both kinds under that same taken name: the selection decides, before the registry is
     // asked.
-    for (case, body) in both_cluster_type_rows(taken) {
+    for (case, body, expected) in both_cluster_type_rows(taken) {
         let reply = emulator.create_cluster_v2(body).await;
-        assert_invalid_request_body(&reply, case);
+        assert_selection_refusal(&reply, case, expected);
     }
 
     // The store still holds the one cluster the served create registered.

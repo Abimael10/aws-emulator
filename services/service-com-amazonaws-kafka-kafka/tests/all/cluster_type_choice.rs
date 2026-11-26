@@ -5,17 +5,17 @@
 //!
 //! The rule under test: a create carries EXACTLY ONE of the two alternative cluster-type
 //! bodies, and each way of failing that has its own fixed answer — a create naming NEITHER is
-//! refused about the `clusterType` parameter the request left unset, a create naming BOTH is
-//! refused on the BODY it sent, with no member named, in the service's sentence for a body it
-//! cannot read, because such a body asks for two clusters at once and either member would have
-//! fixed it. Neither registers anything.
+//! refused about the `clusterType` parameter the request left unset, while a create naming
+//! BOTH is refused on the SELECTION it made, with no member named: in the service's
+//! mutual-exclusion sentence where it would have built a cluster from each named block, and in
+//! its sentence for a body it cannot read where one of those blocks is one it would not have
+//! built. Neither registers anything.
 //!
 //! Where [`super::create_and_update_input_gates`] pins the WORDING, this suite pins that each
-//! answer is INVARIANT over a table of bodies that differ in everything the choice does not
-//! depend on: what else the body carries (nothing, tags, an empty tag set), what each named
-//! block says (broker count, how many VPC configurations) and whether a named block would
-//! itself have been refused. Every row of one group must read one answer, byte for byte, and
-//! the two groups must read different ones.
+//! answer is INVARIANT over a table of bodies that differ in everything that answer does not
+//! depend on: what else the body carries (nothing, tags, an empty tag set) and what each named
+//! block says (broker count, how many VPC configurations). Every row of one group must read one
+//! answer, byte for byte, and the three groups must read different ones.
 //!
 //! The admitted side is driven too: the same store serves a create naming ONE kind, each of
 //! the two, so what the rows assert is the choice and not the create.
@@ -29,9 +29,15 @@ use crate::kafka_harness::{Emulator, Reply};
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the service's sentence for a
-/// body it cannot read, the two members being alternatives rather than a pair, so a body
-/// naming both describes no one cluster.
+/// What MSK answers a create whose body names BOTH cluster types with two blocks it would each
+/// have built a cluster from: the service's sentence for the mutual exclusion of the two
+/// cluster types, which states the rule and names no member.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
+
+/// What MSK answers a create naming both cluster types one of whose blocks it would NOT have
+/// built a cluster from: the service's sentence for a body it cannot read as a create of
+/// either kind.
 const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// A `provisioned` block asking for `brokers` brokers.
@@ -77,10 +83,9 @@ fn no_cluster_type_rows() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Bodies that name BOTH cluster types, differing in what each block says — including whether
-/// a named block would itself have been refused, which the selection refusal is taken ahead
-/// of.
-fn both_cluster_types_rows() -> Vec<(&'static str, Value)> {
+/// Bodies that name BOTH cluster types with two blocks the service would each have built a
+/// cluster from, differing in what each block says.
+fn both_readable_blocks_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "one broker and one VPC configuration",
@@ -99,6 +104,13 @@ fn both_cluster_types_rows() -> Vec<(&'static str, Value)> {
                 "serverless": serverless(2),
             }),
         ),
+    ]
+}
+
+/// Bodies that name BOTH cluster types where ONE of the two blocks is one the service would
+/// not have built a cluster from, differing in which block that is and how it fails.
+fn a_block_the_service_would_refuse_rows() -> Vec<(&'static str, Value)> {
+    vec![
         (
             "a provisioned block that would itself have been refused",
             json!({
@@ -139,7 +151,7 @@ fn answered(reply: &Reply) -> (u16, String, String, Option<String>) {
 }
 
 /// RULE: each way of failing the cluster-type choice has ONE answer, invariant over the
-/// bodies that fail it that way — and the two answers differ.
+/// bodies that fail it that way — and the three answers differ.
 #[tokio::test]
 async fn each_failed_cluster_type_choice_reads_its_own_one_refusal() {
     let emulator = Emulator::new();
@@ -149,16 +161,28 @@ async fn each_failed_cluster_type_choice_reads_its_own_one_refusal() {
         NO_CLUSTER_TYPE_MESSAGE.to_string(),
         Some("clusterType".to_string()),
     );
-    let both_types = (
+    let both_readable = (
+        400u16,
+        "BadRequestException".to_string(),
+        ONE_CLUSTER_TYPE_MESSAGE.to_string(),
+        None,
+    );
+    let unreadable = (
         400u16,
         "BadRequestException".to_string(),
         INVALID_REQUEST_BODY_MESSAGE.to_string(),
         None,
     );
-    assert_ne!(
-        no_type, both_types,
-        "the two ways of failing the choice must be told apart"
-    );
+    for (left, right) in [
+        (&no_type, &both_readable),
+        (&no_type, &unreadable),
+        (&both_readable, &unreadable),
+    ] {
+        assert_ne!(
+            left, right,
+            "every way of failing the choice must be told apart"
+        );
+    }
 
     for (case, body) in no_cluster_type_rows() {
         let reply = emulator.create_cluster_v2(body).await;
@@ -171,13 +195,24 @@ async fn each_failed_cluster_type_choice_reads_its_own_one_refusal() {
             reply.body
         );
     }
-    for (case, body) in both_cluster_types_rows() {
+    for (case, body) in both_readable_blocks_rows() {
         let reply = emulator.create_cluster_v2(body).await;
         assert_eq!(
             answered(&reply),
-            both_types,
-            "case a body naming both cluster types, {case}: expected the selection refusal, got \
-             {} {}",
+            both_readable,
+            "case a body naming both cluster types with two readable blocks, {case}: expected \
+             the mutual-exclusion refusal, got {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+    for (case, body) in a_block_the_service_would_refuse_rows() {
+        let reply = emulator.create_cluster_v2(body).await;
+        assert_eq!(
+            answered(&reply),
+            unreadable,
+            "case a body naming both cluster types with a block the service would refuse, \
+             {case}: expected the invalid-body refusal, got {} {}",
             reply.status,
             reply.body
         );

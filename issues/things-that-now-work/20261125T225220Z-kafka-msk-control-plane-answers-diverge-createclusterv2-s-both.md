@@ -9,6 +9,52 @@ Issue-Commit: c18acb986501f04573c6e3384ceaad629e42cdcb
 
 # MSK control-plane answers diverge: CreateClusterV2's both-cluster-types refusal message is generic prose, and GetBootstrapBrokers advertises fewer distinct broker hosts than the cluster has broker nodes (2 causes)
 
+## Resolution
+
+Cause 1 is FIXED and its replay unit passes. `CreateClusterV2` now decides the SELECTION refusal
+from the two named blocks alone (`src/ops/create_cluster_v2.rs`): a body naming both cluster types
+whose two blocks are each one the service would have built a cluster of that kind from states two
+creates at once and is refused with MSK's mutual-exclusion sentence, while a body one of whose
+blocks the service would itself have refused states a create of neither kind and keeps the
+invalid-body sentence — the two recorded classes that the earlier fixed issues
+20261118T020526Z-kafka-msk-control-plane-refusals-createclusterv2-s-both-cluster.md (the
+behavioural one) and 20261117T050101Z-kafka-msk-createclusterv2-cluster-type-validation-refusal-carries-emulator.md
+(the wire one) each pin. Neither refusal names a member, neither reads the registry, and neither
+registers a cluster.
+
+Cause 2 is BLOCKED on the read-only core, and its replay unit still fails on the same assertion.
+
+What the cause asks for, and where each part stands:
+
+* per-broker IDENTITY — already implemented: every broker node of a provisioned cluster carries its
+  own MSK endpoint name (`src/state/broker_plane/addressing.rs`, `broker_endpoint_host`), which
+  `ListNodes` reports under `BrokerNodeInfo$Endpoints`, and the bootstrap string already carries one
+  `host:port` pair per broker node on the ACCESS METHOD's single shared port
+  (`src/state/broker_plane.rs`, `broker_authorities`).
+* per-broker ADDRESSING of the bootstrap string — BLOCKED. The check requires N DISTINCT hosts
+  sharing one port, each of them an address the responder really accepts on (the wire corpus refuses
+  a host the responder does not serve; see
+  20261121T133835Z-kafka-msk-getbootstrapbrokers-advertises-an-unserved-host-and-createcluster.md,
+  verdict `host_not_own`, which is why the per-broker `.localhost` names were withdrawn). The core
+  binds every resource listener on the ONE operator-chosen interface
+  (`vendor/server/src/listeners.rs:46` `bind_ip_from_env`, `:88` `bind_tokio`, `:230`
+  `tcp_plaintext`) at a port it assigns itself, and a socket bound on one address accepts
+  connections addressed to that address alone — so a second host beside the published one is an
+  address nothing answers at, and a service may not bind a socket or choose a port of its own
+  (`vendor/engine/src/lib.rs:21-32`). The core also drops the accepted connection's local address
+  (`vendor/server/src/listeners.rs:319` `let (stream, _peer) = ...`), handing `NativeHandler::serve`
+  the stream alone (`:136`), so even several hosts resolving to one socket could not be told apart
+  as different brokers. The same constraint blocks the rest of this check: MSK's open monitoring
+  serves the JMX exporter on the FIXED port 11001 and the node exporter on 11002 of each broker
+  host, and a service cannot ask the core for a particular port at all.
+  Required core change: let a service open a listener for a resource at an ALREADY-ASSIGNED port on
+  another loopback address (so a cluster's N broker nodes share one port across N distinct loopback
+  hosts), or accept on the whole loopback block and hand a native handler the local address each
+  accepted connection arrived on; and let a service request the documented fixed port a protocol
+  pins (11001/11002) for a per-broker surface. Then this cluster can publish one distinctly named,
+  dialable broker endpoint per broker node on one shared port, and serve each broker's exporters
+  there.
+
 > _Note: this issue was identified against the code base at commit `c18acb986501f04573c6e3384ceaad629e42cdcb`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

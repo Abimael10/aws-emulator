@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The SENTENCE `CreateClusterV2` refuses an unacceptable request BODY with is FIXED TEXT.
+//! The SENTENCE `CreateClusterV2` refuses a body naming BOTH cluster types with is FIXED TEXT.
 //!
 //! RULE under test: a refusal a service takes on the request BODY as a whole — here the
 //! cluster-type selection, which the API admits only one valid form of, the model declaring
 //! `provisioned` and `serverless` as two separate optional structures rather than a union —
-//! is answered with the service's ONE fixed sentence for that selection, naming no
+//! is answered with one of the service's FIXED sentences for that selection, naming no
 //! member and interpolating nothing of the request. So the answer is the identical string for
-//! every such body: no value the caller submitted and nothing the account already holds
-//! reaches it.
+//! every body of its class: no value the caller submitted and nothing the account already
+//! holds reaches it.
 //!
-//! The neighbouring suite `create_cluster_v2_body_refusal` pins that this class is refused on
-//! the BODY and where that decision sits in the order of decisions; its bodies, its
-//! assertion and its sentence are reused here rather than restated. What these rows add is the
-//! FIXEDNESS of the text, so they vary what that suite holds constant: the cluster name's form
+//! WHICH of the two sentences a body reads is decided by the two blocks it names — the
+//! mutual-exclusion sentence where the service would have built a cluster from each of them,
+//! the invalid-body sentence where it would not have built one of them — and that half of the
+//! rule is the neighbouring suite `create_cluster_v2_body_refusal`'s, along with where the
+//! decision sits in the order of decisions; its bodies, its assertion and its sentences are
+//! reused here rather than restated. What these rows add is the
+//! FIXEDNESS of each text, so they vary what that suite holds constant: the cluster name's form
 //! and its length at both bounds the model declares for it, the broker count at both bounds of
 //! its modelled range, the broker type, what the tags say, whether the serverless block names
 //! client authentication, whether the name is one the account already holds and which region
@@ -25,7 +28,8 @@
 use serde_json::{json, Value};
 
 use crate::create_cluster_v2_body_refusal::{
-    assert_invalid_request_body, listed_names_in, provisioned, serverless,
+    assert_selection_refusal, listed_names_in, provisioned, serverless,
+    INVALID_REQUEST_BODY_MESSAGE, ONE_CLUSTER_TYPE_MESSAGE,
 };
 use crate::kafka_harness::{Emulator, REGION};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
@@ -78,12 +82,14 @@ fn serverless_unauthenticated(configurations: usize) -> Value {
     block
 }
 
-/// One row: the body, the region the call is signed for, and every value the row submitted
-/// that a sentence composed from the request would have leaked.
+/// One row: the body, the region the call is signed for, the sentence the selection refusal
+/// carries for it, and every value the row submitted that a sentence composed from the request
+/// would have leaked.
 struct Row {
     case: &'static str,
     region: &'static str,
     body: Value,
+    expected: &'static str,
     submitted: Vec<String>,
 }
 
@@ -103,6 +109,7 @@ fn rows(held: &str) -> Vec<Row> {
             }),
             // The name this row submits is ONE character, which any sentence can carry by
             // coincidence, so only the values long enough to be evidence are listed.
+            expected: ONE_CLUSTER_TYPE_MESSAGE,
             submitted: vec![BLOCK_VERSION.to_string(), BLOCK_INSTANCE_TYPE.to_string()],
         },
         Row {
@@ -114,6 +121,7 @@ fn rows(held: &str) -> Vec<Row> {
                 "provisioned": provisioned("3.9.x", BROKER_NODES_MAX),
                 "serverless": serverless(4),
             }),
+            expected: ONE_CLUSTER_TYPE_MESSAGE,
             submitted: vec![
                 longest.clone(),
                 "platform-crew".to_string(),
@@ -130,6 +138,7 @@ fn rows(held: &str) -> Vec<Row> {
                 "provisioned": provisioned(BLOCK_VERSION, 2),
                 "serverless": serverless(2),
             }),
+            expected: ONE_CLUSTER_TYPE_MESSAGE,
             submitted: vec![held.to_string()],
         },
         Row {
@@ -140,6 +149,7 @@ fn rows(held: &str) -> Vec<Row> {
                 "provisioned": provisioned_on("kafka.not-a-broker-type", BLOCK_VERSION, 2),
                 "serverless": serverless(1),
             }),
+            expected: INVALID_REQUEST_BODY_MESSAGE,
             submitted: vec![
                 "body-refusal-unoffered-type".to_string(),
                 "kafka.not-a-broker-type".to_string(),
@@ -153,6 +163,7 @@ fn rows(held: &str) -> Vec<Row> {
                 "provisioned": provisioned(BLOCK_VERSION, 2),
                 "serverless": serverless_unauthenticated(1),
             }),
+            expected: INVALID_REQUEST_BODY_MESSAGE,
             submitted: vec!["body-refusal-unauthenticated".to_string()],
         },
         Row {
@@ -163,6 +174,7 @@ fn rows(held: &str) -> Vec<Row> {
                 "provisioned": provisioned("3.9.x", 2),
                 "serverless": serverless(3),
             }),
+            expected: ONE_CLUSTER_TYPE_MESSAGE,
             submitted: vec![
                 "body-refusal-other-region".to_string(),
                 OTHER_REGION.to_string(),
@@ -171,8 +183,8 @@ fn rows(held: &str) -> Vec<Row> {
     ]
 }
 
-/// RULE: the sentence MSK refuses an unacceptable body with is FIXED, so every body naming
-/// both cluster types reads the identical string — one that names no member
+/// RULE: each sentence MSK refuses a body naming both cluster types with is FIXED, so every
+/// body of one class reads the identical string — one that names no member
 /// and carries no value the request submitted — whatever the name is, however long it is,
 /// whatever the two blocks say, whatever tags the body carries, whether the name is one the
 /// account already holds and whichever region the call is signed for.
@@ -198,7 +210,7 @@ async fn the_body_refusal_sentence_is_fixed_whatever_the_request_says() {
         let reply = emulator
             .call_in(row.region, "POST", "/api/v2/clusters", Some(row.body.clone()))
             .await;
-        assert_invalid_request_body(&reply, case);
+        assert_selection_refusal(&reply, case, row.expected);
         assert!(
             !reply.error_message().contains(CLUSTER_TYPE_PARAMETER),
             "case {case}: the invalid-body sentence names no parameter, \

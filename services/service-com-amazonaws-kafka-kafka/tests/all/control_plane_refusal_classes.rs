@@ -6,12 +6,13 @@
 //! Three rules, each asserted over a TABLE rather than over one recorded request:
 //!
 //! 1. `CreateClusterV2` names EXACTLY ONE cluster type. A body naming both asks for two
-//!    clusters at once, so it describes no one cluster the service can read it as, and is
-//!    refused on the BODY with HTTP 400 `BadRequestException`, the service's invalid-body
-//!    sentence and no `invalidParameter`, because either member would have fixed the request.
-//!    The decision is taken on the
-//!    SELECTION alone, ahead of anything inside either block, and no refused create registers
-//!    a cluster.
+//!    clusters at once, so it describes no one cluster, and is refused on the SELECTION with
+//!    HTTP 400 `BadRequestException` and no `invalidParameter`, because either member would
+//!    have fixed the request. WHICH sentence it carries is decided by the two blocks alone:
+//!    the service's mutual-exclusion sentence where it would have built a cluster from each of
+//!    them, its invalid-body sentence where one of them is a block it would not have built.
+//!    The decision is taken from the request alone, ahead of the registry, and no refused
+//!    create registers a cluster.
 //! 2. An operation that READS one cluster resolves the cluster reference it is handed, so
 //!    every ARN of this service is such a reference: one naming another resource type names
 //!    no cluster of the endpoint's region and is answered HTTP 404 `NotFoundException` with
@@ -34,9 +35,16 @@ use serde_json::{json, Value};
 
 use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
 
-/// MSK's sentence for a create whose body names both cluster types — a body it cannot read as
-/// a create of either kind. Written out here rather than read from the service's own constant,
-/// so this suite pins the wording instead of the code under test.
+/// MSK's sentence for a create whose body names both cluster types with two blocks it would
+/// each have built a cluster from — a body that states two creates at once. Written out here
+/// rather than read from the service's own constant, so this suite pins the wording instead of
+/// the code under test.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
+
+/// MSK's sentence for a create naming both cluster types one of whose blocks it would NOT have
+/// built a cluster from — a body it cannot read as a create of either kind. Written out here
+/// for the same reason.
 const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// The service's one sentence for a resource it does not hold (the apostrophe is U+2019, as
@@ -87,20 +95,20 @@ fn serverless(configurations: usize) -> Value {
     })
 }
 
-/// Assert `reply` is the body-level refusal: HTTP 400 `BadRequestException`, MSK's
-/// invalid-body sentence as the WHOLE message, and no member named.
-fn assert_invalid_request_body(reply: &Reply, case: &str) {
+/// Assert `reply` is the selection refusal carrying `expected`: HTTP 400
+/// `BadRequestException`, that sentence as the WHOLE message, and no member named.
+fn assert_selection_refusal(reply: &Reply, case: &str, expected: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
-        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
-        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, \
+        (400, "BadRequestException", expected),
+        "case {case}: expected a 400 BadRequestException {expected:?}, \
          got {} {}",
         reply.status,
         reply.body
     );
     assert!(
         reply.at("/invalidParameter").is_null(),
-        "case {case}: expected the body refusal to name no member, got {}",
+        "case {case}: expected the selection refusal to name no member, got {}",
         reply.body
     );
 }
@@ -116,21 +124,22 @@ async fn listed_under(emulator: &Emulator, name: &str) -> usize {
         .unwrap_or_default()
 }
 
-/// RULE 1: a `CreateClusterV2` body naming BOTH cluster types is refused with the service's
-/// invalid-body sentence — whatever the two blocks ask for, and
-/// whether or not a named block would itself have been refused, because the selection is
-/// decided ahead of either block's own members. No such create registers a cluster, and a
-/// body naming exactly one kind is served.
+/// RULE 1: a `CreateClusterV2` body naming BOTH cluster types is refused on the SELECTION —
+/// the service's mutual-exclusion sentence whatever the two readable blocks ask for, and its
+/// invalid-body sentence where one of the two is a block the service would not have built a
+/// cluster from, because such a body states a create of neither kind. No such create registers
+/// a cluster, and a body naming exactly one kind is served.
 #[tokio::test]
-async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
+async fn naming_both_cluster_types_is_refused_on_the_selection() {
     let emulator = Emulator::new();
 
     // The rows differ in the broker software, the broker type, the broker count, how many VPC
     // configurations the serverless block names, what else the body carries, how long the
     // cluster name is, and whether a named block is one the service would itself have refused
     // (broker software it does not offer, a broker type it does not offer, a serverless block
-    // naming no VPC configuration, one turning no client authentication on).
-    let rows: Vec<(&str, Value)> = vec![
+    // naming no VPC configuration, one turning no client authentication on) — which is what
+    // decides between the two sentences.
+    let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a minimal block of each kind",
             json!({
@@ -138,6 +147,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[0], "kafka.m5.large", 1),
                 "serverless": serverless(1),
             }),
+            ONE_CLUSTER_TYPE_MESSAGE,
         ),
         (
             "two brokers over two subnets, one VPC configuration",
@@ -146,6 +156,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[1], "kafka.m5.large", 2),
                 "serverless": serverless(1),
             }),
+            ONE_CLUSTER_TYPE_MESSAGE,
         ),
         (
             "another broker type, more brokers and more VPC configurations, with tags",
@@ -155,6 +166,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[1], "kafka.m7g.large", 6),
                 "serverless": serverless(3),
             }),
+            ONE_CLUSTER_TYPE_MESSAGE,
         ),
         (
             "the longest cluster name the model admits",
@@ -163,6 +175,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[0], "kafka.m5.large", 2),
                 "serverless": serverless(2),
             }),
+            ONE_CLUSTER_TYPE_MESSAGE,
         ),
         (
             "broker software the service does not offer",
@@ -171,6 +184,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned("0.0.0-not-a-version", "kafka.m5.large", 2),
                 "serverless": serverless(1),
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
         (
             "a broker type the service does not offer",
@@ -179,6 +193,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[0], "kafka.not-a-type", 2),
                 "serverless": serverless(1),
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
         (
             "a serverless block naming no VPC configuration",
@@ -187,6 +202,7 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[0], "kafka.m5.large", 2),
                 "serverless": { "vpcConfigs": [], "clientAuthentication": { "sasl": { "iam": { "enabled": true } } } },
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
         (
             "a serverless block turning no client authentication on",
@@ -195,12 +211,13 @@ async fn naming_both_cluster_types_is_refused_as_an_invalid_body() {
                 "provisioned": provisioned(OFFERED_VERSIONS[0], "kafka.m5.large", 2),
                 "serverless": { "vpcConfigs": [{ "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] }] },
             }),
+            INVALID_REQUEST_BODY_MESSAGE,
         ),
     ];
 
-    for (case, body) in &rows {
+    for (case, body, expected) in &rows {
         let reply = emulator.create_cluster_v2(body.clone()).await;
-        assert_invalid_request_body(&reply, case);
+        assert_selection_refusal(&reply, case, expected);
         let name = body["clusterName"].as_str().unwrap_or_default();
         assert_eq!(
             listed_under(&emulator, name).await,
