@@ -124,7 +124,26 @@ const MAX_INVENTORY_PAGES: usize = 8;
 /// is what the owner's inventory in the discovered Regions holds, which is why a Region a
 /// pass read to its end REPLACES what was discovered there and a Region the settings no
 /// longer name is dropped entirely.
-const MAX_DISCOVERED_INSTANCES: usize = 1_000;
+///
+/// `pub` so a suite whose rule is about what a pass does once this budget is nearly spent
+/// sizes its fleet by this number rather than by a copy of it.
+pub const MAX_DISCOVERED_INSTANCES: usize = 1_000;
+
+/// The SMALLEST page the owner's inventory read serves, which is the floor a hop of this
+/// pass asks for a page at.
+///
+/// `DescribeInstances` declares no `@range` on `MaxResults`, so what bounds the member is
+/// what AWS publishes for it in the EC2 API Reference ("Valid Range: Minimum value of 5.
+/// Maximum value of 1000."): a page size outside that range is REFUSED rather than served.
+/// What this pass may still record is a bound on what it keeps off the page it is answered,
+/// which is a different question from the page size the owner accepts — so a pass whose
+/// remaining record budget is smaller than this still asks for a page of this size and
+/// keeps what its budget allows, instead of asking for one the owner cannot answer.
+const INVENTORY_PAGE_SIZE_MIN: usize = 5;
+
+/// The LARGEST page that read serves — the other end of the published range above. A page
+/// size above it is likewise outside what the member accepts.
+const INVENTORY_PAGE_SIZE_MAX: usize = 1_000;
 
 /// The EC2 client this service asks the account's inventory of.
 ///
@@ -381,12 +400,22 @@ async fn discovered_in_region(
         }
         let answer = client
             .describe_instances()
-            // A page no larger than what this pass may still RECORD, so a page it asked for
-            // can always be read to its end and a resumed read always moves past the page
-            // it starts at: `MaxResults` is the `@paginated` page size of
-            // `DescribeInstances` — "the maximum number of items to return for this
-            // request" — on which that model declares no range.
-            .set_max_results(i32::try_from(budget.records).ok())
+            // A page the owner can ANSWER: what this pass may still record, brought inside
+            // the page sizes `MaxResults` — the `@paginated` page size of
+            // `DescribeInstances`, "the maximum number of items to return for this request"
+            // — accepts ([`INVENTORY_PAGE_SIZE_MIN`], [`INVENTORY_PAGE_SIZE_MAX`]). The
+            // record budget bounds what this read KEEPS, never what it asks the owner for: a
+            // hop asking for a page size the owner refuses is answered no page at all, and a
+            // Region whose first hop that is would be discovered by no pass however often
+            // either list is called.
+            .set_max_results(
+                i32::try_from(
+                    budget
+                        .records
+                        .clamp(INVENTORY_PAGE_SIZE_MIN, INVENTORY_PAGE_SIZE_MAX),
+                )
+                .ok(),
+            )
             .set_next_token(cursor.clone())
             .send()
             .await;
@@ -421,9 +450,11 @@ async fn discovered_in_region(
             for instance in reservation.instances() {
                 if budget.records == 0 {
                     // Nothing more may be recorded, so the rest of this PAGE is not read
-                    // either. The page was asked for no more items than the record budget
-                    // held, so this is reached only when the owner answered a larger page
-                    // than it was asked for.
+                    // either — reached when the answered page carries more instances than
+                    // this pass may still record, either because the page it asked for was
+                    // the smallest the owner serves or because the owner answered a larger
+                    // page than it was asked for. What the page held past this point is left
+                    // to the next pass, which resumes at the page itself.
                     whole_page = false;
                     break 'page;
                 }
