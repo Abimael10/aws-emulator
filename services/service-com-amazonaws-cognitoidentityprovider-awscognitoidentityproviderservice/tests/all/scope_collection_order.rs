@@ -12,9 +12,13 @@
 //!   sequenced the scopes, while the CREATE's response is the configuration it was handed
 //!   and answers the submitted sequence. That is what the recorded service answers for an
 //!   app client created with `["openid","email"]` and read back as `["email","openid"]`.
-//! * A resource server's `Scopes` is an ordinary LIST of structures and keeps the sequence
-//!   the request declared, through the create, the update, and every later read and
-//!   listing — so a caller that indexes it positionally reads the same member back.
+//! * A resource server's `Scopes` is a collection KEYED by the scope name, which the
+//!   resource server holds in the order the table keyed on those names is walked — so the
+//!   create's response, the update's, and every later read and listing state that ONE
+//!   order, whatever sequence declared the set, and re-declaring the set in another
+//!   sequence moves nothing. The order itself is pinned, bucket by bucket, in
+//!   `resource_server_scope_order.rs`; what the rows here assert is that no declaration
+//!   decides it.
 //!
 //! The rows differ along what each rule generalises over: how many scopes the collection
 //! holds (one, two, three, five), which permutation of the set the request wrote (every
@@ -23,8 +27,9 @@
 //! operation carried the collection (create, update, describe, list).
 //!
 //! No expectation here is taken from the code under test: the app-client order is a plain
-//! sort of the row's own scope text, the resource-server order is the row's own submitted
-//! sequence, and the one order the recordings carry is also written out as a literal.
+//! sort of the row's own scope text, the resource-server rows assert one order across every
+//! permutation of the row's own set rather than any particular order, and the one app-client
+//! order the recordings carry is also written out as a literal.
 //!
 //! The harness (the engine, the router, the awsJson1_1 call) is the one
 //! `log_delivery_configuration.rs` builds for this service, reached through the test crate
@@ -303,16 +308,26 @@ async fn an_app_clients_permitted_scopes_read_back_in_the_scope_texts_own_order(
 }
 
 #[tokio::test]
-async fn a_resource_servers_scopes_keep_the_sequence_the_declaration_carried() {
+async fn a_resource_servers_scopes_read_back_in_one_order_whatever_sequence_declared_them() {
     let router = router();
-    let user_pool_id = pool(&router, "server scopes", None).await;
 
     for (row, set) in server_scope_sets().into_iter().enumerate() {
         let case = set.case;
+        // The scopes this row's set holds, keyed by name and ordered by name here, so a
+        // rendering is checked to carry the row's own set — the ORDER it carries them in is
+        // the one every permutation below has to agree on.
+        let mut held_set = set.scopes.clone();
+        held_set.sort_by(|left, right| left.0.cmp(&right.0));
+        let held_set = scope_list_json(&held_set);
+        // The order the first permutation read back, which every later permutation of the
+        // same set must read back too: no declaration decides it.
+        let mut served_order: Option<Value> = None;
+
+        // One pool per row, so a row's own resource servers are the only ones in it.
+        let user_pool_id = pool(&router, "server scopes", None).await;
         for (at, submitted) in permutations(&set.scopes).into_iter().enumerate() {
             let names: Vec<&str> = submitted.iter().map(|(name, _)| name.as_str()).collect();
             let label = format!("{case}, declared as {names:?}");
-            // The expectation is the row's OWN submitted sequence.
             let declared = scope_list_json(&submitted);
             // One resource server per permutation, so each row's reads are its own.
             let identifier = format!("https://scope-order-{row}-{at}.example.test");
@@ -328,16 +343,33 @@ async fn a_resource_servers_scopes_keep_the_sequence_the_declaration_carried() {
             )
             .await["ResourceServer"]
                 .clone();
+            let served = created["Scopes"].clone();
+            let mut as_a_set = served
+                .as_array()
+                .unwrap_or_else(|| panic!("case {label:?}: Scopes must be a list, got {created}"))
+                .clone();
+            as_a_set.sort_by(|left, right| {
+                left["ScopeName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["ScopeName"].as_str().unwrap_or_default())
+            });
             assert_eq!(
-                created["Scopes"], declared,
-                "case {label:?}: the create must answer the declared sequence, got {created}"
+                Value::Array(as_a_set),
+                held_set,
+                "case {label:?}: the resource server must hold the declared set {held_set}, got {created}"
+            );
+            let expected = served_order.get_or_insert_with(|| served.clone()).clone();
+            assert_eq!(
+                served, expected,
+                "case {label:?}: the order must be the one every permutation of this set is served in, {expected}, got {created}"
             );
 
-            // Every rendering of the stored resource server keeps it.
+            // Every rendering of the stored resource server states it.
             let read = described_server(&router, &user_pool_id, &identifier).await;
             assert_eq!(
-                read["Scopes"], declared,
-                "case {label:?}: the read must keep the declared sequence, got {read}"
+                read["Scopes"], expected,
+                "case {label:?}: the read must state the order {expected}, got {read}"
             );
             let again = described_server(&router, &user_pool_id, &identifier).await;
             assert_eq!(
@@ -350,11 +382,11 @@ async fn a_resource_servers_scopes_keep_the_sequence_the_declaration_carried() {
                 "case {label:?}: the listing must serve what the read renders"
             );
 
-            // And an update re-declaring the same scopes in the REVERSE sequence stores
-            // that sequence: the member is a list, so the last declaration decides it.
+            // And an update re-declaring the same scopes in the REVERSE sequence leaves the
+            // same order: the collection is keyed by the scope names, so a declaration
+            // decides which scopes are held and not where each one sits.
             let mut reversed = submitted.clone();
             reversed.reverse();
-            let redeclared = scope_list_json(&reversed);
             let updated = ok(
                 &router,
                 "UpdateResourceServer",
@@ -362,14 +394,14 @@ async fn a_resource_servers_scopes_keep_the_sequence_the_declaration_carried() {
                     "UserPoolId": user_pool_id,
                     "Identifier": identifier,
                     "Name": "scope order, updated",
-                    "Scopes": redeclared,
+                    "Scopes": scope_list_json(&reversed),
                 }),
             )
             .await["ResourceServer"]
                 .clone();
             assert_eq!(
-                updated["Scopes"], redeclared,
-                "case {label:?}: the update must answer the sequence it declared, got {updated}"
+                updated["Scopes"], expected,
+                "case {label:?}: the update must state the order {expected}, got {updated}"
             );
             assert_eq!(
                 described_server(&router, &user_pool_id, &identifier).await,

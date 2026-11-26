@@ -8,10 +8,12 @@
 //!
 //! The rule under test: a created resource server is keyed by (`UserPoolId`,
 //! `Identifier`), it renders `UserPoolId`, `Identifier`, `Name` and the custom
-//! scopes exactly as submitted (an empty list when the request set none), a
+//! scope set exactly as submitted (an empty list when the request set none), a
 //! second resource server under an identifier the pool already holds is refused
 //! and leaves the stored one untouched, and an absent pool or identifier is a
-//! 400. Each table row names the case it asserts.
+//! 400. Each table row names the case it asserts. The ORDER the resource server
+//! serves its scope set in is its own, not the declaration's, and is pinned in
+//! `resource_server_scope_order.rs`.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -129,14 +131,28 @@ impl ResourceServerCase {
         )
     }
 
-    /// What a stored resource server must render for `Scopes`: the submitted
-    /// list, in order, and an empty list when the request set none.
+    /// What a stored resource server must hold for `Scopes`, as a SET keyed by
+    /// scope name: the submitted scopes, and none when the request set none. The
+    /// ORDER the resource server serves that set in is its own, pinned in
+    /// `resource_server_scope_order.rs`.
     fn expected_scopes(&self) -> Value {
-        match &self.scopes {
-            Some(scopes) => self.scopes_json(scopes),
-            None => json!([]),
-        }
+        let mut scopes = self.scopes.clone().unwrap_or_default();
+        scopes.sort_by(|left, right| left.0.cmp(&right.0));
+        self.scopes_json(&scopes)
     }
+}
+
+/// A rendered `Scopes` list keyed by scope name, so a row states the SET it
+/// submitted without restating the order the resource server holds it in.
+fn as_a_scope_set(scopes: &Value) -> Value {
+    let mut keyed = scopes.as_array().cloned().unwrap_or_default();
+    keyed.sort_by(|left, right| {
+        left["ScopeName"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["ScopeName"].as_str().unwrap_or_default())
+    });
+    Value::Array(keyed)
 }
 
 /// The table. `Identifier` spans its modelled length 1..256 and pattern
@@ -218,9 +234,9 @@ async fn a_created_resource_server_round_trips_through_stored_state() {
             "case {label:?}: the stored name must be the created one, got {resource_server}"
         );
         assert_eq!(
-            resource_server["Scopes"],
+            as_a_scope_set(&resource_server["Scopes"]),
             case.expected_scopes(),
-            "case {label:?}: the stored scopes must be the submitted ones, in order, got {resource_server}"
+            "case {label:?}: the stored scopes must be the submitted set, got {resource_server}"
         );
 
         // The round trip: the reader renders the STORED resource server, member

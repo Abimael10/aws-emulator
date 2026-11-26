@@ -6,12 +6,14 @@
 //!
 //! The rule under test: `UpdateResourceServer` REPLACES the two writable members
 //! of the stored resource server its (`UserPoolId`, `Identifier`) names — `Name`
-//! and the custom scope list — with exactly what the request carries, setting a
+//! and the custom scope set — with exactly what the request carries, setting a
 //! member the request omits to its default (no custom scopes), leaves every
 //! read-only field and every other resource untouched, and answers with the
 //! stored record, so a later `DescribeResourceServer` renders the same thing. An
 //! unknown pool or identifier is a 400 `ResourceNotFoundException` that stores
-//! nothing. Each table row names the case it asserts.
+//! nothing. Each table row names the case it asserts. The ORDER the resource
+//! server serves its scope set in is its own, not the declaration's, and is
+//! pinned in `resource_server_scope_order.rs`.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -152,16 +154,30 @@ impl UpdateCase {
         Value::Object(body)
     }
 
-    /// What the updated resource server must render for `Scopes`: the submitted
-    /// list, in order; and the default — an empty list — when the request
-    /// carried none, because "if you don't provide a value for an attribute, it
-    /// is set to the default value" (`UpdateResourceServer`).
+    /// What the updated resource server must hold for `Scopes`, as a SET keyed by scope
+    /// name: the submitted scopes, and the default — no custom scopes — when the request
+    /// carried none, because "if you don't provide a value for an attribute, it is set to
+    /// the default value" (`UpdateResourceServer`). The ORDER the resource server serves
+    /// that set in is its own, pinned in `resource_server_scope_order.rs`, so each row here
+    /// states the set and compares the rendering keyed the same way.
     fn expected_scopes(&self) -> Value {
-        match &self.scopes {
-            Some(scopes) => scopes_json(scopes),
-            None => json!([]),
-        }
+        let mut scopes = self.scopes.clone().unwrap_or_default();
+        scopes.sort_by(|left, right| left.0.cmp(&right.0));
+        scopes_json(&scopes)
     }
+}
+
+/// A rendered `Scopes` list keyed by scope name, so a row states the SET it submitted
+/// without restating the order the resource server holds it in.
+fn as_a_scope_set(scopes: &Value) -> Value {
+    let mut keyed = scopes.as_array().cloned().unwrap_or_default();
+    keyed.sort_by(|left, right| {
+        left["ScopeName"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["ScopeName"].as_str().unwrap_or_default())
+    });
+    Value::Array(keyed)
 }
 
 /// A scope list of `count` entries, named so each case's content differs.
@@ -280,9 +296,9 @@ async fn an_update_replaces_the_writable_members_and_round_trips_through_stored_
             "case {label:?}: the updated name must be the submitted one, got {resource_server}"
         );
         assert_eq!(
-            resource_server["Scopes"],
+            as_a_scope_set(&resource_server["Scopes"]),
             case.expected_scopes(),
-            "case {label:?}: the scopes must be replaced by the submitted list, in order, got {resource_server}"
+            "case {label:?}: the scopes must be replaced by the submitted set, got {resource_server}"
         );
         // The read-only fields: identity never moves.
         assert_eq!(

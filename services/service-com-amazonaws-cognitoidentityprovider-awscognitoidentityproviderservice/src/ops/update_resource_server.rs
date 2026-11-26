@@ -194,9 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read-only, so it stays exactly as `CreateResourceServer` stored it, and
         // nothing outside this record is written: an app client's
         // `AllowedOAuthScopes` is that client's own configuration, not a view of
-        // this resource server, so it stays as the client stored it.
+        // this resource server, so it stays as the client stored it. The declared
+        // scopes are held in the order the resource server holds a collection
+        // keyed on each scope's own name
+        // ([`crate::state::held_resource_server_scopes`]), so a declaration
+        // decides WHICH scopes are held and what each describes rather than where
+        // each one sits.
         resource_server.name = input.name;
-        resource_server.scopes = input.scopes.unwrap_or_default();
+        resource_server.scopes =
+            crate::state::held_resource_server_scopes(&input.scopes.unwrap_or_default());
 
         // Rendered from the STORED resource server, so the response is exactly
         // what a later read sees.

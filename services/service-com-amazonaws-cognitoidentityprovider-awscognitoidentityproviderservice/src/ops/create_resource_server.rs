@@ -216,8 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     name: input.name.clone(),
                     // A request that sets no `Scopes` creates a resource server
                     // with no custom scopes: an empty scope list, not an absent
-                    // one.
-                    scopes: input.scopes.unwrap_or_default(),
+                    // one. The declared scopes are held in the order the resource
+                    // server holds a collection keyed on each scope's own name
+                    // ([`crate::state::held_resource_server_scopes`]), which is
+                    // the order every read of it renders.
+                    scopes: crate::state::held_resource_server_scopes(
+                        &input.scopes.unwrap_or_default(),
+                    ),
                 });
                 Ok(CreateResourceServerOutput {
                     resource_server: stored.to_resource_server_type(),

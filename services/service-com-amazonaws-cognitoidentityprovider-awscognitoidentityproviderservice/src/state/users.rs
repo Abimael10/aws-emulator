@@ -1228,10 +1228,12 @@ pub struct ResourceServer {
     pub user_pool_id: String,
     pub identifier: String,
     pub name: String,
-    /// The custom scopes of this resource server, in the order they were
-    /// submitted: an ordinary list member, which every read of the resource
-    /// server renders as the request that declared it sequenced it. A resource
-    /// server created with no `Scopes` holds none.
+    /// The custom scopes of this resource server, in the order it HOLDS them:
+    /// the collection is keyed by the scope name, and the order is the one the
+    /// table keyed on those names is walked
+    /// ([`crate::state::held_resource_server_scopes`]), so every read of the
+    /// resource server renders that one order whatever sequence declared the
+    /// scopes. A resource server declared with no `Scopes` holds none.
     pub scopes: Vec<ResourceServerScopeType>,
 }
 
