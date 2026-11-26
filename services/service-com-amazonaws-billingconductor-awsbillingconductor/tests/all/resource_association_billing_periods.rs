@@ -13,7 +13,9 @@
 //! provide a billing period, the current billing period is used") — and an association
 //! is in effect only in the billing periods of its own half-open range, which begins no
 //! earlier than the period the associating call was made in, because the association
-//! did not exist before then.
+//! did not exist before then. The item the read addresses is the resource it REFERENCES,
+//! so a billing period no generation of that item applies in is answered with the
+//! modelled 404 `ResourceNotFoundException` rather than a page.
 //!
 //! The rows differ along where the association's own range falls relative to the
 //! current billing period (none at all, open-ended, bounded, wholly past, wholly
@@ -202,21 +204,28 @@ impl Emulator {
         );
     }
 
-    /// The `(Arn, EndBillingPeriod)` pairs a read reports, in the order it reports them.
-    /// `extra` carries whatever the request names beside the item's `Arn` — nothing at
-    /// all for the default read.
-    async fn associated(&self, case: &str, target: &str, extra: Value) -> Vec<(String, Option<String>)> {
+    /// The status and body a read of the item's associations answers with. `extra` carries
+    /// whatever the request names beside the item's `Arn` — nothing at all for the default
+    /// read.
+    async fn read(&self, target: &str, extra: Value) -> (u16, Value) {
         let mut body = json!({ "Arn": target });
         for (member, value) in extra.as_object().cloned().unwrap_or_default() {
             body[member] = value;
         }
-        let (status, answered) = self
-            .send(
-                "POST",
-                "/list-resources-associated-to-custom-line-item",
-                &body,
-            )
-            .await;
+        self.send(
+            "POST",
+            "/list-resources-associated-to-custom-line-item",
+            &body,
+        )
+        .await
+    }
+
+    /// The `(Arn, EndBillingPeriod)` pairs a read reports, in the order it reports them.
+    /// `extra` carries whatever the request names beside the item's `Arn` — nothing at
+    /// all for the default read. The period asked about is one the item applies in, so the
+    /// read is served.
+    async fn associated(&self, case: &str, target: &str, extra: Value) -> Vec<(String, Option<String>)> {
+        let (status, answered) = self.read(target, extra).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the read to answer HTTP 200, got {status} with {answered}"
@@ -506,6 +515,10 @@ async fn an_association_ended_in_the_current_period_leaves_the_default_listing()
 struct ProbeRow {
     case: &'static str,
     billing_period: String,
+    /// Does the TARGET item — the resource the read references — apply in that period in
+    /// any generation of it? A period it does not is refused with the modelled 404, which
+    /// reports neither association.
+    item_applies: bool,
     /// Is the association made with NO range in effect in that period?
     open: bool,
     /// Is the association the call bounded to `[period(-1), period(0))` — the previous
@@ -517,7 +530,9 @@ struct ProbeRow {
 /// No billing period BEFORE an association is made reports it: an association with no
 /// range of its own is in effect from the period the associating call landed in, while
 /// one whose call named an earlier inclusive start is in effect from the period the
-/// caller named.
+/// caller named. A period before the TARGET itself applies reports neither of them: the
+/// item is the resource the read references, so such a period is answered with the
+/// modelled 404 `ResourceNotFoundException` instead of a page.
 #[tokio::test]
 async fn a_period_before_the_association_does_not_report_it() {
     let rows: Vec<ProbeRow> = vec![
@@ -525,54 +540,63 @@ async fn a_period_before_the_association_does_not_report_it() {
             case: "a period long before this account held any custom line item",
             // A fixed month far outside both ranges, whatever the clock says.
             billing_period: "2020-01".to_string(),
+            item_applies: false,
             open: false,
             backdated: false,
         },
         ProbeRow {
             case: "a year before the current period",
             billing_period: period(-12),
+            item_applies: false,
             open: false,
             backdated: false,
         },
         ProbeRow {
             case: "the period before the backdated range starts",
             billing_period: period(-2),
+            item_applies: false,
             open: false,
             backdated: false,
         },
         ProbeRow {
             case: "the backdated range's inclusive start",
             billing_period: period(-1),
+            item_applies: true,
             open: false,
             backdated: true,
         },
         ProbeRow {
             case: "the backdated range's inclusive start, one-digit month",
             billing_period: one_digit_month(&period(-1)),
+            item_applies: true,
             open: false,
             backdated: true,
         },
         ProbeRow {
             case: "the current period, which is the backdated range's exclusive end",
             billing_period: period(0),
+            item_applies: true,
             open: true,
             backdated: false,
         },
         ProbeRow {
             case: "the current period, one-digit month",
             billing_period: one_digit_month(&period(0)),
+            item_applies: true,
             open: true,
             backdated: false,
         },
         ProbeRow {
             case: "the next period",
             billing_period: period(1),
+            item_applies: true,
             open: true,
             backdated: false,
         },
         ProbeRow {
             case: "a year after the current period",
             billing_period: period(12),
+            item_applies: true,
             open: true,
             backdated: false,
         },
@@ -605,6 +629,39 @@ async fn a_period_before_the_association_does_not_report_it() {
         .await;
 
     for row in rows {
+        // The item the read addresses is the resource it references, and whether it exists
+        // is asked of the period being read: a period no generation of it applies in is
+        // the modelled 404, which reports no association of it at all — the answer the
+        // period-scoped listing of the items gives by leaving the item out of that period.
+        if !row.item_applies {
+            let (status, answered) = emulator
+                .read(
+                    &target,
+                    json!({ "BillingPeriod": row.billing_period.clone() }),
+                )
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {:?} ({}): the period holds no version of the item, so the modelled 404 \
+                 is expected, got {status} with {answered}",
+                row.case, row.billing_period
+            );
+            assert_eq!(
+                answered.get("__type").and_then(Value::as_str),
+                Some("ResourceNotFoundException"),
+                "case {:?} ({}): expected the modelled ResourceNotFoundException, got \
+                 {answered}",
+                row.case,
+                row.billing_period
+            );
+            assert!(
+                answered.get("AssociatedResources").is_none(),
+                "case {:?} ({}): a refusal reports no association, got {answered}",
+                row.case,
+                row.billing_period
+            );
+            continue;
+        }
         for (resource, label, expected) in [
             (&open, "the association with no range", row.open),
             (&backdated, "the backdated association", row.backdated),

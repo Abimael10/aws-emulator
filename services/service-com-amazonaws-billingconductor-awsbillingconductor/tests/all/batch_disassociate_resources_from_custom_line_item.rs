@@ -35,6 +35,7 @@
 //! range falls relative to the association's own range (inside it, overlapping either
 //! end, covering it, disjoint on either side) — never along a renaming.
 
+use crate::percentage_custom_line_item_resource_associations::association_read;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_billingconductor_awsbillingconductor::{
@@ -296,14 +297,15 @@ impl Emulator {
             })
     }
 
-    /// The `(Arn, Relationship)` pairs a read reports, sorted.
+    /// The `(Arn, Relationship)` pairs a read reports, sorted — none at all for a billing
+    /// period the target applies in no version of, which the read refuses with the
+    /// modelled 404 rather than serving ([`association_read`]).
     async fn association_pairs(&self, target: &str, extra: Value) -> Vec<(String, String)> {
         let (status, body) = self.associated(target, extra).await;
-        assert_eq!(
-            status, 200,
-            "case read of {target}: expected HTTP 200, got {status} with {body}"
-        );
-        let mut pairs: Vec<(String, String)> = elements(&body)
+        let Some(served) = association_read(&format!("read of {target}"), status, &body) else {
+            return Vec::new();
+        };
+        let mut pairs: Vec<(String, String)> = elements(served)
             .iter()
             .map(|(arn, relationship, _)| (arn.clone(), relationship.clone()))
             .collect();
@@ -325,7 +327,8 @@ impl Emulator {
     }
 
     /// The reported-ness and `EndBillingPeriod` of one resource in whatever read the
-    /// `extra` members describe.
+    /// `extra` members describe. A period the target applies in no version of reports it
+    /// not at all: such a read is refused with the modelled 404 ([`association_read`]).
     async fn in_period(
         &self,
         target: &str,
@@ -333,11 +336,8 @@ impl Emulator {
         extra: Value,
     ) -> Option<Option<String>> {
         let (status, body) = self.associated(target, extra).await;
-        assert_eq!(
-            status, 200,
-            "case read of {target}: expected HTTP 200, got {status} with {body}"
-        );
-        elements(&body)
+        let served = association_read(&format!("read of {target}"), status, &body)?;
+        elements(served)
             .into_iter()
             .find(|(arn, _, _)| arn == resource)
             .map(|(_, _, end)| end)

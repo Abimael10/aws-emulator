@@ -25,7 +25,7 @@
 
 use crate::custom_line_item_associations_accumulate::association_size;
 use crate::percentage_custom_line_item_resource_associations::{
-    failures, period, reported, Emulator,
+    association_read, failures, period, reported, Emulator,
 };
 use serde_json::{json, Value};
 
@@ -64,7 +64,9 @@ async fn disassociate(
 
 /// Every `EndBillingPeriod` a read of `billing_period` reports for `resource`: one entry
 /// per association the item holds for it there — so an item holding the resource twice
-/// is two entries, and one holding it in no stretch covering that period is none.
+/// is two entries, and one holding it in no stretch covering that period is none. A period
+/// the TARGET applies in no version of is none either: such a read is refused with the
+/// modelled 404 rather than served ([`association_read`]).
 async fn ends_in_period(
     emulator: &Emulator,
     case: &str,
@@ -79,12 +81,14 @@ async fn ends_in_period(
             &json!({ "Arn": target, "BillingPeriod": billing_period, "MaxResults": 100 }),
         )
         .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected the read of {billing_period} to answer HTTP 200, got {status} \
-         with {answered}"
-    );
-    answered
+    let Some(served) = association_read(
+        &format!("{case:?}: the read of {billing_period}"),
+        status,
+        &answered,
+    ) else {
+        return Vec::new();
+    };
+    served
         .get("AssociatedResources")
         .and_then(Value::as_array)
         .cloned()

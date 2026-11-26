@@ -4046,6 +4046,31 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         is_aws_managed_pricing_plan(arn) || self.pricing_plans.contains_key(arn)
     }
 
+    /// The custom line item `item_arn` as a read SCOPED TO `billing_period` sees it, or
+    /// `None` when no generation of the item applies in that period.
+    ///
+    /// The custom-line-item side of [`Self::pricing_rule_exists_in`] and
+    /// [`Self::pricing_plan_exists_in`]: the same question the period-scoped LISTING of
+    /// the items answers for a whole period ([`CustomLineItemRecord::effective_in`], which
+    /// `ListCustomLineItems` reports from), asked about the ONE item a read addresses by
+    /// ARN, so a read of one item cannot disagree with the listing of the period it asks
+    /// about. A period BEFORE the item was created holds no generation of it, and neither
+    /// does a period a bounded delete or a bounded write has taken every generation out of
+    /// ([`CustomLineItemRecord::covers`]) — which is also where no association of the item
+    /// is in effect, since a period no generation of the item applies in holds no
+    /// association of it either ([`Self::remove_custom_line_item_periods`]). A delete that
+    /// leaves the item applying nowhere removes the record, so an ARN the store does not
+    /// hold names no item in any period at all.
+    pub fn custom_line_item_in(
+        &self,
+        item_arn: &str,
+        billing_period: &str,
+    ) -> Option<&CustomLineItemRecord> {
+        self.custom_line_items
+            .get(item_arn)
+            .filter(|item| item.covers(billing_period))
+    }
+
     /// The stored resource a `CustomLineItemAssociationElement` names, as its full
     /// ARN, or `None` when no such resource exists.
     ///

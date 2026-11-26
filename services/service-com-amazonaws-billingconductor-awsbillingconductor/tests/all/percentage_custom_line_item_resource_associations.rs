@@ -261,19 +261,54 @@ impl Emulator {
         .await
     }
 
-    /// The `(Arn, Relationship)` pairs a read reports, in the order it reports them.
+    /// The `(Arn, Relationship)` pairs a read reports, in the order it reports them —
+    /// none at all for a billing period the item applies in no version of, which the read
+    /// refuses with the modelled 404 rather than serving ([`association_read`]).
     pub(crate) async fn association_pairs(
         &self,
         target: &str,
         extra: Value,
     ) -> Vec<(String, String)> {
         let (status, body) = self.associated(target, extra).await;
-        assert_eq!(
-            status, 200,
-            "case read of {target}: expected HTTP 200, got {status} with {body}"
-        );
-        elements(&body)
+        match association_read(&format!("read of {target}"), status, &body) {
+            Some(served) => elements(served),
+            None => Vec::new(),
+        }
     }
+}
+
+/// What a read of ONE custom line item's resource associations answered: `Some(body)` for
+/// the 200 a billing period the item applies in is served, and `None` for the modelled 404
+/// `ResourceNotFoundException` a period no version of the item applies in is refused with.
+///
+/// The item is the resource such a read REFERENCES, so whether it exists is resolved in the
+/// period being read: a period that holds no version of the item holds no association of it
+/// either, so either answer reports no association of it at all — which is what the suites
+/// that probe periods outside an item's own range are about. The status rule itself is
+/// pinned by `tests/all/custom_line_item_period_scoped_association_reads.rs`.
+pub(crate) fn association_read<'a>(case: &str, status: u16, body: &'a Value) -> Option<&'a Value> {
+    if status == 404 {
+        assert_eq!(
+            body.get("__type").and_then(Value::as_str),
+            Some("ResourceNotFoundException"),
+            "case {case}: expected the modelled ResourceNotFoundException, got {body}"
+        );
+        assert_eq!(
+            body.get("ResourceType").and_then(Value::as_str),
+            Some("customlineitem"),
+            "case {case}: expected the refusal to name the resource type, got {body}"
+        );
+        assert!(
+            body.get("AssociatedResources").is_none(),
+            "case {case}: a refusal reports no associations, got {body}"
+        );
+        return None;
+    }
+    assert_eq!(
+        status, 200,
+        "case {case}: expected HTTP 200, got {status} with {body}"
+    );
+    Some(body)
 }
 
 /// The `Arn` a create answered with.
@@ -827,7 +862,10 @@ async fn a_read_reports_the_associations_the_request_asks_for() {
     );
 
     // Each published bound of the bounded range, and one period past each — plus a month
-    // long before either association was made.
+    // long before either association was made. The target itself applies from the period
+    // it was created in on, so the two rows before that report neither association: such a
+    // period holds no version of the item and the read of it is refused with the modelled
+    // 404 ([`association_read`]).
     // (case, the billing period the read asks for, is the bounded association in effect
     // there, is the one with no range of its own)
     let probes: [(&str, String, bool, bool); 6] = [

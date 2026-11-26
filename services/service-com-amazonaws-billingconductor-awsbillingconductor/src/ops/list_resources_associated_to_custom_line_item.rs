@@ -11,6 +11,11 @@
 //! `crate::state::association_relationship`) and `EndBillingPeriod` from the billing
 //! period range the associating call set, so neither can drift from the association.
 //!
+//! The custom line item is the resource the read REFERENCES, so whether it exists is
+//! asked of the billing period being read: a period no generation of the item applies in
+//! is the modelled `ResourceNotFoundException` (404), the same answer the period-scoped
+//! listing of the items gives by leaving the item out of that period.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,9 +184,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
+        // "The billing period for which the resource associations will be listed": this
+        // read is scoped to ONE billing period, and the period-scoped reads of this
+        // service fall back to the current one when the request names none ("If you
+        // don't provide a billing period, the current billing period is used"), so the
+        // default read reports the associations in effect right now. The modelled
+        // `@pattern` on the member is enforced before this handler runs. It is resolved
+        // BEFORE the item is looked up, because the period is what the lookup asks about.
+        let billing_period = input
+            .billing_period
+            .unwrap_or_else(crate::state::current_billing_period);
+
         // The `CustomLineItemArn` pattern accepts the full ARN or the bare id.
         let arn = crate::state::normalize_custom_line_item_arn(&input.arn);
-        let Some(item) = state.custom_line_items.get(&arn) else {
+        // The item is the resource this read REFERENCES, so whether it exists is asked of
+        // the period being read: a period no generation of the item applies in is the
+        // modelled 404 rather than a 200 reporting no association, exactly as the
+        // period-scoped listing of the items leaves such an item out of that period
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::custom_line_item_in`)
+        // and exactly as the two sibling cross-reference listings resolve the pricing rule
+        // and the pricing plan they reference.
+        let Some(item) = state.custom_line_item_in(&arn, &billing_period) else {
             return Err(
                 ListResourcesAssociatedToCustomLineItemErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -198,15 +221,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filters
             .as_ref()
             .and_then(|filters| filters.relationship.clone());
-        // "The billing period for which the resource associations will be listed": this
-        // read is scoped to ONE billing period, and the period-scoped reads of this
-        // service fall back to the current one when the request names none ("If you
-        // don't provide a billing period, the current billing period is used"), so the
-        // default read reports the associations in effect right now. The modelled
-        // `@pattern` on the member is enforced before this handler runs.
-        let billing_period = input
-            .billing_period
-            .unwrap_or_else(crate::state::current_billing_period);
         let mut selected: Vec<(String, ListResourcesAssociatedToCustomLineItemResponseElement)> =
             Vec::new();
         for association in &item.associated_resources {

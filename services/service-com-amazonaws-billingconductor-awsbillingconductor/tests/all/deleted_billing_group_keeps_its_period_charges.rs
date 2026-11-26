@@ -31,7 +31,7 @@
 
 use crate::association_delete_gate_spans_billing_periods::error_code;
 use crate::bounded_delete_narrows_resource_associations::range;
-use crate::percentage_custom_line_item_resource_associations::period;
+use crate::percentage_custom_line_item_resource_associations::{association_read, period};
 use crate::pricing_rule_association_periods::period_start_millis;
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -314,7 +314,9 @@ impl Emulator {
     }
 
     /// The resource ARNs `ListResourcesAssociatedToCustomLineItem` reports for one
-    /// percentage item in the billing period `months` from the current one.
+    /// percentage item in the billing period `months` from the current one — none at all
+    /// for a period the item applies in no version of, which the read refuses with the
+    /// modelled 404 rather than serving.
     pub(crate) async fn associated_in(&self, case: &str, item: &str, months: i64) -> Vec<String> {
         let (status, body) = self
             .post(
@@ -322,12 +324,15 @@ impl Emulator {
                 &json!({ "Arn": item, "BillingPeriod": period(months) }),
             )
             .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: ListResourcesAssociatedToCustomLineItem expected HTTP 200, got \
-             {status} with {body}"
-        );
-        body.get("AssociatedResources")
+        let Some(served) = association_read(
+            &format!("{case:?}: the association read of {item}"),
+            status,
+            &body,
+        ) else {
+            return Vec::new();
+        };
+        served
+            .get("AssociatedResources")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()

@@ -975,6 +975,11 @@ async fn period_scoped_fixture() -> World {
 
     // Resources are associated to a PERCENTAGE item only, so the association listing needs
     // one of those; the group and two items are three associations, one past a one-row page.
+    //
+    // That item is the resource the association listing REFERENCES, and a read scoped to a
+    // billing period no generation of it applies in is answered 404 before any token is
+    // looked at — so it is put in effect from the PREVIOUS billing period, the earliest one
+    // a write may name, which is the earliest month the crossings below read.
     let percentage = setup_arn(
         &em,
         "POST",
@@ -984,6 +989,7 @@ async fn period_scoped_fixture() -> World {
             "Description": "a percentage item of the period-scope fixture",
             "BillingGroupArn": groups[0],
             "ChargeDetails": { "Type": "FEE", "Percentage": { "PercentageValue": 10.0 } },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) },
         }),
         "the percentage custom line item",
     )
@@ -1151,7 +1157,9 @@ async fn a_period_scoped_token_is_refused_by_a_read_of_another_billing_period() 
 
         // The two spellings of ONE month name the same sequence, so a token minted for a
         // month spelled either way is still refused by a read of ANOTHER month, however
-        // that month is spelled.
+        // that month is spelled. The other month is the same month a YEAR on, so the two
+        // cannot name one period whatever month the suite runs in — and every parent
+        // resource of these reads exists in it.
         let case = format!(
             "{} given a token minted for a month spelled without its leading zero, on \
              another month",
@@ -1164,7 +1172,7 @@ async fn a_period_scoped_token_is_refused_by_a_read_of_another_billing_period() 
             Some(&one_digit_month(&two_spellings)),
         )
         .await;
-        let body = in_period(&read.body, Some(&period(-2)));
+        let body = in_period(&read.body, Some(&period(12)));
         assert_refused(
             &world.em,
             read,
