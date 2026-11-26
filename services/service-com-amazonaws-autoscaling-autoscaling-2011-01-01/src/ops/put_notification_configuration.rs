@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // or a value outside this service's own event catalog — is about
                         // what the request carries, which this service answers
                         // `ValidationError` for.
-                        crate::state::NotificationConfigurationRefusal::LimitExceeded => {
+                        crate::state::NotificationConfigurationRefusal::LimitExceeded(_) => {
                             PutNotificationConfigurationErrorModeled::LimitExceededFault(
                                 LimitExceededFault {
                                     message: Some(message),

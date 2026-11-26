@@ -88,8 +88,9 @@ pub enum NotificationConfigurationRefusal {
     /// named.
     UnknownNotificationType(String),
     /// The group is already configured with [`MAX_NOTIFICATION_TOPICS_PER_GROUP`] topics
-    /// and this request names one more.
-    LimitExceeded,
+    /// and this request names one more; carries the name of the group that is at the
+    /// quota, which is the group the request named.
+    LimitExceeded(String),
     /// The group holds no configuration for the topic the request names, so there is no
     /// notification to delete; carries the topic it named.
     AbsentConfiguration(String),
@@ -104,7 +105,7 @@ impl NotificationConfigurationRefusal {
             Self::UnknownNotificationType(notification_type) => {
                 unknown_notification_type_message(notification_type)
             }
-            Self::LimitExceeded => too_many_topics_message(),
+            Self::LimitExceeded(group_name) => too_many_topics_message(group_name),
             Self::AbsentConfiguration(topic_arn) => {
                 absent_notification_configuration_message(topic_arn)
             }
@@ -140,7 +141,9 @@ impl StoredGroup {
         if configures_a_new_topic
             && self.notification_configurations.len() >= MAX_NOTIFICATION_TOPICS_PER_GROUP
         {
-            return Err(NotificationConfigurationRefusal::LimitExceeded);
+            return Err(NotificationConfigurationRefusal::LimitExceeded(
+                self.name.clone(),
+            ));
         }
         self.notification_configurations.insert(
             topic_arn.to_string(),
@@ -227,13 +230,17 @@ pub fn unknown_notification_type_message(notification_type: &str) -> String {
 }
 
 /// The message a request that would configure a topic past
-/// [`MAX_NOTIFICATION_TOPICS_PER_GROUP`] is refused with, which quotes the limit the
-/// caller has to come back under — the shape this service reports every per-group ceiling
-/// in.
-pub fn too_many_topics_message() -> String {
+/// [`MAX_NOTIFICATION_TOPICS_PER_GROUP`] is refused with: Amazon EC2 Auto Scaling names the
+/// GROUP that is at the quota and the quota it may not go past.
+///
+/// One variable part, the group the request named — everything else, punctuation and the
+/// quota included, is fixed text: there is no space after the colon and no trailing period.
+/// Naming the group is what tells a caller configuring several groups in a loop WHICH of
+/// them hit the ceiling.
+pub fn too_many_topics_message(group_name: &str) -> String {
     format!(
-        "The notification configuration exceeds the limit of \
-         {MAX_NOTIFICATION_TOPICS_PER_GROUP} SNS topics per Auto Scaling group"
+        "Your AutoScaling Group:{group_name} can't have more than \
+         {MAX_NOTIFICATION_TOPICS_PER_GROUP} topics"
     )
 }
 
