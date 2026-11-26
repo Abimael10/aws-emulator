@@ -296,6 +296,25 @@ pub struct CrossRegionModel {
     /// across no region at all — and the ones it holds are the regions that profile reports
     /// a model for and names in its description.
     pub regions: &'static [&'static str],
+    /// The instant the cross-region profile over this model came into being: its
+    /// `createdAt`.
+    ///
+    /// Published data of the PROFILE, written per row. A profile is published when
+    /// cross-region routing for its model is turned on, which is no earlier than the
+    /// capability's own first day ([`CROSS_REGION_PROFILES_PUBLISHED_AT`]) and no earlier
+    /// than the model's launch ([`FoundationModel::start_of_life_time`]) — and need be
+    /// neither of those days, so no rule computes it from the model and every row states
+    /// its own.
+    pub published_at: &'static str,
+    /// The instant the profile's record last changed: its `updatedAt`.
+    ///
+    /// Published data of the profile as well, and its own value rather than a copy of
+    /// [`CrossRegionModel::published_at`]: AWS revises a published profile after publishing
+    /// it — widening the regions it routes to, re-pointing it at another copy of its model —
+    /// and reports that revision here, so a row AWS has revised carries a LATER instant,
+    /// down to the sub-second precision the record was written at. A row with no published
+    /// revision carries its publication instant, which is when its record last changed.
+    pub last_revised_at: &'static str,
 }
 
 /// The base models this emulator's Amazon Bedrock publishes a cross-region inference
@@ -313,25 +332,33 @@ pub struct CrossRegionModel {
 /// under [`DEFAULT_PROMPT_ROUTERS`]: every model a published router routes between has a
 /// profile here, because that profile is what the router reports as its target.
 ///
-/// Only the ids and the regions are written here. Everything else a profile reports about
-/// its model — the brand its name carries, the launch its instants are bounded below by —
-/// is read off that model's published row, so the two catalogs cannot disagree about one
-/// model.
+/// The ids, the regions and the two instants of each profile are written here; everything
+/// else a profile reports about its model — the brand its name carries, the regions it
+/// routes to — is read off that model's published row or computed from the geography, so
+/// the two catalogs cannot disagree about one model.
 pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
     CrossRegionModel {
         model_id: "amazon.nova-lite-v1:0",
         regions: NOVA_REGIONS,
+        published_at: NOVA_PROFILES_PUBLISHED_AT,
+        last_revised_at: NOVA_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "amazon.nova-micro-v1:0",
         regions: NOVA_REGIONS,
+        published_at: NOVA_PROFILES_PUBLISHED_AT,
+        last_revised_at: NOVA_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "amazon.nova-pro-v1:0",
         regions: NOVA_REGIONS,
+        published_at: NOVA_PROFILES_PUBLISHED_AT,
+        last_revised_at: NOVA_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        published_at: CROSS_REGION_PROFILES_PUBLISHED_AT,
+        last_revised_at: CROSS_REGION_PROFILES_PUBLISHED_AT,
         regions: &[
             "ap-northeast-1",
             "ap-northeast-2",
@@ -348,6 +375,8 @@ pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
     },
     CrossRegionModel {
         model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        published_at: "2024-10-22T00:00:00Z",
+        last_revised_at: "2024-10-22T00:00:00Z",
         regions: &[
             "ap-northeast-1",
             "ap-northeast-2",
@@ -361,6 +390,8 @@ pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
     },
     CrossRegionModel {
         model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+        published_at: CROSS_REGION_PROFILES_PUBLISHED_AT,
+        last_revised_at: CROSS_REGION_PROFILES_PUBLISHED_AT,
         regions: &[
             "ap-northeast-1",
             "ap-northeast-2",
@@ -376,6 +407,8 @@ pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
     },
     CrossRegionModel {
         model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
+        published_at: CROSS_REGION_PROFILES_PUBLISHED_AT,
+        last_revised_at: CROSS_REGION_PROFILES_PUBLISHED_AT,
         regions: &[
             "ap-northeast-1",
             "ap-southeast-1",
@@ -390,36 +423,68 @@ pub const CROSS_REGION_MODELS: &[CrossRegionModel] = &[
     CrossRegionModel {
         model_id: "deepseek.r1-v1:0",
         regions: &["us-east-1", "us-east-2", "us-west-2"],
+        published_at: "2025-03-10T00:00:00Z",
+        last_revised_at: "2025-03-10T00:00:00Z",
     },
     CrossRegionModel {
         model_id: "meta.llama3-1-70b-instruct-v1:0",
         regions: LLAMA_3_1_REGIONS,
+        published_at: LLAMA_3_1_PROFILES_PUBLISHED_AT,
+        last_revised_at: LLAMA_3_1_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "meta.llama3-1-8b-instruct-v1:0",
         regions: LLAMA_3_1_REGIONS,
+        published_at: LLAMA_3_1_PROFILES_PUBLISHED_AT,
+        // The one row of this table AWS has revised since publishing it, at the sub-second
+        // precision its record was written at.
+        last_revised_at: "2024-11-04T18:02:21.191757959Z",
     },
     CrossRegionModel {
         model_id: "meta.llama3-2-11b-instruct-v1:0",
         regions: LLAMA_3_2_REGIONS,
+        published_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
+        last_revised_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "meta.llama3-2-1b-instruct-v1:0",
         regions: LLAMA_3_2_REGIONS,
+        published_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
+        last_revised_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "meta.llama3-2-3b-instruct-v1:0",
         regions: LLAMA_3_2_REGIONS,
+        published_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
+        last_revised_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "meta.llama3-2-90b-instruct-v1:0",
         regions: LLAMA_3_2_REGIONS,
+        published_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
+        last_revised_at: LLAMA_3_2_PROFILES_PUBLISHED_AT,
     },
     CrossRegionModel {
         model_id: "meta.llama3-3-70b-instruct-v1:0",
         regions: &["us-east-1", "us-east-2", "us-west-2"],
+        published_at: "2024-12-06T00:00:00Z",
+        last_revised_at: "2024-12-06T00:00:00Z",
     },
 ];
+
+/// The day the cross-region profiles over the Amazon Nova text models came into being: the
+/// line was launched with cross-region routing already turned on for it, so its profiles
+/// were published with the models themselves.
+const NOVA_PROFILES_PUBLISHED_AT: &str = "2024-12-03T00:00:00Z";
+
+/// The day the cross-region profiles over the Meta Llama 3.1 models came into being — the
+/// two sizes of that line got theirs together, which is why the day is stated once, as
+/// their region list is.
+const LLAMA_3_1_PROFILES_PUBLISHED_AT: &str = "2024-11-01T00:00:00Z";
+
+/// The day the cross-region profiles over the Meta Llama 3.2 generation came into being:
+/// that generation was launched with cross-region routing turned on for it.
+const LLAMA_3_2_PROFILES_PUBLISHED_AT: &str = "2024-09-25T00:00:00Z";
 
 /// The regions the Meta Llama 3.2 models are offered in: the two US regions that hold a
 /// copy of them, which is what the profile published over each one routes to.
@@ -460,9 +525,9 @@ const LLAMA_3_1_REGIONS: &[&str] = &[
 /// into being before the capability it belongs to was offered, however long its model had
 /// been available by then.
 ///
-/// The lower bound of every published profile's instants
-/// ([`cross_region_profile_published_at`]); a profile for a model that launched later came
-/// into being with THAT model instead.
+/// The lower bound of every row's instants ([`CrossRegionModel::published_at`]), and the day
+/// the first of them were published, which is why the rows published then name it rather
+/// than repeating the date.
 pub const CROSS_REGION_PROFILES_PUBLISHED_AT: &str = "2024-08-26T00:00:00Z";
 
 /// How many regions of a geography must hold a model's copy for a cross-region profile to
@@ -485,32 +550,15 @@ pub(super) fn cross_region_routed_regions(
         .collect()
 }
 
-/// The instant a published cross-region profile for `model` came into being: the later of
-/// the day cross-region inference profiles began being published
-/// ([`CROSS_REGION_PROFILES_PUBLISHED_AT`]) and the day the model itself launched
-/// ([`FoundationModel::start_of_life_time`]).
-///
-/// A profile can be no older than either of the two, and nothing has updated it since, so
-/// it is what both `createdAt` and `updatedAt` report. Both are RFC 3339 days written in
-/// this file, which order lexicographically as they order in time.
-#[must_use]
-pub fn cross_region_profile_published_at(model: &FoundationModel) -> &'static str {
-    if model.start_of_life_time > CROSS_REGION_PROFILES_PUBLISHED_AT {
-        model.start_of_life_time
-    } else {
-        CROSS_REGION_PROFILES_PUBLISHED_AT
-    }
-}
-
 /// The BRAND a published cross-region profile names its model by, after the geography's
 /// own label.
 ///
 /// A model's brand is what its publisher sells it as: the provider's name followed by the
 /// model's name for a model published by a third party, and the model's name alone for one
 /// AWS publishes itself ([`AWS_MODEL_PROVIDER`]), because AWS does not brand its own models
-/// by its provider name. Both halves are the row's own published members
-/// ([`FoundationModel::provider_name`], [`FoundationModel::model_name`]), so a profile
-/// names a model exactly as the model catalogue does.
+/// by its provider name. The provider half is the row's own published member
+/// ([`FoundationModel::provider_name`]) and the model half is the model's name at FULL
+/// length ([`full_model_name`]), so a profile names a model the way its publisher does.
 ///
 /// A brand is reported AS PUBLISHED, version separator included, so a name may carry a `.`
 /// that `InferenceProfileName`'s pattern (`^([0-9a-zA-Z][ _-]?)+$`) does not admit. That
@@ -520,12 +568,47 @@ pub fn cross_region_profile_published_at(model: &FoundationModel) -> &'static st
 /// name no client could look the model up by.
 #[must_use]
 pub fn cross_region_model_brand(model: &FoundationModel) -> String {
+    let name = full_model_name(model);
     if model.provider_name == AWS_MODEL_PROVIDER {
-        model.model_name.to_string()
+        name.to_string()
     } else {
-        format!("{} {}", model.provider_name, model.model_name)
+        format!("{} {name}", model.provider_name)
     }
 }
+
+/// The model's name at FULL length: what a resource published OVER the model names it by.
+///
+/// `FoundationModelSummary$modelName` is a `BrandedName` (@length 1..20), so a model whose
+/// published name is longer than that is carried in the catalogue under the shortened form
+/// that shape admits ([`FoundationModel::model_name`]) — while the resources published over
+/// the model are under no such bound (`InferenceProfileName` is @length 1..64) and name it
+/// whole. Dropping the tail of the name there would report a profile under a name its
+/// model is published under nowhere, which is what a client looks the profile up by.
+///
+/// Only a model whose full name does not fit `BrandedName` is written in
+/// [`FULL_MODEL_NAMES`]; for every other model the catalogue's name IS the full one, so the
+/// two cannot disagree.
+#[must_use]
+fn full_model_name(model: &FoundationModel) -> &'static str {
+    FULL_MODEL_NAMES
+        .iter()
+        .find(|(model_id, _)| *model_id == model.model_id)
+        .map_or(model.model_name, |(_, full)| *full)
+}
+
+/// The full published name of each model whose name the catalogue carries shortened,
+/// because the whole of it is longer than `BrandedName` admits.
+///
+/// The names are the ones the recorded listings publish for those models: an
+/// instruction-tuned variant of a Meta Llama model is published as "… Instruct", the
+/// qualifier its `modelId` carries as `-instruct`, and the three rows here are the Llama
+/// models whose name does not fit in twenty characters with it. A model whose full name
+/// does fit is in no row: its catalogue name is already the whole of it.
+const FULL_MODEL_NAMES: &[(&str, &str)] = &[
+    ("meta.llama3-1-70b-instruct-v1:0", "Llama 3.1 70B Instruct"),
+    ("meta.llama3-1-8b-instruct-v1:0", "Llama 3.1 8B Instruct"),
+    ("meta.llama3-3-70b-instruct-v1:0", "Llama 3.3 70B Instruct"),
+];
 
 /// The ARN of a system-defined inference profile in `region`:
 /// `arn:aws:bedrock:<region>:<account>:inference-profile/<id>`.
@@ -608,11 +691,11 @@ pub(super) fn region_list(regions: &[&str]) -> String {
 /// of the regions the profile's own model is offered in ([`cross_region_routed_regions`]):
 /// routing across one region is not cross-region routing. Each one reports one model per
 /// region it routes to — the base model's copy there, and only where that copy exists —
-/// names those same regions in its description, and carries the instant a resource nobody
-/// created came into being ([`cross_region_profile_published_at`]) as both `createdAt` and
-/// `updatedAt`, because nothing has updated it since. None of them is bound to a toolbox:
-/// Amazon Bedrock binds no toolbox to a profile it publishes itself, so each one STATES
-/// that it is bound to none.
+/// names those same regions in its description, and reports the two instants its own row
+/// publishes ([`CrossRegionModel::published_at`], [`CrossRegionModel::last_revised_at`]):
+/// when that profile came into being, and when its record last changed. None of them is
+/// bound to a toolbox: Amazon Bedrock binds no toolbox to a profile it publishes itself, so
+/// each one STATES that it is bound to none.
 #[must_use]
 pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSummary> {
     let Some(geography) = inference_profile_geography(region) else {
@@ -627,7 +710,6 @@ pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSu
                 return None;
             }
             let id = format!("{}.{}", geography.prefix, model.model_id);
-            let published_at = published_instant(cross_region_profile_published_at(model));
             Some(InferenceProfileSummary {
                 inference_profile_name: format!(
                     "{} {}",
@@ -635,8 +717,8 @@ pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSu
                     cross_region_model_brand(model)
                 ),
                 description: Some(system_defined_inference_profile_description(model, &routed)),
-                created_at: published_at,
-                updated_at: published_at,
+                created_at: published_instant(published.published_at),
+                updated_at: published_instant(published.last_revised_at),
                 inference_profile_arn: system_defined_inference_profile_arn(region, &id),
                 models: routed
                     .iter()

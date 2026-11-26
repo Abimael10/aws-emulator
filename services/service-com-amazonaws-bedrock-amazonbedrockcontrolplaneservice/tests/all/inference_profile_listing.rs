@@ -159,12 +159,12 @@ const CROSS_REGION_MODELS: &[(&str, &str, &[&str])] = &[
     ),
     (
         "meta.llama3-1-70b-instruct-v1:0",
-        "Meta Llama 3.1 70B",
+        "Meta Llama 3.1 70B Instruct",
         LLAMA_3_1_REGIONS,
     ),
     (
         "meta.llama3-1-8b-instruct-v1:0",
-        "Meta Llama 3.1 8B",
+        "Meta Llama 3.1 8B Instruct",
         LLAMA_3_1_REGIONS,
     ),
     (
@@ -189,7 +189,7 @@ const CROSS_REGION_MODELS: &[(&str, &str, &[&str])] = &[
     ),
     (
         "meta.llama3-3-70b-instruct-v1:0",
-        "Meta Llama 3.3 70B",
+        "Meta Llama 3.3 70B Instruct",
         &["us-east-1", "us-east-2", "us-west-2"],
     ),
 ];
@@ -638,9 +638,10 @@ async fn the_published_cross_region_profiles_of_the_region_are_listed() {
             listing.body
         );
         // A published profile carries the three members the table above leaves to this row:
-        // the description stating which model it routes and to which regions, and the
-        // instant it came into being — the same for `createdAt` and `updatedAt`, because no
-        // call has updated a resource no call created.
+        // the description stating which model it routes and to which regions, and its own
+        // two instants — the day it was published and the instant its record last changed,
+        // which is no earlier than that day. The suite
+        // `published_profile_names_and_instants.rs` is where those two are pinned.
         let geography = geography_of(region);
         for summary in summaries(case, &listing) {
             let id = summary
@@ -673,13 +674,14 @@ async fn the_published_cross_region_profiles_of_the_region_are_listed() {
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| panic!("case {case:?}: a published profile carries updatedAt, got {summary:?}"))
                 .to_string();
-            assert_eq!(
-                created, updated,
-                "case {case:?}: nothing has updated a published profile, so the two instants \
-                 agree, got {summary:?}"
+            // Each is an instant on the wire, not an epoch number: `@timestampFormat`.
+            let created_at = date_time_seconds(case, &created);
+            let updated_at = date_time_seconds(case, &updated);
+            assert!(
+                updated_at >= created_at,
+                "case {case:?}: a profile's record cannot have changed before the profile \
+                 existed, got {summary:?}"
             );
-            // And it is an instant on the wire, not an epoch number: `@timestampFormat`.
-            date_time_seconds(case, &created);
         }
     }
 

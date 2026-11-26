@@ -888,7 +888,10 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         NO_FEATURES,
         "2025-02-20T00:00:00Z",
     ),
-    // Meta Llama.
+    // Meta Llama. A model whose published name is longer than `BrandedName` admits (@length
+    // 1..20) is named here by the SHORTENED form the catalogue reports; the resources
+    // published over it name it at length
+    // (`state/foundation_models/published_routing.rs`).
     also_provisioned(text_model(
         "meta.llama3-1-70b-instruct-v1:0",
         "Llama 3.1 70B",

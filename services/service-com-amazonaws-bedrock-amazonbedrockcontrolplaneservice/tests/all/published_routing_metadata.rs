@@ -15,14 +15,16 @@
 //! 2. **Its description names exactly those regions**, in the same order, as one sentence
 //!    ending in a period: a reader of the sentence and a reader of `models` learn the same
 //!    region set.
-//! 3. **Its `createdAt` and `updatedAt` are one instant**, no earlier than the day the
-//!    model it routes to launched — which `GetFoundationModel` reports as
-//!    `modelLifecycle.startOfLifeTime` while the model is offered, and which the row the
-//!    published catalogues keep for it carries once it is not — and no earlier than the day
-//!    Amazon Bedrock began publishing cross-region profiles, because a profile predates
-//!    neither. A published profile OUTLIVES the offering of its model: AWS goes on
-//!    publishing it once the model is past its end of life, so a read of that model reports
-//!    it missing while the profile goes on being listed.
+//! 3. **Its `createdAt` is the day that profile was published and its `updatedAt` the
+//!    instant its record last changed**, each read off the profile's own published row
+//!    rather than computed from its model: `updatedAt` is no earlier than `createdAt`, and
+//!    neither is earlier than the day the model it routes to launched — which
+//!    `GetFoundationModel` reports as `modelLifecycle.startOfLifeTime` while the model is
+//!    offered, and which the row the published catalogues keep for it carries once it is
+//!    not — or than the day Amazon Bedrock began publishing cross-region profiles, because
+//!    a profile predates neither. A published profile OUTLIVES the offering of its model:
+//!    AWS goes on publishing it once the model is past its end of life, so a read of that
+//!    model reports it missing while the profile goes on being listed.
 //! 4. **A published prompt router's description names its model LINE**, at line level: no
 //!    version qualifier, so the description carries no digit, while the `modelFamily` the
 //!    fallback model is reported under is a generation OF that line.
@@ -41,7 +43,9 @@
 use serde_json::Value;
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
-use crate::support::{emulator, foundation_model_arn, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    date_time_seconds, emulator, foundation_model_arn, label, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// Whether the published catalog OFFERS `model_id` — as against publishing a routing
 /// resource over it once it is offered no longer.
@@ -323,7 +327,7 @@ async fn a_profile_is_published_only_where_its_model_is_offered() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 3. A profile's two instants are one instant, bounded below by model and capability.
+// 3. A profile's two instants are its own, bounded below by model and capability.
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -336,10 +340,14 @@ async fn a_published_profile_came_into_being_with_its_model_or_with_the_capabili
             let case = format!("{case} / {profile_id}");
             let created = text(&summary, "createdAt");
             let updated = text(&summary, "updatedAt");
-            assert_eq!(
-                created, updated,
-                "case {case:?}: nothing has updated a published profile, so its two \
-                 instants agree, got {summary:?}"
+            // Read as instants rather than as text: two renderings of one instant differ
+            // in their fraction, so only the instants they denote may be ordered.
+            let created_at = date_time_seconds(&case, &created);
+            let updated_at = date_time_seconds(&case, &updated);
+            assert!(
+                updated_at >= created_at,
+                "case {case:?}: a profile's record cannot have changed before the profile \
+                 was published, got {summary:?}"
             );
 
             // The launch the control plane itself reports for the model behind the profile,
@@ -348,18 +356,18 @@ async fn a_published_profile_came_into_being_with_its_model_or_with_the_capabili
             // holds is the day the capability itself began being published.
             let model_id = profile_model_id(&profile_id);
             let read = get_model(&emu, region, &model_id).await;
+            let capability_at = date_time_seconds(&case, PROFILES_PUBLISHED_AT);
+            assert!(
+                created_at >= capability_at,
+                "case {case:?}: a profile predates the capability it belongs to by nothing, \
+                 so it was published no earlier than {PROFILES_PUBLISHED_AT}, got {created:?}"
+            );
             if !is_offered(&model_id) {
                 assert_eq!(
                     read.status, 404,
                     "case {case:?}: the model behind this profile is offered no longer, so a \
                      read of it must report it missing, got {} {:?}",
                     read.status, read.body
-                );
-                assert!(
-                    created.as_str() >= PROFILES_PUBLISHED_AT,
-                    "case {case:?}: a profile predates the capability it belongs to by \
-                     nothing, so its instant is no earlier than {PROFILES_PUBLISHED_AT}, got \
-                     {created:?}"
                 );
                 continue;
             }
@@ -375,16 +383,10 @@ async fn a_published_profile_came_into_being_with_its_model_or_with_the_capabili
                 "case {case:?}: GetFoundationModel must report the model's launch, got {:?}",
                 read.body
             );
-            // RFC 3339 days of the same form order lexicographically as they order in time.
-            let expected = if launched.as_str() > PROFILES_PUBLISHED_AT {
-                launched.clone()
-            } else {
-                PROFILES_PUBLISHED_AT.to_string()
-            };
-            assert_eq!(
-                created, expected,
-                "case {case:?}: a profile came into being with the capability (launched \
-                 {launched:?}), so it predates neither, got {summary:?}"
+            assert!(
+                created_at >= date_time_seconds(&case, &launched),
+                "case {case:?}: a profile predates the model it routes to by nothing \
+                 (launched {launched:?}), got {summary:?}"
             );
         }
     }
