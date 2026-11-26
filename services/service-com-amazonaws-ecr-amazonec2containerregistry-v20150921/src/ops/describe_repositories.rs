@@ -217,10 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(fault_error)?;
 
         let region = crate::state::request_region(ctx.parts());
-        // Every repository is reported at the address this emulator answers THIS caller's
-        // registry requests at (`crate::state::registry_address`), which is the authority its
-        // `repositoryUri` is published on.
-        let published_endpoint = crate::state::announced_registry_endpoint(ctx);
+        // Every repository is published at its own registry's host — this account's registry
+        // in the repository's Region — over the zone this emulator announces its registry
+        // names in (`crate::state::registry_address`), which is the authority its
+        // `repositoryUri` carries.
+        let announced_zone = crate::state::announced_registry_zone(ctx);
         let store = state.lock();
 
         // A read that ENUMERATES the repositories to report PROJECTS that list onto the
@@ -241,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|name| {
                     store
                         .repository(&region, name)
-                        .map(|repo| repo.to_repository(&published_endpoint))
+                        .map(|repo| repo.to_repository(&announced_zone))
                 })
                 .collect::<Result<Vec<Repository>, _>>()
                 .map_err(fault_error)?;
@@ -263,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|repo| {
                 (
                     repo.creation_order_key(),
-                    repo.to_repository(&published_endpoint),
+                    repo.to_repository(&announced_zone),
                 )
             })
             .collect();

@@ -3,30 +3,29 @@
 //! The URI Amazon ECR reports for a repository, end to end over the wire.
 //!
 //! The rule under test: **`Repository$repositoryUri` is the ADDRESS a client reaches the
-//! repository at — the endpoint this emulator answers that caller's registry requests at,
-//! host and port together, followed by `/` and the repository's own name.** The member says
-//! what the value is for ("The URI for the repository. You can use this URI for container
-//! image `push` and `pull` operations"), and a container client reads it by splitting it on
-//! the first `/`: it DIALS the authority ahead of that `/` and asks for the repository the
-//! path names.
+//! repository at — its registry's own host, this account's registry in the Region the
+//! repository is held in, written over the zone this emulator announces its own names in,
+//! followed by `/` and the repository's own name.** The member says what the value is for
+//! ("The URI for the repository. You can use this URI for container image `push` and `pull`
+//! operations"), and a container client reads it by splitting it on the first `/`: it DIALS
+//! the authority ahead of that `/` and asks for the repository the path names, while a client
+//! that reads the value recovers the registry from the authority's own labels.
 //!
-//! So the authority has to be an address this process is reached at, which is the same
-//! endpoint the URL a `docker login` is pointed at carries
-//! (`AuthorizationData$proxyEndpoint`): the registry host AWS publishes
+//! So the authority carries the label run every registry host carries — the owning account,
+//! `dkr`, `ecr`, the Region — over a zone that leads back to this process, and no port. The
+//! zone is never one AWS publishes its own endpoints in: the registry host AWS serves
 //! (`<registryId>.dkr.ecr.<region>.amazonaws.com`, the registry URL form the model states in
-//! that member) resolves at the real Amazon ECR rather than at the machine this emulator runs
-//! on, so a client handed it leaves the emulated environment entirely, carrying the credential
-//! its `docker login` was issued — and a registry host this emulator composes for itself, in
-//! a zone of its own, resolves only where a resolver implements that zone. The endpoint this
-//! emulator is reached at resolves to the interface it is served on, and this registry's `/v2`
-//! plane answers there whatever host a request arrived on.
+//! `AuthorizationData$proxyEndpoint`) resolves at the real Amazon ECR rather than at the
+//! machine this emulator runs on, so a client handed it leaves the emulated environment
+//! entirely, carrying the credential its `docker login` was issued. The zone this emulator
+//! announces in resolves to the interface it is served on, and this registry's `/v2` plane
+//! answers there whatever host a request arrived on.
 //!
-//! That one endpoint answers for every Region's registry, so the address carries no registry
-//! identity of its own. Which registry HOLDS the repository is reported on the very response
-//! that carries the address instead — `Repository$registryId` is the owning account and
-//! `Repository$repositoryArn` names the Region — and those are LABELS off the stored record,
-//! so one repository name taken in two Regions is still two repositories, with two ARNs, each
-//! reached with the credential its Region's `docker login` was issued.
+//! The authority therefore names the registry that HOLDS the repository, which the very same
+//! response also reports beside it — `Repository$registryId` is the owning account and
+//! `Repository$repositoryArn` names the Region — as LABELS off the stored record, so one
+//! repository name taken in two Regions is still two repositories, with two ARNs and two
+//! published names, each reached with the credential its Region's `docker login` was issued.
 //!
 //! The class the rule generalises over is the Region the repository was created in crossed
 //! with the repository name: the rows below span Regions of five partitions crossed with the
@@ -54,7 +53,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
     at, call_in_region, emulator, given_layer_in_region, ok_in_region,
-    published_registry_authority, published_repository_uri, registry_get, registry_host_in,
+    published_registry_authority_in, published_repository_uri_in, registry_get, registry_host_in,
     REGISTRY_ID,
 };
 
@@ -102,17 +101,17 @@ fn reported_uri(case: &str, body: &Value, pointer: &str) -> String {
         .to_string()
 }
 
-/// Assert `uri` is the authority this emulator publishes the repository `name` at, with the
-/// repository's name as its path: the endpoint this emulator answers the caller's registry
-/// requests at — and never the host AWS serves that Region's registry at, nor a registry host
-/// composed in a zone of this emulator's own, because no listener here answers for either.
+/// Assert `uri` is the authority this emulator publishes the repository `name` of `region`'s
+/// registry at, with the repository's name as its path: that registry's own host over the zone
+/// this emulator announces its names in — and never the host AWS serves that Region's registry
+/// at, because no listener here answers for a name AWS serves.
 fn assert_published_address(case: &str, uri: &str, region: &str, name: &str) {
     let (authority, path) = uri
         .split_once('/')
         .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no repository path"));
     assert_eq!(
         authority,
-        published_registry_authority(),
+        published_registry_authority_in(region),
         "case {case:?}: expected the host of {uri:?} to be the registry authority this \
          emulator publishes this repository at, got {authority:?}"
     );
@@ -127,13 +126,11 @@ fn assert_published_address(case: &str, uri: &str, region: &str, name: &str) {
         "case {case:?}: {uri:?} names the host AWS publishes for this account's registry in \
          {region:?}, which resolves nowhere near this process"
     );
-    // Neither the account nor the Region is composed into the address: the endpoint answers
-    // for every registry this emulator serves, and a name carrying those labels in a zone of
-    // this emulator's own is a name nothing resolves.
+    // The account and the Region ARE composed into the address, in the one layout every
+    // registry host carries — what this emulator's own is written over is its own zone.
     assert!(
-        !authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
-        "case {case:?}: expected an address this emulator answers on, got the registry host \
-         spelling {authority:?}"
+        authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
+        "case {case:?}: expected the registry host spelling in {authority:?}"
     );
     for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
         assert!(
@@ -150,7 +147,7 @@ async fn every_operation_reports_the_address_the_repository_is_published_at() {
     for region in REGISTRY_REGIONS {
         for name in REPOSITORY_NAMES {
             let case = format!("{region}, repository {name}");
-            let expected = published_repository_uri(name);
+            let expected = published_repository_uri_in(region, name);
 
             let created = ok_in_region(
                 &router,
@@ -300,8 +297,8 @@ async fn a_client_recovers_the_registry_the_account_and_the_region_beside_the_re
 #[tokio::test]
 async fn one_name_in_two_registries_is_told_apart_by_the_members_that_carry_that_identity() {
     // One name in several Regions is several repositories, and what tells them apart is the
-    // identity each reports — its own Region's ARN — because the address each is published at
-    // is the one this emulator answers every registry's requests at.
+    // identity each reports — its own Region's ARN — which the address each is published at
+    // names as well, since that address is its own registry's host.
     let router = emulator();
     let name = "shared-name";
     let mut arns: Vec<String> = Vec::new();
@@ -324,7 +321,7 @@ async fn one_name_in_two_registries_is_told_apart_by_the_members_that_carry_that
         )
         .await;
         let uri = reported_uri(&case, &described, "/repositories/0/repositoryUri");
-        let expected = published_repository_uri(name);
+        let expected = published_repository_uri_in(region, name);
         assert_eq!(
             uri, expected,
             "case {case:?}: expected {expected:?}, got {uri:?}"
@@ -369,7 +366,7 @@ async fn a_pull_at_the_reported_uri_reaches_the_repository_it_names() {
         let reported = reported_uri(&case, &created, "/repository/repositoryUri");
         assert_eq!(
             reported,
-            published_repository_uri(name),
+            published_repository_uri_in(region, name),
             "case {case:?}: expected the address this repository is published at, got \
              {reported:?}"
         );
@@ -411,9 +408,10 @@ async fn a_pull_at_the_reported_uri_reaches_the_repository_it_names() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: expected an authorizationToken, got {issued}"))
             .to_string();
-        // The login URL is the endpoint this caller reached, behind a scheme; the
-        // repository's own URI is that same address with the repository as its path, which is
-        // what this pair says.
+        // The login URL is the endpoint this caller reached, behind a scheme: it is dialled as
+        // it is handed over. The repository's own URI is a NAME instead — its registry's host
+        // in that endpoint's zone — and this registry's `/v2` plane answers at either, which
+        // is what this pair says.
         let proxy_endpoint = at(&issued, "/authorizationData/0/proxyEndpoint")
             .as_str()
             .unwrap_or_default()
@@ -424,11 +422,10 @@ async fn a_pull_at_the_reported_uri_reaches_the_repository_it_names() {
             "case {case:?}: expected the login URL to name the endpoint this emulator \
              answers this caller at, got {proxy_endpoint:?}"
         );
-        assert_eq!(
-            format!("https://{reported_host}"),
-            proxy_endpoint,
-            "case {case:?}: expected the repository to be published at the address the login \
-             URL names, got {reported:?} beside {proxy_endpoint:?}"
+        assert!(
+            reported_host.ends_with(&format!(".{}", crate::wire::ANNOUNCED_ZONE)),
+            "case {case:?}: expected the repository to be published in the zone of the \
+             endpoint the login URL names, got {reported:?} beside {proxy_endpoint:?}"
         );
 
         let pulled = pull_manifest(&router, reported_host, reported_path, &token).await;
@@ -502,7 +499,7 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
     for pair in REGION_PAIRS {
         let router = emulator();
         let case = format!("{}, repository {}", pair.case, pair.name);
-        let expected = published_repository_uri(pair.name);
+        let expected = published_repository_uri_in(pair.home, pair.name);
 
         let created = ok_in_region(
             &router,
@@ -590,8 +587,7 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
         );
 
         // The second Region's registry does not hold the name, so the same create succeeds
-        // there, reporting its own registry's ARN at the one address this emulator answers
-        // every registry's requests at.
+        // there, reporting its own registry's ARN at its own registry's published authority.
         let elsewhere = ok_in_region(
             &router,
             &case,
@@ -605,24 +601,22 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let expected_elsewhere = published_repository_uri(pair.name);
+        let expected_elsewhere = published_repository_uri_in(pair.other, pair.name);
         assert_eq!(
             other_uri, expected_elsewhere,
             "case {case:?}: expected {expected_elsewhere:?}, got {other_uri:?}"
         );
-        assert_eq!(
+        assert_ne!(
             other_uri, home_uri,
-            "case {case:?}: expected one name in two registries to be published at the one \
-             address this emulator answers every registry's requests at, got {other_uri:?} \
-             and {home_uri:?}"
+            "case {case:?}: expected one name in two registries to be published under each \
+             registry's own name, got {other_uri:?} for both"
         );
-        // The address says nothing about which registry holds the repository, so the two are
-        // told apart by the identity each reports: the ARN names that Region.
+        // Each address names the registry that holds the repository, and the identity reported
+        // beside it says the same: the ARN names that Region.
         for (region, uri) in [(pair.home, &home_uri), (pair.other, &other_uri)] {
             assert_published_address(&case, uri, region, pair.name);
         }
-        // What tells the two apart is the identity each reports, not the address: the ARN
-        // names the Region of the registry holding it.
+        // The ARN names the Region of the registry holding it.
         for (region, arn) in [(pair.home, &home_arn), (pair.other, &other_arn)] {
             assert!(
                 arn.contains(&format!(":{region}:")),
@@ -653,10 +647,10 @@ async fn a_pull_with_each_regions_credential_reaches_that_regions_own_image() {
     // What telling the two apart is FOR: with one name in two registries, the reported URI
     // is followed the way a container client follows it — split at the first '/', dialled,
     // and pulled from with the credential that Region's `docker login` token carries — and
-    // answers the manifest THAT Region's repository holds. The address answers for every
-    // registry this emulator serves, so the credential is what says which registry the pull
-    // addresses; the two manifests differ, so a pull that reached the other registry answers
-    // the wrong document rather than nothing.
+    // answers the manifest THAT Region's repository holds. Each address names its own
+    // registry, and this registry's `/v2` plane answers whatever host a request arrived on;
+    // the two manifests differ, so a pull that reached the other registry answers the wrong
+    // document rather than nothing.
     for pair in REGION_PAIRS {
         let router = emulator();
         let case = format!("{}, repository {}", pair.case, pair.name);
@@ -717,12 +711,12 @@ async fn a_pull_with_each_regions_credential_reaches_that_regions_own_image() {
             let (authority, path) = uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no repository path"));
-            // Each Region's repository is published at the one address this emulator answers
-            // on, with the repository as the path.
+            // Each Region's repository is published under that Region's registry name, with
+            // the repository as the path.
             assert_published_address(&case, uri, region, pair.name);
             // The token's own registry URL is the endpoint this caller reached, behind a
-            // scheme: it is DIALLED as it is handed over, and the credential it carries is
-            // what says which Region's registry the pull addresses.
+            // scheme: it is DIALLED as it is handed over, so it carries the address and the
+            // port this process answers on rather than a name to resolve.
             assert_eq!(
                 proxy_endpoint,
                 crate::wire::announced_registry_url(),
@@ -888,7 +882,7 @@ async fn a_cached_repository_is_reported_at_the_address_it_is_published_at() {
         let described = import_and_describe(&router, import, &repository).await;
 
         let reported = reported_uri(case, &described, "/repositories/0/repositoryUri");
-        let expected = published_repository_uri(&repository);
+        let expected = published_repository_uri_in(import.region, &repository);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected {expected:?}, got {reported:?}"
@@ -904,9 +898,9 @@ async fn a_cached_repository_is_reported_at_the_address_it_is_published_at() {
 #[tokio::test]
 async fn one_cached_path_in_two_regions_is_told_apart_by_its_registrys_identity() {
     // What the URI is FOR: a client stores the reported value as an image reference it
-    // dials, so each Region's mirror of one cached path is published at the one address this
-    // emulator answers on — and what tells the two apart is the ARN each carries. The same
-    // rule and the same covered path are imported in each Region of a pair.
+    // dials, so each Region's mirror of one cached path is published under that Region's own
+    // registry name — which the ARN each carries names as well. The same rule and the same
+    // covered path are imported in each Region of a pair.
     const PAIRS: &[(&str, &str, &str)] = &[
         ("two commercial Regions", "us-east-1", "eu-west-1"),
         ("two partitions", "us-west-2", "cn-north-1"),
@@ -934,7 +928,7 @@ async fn one_cached_path_in_two_regions_is_told_apart_by_its_registrys_identity(
             let uri = reported_uri(case, &described, "/repositories/0/repositoryUri");
             assert_eq!(
                 uri,
-                published_repository_uri(&repository),
+                published_repository_uri_in(region, &repository),
                 "case {case:?}: expected the address this emulator publishes the repository \
                  at in {region:?}, got {uri:?}"
             );
@@ -993,7 +987,7 @@ async fn a_cached_repository_and_a_created_one_are_reported_the_same_way() {
     ] {
         assert_eq!(
             *uri,
-            published_repository_uri(repository),
+            published_repository_uri_in(import.region, repository),
             "case {what:?}: expected the published address of {repository:?}, got {uri:?}"
         );
         assert_published_address(what, uri, import.region, repository);
@@ -1082,7 +1076,7 @@ async fn the_reported_uri_is_the_reference_a_client_pulls_the_image_by() {
         )
         .await;
         let reported = reported_uri(&case, &created, "/repository/repositoryUri");
-        let expected = published_repository_uri(&repository);
+        let expected = published_repository_uri_in(row.region, &repository);
         assert_eq!(
             reported, expected,
             "case {case:?}: expected {expected:?}, got {reported:?}"

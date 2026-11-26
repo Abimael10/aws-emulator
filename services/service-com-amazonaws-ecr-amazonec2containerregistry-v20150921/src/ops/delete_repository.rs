@@ -245,12 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::key_grant::retire(ctx, &region, &removed.key_grants).await;
 
         Ok(DeleteRepositoryOutput {
-            // The echoed repository carries the same URI every read of it carried: the
-            // endpoint this emulator answers this caller's registry requests at, followed by
-            // the repository's name (`crate::state::registry_address`).
-            repository: Some(
-                removed.to_repository(&crate::state::announced_registry_endpoint(ctx)),
-            ),
+            // The echoed repository carries the same URI every read of it carried: its own
+            // registry's host over the zone this emulator announces its registry names in,
+            // followed by the repository's name (`crate::state::registry_address`).
+            repository: Some(removed.to_repository(&crate::state::announced_registry_zone(ctx))),
         })
     }
 }

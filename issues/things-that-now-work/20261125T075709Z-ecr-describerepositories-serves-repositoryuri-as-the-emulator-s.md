@@ -49,3 +49,37 @@ No status, error code or error message divergence is involved: the 200 body is w
    -> Emulator: the authority is the emulator's bare `127.0.0.1:<port>`, so the first label is `127`.
 4. Attempt what the field documents — resolve the authority, `docker login`/`push` against it, or extract the registry id and region from it: none is possible.
 5. Re-replay check ecr.ecracc-describe-unknown-repository-rejected to confirm the fix (note it continues past the URI assertion into DescribeRepositories duplicate-name and RepositoryNotFoundException coverage once the URI is correct).
+
+## Resolution
+`Repository$repositoryUri` is now composed in ONE place from the stored record's own registry:
+`Repo::to_repository` in
+`services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/src/state.rs` calls
+`registry_host_in_zone(registry_id, region, zone)` — the crate's one composer of a registry
+host — over the zone `announced_registry_zone` reads off the endpoint this emulator answers
+that caller at (`src/state/registry_address.rs`, through the tree's own
+`service_common::data_plane_addressing::announced_zone_of_authority`), followed by the
+repository's own name as the path. Every operation that reports a `Repository` passes that
+zone: `CreateRepository`, `DescribeRepositories`, `DeleteRepository`.
+
+Why there is no port on it, and how a client still reaches the registry: the member carries a
+NAME, as the value AWS publishes does, and the two things that make the name reach this
+registry are that its zone is one this process answers in (the zone RFC 6761 reserves for the
+interface the core binds its listeners on, or the name an operator serves this process under)
+and that the registry's `/v2` plane claims a request whatever host it arrived on
+(`src/service.rs`, `src/service/registry_v2.rs`). The address for a client that resolves
+nothing and dials what it was handed, port included, is the registry URL
+`GetAuthorizationToken` carries (`AuthorizationData$proxyEndpoint`, built on
+`announced_registry_endpoint`), which the same plane answers for the same credential — so the
+repository's URI says WHICH registry and repository is addressed, in the spelling every
+consumer of the member parses, and the login URL says where to open the connection on this
+machine. The module header of `src/state/registry_address.rs` states this split.
+
+Pinned by the crate's own `tests/all/repository_uri_registry_layout.rs`, which reads the
+authority label by label against the identity the same response reports and pulls the pushed
+manifest at it, plus `tests/all/repository_registry_uri.rs`,
+`tests/all/published_registry_address.rs`, `tests/all/repository_uri_is_served.rs`,
+`tests/all/repository_uri_is_dialable_wherever_served.rs`,
+`tests/all/cached_repository_registry_address.rs` and `tests/all/named_read_projection.rs`,
+and on the cross-service side by
+`core/router/tests/all/ecr_repository_uri_is_a_registry_authority_for_its_consumers.rs` and
+`core/router/tests/all/batch_job_definition_image_names_a_served_registry.rs`.

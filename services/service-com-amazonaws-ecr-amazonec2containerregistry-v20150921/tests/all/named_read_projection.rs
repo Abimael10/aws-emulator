@@ -25,27 +25,25 @@
 //! the requested list — its length, its order against the store's, and how often one name
 //! appears in it — rather than the names themselves.
 //!
-//! **`Repository$repositoryUri` is the ADDRESS this registry answers the reading caller's
-//! registry requests at, followed by `/` and the repository's own name.** The member says
-//! what the value is for ("The URI for the repository. You can use this URI for container
-//! image `push` and `pull` operations"), and a client DIALS it, splitting it on the first `/`.
-//! This suite asserts that out of the very response that carries the value and the token the
-//! same registry issues: the authority is the one the URL a `docker login` is pointed at
-//! carries (`AuthorizationData$proxyEndpoint`) — so a client logs in and pulls at one address
-//! — and it is never a name in a zone AWS publishes its own endpoints in, which resolves at
-//! the real Amazon ECR rather than at the machine this emulator runs on, nor a registry host
-//! this emulator composed for itself, which no resolver answers for. WHICH registry holds the
-//! repository is reported BESIDE the address instead, by `registryId` and `repositoryArn`,
-//! and those two have to agree. Nothing here composes the expected address, so a value taken
-//! from anywhere but the endpoint this emulator answers on fails these tests.
+//! **`Repository$repositoryUri` is the ADDRESS a client reaches the repository at: the
+//! registry that HOLDS it, named the way every Amazon ECR registry host is — the owning
+//! account, the two fixed labels and that registry's Region — over the zone this emulator
+//! announces its own names in, followed by `/` and the repository's own name.** The member
+//! says what the value is for ("The URI for the repository. You can use this URI for container
+//! image `push` and `pull` operations"), and a client both DIALS it, splitting it on the first
+//! `/`, and READS the registry out of it. This suite asserts that out of the very response
+//! that carries the value: the account and the Region in the authority are the `registryId`
+//! and the ARN reported beside it, the path is the repository's own name, there is no port,
+//! and the zone is never one AWS publishes its own endpoints in — a name there resolves at
+//! the real Amazon ECR rather than at the machine this emulator runs on. Nothing here
+//! composes the expected address from a constant, so a value that took its identity from
+//! anywhere but the stored record fails these tests.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::published_registry_address::AWS_ENDPOINT_DNS_SUFFIXES;
-use crate::wire::{
-    call, call_in_region, emulator, ok, ok_in_region, published_registry_authority, REGION,
-};
+use crate::wire::{call, call_in_region, emulator, ok, ok_in_region, REGION};
 
 /// The repositories every projection case reads, in the order the store holds them in —
 /// ascending by name, which is what a read enumerating nothing reports.
@@ -55,13 +53,13 @@ const STORED: [&str; 3] = ["alpha", "bravo", "charlie"];
 /// `@length(min: 1, max: 100)`.
 const MAX_REQUESTED_NAMES: usize = 100;
 
-/// The two fixed labels every Amazon ECR registry host AWS publishes carries between the
-/// owning account's id and the registry's Region, as the registry URL format the model states
-/// spells them (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
-/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`"). No address this emulator answers
-/// on carries them: that name resolves at the real Amazon ECR, and the same layout in a zone
-/// of this emulator's own resolves nowhere. Spelled out here rather than imported so a value
-/// that slipped into that spelling fails this suite.
+/// The two fixed labels every Amazon ECR registry host carries between the owning account's
+/// id and the registry's Region, as the registry URL format the model states spells them
+/// (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
+/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`"). Every address this registry
+/// publishes carries them; what it does not carry is the ZONE AWS serves its own registries
+/// in. Spelled out here rather than imported so a value that lost that spelling fails this
+/// suite.
 const FIXED_REGISTRY_LABELS: [&str; 2] = ["dkr", "ecr"];
 
 /// One projection case: the list the read enumerates, and the repository names its answer
@@ -111,18 +109,20 @@ fn member(case: &str, repository: &Value, name: &str) -> String {
         .to_string()
 }
 
-/// Assert that `repository` reports the address a client reaches it at: the endpoint this
-/// registry answers that caller's registry requests at, followed by the repository's own
-/// name, with the identity of the registry that HOLDS it reported beside the address.
+/// Assert that `repository` reports the address a client reaches it at: the registry that
+/// HOLDS it, named as every Amazon ECR registry host is — the owning account, the two fixed
+/// labels and that registry's Region — over a zone of this emulator's own, followed by the
+/// repository's own name.
 ///
 /// Read exactly as a container client reads the value — split on the first `/`, then the
-/// authority — so the assertion is about the rule rather than about one composed string.
+/// authority's labels — and compared against the identity the SAME response reports beside
+/// it, so the assertion is about the rule rather than about one composed string.
 fn assert_published_uri(case: &str, repository: &Value, name: &str) {
     let uri = member(case, repository, "repositoryUri");
     let registry_id = member(case, repository, "registryId");
     let arn = member(case, repository, "repositoryArn");
     // `arn:<partition>:ecr:<region>:<account>:repository/<name>` — the identity the stored
-    // record carries, which is what the response reports beside the address.
+    // record carries, which is what the authority has to name.
     let arn_fields: Vec<&str> = arn.split(':').collect();
     let arn_region = *arn_fields
         .get(3)
@@ -147,41 +147,35 @@ fn assert_published_uri(case: &str, repository: &Value, name: &str) {
         path, name,
         "case {case:?}: expected the path of {uri:?} to be the repository's own name"
     );
-    assert_eq!(
-        authority,
-        published_registry_authority(),
-        "case {case:?}: expected the address this emulator answers this caller's registry \
-         requests at as the authority of {uri:?}"
-    );
-
-    // A `:port` belongs to the ADDRESS rather than to a name, so it is taken off before the
-    // host is read — and whatever is left of it must be a port.
-    let host = match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            assert!(
-                port.parse::<u16>().is_ok(),
-                "case {case:?}: expected a port after the host of {authority:?}, got {port:?}"
-            );
-            host
-        }
-        None => authority,
-    };
-    // No registry host composed on top of that address, and nothing in a zone AWS publishes
-    // its own endpoints in: neither resolves to this process.
-    let labels: Vec<&str> = host.split('.').collect();
+    // The leading labels are the registry this very response names: the owning account, the
+    // two fixed labels, the Region its ARN carries. What follows is the zone the registry is
+    // served in, which this emulator announces in its own.
+    let [dkr, ecr] = FIXED_REGISTRY_LABELS;
+    let names_the_registry = format!("{registry_id}.{dkr}.{ecr}.{arn_region}.");
     assert!(
-        !labels
-            .windows(FIXED_REGISTRY_LABELS.len())
-            .any(|run| run == FIXED_REGISTRY_LABELS),
-        "case {case:?}: expected an address this emulator answers on, got the registry host \
-         spelling {host:?}, which no resolver answers for"
+        authority.starts_with(&names_the_registry),
+        "case {case:?}: expected the authority of {uri:?} to lead with \
+         {names_the_registry:?}, the registry this response reports, got {authority:?}"
     );
+    let zone = &authority[names_the_registry.len()..];
+    assert!(
+        !zone.is_empty(),
+        "case {case:?}: expected a zone behind the registry's labels in {authority:?}"
+    );
+    // An ADDRESS a client dials on the registry's own port, as the value AWS publishes is: a
+    // port is no part of the name.
+    assert!(
+        !authority.contains(':'),
+        "case {case:?}: expected no port in the authority of {uri:?}, got {authority:?}"
+    );
+    // The zone is never one AWS publishes its own endpoints in: a name there resolves at the
+    // real Amazon ECR rather than at this process.
     assert!(
         !AWS_ENDPOINT_DNS_SUFFIXES
             .iter()
-            .any(|suffix| host == suffix.trim_start_matches('.') || host.ends_with(suffix)),
-        "case {case:?}: expected {host:?} to be an address this emulator is served at, got a \
-         name in a zone AWS publishes its own endpoints in"
+            .any(|suffix| zone == suffix.trim_start_matches('.') || zone.ends_with(suffix)),
+        "case {case:?}: expected {zone:?} to be a zone this emulator answers in, got a name \
+         in a zone AWS publishes its own endpoints in"
     );
 }
 

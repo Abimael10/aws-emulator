@@ -3,14 +3,16 @@
 //! The address a repository is published at where BOTH endpoints move: the one a caller
 //! REACHED this emulator on and the one this emulator is SERVED at.
 //!
-//! The rule under test: **`Repository$repositoryUri` is the endpoint this emulator answers
-//! THAT caller's registry requests at — the endpoint the caller reached, whenever a `/v2`
-//! request addressed there reaches this registry, and otherwise the address this emulator is
-//! served at — followed by `/` and the repository's own name.** The member states what the
-//! value is for ("The URI for the repository. You can use this URI for container image `push`
-//! and `pull` operations"), so a container client splits it on the first `/` and DIALS what is
-//! ahead of that `/`: the authority has to be an address that client can open a connection
-//! to.
+//! The rule under test: **`Repository$repositoryUri` is this registry's own host — the owning
+//! account, the two fixed labels and the repository's Region — written over the zone this
+//! emulator announces its own names in, which is the zone of the endpoint it answers THAT
+//! caller's registry requests at (the endpoint the caller reached, whenever a `/v2` request
+//! addressed there reaches this registry, and otherwise the address this emulator is served
+//! at), followed by `/` and the repository's own name.** The member states what the value is
+//! for ("The URI for the repository. You can use this URI for container image `push` and
+//! `pull` operations"), so a container client splits it on the first `/` and DIALS what is
+//! ahead of that `/`, while a client that reads the value recovers the registry from the same
+//! labels: the authority has to name the registry AND to lead back to this process.
 //!
 //! What this suite adds to its siblings is the CROSS of the two axes they hold fixed, each on
 //! its own: `crate::published_registry_address` drives the endpoint a CALL arrived on against
@@ -19,11 +21,11 @@
 //! disagree — a caller that reached an address it can dial while this process is served under
 //! a name of an operator's own, or a caller that reached a host naming another service, or one
 //! registry, while the served address answers for them all. Each row below pairs a served
-//! address with an arrival host and states which of the two the value must carry, then reads
-//! that back through every operation that serializes a `Repository` — the three the fix this
-//! suite guards covers — and DIALS the authority with the credential `GetAuthorizationToken`
-//! issued that same caller, so the published address is shown to reach this registry rather
-//! than merely to carry the right shape.
+//! address with an arrival host and states which of the two the published NAME's zone is taken
+//! from, then reads that back through every operation that serializes a `Repository` — the
+//! three the fix this suite guards covers — and DIALS the published authority with the
+//! credential `GetAuthorizationToken` issued that same caller, so the published address is
+//! shown to reach this registry rather than merely to carry the right shape.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -31,8 +33,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::wire::{at, emulator_served_at, registry_get, REGISTRY_ID};
 
 /// One pairing of the two endpoints: where this emulator is SERVED, the `Host` a caller
-/// ARRIVED on, and the authority a repository that caller creates or reads must be published
-/// at.
+/// ARRIVED on, the endpoint a `docker login` of that caller is pointed at, and the zone every
+/// registry name reported to it is written over.
 struct Pairing {
     case: &'static str,
     /// The base URL the router is served at, which is what `OperationContext::endpoint`
@@ -40,11 +42,15 @@ struct Pairing {
     served_base: &'static str,
     /// The `Host` the caller's own calls carry.
     reached: &'static str,
-    /// The authority the published URI must carry: the arrival host where a registry request
-    /// addressed there reaches this registry, and the served address where it does not.
-    /// Spelled out per row rather than derived, so a value built on anything else fails these
-    /// rows.
+    /// The endpoint this emulator answers that caller's registry requests at: the arrival
+    /// host where a registry request addressed there reaches this registry, and the served
+    /// address where it does not. Spelled out per row rather than derived, so a value built on
+    /// anything else fails these rows.
     published: &'static str,
+    /// The zone the registry names reported to that caller are written over: the zone of
+    /// `published` — the one RFC 6761 reserves for the loopback interface where that endpoint
+    /// is an address literal, and the host itself where it is a name.
+    zone: &'static str,
 }
 
 /// The pairings the rows drive. Each states WHY the value is the one it is, in the case text:
@@ -58,36 +64,42 @@ const PAIRINGS: &[Pairing] = &[
         served_base: "https://127.0.0.1:9297",
         reached: "api.ecr.us-west-2.amazonaws.com",
         published: "127.0.0.1:9297",
+        zone: "localhost",
     },
     Pairing {
         case: "a caller on the emulator's own socket, served under a name of an operator's own",
         served_base: "https://registry.emulator.test:8443",
         reached: "127.0.0.1:8443",
         published: "127.0.0.1:8443",
+        zone: "localhost",
     },
     Pairing {
         case: "a caller on the loopback name, served on an IPv6 socket",
         served_base: "https://[::1]:9443",
         reached: "localhost:9443",
         published: "localhost:9443",
+        zone: "localhost",
     },
     Pairing {
         case: "a caller on ANOTHER service's host, served at a host of this service",
         served_base: "https://ecr.localhost:8443",
         reached: "dynamodb.localhost:8443",
         published: "ecr.localhost:8443",
+        zone: "ecr.localhost",
     },
     Pairing {
         case: "a caller on a registry host of one Region, served on a loopback socket",
         served_base: "https://127.0.0.1:9297",
         reached: "000000000000.dkr.ecr.us-west-2.localhost:9297",
         published: "127.0.0.1:9297",
+        zone: "localhost",
     },
     Pairing {
         case: "a caller on the loopback name, served under an operator's name with no port",
         served_base: "https://registry.emulator.test",
         reached: "localhost",
         published: "localhost",
+        zone: "localhost",
     },
 ];
 
@@ -159,10 +171,11 @@ fn text(case: &str, body: &Value, pointer: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: every operation that serializes a Repository publishes it at the endpoint this
-// emulator answers THAT caller's registry requests at — the arrival endpoint where a registry
-// request addressed there reaches this registry, the served address otherwise — and that
-// authority answers this registry's Docker Registry v2 requests.
+// RULE: every operation that serializes a Repository publishes it under its own registry's
+// name — this account's registry in the repository's Region — written over the zone of the
+// endpoint this emulator answers THAT caller's registry requests at (the arrival endpoint
+// where a registry request addressed there reaches this registry, the served address
+// otherwise), and that authority answers this registry's Docker Registry v2 requests.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -172,7 +185,9 @@ async fn the_published_address_pairs_the_reached_endpoint_with_the_served_one() 
         for region in HOLDING_REGIONS {
             for name in REPOSITORY_NAMES {
                 let case = format!("{}, {region}, repository {name}", pairing.case);
-                let expected = format!("{}/{name}", pairing.published);
+                let authority =
+                    format!("{REGISTRY_ID}.dkr.ecr.{region}.{}", pairing.zone);
+                let expected = format!("{authority}/{name}");
 
                 let created = call_at(
                     &router,
@@ -191,7 +206,8 @@ async fn the_published_address_pairs_the_reached_endpoint_with_the_served_one() 
                 );
 
                 // The identity the response reports BESIDE the address, off the stored record:
-                // the address names no registry, so this is where a reader takes one from.
+                // the address names the registry too, and these are what a reader takes it
+                // from without parsing anything.
                 let registry_id = text(&case, &created, "/repository/registryId");
                 let arn = text(&case, &created, "/repository/repositoryArn");
                 assert_eq!(
@@ -228,8 +244,9 @@ async fn the_published_address_pairs_the_reached_endpoint_with_the_served_one() 
                     );
                 }
 
-                // The URL a `docker login` of that same caller is pointed at carries that one
-                // authority too, so a client logs in and pushes at one address.
+                // The URL a `docker login` of that same caller is pointed at is dialled as
+                // given, so it carries the endpoint this emulator answers that caller at —
+                // the very endpoint whose zone the published name is written over.
                 let issued = call_at(
                     &router,
                     &case,
@@ -245,21 +262,23 @@ async fn the_published_address_pairs_the_reached_endpoint_with_the_served_one() 
                 });
                 assert_eq!(
                     dialled, pairing.published,
-                    "case {case:?}: expected the login URL to carry the address the repository \
-                     is published at, got {proxy_endpoint:?}"
+                    "case {case:?}: expected the login URL to carry the endpoint this emulator \
+                     answers this caller at, got {proxy_endpoint:?}"
                 );
 
                 // What the address is FOR: dialled as it was handed over, with the credential
-                // this call issued, this registry's `/v2` plane answers there.
+                // this call issued, this registry's `/v2` plane answers at the published name
+                // and at the login URL's endpoint alike.
                 let token = text(&case, &issued, "/authorizationData/0/authorizationToken");
-                let (status, answered) =
-                    registry_get(&router, pairing.published, "/v2/", &token, None).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: the registry API must answer at the published address \
-                     {:?}, got HTTP {status} with {answered:?}",
-                    pairing.published
-                );
+                for dialable in [authority.as_str(), pairing.published] {
+                    let (status, answered) =
+                        registry_get(&router, dialable, "/v2/", &token, None).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: the registry API must answer at the published address \
+                         {dialable:?}, got HTTP {status} with {answered:?}"
+                    );
+                }
             }
         }
     }
