@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransitGatewayMulticastDomainAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransitGatewayMulticastDomainAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransitGatewayMulticastDomainAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the subnet associations the stored multicast domain the request names
+//! actually holds, narrowed by the filters the request carries and paged in a stable order.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +73,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -146,18 +142,296 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransitGatewayMulticastDomainAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransitGatewayMulticastDomainAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the domain is
+        // named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Matching cost is filters x values x stored associations x value length, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to it
+        // is done and before the store is locked — the same ceilings the other filtered reads
+        // of this crate enforce, from `crate::state`. Their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {maximum}",
+                supplied = filters.len(),
+                maximum = state::MAX_FILTERS,
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // association would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than recompiled
+        // for every candidate association.
+        let mut compiled: Vec<state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !MULTICAST_DOMAIN_ASSOCIATION_FILTERS.contains(&name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {maximum}",
+                    supplied = oversize.len(),
+                    maximum = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            compiled.push(state::CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The ID of the transit gateway multicast domain"
+        // (`TransitGatewayMulticastDomainId`): a value that is not a multicast domain id at
+        // all is refused as malformed, so "not an id of this kind" never reads as "no such
+        // domain" and is never answered by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX,
+            &input.transit_gateway_multicast_domain_id,
+            state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED,
+        )?;
+
+        // "The token for the next page of results" (`NextToken`) — a token this service did
+        // not mint is refused rather than read as a position, and it is refused before the
+        // store is read, so whether a bogus token is caught never depends on what the store
+        // holds. This report is of ONE domain's associations, so the cursor carries the domain
+        // it was minted for and a token presented back against another domain is refused
+        // rather than resuming inside an association set it never reported.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(
+                    token,
+                    &input.transit_gateway_multicast_domain_id,
+                )
+                .ok_or_else(state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "The maximum number of results to return with a single call" (`MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path below behaves the same whether or not a page size was asked for.
+        // The model's `range 5..1000` has already refused anything outside it; the floor of
+        // [`MIN_MAX_RESULTS`] is applied anyway, because a page size below it would cut this
+        // report finer than a caller can ask for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, DEFAULT_MAX_RESULTS);
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply — the same call the describes of
+        // this crate make: an association an associate or an acceptance left `associating` is
+        // `associated` once its due instant has passed, whether or not anybody called, so
+        // applying it here changes nothing a later caller would not have seen anyway. Nothing
+        // else is written: the associations themselves are only read below.
+        store.materialize_due_transitions();
+
+        // A domain id naming no domain of the account is an error and not an empty
+        // association set — an empty set is what a domain nothing is associated with reports,
+        // which is what lets a client tell a dangling reference from a domain that simply
+        // holds no association. Resolved through the crate's one reader of a
+        // `TransitGatewayMulticastDomainId`, so this report refuses an unknown id exactly as
+        // the associate and the describe do.
+        let domain = store
+            .require_transit_gateway_multicast_domain(&input.transit_gateway_multicast_domain_id)?;
+
+        // "Gets information about the associations for the transit gateway multicast domain":
+        // every association the domain holds, narrowed by the filters, which must all hold
+        // ("If you specify multiple filters, the filters are joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransitGatewayMulticastDomainAssociations"))
+        // Every comparison is charged to ONE budget — one step per candidate even when no
+        // filter was given, so an unfiltered scan is counted too — which bounds the product
+        // of stored associations, filters, values and value length however the caller combines
+        // them, and with it how long this holds the store's lock.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<AssociationRow> = Vec::new();
+        for record in &domain.associations {
+            if budget.exhausted() {
+                break;
+            }
+            // The modelled shape this record is reported as, through the ONE projection of a
+            // stored association (`MulticastDomainAssociationRecord::view`), so this report
+            // and the associate that made the association cannot report it differently.
+            let association = record.view();
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(&association, name)
+            }) {
+                selected.push(AssociationRow {
+                    cursor: association_cursor(record),
+                    association,
+                });
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {steps} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    steps = state::MAX_FILTER_MATCH_STEPS,
+                ),
+            ));
+        }
+        // Every row is owned by now and nothing else about the store is read, so the store's
+        // lock is not held across the paging below.
+        drop(store);
+
+        // The page order the cursor names a position in, established at the point of use
+        // rather than inherited from the order the associations happen to be stored in.
+        selected.sort_by(|left, right| left.cursor.cmp(&right.cursor));
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when an association follows this page, scoped to the domain this report
+        // is of — the crate's one reading of that rule
+        // (`crate::state::scoped_page_from_cursor`), so this report cannot page differently
+        // from the others.
+        let (page, next_token) = state::scoped_page_from_cursor(
+            &input.transit_gateway_multicast_domain_id,
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |row| row.cursor.as_str(),
+        );
+
+        Ok(GetTransitGatewayMulticastDomainAssociationsOutput {
+            multicast_domain_associations: Some(
+                page.iter().map(|row| row.association.clone()).collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`TransitGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The smallest page this operation will serve: the minimum of the same published range
+/// (`TransitGatewayMaxResults`, `range 5..1000`). The boundary validator refuses anything
+/// below it, so this is the floor that keeps a page of zero — which would mint a token for a
+/// page carrying nothing — unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 5;
+
+/// One selected association: the modelled shape it is reported as, and the position a page
+/// cursor names it by.
+struct AssociationRow {
+    /// The position of this association in the report's order, as [`association_cursor`]
+    /// builds it.
+    cursor: String,
+    /// The association itself, as the one projection of a stored record reports it.
+    association: TransitGatewayMulticastDomainAssociation,
+}
+
+/// What separates the two ids an association's position is built from: a character no EC2
+/// resource id carries, so the halves can never run together — and not
+/// [`crate::state::CURSOR_SCOPE_SEPARATOR`], which already separates the domain a token was
+/// minted for from the position inside it.
+const CURSOR_PART_SEPARATOR: char = '/';
+
+/// The position a page cursor names this association by: its subnet first, then the
+/// attachment the subnet is reached through.
+///
+/// An association IS per subnet (`TransitGatewayMulticastDomainAssociation$Subnet`) and one
+/// subnet is associated with one domain once, so the subnet already orders the report
+/// totally; the attachment is carried beside it so the order stays total — and the cursor
+/// keeps advancing — whatever a path that stores associations puts in the store.
+fn association_cursor(record: &crate::state::MulticastDomainAssociationRecord) -> String {
+    format!(
+        "{subnet_id}{CURSOR_PART_SEPARATOR}{attachment_id}",
+        subnet_id = record.subnet_id,
+        attachment_id = record.transit_gateway_attachment_id,
+    )
+}
+
+/// The filter names this operation documents, from
+/// `GetTransitGatewayMulticastDomainAssociationsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="GetTransitGatewayMulticastDomainAssociationsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That list is exactly these five — this operation documents no `tag:<key>` or `tag-key`
+/// filter, so a tag filter is as undocumented here as any other misspelling. Every entry must
+/// be answered by [`filter_values`].
+const MULTICAST_DOMAIN_ASSOCIATION_FILTERS: [&str; 5] = [
+    "resource-id",
+    "resource-type",
+    "state",
+    "subnet-id",
+    "transit-gateway-attachment-id",
+];
+
+/// The values the EC2 filter `name` compares against this association.
+///
+/// A filter naming an attribute this association does not carry compares against NO values,
+/// so it selects nothing. `name` is one of [`MULTICAST_DOMAIN_ASSOCIATION_FILTERS`]; "Filter
+/// names are case-sensitive" (`Filter$Name`), so the caller's name was matched exactly.
+fn filter_values<'a>(
+    association: &'a TransitGatewayMulticastDomainAssociation,
+    name: &str,
+) -> Vec<Cow<'a, str>> {
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "resource-id" => text(association.resource_id.as_deref()),
+        "resource-type" => text(association.resource_type.as_deref()),
+        // "The state of the subnet association" is the SUBNET association's own state, which
+        // the association carries inside its `Subnet` member rather than on itself.
+        "state" => text(
+            association
+                .subnet
+                .as_ref()
+                .and_then(|subnet| subnet.state.as_deref()),
+        ),
+        "subnet-id" => text(
+            association
+                .subnet
+                .as_ref()
+                .and_then(|subnet| subnet.subnet_id.as_deref()),
+        ),
+        "transit-gateway-attachment-id" => {
+            text(association.transit_gateway_attachment_id.as_deref())
+        }
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
     }
 }
