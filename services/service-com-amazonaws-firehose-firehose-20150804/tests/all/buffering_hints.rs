@@ -27,7 +27,18 @@
 //! The rows here vary the HINT VALUES of one destination member; the sibling suite
 //! `buffering_hints_destination_members` varies the MEMBER carrying them, and drives its own
 //! rows through [`assert_window_rule`] below, so there is one table-driver and one reading of
-//! "delivered" and "not delivered yet" between the two.
+//! "delivered" and "not delivered yet" between the two. The hints are hints the service may
+//! improve on, so an interval longer than the span this emulator holds data for is delivered
+//! at the end of that span rather than at the end of the interval; that is the child suite
+//! [`hint_ceiling`], and every row here whose interval is minutes away is read inside the
+//! span, where it holds nothing.
+
+/// What a destination asking for an interval LONGER than the span this emulator holds data
+/// for gets. The `#[path]` is what keeps it a child of THIS suite rather than a second suite
+/// beside it: this crate's `tests/all.rs` declares the suites directly under `tests/all/`, and
+/// a module of a `#[path]`-declared file resolves next to that file unless it says otherwise.
+#[path = "buffering_hints/hint_ceiling.rs"]
+mod hint_ceiling;
 
 use std::time::{Duration, Instant};
 
@@ -167,7 +178,7 @@ fn rows() -> Vec<Row> {
             due: Due::AfterItsInterval,
         },
         Row {
-            case: "no BufferingHints at all, so the documented 300 s default decides",
+            case: "no BufferingHints at all, so the documented 300 s default interval stands",
             member: Member::ExtendedS3,
             hints: None,
             records: (1, 0),
