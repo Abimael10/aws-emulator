@@ -17,6 +17,7 @@
 pub mod batch_execute_statement_types;
 pub mod batch_get_item_types;
 pub mod batch_write_item_types;
+pub mod cancel_bulk_operation_types;
 pub mod create_backup_types;
 pub mod create_global_table_types;
 pub mod create_table_types;
@@ -25,6 +26,7 @@ pub mod delete_item_types;
 pub mod delete_resource_policy_types;
 pub mod delete_table_types;
 pub mod describe_backup_types;
+pub mod describe_bulk_operation_types;
 pub mod describe_continuous_backups_types;
 pub mod describe_contributor_insights_types;
 pub mod describe_endpoints_types;
@@ -82,6 +84,8 @@ pub use batch_get_item_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use batch_write_item_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use cancel_bulk_operation_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_backup_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_global_table_types::*;
@@ -97,6 +101,8 @@ pub use delete_resource_policy_types::*;
 pub use delete_table_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_backup_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_bulk_operation_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_continuous_backups_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

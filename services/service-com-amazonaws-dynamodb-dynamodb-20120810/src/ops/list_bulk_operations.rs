@@ -9,8 +9,12 @@
 //!
 //! A REPORTING operation: every summary is read from the bulk-operation catalogue
 //! `StartBulkPutItems` writes ([`crate::state::BulkOperation`]), and the status each one
-//! reports is derived from the clock at every read, so this call writes nothing and two
-//! callers reading it see the same thing.
+//! reports is derived from the clock at every read, so the only write it makes is what the
+//! clock had already made due and two callers reading it see the same thing.
+//!
+//! A request that NARROWS the listing to a table the account does not hold is refused with
+//! the modelled `ResourceNotFoundException` rather than answered with an empty page: it
+//! named a resource whose operations cannot be read.
 //!
 //! WHERE THIS OPERATION'S CONTRACT COMES FROM. The service's Smithy model carried no
 //! bulk-operation shape when this was written, so there is no modelled doc text to quote:
@@ -114,7 +118,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Finish what the clock has already made due before reporting: a table whose
+        // `DeleteTable` span has elapsed is gone, and a listing narrowed to it names a table
+        // that is not there. This is a read, so that is the only write it makes.
+        store.apply_due_transitions(now);
+        // A listing NARROWED to one table is refused when the account holds no such table:
+        // the request named a resource whose operations cannot be read, which is the
+        // modelled `ResourceNotFoundException` rather than an empty page — exactly as the
+        // sibling listing that narrows itself to a table answers it
+        // (`super::list_contributor_insights`).
+        if let Some(named) = table.as_deref() {
+            store.table(&region, named).map_err(lift)?;
+        }
         // A reporting operation, and one that reports nothing a WRITE could settle: a
         // bulk-operation record is fixed once written and the status it reports is derived
         // from the clock on each read. So this reads only.
@@ -163,24 +179,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The page size this operation reports when the request names no `MaxResults`: the ceiling
-/// the model declares for that member, so a request that asks for no bound is answered with
-/// as many operations as one page may carry.
-const DEFAULT_MAX_RESULTS: i32 = 100;
+/// the model declares for that member
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ListBulkOperationsMaxResults")`
+/// gives `@range` 1..25), so a request that asks for no bound is answered with as many
+/// operations as one page may carry.
+const DEFAULT_MAX_RESULTS: i32 = 25;
 
 /// The IAM action this operation performs, which a refusal names.
 const ACTION: &str = "dynamodb:ListBulkOperations";
 
-/// The cursor a truncated page reports: the entry the page stopped on, in hex, so a token
-/// is opaque to a client and carries nothing but that entry — and is a value the next
-/// request may send straight back.
+/// The bytes one group of the token's pattern carries: `^([0-9a-f]{16})+$`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#BulkOperationNextToken")`) is
+/// a whole number of 16-hex-digit groups, and 16 hex digits are 8 bytes.
+const TOKEN_GROUP_BYTES: usize = 8;
+
+/// The cursor a truncated page reports, in the form the `BulkOperationNextToken` member
+/// models: the entry the page stopped on, as its bytes in hex, padded with NULs to the
+/// 8-byte boundary that member's 16-hex-digit groups require.
+///
+/// A token is therefore opaque to a client and carries nothing but that entry, and it
+/// satisfies the member's own constraint — so the value this operation reports is one the
+/// next request may send straight back. The one padding rule a token of this service is
+/// padded by, which its sibling listing states too (`super::list_imports`).
 fn encode_token(cursor: &str) -> String {
-    ::hex::encode(cursor.as_bytes())
+    let mut bytes = cursor.as_bytes().to_vec();
+    while !bytes.len().is_multiple_of(TOKEN_GROUP_BYTES) {
+        bytes.push(0);
+    }
+    ::hex::encode(bytes)
 }
 
 /// The cursor a `NextToken` stands for, or the refusal for a token this operation did not
 /// mint.
 fn decode_token(token: &str) -> Result<String, ListBulkOperationsError> {
-    let bytes = ::hex::decode(token).map_err(|_| invalid_next_token())?;
+    let mut bytes = ::hex::decode(token).map_err(|_| invalid_next_token())?;
+    // Drop the NUL padding [`encode_token`] added, without indexing: the position is
+    // derived from the vector itself, so there is no request-derived index at all.
+    let unpadded = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    bytes.truncate(unpadded);
     let cursor = String::from_utf8(bytes).map_err(|_| invalid_next_token())?;
     if cursor.is_empty() {
         return Err(invalid_next_token());

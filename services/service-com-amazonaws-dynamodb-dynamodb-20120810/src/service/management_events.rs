@@ -271,7 +271,7 @@ macro_rules! quoting_refused_values {
 /// Every modelled operation of this service, each constructed from the shared engine and
 /// served behind the audit recorder.
 ///
-/// EVERY one is here — the 58 operations `smithy_query(query="digest")` lists — the ones
+/// EVERY one is here — the operations `smithy_query(query="digest")` lists — the ones
 /// this emulator has not implemented included: a stub answers 501 and the wrapper records
 /// nothing for it, so an operation implemented later is auditable the moment it serves a
 /// call rather than when someone remembers to add it.
@@ -294,12 +294,14 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
     let mut table = AuditedTable::new(recorder, JSON_ENVELOPE);
     audited!(
         table, engine,
+        cancel_bulk_operation::CancelBulkOperation => mutates,
         create_backup::CreateBackup => mutates,
         create_global_table::CreateGlobalTable => mutates,
         create_table::CreateTable => mutates,
         delete_backup::DeleteBackup => mutates,
         delete_table::DeleteTable => mutates,
         describe_backup::DescribeBackup => reports,
+        describe_bulk_operation::DescribeBulkOperation => reports,
         describe_continuous_backups::DescribeContinuousBackups => reports,
         describe_contributor_insights::DescribeContributorInsights => reports,
         describe_endpoints::DescribeEndpoints => reports,

@@ -29,6 +29,100 @@ pub const BULK_OPERATION_STATUS_COMPLETED: &str = "COMPLETED";
 /// which it reports once its span has elapsed rather than a completion it did not achieve.
 pub const BULK_OPERATION_STATUS_FAILED: &str = "FAILED";
 
+/// The `BulkOperationStatus` a bulk operation reports while a cancel of it is being carried
+/// out: stopping work takes a span exactly as doing it does, so a caller that reads straight
+/// after asking for the cancel still sees it stopping rather than stopped.
+pub const BULK_OPERATION_STATUS_CANCELLING: &str = "CANCELLING";
+
+/// The `BulkOperationStatus` such an operation settles into once that span has elapsed.
+pub const BULK_OPERATION_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// The resource type a bulk operation's ARN names, which is the one type a member that
+/// addresses a bulk operation accepts ([`new_bulk_operation_arn`] mints it, and
+/// [`resolve_bulk_operation_arn`] is what admits it).
+pub const BULK_OPERATION_RESOURCE_TYPE: &str = "bulk-operation";
+
+/// The service field a bulk operation's ARN carries: a bulk operation is a resource of THIS
+/// service, so an ARN of any other service names none of them.
+const BULK_OPERATION_ARN_SERVICE: &str = "dynamodb";
+
+/// How AWS's refusals name the member a bulk-operation ARN arrives in: the lowerCamel path
+/// its own request validator reports a violation of that member against.
+pub const BULK_OPERATION_ARN_MEMBER_PATH: &str = "bulkOperationArn";
+
+/// How a value that is not the ARN of a bulk operation is refused: FIXED text, naming
+/// neither the member it arrived in nor the value it held — the whole message is this
+/// sentence, because what is wrong is that the value is no bulk-operation ARN at all and no
+/// one field of it can be pointed at.
+pub const INVALID_BULK_OPERATION_ARN: &str = "Invalid Bulk operation ARN";
+
+/// Admit `arn` as the ARN of a bulk operation, or refuse it with the one sentence above.
+///
+/// The form: `arn:<partition>:dynamodb:<region>:<account>:bulk-operation/<id>` — every
+/// field stated and non-empty, the service field this service's own, the resource type a
+/// bulk operation's ([`BULK_OPERATION_RESOURCE_TYPE`]) and a resource id after it. Read the
+/// way this service reads every other ARN-shaped member (`super::ARN_PREFIX` and the
+/// five colon-separated fields after it), so a value that is not an ARN, an ARN of another
+/// service, and an ARN naming a resource of another kind are all the same defect: the value
+/// addresses no bulk operation.
+///
+/// The LENGTH the member admits is not read here: the model declares it
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#BulkOperationArn")` gives
+/// `@length` 1..1024), so the framework's own validating walk refuses a value outside it in
+/// the clause that states that bound, before any handler runs.
+///
+/// WHICH bulk operation it addresses is a question for the catalogue
+/// ([`ComAmazonawsDynamodbDynamodb20120810State::bulk_operation_in`]), not for this: a
+/// well-formed ARN the account holds no operation under is a resource that is not there
+/// rather than a request that is malformed.
+pub fn resolve_bulk_operation_arn(arn: &str) -> Result<(), RequestError> {
+    let invalid = || RequestError::Validation(INVALID_BULK_OPERATION_ARN.to_string());
+    let Some(rest) = arn.strip_prefix(ARN_PREFIX) else {
+        return Err(invalid());
+    };
+    let fields: Vec<&str> = rest.splitn(5, ':').collect();
+    let [partition, service, region, account, resource] = fields.as_slice() else {
+        return Err(invalid());
+    };
+    if partition.is_empty() || region.is_empty() || account.is_empty() {
+        return Err(invalid());
+    }
+    if *service != BULK_OPERATION_ARN_SERVICE {
+        return Err(invalid());
+    }
+    match resource.split_once('/') {
+        Some((resource_type, id))
+            if resource_type == BULK_OPERATION_RESOURCE_TYPE && !id.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+/// How a bulk-operation ARN the account holds no operation under is refused: the
+/// `ResourceNotFoundException` sentence this service states for a resource that is not
+/// there, naming the kind of resource and the one the request addressed — the form its
+/// sibling catalogues state it in (`Requested resource not found: Table: <name> not found`).
+pub fn bulk_operation_not_found(arn: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: Bulk operation: {arn} not found"
+    ))
+}
+
+/// How a cancel of a bulk operation that has already finished is refused: stopping work
+/// that is over changes nothing, so the request is refused rather than answered with a
+/// cancellation that did not happen.
+///
+/// The sentence is this service's own — the recorded calls carry none for this case — and
+/// states the operation addressed and the status it had already reached, which is what tells
+/// the caller why the cancel could not be carried out.
+pub fn bulk_operation_not_cancellable(arn: &str, status: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Bulk operation {arn} has already reached status {status} and cannot be cancelled"
+    ))
+}
+
 /// How long a `ClientToken` stands for the bulk operation it first started.
 ///
 /// The window every other idempotent start of this service measures a repeated token over
@@ -71,7 +165,7 @@ pub fn new_bulk_operation_arn(region: &str, requested_at: SystemTime) -> String 
         "dynamodb",
         region,
         &format!(
-            "bulk-operation/{millis:014}-{}",
+            "{BULK_OPERATION_RESOURCE_TYPE}/{millis:014}-{}",
             unique.get(..8).unwrap_or(unique.as_str())
         ),
     )
@@ -165,8 +259,13 @@ pub struct BulkOperation {
     pub started_at: SystemTime,
     /// The instant it is due to end, which is one transition span after it began
     /// ([`STATUS_TRANSITION`]). Before it the operation reports `IN_PROGRESS` and no end
-    /// time; from it the status it settled into, and this instant as its end.
+    /// time; from it the status it settled into, and this instant as its end. A cancel moves
+    /// it to one span after the cancel was asked for ([`Self::cancel`]).
     pub ended_at: SystemTime,
+    /// The instant a CANCEL of this operation was asked for, or `None` where none was: what
+    /// makes the span before [`Self::ended_at`] report `CANCELLING` rather than the
+    /// `IN_PROGRESS` of an operation still doing its work.
+    pub cancelled_at: Option<SystemTime>,
     /// The status it SETTLES INTO once that instant has passed: one of the
     /// `BulkOperationStatus` values the model declares.
     pub status: String,
@@ -175,13 +274,37 @@ pub struct BulkOperation {
 impl BulkOperation {
     /// The `BulkOperationStatus` at `now`: a bulk operation runs for a span, so a caller
     /// that reads straight after the request still sees it running, and only then the
-    /// status it settled into.
+    /// status it settled into. An operation a cancel has been asked for reports `CANCELLING`
+    /// over that span instead, because what it is doing until it stops is stopping.
     pub fn status(&self, now: SystemTime) -> &str {
         if now >= self.ended_at {
             self.status.as_str()
+        } else if self.cancelled_at.is_some() {
+            BULK_OPERATION_STATUS_CANCELLING
         } else {
             BULK_OPERATION_STATUS_IN_PROGRESS
         }
+    }
+
+    /// Whether this operation is still RUNNING at `now` — the one state a cancel can act on,
+    /// since an operation whose span has elapsed has already reached its terminal status.
+    pub fn is_running(&self, now: SystemTime) -> bool {
+        now < self.ended_at
+    }
+
+    /// Stop this operation: from `now` it reports `CANCELLING`, and one transition span
+    /// later the `CANCELLED` it settles into ([`STATUS_TRANSITION`]).
+    ///
+    /// IDEMPOTENT — an operation a cancel has already been asked for keeps the instant that
+    /// cancel was asked at, so a repeated cancel does not push the instant it stops further
+    /// out and two callers asking for one cancellation observe one.
+    pub fn cancel(&mut self, now: SystemTime) {
+        if self.cancelled_at.is_some() {
+            return;
+        }
+        self.cancelled_at = Some(now);
+        self.ended_at = now + STATUS_TRANSITION;
+        self.status = BULK_OPERATION_STATUS_CANCELLED.to_string();
     }
 
     /// The instant this operation ENDED, or `None` while it is still running: no reader
@@ -273,6 +396,28 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     pub fn insert_bulk_operation(&mut self, operation: BulkOperation) {
         self.bulk_operations
             .insert(operation.arn.clone(), operation);
+    }
+
+    /// The bulk operation `arn` names in that region, or `None` where the account holds
+    /// none under it.
+    ///
+    /// Scoped to the region the request reached, like every other bulk-operation lookup: an
+    /// endpoint serves one region, so an ARN naming another names nothing it can reach.
+    pub fn bulk_operation_in(&self, region: &str, arn: &str) -> Option<&BulkOperation> {
+        self.bulk_operations
+            .get(arn)
+            .filter(|operation| operation.region == region)
+    }
+
+    /// The same operation, for the one call that CHANGES it ([`BulkOperation::cancel`]).
+    pub fn bulk_operation_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut BulkOperation> {
+        self.bulk_operations
+            .get_mut(arn)
+            .filter(|operation| operation.region == region)
     }
 
     /// The bulk operation a `ClientToken` still stands for at `now` in that region, if any

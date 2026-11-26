@@ -15,7 +15,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dynamodb-dynamodb-20120
 pub struct StartBulkPutItemsInput {
     pub table_name: String,
     pub input_s3_configuration: BulkPutInputS3Configuration,
-    pub output_s3_configuration: Option<BulkPutOutputS3Configuration>,
+    pub output_s3_configuration: BulkPutOutputS3Configuration,
     pub max_write_request_units: Option<i64>,
     pub performance_tier: Option<String>,
     pub client_token: Option<String>,

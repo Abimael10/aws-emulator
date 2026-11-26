@@ -28,7 +28,10 @@
 //! prefix, the format and the compression the items are staged in, which is the same source
 //! an `ImportTable` reads — so this reads it through the same reader and decoder
 //! ([`crate::state::read_import_source`], [`crate::state::imported_items`]), with the
-//! calling principal's own S3 permissions, and each decoded item is then held to exactly
+//! calling principal's own S3 permissions — though the FORMATS it admits are its own and
+//! narrower than an import's
+//! (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#BulkPutInputFormat")`), and
+//! each decoded item is then held to exactly
 //! what a single-item write holds one to (its numbers canonicalized, its values held to the
 //! documented domain, the documented 400 KB ceiling, the table's own key schema) and stored
 //! through the one write seam this service stores an item through. So the items a bulk put
@@ -38,8 +41,9 @@
 //! way an import task logs an error for one and carries on.
 //!
 //! WHAT IT DOES NOT DO. `OutputS3Configuration` names where the operation reports its
-//! per-record outcomes, `MaxWriteRequestUnits` the throughput it may consume while it runs,
-//! and `PerformanceTier` the tier it runs in: all three are read and held to their own
+//! per-record outcomes — a location every request must name — `MaxWriteRequestUnits` the
+//! throughput it may consume while it runs, and `PerformanceTier` the tier it runs in: all
+//! three are read and held to their own
 //! shape, and none of them changes what the call answers here — this emulator applies the
 //! whole source under the call that started it, so there is no rate to bound and no
 //! long-running task to report progress of, and the layout of the report objects is stated
@@ -163,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let signature = crate::state::bulk_put_request_signature(
             &name,
             source,
-            input.output_s3_configuration.as_ref(),
+            Some(&input.output_s3_configuration),
             input.max_write_request_units,
             input.performance_tier.as_deref(),
         );
@@ -187,8 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // will not use leaves nothing this call could encrypt its writes with
             // ([`crate::state::check_table_key_accessible`]).
             crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
-            // The attribute types the TABLE declares, which is what a CSV column's value is
-            // read as.
+            // The attribute types the TABLE declares, which is what a column of a
+            // record that carries no type of its own is read as.
             let declared_types = table
                 .attribute_definitions
                 .iter()
@@ -334,11 +338,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table_name: name.clone(),
             client_token: input.client_token.clone(),
             input_s3_configuration: input.input_s3_configuration.clone(),
-            output_s3_configuration: input.output_s3_configuration.clone(),
+            output_s3_configuration: Some(input.output_s3_configuration.clone()),
             max_write_request_units: input.max_write_request_units,
             performance_tier: input.performance_tier.clone(),
             started_at: crate::state::at_timestamp_precision(now),
             ended_at: now + crate::state::STATUS_TRANSITION,
+            // Nothing has asked for this operation to stop: a cancel is what sets it
+            // ([`crate::state::BulkOperation::cancel`]).
+            cancelled_at: None,
             // What the task SETTLES INTO: a source it could not read at all is the one
             // outcome that fails, and anything it read — per-record errors included — is an
             // operation that completed, the way an import task that logged errors completes.

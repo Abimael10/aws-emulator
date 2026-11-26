@@ -168,6 +168,12 @@ mod body_checksum;
 /// served under, and what a target naming no bound operation is refused with.
 mod front_door;
 
+/// Which bulk-operation targets the table this service routes through binds — read back at
+/// the layer that routes them, because a target missing from it is answered as an operation
+/// this endpoint does not have.
+#[cfg(test)]
+mod bulk_operation_management;
+
 /// How a request whose SigV4 signature PRESENTATION is at fault is answered — unsigned,
 /// incomplete, presented twice, or carrying a signature that does not verify — which is a
 /// fault in the request rather than in the identity it named.

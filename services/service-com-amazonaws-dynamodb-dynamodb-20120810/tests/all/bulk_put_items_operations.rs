@@ -30,7 +30,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::emulator::{
-    call, create_bucket, emulator_with_s3, error_code, message, ok, put_object, POLL_INTERVAL,
+    absent_clause, call, create_bucket, emulator_with_s3, error_code, message, ok, put_object,
+    validation_envelope, POLL_INTERVAL,
 };
 use crate::table_items::create_active_table;
 
@@ -65,6 +66,11 @@ fn gzipped(bytes: &[u8]) -> Vec<u8> {
 
 /// One `StartBulkPutItems` body: the table, the source prefix, the compression the source
 /// is staged with, and the token when the row carries one.
+///
+/// Every request names an `OutputS3Configuration`, the location the operation reports its
+/// per-record outcomes into: the member is one the input REQUIRES
+/// (`smithy_query(query="operation", operation="StartBulkPutItems")`), so a body that omits
+/// it is refused before the call is served (the row below that pins it).
 fn start_body(
     table: &str,
     prefix: &str,
@@ -77,6 +83,10 @@ fn start_body(
             "S3Bucket": BUCKET,
             "S3KeyPrefix": prefix,
             "InputFormat": "DYNAMODB_JSON",
+        },
+        "OutputS3Configuration": {
+            "S3Bucket": BUCKET,
+            "S3KeyPrefix": "outcomes/",
         },
     });
     if let Some(compression) = compression {
@@ -543,6 +553,25 @@ async fn a_bulk_put_is_refused_before_it_reads_or_writes_anything() {
         body["InputS3Configuration"]["InputFormat"] = json!("ION");
         body
     };
+    // A body that states no outcome location at all, and one that states it `null`: the
+    // member is one the input REQUIRES, so both are the same absence and are refused ahead
+    // of everything the request names — the table it addresses included, which is why this
+    // row names one the account does not hold and is still answered for the member.
+    let no_outcome_location = {
+        let mut body = start_body("BulkPutItemsAbsent", "refused/", None, None);
+        body.as_object_mut()
+            .expect("the body is an object")
+            .remove("OutputS3Configuration");
+        body
+    };
+    let null_outcome_location = {
+        let mut body = start_body("BulkPutItemsAbsent", "refused/", None, None);
+        body["OutputS3Configuration"] = Value::Null;
+        body
+    };
+    let absent_member = Some(validation_envelope(&[absent_clause(
+        "outputS3Configuration",
+    )]));
     let rows: Vec<(&str, Value, &str, Option<String>)> = vec![
         (
             "a table the account does not hold",
@@ -562,6 +591,18 @@ async fn a_bulk_put_is_refused_before_it_reads_or_writes_anything() {
             "NotImplemented",
             None,
         ),
+        (
+            "no outcome location at all",
+            no_outcome_location,
+            "ValidationException",
+            absent_member.clone(),
+        ),
+        (
+            "an outcome location stated null",
+            null_outcome_location,
+            "ValidationException",
+            absent_member,
+        ),
     ];
 
     for (case, body, code, expected) in rows {
@@ -578,6 +619,36 @@ async fn a_bulk_put_is_refused_before_it_reads_or_writes_anything() {
                 "case {case:?}: expected the message {expected:?}, got {stated:?}"
             );
         }
+    }
+
+    // A source format outside the set the member admits
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#BulkPutInputFormat")` gives
+    // ION and DYNAMODB_JSON) is refused by that set, ahead of everything else the request
+    // names — the table it addresses included, which is why these rows name one the account
+    // does not hold and are still answered for the member.
+    let format_rows: Vec<(&str, &str)> = vec![
+        ("a format the import surface reads and a bulk put does not", "CSV"),
+        ("a format no surface reads", "PARQUET"),
+        ("the right value in the wrong case", "dynamodb_json"),
+    ];
+    for (case, format) in format_rows {
+        let mut body = start_body("BulkPutItemsAbsent", "refused/", None, None);
+        body["InputS3Configuration"]["InputFormat"] = json!(format);
+        let (status, answered) = call(&router, "StartBulkPutItems", body).await;
+        let expected = validation_envelope(&[format!(
+            "Value '{format}' at 'inputS3Configuration.inputFormat' failed to satisfy \
+             constraint: Member must satisfy enum value set: [ION, DYNAMODB_JSON]"
+        )]);
+        let stated = message(&answered);
+        assert_eq!(
+            (
+                status,
+                error_code(&answered).as_str(),
+                stated.as_str()
+            ),
+            (400, "ValidationException", expected.as_str()),
+            "case {case:?}: expected the value-set refusal, got {status} with {answered}"
+        );
     }
 
     // Nothing any refused call carried was written, and no operation was recorded for one.
