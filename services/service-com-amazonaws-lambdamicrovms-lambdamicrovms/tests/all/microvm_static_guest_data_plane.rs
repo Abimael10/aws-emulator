@@ -61,7 +61,7 @@ enum Body<'a> {
 }
 
 /// The `.zip` a client uploads as a MicroVM image's code artifact, holding `entries`.
-fn artifact(entries: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn artifact(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);

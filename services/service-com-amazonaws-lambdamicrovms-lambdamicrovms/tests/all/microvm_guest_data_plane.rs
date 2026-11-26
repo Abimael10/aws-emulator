@@ -989,7 +989,7 @@ if __name__ == "__main__":
 /// The container specification that declares a PYTHON guest the way a client's build
 /// context does: the interpreter is installed, the module is written by a `RUN` step, and
 /// the command starts it.
-fn python_specification(server: &str) -> String {
+pub(crate) fn python_specification(server: &str) -> String {
     let encoded = aws_smithy_types::base64::encode(server);
     format!(
         "FROM public.ecr.aws/amazonlinux/amazonlinux:2023\n\
@@ -1002,7 +1002,7 @@ fn python_specification(server: &str) -> String {
 
 /// The .zip a client uploads whose Python guest is an ENTRY of the archive rather than a
 /// file a build step writes — the other form the same image is staged in.
-fn python_entry_artifact(server: &str) -> Vec<u8> {
+pub(crate) fn python_entry_artifact(server: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -1353,7 +1353,7 @@ async fn a_python_guest_that_never_answers_is_stopped_and_the_microvm_goes_on() 
 /// The .zip a client uploads whose ONLY entry is the container specification: the guest does
 /// not exist as an entry of the archive at all — the build's own `RUN` steps materialise it,
 /// which is the ordinary container-image shape for this service.
-fn specification_only_artifact(dockerfile: &str) -> Vec<u8> {
+pub(crate) fn specification_only_artifact(dockerfile: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);

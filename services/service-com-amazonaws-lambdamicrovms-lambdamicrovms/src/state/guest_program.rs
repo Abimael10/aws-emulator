@@ -48,7 +48,8 @@
 //! 2. the `main` of a `package.json` beside it, then `index.js` — Node's own module
 //!    resolution ("If the main field is absent … Node.js will attempt to load
 //!    `index.js`");
-//! 3. the single JavaScript module, where the artifact holds exactly one.
+//! 3. the single module of a one-module artifact, whichever engine loads it — which engine
+//!    that is, this module reads off the module's own suffix.
 //!
 //! An artifact declaring none of those has nothing that starts a guest, so it holds no
 //! guest program: what starts the guest is not guessed from the content of its code.

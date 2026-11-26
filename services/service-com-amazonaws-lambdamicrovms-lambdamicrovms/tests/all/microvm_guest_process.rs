@@ -40,7 +40,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The variable the image declares for its guest, and the value it carries — the guest
 /// reports it back, so the test reads the environment the image published rather than one
 /// this emulator chose.
-const MARKER_VARIABLE: &str = "SUITE_MARKER";
+pub(crate) const MARKER_VARIABLE: &str = "SUITE_MARKER";
 
 /// The port this suite's guest binds its server on, which is therefore the port its
 /// MicroVM's endpoint fronts.
@@ -105,7 +105,12 @@ http.createServer(function (req, res) {
 /// Create the image whose code artifact is the staged guest, with `env` as its
 /// `environmentVariables`, and poll it until its build has settled with an active
 /// version.
-async fn guest_image(router: &MultiServiceRouter, name: &str, uri: &str, env: Value) -> String {
+pub(crate) async fn guest_image(
+    router: &MultiServiceRouter,
+    name: &str,
+    uri: &str,
+    env: Value,
+) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -145,7 +150,7 @@ async fn guest_image(router: &MultiServiceRouter, name: &str, uri: &str, env: Va
 
 /// Poll `GetMicrovm` until `microvm_id` reports `state`, which is how a client waits out
 /// a clock-owed transition.
-async fn microvm_in_state(router: &MultiServiceRouter, microvm_id: &str, state: &str) {
+pub(crate) async fn microvm_in_state(router: &MultiServiceRouter, microvm_id: &str, state: &str) {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let (status, read) = call(
@@ -172,7 +177,7 @@ async fn microvm_in_state(router: &MultiServiceRouter, microvm_id: &str, state: 
 
 /// Run a MicroVM from `image`, poll it until it reports `RUNNING`, and answer its id and
 /// published endpoint.
-async fn running_microvm(router: &MultiServiceRouter, image: &str) -> (String, String) {
+pub(crate) async fn running_microvm(router: &MultiServiceRouter, image: &str) -> (String, String) {
     let (status, run) = call(
         router,
         "POST",
@@ -194,7 +199,7 @@ async fn running_microvm(router: &MultiServiceRouter, image: &str) -> (String, S
 }
 
 /// Mint an authentication token for `microvm_id` scoped to `allowed_ports`.
-async fn auth_token(
+pub(crate) async fn auth_token(
     router: &MultiServiceRouter,
     microvm_id: &str,
     allowed_ports: Value,
@@ -221,7 +226,7 @@ async fn auth_token(
 ///
 /// `microvm_id` is the MicroVM whose own address the request is sent to — the published
 /// endpoint is that address's authority, so the request's whole path is the guest's.
-async fn through_endpoint(
+pub(crate) async fn through_endpoint(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     microvm_id: &str,
@@ -250,7 +255,7 @@ async fn through_endpoint(
 }
 
 /// The guest's answer to `path`, which must be the guest's own 200.
-async fn guest_answer(
+pub(crate) async fn guest_answer(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     microvm_id: &str,
