@@ -1002,3 +1002,174 @@ async fn a_refused_create_using_import_persists_nothing() {
         graph["name"]
     );
 }
+
+/// The whole sentence an import that locates its data in Amazon S3 and names no `format`
+/// is refused with, written out here rather than reached from the service's own constant
+/// so this suite states the expectation independently of the code under test.
+///
+/// Fixed text: the rule is about a PAIR of members rather than about one value, so it
+/// interpolates nothing from the request and every row below expects it unchanged.
+const S3_SOURCE_NEEDS_A_FORMAT: &str = "Source format should be specified when Source type is S3.";
+
+/// RULE: `format` is what tells a load how the objects at an Amazon S3 location are
+/// WRITTEN, so a request that locates its data there must name one and a request whose
+/// `source` names anything else (a Neptune database endpoint or snapshot, which carries
+/// its own structure) need not — and the rule is about the REQUEST, so it is answered
+/// with the modelled `ValidationException` (400) before either record this one call would
+/// mint exists.
+///
+/// The rows span what the rule generalises over: the FORM the S3 location takes (a bare
+/// bucket, a prefix, a nested prefix, a single object), every `format` value the model
+/// declares (`smithy_query(query="shape",shape="Format")`: `CSV`, `OPEN_CYPHER`,
+/// `PARQUET`, `NTRIPLES` — each with the member its own documented dependency requires),
+/// and a `source` that is no S3 location at all. The sibling suite
+/// `tests/all/import_task_lifecycle.rs` drives the same rule through `StartImportTask`,
+/// which takes the same `source`/`format` pair; this one pins it on the call that MINTS
+/// the graph, where an over-permissive accept would leave the caller holding two records
+/// AWS never created.
+#[tokio::test]
+async fn an_s3_create_using_import_must_say_what_format_its_data_is_written_in() {
+    let router = emulator();
+
+    // Every row asks for the SAME graphName: a refused create reserves nothing, so the
+    // name is still free for the next row — and for the accepted request at the end.
+    let name = "s3-format-rule";
+    let s3_sources = [
+        ("a bare S3 bucket", "s3://import-bucket"),
+        ("an S3 key prefix", "s3://import-bucket/prefix/"),
+        ("a nested S3 key prefix", "s3://import-bucket/year=2026/month=01/"),
+        ("a single S3 object", "s3://import-bucket/one-object.csv"),
+    ];
+    for (case, source) in s3_sources {
+        let (status, body) = create_using_import(
+            &router,
+            json!({"graphName": name, "roleArn": ROLE_ARN, "source": source}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} ({source}): expected 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?} ({source}): expected ValidationException, got {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, S3_SOURCE_NEEDS_A_FORMAT,
+            "case {case:?} ({source}): expected {S3_SOURCE_NEEDS_A_FORMAT:?}, got \
+             {message:?}"
+        );
+    }
+
+    // The refusals minted NOTHING: no graph took the name they asked for and no import
+    // task was created, so the caller is not left holding records AWS would not have
+    // created.
+    let (listed_status, graphs) = call(&router, "GET", "/graphs", None).await;
+    assert_eq!(
+        listed_status, 200,
+        "case the graphs after four refusals: expected 200 from ListGraphs, got \
+         {listed_status}: {graphs}"
+    );
+    assert_eq!(
+        graphs["graphs"].as_array().map(Vec::len),
+        Some(0),
+        "case the graphs after four refusals: a refused create must mint no graph, got \
+         {graphs}"
+    );
+    let (listed_status, tasks) = call(&router, "GET", "/importtasks", None).await;
+    assert_eq!(
+        listed_status, 200,
+        "case the tasks after four refusals: expected 200 from ListImportTasks, got \
+         {listed_status}: {tasks}"
+    );
+    assert_eq!(
+        tasks["tasks"].as_array().map(Vec::len),
+        Some(0),
+        "case the tasks after four refusals: a refused create must mint no import task, \
+         got {tasks}"
+    );
+
+    // The same S3 location with each format the model declares is accepted, so the rule
+    // is about the member being ABSENT and not about one value of it — and so is a
+    // source that is no S3 location at all, with no format named.
+    let accepted: Vec<(&str, &str, Value)> = vec![
+        (
+            "CSV",
+            name,
+            json!({"source": "s3://import-bucket/csv/", "format": "CSV"}),
+        ),
+        (
+            "OPEN_CYPHER",
+            "s3-format-opencypher",
+            json!({"source": "s3://import-bucket/opencypher/", "format": "OPEN_CYPHER"}),
+        ),
+        (
+            "PARQUET",
+            "s3-format-parquet",
+            json!({
+                "source": "s3://import-bucket/parquet/",
+                "format": "PARQUET",
+                "parquetType": "COLUMNAR",
+            }),
+        ),
+        (
+            "NTRIPLES",
+            "s3-format-ntriples",
+            json!({
+                "source": "s3://import-bucket/ntriples/",
+                "format": "NTRIPLES",
+                "blankNodeHandling": "convertToIri",
+            }),
+        ),
+        (
+            // Not an S3 location: "This can be an Amazon S3 path, or can point to a
+            // Neptune database endpoint or snapshot"
+            // (`smithy_query(query="doc",shape="CreateGraphUsingImportTaskInput",
+            // member="source")`), and what is not in an object store carries its own
+            // structure — so no format is required.
+            "a Neptune database endpoint and no format at all",
+            "s3-format-neptune-source",
+            json!({"source": "my-graph.cluster-abcdefghijkl.us-east-1.neptune.amazonaws.com"}),
+        ),
+    ];
+    for (case, graph_name, request) in accepted {
+        let mut body = json!({"graphName": graph_name, "roleArn": ROLE_ARN});
+        for (member, value) in request.as_object().expect("each row is a JSON object") {
+            body[member] = value.clone();
+        }
+        let (status, created) = create_using_import(&router, body.clone()).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?} ({body}): expected 201, got {status}: {created}"
+        );
+        // The accepted call persisted both records, which is what the refusals above did
+        // not: the minted task reads back through `GetImportTask` and names the graph it
+        // populates.
+        let task_id = created["taskId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no taskId in {created}"))
+            .to_string();
+        assert!(
+            is_task_id(&task_id),
+            "case {case:?}: expected a minted task id, got {task_id:?}"
+        );
+        let (read_status, read) = get_import(&router, &task_id).await;
+        assert_eq!(
+            read_status, 200,
+            "case {case:?}: expected 200 from GetImportTask, got {read_status}: {read}"
+        );
+        assert_eq!(
+            read["graphId"],
+            created["graphId"],
+            "case {case:?}: expected graphId {}, got {}",
+            created["graphId"],
+            read["graphId"]
+        );
+        assert!(
+            read["graphId"].as_str().is_some_and(is_graph_id),
+            "case {case:?}: expected the task to name a minted graph, got {read}"
+        );
+    }
+}

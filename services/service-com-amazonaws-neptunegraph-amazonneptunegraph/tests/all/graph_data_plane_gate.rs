@@ -548,3 +548,191 @@ async fn an_unresolvable_graph_host_prefix_is_refused_as_an_authentication_failu
         );
     }
 }
+
+/// Every operation addressed by a `graphIdentifier` the REQUEST carries — in its URI
+/// label or its query string — rather than by the host it was dialled at, as (operation,
+/// method, path, body) for one identifier.
+///
+/// Source: these operations' HTTP bindings (`smithy_query(query="operation",
+/// operation="GetGraph,UpdateGraph,ResetGraph,DeleteGraph,StartGraph,StopGraph,ListGraphSnapshots")`),
+/// none of which carries an `endpoint` trait: they are reached at the SERVICE's own
+/// endpoint, which exists whatever the identifier resolves to.
+fn service_endpoint_requests(
+    identifier: &str,
+) -> Vec<(&'static str, &'static str, String, Option<Value>)> {
+    vec![
+        ("GetGraph", "GET", format!("/graphs/{identifier}"), None),
+        (
+            "UpdateGraph",
+            "PATCH",
+            format!("/graphs/{identifier}"),
+            Some(json!({"provisionedMemory": 32})),
+        ),
+        (
+            "ResetGraph",
+            "PUT",
+            format!("/graphs/{identifier}"),
+            Some(json!({"skipSnapshot": true})),
+        ),
+        (
+            "DeleteGraph",
+            "DELETE",
+            format!("/graphs/{identifier}?skipSnapshot=true"),
+            None,
+        ),
+        (
+            "StartGraph",
+            "POST",
+            format!("/graphs/{identifier}/start"),
+            None,
+        ),
+        (
+            "StopGraph",
+            "POST",
+            format!("/graphs/{identifier}/stop"),
+            None,
+        ),
+        (
+            "ListGraphSnapshots",
+            "GET",
+            format!("/snapshots?graphIdentifier={identifier}"),
+            None,
+        ),
+    ]
+}
+
+/// RULE: which refusal an identifier that resolves to no graph earns is decided by the
+/// DOOR the request was dialled at, not by the identifier itself. At the graph's OWN
+/// endpoint there is nothing behind the host prefix for the request's signature to be
+/// accepted against, so the call is an authentication failure (403, the error class
+/// `AccessDeniedException`, the one fixed sentence, in the data plane's own envelope);
+/// the same value carried in a control-plane request's URI or query string reaches the
+/// service's endpoint, where it is the missing resource it is (404
+/// `ResourceNotFoundException`, naming the account the lookup resolved in and the
+/// identifier the request asked for, and carrying only the members that error shape
+/// models).
+///
+/// The rows span what the rule generalises over: the identifier (three forms of the
+/// modelled `^g-[a-z0-9]{10}$` space that never named a graph, and one whose graph was
+/// created, deleted and reclaimed), the door, and the operation behind each door —
+/// a read and a write at the graph endpoint, and every operation at the service endpoint
+/// that resolves a `graphIdentifier` it was handed, over GET, PATCH, PUT, POST and
+/// DELETE.
+#[tokio::test]
+async fn one_unresolvable_identifier_is_refused_by_the_door_it_was_dialled_at() {
+    let (router, _engine) = emulator();
+
+    // The one canonical emulator account every request is served for — read from the
+    // framework rather than written out, so the assertion cannot drift from the account
+    // the service resolves a lookup in.
+    let account = engine::emulator_account_id();
+
+    // A graph that IS serving, so no refusal below comes from a store that resolves
+    // nothing at all: both doors answer for this one at the end.
+    let serving = graph_in_service(&router, "two-doors-serving").await;
+
+    // (case, an identifier that resolves to no graph).
+    let reclaimed = graph_in_service(&router, "two-doors-reclaimed").await;
+    deleted_and_reclaimed(&router, &reclaimed).await;
+    let unresolvable: Vec<(&str, String)> = vec![
+        (
+            "an identifier no graph was ever created under",
+            "g-0000000000".to_string(),
+        ),
+        (
+            "an identifier at the other end of the id space",
+            "g-zzzzzzzzzz".to_string(),
+        ),
+        ("a mixed identifier no graph holds", "g-a1b2c3d4e5".to_string()),
+        ("the identifier of a graph that has been deleted", reclaimed),
+    ];
+
+    for (address, identifier) in &unresolvable {
+        // Dialled at the GRAPH's own endpoint: a read and a write, since the address is
+        // what was not accepted and the operation behind it decides nothing. (The suite's
+        // front-door test above drives all five operations on that endpoint.)
+        for (operation, method, path, body) in host_prefixed_requests()
+            .into_iter()
+            .filter(|(operation, ..)| matches!(*operation, "GetGraphSummary" | "CancelQuery"))
+        {
+            let case = format!("{operation} at the graph endpoint for {address}");
+            let (code, error_type, answered) =
+                addressed_call(&router, method, &path, identifier, body).await;
+            assert_eq!(
+                code, UNRESOLVED_ENDPOINT_STATUS,
+                "case {case:?}: expected {UNRESOLVED_ENDPOINT_STATUS}, got {code}: {answered}"
+            );
+            assert_eq!(
+                error_type.as_deref(),
+                Some(UNRESOLVED_ENDPOINT_CODE),
+                "case {case:?}: expected the error class in x-amzn-errortype, got \
+                 {error_type:?}"
+            );
+            assert_eq!(
+                answered["code"].as_str(),
+                Some(UNRESOLVED_ENDPOINT_CODE),
+                "case {case:?}: expected code {UNRESOLVED_ENDPOINT_CODE:?}, got {answered}"
+            );
+            assert_eq!(
+                answered["message"].as_str(),
+                Some(UNRESOLVED_ENDPOINT_MESSAGE),
+                "case {case:?}: expected message {UNRESOLVED_ENDPOINT_MESSAGE:?}, got \
+                 {answered}"
+            );
+        }
+
+        // The SAME identifier handed to the service's own endpoint: the RESOURCE is what
+        // was not found, and the refusal names the account it was looked for in.
+        let expected_message =
+            format!("No graph found for customer [{account}] with graph id [{identifier}]");
+        for (operation, method, path, body) in service_endpoint_requests(identifier) {
+            let case = format!("{operation} at the service endpoint for {address}");
+            let (code, answered) = call(&router, method, &path, None, body).await;
+            assert_eq!(
+                code, 404,
+                "case {case:?}: expected 404, got {code}: {answered}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {answered}"
+            );
+            let actual = answered["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                actual, expected_message,
+                "case {case:?}: expected {expected_message:?}, got {actual:?}"
+            );
+            // The control-plane refusal is the MODELLED error shape, so it carries none
+            // of the data plane's envelope: a client that branches on `code` is told by
+            // the error type, as every other control-plane failure tells it.
+            assert!(
+                answered.get("code").is_none() && answered.get("requestId").is_none(),
+                "case {case:?}: expected only the modelled members of the error shape, \
+                 got {answered}"
+            );
+        }
+    }
+
+    // Both doors are open for an identifier that DOES resolve, so each refused the
+    // address it was given and not the operation it was asked for.
+    let (code, _, summary) =
+        addressed_call(&router, "GET", "/summary?mode=BASIC", &serving, None).await;
+    assert_eq!(
+        code, 200,
+        "case GetGraphSummary at the graph endpoint of a serving graph: expected 200, \
+         got {code}: {summary}"
+    );
+    let (code, read) = call(&router, "GET", &format!("/graphs/{serving}"), None, None).await;
+    assert_eq!(
+        code, 200,
+        "case GetGraph at the service endpoint for the same graph: expected 200, got \
+         {code}: {read}"
+    );
+    assert_eq!(
+        read["id"],
+        json!(serving),
+        "case GetGraph at the service endpoint for the same graph: expected the graph \
+         {serving:?}, got {}",
+        read["id"]
+    );
+}
