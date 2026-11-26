@@ -59,8 +59,10 @@ pub(super) const BASELINE_CLAUSE_CHARGE: i64 = SET_CLAUSE_CHARGE;
 
 /// The frame an assignment whose operand is ARITHMETIC costs: `+` or `-` over two
 /// operands, each of which the write has to read before it can store anything. The
-/// boundary such a clause is observed to move is 71 bytes, the number it computes
-/// accounting for the rest.
+/// boundary such a clause is observed to move is 71 bytes, the widest of the OPERANDS it
+/// reads accounting for the rest — which is what the accounting charges in place of the
+/// number the clause computes ([`ParsedUpdate::arithmetic_operand_charge`]), so the boundary
+/// stays where it is whichever result the arithmetic carries into.
 pub(super) const SET_ARITHMETIC_CLAUSE_CHARGE: i64 = 69;
 
 /// The frame an assignment whose operand is a FUNCTION CALL costs — `if_not_exists` or

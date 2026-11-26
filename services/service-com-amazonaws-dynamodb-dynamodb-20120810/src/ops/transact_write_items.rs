@@ -1391,7 +1391,12 @@ fn update_asks_for_an_oversized_item(
             if crate::state::canonicalize_item(&mut asked).is_err() {
                 return false;
             }
-            crate::state::update_size_exceeded(table, &asked, applied.request_shape())
+            // Sized over NO pre-image, for the same reason the update was applied over none:
+            // an arithmetic clause whose operands the stored item would supply states no
+            // operand this reading can charge
+            // ([`crate::state::ParsedUpdate::request_shape`]), which is the reading this
+            // question wants. The pass that reads the stored item charges it there.
+            crate::state::update_size_exceeded(table, &asked, applied.request_shape(None))
         }
         Err(crate::state::RequestError::Validation(message)) => {
             message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE
@@ -1790,7 +1795,11 @@ fn resolve_element(
             // expression is refused. The item a `Put` CARRIES is the request's own and is
             // refused before any of the transaction is applied, worded for an item that was
             // carried.
-            if crate::state::update_size_exceeded(table, &item, applied.request_shape()) {
+            if crate::state::update_size_exceeded(
+                table,
+                &item,
+                applied.request_shape(before.as_ref()),
+            ) {
                 return Err(crossed_the_item_quota(table, &item));
             }
             table

@@ -629,7 +629,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // portion is charged ([`crate::state::update_size_exceeded`]), whose floor on
             // the expression path is why that boundary does not move between two items
             // keyed by different numbers of bytes.
-            if crate::state::update_size_exceeded(table, &item, update.request_shape()) {
+            if crate::state::update_size_exceeded(
+                table,
+                &item,
+                update.request_shape(before.as_ref()),
+            ) {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                 ));

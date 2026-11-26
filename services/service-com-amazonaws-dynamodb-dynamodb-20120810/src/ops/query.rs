@@ -1403,6 +1403,22 @@ impl KeyCondition {
                 });
             }
         }
+        // A schema keyed on SEVERAL partition key attributes is read only when EVERY one of
+        // them carries an equality, and AWS states that rule over the attributes that carry
+        // none ([`hash_keys_need_equality`]) — the rule a condition over such a schema broke
+        // is that rule, whatever else the condition named, which is why it is stated ahead of
+        // the single element a one-attribute schema reports as missed.
+        if hash_names.len() > 1 {
+            let missing: Vec<String> = hash_names
+                .iter()
+                .zip(hashes.iter())
+                .filter(|(_, constrained)| constrained.is_none())
+                .map(|(name, _)| name.clone())
+                .collect();
+            if !missing.is_empty() {
+                return Err(hash_keys_need_equality(&missing));
+            }
+        }
         if non_key {
             // That comparison stood where a key schema element's comparison belongs, so
             // the element it stood in for is the one the condition missed: the first key
@@ -1808,6 +1824,22 @@ fn not_an_indexable_operation() -> crate::state::RequestError {
     crate::state::RequestError::Validation(format!(
         "{}: Attempted conditional constraint is not an indexable operation",
         crate::state::INVALID_PARAMETER_CLAUSE
+    ))
+}
+
+/// The refusal for a key condition over a schema keyed on SEVERAL partition key attributes
+/// that leaves one of them without an equality condition.
+///
+/// A schema declaring more than one `HASH` element — "each global secondary index supports up
+/// to 4 partition keys" (`CreateTable$GlobalSecondaryIndexes`) — selects its entries by ALL of
+/// them together, so a read of it needs every one pinned to a single value. AWS names the
+/// partition key attributes that carry no equality, in the order the schema declares them,
+/// around fixed text: the same sentence its range-key counterpart states
+/// ([`range_keys_need_equality`]), over the half of the key schema this rule is about.
+fn hash_keys_need_equality(missing: &[String]) -> crate::state::RequestError {
+    crate::state::RequestError::Validation(format!(
+        "HASH key attributes {} must have equality conditions specified in the query",
+        missing.join(", ")
     ))
 }
 

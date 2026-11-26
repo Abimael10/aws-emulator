@@ -489,15 +489,27 @@ pub fn check_legacy_comparison(
 ///   compare whatever a request carries;
 /// * the two existence tests compare no value at all (their operand count is 0).
 ///
+/// The two SUBSEQUENCE tests are the one pair whose admitted set is WIDER than the sentence
+/// above: what they look for is a single value inside the value the item holds — "checks for a
+/// subsequence, or value in a set" (`ComparisonOperator`, the `CONTAINS` entry) — so every
+/// SCALAR operand is something that can be looked for, and one that cannot be found simply
+/// matches nothing rather than making the read a defect. Recorded behaviour bears that out: a
+/// boolean or null operand is served and selects no item, while an operand that is itself a
+/// COLLECTION — a document type, and the set types the operator's own doc excludes — names no
+/// single value to look for and is refused.
+///
 /// An operand outside its comparison's set can match nothing whatever the addressed item
 /// holds, so it is the caller's mistake and refused before anything is read. `None` for an
 /// operator this service does not serve, which [`check_legacy_comparison`] answers for.
 pub(super) fn legacy_operand_types(operator: &str) -> Option<&'static [&'static str]> {
     const TEXT_NUMBER_BINARY: &[&str] = &["S", "N", "B"];
     const TEXT_BINARY: &[&str] = &["S", "B"];
+    /// Every type whose value is ONE scalar, which is what a subsequence test looks for.
+    const SCALARS: &[&str] = &["S", "N", "B", "BOOL", "NULL"];
     match operator {
         "EQ" | "NE" | "NULL" | "NOT_NULL" => None,
         "BEGINS_WITH" => Some(TEXT_BINARY),
+        "CONTAINS" | "NOT_CONTAINS" => Some(SCALARS),
         _ => Some(TEXT_NUMBER_BINARY),
     }
 }

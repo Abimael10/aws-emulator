@@ -2914,6 +2914,56 @@ impl ParsedUpdate {
         (charge - BASELINE_CLAUSE_CHARGE).max(0)
     }
 
+    /// What an ARITHMETIC assignment is charged in place of the number it computes: the
+    /// widest OPERAND it read.
+    ///
+    /// What such a clause asks for is the two operands it has to read before it can store
+    /// anything — the number it computes from them is the service's own result, not something
+    /// the caller sent — so the item-size accounting is charged those operands and never the
+    /// digit width of the result. Which is why the largest operand one write may carry does
+    /// not move when the same arithmetic happens to carry into another digit: one pair of
+    /// 2-digit operands summing to a 2-digit result and another summing to a 3-digit one admit
+    /// the same write.
+    ///
+    /// Stated as the DIFFERENCE the gate applies to the bytes the item it is handed stores
+    /// (which already carry the computed number), so it is added to the clause frames beside
+    /// it ([`Self::request_shape_charge`]) rather than re-sizing the item: positive where the
+    /// operands are wider than the result, negative where the result carried into a digit the
+    /// operands do not have, zero for every other clause kind.
+    ///
+    /// A READ of the item as it stood BEFORE the update, which is what the operands were
+    /// evaluated against: an operand this reading cannot evaluate — a path the item does not
+    /// hold, a value that is no number — states no arithmetic the gate could charge and is
+    /// left to the pass that applies the update.
+    fn arithmetic_operand_charge(&self, before: Option<&Item>) -> i64 {
+        let absent = Item::new();
+        let before = before.unwrap_or(&absent);
+        let mut charge: i64 = 0;
+        for action in &self.actions {
+            let UpdateAction::Set(_, value) = action else {
+                continue;
+            };
+            let (SetValue::Sum(left, right) | SetValue::Difference(left, right)) = value else {
+                continue;
+            };
+            let Ok(computed) = evaluate_set_value(self.member, value, before) else {
+                continue;
+            };
+            let widest = [left, right]
+                .into_iter()
+                .filter_map(|operand| evaluate_set_operand(self.member, operand, before).ok())
+                .map(|operand| attribute_value_size(&operand.value))
+                .max()
+                .unwrap_or_default();
+            // The operand charged IN and the computed number charged OUT, saturatingly: both
+            // are sizes of one attribute value, so neither arithmetic can leave this range.
+            charge = charge
+                .saturating_add(widest)
+                .saturating_sub(attribute_value_size(&computed));
+        }
+        charge
+    }
+
     /// What the SHAPE of the request that stated this update costs the item-size
     /// accounting ([`UpdateRequestShape`]).
     ///
@@ -2921,9 +2971,16 @@ impl ParsedUpdate {
     /// states clauses and is charged their frames and the key-portion floor beside them,
     /// while the legacy per-attribute map states no clause at all and is charged the item
     /// alone.
-    pub fn request_shape(&self) -> UpdateRequestShape {
+    ///
+    /// `before` is the item the addressed key held when the update was applied (`None` for a
+    /// key that held none), which is what an arithmetic clause's operands were read against
+    /// ([`Self::arithmetic_operand_charge`]).
+    pub fn request_shape(&self, before: Option<&Item>) -> UpdateRequestShape {
         if self.member == UPDATE_EXPRESSION_MEMBER {
-            UpdateRequestShape::StatedAsAnExpression(self.request_shape_charge())
+            UpdateRequestShape::StatedAsAnExpression(
+                self.request_shape_charge()
+                    .saturating_add(self.arithmetic_operand_charge(before)),
+            )
         } else {
             UpdateRequestShape::StatedWithoutAnExpression
         }
@@ -2939,6 +2996,12 @@ impl ParsedUpdate {
         let read = tokenize_expression_spanned(member, expression)?;
         let mut parser = ExprParser::over(member, &read, substitutions);
         let actions = parser.update_actions()?;
+        // This member groups with parentheses too — an arithmetic operand pair may be
+        // written inside one — so it is held to the same grouping rule every other grammar
+        // of this service is ([`ExprParser::check_no_redundant_parentheses`]): a pair that
+        // wraps nothing but another pair states nothing about how the expression is read and
+        // is refused, before anything is applied.
+        parser.check_no_redundant_parentheses()?;
         parser.check_no_reserved_name()?;
         Self::from_actions(member, actions)
     }
@@ -3571,10 +3634,12 @@ impl<'a> ExprParser<'a> {
     /// parentheses the grammar could not complete are the syntax error the parse stopped
     /// at, and only an expression that parsed has groups to call redundant.
     ///
-    /// Grouping is what parentheses do in the CONDITION grammar, so this is asked where
-    /// that grammar is parsed ([`ParsedCondition::parse`]) — the parentheses of a function
-    /// call carry its arguments and are never redundant, which is why a group around a
-    /// whole call (`(attribute_exists(a))`) is not one.
+    /// Grouping is what parentheses do in BOTH grammars this parser reads, so this is asked
+    /// where each of them is parsed — the condition and filter language
+    /// ([`ParsedCondition::parse`]) and the update language, whose `SET` groups the value it
+    /// assigns ([`ParsedUpdate::parse`]). The parentheses of a function call carry its
+    /// arguments and are never redundant, which is why a group around a whole call
+    /// (`(attribute_exists(a))`) is not one.
     ///
     /// The rule itself is stated once for every grammar of this service that groups with
     /// parentheses ([`states_redundant_parentheses`]); this is where this grammar's tokens
