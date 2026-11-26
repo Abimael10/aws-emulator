@@ -2070,13 +2070,19 @@ pub fn instance_id_not_found_message(connect_instance_id: &str) -> String {
 ///
 /// Composed from the request, so the refusal names the instance the caller asked
 /// about, as the recorded responses of this class do. The one text shared by every
-/// operation whose wire states it — the two on `/v2/connect-instance/{id}/config`, the
-/// two on the instance's communication-limits, which are a member of that same stored
-/// configuration (see [`StoredInstanceOnboarding::communication_limits`]), and the two
-/// that write an instance's integrations — so two of them cannot disagree about an
-/// instance this service holds no configuration for. The operations whose wire states
-/// the instance's USABILITY instead answer [`INSTANCE_NOT_FOUND_MESSAGE`], which is the
-/// text recorded for those.
+/// operation whose wire states it — the READ of `/v2/connect-instance/{id}/config`
+/// (`GetConnectInstanceConfig`) and the two that write an instance's integrations
+/// (`PutConnectInstanceIntegration` and `DeleteConnectInstanceIntegration`), which hang
+/// off that same stored configuration — so two of them cannot disagree about an
+/// instance this service holds no configuration for.
+///
+/// The REMOVAL of that configuration (`DeleteConnectInstanceConfig`) states its own
+/// sentence instead, reporting the instance as not onboarded
+/// ([`INSTANCE_NOT_ONBOARDED_MESSAGE`]), and the operations whose wire states the
+/// instance's USABILITY answer [`INSTANCE_NOT_FOUND_MESSAGE`], which is the text
+/// recorded for those — the two on the instance's communication limits among them, even
+/// though those limits are a member of this same stored configuration (see
+/// [`StoredInstanceOnboarding::communication_limits`]).
 pub fn instance_config_not_found_message(connect_instance_id: &str) -> String {
     format!("ConnectInstanceConfig not found {connect_instance_id}.")
 }
@@ -2272,10 +2278,16 @@ pub fn service_linked_role_arn() -> String {
 /// A FIXED service string — it names no instance and carries nothing from the request,
 /// which is what the recorded responses of this class carry — so every refusal of this
 /// kind reads the same and the response is deterministic. The one text shared by the
-/// operations whose wire states the instance's usability (starting an onboarding job,
-/// creating a campaign, and listing an instance's integrations), so two of them cannot
-/// disagree about a request they both refuse. The operations whose wire states the
-/// instance's CONFIGURATION answer [`instance_config_not_found_message`] instead.
+/// operations whose wire states the instance's usability (creating a campaign, listing
+/// an instance's integrations, and the two on the instance's communication limits), so
+/// two of them cannot disagree about a request they both refuse.
+///
+/// Each of the other instance-scoped sentences is stated by its own operations: the
+/// ones whose wire states the instance's CONFIGURATION answer
+/// [`instance_config_not_found_message`], the onboarding START reports the instance id
+/// itself as unresolved ([`instance_id_not_found_message`]), and the campaign listing
+/// and the removal of an instance's configuration report the instance as not onboarded
+/// ([`INSTANCE_NOT_ONBOARDED_MESSAGE`]).
 ///
 /// The sentence itself is the shared gate's
 /// ([`::service_common::connect_instance_registry::INSTANCE_NOT_USABLE_MESSAGE`]), stated
@@ -3699,7 +3711,8 @@ pub enum InstanceConfigDeletion {
     /// The region holds no configuration for the instance at the instant the call was
     /// judged, so there was none to delete. The caller answers this with the modelled
     /// `ResourceNotFoundException` (HTTP 404) carrying
-    /// [`instance_config_not_found_message`].
+    /// [`INSTANCE_NOT_ONBOARDED_MESSAGE`], the sentence that operation's own wire states
+    /// for an instance it holds no finished onboarding for.
     NotConfigured,
     /// The instance still owns at least one campaign and the request asked for no
     /// campaign deletion, so the configuration those campaigns depend on is left in
