@@ -38,15 +38,19 @@
 //! * a per-id read of a read set id the sequence store the request names does not hold is
 //!   the read-set-not-found refusal, whatever the reason the store does not hold it;
 //! * a request naming a sequence store or an upload this emulator does not hold — or
-//!   carrying no content at all — is refused rather than stored.
+//!   carrying no content at all — is refused rather than stored;
+//! * a read of a read set's data serves ONE part of ONE of its files, byte for byte as
+//!   that part was ingested, and a part or a file the read set does not hold is the
+//!   not-found refusal.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_omics_omics::state::{
     service_state, CREATION_TYPE_UPLOAD, FIRST_SEQUENCE_STORE_ID,
     MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE, MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG,
-    READ_SET_ID_OFFSET, READ_SET_NOT_FOUND_MESSAGE, READ_SET_PAGE_TOKEN_TAG,
-    READ_SET_STATUS_ACTIVE, READ_SET_STATUS_DELETED, READ_SET_STATUS_PROCESSING_UPLOAD,
-    READ_SET_UPLOAD_PART_SIZE, RESOURCE_HAS_DEPENDENTS_MESSAGE, SEQUENCE_STORE_NOT_FOUND_MESSAGE,
+    READ_SET_FILE_INDEX, READ_SET_ID_OFFSET, READ_SET_NOT_FOUND_MESSAGE, READ_SET_PAGE_TOKEN_TAG,
+    READ_SET_PART_NOT_FOUND_MESSAGE, READ_SET_STATUS_ACTIVE, READ_SET_STATUS_DELETED,
+    READ_SET_STATUS_PROCESSING_UPLOAD, READ_SET_UPLOAD_PART_SIZE, RESOURCE_HAS_DEPENDENTS_MESSAGE,
+    SEQUENCE_STORE_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -3632,5 +3636,517 @@ async fn a_read_set_id_the_named_store_does_not_hold_is_not_found() {
         metadata.get("id").and_then(Value::as_str),
         Some(held.as_str()),
         "expected the held read set to be reported, got {metadata:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reading a read set's data back
+// ---------------------------------------------------------------------------
+//
+// The rules the cases below assert:
+//
+// * a read of a read set's data serves ONE part of ONE of its files: the bytes that part
+//   was ingested with, unchanged — so a part read back is byte for byte the part that was
+//   uploaded, a compressed part is served still compressed, and the parts of a file in
+//   order are the file the metadata describes;
+//   * a file's parts are counted from one in the order they formed it, as its `totalParts`
+//     reports, whatever part numbers the upload itself used;
+//   * the file read is the modelled `ReadSetFile` the request names, and the read set's
+//     first source file when the request names none;
+// * a part the file does not hold — a number past the parts that formed it — and a file
+//   the read set does not hold are the not-found refusal: that part is simply not there;
+// * a read set whose files the service is still forming cannot have its data served, and
+//   the same read answers the stored part once the read set is active.
+
+/// `GET /sequencestore/{store}/readset/{id}?partNumber=..[&file=..]`, with the RAW response
+/// body beside the response document.
+///
+/// That is the one wire form this operation binds: `payload` is an `@httpPayload` streaming
+/// blob, so a success carries bytes rather than JSON and the harness's JSON `call` cannot
+/// express it. A refusal still carries the modelled error document, which is parsed beside
+/// those bytes so one helper serves both.
+async fn get_read_set(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    read_set_id: &str,
+    file: Option<&str>,
+    part_number: i32,
+) -> (u16, Vec<u8>, Value) {
+    let file_query = file.map(|file| format!("&file={file}")).unwrap_or_default();
+    let uri = format!(
+        "/sequencestore/{sequence_store_id}/readset/{read_set_id}\
+         ?partNumber={part_number}{file_query}"
+    );
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", format!("omics.{REGION}.amazonaws.com"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={AKID}/20260101/{REGION}/omics/aws4_request, \
+                 SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::new())
+        .expect("a well-formed test request");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let raw = response.into_body().to_vec();
+    // A payload of bytes is not JSON, so a success parses as nothing: only a refusal has a
+    // document, and the `x-amzn-errortype` header is folded into it the way `call` does.
+    let mut parsed: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    if let (Some(error_type), Value::Object(map)) = (error_type, &mut parsed) {
+        map.entry("__type")
+            .or_insert_with(|| Value::String(error_type));
+    }
+    (status, raw, parsed)
+}
+
+/// `content` read back out of the gzip stream `gzipped` wrote it into.
+fn gunzipped(content: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(content)
+        .read_to_end(&mut decoded)
+        .expect("the gzip decoder takes the served payload");
+    decoded
+}
+
+/// A row of the data-read table: the parts one read set is formed from.
+struct DataReadCase {
+    case: &'static str,
+    /// The parts uploaded into it: source file, part number, content.
+    parts: Vec<(&'static str, i32, Vec<u8>)>,
+}
+
+/// The table: one row per way the parts a read set is formed from can differ, so the rule
+/// is asserted over the class and not over one request. The rows differ along how many
+/// parts formed a file, the sizes of those parts, whether the uploaded bytes are
+/// compressed, which part NUMBERS the upload used (consecutive, and sparse up to the top of
+/// the modelled range), and how many source files the read set holds.
+fn data_read_cases() -> Vec<DataReadCase> {
+    let (_, last_number) = PART_NUMBER_RANGE;
+    let stream = gzipped(THREE_READ_FASTQ);
+    let third = stream.len() / 3;
+    vec![
+        DataReadCase {
+            case: "one plaintext part",
+            parts: vec![("SOURCE1", 1, ONE_READ_FASTQ.to_vec())],
+        },
+        DataReadCase {
+            case: "one gzipped part",
+            parts: vec![("SOURCE1", 1, gzipped(ONE_READ_FASTQ))],
+        },
+        DataReadCase {
+            case: "three parts of different sizes",
+            parts: vec![
+                ("SOURCE1", 1, stream[..third].to_vec()),
+                ("SOURCE1", 2, stream[third..third * 2 + 1].to_vec()),
+                ("SOURCE1", 3, stream[third * 2 + 1..].to_vec()),
+            ],
+        },
+        DataReadCase {
+            case: "parts the upload numbered sparsely",
+            parts: vec![
+                ("SOURCE1", 1, FORWARD_FASTQ.to_vec()),
+                ("SOURCE1", last_number, REVERSE_FASTQ.to_vec()),
+            ],
+        },
+        DataReadCase {
+            case: "a paired read set, two parts of one source and one of the other",
+            parts: vec![
+                ("SOURCE1", 1, FORWARD_FASTQ.to_vec()),
+                ("SOURCE1", 2, ONE_READ_FASTQ.to_vec()),
+                ("SOURCE2", 1, REVERSE_FASTQ.to_vec()),
+            ],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_read_of_a_read_set_serves_the_part_it_was_ingested_with() {
+    let (router, _engine) = emulator_holding_its_engine();
+
+    for row in data_read_cases() {
+        let case = row.case;
+        let store = create_store(&router, case).await;
+        let (status, body) = create_upload(&router, &store, &upload_request(case)).await;
+        let upload = created_upload_id(case, status, &body);
+        let listed = upload_all(&router, case, &store, &upload, &row.parts).await;
+        let (status, body) = complete_upload(&router, &store, &upload, &parts_list(&listed)).await;
+        let read_set = completed_read_set_id(case, status, &body);
+        let metadata =
+            await_read_set_status(&router, &store, &read_set, READ_SET_STATUS_ACTIVE).await;
+
+        // The parts of each source file, in the ascending part-number order they formed
+        // that file in — which is the order the file's own parts are counted in, from one.
+        let mut by_source: std::collections::BTreeMap<&str, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        let mut uploaded: Vec<(&str, i32, Vec<u8>)> = row
+            .parts
+            .iter()
+            .map(|(source, number, payload)| (*source, *number, payload.clone()))
+            .collect();
+        uploaded.sort_by_key(|(source, number, _)| (*source, *number));
+        for (source, _, payload) in uploaded {
+            by_source.entry(source).or_default().push(payload);
+        }
+
+        for (&source, parts) in &by_source {
+            let mut file = Vec::new();
+            for (index, expected) in parts.iter().enumerate() {
+                let part_number = index as i32 + 1;
+                let (status, payload, body) =
+                    get_read_set(&router, &store, &read_set, Some(source), part_number).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200 for part {part_number} of {source}, \
+                     got {status} {body:?}"
+                );
+                assert_eq!(
+                    payload, *expected,
+                    "case {case:?}: part {part_number} of {source} must be served byte for \
+                     byte as uploaded, got {payload:?}"
+                );
+                file.extend_from_slice(&payload);
+            }
+
+            // The parts served for the file ARE the file the metadata describes: as many
+            // parts as it reports, holding as many bytes as it reports.
+            let reported = metadata
+                .get("files")
+                .and_then(|files| files.get(source.to_lowercase()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: metadata reports no {source} file, got {metadata:?}")
+                });
+            assert_eq!(
+                reported.get("totalParts").and_then(Value::as_i64),
+                Some(parts.len() as i64),
+                "case {case:?}: expected {source} to report the parts that formed it, \
+                 got {reported:?}"
+            );
+            assert_eq!(
+                reported.get("contentLength").and_then(Value::as_i64),
+                Some(file.len() as i64),
+                "case {case:?}: expected {source}'s length to be the bytes its parts served, \
+                 got {reported:?}"
+            );
+
+            // One past the parts that formed the file names no part of it.
+            let past = parts.len() as i32 + 1;
+            let (status, payload, body) =
+                get_read_set(&router, &store, &read_set, Some(source), past).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected 404 for part {past} of {source}, got {status} \
+                 {body:?} with {} bytes",
+                payload.len()
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException for part {past} of \
+                 {source}, got {body:?}"
+            );
+        }
+
+        // A read naming no file serves the read set's first source file.
+        let first = by_source
+            .get("SOURCE1")
+            .unwrap_or_else(|| panic!("case {case:?}: every row uploads a SOURCE1 file"));
+        for index in 0..first.len() {
+            let part_number = index as i32 + 1;
+            let (status, defaulted, body) =
+                get_read_set(&router, &store, &read_set, None, part_number).await;
+            let (named_status, named, _) =
+                get_read_set(&router, &store, &read_set, Some("SOURCE1"), part_number).await;
+            assert_eq!(
+                (status, &defaulted),
+                (named_status, &named),
+                "case {case:?}: a read naming no file must answer part {part_number} of \
+                 SOURCE1, got {status} {body:?} with {} bytes",
+                defaulted.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_compressed_part_is_served_still_compressed() {
+    // The service answers a read set in the format it was uploaded in, so what comes back
+    // is the gzip stream the caller sent and never the data inside it.
+    let (router, _engine) = emulator_holding_its_engine();
+
+    for (case, plain) in [
+        ("one read", ONE_READ_FASTQ),
+        ("three reads", THREE_READ_FASTQ),
+        ("one mate of a pair", FORWARD_FASTQ),
+    ] {
+        let compressed = gzipped(plain);
+        let store = create_store(&router, case).await;
+        let (status, body) = create_upload(&router, &store, &upload_request(case)).await;
+        let upload = created_upload_id(case, status, &body);
+        let listed = upload_all(
+            &router,
+            case,
+            &store,
+            &upload,
+            &[("SOURCE1", 1, compressed.clone())],
+        )
+        .await;
+        let (status, body) = complete_upload(&router, &store, &upload, &parts_list(&listed)).await;
+        let read_set = completed_read_set_id(case, status, &body);
+        await_read_set_status(&router, &store, &read_set, READ_SET_STATUS_ACTIVE).await;
+
+        let (status, payload, body) = get_read_set(&router, &store, &read_set, None, 1).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {body:?}"
+        );
+        assert_eq!(
+            payload, compressed,
+            "case {case:?}: expected the uploaded gzip stream, got {payload:?}"
+        );
+        assert_ne!(
+            payload.as_slice(),
+            plain,
+            "case {case:?}: the service must not decompress what it was given"
+        );
+        // And the served bytes really are that stream: they decode back to the records.
+        assert_eq!(
+            gunzipped(&payload),
+            plain,
+            "case {case:?}: the served payload must decompress to the uploaded records"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_read_of_a_part_or_a_file_a_read_set_does_not_hold_is_not_found() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the store holding the read set").await;
+    let elsewhere = create_store(&router, "another store").await;
+    let case = "a read set of two parts from one source";
+    let (status, body) = create_upload(&router, &store, &upload_request(case)).await;
+    let upload = created_upload_id(case, status, &body);
+    let listed = upload_all(
+        &router,
+        case,
+        &store,
+        &upload,
+        &[
+            ("SOURCE1", 1, FORWARD_FASTQ.to_vec()),
+            ("SOURCE1", 2, REVERSE_FASTQ.to_vec()),
+        ],
+    )
+    .await;
+    let (status, body) = complete_upload(&router, &store, &upload, &parts_list(&listed)).await;
+    let read_set = completed_read_set_id(case, status, &body);
+    await_read_set_status(&router, &store, &read_set, READ_SET_STATUS_ACTIVE).await;
+
+    let (_, last_number) = PART_NUMBER_RANGE;
+    // Every way a read can name data this read set does not hold: a part number just past
+    // the parts that formed the file and one at the top of the modelled range, the source
+    // file the read set has no part from, the index file this service builds none of, a
+    // read set id the store holds nothing for, the read set addressed through another
+    // store, and a sequence store this emulator does not hold.
+    for (case, sequence_store_id, read_set_id, file, part_number, message) in [
+        (
+            "one part past the parts that formed the file",
+            store.as_str(),
+            read_set.as_str(),
+            None,
+            3,
+            READ_SET_PART_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "a part number at the top of the modelled range",
+            store.as_str(),
+            read_set.as_str(),
+            None,
+            last_number,
+            READ_SET_PART_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "the source file this read set holds no part from",
+            store.as_str(),
+            read_set.as_str(),
+            Some("SOURCE2"),
+            1,
+            READ_SET_PART_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "the index file this service builds none of",
+            store.as_str(),
+            read_set.as_str(),
+            Some(READ_SET_FILE_INDEX),
+            1,
+            READ_SET_PART_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "a read set id the store holds nothing for",
+            store.as_str(),
+            "9999999999",
+            None,
+            1,
+            READ_SET_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "the read set addressed through another store",
+            elsewhere.as_str(),
+            read_set.as_str(),
+            None,
+            1,
+            READ_SET_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "a sequence store this emulator does not hold",
+            "9999999999",
+            read_set.as_str(),
+            None,
+            1,
+            SEQUENCE_STORE_NOT_FOUND_MESSAGE,
+        ),
+    ] {
+        let (status, payload, body) = get_read_set(
+            &router,
+            sequence_store_id,
+            read_set_id,
+            file,
+            part_number,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404, got {status} {body:?} with {} bytes",
+            payload.len()
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(message),
+            "case {case:?}: expected the message this service words that refusal with, \
+             got {body:?}"
+        );
+    }
+
+    // The parts the read set does hold are untouched by every refusal above.
+    for (part_number, expected) in [(1, FORWARD_FASTQ), (2, REVERSE_FASTQ)] {
+        let (status, payload, body) =
+            get_read_set(&router, &store, &read_set, None, part_number).await;
+        assert_eq!(
+            status, 200,
+            "expected 200 for part {part_number}, got {status} {body:?}"
+        );
+        assert_eq!(
+            payload.as_slice(),
+            expected,
+            "expected part {part_number} to be served as uploaded, got {payload:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_part_number_outside_the_modelled_range_is_refused() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the store holding the read set").await;
+    let read_set = form_read_set(&router, &store, "the read set a read names").await;
+    await_read_set_status(&router, &store, &read_set, READ_SET_STATUS_ACTIVE).await;
+
+    let (first, last) = PART_NUMBER_RANGE;
+    // Each published bound of the modelled range and one past it: inside the range the
+    // answer is about what the read set holds — its only part, and a part it does not have
+    // — while outside it the request itself is refused.
+    for (case, part_number, expected_status) in [
+        ("one below the bottom of the range", first - 1, 400),
+        ("the bottom of the range", first, 200),
+        ("the top of the range", last, 404),
+        ("one past the top of the range", last + 1, 400),
+    ] {
+        let (status, payload, body) =
+            get_read_set(&router, &store, &read_set, None, part_number).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status} for partNumber {part_number}, got \
+             {status} {body:?} with {} bytes",
+            payload.len()
+        );
+        if expected_status == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {body:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_read_set_still_being_processed_cannot_have_its_data_read() {
+    let (router, engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the store holding the read set").await;
+    let read_set = form_read_set(&router, &store, "the read set a read names").await;
+    await_read_set_status(&router, &store, &read_set, READ_SET_STATUS_ACTIVE).await;
+    let state = service_state(&*engine).expect("the omics service state");
+
+    // Held in the transient status a completion leaves behind, with no transition owed, so
+    // what is asserted is the refusal that status carries rather than when the clock
+    // happened to move it.
+    {
+        let mut registry = state.lock();
+        let held = registry
+            .read_sets
+            .values_mut()
+            .find(|held| held.id == read_set)
+            .expect("the read set the completion formed");
+        held.status = READ_SET_STATUS_PROCESSING_UPLOAD.to_string();
+        held.status_due_at_ms = None;
+    }
+
+    let (status, payload, body) = get_read_set(&router, &store, &read_set, None, 1).await;
+    assert_eq!(
+        status, 409,
+        "expected 409 while the read set is {READ_SET_STATUS_PROCESSING_UPLOAD}, got \
+         {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ConflictException",
+        "expected ConflictException, got {body:?}"
+    );
+    assert_ne!(
+        payload.as_slice(),
+        ONE_READ_FASTQ,
+        "a refusal must carry no part of the read set's data"
+    );
+
+    // The same read answers the stored part once the read set is active again.
+    {
+        let mut registry = state.lock();
+        let held = registry
+            .read_sets
+            .values_mut()
+            .find(|held| held.id == read_set)
+            .expect("the read set the completion formed");
+        held.status = READ_SET_STATUS_ACTIVE.to_string();
+    }
+    let (status, payload, body) = get_read_set(&router, &store, &read_set, None, 1).await;
+    assert_eq!(status, 200, "expected 200, got {status} {body:?}");
+    assert_eq!(
+        payload.as_slice(),
+        ONE_READ_FASTQ,
+        "expected the stored part, got {payload:?}"
     );
 }

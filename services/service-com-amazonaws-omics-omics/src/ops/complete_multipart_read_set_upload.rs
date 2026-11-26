@@ -330,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .or_insert_with(|| crate::state::ReadSetSource {
                     part_source: part_source.clone(),
                     content: Vec::new(),
-                    total_parts: 0,
+                    part_lengths: Vec::new(),
                     // The part size the upload itself is conducted with, which is what
                     // the file reports however much the parts that formed it weighed.
                     part_size: crate::state::READ_SET_UPLOAD_PART_SIZE,
@@ -339,7 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     s3_uri: String::new(),
                 });
             file.content.extend_from_slice(&part.payload);
-            file.total_parts += 1;
+            // The boundary this part leaves in the file, so a later read of part N answers
+            // the bytes this part carried rather than a slice of a guessed width.
+            file.part_lengths.push(part.payload.len());
         }
         let read_set_bytes: usize = sources.values().map(|file| file.content.len()).sum();
 

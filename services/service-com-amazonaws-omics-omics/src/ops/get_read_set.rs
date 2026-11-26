@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReadSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReadSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReadSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves one part of one file of a stored read set: the bytes that part was ingested
+//! with, unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReadSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReadSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: the payload is the stored part's own bytes, and the only write
+        // is the status transition the clock already owed the read set, which was due at
+        // the same instant whether or not anybody called.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReadSet"))
+        // The modelled `partNumber` range is a constraint the centralized walk has
+        // already refused anything outside of, so a part number reaching here is one the
+        // model admits — whether the read set holds a part with that number is what is
+        // resolved below.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            GetReadSetErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // A read set is held BY a sequence store, so there is no read set collection to
+        // reach when the store the path names is not one this emulator holds.
+        if registry.sequence_store(&input.sequence_store_id).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(GetReadSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(read_set) = registry.read_set(&input.sequence_store_id, &input.id) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            return Err(GetReadSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::READ_SET_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A read set's data is there to be read once the service has finished forming its
+        // files out of the parts that were uploaded: one still being processed cannot have
+        // its content served, which is what the modelled conflict states.
+        if read_set.status != crate::state::READ_SET_STATUS_ACTIVE {
+            let status = read_set.status.clone();
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::Conflict,
+                Some(&input.id),
+            );
+            return Err(GetReadSetErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "readset {} is {status}; its files can be read once it is {}",
+                    input.id,
+                    crate::state::READ_SET_STATUS_ACTIVE
+                ),
+            })
+            .into());
+        }
+
+        // Which file of the read set is being read: the modelled `ReadSetFile` the request
+        // names, or its first source file when the request names none. `SOURCE1`/`SOURCE2`
+        // are the sources a read set's files were uploaded from, so they key the stored
+        // files directly; `INDEX` names the index HealthOmics builds from sequence data,
+        // which this emulator holds no file for (see `ReadSet::files_output`), so a read
+        // of it resolves to nothing here rather than to bytes nothing produced.
+        let file = input
+            .file
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_READ_SET_FILE);
+
+        // The part itself: the bytes that part of that file carries, or nothing at all
+        // when this read set holds no such file, or that file no part with this number —
+        // a part past the ones the file was uploaded in simply does not exist on it.
+        let Some(payload) = read_set
+            .sources
+            .get(file)
+            .and_then(|source| source.part(input.part_number))
+            .map(<[u8]>::to_vec)
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            return Err(GetReadSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::READ_SET_PART_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&input.id),
+        );
+
+        // The payload is the stored bytes verbatim: the service returns a read set in the
+        // same format it was uploaded in, so nothing here decodes, decompresses or
+        // re-frames what was ingested.
+        Ok(GetReadSetOutput { payload })
     }
 }

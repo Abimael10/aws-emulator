@@ -321,6 +321,15 @@ pub const MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE: &str =
 /// delete has already taken away.
 pub const READ_SET_NOT_FOUND_MESSAGE: &str = "The specified readset does not exist.";
 
+/// How this service states that the read set a data read reached holds no such file or no
+/// such part — a part number past the parts the file was uploaded in, or a file the read
+/// set does not hold at all.
+///
+/// The storage data plane words this refusal as the error code itself: fixed text that
+/// carries nothing of the request, which is the wording the recorded refusal of an
+/// out-of-range part number carries.
+pub const READ_SET_PART_NOT_FOUND_MESSAGE: &str = "ResourceNotFoundException";
+
 /// What a delete answers when the resource it names still has resources of its own
 /// hanging off it — a sequence store that still holds read sets, say.
 ///
@@ -1032,8 +1041,11 @@ pub struct ReadSetSource {
     pub part_source: String,
     /// The file's content: the parts that formed it, in ascending part-number order.
     pub content: Vec<u8>,
-    /// How many parts formed it, as the modelled `totalParts` reports it.
-    pub total_parts: i32,
+    /// The length of each part that formed this file, in that same ascending part-number
+    /// order. The boundaries are kept, not just the total: a read of one part of this file
+    /// answers exactly the bytes that part carried, and how many parts the file holds is
+    /// read off this list ([`ReadSetSource::total_parts`]).
+    pub part_lengths: Vec<usize>,
     /// The size of the part the file was uploaded in, as the modelled `partSize` reports
     /// it: the part size the upload itself is conducted with
     /// ([`READ_SET_UPLOAD_PART_SIZE`]), not the length of any part a caller sent.
@@ -1054,6 +1066,24 @@ impl ReadSetSource {
     pub fn content_length(&self) -> i64 {
         self.content.len() as i64
     }
+
+    /// How many parts formed this file, as the modelled `totalParts` reports it.
+    pub fn total_parts(&self) -> i32 {
+        self.part_lengths.len() as i32
+    }
+
+    /// The content of the part this file holds under the 1-based `part_number`, or `None`
+    /// when the file holds no part with that number.
+    ///
+    /// The bytes are the ones that part carried, sliced at the boundaries the parts that
+    /// formed the file left behind, so a part read back is the part as uploaded — this
+    /// service stores what it ingested and transforms none of it.
+    pub fn part(&self, part_number: i32) -> Option<&[u8]> {
+        let index = usize::try_from(part_number.checked_sub(1)?).ok()?;
+        let length = *self.part_lengths.get(index)?;
+        let start: usize = self.part_lengths.iter().take(index).sum();
+        self.content.get(start..start + length)
+    }
 }
 
 /// `FileInformation` for one read set file, every member read off that stored file.
@@ -1066,7 +1096,7 @@ impl ReadSetSource {
 /// none, which is what a read set whose files are gone (a deleted one) holds.
 fn file_information(file: &ReadSetSource) -> FileInformation {
     FileInformation {
-        total_parts: Some(file.total_parts),
+        total_parts: Some(file.total_parts()),
         part_size: Some(file.part_size),
         content_length: Some(file.content_length()),
         s3_access: (!file.s3_uri.is_empty()).then(|| ReadSetS3Access {
@@ -1083,6 +1113,15 @@ pub const READ_SET_PART_SOURCE1: &str = "SOURCE1";
 /// The modelled `ReadSetPartSource` of a read set's second file, which a paired-end
 /// upload carries beside the first.
 pub const READ_SET_PART_SOURCE2: &str = "SOURCE2";
+
+/// The modelled `ReadSetFile` naming the index HealthOmics builds from a read set's
+/// sequence data, which is neither of the source files a caller uploads.
+/// Source: `smithy_query(query="shape",shape="ReadSetFile")` -> SOURCE1 | SOURCE2 | INDEX.
+pub const READ_SET_FILE_INDEX: &str = "INDEX";
+
+/// The `ReadSetFile` a read set data read serves when the request names none: the read
+/// set's first source file, the only file a single-source read set holds.
+pub const DEFAULT_READ_SET_FILE: &str = READ_SET_PART_SOURCE1;
 
 /// One stored run cache: every member `GetRunCache` reports.
 ///
