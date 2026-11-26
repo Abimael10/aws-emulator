@@ -83,9 +83,11 @@ pub fn registrations_store_full_message() -> String {
 ///
 /// `ResourceInUseException`'s own documentation is "Error returned if an attempt is made to
 /// delete a patch baseline that is registered for a patch group", and the refusal names the
-/// group that holds it so the caller knows which registration to take away first.
+/// group that holds it so the caller knows which registration to take away first: the fixed
+/// text states what the delete was refused for, and the group it names is the one the store
+/// holds the registration under.
 pub fn baseline_in_use_message(patch_group: &str) -> String {
-    format!("Patch baseline is registered with patch group {patch_group}")
+    format!("PatchBaseline to be deleted is used for Patch Group: {patch_group}")
 }
 
 impl ComAmazonawsSsmAmazonssmState {

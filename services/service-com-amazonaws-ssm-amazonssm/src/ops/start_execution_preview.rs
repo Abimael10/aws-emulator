@@ -250,13 +250,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // execution would run in, and the resources its targets resolve to in this Region.
         // Worked out HERE, from the store as it stands, so the read reports a computation
         // rather than repeating the request.
-        let computed =
-            crate::state::execution_previews::compute(&store, &region, &steps, automation)
-                .map_err(|key| {
-                    invalid(crate::state::automation::unresolvable_target_key_message(
-                        &key,
-                    ))
-                })?;
+        let computed = crate::state::execution_previews::compute(
+            &store,
+            &region,
+            &version.parsed.parameters,
+            &steps,
+            automation,
+        )
+        .map_err(|key| {
+            invalid(crate::state::automation::unresolvable_target_key_message(
+                &key,
+            ))
+        })?;
 
         let preview_id = store.mint_execution_preview_id();
         store.insert_execution_preview(crate::state::execution_previews::ExecutionPreviewRecord {

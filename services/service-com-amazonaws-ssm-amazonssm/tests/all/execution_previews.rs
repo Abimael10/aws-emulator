@@ -514,9 +514,11 @@ struct TargetRow {
     counts: Value,
 }
 
-/// A preview counts the resources its targets resolve to, grouped by the type each of them
-/// is: the criteria are resolved against the nodes this Region holds, so criteria that
-/// describe no registered node contribute no resource.
+/// A preview counts the resources the execution would act on, grouped by the type each of
+/// them is: a criterion is resolved against the nodes this Region holds, so one that
+/// describes no registered node contributes no resource, while an identity names its
+/// resource outright. The wider table over that rule — every input form a resource is named
+/// through, and both id forms — is `execution_preview_target_resources`.
 #[tokio::test]
 async fn a_preview_counts_the_resources_its_targets_resolve_to() {
     let (router, engine) = service();
@@ -525,9 +527,11 @@ async fn a_preview_counts_the_resources_its_targets_resolve_to() {
 
     let rows = [
         TargetRow {
-            case: "no targets at all",
+            // No targets, so what the execution would act on is what the runbook's own
+            // step names: the node the parameter its inputs reference resolves to.
+            case: "no targets at all, the step naming a node through a parameter",
             inputs: json!({"Automation": {"Parameters": {"Node": [EC2_ONE]}}}),
-            counts: json!([]),
+            counts: json!([{"TargetType": "AWS::EC2::Instance", "Count": 1}]),
         },
         TargetRow {
             case: "node ids across both resource types",
@@ -560,12 +564,24 @@ async fn a_preview_counts_the_resources_its_targets_resolve_to() {
             ]),
         },
         TargetRow {
-            case: "a criterion no registered node answers",
+            case: "a tag criterion no registered node answers",
+            inputs: json!({"Automation": {
+                "TargetParameterName": "Node",
+                "Targets": [{"Key": "tag:env", "Values": ["nothing-is-tagged-this"]}],
+            }}),
+            counts: json!([]),
+        },
+        TargetRow {
+            // An identity NAMES its resource: an Automation action reaches an Amazon EC2
+            // instance through that service's own API, so the instance the target names is
+            // a resource the execution would act on whether or not a node is registered
+            // for it here.
+            case: "a node id no registration is held for",
             inputs: json!({"Automation": {
                 "TargetParameterName": "Node",
                 "Targets": [{"Key": "InstanceIds", "Values": [UNREGISTERED]}],
             }}),
-            counts: json!([]),
+            counts: json!([{"TargetType": "AWS::EC2::Instance", "Count": 1}]),
         },
         TargetRow {
             case: "parameter values, only one of which names a node",

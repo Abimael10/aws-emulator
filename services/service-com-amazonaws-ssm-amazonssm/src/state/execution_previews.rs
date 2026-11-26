@@ -20,10 +20,11 @@
 //!   have ([`step_impact`]) — the steps read out of the resolved version's content by the
 //!   one runbook reader this service has ([`super::automation::runbook::steps_of`]), so a
 //!   preview and an execution read the same runbook;
-//! * `TargetPreviews` counts the resources the inputs' targets resolve to, grouped by the
-//!   type each resolved resource is ([`target_type_of`]) — resolved through the one node
-//!   matcher this service has ([`super::commands::nodes_matching_target`]), so a criterion
-//!   that describes no registered node contributes no resource rather than an invented one;
+//! * `TargetPreviews` counts the resources the inputs' targets identify, grouped by the
+//!   type each one is ([`resource_type_of_value`]) — a criterion is resolved through the one
+//!   node matcher this service has ([`super::commands::nodes_matching_target`]), so a
+//!   criterion that describes no registered node contributes no resource rather than an
+//!   invented one, while an identity target contributes the resources it names;
 //! * `Regions` are the Regions the inputs' `TargetLocations` name, and the Region the start
 //!   was signed for when they name none;
 //! * `TotalAccounts` is how many accounts those same target locations name, and this one
@@ -41,13 +42,14 @@
 //! preview report the same instant. The work itself is done once, when the start persisted
 //! the record, so the clock moves a status rather than computing anything late.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use ::serde_json::Value;
 
 use crate::ops::types::{
-    AutomationExecutionInputs, AutomationExecutionPreview, ExecutionPreview, Target, TargetPreview,
+    AutomationExecutionInputs, AutomationExecutionPreview, DocumentParameter, ExecutionPreview,
+    Target, TargetPreview,
 };
 
 use super::automation::runbook::RunbookStep;
@@ -97,6 +99,17 @@ pub const MAX_PREVIEW_REGIONS: usize = 50;
 /// `TargetPreviewList` length (0..50). Past it the types latest in the report's own
 /// ascending type order are left out, for the same reason.
 pub const MAX_TARGET_PREVIEWS: usize = 50;
+
+/// How many distinct resources one preview identifies before it stops looking.
+///
+/// Emulator resource guard, NOT a published quota: both the runbook's steps and the values
+/// resolved into them come from the caller — the content a document holds and the
+/// parameters, target maps and targets one request carries — so without a ceiling the
+/// number of identifiers one call can make this scan produce follows that input. A preview
+/// reports a COUNT per resource type ([`MAX_TARGET_PREVIEWS`] of them), so this ceiling is
+/// far above the resources a runbook names while keeping the work one request asks for
+/// bounded; past it no further identifier is taken.
+pub const MAX_IDENTIFIED_RESOURCES: usize = 1_000;
 
 /// The `TargetPreview$TargetType` of a resolved resource that is an EC2 instance, in the
 /// resource-type spelling this service's model uses for it (the `SourceType` enum, and the
@@ -196,6 +209,46 @@ pub fn step_impact(step: &RunbookStep) -> &'static str {
     IMPACT_UNDETERMINED
 }
 
+/// The `TargetPreview$TargetType` a resolved VALUE is counted under, or `None` for a value
+/// that identifies no resource at all.
+///
+/// "Information about the resources that would be included in the actual runbook execution,
+/// if it were to be run" (`TargetPreview`): an Automation action acts on a resource through
+/// that resource's own service rather than through a node's agent, so what a preview counts
+/// is the resource a value IDENTIFIES — the node's own reported type when this endpoint
+/// holds a registration for it ([`target_type_of`]), and otherwise the type the identifier's
+/// own form names ([`target_type_of_node_id`]). A value that is no resource identifier — a
+/// plain `Key=ParameterValues` value — identifies no resource and is counted as none.
+pub fn resource_type_of_value(
+    store: &ComAmazonawsSsmAmazonssmState,
+    region: &str,
+    value: &str,
+) -> Option<String> {
+    if let Some(held) = store.managed_node(region, value).and_then(target_type_of) {
+        return Some(held);
+    }
+    target_type_of_node_id(value).map(str::to_string)
+}
+
+/// The `TargetPreview$TargetType` the FORM of a managed-node id names, or `None` for a value
+/// that is no managed-node id.
+///
+/// The identifier space is the modelled one
+/// ([`super::managed_node_id_is_well_formed`], the `InstanceId` pattern): an `i-` id names an
+/// Amazon EC2 instance and an `mi-` id names a hybrid-activation managed node, which are the
+/// two resource types this service's `SourceType` enum spells
+/// ([`TARGET_TYPE_EC2_INSTANCE`], [`TARGET_TYPE_MANAGED_INSTANCE`]).
+pub fn target_type_of_node_id(id: &str) -> Option<&'static str> {
+    if !super::managed_node_id_is_well_formed(id) {
+        return None;
+    }
+    if id.starts_with("mi-") {
+        Some(TARGET_TYPE_MANAGED_INSTANCE)
+    } else {
+        Some(TARGET_TYPE_EC2_INSTANCE)
+    }
+}
+
 /// The `TargetPreview$TargetType` one resolved managed node is counted under, or `None`
 /// for a node this store holds no type for.
 ///
@@ -271,11 +324,16 @@ impl ComputedPreview {
 /// Work out what running `steps` with `inputs` would do, against the nodes `region` holds,
 /// or `Err(key)` when a target's key is not one an automation targets by.
 ///
+/// `declared` is what the runbook declares its parameters to be, so a parameter the inputs
+/// name no value for is read at the default the runbook gives it — the same reading an
+/// execution runs with ([`super::automation::resolved_parameters`]).
+///
 /// Pure over the store: it reads the runbook's steps and the Region's nodes and writes
 /// nothing, so the same preview is worked out whenever it is asked for.
 pub fn compute(
     store: &ComAmazonawsSsmAmazonssmState,
     region: &str,
+    declared: &[DocumentParameter],
     steps: &[RunbookStep],
     inputs: Option<&AutomationExecutionInputs>,
 ) -> Result<ComputedPreview, String> {
@@ -332,11 +390,11 @@ pub fn compute(
         1
     };
 
-    // "The number of resources of a certain type included in an execution preview": the
-    // resources the inputs' own targets and each target location's targets resolve to,
-    // counted once each and grouped by the type they are.
-    let mut target_counts: BTreeMap<String, i32> = BTreeMap::new();
-    let mut counted: Vec<String> = Vec::new();
+    // "The number of resources of a certain type included in an execution preview": every
+    // resource the execution would act on, counted once each and grouped by the type it is.
+    // The inputs' own targets and each target location's targets identify the first of
+    // them.
+    let mut identified: BTreeSet<String> = BTreeSet::new();
     let targets = inputs
         .and_then(|inputs| inputs.targets.as_deref())
         .unwrap_or_default()
@@ -348,16 +406,24 @@ pub fn compute(
         );
     for target in targets {
         for id in resolved_resources(store, region, target)? {
-            if counted.iter().any(|held| held == &id) {
-                continue;
+            if identified.len() >= MAX_IDENTIFIED_RESOURCES {
+                break;
             }
-            let Some(node) = store.managed_node(region, &id) else {
-                continue;
-            };
-            let Some(target_type) = target_type_of(node) else {
-                continue;
-            };
-            counted.push(id);
+            identified.insert(id);
+        }
+    }
+    // The rest are the ones the runbook's OWN steps would act on, which is what a preview
+    // of a runbook nothing targets by criteria still has to report.
+    let target_values: Vec<String> = identified.iter().cloned().collect();
+    for value in step_resources(declared, steps, inputs, &target_values) {
+        if identified.len() >= MAX_IDENTIFIED_RESOURCES {
+            break;
+        }
+        identified.insert(value);
+    }
+    let mut target_counts: BTreeMap<String, i32> = BTreeMap::new();
+    for value in &identified {
+        if let Some(target_type) = resource_type_of_value(store, region, value) {
             *target_counts.entry(target_type).or_insert(0) += 1;
         }
     }
@@ -376,25 +442,149 @@ pub fn compute(
     })
 }
 
-/// The ids of the resources one target resolves to in `region`, or `Err(key)` when the
+/// The ids of the resources one target IDENTIFIES in `region`, or `Err(key)` when the
 /// target's key is not one an automation targets by.
 ///
-/// The resolution itself is the ONE an automation resolves its targets by
-/// ([`ComAmazonawsSsmAmazonssmState::automation_target_values`]), so a preview and a start
-/// resolve one target the same way. What a PREVIEW adds is that it reports resources: a
-/// resolved value counts only where it names a node this Region holds — a
-/// `Key=ParameterValues` value naming none is a parameter value, not a resource, and is
-/// counted as neither.
+/// A target either DESCRIBES resources or NAMES them, and a preview reports both:
+///
+/// * the criteria are resolved the way an automation resolves its own targets
+///   ([`ComAmazonawsSsmAmazonssmState::automation_target_values`]), so a tag, the wildcard
+///   or a resource group contributes the nodes this Region holds that answer it;
+/// * the identity forms NAME their resources ([`super::commands::node_ids_a_target_names`]),
+///   so an id a target names is a resource the execution would act on whether or not this
+///   endpoint holds a registration for it — an Automation action reaches an Amazon EC2
+///   instance through that service's own API rather than through the node's agent.
+///
+/// What each identified value is counted as is decided once, by
+/// [`resource_type_of_value`]: a value that identifies no resource — a plain
+/// `Key=ParameterValues` value — is counted as none.
 fn resolved_resources(
     store: &ComAmazonawsSsmAmazonssmState,
     region: &str,
     target: &Target,
 ) -> Result<Vec<String>, String> {
-    Ok(store
-        .automation_target_values(region, target)?
+    let mut identified = store.automation_target_values(region, target)?;
+    for named in super::commands::node_ids_a_target_names(target) {
+        if !identified.iter().any(|held| held == named) {
+            identified.push(named.to_string());
+        }
+    }
+    Ok(identified)
+}
+
+/// The resource identifiers the runbook's OWN steps would act on, beside the ones its
+/// targets identify.
+///
+/// "Fully-resolved values passed into the step before execution" (`StepExecution$Inputs`):
+/// what an action reaches is what its inputs hold once the execution's values are resolved
+/// into them, so the resolution is the one an execution runs
+/// ([`super::automation::runbook::resolve_inputs`]) over the values this preview would run
+/// with — the parameters the inputs supply at the defaults the runbook declares, the target
+/// parameter bound to the values the targets identified, and each target map's own values.
+/// A step whose inputs this cannot resolve — one referring to an earlier step's output,
+/// which no preview runs — is read as the content declares it, so what it names outright is
+/// still reported.
+///
+/// Only a value that IDENTIFIES a resource is reported ([`resource_type_of_value`] decides
+/// that), and a resolved value holding several ids carries them the way a `StringList` is
+/// written, which is why each is split out. At most [`MAX_IDENTIFIED_RESOURCES`] values are
+/// taken, against one [`super::automation::runbook::MAX_RESOLVED_INPUT_BYTES`] budget for
+/// the whole scan.
+fn step_resources(
+    declared: &[DocumentParameter],
+    steps: &[RunbookStep],
+    inputs: Option<&AutomationExecutionInputs>,
+    target_values: &[String],
+) -> BTreeSet<String> {
+    let supplied: BTreeMap<String, Vec<String>> = inputs
+        .and_then(|inputs| inputs.parameters.clone())
+        .unwrap_or_default()
         .into_iter()
-        .filter(|value| store.managed_node(region, value).is_some())
-        .collect())
+        .collect();
+    let mut variables: BTreeMap<String, String> =
+        super::automation::resolved_parameters(declared, &supplied)
+            .into_iter()
+            .map(|(name, values)| (name, values.join(",")))
+            .collect();
+    // A rate-controlled execution binds the target parameter to the targets it resolved,
+    // one value per execution it runs; the preview is over all of them together.
+    if let Some(name) = inputs
+        .and_then(|inputs| inputs.target_parameter_name.as_deref())
+        .filter(|name| !name.is_empty())
+    {
+        if !target_values.is_empty() {
+            variables.insert(name.to_string(), target_values.join(","));
+        }
+    }
+    // "A key-value mapping of document parameters to target resources" (`TargetMaps`): each
+    // map binds parameters of the runbook the same way, so its values are resolved into the
+    // steps too.
+    for map in inputs
+        .and_then(|inputs| inputs.target_maps.clone())
+        .unwrap_or_default()
+    {
+        for (name, values) in map {
+            if !name.is_empty() {
+                variables.insert(name, values.join(","));
+            }
+        }
+    }
+
+    // ONE budget spans every step this scan resolves, the way one execution's walk charges
+    // every step it walks against one budget
+    // (`super::automation::AutomationExecutionRecord::resolved_input_budget`): the
+    // expansion a resolution produces is the product of how many references the content
+    // carries and how long each resolves to, both of them caller-chosen, so the product is
+    // what has to be bounded rather than either factor. A step the budget can no longer
+    // cover is read as the content declares it.
+    let mut budget = super::automation::runbook::MAX_RESOLVED_INPUT_BYTES;
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    'steps: for step in steps {
+        let resolved =
+            super::automation::runbook::resolve_inputs(&step.inputs, &variables, &mut budget)
+                .unwrap_or_else(|_| step.inputs.clone());
+        for text in input_texts(&resolved) {
+            for value in text.split(',') {
+                if found.len() >= MAX_IDENTIFIED_RESOURCES {
+                    break 'steps;
+                }
+                let value = value.trim();
+                if !value.is_empty() {
+                    found.insert(value.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every text value one step's inputs carry, at whatever depth the content nests it: an
+/// input is declared as a value, a list of values or a mapping of them, and a resource an
+/// action reaches can be named in any of those.
+fn input_texts(inputs: &::serde_json::Map<String, Value>) -> Vec<String> {
+    let mut texts: Vec<String> = Vec::new();
+    for value in inputs.values() {
+        collect_texts(value, &mut texts);
+    }
+    texts
+}
+
+/// [`input_texts`] over one value.
+fn collect_texts(value: &Value, into: &mut Vec<String>) {
+    match value {
+        Value::String(text) => into.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_texts(item, into);
+            }
+        }
+        Value::Object(members) => {
+            for held in members.values() {
+                collect_texts(held, into);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// ONE execution preview: what the start worked out, and the status the clock has moved it
