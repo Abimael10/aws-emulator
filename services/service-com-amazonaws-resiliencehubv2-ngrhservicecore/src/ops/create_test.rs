@@ -192,13 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // What the test would be measured against: the objectives the service's resilience
-        // policy puts in force, resolved from the policy store under this same lock. A
+        // What the test would be measured against: the objectives the policies that reach
+        // the service put in force, resolved from the store under this same lock. A
         // service with no multi-AZ RTO in force is refused here — before the id is minted
         // and before anything is written — so no test is ever stored that nothing could
         // grade.
-        let effective =
-            store.effective_policy_values(service.policy_arn.as_deref(), &service.account_id);
+        let effective = store.effective_policy_values(service);
         if let Some(refusal) = crate::state::multi_az_rto_rejection(&service_arn, &effective) {
             return Err(CreateTestErrorModeled::ValidationException(refusal).into());
         }

@@ -16,6 +16,10 @@
 //! Every `Policy` body this crate returns is projected from a record here through
 //! [`PolicyRecord::to_policy`], so `CreatePolicy` and `GetPolicy` cannot drift from one
 //! another or from what was stored.
+//!
+//! What a policy contributes to a SERVICE's effective values is
+//! [`PolicyRecord::effective_policy_values`]; the fold across every policy that reaches one
+//! service lives in [`super::effective_policy`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -147,13 +151,19 @@ impl PolicyRecord {
         arn_account(&self.policy_arn)
     }
 
-    /// The `EffectivePolicyValues` a service that references this policy has in force.
+    /// What THIS policy contributes to the `EffectivePolicyValues` of a service it
+    /// reaches.
     ///
     /// One entry per target this policy actually sets, each carrying that target's stored
     /// value (an RTO/RPO or time-between-backups in the minutes the target is stored in,
     /// the availability SLO as its percentage), this policy's own `name`, and `source` —
     /// which account the value came from. A target the policy leaves unset derives
     /// nothing, so its entry stays absent rather than reporting a value nobody set.
+    ///
+    /// A service can be reached by more than one policy (its own, and those of the user
+    /// journeys it is associated through), so the values a service REPORTS are these
+    /// contributions folded together by
+    /// [`super::effective_policy`]: this projection answers for one policy alone.
     pub fn effective_policy_values(&self, source: &str) -> EffectivePolicyValues {
         let slo = |value: f64| SloSource {
             value: Some(value),
@@ -284,34 +294,6 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
     pub fn policy_view(&self, policy_arn: &str) -> Option<Policy> {
         let record = self.policies.get(policy_arn)?;
         Some(record.to_policy(self.associated_service_count(policy_arn)))
-    }
-
-    /// The `EffectivePolicyValues` in force for a service whose attached policy is
-    /// `policy_arn` and whose own account is `account_id`.
-    ///
-    /// Resolved from the policy store on every projection rather than copied into the
-    /// service when the policy was attached, so attaching, re-attaching, editing or
-    /// deleting the policy shows up the next time the service is read. The result is
-    /// always a value: a service with no `policyArn`, or one whose ARN no longer resolves
-    /// to a stored policy, has nothing to derive and gets the empty object — the pointer
-    /// survives, the derived values do not.
-    pub fn effective_policy_values(
-        &self,
-        policy_arn: Option<&str>,
-        account_id: &str,
-    ) -> EffectivePolicyValues {
-        let Some(arn) = policy_arn else {
-            return EffectivePolicyValues::default();
-        };
-        let Some(record) = self.policies.get(arn) else {
-            return EffectivePolicyValues::default();
-        };
-        let source = if arn_account(arn) == Some(account_id) {
-            POLICY_VALUE_SOURCE_SELF
-        } else {
-            POLICY_VALUE_SOURCE_CROSS_ACCOUNT
-        };
-        record.effective_policy_values(source)
     }
 
     /// The policy stored under `name`, if any — what a create consults before storing a

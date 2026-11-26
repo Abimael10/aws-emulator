@@ -50,6 +50,10 @@
 //! [`service_events`] holds the EVENT LOG of a service: the record every mutation of a
 //! service, or of a resource inside it, appends to and `ListServiceEvents` reports.
 //!
+//! [`effective_policy`] holds the derivation behind `Service$effectivePolicyValues`: which
+//! policies reach one service — its own, and those of the user journeys it is associated
+//! through — and how their targets fold into the values it reports.
+//!
 //! [`not_found`] holds the refusal every operation that resolves an ARN answers with when
 //! the ARN names nothing stored, so the whole crate words it once, [`conflicts`] holds the
 //! `ConflictException` wordings a create answers with, [`availability_slo`] holds the
@@ -62,6 +66,7 @@ mod assertions;
 mod availability_slo;
 mod conflicts;
 pub mod discovered_resources;
+mod effective_policy;
 mod input_sources;
 mod invoker_role;
 mod not_found;
@@ -359,9 +364,9 @@ impl ServiceRecord {
     /// This record as the `Service` shape `CreateService` / `GetService` / `UpdateService`
     /// return.
     ///
-    /// `effectivePolicyValues` is DERIVED rather than stored — it is the policy this
-    /// record's `policyArn` names, resolved at projection time — so it is passed in by
-    /// the store that holds both resources (see
+    /// `effectivePolicyValues` is DERIVED rather than stored — it is folded from every
+    /// policy that reaches this service, resolved at projection time — so it is passed in
+    /// by the store that holds those resources (see
     /// [`ComAmazonawsResiliencehubv2NgrhservicecoreState::effective_policy_values`]) the
     /// way `associatedServiceCount` is passed into the policy projection. It is always
     /// present: a service with nothing to derive reports the empty object.
@@ -604,13 +609,13 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
     /// change applied first — the one path every `Service` reader answers from.
     ///
     /// It hangs off the STORE rather than the record because the body's
-    /// `effectivePolicyValues` is derived from the policy the record's `policyArn` names,
-    /// which lives beside it under this same lock.
+    /// `effectivePolicyValues` is derived from the policies that reach the record — its own
+    /// `policyArn` and those of the user journeys it is associated through — which live
+    /// beside it under this same lock.
     pub fn service_view(&mut self, arn: &str, now: SystemTime) -> Option<Service> {
         self.resolve(arn, now)?;
         let record = self.services.get(arn)?;
-        let effective =
-            self.effective_policy_values(record.policy_arn.as_deref(), &record.account_id);
+        let effective = self.effective_policy_values(record);
         Some(record.to_service(effective))
     }
 

@@ -322,9 +322,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The body is projected through the store's one `Service` view rather than from
-        // the record alone: `effectivePolicyValues` is derived from the policy the
-        // (possibly just-changed) `policyArn` names, which this call cannot reach while it
-        // holds the record. The record was found above, so the lookup cannot miss.
+        // the record alone: `effectivePolicyValues` is folded from every policy that
+        // reaches the service — the (possibly just-changed) `policyArn`, and those of the
+        // user journeys its `associatedSystems` entries name — which this call cannot reach
+        // while it holds the record. The record was found above, so the lookup cannot miss.
         let Some(service) = store.service_view(&input.service_arn, now) else {
             return Err(UpdateServiceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(

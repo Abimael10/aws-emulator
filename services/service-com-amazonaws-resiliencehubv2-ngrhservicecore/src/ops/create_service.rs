@@ -328,11 +328,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             store.idempotency.insert(token, service_arn.clone());
         }
-        // `effectivePolicyValues` is derived from the policy `policyArn` names, resolved
-        // here against the policy store under this same lock rather than copied into the
-        // record, so a later read reflects the policy as it stands then.
-        let effective =
-            store.effective_policy_values(record.policy_arn.as_deref(), &record.account_id);
+        // `effectivePolicyValues` is derived from every policy that reaches this service —
+        // the one `policyArn` names and those of the user journeys its `associatedSystems`
+        // entries name — resolved here against the store under this same lock rather than
+        // copied into the record, so a later read reflects those policies as they stand
+        // then.
+        let effective = store.effective_policy_values(&record);
         let service = record.to_service(effective);
         // What this create did, as the service's event log records it: the create itself,
         // and the references it established. Read off the record before it is stored.

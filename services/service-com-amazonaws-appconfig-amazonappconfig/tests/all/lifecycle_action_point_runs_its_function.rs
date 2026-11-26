@@ -245,6 +245,15 @@ struct Watch<'wait> {
     until: &'wait [&'wait str],
     /// The event `Type`s that must also have been delivered before it ends.
     required: &'wait [&'wait str],
+    /// The `DeploymentEventType` whose log entry must already RECORD the invocations it owes
+    /// before the wait ends, and `None` for a row that asserts on no entry.
+    ///
+    /// An action point is invoked either by the read that owes it or by the service's own
+    /// clock, and the record of an invocation is written once the function it invoked has
+    /// answered — so the observation reaching the queue is not yet evidence that the stage's
+    /// entry carries the record, and a caller watching for the record looks again rather than
+    /// concluding from the first document that reports the stage.
+    logging: Option<&'wait str>,
 }
 
 /// Read the deployment until it reports one of `until` AND every event type `required` names
@@ -267,6 +276,7 @@ async fn watched(router: &MultiServiceRouter, watch: &Watch<'_>) -> (Value, Vec<
         queue_url,
         until,
         required,
+        logging,
     } = *watch;
     let deadline = Instant::now() + REACHED_BY;
     let mut seen: Vec<Value> = Vec::new();
@@ -290,13 +300,23 @@ async fn watched(router: &MultiServiceRouter, watch: &Watch<'_>) -> (Value, Vec<
             .iter()
             .filter(|wanted| !delivered.contains(*wanted))
             .collect();
-        if until.contains(&state.as_str()) && awaited.is_empty() {
+        // The stage that owes the point records what it invoked, which is written after the
+        // invocation answered: a row that asserts on that record waits for it too.
+        let recorded = logging.is_none_or(|event_type| {
+            logged(&document, event_type).is_some_and(|entry| {
+                entry["ActionInvocations"]
+                    .as_array()
+                    .is_some_and(|invocations| !invocations.is_empty())
+            })
+        });
+        if until.contains(&state.as_str()) && awaited.is_empty() && recorded {
             return (document, seen);
         }
         assert!(
             Instant::now() < deadline,
             "case {case:?}: after {}s the deployment reports {state:?} (waiting for any of \
-             {until:?}) and has not delivered {awaited:?} (delivered {delivered:?})",
+             {until:?}), has not delivered {awaited:?} (delivered {delivered:?}) or has not \
+             recorded the invocations {logging:?} owes in {document}",
             REACHED_BY.as_secs()
         );
         tokio::time::sleep(LOOK).await;
@@ -500,6 +520,9 @@ async fn each_lifecycle_action_point_runs_the_function_its_uri_names() {
         // reports the last stage is the read that owes that stage's invocations. An unbound
         // row waits for no event, because the rule says none is owed.
         let required: &[&str] = if row.bound { &[row.event_type] } else { &[] };
+        // And a bound row whose stage logs the invocation waits for that record too; an
+        // unbound row waits for none, because the rule says nothing is invoked for it.
+        let logging = if row.bound { row.owed_by } else { None };
         let (document, seen) = watched(
             &router,
             &Watch {
@@ -510,6 +533,7 @@ async fn each_lifecycle_action_point_runs_the_function_its_uri_names() {
                 queue_url: &queue_url,
                 until: row.until,
                 required,
+                logging,
             },
         )
         .await;
@@ -816,6 +840,7 @@ async fn a_validator_refusal_runs_no_lifecycle_action_point() {
                 queue_url: &queue_url,
                 until: TERMINAL_DEPLOYMENT_STATES,
                 required: &LET_THROUGH_POINTS,
+                logging: None,
             },
         )
         .await;
