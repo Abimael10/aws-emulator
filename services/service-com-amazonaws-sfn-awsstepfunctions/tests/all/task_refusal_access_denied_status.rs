@@ -85,7 +85,10 @@ fn unstated(action: &str) -> String {
 }
 
 /// The member the details of `event` sit under, as the history models them.
-fn details_member(event: &str) -> &'static str {
+///
+/// `pub(crate)` because every suite that reads a failed `Task` state's own history event
+/// needs it: `tests/all/main.rs` is one crate root, so the mapping is stated here once.
+pub(crate) fn details_member(event: &str) -> &'static str {
     match event {
         EVENT_LAMBDA_FUNCTION_FAILED => "lambdaFunctionFailedEventDetails",
         _ => "taskFailedEventDetails",

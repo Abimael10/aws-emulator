@@ -338,7 +338,11 @@ async fn history(chain: &Chain, case: &str, execution: &str) -> Vec<Value> {
 }
 
 /// The one event of type `named` in `events`.
-fn only(case: &str, events: &[Value], named: &str) -> Value {
+///
+/// `pub(crate)` because every suite that reads one event of a failed execution's history
+/// reads it this way: `tests/all/main.rs` is one crate root, so the reading is stated here
+/// once.
+pub(crate) fn only(case: &str, events: &[Value], named: &str) -> Value {
     let found: Vec<&Value> = events
         .iter()
         .filter(|event| event.get("type").and_then(Value::as_str) == Some(named))
