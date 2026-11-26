@@ -973,8 +973,8 @@ pub fn instrumentation_key(signal_type: &str, location_hash: &str) -> String {
 
 /// Whether `key` is spelled the way [`instrumentation_key`] spells a key of one scope's
 /// ordered set: a modelled `DynamicInstrumentationSignalType` value, the one separator, and a
-/// `LocationHash` — the 16 lowercase hex characters [`stable_hash`] writes, which is the
-/// length and alphabet the member's own model fixes (`length 16..16`, and the
+/// `LocationHash` — the 16 lowercase hex characters [`code_location_hash`] writes, which is
+/// the length and alphabet the member's own model fixes (`length 16..16`, and the
 /// `InstrumentationConfigurationArn` pattern's hash segment).
 ///
 /// Anything else is a value no record of this store is keyed by, and so no boundary the paging
@@ -1151,21 +1151,82 @@ pub fn identified_location_refusal(identifier: &LocationIdentifier) -> Option<St
 /// member's `length 16..16` and the ARN pattern's `[0-9a-f]{16}` suffix require.
 pub fn location_hash(location: &Location) -> String {
     match location {
-        Location::CodeLocation(code) => {
-            let line_number = code.line_number.map(|line| line.to_string());
-            stable_hash(&[
-                // The union member name, so two variants could never collide on one
-                // rendering of their contents.
-                Some("CodeLocation"),
-                Some(code.language.as_str()),
-                code.code_unit.as_deref(),
-                code.class_name.as_deref(),
-                code.method_name.as_deref(),
-                Some(code.file_path.as_str()),
-                line_number.as_deref(),
-            ])
-        }
+        Location::CodeLocation(code) => code_location_hash(code),
     }
+}
+
+/// The `LocationHash` of one `CodeLocation`: the 64-bit FNV-1a digest of the location
+/// rendered as a compact JSON object, written as 16 lowercase hex characters.
+///
+/// The digest covers the location's own members and nothing else — no service, environment,
+/// signal type, account, region, clock or request id — so the same code location hashes to the
+/// same value in every account and in every process, which is what lets a client pre-compute
+/// it and address a configuration by it (`LocationIdentifier.LocationHash`, "The pre-computed
+/// location hash (16-character hex string)").
+///
+/// The rendering is [`code_location_digest_input`]; the 16 hex characters are the length and
+/// alphabet the member's own model fixes (`length 16..16`, and the
+/// `InstrumentationConfigurationArn` pattern's `[0-9a-f]{16}` suffix).
+pub fn code_location_hash(code: &CodeLocation) -> String {
+    fnv1a_64_hex(&code_location_digest_input(code))
+}
+
+/// The bytes a code location is digested over: a compact JSON object carrying the location's
+/// members under their lowerCamel names, in the order `CodeLocation` declares them
+/// (`smithy_query(query="shape",shape="CodeLocation")`: `Language`, `CodeUnit`, `ClassName`,
+/// `MethodName`, `FilePath`, `LineNumber`), with no separator spaces, string values JSON
+/// string literals and `LineNumber` a JSON number.
+///
+/// A member the location does not carry contributes NO key, exactly as a JSON serializer
+/// writes an absent optional: the rendering of a location naming four members is the object of
+/// those four. The two required members (`Language`, `FilePath`) are always present, so the
+/// object is never empty.
+///
+/// Rendering through a JSON string literal is what keeps the input unambiguous without a
+/// separate length prefix: a value carrying a quote, a backslash or a control character is
+/// escaped rather than ending its own field.
+fn code_location_digest_input(code: &CodeLocation) -> String {
+    let line_number = code.line_number.map(|line| line.to_string());
+    let members: [(&str, Option<&str>, bool); 6] = [
+        ("language", Some(code.language.as_str()), true),
+        ("codeUnit", code.code_unit.as_deref(), true),
+        ("className", code.class_name.as_deref(), true),
+        ("methodName", code.method_name.as_deref(), true),
+        ("filePath", Some(code.file_path.as_str()), true),
+        ("lineNumber", line_number.as_deref(), false),
+    ];
+
+    let carried: Vec<String> = members
+        .into_iter()
+        .filter_map(|(key, value, quoted)| {
+            let value = value?;
+            let value = if quoted {
+                json_string_literal(value)
+            } else {
+                value.to_string()
+            };
+            Some(format!("{}:{value}", json_string_literal(key)))
+        })
+        .collect();
+    format!("{{{}}}", carried.join(","))
+}
+
+/// `value` as a JSON string literal, escaped by the JSON implementation this crate already
+/// serializes with rather than by hand.
+fn json_string_literal(value: &str) -> String {
+    ::serde_json::Value::String(value.to_string()).to_string()
+}
+
+/// The 64-bit FNV-1a digest of `input`, as 16 lowercase hex characters — the width a
+/// `LocationHash` is modelled at, which is exactly one 64-bit digest.
+///
+/// The digest itself is the maintained `fnv` crate's, rather than a hand-written one.
+fn fnv1a_64_hex(input: &str) -> String {
+    use ::std::hash::Hasher;
+
+    let mut hasher = ::fnv::FnvHasher::default();
+    hasher.write(input.as_bytes());
+    format!("{:016x}", hasher.finish())
 }
 
 /// The `LocationHash` a `GetInstrumentationConfiguration` request's `LocationIdentifier`
@@ -1177,9 +1238,7 @@ pub fn location_hash(location: &Location) -> String {
 /// record — and a hash the caller already holds IS the value, taken verbatim.
 pub fn identified_location_hash(identifier: &LocationIdentifier) -> String {
     match identifier {
-        LocationIdentifier::CodeLocation(code) => {
-            location_hash(&Location::CodeLocation(code.clone()))
-        }
+        LocationIdentifier::CodeLocation(code) => code_location_hash(code),
         LocationIdentifier::LocationHash(hash) => hash.clone(),
     }
 }

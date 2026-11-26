@@ -10775,6 +10775,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "chrono",
+ "fnv",
  "hex",
  "http",
  "serde_json",
