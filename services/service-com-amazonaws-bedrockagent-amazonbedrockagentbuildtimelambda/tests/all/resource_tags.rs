@@ -36,6 +36,8 @@ use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state:
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::tag_mutation_no_content::TAG_MUTATION_SUCCESS_STATUS;
+
 /// A SigV4 `Authorization` header scoped to the `bedrock` signing name: the routing key
 /// every Bedrock-family service claims on.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -560,8 +562,8 @@ async fn tags_a_caller_sets_are_read_back_and_the_keys_it_removes_are_gone() {
         .collect();
         let tagged = emulator.tag(&resource_arn, &written).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case}: expected TagResource -> 200, got {tagged:?}"
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case}: expected TagResource -> {TAG_MUTATION_SUCCESS_STATUS}, got {tagged:?}"
         );
         let mut expected = held.clone();
         expected.extend(written.clone());
@@ -579,8 +581,9 @@ async fn tags_a_caller_sets_are_read_back_and_the_keys_it_removes_are_gone() {
             .untag(&resource_arn, &["estate", "never-held"])
             .await;
         assert_eq!(
-            removed.status, 200,
-            "case {case}: expected UntagResource -> 200, got {removed:?}"
+            removed.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case}: expected UntagResource -> {TAG_MUTATION_SUCCESS_STATUS}, got \
+             {removed:?}"
         );
         expected.remove("estate");
         let listed = emulator.list_tags(&resource_arn).await;
@@ -595,8 +598,9 @@ async fn tags_a_caller_sets_are_read_back_and_the_keys_it_removes_are_gone() {
             .untag(&resource_arn, &["estate", "never-held"])
             .await;
         assert_eq!(
-            again.status, 200,
-            "case {case}: expected a repeated UntagResource -> 200, got {again:?}"
+            again.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case}: expected a repeated UntagResource -> \
+             {TAG_MUTATION_SUCCESS_STATUS}, got {again:?}"
         );
         let listed = emulator.list_tags(&resource_arn).await;
         assert_eq!(
@@ -630,8 +634,9 @@ async fn a_merge_past_the_tag_quota_is_refused_and_writes_nothing() {
         .collect();
     let tagged = emulator.tag(&knowledge_base, &at_the_bound).await;
     assert_eq!(
-        tagged.status, 200,
-        "case at the bound: expected TagResource -> 200, got {tagged:?}"
+        tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case at the bound: expected TagResource -> {TAG_MUTATION_SUCCESS_STATUS}, got \
+         {tagged:?}"
     );
     let listed = emulator.list_tags(&knowledge_base).await;
     assert_eq!(
@@ -915,8 +920,8 @@ async fn a_prompt_reads_back_the_record_its_tags_are_read_off() {
                 .collect();
         let tagged = emulator.tag(&prompt_arn, &written).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case}: expected TagResource -> 200, got {tagged:?}"
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case}: expected TagResource -> {TAG_MUTATION_SUCCESS_STATUS}, got {tagged:?}"
         );
         let mut expected = stored.clone();
         expected.extend(written);

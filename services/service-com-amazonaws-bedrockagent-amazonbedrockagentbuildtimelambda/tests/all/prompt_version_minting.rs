@@ -24,6 +24,8 @@ use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state:
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::tag_mutation_no_content::TAG_MUTATION_SUCCESS_STATUS;
+
 /// A SigV4 `Authorization` header scoped to the `bedrock` signing name: the routing key
 /// this service claims on, and the source of the region its ARNs carry.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -663,8 +665,9 @@ async fn a_version_carries_the_tags_its_cut_attached_under_its_own_arn() {
         let written = tag_map(&[("estate", "rewritten"), ("release", "cut")]);
         let tagged = emulator.tag(&version_arn, &written).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case}: expected TagResource -> 200 for {version_arn}, got {tagged:?}"
+            tagged.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case}: expected TagResource -> {TAG_MUTATION_SUCCESS_STATUS} for \
+             {version_arn}, got {tagged:?}"
         );
         let mut expected = cut_tags.clone();
         expected.extend(written.clone());

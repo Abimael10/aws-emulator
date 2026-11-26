@@ -146,7 +146,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful assignment answers NO CONTENT. `TagResourceResponse` declares no member
+    // at all (`smithy_query(query="operation", operation="TagResource")`: `output {}`), so
+    // the answer leaves the caller nothing to parse, and the status says so. The 200 the
+    // model carries here is the protocol's own fallback for a success rather than a
+    // statement about this plane: every other operation of this service whose output
+    // declares no member pins 204 explicitly (`DisassociateAgentKnowledgeBase`,
+    // `DisassociateAgentCollaborator` and `DeleteAgentActionGroup`, each `@http code 204`),
+    // and `UntagResource`, the other mutation of the tagging plane, answers the same way.
+    // Every operation whose output carries members keeps its own status.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
