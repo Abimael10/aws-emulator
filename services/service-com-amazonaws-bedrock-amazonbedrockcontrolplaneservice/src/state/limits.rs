@@ -225,18 +225,39 @@ pub fn prompt_router_not_found_message(prompt_router_arn: &str) -> String {
 /// more is refused with that error rather than stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// What this service answers as its `TooManyTagsException` message for EVERY call refused on
-/// the per-resource tag quota — a create whose own `tags` list carries more tags than one
-/// resource may hold, and a tagging call whose resultant set would.
+/// What this service answers as its `TooManyTagsException` message for a call refused on the
+/// per-resource tag quota by the tag list the REQUEST ITSELF carries — a create whose own
+/// `tags` list is longer than one resource may hold, and a tagging call that submits more
+/// than that in one go.
 ///
 /// RECORDED behaviour: Amazon Bedrock states the BOUND and nothing about the request — no
 /// member path, no submitted tag count and no resource — so the one variable part is the
 /// bound itself, read off [`MAX_TAGS_PER_RESOURCE`] rather than spelled into the sentence.
-/// The sentence does not depend on WHICH set the quota was reached through: a client reads
-/// one wording for the quota, whichever operation it hit it with.
+/// The sentence does not depend on WHICH operation submitted the over-long list: a client
+/// reads one wording for "that is more tags than a resource may be assigned", whichever call
+/// it sent them on. A call whose own list is INSIDE the bound but whose resultant set would
+/// leave it is refused on the other half of the quota, which AWS words as the resultant set
+/// ([`resultant_tag_set_too_large_message`]).
 #[must_use]
 pub fn too_many_tags_message() -> String {
     format!("You can assign a maximum of {MAX_TAGS_PER_RESOURCE} tags to a resource")
+}
+
+/// What this service answers as its `TooManyTagsException` message for a call whose own tag
+/// list is inside the bound but whose RESULTANT tag set — "both existing tags and those
+/// included in your current request" (`TooManyTagsException`) — would carry more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// RECORDED behaviour: AWS words this half of the quota about the set the call would LEAVE
+/// the resource holding rather than about the list it submitted, and the sentence carries no
+/// part of the request — not the ARN, not the tag count, not a key — so the bound is again
+/// the one variable part, read off [`MAX_TAGS_PER_RESOURCE`]. "User tags" is what AWS calls
+/// the tags an account set, which is every tag this store holds against a resource.
+#[must_use]
+pub fn resultant_tag_set_too_large_message() -> String {
+    format!(
+        "The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags."
+    )
 }
 
 /// What a tagging call whose `resourceARN` names no resource of this account answers as its

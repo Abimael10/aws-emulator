@@ -4,13 +4,16 @@
 //!
 //! The rule under test, one sentence: **every call Amazon Bedrock refuses on the
 //! per-resource tag quota — a merge into a resource's existing tags and a create's own
-//! over-long `tags` list alike — carries ONE fixed sentence, which states the bound and
+//! over-long `tags` list alike — carries a fixed sentence, which states the bound and
 //! nothing of the request, so the optional `TooManyTagsException$resourceName` is left
 //! UNSET.**
 //!
-//! That sentence states the bound (`MAX_TAGS_PER_RESOURCE`, the "50 tags per resource"
+//! The sentence states the bound (`MAX_TAGS_PER_RESOURCE`, the "50 tags per resource"
 //! `TooManyTagsException` documents) and nothing else: no ARN, no tag key, no submitted
-//! count, and nothing about WHICH set the quota was reached through.
+//! count. WHICH of the two sentences it is follows from the bound the call broke — its own
+//! over-long list, or the resultant set it would have left behind — which is
+//! `crate::tag_quota_names_the_bound_it_broke`'s rule and is read here only so each row
+//! asserts the sentence its own arithmetic earns.
 //! `TooManyTagsException$resourceName` is modelled optional
 //! (`smithy_query(query="shape",shape="TooManyTagsException")`: members `message` and
 //! `resourceName`, neither `@required`), and this service leaves it out.
@@ -40,12 +43,17 @@ use crate::tagging::{
     given_guardrail, list_tags, listed, numbered_tags, owned_tag_list, tag, MAX_TAGS,
 };
 
-/// The one sentence Amazon Bedrock refuses a tag-quota call with, whichever set the quota
-/// was reached through. Spelled here rather than read off the handler, so a re-wording of it
-/// is caught: the bound is the one `TooManyTagsException` documents ("50 tags per
-/// resource").
+/// The sentence Amazon Bedrock refuses a call whose OWN tag list is past the bound with.
+/// Spelled here rather than read off the handler, so a re-wording of it is caught: the bound
+/// is the one `TooManyTagsException` documents ("50 tags per resource").
 fn quota_sentence() -> String {
     format!("You can assign a maximum of {MAX_TAGS} tags to a resource")
+}
+
+/// The sentence it refuses a call INSIDE that bound whose resultant tag set would pass it
+/// with, spelled here for the same reason.
+fn resultant_set_sentence() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS} user tags.")
 }
 
 /// The resource family a merging row addresses, each an alternative `TaggableResourcesArn`
@@ -141,8 +149,6 @@ const MERGE_ROWS: &[MergeRow] = &[
 #[tokio::test]
 async fn a_resultant_set_past_the_bound_is_refused_over_the_resultant_set() {
     let emu = emulator();
-    // The sentence Amazon Bedrock words this refusal with, stating the bound.
-    let expected_message = quota_sentence();
 
     for (index, row) in MERGE_ROWS.iter().enumerate() {
         let case = format!("{} / {:?}", row.case, row.family);
@@ -172,6 +178,14 @@ async fn a_resultant_set_past_the_bound_is_refused_over_the_resultant_set() {
              of {}",
             row.held + row.fresh
         );
+
+        // The sentence this row earns: a batch that is itself longer than one resource may
+        // hold is refused over that list, and one inside the bound over the resultant set.
+        let expected_message = if batch.len() > MAX_TAGS {
+            quota_sentence()
+        } else {
+            resultant_set_sentence()
+        };
 
         let refused = tag(&emu, &arn, owned_tag_list(&batch)).await;
         assert_eq!(

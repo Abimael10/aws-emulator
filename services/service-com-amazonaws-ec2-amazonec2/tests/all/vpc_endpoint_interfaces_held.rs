@@ -17,9 +17,9 @@
 //!
 //! The rows span what that generalises over: how many subnets the endpoint is served from (so
 //! how many interfaces it holds), which endpoint type stood them up, and an endpoint type that
-//! stands up none at all. A caller's OWN interface is the control row: nothing holds it, so it
-//! is `available` and the same delete takes it away — the rule refuses an interface a service
-//! holds, not every interface.
+//! stands up none at all. A caller's OWN interface is the control row: nothing holds it, so the
+//! clock settles it `available` and the same delete takes it away — the rule refuses an
+//! interface a service holds, not every interface.
 
 use std::time::{Duration, Instant};
 
@@ -391,15 +391,25 @@ async fn an_interface_nothing_holds_is_available_and_deletable() {
     )
     .await;
     let network_interface_id = element(&body, "networkInterfaceId").unwrap_or_default();
-    let view = described("a caller's own interface", &router, &network_interface_id).await;
-    // Nothing holds an interface the caller created, so it rests in `available`, which is
-    // what this assertion is about (`network_interface_create_comes_up_pending` owns the
-    // rule that the status follows what holds the interface).
-    assert_eq!(
-        view.as_ref().map(|held| held.status.as_str()),
-        Some(ec2::state::NETWORK_INTERFACE_STATUS_AVAILABLE),
-        "an interface nothing holds is available, got {view:?}"
-    );
+    // Nothing holds an interface the caller created, so the clock settles it in `available`
+    // — looked at AGAIN until it is reported there, because a create answers it still coming
+    // up (`network_interface_create_comes_up_pending` owns that rule, and the rule that the
+    // status follows what holds the interface).
+    let case = "a caller's own interface";
+    let deadline = poll_deadline();
+    let view = loop {
+        let view = described(case, &router, &network_interface_id).await;
+        if view.as_ref().map(|held| held.status.as_str())
+            == Some(ec2::state::NETWORK_INTERFACE_STATUS_AVAILABLE)
+        {
+            break view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an interface nothing holds settles available, got {view:?}"
+        );
+        tokio::time::sleep(poll_interval()).await;
+    };
     assert_eq!(
         view.as_ref().map(|held| held.requester_managed.as_str()),
         Some("false"),

@@ -469,14 +469,14 @@ async fn each_created_interface_round_trips_through_the_describe() {
             "case {:?}: expected an eni- id, got {network_interface_id:?} from {created}",
             case.name
         );
-        // The create's OWN answer carries the status the interface rests in: nothing holds
-        // an interface a create minted, so it is `available` from here on, which
-        // `network_interface_create_comes_up_pending` is the suite for — so the describe
-        // below reads every other member.
+        // The create's OWN answer carries the status the interface comes up in: an interface
+        // a caller creates is still being brought up, so it is `pending` and the clock owes
+        // it `available`, which `network_interface_create_comes_up_pending` is the suite for
+        // — so the describe below reads every other member.
         assert_eq!(
             element(&created, "status").as_deref(),
-            Some("available"),
-            "case {:?}: expected the create to answer the interface available, got {created}",
+            Some("pending"),
+            "case {:?}: expected the create to answer the interface pending, got {created}",
             case.name
         );
 
@@ -1597,12 +1597,6 @@ async fn every_documented_filter_selects_on_the_stored_interface() {
             vec![0, 1, 2, 3, 4],
         ),
         (
-            "an available interface",
-            "status",
-            vec!["available".to_string()],
-            vec![0, 2, 3, 4],
-        ),
-        (
             "an interface in use",
             "status",
             vec!["in-use".to_string()],
@@ -1737,6 +1731,32 @@ async fn every_documented_filter_selects_on_the_stored_interface() {
         assert_eq!(
             reported, expected,
             "case {case:?} (filter {name:?} = {values:?}): expected {expected:?}, got {reported:?}"
+        );
+    }
+
+    // The `status` filter over the interfaces nothing holds, read against the status they
+    // REPORT rather than against a value this row names: an interface nothing holds is the one
+    // its create left coming up (`pending`) until the clock settles it (`available`), so which
+    // of the two it is depends on when this row runs, while the rule — the filter selects
+    // exactly the interfaces reporting the value it names — does not.
+    // (`network_interface_create_comes_up_pending` is the suite for that move.)
+    for index in [0_usize, 2, 3, 4] {
+        let id = &seeded.ids[index];
+        let case = format!("the status an unheld interface reports (interface {index})");
+        let body = describe_one(&router, &case, id).await;
+        let status = element(&body, "status")
+            .unwrap_or_else(|| panic!("case {case:?}: the interface reports no status: {body}"));
+        let selected = described_ids(&router, &case, &filters(&[("status", &[status.as_str()])]))
+            .await;
+        assert!(
+            selected.contains(id),
+            "case {case:?}: the status filter {status:?} must select the interface reporting \
+             it, got {selected:?}"
+        );
+        assert!(
+            !selected.contains(&seeded.ids[1]),
+            "case {case:?}: the status filter {status:?} must not select the interface an \
+             attachment holds, got {selected:?}"
         );
     }
 

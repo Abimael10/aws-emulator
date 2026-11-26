@@ -466,6 +466,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same one an assignment to an interface that already exists takes, so no two
         // interfaces of an account can be handed the same IPv6 address. Resolved BEFORE the
         // IPv4 addresses are taken, so a refusal here takes nothing to hand back.
+        //
+        // This resolution is a READ: it takes `&self`, and the pool it resolves against is the
+        // interface RECORDS themselves (`NetworkInterface$Ipv6Addresses` and
+        // `$Ipv6Prefixes`, which is what
+        // [`crate::state::ComAmazonawsEc2Amazonec2State::assigned_ipv6_addresses`] walks), so
+        // the record the insert below stores IS the take. Nothing is reserved on the side and
+        // no refusal or dry-run path below owes an IPv6 release — unlike the IPv4 addresses,
+        // which leave the account's in-use pool as they are chosen and are therefore handed
+        // back on every path that stores no interface
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::release_private_ips`]). Both halves
+        // of that invariant are held by
+        // `tests/all/create_network_interface_refusal_leaves_the_pools.rs`.
         let assigned_ipv6 = if requested_ipv6.asks_for_anything() {
             let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
                 return Err(state::subnet_has_no_ipv6_range());
@@ -530,8 +542,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             interface_type,
             private_ip_addresses: addresses,
             groups,
-            // A created interface is attached to nothing, which is the resting `available`
-            // state the store derives for it: only an attach moves it off that status.
+            // A created interface is attached to nothing, so the store hands it back in the
+            // `pending` status a create answers and owes it `available` a span later: only an
+            // attach moves it off that resting status.
             attachment: None,
             // Nothing but the caller manages an interface the caller created itself.
             requester: None,

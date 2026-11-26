@@ -107,9 +107,25 @@ pub const NETWORK_INTERFACE_TYPE_GATEWAY_LOAD_BALANCER_ENDPOINT: &str =
 
 /// The status of a network interface nothing holds: the `NetworkInterfaceStatus` enum's
 /// `available` member (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`), which
-/// is where an interface with no attachment sits — the status a create answers and every
-/// read reports until something attaches it — and the one state a delete accepts.
+/// is where an interface with no attachment comes to rest — the status every read reports
+/// once the interface is up and until something attaches it — and the one state a delete
+/// accepts.
 pub const NETWORK_INTERFACE_STATUS_AVAILABLE: &str = "available";
+
+/// The status of a network interface a create has just minted, before it is up.
+///
+/// RECORDED behaviour: `CreateNetworkInterface` answers the interface in `pending`, and the
+/// modelled `NetworkInterfaceStatus` enum does not carry that member at all
+/// (`smithy_query(query="shape",shape="NetworkInterfaceStatus")` lists `available`,
+/// `associated`, `attaching`, `in-use` and `detaching`), so the recorded answer is the
+/// requirement here rather than the enum.
+///
+/// NON-TERMINAL: the clock owes the interface [`NETWORK_INTERFACE_STATUS_AVAILABLE`] one
+/// [`TRANSITION_DELAY`] later
+/// ([`ComAmazonawsEc2Amazonec2State::network_interface_available_at`]), whether or not
+/// anybody calls again, so a caller reading the interface straight after the create still
+/// sees the status the create answered.
+pub const NETWORK_INTERFACE_STATUS_PENDING: &str = "pending";
 
 /// The status of a network interface something holds: the `NetworkInterfaceStatus` enum's
 /// `in-use` member, which is where an interface with an attachment sits.
@@ -474,8 +490,10 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         // And the move the clock owed this interface's attachment, which an interface the
         // store no longer holds cannot be owed: nothing is left pointing at a record that is
-        // gone.
+        // gone. The interface's own `pending` -> `available` move goes the same way.
         self.network_interface_attachment_move_at
+            .remove(network_interface_id);
+        self.network_interface_available_at
             .remove(network_interface_id);
         Some(interface)
     }

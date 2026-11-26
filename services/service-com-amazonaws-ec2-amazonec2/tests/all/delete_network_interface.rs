@@ -31,7 +31,7 @@ use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, NetworkInterfaceSpec, ATTACHMENT_STATUS_ATTACHED,
     ATTACHMENT_STATUS_DETACHED, NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX,
     NETWORK_INTERFACE_STATUS_AVAILABLE, NETWORK_INTERFACE_STATUS_IN_USE,
-    NETWORK_INTERFACE_TYPE_INTERFACE,
+    NETWORK_INTERFACE_STATUS_PENDING, NETWORK_INTERFACE_TYPE_INTERFACE,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -238,12 +238,17 @@ async fn the_delete_removes_the_named_interface_whatever_shape_it_has() {
             stored(&engine, &network_interface_id),
             "case {case:?}: the interface must be stored before it is deleted"
         );
-        assert_eq!(
-            status_of(&engine, &network_interface_id).as_deref(),
-            Some(NETWORK_INTERFACE_STATUS_AVAILABLE),
-            "case {case:?}: an interface nothing holds is {NETWORK_INTERFACE_STATUS_AVAILABLE}, \
-             got {:?}",
-            status_of(&engine, &network_interface_id)
+        // What a delete refuses on is the interface being HELD, not the status it is
+        // passing through: an interface nothing holds is the one a create left coming up
+        // (`pending`) or the one the clock has since settled (`available`), and either is
+        // deletable.
+        let held_status = status_of(&engine, &network_interface_id);
+        assert!(
+            held_status.as_deref() == Some(NETWORK_INTERFACE_STATUS_PENDING)
+                || held_status.as_deref() == Some(NETWORK_INTERFACE_STATUS_AVAILABLE),
+            "case {case:?}: an interface nothing holds is \
+             {NETWORK_INTERFACE_STATUS_PENDING} or {NETWORK_INTERFACE_STATUS_AVAILABLE}, \
+             got {held_status:?}"
         );
 
         let (status, body) = delete_id(&router, &network_interface_id).await;
@@ -442,17 +447,26 @@ async fn an_interface_an_attachment_still_holds_is_refused() {
                 ..plain(&place)
             },
         );
-        let expected_status = if deletable {
-            NETWORK_INTERFACE_STATUS_AVAILABLE
+        // An interface something holds is `in-use`; one nothing holds is wherever its own
+        // coming-up left it — `pending` until the clock settles it `available` — and that is
+        // what the delete goes through on.
+        let stored_status = status_of(&engine, &network_interface_id);
+        if deletable {
+            assert!(
+                stored_status.as_deref() == Some(NETWORK_INTERFACE_STATUS_PENDING)
+                    || stored_status.as_deref() == Some(NETWORK_INTERFACE_STATUS_AVAILABLE),
+                "case {case:?}: expected the stored status \
+                 {NETWORK_INTERFACE_STATUS_PENDING} or {NETWORK_INTERFACE_STATUS_AVAILABLE}, \
+                 got {stored_status:?}"
+            );
         } else {
-            NETWORK_INTERFACE_STATUS_IN_USE
-        };
-        assert_eq!(
-            status_of(&engine, &network_interface_id).as_deref(),
-            Some(expected_status),
-            "case {case:?}: expected the stored status {expected_status}, got {:?}",
-            status_of(&engine, &network_interface_id)
-        );
+            assert_eq!(
+                stored_status.as_deref(),
+                Some(NETWORK_INTERFACE_STATUS_IN_USE),
+                "case {case:?}: expected the stored status {NETWORK_INTERFACE_STATUS_IN_USE}, \
+                 got {stored_status:?}"
+            );
+        }
 
         let (status, body) = delete_id(&router, &network_interface_id).await;
         if deletable {

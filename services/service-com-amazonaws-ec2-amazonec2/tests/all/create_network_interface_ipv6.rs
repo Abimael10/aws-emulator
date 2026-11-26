@@ -43,12 +43,25 @@ const IPV6_POOL: &str = "ipv6pool-ec2-0123456789abcdef0";
 const SUBNET_IPV6_BLOCK: &str = "2001:db8:a:1::/64";
 
 /// One `action` call carrying `params`, as its HTTP status and XML body.
-async fn call(router: &MultiServiceRouter, action: &str, params: &[Param]) -> (u16, String) {
+///
+/// `pub(crate)`: the sibling suite that holds a REFUSED create to the pools it found
+/// ([`super::create_network_interface_refusal_leaves_the_pools`]) drives the same surface
+/// through the same harness rather than a second copy of it.
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[Param],
+) -> (u16, String) {
     super::ec2_query::call(router, REGION, action, params).await
 }
 
 /// One `action` call that has to succeed, and the body it answered.
-async fn ok(case: &str, router: &MultiServiceRouter, action: &str, params: &[Param]) -> String {
+pub(crate) async fn ok(
+    case: &str,
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[Param],
+) -> String {
     let (status, body) = call(router, action, params).await;
     assert_eq!(
         status, 200,
@@ -58,7 +71,7 @@ async fn ok(case: &str, router: &MultiServiceRouter, action: &str, params: &[Par
 }
 
 /// One element of a response body, or a panic naming the case.
-fn member(case: &str, body: &str, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &str, name: &str) -> String {
     element(body, name).unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {body}"))
 }
 
@@ -89,17 +102,22 @@ fn block_bounds(case: &str, block: &str) -> (u128, u128) {
 /// without — "Amazon EC2 automatically selects the IPv6 addresses from the subnet range"
 /// (`CreateNetworkInterfaceRequest$Ipv6AddressCount`), so a subnet with no IPv6 range is part
 /// of the rule too.
-struct Fixtures {
-    router: MultiServiceRouter,
+pub(crate) struct Fixtures {
+    pub(crate) router: MultiServiceRouter,
+    /// The shared engine those calls are served from, so a test can read the pools the
+    /// handler draws from off the store itself.
+    pub(crate) engine: std::sync::Arc<engine::InMemoryEngine>,
     /// A subnet holding [`SUBNET_IPV6_BLOCK`].
-    dual_stack_subnet: String,
+    pub(crate) dual_stack_subnet: String,
     /// A subnet of the same VPC with no IPv6 block at all.
-    ipv4_only_subnet: String,
+    pub(crate) ipv4_only_subnet: String,
 }
 
 /// A VPC with an IPv6 block, a subnet holding a `/64` of it, and a subnet holding none.
-async fn fixtures(case: &str) -> Fixtures {
-    let (router, _engine) = super::ec2_query::emulator();
+///
+/// `pub(crate)` for the reason [`call`] is.
+pub(crate) async fn fixtures(case: &str) -> Fixtures {
+    let (router, engine) = super::ec2_query::emulator();
     let created = ok(
         case,
         &router,
@@ -131,6 +149,7 @@ async fn fixtures(case: &str) -> Fixtures {
     );
     Fixtures {
         router,
+        engine,
         dual_stack_subnet,
         ipv4_only_subnet,
     }

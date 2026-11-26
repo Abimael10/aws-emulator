@@ -35,19 +35,23 @@
 //! puts it: what a caller cannot do is make a token of its own.
 //!
 //! WHICH ALPHABET the authenticated bytes are written in is the listing's own, because it is
-//! the one AWS writes that listing's token in ([`PagedListing::spelling`]): the bucket
-//! listing and the four listings of a bucket's id-addressed configurations hand back a
-//! lowercase-hex value, and the object listings and the directory-bucket listing hand back a
-//! base64 one. A client round-trips either unread, so WHICH of the two a listing writes is a
-//! fidelity question — which is why it is read off the recordings rather than chosen.
+//! the one AWS writes that listing's token in ([`PagedListing::spelling`]): the listings of
+//! what a bucket or an object version holds hand back a base64 value, and the two listings of
+//! an ACCOUNT's buckets and the four listings of a bucket's id-addressed configurations hand
+//! back a lowercase-hex one. A client round-trips either unread, so WHICH of the two a
+//! listing writes is a fidelity question — which is why it is read off the recordings rather
+//! than chosen.
 //!
-//! What is NOT free in either alphabet is the CHARACTER SET, which is read off the recorded
-//! answers of each listing rather than chosen: lowercase hex, and base64 in the STANDARD
-//! alphabet over its padding (RFC 4648 §4), which is what the recorded tokens of the object
-//! listings and the directory-bucket listing are written in. The two characters of that
-//! alphabet a URI query component does not carry unchanged (`+` and `/`), and its padding
-//! (`=`), travel percent-encoded on the `continuation-token` parameter the caller hands the
-//! value back on, exactly as any other query value does.
+//! What is NOT free in either alphabet is the CHARACTER SET: lowercase hex, and base64 in the
+//! STANDARD alphabet over its padding (RFC 4648 §4), which is what the recorded tokens of the
+//! object listings are written in. The two characters of that alphabet a URI query component
+//! does not carry unchanged (`+` and `/`), and its padding (`=`), travel percent-encoded on
+//! the `continuation-token` parameter the caller hands the value back on, exactly as any other
+//! query value does — so a listing whose page is addressed on the QUERY STRING of a SIGNED
+//! request is minted in the hex alphabet, whose every character a query component carries as
+//! itself: a character with two spellings on the wire has only one of them inside the
+//! signature over that request, so a client that resumes such a listing with the value it was
+//! handed must not have to agree with the service about which spelling the signature covers.
 //!
 //! No page is kept on the side: the cursor is the position the next page resumes at — a
 //! configuration id, a bucket name, an object key, an annotation name — which is why every
@@ -101,24 +105,32 @@ impl PagedListing {
     }
 
     /// The alphabet THIS listing's token is written in, which is the alphabet the recorded
-    /// answers of that listing write it in: a lowercase-hex value for the account's own
-    /// bucket listing and for the four listings of a bucket's id-addressed configurations, a
-    /// base64 one — the standard alphabet, padded — for the listings of what a bucket or an
-    /// object version holds and for the directory-bucket listing.
+    /// answers of that listing write it in: a lowercase-hex value for the two listings of an
+    /// ACCOUNT's buckets — the general purpose ones and the directory ones — and for the four
+    /// listings of a bucket's id-addressed configurations, a base64 one — the standard
+    /// alphabet, padded — for the listings of what a bucket or an object version holds.
     ///
     /// The token is round-tripped unread either way — "an opaque value that Amazon S3
     /// understands" — so which of the two it is changes nothing a client can do with the
     /// value; it is what a client that reads the value's FORM, or a recorded-answer
-    /// comparison, sees. Both are written in the characters a query component carries
-    /// unchanged, which is NOT a free choice (the module docs).
+    /// comparison, sees.
+    ///
+    /// The hex alphabet is also what a listing resumed on the QUERY STRING needs: every
+    /// character of it is one a query component carries as itself, so the value a client hands
+    /// back is the same bytes whether it percent-encodes the value or not — and therefore the
+    /// same bytes inside the SIGNATURE over the resuming request, whichever of the two
+    /// spellings the client signed. The directory-bucket listing is resumed exactly that way,
+    /// on the `continuation-token` parameter of a signed `GET /` to the Express control
+    /// endpoint (see the module docs).
     fn spelling(self) -> Spelling {
         match self {
             Self::Analytics
             | Self::Buckets
+            | Self::DirectoryBuckets
             | Self::IntelligentTiering
             | Self::Inventory
             | Self::Metrics => Spelling::Hex,
-            Self::DirectoryBuckets | Self::ObjectAnnotations | Self::Objects => Spelling::Base64,
+            Self::ObjectAnnotations | Self::Objects => Spelling::Base64,
         }
     }
 }

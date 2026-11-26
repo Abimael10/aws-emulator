@@ -18,10 +18,11 @@
 //! ([`crate::state::tagging_resource_not_found_message`]), and a
 //! request that would leave the resource carrying more than the 50 tags
 //! `TooManyTagsException` documents is refused in full, before any pair is applied, so a
-//! refused call changes nothing. That refusal is evaluated against the RESULTANT tag set
-//! and worded in this service's one sentence for the quota
-//! ([`crate::state::too_many_tags_message`]), the same one a create's own over-long `tags`
-//! list is refused with.
+//! refused call changes nothing. The refusal names the half of the quota it broke: a request
+//! whose own `tags` list is longer than one resource may hold earns the bound's own sentence
+//! ([`crate::state::too_many_tags_message`], the one a create's over-long list earns), while
+//! one inside that bound whose RESULTANT set would leave it earns the resultant-set sentence
+//! ([`crate::state::resultant_tag_set_too_large_message`]).
 //!
 //! The one resolution of a tagging ARN lives in `crate::state` (`tagged_resource`), shared
 //! with `ops/list_tags_for_resource.rs` and `ops/untag_resource.rs`.
@@ -173,15 +174,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already carry grow it. The whole request is refused before a single pair is
         // applied, so a refused call leaves the resource's tags exactly as they were.
         //
-        // The refusal carries no part of the request: `resourceName` is left unset, as this
-        // service leaves it on every `TooManyTagsException` it answers, and the sentence
-        // states the bound alone — the one wording this service answers the quota with,
-        // whichever set the quota was reached through.
+        // WHICH half of the quota refused it is what the sentence reports: a request whose own
+        // `tags` list is longer than one resource may hold is refused on that list
+        // ([`crate::state::too_many_tags_message`], the wording a create's own over-long list
+        // earns), while one inside that bound whose RESULTANT set would leave it is refused on
+        // the set it would have left behind
+        // ([`crate::state::resultant_tag_set_too_large_message`]).
+        //
+        // Neither refusal carries any part of the request: `resourceName` is left unset, as
+        // this service leaves it on every `TooManyTagsException` it answers, and each sentence
+        // states the bound alone.
+        let submitted = input.tags.len();
         let merged = crate::state::tag_count_after(held, &input.tags);
         if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            let message = if submitted > crate::state::MAX_TAGS_PER_RESOURCE {
+                crate::state::too_many_tags_message()
+            } else {
+                crate::state::resultant_tag_set_too_large_message()
+            };
             return Err(TagResourceErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(crate::state::too_many_tags_message()),
+                    message: Some(message),
                     resource_name: None,
                 },
             )

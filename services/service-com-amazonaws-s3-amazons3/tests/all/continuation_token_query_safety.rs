@@ -17,9 +17,9 @@
 //!
 //! The rows span what the rule generalises over: WHICH paged listing minted the token, which
 //! covers both alphabets this service writes a token in (`super::continuation_token_alphabet`
-//! states which listing writes which) — the DIRECTORY-bucket listing and the object listing,
-//! whose tokens are base64, and the account's own bucket listing, whose token is lowercase hex
-//! — and, per listing, the position the token resumes at.
+//! states which listing writes which) — the OBJECT listing, whose token is base64, and the
+//! account's own bucket listing and its directory-bucket listing, whose tokens are lowercase
+//! hex — and, per listing, the position the token resumes at.
 //!
 //! Each call goes over the wire through the harness the bucket and object suites own, so what
 //! is pinned is the wire document.
@@ -62,7 +62,11 @@ async fn list_directory_buckets(router: &MultiServiceRouter, query: &str) -> Ans
 
 /// Whether every character of `token` is one a URI query component carries unchanged: RFC
 /// 3986's unreserved set, `A-Za-z0-9` with `-`, `.`, `_` and `~`.
-fn is_unreserved(token: &str) -> bool {
+///
+/// `pub(crate)`: the suite that holds the DIRECTORY-bucket listing's token to that set
+/// ([`super::directory_bucket_listing_token_alphabet`]) reads the rule here rather than
+/// keeping a second copy of it.
+pub(crate) fn is_unreserved(token: &str) -> bool {
     !token.is_empty()
         && token.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
@@ -108,7 +112,8 @@ fn assert_travels_unchanged(case: &str, token: &str) {
 
 /// RULE on the DIRECTORY-bucket listing: its token is written in a published alphabet and
 /// resumes the account's listing where the page stopped, handed back the way a client puts a
-/// query value on the wire.
+/// query value on the wire. Which alphabet that is, and that either hand-back of it resumes
+/// the same page, is `super::directory_bucket_listing_token_alphabet`'s rule.
 #[tokio::test]
 async fn the_directory_bucket_listing_token_travels_unchanged_and_resumes_the_listing() {
     let router = router();

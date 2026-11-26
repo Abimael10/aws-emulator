@@ -54,7 +54,10 @@ pub(crate) fn handed_back_in_query(token: &str) -> String {
 }
 
 /// Whether `token` is written in lowercase hexadecimal.
-fn is_lowercase_hex(token: &str) -> bool {
+///
+/// `pub(crate)`: the suites that hold a hex-spelled listing's token to that alphabet read it
+/// here rather than keeping a second copy of the rule.
+pub(crate) fn is_lowercase_hex(token: &str) -> bool {
     !token.is_empty() && token.chars().all(|character| matches!(character, '0'..='9' | 'a'..='f'))
 }
 

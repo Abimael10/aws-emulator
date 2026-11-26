@@ -1419,7 +1419,8 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// Everything the service itself owns is derived here rather than taken from the
     /// caller — the id, the MAC address built from it, the owning account, the private DNS
-    /// name of its primary address and the `available` status of an unattached interface — so
+    /// name of its primary address and the status it starts in (`in-use` for an interface
+    /// something already holds, the `pending` a create answers for one nothing does) — so
     /// two writers cannot report the same interface differently.
     ///
     /// The addresses the interface takes leave the subnet: "`AvailableIpAddressCount` - The
@@ -1475,17 +1476,19 @@ impl ComAmazonawsEc2Amazonec2State {
         let retained_bytes =
             network_interface_spec_bytes(&spec).saturating_add(STORED_RECORD_OVERHEAD_BYTES);
         // "The status of the network interface" (`NetworkInterface$Status`): an interface
-        // something holds is `in-use`, and one held by nothing is `available` — the resting
-        // state of an unattached interface, which is where every interface starts. Derived
-        // here rather than taken from the writer, so a stored interface cannot claim to be
-        // `available` while something holds it — and derived on the same terms a later read
-        // asks ([`ComAmazonawsEc2Amazonec2State::network_interface_is_held`]): an attachment
-        // that has not been taken away holds it, and so does the SERVICE that created it to
-        // serve a resource of the account, for as long as that resource exists. A create the
-        // CALLER made for itself attaches nothing and names no such service, so it is
-        // `available` from the create's own answer on, and only an attachment moves it off
-        // that status ([`NETWORK_INTERFACE_STATUS_ATTACHING`] and the rest of the attachment
-        // lifecycle).
+        // something holds is `in-use`. Derived here rather than taken from the writer, so a
+        // stored interface cannot claim to be free while something holds it — and derived on
+        // the same terms a later read asks
+        // ([`ComAmazonawsEc2Amazonec2State::network_interface_is_held`]): an attachment that
+        // has not been taken away holds it, and so does the SERVICE that created it to serve
+        // a resource of the account, for as long as that resource exists.
+        //
+        // An interface nothing holds is one a caller created for itself, which is handed back
+        // in the NON-TERMINAL [`NETWORK_INTERFACE_STATUS_PENDING`] — it is still being brought
+        // up — and the clock owes it [`NETWORK_INTERFACE_STATUS_AVAILABLE`] one
+        // [`TRANSITION_DELAY`] later, recorded below rather than slept for. Only an attachment
+        // moves it off that resting status afterwards
+        // ([`NETWORK_INTERFACE_STATUS_ATTACHING`] and the rest of the attachment lifecycle).
         let held = spec
             .attachment
             .as_ref()
@@ -1494,7 +1497,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let status = if held {
             NETWORK_INTERFACE_STATUS_IN_USE
         } else {
-            NETWORK_INTERFACE_STATUS_AVAILABLE
+            NETWORK_INTERFACE_STATUS_PENDING
         };
         let interface = NetworkInterface {
             // No Elastic IP address is associated until something associates one.
@@ -1629,8 +1632,15 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         self.network_interfaces
             .insert(network_interface_id.clone(), interface);
-        // Nothing is owed on the interface by the clock: the status it is stored in is the
-        // one it rests in, and only an attachment moves it.
+        // The move the clock now owes an interface a caller created for itself: it was handed
+        // back `pending` above, so it is `available` one [`TRANSITION_DELAY`] later whether or
+        // not anybody calls again ([`Self::materialize_due_transitions`] applies it). An
+        // interface stored HELD owes nothing: `in-use` is where it already is, and only its
+        // attachment moves it.
+        if !held {
+            self.network_interface_available_at
+                .insert(network_interface_id.clone(), Instant::now() + TRANSITION_DELAY);
+        }
         Some(network_interface_id)
     }
 }

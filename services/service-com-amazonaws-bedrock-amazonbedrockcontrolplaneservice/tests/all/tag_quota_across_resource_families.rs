@@ -304,10 +304,16 @@ async fn the_quota_contract_holds_for(family: TaggedFamily) {
             )
         });
         // The quota was evaluated against the RESULTANT tag set, and the sentence states
-        // the bound — nothing of the request, and nothing of which set the quota was
-        // reached through. Spelled here rather than read off the handler, so a re-wording
-        // of it fails this row.
-        let expected = format!("You can assign a maximum of {MAX_TAGS} tags to a resource");
+        // the bound and nothing of the request. WHICH of the two sentences the bound is
+        // stated in follows from the bound this row broke — its own batch being longer than
+        // one resource may hold, or the set it would have left behind
+        // (`crate::tag_quota_names_the_bound_it_broke` holds that rule). Both are spelled
+        // here rather than read off the handler, so a re-wording of either fails this row.
+        let expected = if refused_batch.len() > MAX_TAGS {
+            format!("You can assign a maximum of {MAX_TAGS} tags to a resource")
+        } else {
+            format!("The resultant tag set must not have more than {MAX_TAGS} user tags.")
+        };
         assert_eq!(
             message, expected,
             "case {case:?}: the refusal must be worded {expected:?}, got {message:?}"
