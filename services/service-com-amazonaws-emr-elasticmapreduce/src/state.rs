@@ -359,6 +359,11 @@ pub use step_logs::*;
 mod node_logs;
 pub use node_logs::*;
 
+/// WHO performs the work a cluster's bring-up owes its nodes when no request does — the runs
+/// above and the files above, driven by the clock — split out and re-exported the same way.
+mod node_work;
+pub use node_work::*;
+
 /// The SPARK release family of the release catalog — the labels an Amazon EMR Spark
 /// release carries and what one bundles — split out and re-exported the same way.
 mod spark_releases;

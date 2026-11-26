@@ -36,7 +36,9 @@
 //!    then due and publishes it, so a client that only listens on the bus still
 //!    sees the cluster finish. It does not change WHEN a transition happens: it
 //!    applies only what the stored due instant has already made due, which is
-//!    what every reporting operation applies too.
+//!    what every reporting operation applies too. The same pump performs the work
+//!    a cluster's BRING-UP owes its nodes ([`super::node_work`]), because a
+//!    transition it carries waits on that work having really happened.
 //!
 //! The store's guard is never held across the publication: the queue is drained
 //! under it and the `PutEvents` runs with it released.
@@ -69,6 +71,39 @@ const MIN_CLOCK_WAIT: Duration = Duration::from_millis(5);
 /// The longest one wake-up waits before it looks at the store again: a backstop,
 /// so a due instant far in the future cannot park the pump indefinitely.
 const MAX_CLOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the pump waits before looking again at work a cluster's nodes still owe when no
+/// transition is outstanding ([`super::node_work`]). CHOSEN: short enough that the files a node
+/// has to push follow its run closely, and long enough that a pass which performed nothing
+/// costs one look at the store rather than a spin.
+const NODE_WORK_RECHECK: Duration = Duration::from_millis(250);
+
+/// How many wake-ups one pump makes for that work ALONE, with no transition outstanding.
+/// CHOSEN: enough passes to drain the files of far more nodes than one pass carries
+/// ([`MAX_NODE_LOG_DELIVERIES_PER_CALL`]), and bounded so a delivery that cannot go through —
+/// a log location the object store refuses every write to — is left to the next reader rather
+/// than retried for the whole life of the pump.
+const MAX_NODE_WORK_WAKE_UPS: usize = 64;
+
+/// What the pump's next wake-up is for, as the one critical section that decides it saw the
+/// store ([`ComAmazonawsEmrElasticmapreduceState::next_cluster_due_or_release_pump`]).
+#[derive(Debug, Clone, Copy)]
+enum NextWakeUp {
+    /// A transition the store owes at that instant, or a change already queued for
+    /// publication.
+    Owed(SystemTime),
+    /// Nothing but the work a cluster's nodes still owe, to be looked at again then.
+    NodeWork(SystemTime),
+}
+
+impl NextWakeUp {
+    /// The instant to wait for.
+    fn at(self) -> SystemTime {
+        match self {
+            Self::Owed(at) | Self::NodeWork(at) => at,
+        }
+    }
+}
 
 /// How many wake-ups one pump makes before it stands down. A backstop, not a
 /// budget: a cluster owes a handful of transitions and the cluster map is bounded
@@ -187,17 +222,27 @@ impl ComAmazonawsEmrElasticmapreduceState {
         &mut self,
         now: SystemTime,
         generation: u64,
-    ) -> Option<SystemTime> {
+        carry_node_work: bool,
+    ) -> Option<NextWakeUp> {
         if !self.pending_cluster_events.is_empty() {
-            return Some(now);
+            return Some(NextWakeUp::Owed(now));
         }
-        match self.next_cluster_due_at() {
-            Some(due) => Some(due),
-            None => {
-                self.release_cluster_clock_pump(generation);
-                None
-            }
+        if let Some(due) = self.next_cluster_due_at() {
+            return Some(NextWakeUp::Owed(due));
         }
+        // A cluster whose nodes still owe their own work keeps the pump awake even with no
+        // transition left to wait for ([`super::node_work`]): the run of a bootstrap action and
+        // the push of the files it left are work of this emulator's own, so a pump that stood
+        // down with them outstanding would leave them to a reader that may never come. It is
+        // looked at again a span later rather than at once, because what is owed is work and
+        // not an instant, and only while the pump has wake-ups left to spend on work alone, so
+        // work that is not progressing is handed to the next reader instead of being retried
+        // for as long as the pump may live.
+        if carry_node_work && self.owes_node_work() {
+            return Some(NextWakeUp::NodeWork(now + NODE_WORK_RECHECK));
+        }
+        self.release_cluster_clock_pump(generation);
+        None
     }
 
     /// Claim the single clock pump for this store: the claim's GENERATION when the
@@ -420,6 +465,10 @@ pub fn drive_cluster_clock<Eng: Send + Sync + 'static>(
         return;
     };
     let callback = ctx.callback().clone();
+    // The identity of this service, kept so the pump can build the context its own calls into
+    // other services ride, exactly as a handler's do: the pump serves no request, so there is
+    // nothing of one to carry.
+    let identity = ctx.identity().clone();
     let engine = ::std::sync::Arc::clone(engine);
     let region = region.to_string();
     let pumped = ::engine::ServiceState::clone(&state);
@@ -428,21 +477,48 @@ pub fn drive_cluster_clock<Eng: Send + Sync + 'static>(
         // ran out of work has already released its claim inside the one critical
         // section that observed it (`next_cluster_due_or_release_pump`).
         let mut capped = true;
+        // How many wake-ups this pump has made for the node work alone, which is what bounds
+        // the retrying of work that is not progressing ([`MAX_NODE_WORK_WAKE_UPS`]).
+        let mut node_work_wake_ups = 0_usize;
         for _ in 0..MAX_CLOCK_WAKE_UPS {
             let now = SystemTime::now();
-            let Some(due) = state.lock().next_cluster_due_or_release_pump(now, generation) else {
+            let next = state.lock().next_cluster_due_or_release_pump(
+                now,
+                generation,
+                node_work_wake_ups < MAX_NODE_WORK_WAKE_UPS,
+            );
+            let Some(next) = next else {
                 capped = false;
                 break;
             };
+            if matches!(next, NextWakeUp::NodeWork(_)) {
+                node_work_wake_ups = node_work_wake_ups.saturating_add(1);
+            }
             // Every wake-up waits, even for an instant already past: that is what
             // keeps the backstop above from ever costing a CPU-bound spin, and it
             // hands the runtime back between wake-ups.
-            let wait = due
+            let wait = next
+                .at()
                 .duration_since(now)
                 .unwrap_or_default()
                 .clamp(MIN_CLOCK_WAIT, MAX_CLOCK_WAIT);
             ::tokio::time::sleep(wait).await;
-            state.lock().advance_all(SystemTime::now());
+            let now = SystemTime::now();
+            state.lock().advance_all(now);
+            // The work the clock owes a cluster's NODES, performed here because a cluster's
+            // bring-up is this emulator's own work and not its reader's: each bootstrap action
+            // whose turn it is runs, and the files those runs and those nodes left are pushed
+            // to the cluster's log location ([`super::node_work`]). It stands BEFORE the
+            // publication below, so the state a run this pass answered for took the cluster to
+            // is announced with the rest rather than waiting for another pass.
+            //
+            // The parts a context is built over name nothing — this task serves no request, so
+            // there is no caller, no credential and no body — and the Region the work runs for
+            // is the one this pump was started for.
+            let parts = ::http::Request::new(()).into_parts().0;
+            let ctx =
+                smithy_server_runtime::OperationContext::new(&parts, &identity, callback.clone());
+            settle_due_node_work(&*engine, &ctx, &region, now).await;
             publish_pending(&callback, &*engine, &region).await;
             // A transition the clock just materialised can also be the first state of a
             // cluster nobody's call launched into — the groups its launch handed Amazon EMR

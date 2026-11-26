@@ -120,6 +120,11 @@ pub const BOOTSTRAP_CALL_CEILING: Duration = Duration::from_secs(8);
 /// ([`performed_on_its_own_thread`]).
 const BOOTSTRAP_THREAD_NAME: &str = "emr-bootstrap-action";
 
+/// What one cluster's bootstrap PHASE is claimed under ([`claimed_program`]): the key
+/// `<cluster-id>/<this>`, which the key of one RUN of that phase extends with the action's
+/// position and the node it is performed on.
+const BOOTSTRAP_PHASE_CLAIM: &str = "bootstrap";
+
 /// How much of what a bootstrap action's script WROTE the session keeps.
 ///
 /// CHOSEN, the sibling of the step command's own limits
@@ -439,6 +444,17 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
+    // ONE driver performs a cluster's bootstrap PHASE at a time ([`claimed_program`], the same
+    // claim an individual run is taken under), so what the phase comes to does not depend on how
+    // many of them arrived at it. The phase is a SEQUENCE and not a set of independent runs: an
+    // action that did not succeed takes the cluster down, and the nodes the actions behind it
+    // would have run on are going away with it — so a second driver performing another node's
+    // turn beside this one would run a script on a node this phase had already stopped for. A
+    // driver that finds the phase claimed leaves it to the one holding the claim, exactly as it
+    // leaves an individual run it could not claim.
+    let Some(_phase) = claimed_program(&format!("{cluster_id}/{BOOTSTRAP_PHASE_CLAIM}")) else {
+        return;
+    };
     let job_flow_role: Option<String> = {
         let mut store = state.lock();
         // The phases the clock owes are applied first, so a cluster whose capacity is up is
@@ -487,7 +503,7 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
             // second time: a script's transfers are real effects on the object store.
             let node = plan.node.key();
             let Some(claim) = claimed_program(&format!(
-                "{cluster_id}/bootstrap/{}/{node}",
+                "{cluster_id}/{BOOTSTRAP_PHASE_CLAIM}/{}/{node}",
                 plan.position
             )) else {
                 continue;
