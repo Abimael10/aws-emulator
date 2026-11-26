@@ -189,16 +189,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // current run was dispatched, which its overview reports.
         store.materialize_due(now);
 
-        // The refusal NAMES the association the request asked about, in the sentence this
-        // read words it with
+        // The refusal NAMES what the request asked about, in each lookup form's own sentence.
+        // An id is named by the sentence this read words that form with
         // ([`crate::state::associations::association_does_not_exist`]); a request that
-        // addressed the association by the document and the node a create paired carried no
-        // id to name, so it is refused with the sentence that names none.
-        let does_not_exist = |association_id: Option<&str>| {
+        // addressed the association by the document and the node a create paired carries no
+        // id, so its refusal names that PAIR and states what an association created through
+        // `Targets` must be looked up by instead
+        // ([`crate::state::associations::association_not_found_for_node`]).
+        let no_such_id = |association_id: &str| {
             DescribeAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
-                message: Some(association_id.map_or_else(
-                    || crate::state::associations::ASSOCIATION_DOES_NOT_EXIST.to_string(),
-                    crate::state::associations::association_does_not_exist,
+                message: Some(crate::state::associations::association_does_not_exist(
+                    association_id,
+                )),
+            })
+        };
+        let no_association_of_node = |name: &str, instance_id: &str| {
+            DescribeAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
+                message: Some(crate::state::associations::association_not_found_for_node(
+                    name,
+                    instance_id,
                 )),
             })
         };
@@ -212,13 +221,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = match (association_id, name, instance_id) {
             (Some(id), _, _) => store
                 .association(&region, id)
-                .ok_or_else(|| does_not_exist(Some(id)))?,
+                .ok_or_else(|| no_such_id(id))?,
             // The pairing form: the association of that document on that node. The node ids
             // an association TARGETS are criteria resolved when it is dispatched rather than
             // an identity it is held under, so only the node a create named resolves here.
             (None, Some(name), Some(instance_id)) => store
                 .association_of_node(&region, name, instance_id)
-                .ok_or_else(|| does_not_exist(None))?,
+                .ok_or_else(|| no_association_of_node(name, instance_id))?,
             (None, _, _) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     "Either AssociationId or both Name and InstanceId must be specified",

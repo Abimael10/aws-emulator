@@ -232,6 +232,26 @@ pub fn association_does_not_exist(association_id: &str) -> String {
 /// which carries no association id.
 pub const ASSOCIATION_DOES_NOT_EXIST: &str = "The specified association doesn't exist.";
 
+/// How the read of one association states that the legacy pairing a request addressed names
+/// no association of this endpoint — "Association not found for documentName <Name> and
+/// instanceId <InstanceId>. Try using the association-id parameter if you are looking for an
+/// association created using targets."
+///
+/// A request in that form carries no association id to name, so what it names is the pair it
+/// asked about: the document name and the node id it carried, interpolated into fixed text
+/// that also states what a caller whose association was created through `Targets` must look
+/// it up by instead — "If you created the association by using the Targets parameter, then
+/// you must retrieve the association by using the association ID" (`DescribeAssociation`).
+/// Which sentence an operation words the refusal with is that operation's own fact, so this
+/// is not derived from, and does not derive, [`association_does_not_exist`].
+pub fn association_not_found_for_node(document_name: &str, instance_id: &str) -> String {
+    format!(
+        "Association not found for documentName {document_name} and instanceId \
+         {instance_id}. Try using the association-id parameter if you are looking for an \
+         association created using targets."
+    )
+}
+
 /// How this service states an `AssociationVersion` the association does not hold.
 /// `InvalidAssociationVersion`'s own documentation is "The version you specified isn't
 /// valid. Use ListAssociationVersions to view all versions of an association according to
