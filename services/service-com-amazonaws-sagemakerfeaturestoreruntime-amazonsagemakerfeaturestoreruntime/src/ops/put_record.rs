@@ -6,7 +6,10 @@
 //! ([`crate::state::offline_store`]). The `FeatureGroupName` is resolved against the feature
 //! groups the SageMaker control plane holds ([`crate::state::resolve_group`]) and a name
 //! that resolves to none is refused with the modelled `ValidationError` (400) rather than
-//! ingested. The online write is a full over-write of the identified record's feature
+//! ingested. A record posting a feature value under one of the three names Feature Store
+//! RESERVES — the columns it adds to every offline record, which no feature group may
+//! declare ([`crate::state::reserved_feature_posted`]) — is refused the same way: that value
+//! belongs to no feature of the group. The online write is a full over-write of the identified record's feature
 //! values — the record's identifier is the value of the group's own
 //! `RecordIdentifierFeatureName` — ; it is skipped when the posted record is historic
 //! (its event time is not later than the stored record's) or when `TargetStores` names

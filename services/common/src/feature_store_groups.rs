@@ -43,6 +43,22 @@ use std::collections::{HashMap, VecDeque};
 /// data plane.
 pub const MAX_REGISTERED_FEATURE_GROUPS: usize = 10_000;
 
+/// The feature names a feature group may NOT declare, and so the names no record of one
+/// carries a value under: "FeatureNames cannot be any of the following: is_deleted,
+/// write_time, api_invocation_time" (`FeatureDefinitions`).
+///
+/// Feature Store adds those three columns to every row of a feature group's OfflineStore
+/// itself — whether the row marks the record deleted, when it was written there and when the
+/// call that wrote it was made — so a feature of the same name is a second column of that
+/// name in the replicated object, and the delete marker of the row can no longer be
+/// identified by name.
+///
+/// Both planes of the Feature Store read the list from HERE: the control plane refuses a
+/// schema that declares one of these names, and the runtime data plane refuses a record that
+/// posts a feature value under one — the same rule, so neither plane can admit a feature the
+/// other says cannot exist.
+pub const RESERVED_FEATURE_NAMES: &[&str] = &["is_deleted", "write_time", "api_invocation_time"];
+
 /// One feature group the control plane created, as the directory records it.
 #[derive(Debug, Clone)]
 pub struct FeatureGroupRecord {

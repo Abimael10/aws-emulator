@@ -505,6 +505,43 @@ pub fn identifier_not_scalar(identifier_feature_name: &str) -> String {
     )
 }
 
+/// The first feature of a posted list whose name Feature Store RESERVES
+/// ([`::service_common::feature_store_groups::RESERVED_FEATURE_NAMES`]), or `None` when the
+/// request posts a value under none of them.
+///
+/// Those three names are the columns Feature Store adds to every row of a feature group's
+/// OfflineStore, and no feature group can DECLARE a feature named after one of them
+/// ("FeatureNames cannot be any of the following: is_deleted, write_time,
+/// api_invocation_time", `FeatureDefinitions`) — so a value posted under one of them belongs
+/// to no feature of the group it is written to, whatever that group's schema says. Every
+/// write of this data plane reads the names it posts through here, so a whole-record
+/// ingestion and a partial update refuse the same posted name.
+pub fn reserved_feature_posted(record: &[crate::ops::types::FeatureValue]) -> Option<&str> {
+    record
+        .iter()
+        .map(|feature| feature.feature_name.as_str())
+        .find(|name| ::service_common::feature_store_groups::RESERVED_FEATURE_NAMES.contains(name))
+}
+
+/// The refusal a write is answered with for a feature value posted under a name Feature
+/// Store reserves ([`reserved_feature_posted`]).
+///
+/// `member` is the request member the value arrived in — `Record` for a whole-record write,
+/// `Features` for a partial update — so the refusal points at the list the offending value is
+/// in, and the group is named as the other request-level refusals of this service name it
+/// ([`no_online_store`]). The rule itself is the documented sentence the reserved names come
+/// from ("FeatureNames cannot be any of the following: is_deleted, write_time,
+/// api_invocation_time", `FeatureDefinitions`), with the names read from the one list both
+/// planes share rather than restated here.
+pub fn reserved_feature_name(member: &str, group: &str, feature_name: &str) -> String {
+    format!(
+        "Validation Error: {member} names the feature '{feature_name}', which is reserved by \
+         the FeatureStore and is not a Feature of FeatureGroup {group}. FeatureNames cannot be \
+         any of the following: {}.",
+        ::service_common::feature_store_groups::RESERVED_FEATURE_NAMES.join(", ")
+    )
+}
+
 /// The refusal every write of this data plane answers for the group's EVENT-TIME feature
 /// carrying no value this plane can read as one value ([`ScalarFeature::Unreadable`]):
 /// stated once here, so a whole-record write and a partial update refuse the same posted
@@ -559,6 +596,15 @@ pub fn prepare_record(
     // record with no feature values.
     if record.is_empty() {
         return Err("Record must carry at least one FeatureValue".to_owned());
+    }
+
+    // A feature group cannot DECLARE a feature named after one of the columns Feature Store
+    // adds to every offline row, so a value posted under one of those names belongs to no
+    // feature of this group and the write is refused rather than ingested
+    // ([`reserved_feature_posted`]). Read before the record is interpreted: the names a
+    // write posts are read against what the group can hold, not the other way round.
+    if let Some(name) = reserved_feature_posted(record) {
+        return Err(reserved_feature_name("Record", &definition.name, name));
     }
 
     // One value per feature name ([`held_feature_values`]): every read below, and the

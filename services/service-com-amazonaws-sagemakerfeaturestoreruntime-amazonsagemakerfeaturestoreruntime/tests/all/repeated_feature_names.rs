@@ -19,6 +19,13 @@
 //! (`PutRecord`, `BatchWriteRecord`) — with a record whose names are all distinct as the
 //! control row.
 //!
+//! The second rule under test is the other way one object could declare a column twice: the
+//! three names Feature Store adds as columns to every offline row are RESERVED
+//! ("FeatureNames cannot be any of the following: is_deleted, write_time,
+//! api_invocation_time", `FeatureDefinitions`), so no feature group can declare a feature of
+//! one of those names and every write of this data plane refuses a feature value posted under
+//! one — while a name that merely resembles one is a feature like any other.
+//!
 //! Four services are mounted on ONE shared engine, exactly as the router mounts them: this
 //! data plane, the SageMaker control plane that defines the feature group, IAM which holds
 //! the role the offline write is made under, and Amazon S3 which holds the written object.
@@ -62,6 +69,10 @@ const ADDED_COLUMNS: [&str; 3] = ["write_time", "api_invocation_time", "is_delet
 /// An event time well in the future, so no row's record is already expired when it is read
 /// back.
 const EVENT_TIME: &str = "2035-01-01T00:00:00Z";
+
+/// Feature names that merely RESEMBLE one of [`ADDED_COLUMNS`]: a feature group may declare
+/// either, so a write may post a value under either.
+const NEAR_MISS_FEATURES: [&str; 2] = ["is_deleted_by", "write_times"];
 
 /// A second event time, for the row that names the event-time feature twice.
 const LATER_EVENT_TIME: &str = "2036-02-03T04:05:06Z";
@@ -330,6 +341,11 @@ impl Aws {
                 { "FeatureName": EVENT_TIME_FEATURE, "FeatureType": "String" },
                 { "FeatureName": "city", "FeatureType": "String" },
                 { "FeatureName": "tags", "FeatureType": "String" },
+                // The two names that merely RESEMBLE a column Feature Store adds: a feature
+                // group may declare either, which is what the control rows of the reserved
+                // -name table below post.
+                { "FeatureName": NEAR_MISS_FEATURES[0], "FeatureType": "String" },
+                { "FeatureName": NEAR_MISS_FEATURES[1], "FeatureType": "String" },
             ],
             "OnlineStoreConfig": { "EnableOnlineStore": true },
             // `DisableGlueTableCreation`: this suite manages no Glue table.
@@ -687,6 +703,300 @@ async fn a_feature_named_twice_in_one_write_holds_the_last_value_named() {
                 !rendered_row.contains(gone),
                 "case {case:?}: expected the replicated row not to carry the superseded \
                  value {gone:?}, got {rendered_row}"
+            );
+        }
+    }
+}
+
+/// Which write of this data plane posts a row's feature values.
+#[derive(Debug, Clone, Copy)]
+enum Write {
+    Put,
+    Batch,
+    Update,
+}
+
+impl Write {
+    /// The operation this write is, as the API names it.
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Put => "PutRecord",
+            Self::Batch => "BatchWriteRecord",
+            Self::Update => "UpdateRecord",
+        }
+    }
+}
+
+/// One row of the reserved-name table.
+struct ReservedRow {
+    case: String,
+    /// The operation the features are posted through.
+    via: Write,
+    /// The name the row posts a feature value under, beside the record's own two features.
+    posted_name: &'static str,
+    /// Whether the write must be refused.
+    refused: bool,
+}
+
+/// The record every row of that table seeds and then writes to, and the value it posts under
+/// the name under test.
+const SEEDED_IDENTIFIER: &str = "C1";
+const POSTED_VALUE: &str = "postedvalue";
+
+/// The wire error code of an error response: restJson1 carries it as the body's `__type`.
+fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The message an error response carries, in either spelling: the framework's own refusal
+/// uses `message`, while this service's modelled errors declare a `Message` member.
+fn error_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Post `features` through the write `via` names, answering its status and body. Nothing is
+/// asserted: a row of the table below is expected to be refused.
+async fn post_features(aws: &Aws, via: Write, features: &[Value]) -> (u16, Value) {
+    match via {
+        Write::Put => {
+            aws.data_plane(
+                "PUT",
+                &format!("/FeatureGroup/{GROUP}"),
+                Some(json!({ "Record": features })),
+            )
+            .await
+        }
+        Write::Batch => {
+            aws.data_plane(
+                "POST",
+                "/BatchWriteRecord",
+                Some(json!({ "Entries": [
+                    { "FeatureGroupName": GROUP, "Record": features }
+                ] })),
+            )
+            .await
+        }
+        Write::Update => {
+            aws.data_plane(
+                "POST",
+                &format!("/FeatureGroup/{GROUP}/Record"),
+                Some(json!({
+                    "RecordIdentifierValueAsString": SEEDED_IDENTIFIER,
+                    "Features": features,
+                })),
+            )
+            .await
+        }
+    }
+}
+
+/// Whether the answer to one write is a REFUSAL, with the wire error code and the message it
+/// carried.
+///
+/// A batch reports a refused entry in its own `Errors` element and answers HTTP 200 — "the
+/// `ErrorCode` a batch operation of this data plane reports a refused entry with" is the code
+/// a single-record write refuses the same request with — so the two are read here into one
+/// verdict.
+fn refusal(via: Write, status: u16, body: &Value) -> (bool, String, String) {
+    if let Write::Batch = via {
+        let errors = body
+            .get("Errors")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        return match errors.first() {
+            Some(error) => (
+                true,
+                error["ErrorCode"].as_str().unwrap_or_default().to_owned(),
+                error["ErrorMessage"].as_str().unwrap_or_default().to_owned(),
+            ),
+            None => (false, String::new(), String::new()),
+        };
+    }
+    (
+        status != 200,
+        error_code(body),
+        error_message(body),
+    )
+}
+
+/// The columns a replicated Parquet object declares, in the order it declares them.
+fn object_columns(bytes: Vec<u8>) -> Vec<String> {
+    let reader = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes))
+        .expect("the replicated object must be a Parquet file");
+    reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|column| column.name().to_owned())
+        .collect()
+}
+
+/// RULE: Feature Store RESERVES the three names it adds as columns to every offline row
+/// ("FeatureNames cannot be any of the following: is_deleted, write_time,
+/// api_invocation_time", `FeatureDefinitions`), so no feature group can declare a feature of
+/// one of those names and a write that posts a feature value under one is refused with the
+/// modelled `ValidationError` — nothing stored in the OnlineStore and nothing appended to the
+/// OfflineStore — while a name that merely resembles one is a feature like any other. Every
+/// object the offline store does hold therefore declares each column exactly once, so the
+/// `is_deleted` column that marks a row deleted is identifiable by name.
+///
+/// The rows differ along WHICH of the three reserved names is posted, WHICH operation posts
+/// it (`PutRecord`, `BatchWriteRecord`, `UpdateRecord`) and, as the control rows, names that
+/// only resemble a reserved one — which the feature group declares.
+#[tokio::test]
+async fn a_feature_posted_under_a_name_feature_store_reserves_is_refused() {
+    let mut rows: Vec<ReservedRow> = Vec::new();
+    for via in [Write::Put, Write::Batch, Write::Update] {
+        for posted_name in ADDED_COLUMNS {
+            rows.push(ReservedRow {
+                case: format!("{posted_name} posted by {}", via.operation()),
+                via,
+                posted_name,
+                refused: true,
+            });
+        }
+        for posted_name in NEAR_MISS_FEATURES {
+            rows.push(ReservedRow {
+                case: format!("{posted_name} posted by {}", via.operation()),
+                via,
+                posted_name,
+                refused: false,
+            });
+        }
+    }
+
+    for row in rows {
+        let case = row.case.as_str();
+        // A fresh emulator per row, so each row's offline bucket holds only its own objects.
+        let aws = Aws::new();
+        aws.create_bucket().await;
+        let role_arn = aws.create_granted_role(case, "offline-store-role").await;
+        aws.create_feature_group(case, &role_arn).await;
+
+        // The record the row writes to: it is what an `UpdateRecord` needs to exist, and the
+        // one object the offline store holds before the row's own write.
+        aws.write_record(
+            case,
+            Via::PutRecord,
+            &[
+                feature(IDENTIFIER_FEATURE, SEEDED_IDENTIFIER),
+                feature(EVENT_TIME_FEATURE, EVENT_TIME),
+                feature("city", "Seattle"),
+            ],
+        )
+        .await;
+        let seeded_keys = aws.keys().await;
+        assert_eq!(
+            seeded_keys.len(),
+            1,
+            "case {case:?}: expected the seeded record to be the one replicated object, got \
+             {seeded_keys:?}"
+        );
+
+        let posted = vec![
+            feature(IDENTIFIER_FEATURE, SEEDED_IDENTIFIER),
+            // Later than the seeded record's event time, so an accepted write is not a
+            // historic one that only the OfflineStore would take.
+            feature(EVENT_TIME_FEATURE, LATER_EVENT_TIME),
+            feature(row.posted_name, POSTED_VALUE),
+        ];
+        let (status, body) = post_features(&aws, row.via, &posted).await;
+        let (refused, code, message) = refusal(row.via, status, &body);
+        assert_eq!(
+            refused, row.refused,
+            "case {case:?}: expected refused={}, got HTTP {status} with {body}",
+            row.refused
+        );
+        if row.refused {
+            assert_eq!(
+                code, "ValidationError",
+                "case {case:?}: expected the refusal to be a ValidationError, got {code:?} \
+                 with {body}"
+            );
+            assert!(
+                message.contains(row.posted_name),
+                "case {case:?}: expected the refusal to name the posted feature {:?}, got \
+                 {message:?}",
+                row.posted_name
+            );
+            assert!(
+                message.contains(GROUP),
+                "case {case:?}: expected the refusal to name the feature group {GROUP:?}, got \
+                 {message:?}"
+            );
+        }
+
+        // The ONLINE record: the refused write left it alone, so it carries no feature of the
+        // reserved name; the accepted write stored the posted feature.
+        let (status, served) = aws.get_record(SEEDED_IDENTIFIER).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the record to be readable, got {status} with {served}"
+        );
+        let held: Vec<String> = record_pairs(&served)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            held.contains(&row.posted_name.to_owned()),
+            !row.refused,
+            "case {case:?}: expected the record to hold {:?} only when the write was served, \
+             got {held:?}",
+            row.posted_name
+        );
+
+        // The OFFLINE store: the refused write appended nothing, the accepted one appended one
+        // object — and every object it holds declares each column exactly once.
+        let keys = aws.keys().await;
+        let expected_objects = if row.refused { 1 } else { 2 };
+        assert_eq!(
+            keys.len(),
+            expected_objects,
+            "case {case:?}: expected {expected_objects} replicated object(s), got {keys:?}"
+        );
+        for key in &keys {
+            let columns = object_columns(aws.object(key).await);
+            let mut once = columns.clone();
+            once.sort_unstable();
+            once.dedup();
+            assert_eq!(
+                once.len(),
+                columns.len(),
+                "case {case:?}: expected the object {key} to declare each column once, got \
+                 {columns:?}"
+            );
+            for added in ADDED_COLUMNS {
+                assert_eq!(
+                    columns.iter().filter(|column| *column == added).count(),
+                    1,
+                    "case {case:?}: expected one {added} column in {key}, got {columns:?}"
+                );
+            }
+        }
+        if !row.refused {
+            let appended = keys
+                .iter()
+                .find(|key| !seeded_keys.contains(key))
+                .expect("the accepted write appended an object");
+            let columns = object_columns(aws.object(appended).await);
+            assert!(
+                columns.contains(&row.posted_name.to_owned()),
+                "case {case:?}: expected the appended object to declare the posted feature \
+                 {:?}, got {columns:?}",
+                row.posted_name
             );
         }
     }

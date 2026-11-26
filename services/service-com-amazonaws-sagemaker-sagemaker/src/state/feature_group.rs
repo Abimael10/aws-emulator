@@ -273,7 +273,13 @@ pub fn feature_group_not_updatable(name: &str, status: &str) -> String {
 /// The feature names a `FeatureGroup` may not declare, from `FeatureDefinitions`' own
 /// doc: "FeatureNames cannot be any of the following: is_deleted, write_time,
 /// api_invocation_time" — Feature Store writes those three columns itself.
-pub const RESERVED_FEATURE_NAMES: &[&str] = &["is_deleted", "write_time", "api_invocation_time"];
+///
+/// The SHARED list ([`::service_common::feature_store_groups::RESERVED_FEATURE_NAMES`]):
+/// the FeatureStore Runtime data plane refuses a record that posts a feature value under
+/// one of these names for the same reason this plane refuses a schema that declares one, so
+/// the two planes cannot disagree about which names are reserved.
+pub const RESERVED_FEATURE_NAMES: &[&str] =
+    ::service_common::feature_store_groups::RESERVED_FEATURE_NAMES;
 
 /// A feature group created by `CreateFeatureGroup`, as `DescribeFeatureGroup` replays
 /// it.

@@ -9,7 +9,9 @@
 //!
 //! An entry this data plane cannot write — its `FeatureGroupName` resolves to no feature
 //! group, or its `Record` carries no value for the group's own record-identifier feature,
-//! or an unreadable event time — is reported in `Errors` as that ONE entry's failure and
+//! or an unreadable event time, or a feature value posted under one of the names Feature
+//! Store reserves ([`crate::state::reserved_feature_posted`]) — is reported in `Errors` as
+//! that ONE entry's failure and
 //! leaves every other entry of the batch written, rather than failing the whole call; an
 //! entry whose feature group cannot be found is named there by the ARN a group of that
 //! name would carry. An entry the emulator's bounded store has no room for is reported in

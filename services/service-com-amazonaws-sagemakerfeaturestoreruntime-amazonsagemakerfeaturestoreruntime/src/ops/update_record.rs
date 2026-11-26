@@ -25,7 +25,11 @@
 //! state the instant `ExpiresAt` is — and one that does not is refused with
 //! `ValidationError` (400). A request that states no `TtlDuration` needs no `EventTime`,
 //! whatever TTL the record or its feature group already stands under, because the expiry
-//! is then re-derived from the event time the record keeps.
+//! is then re-derived from the event time the record keeps. A posted feature value under
+//! one of the three names Feature Store RESERVES — the columns it adds to every offline
+//! record, which no feature group may declare
+//! ([`crate::state::reserved_feature_posted`]) — names no feature of the group and is
+//! refused with `ValidationError` (400), exactly as a whole-record write refuses it.
 //!
 //! This is the one operation that GROWS a stored record — a posted feature the record
 //! does not carry yet is appended, where `PutRecord` replaces a record's feature values
@@ -274,6 +278,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled error instead of applying an update that changes nothing.
         if input.features.is_empty() {
             return Err(validation("Features must carry at least one FeatureValue"));
+        }
+
+        // The rule every whole-record write of this plane reads a posted record by, applied
+        // to the features an update posts: a feature group cannot declare a feature named
+        // after one of the columns Feature Store adds to every offline row, so a value
+        // posted under one of those names belongs to no feature of this group and the
+        // update is refused rather than merged into the record (and rather than appended to
+        // the OfflineStore as a second column of that name).
+        if let Some(name) = crate::state::reserved_feature_posted(&input.features) {
+            let message = crate::state::reserved_feature_name("Features", &definition.name, name);
+            return Err(validation(message));
         }
 
         // One value per feature name ([`crate::state::held_feature_values`]): `Features`

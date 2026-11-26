@@ -26,9 +26,16 @@
 //! the Apache implementation of the format through its row-group writer rather than
 //! assembled here — so what lands in the bucket is a file any Parquet reader reads. Its
 //! columns are the record's own features plus the three Feature Store adds to every offline
-//! record: `write_time`, `api_invocation_time` and `is_deleted` — the three names a feature
-//! group may therefore not declare ("FeatureNames cannot be any of the following:
-//! is_deleted, write_time, api_invocation_time", `FeatureDefinitions`).
+//! record: `write_time`, `api_invocation_time` and `is_deleted` ([`ADDED_COLUMNS`]) — the
+//! three names a feature group may therefore not declare ("FeatureNames cannot be any of the
+//! following: is_deleted, write_time, api_invocation_time", `FeatureDefinitions`).
+//!
+//! That rule is ENFORCED where a record is read rather than assumed here: every write of this
+//! data plane refuses a feature value posted under one of those three names
+//! ([`crate::state::reserved_feature_posted`]), so no row reaching this module carries a
+//! feature of a reserved name — and a row that did would be reported as bytes that could not
+//! be laid out ([`record_parquet_bytes`]) rather than written as an object declaring one
+//! column twice.
 //!
 //! Nothing here holds this service's store guard: the permission question and the write are
 //! both awaited.
@@ -55,6 +62,15 @@ const API_INVOCATION_TIME_COLUMN: &str = "api_invocation_time";
 
 /// The column carrying whether the row is a delete marker; see [`WRITE_TIME_COLUMN`].
 const IS_DELETED_COLUMN: &str = "is_deleted";
+
+/// The three columns Feature Store adds to every offline record, as this module lays them
+/// out: the two timestamps of the write and the delete marker.
+///
+/// They are also exactly the names a feature group may not declare
+/// ([`::service_common::feature_store_groups::RESERVED_FEATURE_NAMES`], the list the whole
+/// Feature Store reads that rule from), which is what keeps a feature column from colliding
+/// with one of these.
+const ADDED_COLUMNS: [&str; 3] = [WRITE_TIME_COLUMN, API_INVOCATION_TIME_COLUMN, IS_DELETED_COLUMN];
 
 /// One row the offline store holds: the feature values the write carried, as text, the
 /// event time they belong to, and whether the row is a DELETE MARKER.
@@ -276,13 +292,29 @@ pub async fn replicate(
 /// Every feature column is a UTF-8 string, which is what this data plane holds a feature
 /// value as (`ValueAsString`), and the three columns Feature Store adds are the two
 /// timestamps of the write and the delete marker. `Err` carries what the Parquet writer
-/// refused, which the caller reports rather than writing a truncated object.
+/// refused, or the collision below, which the caller reports rather than writing an object
+/// no reader can make sense of.
 pub fn record_parquet_bytes(
     group_name: &str,
     record: &OfflineRecord,
     written_at: SystemTime,
 ) -> Result<Vec<u8>, String> {
-    let mut fields = Vec::with_capacity(record.features.len() + 3);
+    // A feature column named after one of the three added ones would make the schema declare
+    // that column TWICE, leaving the ingested value and the column Feature Store writes
+    // indistinguishable by name. No write of this data plane can post such a feature — each
+    // refuses the name before the record is read (`crate::state::reserved_feature_posted`) —
+    // so this states the premise the layout rests on instead of relying on it.
+    if let Some((name, _)) = record
+        .features
+        .iter()
+        .find(|(name, _)| ADDED_COLUMNS.contains(&name.as_str()))
+    {
+        return Err(format!(
+            "the row of feature group '{group_name}' carries the feature '{name}', which is \
+             the name of a column Feature Store adds to every offline record"
+        ));
+    }
+    let mut fields = Vec::with_capacity(record.features.len() + ADDED_COLUMNS.len());
     for (name, _) in &record.features {
         fields.push(::std::sync::Arc::new(text_column(name)?));
     }
@@ -598,6 +630,82 @@ mod tests {
                 read, expected,
                 "case {case:?}: expected {expected:?}, got {read:?}"
             );
+        }
+    }
+
+    /// RULE: the three columns this module adds to every row are exactly the names a feature
+    /// group may not declare, which is the ONE list the whole Feature Store reads that rule
+    /// from — so neither side can name a column the other does not reserve.
+    #[test]
+    fn the_added_columns_are_the_names_a_feature_group_may_not_declare() {
+        let mut added = ADDED_COLUMNS.to_vec();
+        added.sort_unstable();
+        let mut reserved =
+            ::service_common::feature_store_groups::RESERVED_FEATURE_NAMES.to_vec();
+        reserved.sort_unstable();
+        assert_eq!(
+            added, reserved,
+            "case the added columns: expected the reserved names {reserved:?}, got {added:?}"
+        );
+    }
+
+    /// RULE: a row whose features would collide with one of the added columns lays out as NO
+    /// object: the schema of an offline object declares each column exactly once, so a
+    /// colliding row is reported rather than written.
+    ///
+    /// The rows differ along WHICH added column the feature is named after and whether the
+    /// name merely resembles one (the control rows, which do lay out).
+    #[test]
+    fn a_row_colliding_with_an_added_column_lays_out_as_no_object() {
+        // (case, the feature's name, whether the row lays out at all)
+        let rows: [(&str, &str, bool); 6] = [
+            ("a feature named after the delete marker", IS_DELETED_COLUMN, false),
+            ("a feature named after the write time", WRITE_TIME_COLUMN, false),
+            (
+                "a feature named after the API invocation time",
+                API_INVOCATION_TIME_COLUMN,
+                false,
+            ),
+            ("a name that merely contains one", "is_deleted_by", true),
+            ("a name that merely starts like one", "write_times", true),
+            ("an ordinary feature", "city", true),
+        ];
+        for (case, name, lays_out) in rows {
+            let record = OfflineRecord::of(
+                &definition(),
+                &[
+                    feature("customer_id", "C1"),
+                    feature("event_time", "2026-06-01T00:00:00Z"),
+                    feature(name, "whatever"),
+                ],
+            );
+            let laid_out = record_parquet_bytes("customers", &record, SystemTime::UNIX_EPOCH);
+            assert_eq!(
+                laid_out.is_ok(),
+                lays_out,
+                "case {case:?} ({name}): expected lays_out={lays_out}, got {laid_out:?}"
+            );
+            if let Ok(bytes) = laid_out {
+                let reader =
+                    ::parquet::file::reader::SerializedFileReader::new(::bytes::Bytes::from(bytes))
+                        .expect("the written object is a Parquet file");
+                let columns: Vec<String> = reader
+                    .metadata()
+                    .file_metadata()
+                    .schema_descr()
+                    .columns()
+                    .iter()
+                    .map(|column| column.name().to_string())
+                    .collect();
+                let mut unique = columns.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                assert_eq!(
+                    unique.len(),
+                    columns.len(),
+                    "case {case:?} ({name}): expected each column declared once, got {columns:?}"
+                );
+            }
         }
     }
 }
