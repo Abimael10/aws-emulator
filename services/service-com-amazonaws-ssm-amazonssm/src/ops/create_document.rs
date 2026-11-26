@@ -11,8 +11,11 @@
 //! is both its latest and its default one until `UpdateDocument` appends another.
 //!
 //! Everything the response reports beyond the request's own members is derived from the
-//! content that was persisted (`crate::state::parse_document_content`): the schema
-//! version, the description, the parameters, the platform types and the Sha256 hash.
+//! content that was persisted (`crate::state::parse_supplied_document_content`): the schema
+//! version, the description, the parameters, the platform types and the Sha256 hash. That
+//! same read is what holds the body to the schema it declares, so a body missing a member
+//! its schema version makes mandatory is refused `InvalidDocumentContent` and no document
+//! is minted for it.
 //! The document is minted `Creating`, which is the status this call's own response
 //! reports, and the clock owes its move to `Active` from the instant the create completes
 //! ([`crate::state::document_active_due`]), so a read that comes after it reports a
@@ -268,20 +271,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let parsed =
-            crate::state::parse_document_content(&input.content, &document_format, &document_type)
-                .map_err(|rejection| match rejection {
-                    crate::state::ContentRejection::Content(why) => {
-                        CreateDocumentErrorModeled::InvalidDocumentContent(InvalidDocumentContent {
-                            message: Some(why),
-                        })
-                    }
-                    crate::state::ContentRejection::SchemaVersion(why) => {
-                        CreateDocumentErrorModeled::InvalidDocumentSchemaVersion(
-                            InvalidDocumentSchemaVersion { message: Some(why) },
-                        )
-                    }
-                })?;
+        let parsed = crate::state::parse_supplied_document_content(
+            &input.content,
+            &document_format,
+            &document_type,
+        )
+        .map_err(|rejection| match rejection {
+            crate::state::ContentRejection::Content(why) => {
+                CreateDocumentErrorModeled::InvalidDocumentContent(InvalidDocumentContent {
+                    message: Some(why),
+                })
+            }
+            crate::state::ContentRejection::SchemaVersion(why) => {
+                CreateDocumentErrorModeled::InvalidDocumentSchemaVersion(
+                    InvalidDocumentSchemaVersion { message: Some(why) },
+                )
+            }
+        })?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();

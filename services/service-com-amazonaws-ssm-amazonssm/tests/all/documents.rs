@@ -44,6 +44,28 @@ const RESERVED_PREFIXES: &[&str] = &[
 /// KB").
 const MAX_CONTENT: usize = 64 * 1024;
 
+/// The smallest body a `document_type` document on `schema_version` is accepted with: the
+/// schema version itself, plus the top-level member that generation of the schema makes
+/// mandatory for a document whose body declares what Systems Manager runs.
+///
+/// Source: the document schemas of the AWS Systems Manager User Guide ("Systems Manager
+/// document schemas and features", and "Creating SSM document content" for each schema's
+/// top-level elements) — a command document, an inventory policy document, an Automation
+/// runbook and a change template declare their steps as `mainSteps` in the 2.x and 0.3
+/// schemas and as `runtimeConfig` in the 1.2 one, while a session document and a
+/// Distributor package declare no steps at all. A body on a schema version its type does
+/// not support carries whatever that version would require, so the schema-version refusal
+/// is what such a row observes.
+fn minimal_body(document_type: &str, schema_version: &str) -> String {
+    const STEP_TYPES: &[&str] = &["Command", "Policy", "Automation", "Automation.ChangeTemplate"];
+    let steps = match (STEP_TYPES.contains(&document_type), schema_version) {
+        (true, "1.2") => ", \"runtimeConfig\": {\"aws:runShellScript\": {\"properties\": []}}",
+        (true, "0.3" | "2.0" | "2.2") => ", \"mainSteps\": []",
+        _ => "",
+    };
+    format!("{{\"schemaVersion\": \"{schema_version}\"{steps}}}")
+}
+
 /// A `Command` document: schema version 2.2, two parameters (a scalar default and a
 /// list default), and one step whose precondition restricts it to Linux.
 const COMMAND_JSON: &str = r#"{
@@ -580,7 +602,13 @@ async fn a_name_a_region_already_holds_is_refused() {
         // for content validation and the check below shows nothing was replaced.
         let (status, response) = create(
             &router,
-            &json!({ "Name": name, "Content": "{\"schemaVersion\": \"2.2\"}" }),
+            &json!({
+                "Name": name,
+                "Content": "{\"schemaVersion\": \"2.2\", \"description\": \"another \
+                             body\", \"mainSteps\": [{\"action\": \"aws:runShellScript\", \
+                             \"name\": \"run\", \"inputs\": {\"runCommand\": \
+                             [\"echo other\"]}}]}",
+            }),
         )
         .await;
         assert_eq!(
@@ -730,7 +758,7 @@ async fn an_unsupported_schema_version_is_refused() {
         for version in *supported {
             minted += 1;
             let name = format!("SchemaDocument{minted}");
-            let content = format!("{{\"schemaVersion\": \"{version}\"}}");
+            let content = minimal_body(document_type, version);
             let case = format!("{document_type} {version}");
             let created = create_ok(
                 &router,
@@ -747,7 +775,7 @@ async fn an_unsupported_schema_version_is_refused() {
         for version in *unsupported {
             minted += 1;
             let name = format!("SchemaDocument{minted}");
-            let content = format!("{{\"schemaVersion\": \"{version}\"}}");
+            let content = minimal_body(document_type, version);
             let case = format!("{document_type} {version}");
             let (status, response) = create(
                 &router,
@@ -785,10 +813,18 @@ async fn an_unsupported_schema_version_is_refused() {
 #[tokio::test]
 async fn content_past_the_published_size_limit_is_refused() {
     let router = router();
-    let envelope = "{\"schemaVersion\": \"2.2\", \"description\": \"\"}";
+    // A body a schema 2.2 `Command` document is accepted with — its `mainSteps` included —
+    // whose `description` is what the padding below grows, so size is the only thing the
+    // rows differ along.
+    let envelope = concat!(
+        "{\"schemaVersion\": \"2.2\", \"mainSteps\": [{\"action\": \"aws:runShellScript\", ",
+        "\"name\": \"run\", \"inputs\": {\"runCommand\": [\"echo hi\"]}}], ",
+        "\"description\": \"\"}"
+    );
     let padding = |total: usize| {
         let mut content = String::with_capacity(total);
-        content.push_str("{\"schemaVersion\": \"2.2\", \"description\": \"");
+        // Everything up to the opening quote of the description, which the padding fills.
+        content.push_str(&envelope[..envelope.len() - 2]);
         content.push_str(&"p".repeat(total - envelope.len()));
         content.push_str("\"}");
         content

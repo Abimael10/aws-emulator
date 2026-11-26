@@ -2108,6 +2108,11 @@ pub struct ParsedDocumentContent {
     /// steps a command's invocation runs, which `GetCommandInvocation`'s `PluginName`
     /// names one of ([`declared_step_names`]).
     pub step_names: Vec<String>,
+    /// The top-level member the content declares its steps in — [`DOCUMENT_MAIN_STEPS`] in
+    /// a schema 2.x or 0.3 body, [`DOCUMENT_RUNTIME_CONFIG`] in a schema 1.2 one — or
+    /// `None` when it declares neither, which is what a body missing the member its schema
+    /// requires is refused for ([`ParsedDocumentContent::missing_steps_member`]).
+    pub steps_member: Option<String>,
 }
 
 /// The documented size bound, applied to content of EVERY format: "The content of the

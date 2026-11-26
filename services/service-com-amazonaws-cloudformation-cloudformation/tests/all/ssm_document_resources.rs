@@ -28,8 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dynamic_references::ssm;
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_blocks,
-    xml_text,
+    call, create_stack, describe_stack, member, resource_event_reason, resource_event_statuses,
+    router, wait_for_the_transition, xml_blocks, xml_text,
 };
 
 /// How long a case waits for a stack operation to settle, and for an automation to reach its
@@ -535,6 +535,106 @@ async fn a_changed_declaration_adds_a_version_to_the_document_in_place() {
         Some("1"),
         "case {case:?}: expected the update to have added a version, got {described}"
     );
+}
+
+/// RULE (the refusal half): a declaration whose `Content` is not a body Systems Manager
+/// accepts for the declared document type is refused by that service, so the resource goes
+/// `CREATE_FAILED` carrying that service's own sentence, the stack rolls back to
+/// `ROLLBACK_COMPLETE`, and no document exists afterwards under the name the stack would
+/// have published.
+///
+/// The rows differ along the schema generation whose mandatory steps member the body omits —
+/// `mainSteps` for a schema 2.2 command document and for a schema 0.3 runbook,
+/// `runtimeConfig` for a schema 1.2 command document — because what the stack does with a
+/// refused create is the same whichever member the body is missing.
+#[tokio::test]
+async fn a_body_systems_manager_refuses_fails_the_resource_and_rolls_the_stack_back() {
+    // (case, stack, the document the declaration names, its type, the body, the member
+    // Systems Manager reports missing)
+    let rows: [(&str, &str, &str, &str, Value, &str); 3] = [
+        (
+            "a schema 2.2 command body with no mainSteps",
+            "ssm-document-refused-command",
+            "refused-command-document",
+            "Command",
+            json!({"schemaVersion": "2.2", "description": "no mainSteps here"}),
+            "mainSteps",
+        ),
+        (
+            "a schema 1.2 command body with no runtimeConfig",
+            "ssm-document-refused-plugin",
+            "refused-plugin-document",
+            "Command",
+            json!({"schemaVersion": "1.2", "description": "no runtimeConfig here"}),
+            "runtimeConfig",
+        ),
+        (
+            "a schema 0.3 runbook with no mainSteps",
+            "ssm-document-refused-runbook",
+            "refused-runbook-document",
+            "Automation",
+            json!({"schemaVersion": "0.3", "description": "nothing to run"}),
+            "mainSteps",
+        ),
+    ];
+
+    for (case, stack, name, document_type, content, member) in rows {
+        let router = router();
+        let template = json!({
+            "Resources": {
+                "Doc": {
+                    "Type": "AWS::SSM::Document",
+                    "Properties": {
+                        "Name": name,
+                        "DocumentType": document_type,
+                        "Content": content,
+                    }
+                }
+            },
+            "Outputs": {"DocumentName": {"Value": {"Ref": "Doc"}}}
+        })
+        .to_string();
+        let (status, body) = create_stack(&router, stack, &template, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateStack, got {status} with {body}"
+        );
+        let settled = settled_status(case, &router, stack).await;
+        assert_eq!(
+            settled, "ROLLBACK_COMPLETE",
+            "case {case:?}: expected the stack to roll back, got {settled:?}"
+        );
+
+        // The resource the refusal was about failed, and its event carries the sentence the
+        // owning service answered.
+        let statuses = resource_event_statuses(&router, case, stack, "Doc").await;
+        assert!(
+            statuses.iter().any(|status| status == "CREATE_FAILED"),
+            "case {case:?}: expected a CREATE_FAILED event for the document, got {statuses:?}"
+        );
+        let reason = resource_event_reason(&router, stack, "Doc", "CREATE_FAILED").await;
+        let sentence = format!("Missing \"{member}\" in the document.");
+        assert!(
+            reason.contains(&sentence),
+            "case {case:?}: expected the reason to carry {sentence:?}, got {reason:?}"
+        );
+
+        // Nothing is left behind: the name resolves to no document at all.
+        assert!(
+            held_document(&router, name).await.is_none(),
+            "case {case:?}: expected Systems Manager to hold no document {name:?}"
+        );
+        let (status, refused) = ssm(&router, "GetDocument", &json!({"Name": name})).await;
+        assert_eq!(
+            (status, refused["Message"].as_str()),
+            (
+                400,
+                Some(format!("Document with name {name} does not exist.").as_str())
+            ),
+            "case {case:?}: expected the read of {name:?} to be refused as a document that \
+             does not exist, got {status} {refused}"
+        );
+    }
 }
 
 /// The state Amazon EC2 reports for one instance, read through that service's own

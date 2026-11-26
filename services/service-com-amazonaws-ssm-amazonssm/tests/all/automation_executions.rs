@@ -1461,13 +1461,15 @@ async fn resolving_more_than_the_input_budget_allows_fails_the_step() {
 async fn a_runbook_with_no_walkable_steps_is_refused_at_the_start() {
     let (router, engine) = service();
 
-    // One row per way the content declares no walk: no steps at all, and flow members
-    // naming a step the runbook does not declare.
+    // One row per way the content declares no walk: steps that declare no step to run, and
+    // flow members naming a step the runbook does not declare. (A body that declares no
+    // `mainSteps` member at all is refused by `CreateDocument` itself, so no runbook of that
+    // shape ever reaches a start.)
     let rows: Vec<(&str, Value, &str)> = vec![
         (
-            "a runbook with no mainSteps",
-            json!({"schemaVersion": "0.3", "description": "Nothing to run."}),
-            "mainSteps",
+            "a runbook whose mainSteps declare no step",
+            json!({"schemaVersion": "0.3", "description": "Nothing to run.", "mainSteps": []}),
+            "no steps to run",
         ),
         (
             "a runbook whose nextStep names no step",

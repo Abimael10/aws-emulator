@@ -310,6 +310,65 @@ pub(super) fn declared_parameters(
     Ok((parameters, constraints))
 }
 
+/// The top-level member a schema 2.x or 0.3 document declares its steps in: the steps
+/// Systems Manager runs for that document, each with its own `name` (the `mainSteps`
+/// top-level element of those schemas, "Systems Manager document schemas and features" in
+/// the AWS Systems Manager User Guide).
+pub const DOCUMENT_MAIN_STEPS: &str = "mainSteps";
+
+/// The top-level member the schema 1.2 generation declares what a document runs in: the
+/// plugin entries, whose keys are the plugin names (the `runtimeConfig` top-level element
+/// of that schema).
+pub const DOCUMENT_RUNTIME_CONFIG: &str = "runtimeConfig";
+
+/// The document types whose body declares WHAT SYSTEMS MANAGER RUNS, so a body of one has
+/// to carry the steps member its schema version names ([`required_steps_member`]).
+///
+/// Source: the per-type document schemas of the AWS Systems Manager User Guide ("Systems
+/// Manager document schemas and features", and "Creating SSM document content" for the
+/// top-level elements of each schema): a command document, an inventory policy document, an
+/// Automation runbook and a change template each declare the steps to run, while a session
+/// document declares the session it opens (`sessionType`) and a Distributor package declares
+/// the packages it installs, so neither of those carries steps at all. Every other document
+/// type carries no Systems Manager document schema ([`supported_schema_versions`]) and so
+/// nothing this service requires of its body.
+pub const STEP_DOCUMENT_TYPES: &[&str] = &[
+    "Command",
+    "Policy",
+    "Automation",
+    "Automation.ChangeTemplate",
+];
+
+/// The top-level member a document of `document_type` on `schema_version` MUST declare, or
+/// `None` when that pair requires none.
+///
+/// Systems Manager validates a document body against the schema its `schemaVersion`
+/// declares, and the member a step document ([`STEP_DOCUMENT_TYPES`]) declares its steps in
+/// is mandatory in every generation of that schema: the 2.x and 0.3 schemas declare them as
+/// [`DOCUMENT_MAIN_STEPS`] and the 1.2 schema as [`DOCUMENT_RUNTIME_CONFIG`]. A body that
+/// declares no such member is what `InvalidDocumentContent` reports
+/// ([`missing_document_member_message`]).
+pub fn required_steps_member(document_type: &str, schema_version: &str) -> Option<&'static str> {
+    if !STEP_DOCUMENT_TYPES.contains(&document_type) {
+        return None;
+    }
+    match schema_version {
+        "0.3" | "2.0" | "2.2" => Some(DOCUMENT_MAIN_STEPS),
+        "1.2" => Some(DOCUMENT_RUNTIME_CONFIG),
+        _ => None,
+    }
+}
+
+/// How this service states that a document body declares no member its schema requires.
+///
+/// `InvalidDocumentContent` is "the content for the document isn't valid" (its own
+/// documentation), and the sentence Systems Manager answers a body missing a mandatory
+/// top-level member with is fixed text naming that MEMBER — `Missing "mainSteps" in the
+/// document.` — with nothing of the request in it.
+pub fn missing_document_member_message(member: &str) -> String {
+    format!("Missing \"{member}\" in the document.")
+}
+
 /// The names of the steps `content` declares, in its own order.
 ///
 /// A schema 2.x document declares its steps as `mainSteps`, each with its own `name`
@@ -317,13 +376,15 @@ pub(super) fn declared_parameters(
 /// plugin entries, whose keys are the plugin names. A `GetCommandInvocation` asks for one
 /// step's detailed results by that name, so both spellings are read.
 pub(super) fn declared_step_names(map: &::yaml_rust2::yaml::Hash) -> Vec<String> {
-    if let Some(steps) = mapping_get(map, "mainSteps").and_then(::yaml_rust2::Yaml::as_vec) {
+    if let Some(steps) =
+        mapping_get(map, DOCUMENT_MAIN_STEPS).and_then(::yaml_rust2::Yaml::as_vec)
+    {
         return steps
             .iter()
             .filter_map(|step| mapping_get(step.as_hash()?, "name").and_then(scalar_string))
             .collect();
     }
-    mapping_get(map, "runtimeConfig")
+    mapping_get(map, DOCUMENT_RUNTIME_CONFIG)
         .and_then(::yaml_rust2::Yaml::as_hash)
         .map(|plugins| {
             plugins
@@ -432,7 +493,52 @@ pub fn parse_document_content(
         parameter_constraints,
         platform_types: document_platforms::declared_platform_types(map),
         step_names: declared_step_names(map),
+        steps_member: [DOCUMENT_MAIN_STEPS, DOCUMENT_RUNTIME_CONFIG]
+            .into_iter()
+            .find(|member| mapping_get(map, member).is_some())
+            .map(str::to_string),
     })
+}
+
+/// What the content a CALL supplies declares, or why it is not a document body this service
+/// accepts from the caller.
+///
+/// Everything [`parse_document_content`] derives, plus the requirement that the body declare
+/// the member its schema version makes mandatory ([`required_steps_member`]): Systems
+/// Manager validates the body a `CreateDocument` or an `UpdateDocument` carries against the
+/// schema that body declares, and refuses one missing a mandatory member with
+/// `InvalidDocumentContent` rather than registering a document nothing can run.
+///
+/// The one entry point for caller-supplied content, so a create and an update hold a body to
+/// the same rules; this crate's own published bodies are read through
+/// [`parse_document_content`], which derives what a read reports without re-validating a
+/// body no request supplied.
+pub fn parse_supplied_document_content(
+    content: &str,
+    format: &str,
+    document_type: &str,
+) -> Result<ParsedDocumentContent, ContentRejection> {
+    let parsed = parse_document_content(content, format, document_type)?;
+    if let Some(member) = parsed.missing_steps_member(document_type) {
+        return Err(ContentRejection::Content(missing_document_member_message(
+            member,
+        )));
+    }
+    Ok(parsed)
+}
+
+impl ParsedDocumentContent {
+    /// The steps member a body of a `document_type` document has to declare and this body
+    /// does not ([`required_steps_member`]), or `None` when it declares the member its
+    /// schema version requires.
+    ///
+    /// A body that declares the OTHER generation's steps member still declares none of the
+    /// one its own schema version names, so it is missing it: the schema the body declares
+    /// is what decides which member it has to carry.
+    pub fn missing_steps_member(&self, document_type: &str) -> Option<&'static str> {
+        let required = required_steps_member(document_type, self.schema_version.as_deref()?)?;
+        (self.steps_member.as_deref() != Some(required)).then_some(required)
+    }
 }
 
 // ---------------------------------------------------------------------------

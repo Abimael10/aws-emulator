@@ -13,8 +13,11 @@
 //! reports the default one.
 //!
 //! Everything the new version reports beyond the request's own members is derived from the
-//! content it persisted (`crate::state::parse_document_content`): the schema version, the
-//! description, the parameters, the platform types and the Sha256 hash. A version is
+//! content it persisted (`crate::state::parse_supplied_document_content`): the schema
+//! version, the description, the parameters, the platform types and the Sha256 hash. That
+//! same read holds the new body to the schema it declares, so a version whose body is
+//! missing a member its schema version makes mandatory is refused `InvalidDocumentContent`
+//! and nothing is appended. A version is
 //! minted `Updating`, which is the status this call's own response reports, and the clock
 //! owes its move to `Active` from the instant the update completes
 //! ([`crate::state::document_active_due`]), so a read that comes after it reports a
@@ -310,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The content is parsed in the format this version declares, against the type the
         // document was created as: `UpdateDocument` carries no `DocumentType`, so a
         // version never changes which schema versions the content may declare.
-        let parsed = crate::state::parse_document_content(
+        let parsed = crate::state::parse_supplied_document_content(
             &input.content,
             &document_format,
             &record.document_type,

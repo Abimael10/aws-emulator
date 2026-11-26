@@ -256,7 +256,10 @@ async fn a_schema_1_2_plugin_is_the_step_a_send_reports() {
 /// The rows differ along the shape of the content being converted — one scalar, a nested
 /// mapping, a sequence of scalars, a sequence of mappings with a sequence inside, and
 /// values that are not strings — rather than along the one document a recorded unit
-/// created.
+/// created. Every row also declares the `mainSteps` a schema 2.2 `Command` body has to
+/// carry, so each one is a document this service accepts; the step converts identically in
+/// all of them, which is what makes the shape under test the only difference between the
+/// rows.
 #[tokio::test]
 async fn a_json_document_asked_for_as_yaml_is_converted_in_one_style() {
     let router = router();
@@ -265,20 +268,30 @@ async fn a_json_document_asked_for_as_yaml_is_converted_in_one_style() {
         (
             "one string scalar",
             "YamlScalarDocument",
-            r#"{"schemaVersion": "2.2"}"#,
-            "---\nschemaVersion: \"2.2\"\n",
+            r#"{"schemaVersion": "2.2", "mainSteps": [{"action": "aws:runShellScript",
+                "name": "run", "inputs": {"runCommand": ["echo hello"]}}]}"#,
+            "---\nschemaVersion: \"2.2\"\nmainSteps:\n- action: \"aws:runShellScript\"\n  \
+             name: \"run\"\n  inputs:\n    runCommand:\n    - \"echo hello\"\n",
         ),
         (
             "a nested mapping",
             "YamlMappingDocument",
-            r#"{"schemaVersion": "2.2", "parameters": {"Message": {"type": "String"}}}"#,
-            "---\nschemaVersion: \"2.2\"\nparameters:\n  Message:\n    type: \"String\"\n",
+            r#"{"schemaVersion": "2.2", "parameters": {"Message": {"type": "String"}},
+                "mainSteps": [{"action": "aws:runShellScript", "name": "run",
+                "inputs": {"runCommand": ["echo hello"]}}]}"#,
+            "---\nschemaVersion: \"2.2\"\nparameters:\n  Message:\n    type: \"String\"\n\
+             mainSteps:\n- action: \"aws:runShellScript\"\n  name: \"run\"\n  inputs:\n    \
+             runCommand:\n    - \"echo hello\"\n",
         ),
         (
             "a sequence of scalars",
             "YamlSequenceDocument",
-            r#"{"schemaVersion": "2.2", "commands": ["echo one", "echo two"]}"#,
-            "---\nschemaVersion: \"2.2\"\ncommands:\n- \"echo one\"\n- \"echo two\"\n",
+            r#"{"schemaVersion": "2.2", "commands": ["echo one", "echo two"],
+                "mainSteps": [{"action": "aws:runShellScript", "name": "run",
+                "inputs": {"runCommand": ["echo hello"]}}]}"#,
+            "---\nschemaVersion: \"2.2\"\ncommands:\n- \"echo one\"\n- \"echo two\"\n\
+             mainSteps:\n- action: \"aws:runShellScript\"\n  name: \"run\"\n  inputs:\n    \
+             runCommand:\n    - \"echo hello\"\n",
         ),
         (
             "a sequence of mappings with a sequence inside",
@@ -294,9 +307,13 @@ async fn a_json_document_asked_for_as_yaml_is_converted_in_one_style() {
             "values that are not strings",
             "YamlScalarsDocument",
             r#"{"schemaVersion": "2.2", "parameters": {"Count": {"minItems": 1,
-                "required": true, "default": null}}}"#,
+                "required": true, "default": null}},
+                "mainSteps": [{"action": "aws:runShellScript", "name": "run",
+                "inputs": {"runCommand": ["echo hello"]}}]}"#,
             "---\nschemaVersion: \"2.2\"\nparameters:\n  Count:\n    minItems: 1\n    \
-             required: true\n    default: null\n",
+             required: true\n    default: null\nmainSteps:\n- action: \
+             \"aws:runShellScript\"\n  name: \"run\"\n  inputs:\n    runCommand:\n    - \
+             \"echo hello\"\n",
         ),
     ];
     for (case, name, content, expected) in rows {
@@ -369,7 +386,9 @@ async fn a_json_document_asked_for_as_yaml_is_converted_in_one_style() {
 async fn a_version_name_no_version_carries_is_a_missing_document() {
     let router = router();
     let name = "VersionNameRefusalDocument";
-    let content = r#"{"schemaVersion": "2.2", "description": "versioned"}"#;
+    let content = r#"{"schemaVersion": "2.2", "description": "versioned",
+        "mainSteps": [{"action": "aws:runShellScript", "name": "run",
+        "inputs": {"runCommand": ["echo hello"]}}]}"#;
     create_ok(
         &router,
         "a document with one named version",
@@ -455,7 +474,9 @@ async fn a_version_name_no_version_carries_is_a_missing_document() {
 #[tokio::test]
 async fn a_minted_document_version_is_active_on_the_next_read() {
     let router = router();
-    let command = r#"{"schemaVersion": "2.2", "description": "mint"}"#;
+    let command = r#"{"schemaVersion": "2.2", "description": "mint",
+        "mainSteps": [{"action": "aws:runShellScript", "name": "run",
+        "inputs": {"runCommand": ["echo hello"]}}]}"#;
     let automation = r#"{"schemaVersion": "0.3", "description": "mint",
         "mainSteps": [{"name": "wait", "action": "aws:sleep",
         "inputs": {"Duration": "PT0S"}}]}"#;
