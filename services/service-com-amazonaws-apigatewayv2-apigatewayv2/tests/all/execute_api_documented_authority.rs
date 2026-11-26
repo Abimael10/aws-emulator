@@ -211,15 +211,18 @@ async fn the_published_address_serves_the_documented_execute_api_authority() {
     let deployed = deployed_api(&emulator, case, "documented-authority").await;
     let (authority, published_path) = announced_parts(&deployed.api_endpoint);
 
-    // The published address is an address OF THIS EMULATOR: the api's own `execute-api` host
-    // in the zone RFC 6761 reserves for the loopback interface this emulator's listeners are
-    // bound on, carrying the port the socket landed on, so a client dials it as it stands.
+    // The published address is an address OF THIS EMULATOR: the address the socket serving the
+    // api's data plane landed on, carrying the port it answers on, with the api named behind
+    // the reserved data-plane path — so a client dials it as it stands.
     assert_eq!(
-        authority,
-        format!(
-            "{}.execute-api.{REGION}.localhost:{}",
-            deployed.api_id,
-            crate::published_invoke_socket_front_door::dialable_port(case, &authority)
+        (authority.as_str(), published_path.as_str()),
+        (
+            format!(
+                "127.0.0.1:{}",
+                crate::published_invoke_socket_front_door::dialable_port(case, &authority)
+            )
+            .as_str(),
+            format!("/_aws/execute-api/{}", deployed.api_id).as_str()
         ),
         "case {case:?}: the published endpoint must name the api on an address of this \
          emulator, got {:?}",
@@ -526,18 +529,19 @@ async fn the_published_endpoint_is_the_one_every_reader_reports() {
         deployed.api_id,
         "case {case:?}: GetApi must report the api the create minted, got {fetched}"
     );
-    // And the value is a URL with an authority a client can dial that NAMES the api in its
-    // leading label, which is what makes the documented addressing above reachable at all.
+    // And the value is a URL whose authority a client can dial as it stands, with the api
+    // NAMED in the path under it, which is what makes the addressing above reachable at all.
     let (authority, path) = announced_parts(&deployed.api_endpoint);
     assert!(
-        authority.starts_with(&format!("{}.", deployed.api_id)) && authority.contains(':'),
-        "case {case:?}: the published endpoint must name the api on an address this emulator \
-         answers on, got {:?}",
+        authority.starts_with("127.0.0.1:") && authority.contains(':'),
+        "case {case:?}: the published endpoint must name an address this emulator answers on, \
+         got {:?}",
         deployed.api_endpoint
     );
     assert_eq!(
-        path, "",
-        "case {case:?}: the published endpoint carries no path of its own, so appending the \
+        path,
+        format!("/_aws/execute-api/{}", deployed.api_id),
+        "case {case:?}: the published endpoint names the api in its path, so appending the \
          stage name to it is the whole invoke path, got {:?}",
         deployed.api_endpoint
     );

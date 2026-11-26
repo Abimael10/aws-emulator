@@ -18,15 +18,15 @@
 //! canonical field-name spelling this address exists for is written.
 //!
 //! What is this socket's own is WHICH requests it answers for: the HTTP apis of this account.
-//! Each is PUBLISHED there under its own `execute-api` AUTHORITY
-//! ([`crate::state::invoke_plane_transport::announced_endpoint`]) —
-//! `{api-id}.execute-api.{region}.{zone}`, the addressing `Api$ApiEndpoint` documents — which
-//! is served by re-addressing such a request onto the api its leading label names
-//! ([`published_target`]), so a client that resolves that name to this address reaches the api
-//! there; and each is served as sent under its own id behind the reserved data-plane marker as
-//! well, which is the path this emulator's front door serves the same api at, so a client that
-//! rewrote an endpoint into a path reaches it too. A request addressing anything else — the
-//! control plane, a host in a zone this plane serves no endpoint in, a
+//! Each is PUBLISHED there under THIS SOCKET'S OWN ADDRESS — the `host:port` the core's
+//! listener landed on — with the api's own id behind the reserved data-plane marker
+//! ([`crate::state::invoke_plane_transport::announced_endpoint`]), which is the path this
+//! emulator's front door serves the same api at, so a client that dialled the published value
+//! names the api in the path and its request goes to the router AS SENT. A request that
+//! carried the api's own `execute-api` HOST instead — the addressing `Api$ApiEndpoint`
+//! documents, which a client that resolves such a name sends — is served by re-addressing it
+//! onto the api its leading label names ([`published_target`]). A request addressing anything
+//! else — the control plane, a host in a zone this plane serves no endpoint in, a
 //! path whose dot segment would resolve out of the plane — is refused here, in the envelope
 //! every answer of this service's data planes carries, and no service is asked about it.
 //! Everything the answer itself is — the stage, the deployment, the route, its authorization
@@ -172,16 +172,15 @@ impl NativeHandler for ApiDataPlaneAddress {
 
 /// Where a request `parts` addresses goes on this address.
 ///
-/// The endpoint published on this socket is the api's OWN `execute-api` authority
-/// ([`crate::state::invoke_plane_transport::announced_endpoint`]), so a client that dialled the
-/// published URL names the api in its `Host` and carries the invoke path alone — the
-/// composition `Api$ApiEndpoint` documents ("the stage name is typically appended to this
-/// URI") — and such a request is RE-ADDRESSED onto the api the host's leading label names, at
-/// the reserved data-plane path this emulator's front door serves the same api at
-/// ([`readdressed`]), so what answers is [`super::invoke`] with the api's stages, routes,
-/// authorizers and integrations — the same answer the front door gives for the same request. A
-/// client that carried the endpoint in the PATH instead, behind that same marker, names the api
-/// there and its request goes to the router AS SENT.
+/// The endpoint published on this socket is this socket's own address with the api behind the
+/// reserved data-plane marker ([`crate::state::invoke_plane_transport::announced_endpoint`]),
+/// so a client that dialled the published URL names the api in its PATH — with the stage name
+/// and route path appended, the composition `Api$ApiEndpoint` documents ("the stage name is
+/// typically appended to this URI") — and such a request goes to the router AS SENT, where
+/// [`super::invoke`] answers it with the api's stages, routes, authorizers and integrations.
+/// A client that carried the api's own `execute-api` HOST instead, which is the addressing AWS
+/// publishes, is RE-ADDRESSED onto the api that host's leading label names, at the same
+/// reserved data-plane path ([`readdressed`]), so it is answered by the same records.
 ///
 /// Refused here, and nothing else is: a request that addresses no api of this plane at all —
 /// neither in its host nor in its path — and one carrying a dot segment, which could resolve
@@ -199,7 +198,7 @@ impl NativeHandler for ApiDataPlaneAddress {
 /// The `Host` ALLOWLIST — the core's DNS-rebinding guard, which the shared endpoint applies to
 /// every request served AS SENT — stays binding on the host-style branch too, through the two
 /// zones that branch admits: the zone AWS ITSELF publishes the api's endpoint in and the
-/// loopback zone this plane announces it in ([`addressed_api_id`],
+/// loopback zone RFC 6761 reserves for the interface the core binds on ([`addressed_api_id`],
 /// `crate::state::serves_execute_api_zone`). No resolver an attacker controls answers for a
 /// name in either — AWS answers for the one, and RFC 6761 reserves the other and every name
 /// under it for the loopback interface — so admitting them widens the set of names that reach
@@ -239,8 +238,8 @@ fn published_target(parts: &::http::request::Parts) -> Addressed {
 /// Narrowed to the zones an api's own `execute-api` host can only lead back to
 /// ([`crate::state::serves_execute_api_zone`]): exactly one Region label, then the zone AWS
 /// publishes that endpoint in or the loopback zone RFC 6761 reserves for the interface the
-/// core binds on — `{api-id}.execute-api.{region}.amazonaws.com`, and the name this plane
-/// ANNOUNCES ([`crate::state::invoke_plane_transport::announced_endpoint`]). Admitting a host
+/// core binds on — `{api-id}.execute-api.{region}.amazonaws.com`, and that same name written
+/// over the zone a resolver answers with this interface. Admitting a host
 /// is admitting a name that may reach this address without the core's `Host` allowlist, and
 /// those are the two zones no resolver somebody else controls can answer for; a name carrying
 /// no Region, a deeper zone, or any other zone is one only such a resolver could point at this
@@ -287,7 +286,7 @@ fn readdressed(api_id: &str, target: &::http::Uri) -> Addressed {
 }
 
 /// Whether `path` addresses an api of this plane: the reserved data-plane marker, the endpoint
-/// label this service announces an api behind
+/// label this service publishes an api behind
 /// ([`crate::state::invoke_plane_transport::announced_endpoint`]), and an api id after it.
 ///
 /// Read with the tree's one reading of a path's segments

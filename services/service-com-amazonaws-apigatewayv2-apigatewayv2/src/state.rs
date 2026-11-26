@@ -4670,12 +4670,34 @@ pub fn emulator_served_api_endpoint(
     served_base: &str,
 ) -> String {
     match reached_emulator_endpoint(parts).or_else(|| served_endpoint_authority(served_base)) {
-        Some(authority) => format!(
-            "{}://{authority}/{LOCAL_ENDPOINT_PREFIX}/{EXECUTE_API_LABEL}/{api_id}",
-            execute_api_scheme(protocol_type)
-        ),
+        Some(authority) => api_data_plane_endpoint(&authority, api_id, protocol_type),
         None => execute_api_endpoint(api_id, region, protocol_type),
     }
+}
+
+/// The URI an api's data plane is reached at ON `authority`: the scheme the api's
+/// `ProtocolType` names ([`execute_api_scheme`]), the address itself, and the api's own id
+/// behind the [`LOCAL_ENDPOINT_PREFIX`] marker — `/_aws/execute-api/{api-id}`.
+///
+/// The ONE place that spells an announced URI over an address of this emulator, so every
+/// address an api is announced on carries the api in the same place: the emulator's own
+/// endpoint ([`emulator_served_api_endpoint`]) and the socket this emulator publishes an HTTP
+/// api's data plane on ([`invoke_plane_transport::announced_endpoint`]) are two such
+/// addresses, and both are served under exactly this path (`crate::service::invoke`,
+/// `crate::service::invoke_plane_socket`).
+///
+/// `authority` is a `host[:port]` a client DIALS AS GIVEN — an address the core reported for
+/// one of its listeners, or the endpoint this request reached — and never a name this emulator
+/// minted: nothing on the machine this emulator runs on resolves a name of this service's own
+/// invention, so a client handed one reaches nothing at all. The api is therefore named in the
+/// PATH, which is the only part of such a URI left to name it, and appending
+/// `/{stageName}/{routePath}` to the value is the complete path to a deployed stage, as the
+/// member that carries it documents.
+pub fn api_data_plane_endpoint(authority: &str, api_id: &str, protocol_type: &str) -> String {
+    format!(
+        "{}://{authority}/{LOCAL_ENDPOINT_PREFIX}/{EXECUTE_API_LABEL}/{api_id}",
+        execute_api_scheme(protocol_type)
+    )
 }
 
 /// The EMULATOR'S OWN endpoint this request reached — an address or a loopback name, which

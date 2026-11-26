@@ -25,25 +25,28 @@
 //! set. A client handed an `ApiEndpoint` on that address reads the media type, the version and
 //! every other field of the answer under the name its specification states.
 //!
-//! ONE socket serves every HTTP api of the account, because the api is named by the HOST: the
-//! endpoint announced on it is the api's own `execute-api` host — the api id, the
-//! `execute-api` label and the api's Region as its three leading labels
-//! ([`crate::state::execute_api_host_in_zone`]) — which is the addressing `Api$ApiEndpoint`
-//! documents, and a request arriving here under it is placed on the api its leading label
-//! names ([`crate::service::invoke_plane_socket`]), exactly as this emulator's front door
-//! places one addressed host-style. The socket is opened by the first api create that needs
-//! one (there is nothing to serve before then) and is never re-opened, so a URL a client is
-//! holding keeps naming the address that serves it; its life is the store's, and dropping the
-//! store closes the port.
+//! ONE socket serves every HTTP api of the account, because the api is named by the PATH: the
+//! endpoint announced on it carries the api's own id behind the reserved data-plane marker
+//! (`/_aws/execute-api/{api-id}`), which is the addressing this emulator's front door serves
+//! an api's data plane at, so a request arriving here is placed on the api its path names and
+//! answered by the same records
+//! ([`crate::service::invoke_plane_socket`]). That socket also answers for the api's own
+//! `execute-api` host for a client that resolves it ([`crate::state::execute_api_host_in_zone`],
+//! the addressing `Api$ApiEndpoint` documents), placing such a request on the api its leading
+//! label names, exactly as the front door does. The socket is opened by the first api create
+//! that needs one (there is nothing to serve before then) and is never re-opened, so a URL a
+//! client is holding keeps naming the address that serves it; its life is the store's, and
+//! dropping the store closes the port.
 //!
-//! The ZONE that host is written in is the one this emulator may announce a name of its own in
-//! (`service_common::data_plane_addressing::announced_zone_of_authority`), which for the
-//! address a core listener lands on is the loopback zone RFC 6761 reserves for the interface
-//! the core binds on — so the name a caller is given leads back to this process rather than to
-//! anything of AWS's own, and the PORT it carries is the one this socket landed on. The api is
-//! served at the reserved data-plane path on this same address too
-//! ([`crate::state::LOCAL_ENDPOINT_PREFIX`], the addressing the front door serves), so a
-//! client that rewrote an endpoint into a path reaches the same api.
+//! The address announced is not a NAME: what is published is the `host:port` the core's
+//! listener landed on — an address literal on the interface the core binds — with the api's
+//! own id behind the reserved data-plane path ([`crate::state::LOCAL_ENDPOINT_PREFIX`], the
+//! addressing this socket and this emulator's front door both serve). A client DIALS the
+//! published value as it stands, and nothing on the machine this emulator runs on resolves a
+//! name this service invented, so a name of its own is announced nowhere — exactly as this
+//! service's other core-owned addresses are published
+//! ([`super::websocket_transport::announced_endpoint`] for a WebSocket api,
+//! `crate::state::portal_preview_url` for a portal's site).
 
 use std::sync::Arc;
 
@@ -88,54 +91,25 @@ impl InvokePlaneTransport {
 }
 
 /// The `ApiEndpoint` an HTTP api announces on the socket this plane is published at: the
-/// scheme an HTTP api is invoked over ([`crate::state::execute_api_scheme`]) over the api's
-/// own `execute-api` host ([`announced_authority`]), and no path of its own.
+/// address that socket landed on, with the api's own id behind the reserved data-plane path
+/// ([`crate::state::api_data_plane_endpoint`], the one place that spells an announced URI over
+/// an address of this emulator).
 ///
-/// That is the value `Api$ApiEndpoint` documents — "The URI of the API, of the form
+/// `Api$ApiEndpoint` is "The URI of the API, of the form
 /// `{api-id}.execute-api.{region}.amazonaws.com`. The stage name is typically appended to this
-/// URI to form a complete path to a deployed API stage" — so a client recovers the api's id
-/// from the host's first label and its Region from the label behind `execute-api`, and
-/// appending `/{stage}/{route-path}` to it is the complete invoke path. The host is written in
-/// a zone that leads back to this process and carries the port this socket landed on, and this
-/// socket serves it ([`crate::service::invoke_plane_socket`]), so the address a caller is given
-/// is the address the api answers at.
-pub fn announced_endpoint(authority: &str, api_id: &str, region: &str) -> String {
-    format!(
-        "{}://{}",
-        crate::state::execute_api_scheme(crate::state::HTTP_PROTOCOL_TYPE),
-        announced_authority(authority, api_id, region),
-    )
-}
-
-/// The AUTHORITY an api is announced at on this plane's socket: the api's own `execute-api`
-/// host ([`crate::state::execute_api_host_in_zone`]) in the zone this emulator may announce a
-/// name of its own in, carrying the PORT the socket landed on.
+/// URI to form a complete path to a deployed API stage" — a value whose whole purpose is that
+/// a client DIALS it. AWS's own form is a NAME, and AWS answers for it; a name of this
+/// emulator's own minting is answered for by no resolver on the machine it runs on, so what is
+/// published is the socket's own address and the api is named in the path under it — the path
+/// this socket serves ([`crate::service::invoke_plane_socket`]) and the one this emulator's
+/// front door serves the same api at. Appending `/{stage}/{route-path}` to the value is still
+/// the complete invoke path.
 ///
-/// `authority` is the `host:port` the core's listener reports ([`authority_of`]). Its HOST
-/// decides the zone, through the tree's one reading of that question
-/// (`service_common::data_plane_addressing::announced_zone_of_authority`): the loopback zone
-/// RFC 6761 reserves for the interface the core binds on, which is the zone the ADDRESS
-/// LITERAL a core listener lands on names. Its PORT is carried over unchanged, because that is
-/// the port this plane answers on — an authority that names none is announced none, and the
-/// `https` an HTTP api is invoked over is dialled on its implicit port there.
-///
-/// The api's id and its Region are folded to one DNS label each
-/// (`service_common::data_plane_addressing::dns_label`) before they are written into the name:
-/// the Region is read off the credential scope of the request that minted the api, so folding
-/// it is what keeps a value carrying a host or path delimiter from making the announced address
-/// name an authority the caller chose.
-pub fn announced_authority(authority: &str, api_id: &str, region: &str) -> String {
-    use ::service_common::data_plane_addressing as addressing;
-
-    let host = crate::state::execute_api_host_in_zone(
-        &addressing::dns_label(api_id),
-        &addressing::dns_label(region),
-        &addressing::announced_zone_of_authority(authority),
-    );
-    match addressing::addressed_port(Some(authority)).and_then(|port| u16::try_from(port).ok()) {
-        Some(port) => addressing::host_port_authority(&host, port),
-        None => host,
-    }
+/// `authority` is the `host:port` the core's listener reports ([`authority_of`]), carried over
+/// unchanged: the port is the one this plane answers on, and the host is the address the core
+/// bound, so the value is dialable as it stands.
+pub fn announced_endpoint(authority: &str, api_id: &str) -> String {
+    crate::state::api_data_plane_endpoint(authority, api_id, crate::state::HTTP_PROTOCOL_TYPE)
 }
 
 #[cfg(test)]
@@ -143,75 +117,72 @@ mod tests {
     use super::*;
 
     /// RULE: the endpoint announced on this plane's socket is the HTTP api scheme over the
-    /// api's own `execute-api` host — its id, the endpoint label and its Region as the three
-    /// leading labels — in a zone that leads back to this process, on the port the socket
-    /// landed on, and with no path of its own.
+    /// ADDRESS that socket landed on — a `host[:port]` a client dials as given, never a name
+    /// this emulator minted — with the api named behind the reserved data-plane path.
     #[test]
-    fn an_announced_endpoint_names_the_api_in_the_leading_labels_of_its_own_host() {
+    fn an_announced_endpoint_names_the_api_under_the_address_its_socket_landed_on() {
         // The rows span what the reading generalises over: the address a core listener
         // reports (an IPv4 literal, a bracketed IPv6 one, a loopback name, an operator's own
-        // name, and one carrying no port at all), the api id and the Region.
-        let cases: &[(&str, &str, &str, &str)] = &[
+        // name, and one carrying no port at all) and the api id.
+        let cases: &[(&str, &str, &str)] = &[
             (
                 "127.0.0.1:34567",
                 "abc1230000",
-                "us-west-2",
-                "https://abc1230000.execute-api.us-west-2.localhost:34567",
+                "https://127.0.0.1:34567/_aws/execute-api/abc1230000",
             ),
             (
                 "[::1]:8443",
                 "zzz9990000",
-                "eu-central-1",
-                "https://zzz9990000.execute-api.eu-central-1.localhost:8443",
+                "https://[::1]:8443/_aws/execute-api/zzz9990000",
             ),
             (
                 "localhost:9297",
                 "0123456789",
-                "ap-southeast-2",
-                "https://0123456789.execute-api.ap-southeast-2.localhost:9297",
+                "https://localhost:9297/_aws/execute-api/0123456789",
             ),
             (
                 "127.0.0.42:41",
                 "mixedcase00",
-                "eu-north-1",
-                "https://mixedcase00.execute-api.eu-north-1.localhost:41",
+                "https://127.0.0.42:41/_aws/execute-api/mixedcase00",
             ),
             (
                 "127.0.0.1",
                 "abc1230000",
-                "us-east-1",
-                "https://abc1230000.execute-api.us-east-1.localhost",
+                "https://127.0.0.1/_aws/execute-api/abc1230000",
             ),
         ];
-        for (authority, api_id, region, expected) in cases {
-            let announced = announced_endpoint(authority, api_id, region);
+        for (authority, api_id, expected) in cases {
+            let announced = announced_endpoint(authority, api_id);
             assert_eq!(
                 announced, *expected,
                 "case {authority:?}: expected {expected:?}, got {announced:?}"
             );
-            // And the announced value carries no path at all, so appending the stage name to
-            // it is the complete path to a deployed stage, which is what the member it fills
-            // documents.
+            // The authority a client dials is the address the socket landed on, carried over
+            // unchanged: a published address is dialled AS GIVEN, so no label of it is this
+            // service's to mint.
+            let dialled = announced
+                .split_once("://")
+                .map(|(_scheme, rest)| rest.split('/').next().unwrap_or_default())
+                .unwrap_or_default();
+            assert_eq!(
+                dialled, *authority,
+                "case {authority:?}: expected the socket's own address, got {dialled:?}"
+            );
+            // And the api is recoverable from the path, which is where this form names it, so
+            // appending the stage name reaches a deployed stage of THIS api.
             let path = announced
                 .split_once("://")
                 .and_then(|(_scheme, rest)| rest.find('/').map(|at| rest[at..].to_string()))
                 .unwrap_or_default();
             assert_eq!(
-                path, "",
-                "case {authority:?}: expected an announced host with no path, got {path:?}"
-            );
-            // The api and its Region are recoverable from the three leading labels of the
-            // host, which is the whole point of the form.
-            let host = announced
-                .split_once("://")
-                .map(|(_scheme, rest)| rest)
-                .unwrap_or(&announced);
-            let labels: Vec<&str> = host.split(':').next().unwrap_or(host).split('.').collect();
-            assert_eq!(
-                labels.iter().take(3).copied().collect::<Vec<&str>>(),
-                vec![*api_id, crate::state::EXECUTE_API_LABEL, *region],
-                "case {authority:?}: expected the api, the endpoint label and the Region as \
-                 the leading labels, got {labels:?}"
+                path,
+                format!(
+                    "/{}/{}/{api_id}",
+                    crate::state::LOCAL_ENDPOINT_PREFIX,
+                    crate::state::EXECUTE_API_LABEL
+                ),
+                "case {authority:?}: expected the api behind the reserved data-plane path, got \
+                 {path:?}"
             );
         }
     }

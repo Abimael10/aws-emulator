@@ -1,30 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the HOST FORM of the address an HTTP api publishes.
+//! End-to-end tests for the ADDRESS an HTTP api publishes as its `ApiEndpoint`.
 //!
 //! The rule, one level above the recorded case (an HTTP api created through CloudFormation,
-//! whose `ApiEndpoint` a client parsed to recover the api's identity and Region):
+//! whose `ApiEndpoint` a client read out of the stack's outputs and dialled):
 //!
-//! > The URI an HTTP api publishes as its `ApiEndpoint` names the api in the LEADING LABELS OF
-//! > ITS HOST — "The URI of the API, of the form `{api-id}.execute-api.{region}.amazonaws.com`.
-//! > The stage name is typically appended to this URI to form a complete path to a deployed API
-//! > stage" (`Api$ApiEndpoint`) — so the host's first three labels are, in order, the api's own
-//! > id (the value `ApiId` reports), the literal `execute-api` and the api's Region, and the
-//! > URI carries no path of its own. The DNS suffix after those labels and the port are the
-//! > ENVIRONMENT's: this emulator writes the name in the zone that leads back to it, on the
-//! > port it serves that api's data plane at, and serves the api under that very host — so
-//! > appending `/{stageName}/{routePath}` to the published value reaches the api's route.
+//! > The URI an HTTP api publishes as its `ApiEndpoint` is one a client DIALS AS GIVEN — "The
+//! > URI of the API, of the form `{api-id}.execute-api.{region}.amazonaws.com`. The stage name
+//! > is typically appended to this URI to form a complete path to a deployed API stage"
+//! > (`Api$ApiEndpoint`) — so its AUTHORITY is an address this emulator ANSWERS ON: the
+//! > `host:port` of the socket that api's data plane is served on, which is an address literal
+//! > carrying the port the core assigned. AWS's own form is a NAME and AWS answers for it; a
+//! > name of this emulator's own minting is answered for by no resolver on the machine it runs
+//! > on, so none is published. What names the api is then the PATH: its own id behind the
+//! > reserved data-plane marker (`/_aws/execute-api/{api-id}`), the addressing this emulator
+//! > serves an api's data plane at — so appending `/{stageName}/{routePath}` to the published
+//! > value reaches the api's route.
 //!
 //! The rows span what the rule generalises over: the Region the api is created in (including
 //! the emulator's own default, so no row can pass on a hardcoded Region), the operation that
 //! MINTED the api (`CreateApi`, `ImportApi`) and the operation that REPORTS the value back
 //! (`CreateApi`/`ImportApi`, `GetApi`, `GetApis`). The recorded case is ONE row.
 //!
-//! The other half of the same rule: `zz_temp_resolution_probe` holds that the published name
-//! leads back to this process and that the api is SERVED under it. What the socket decides for
+//! The other half of the same rule: `zz_temp_resolution_probe` holds that the published value
+//! needs no resolution at all and that the api is SERVED under it. What the socket decides for
 //! a request arriving there — the stage, the route, the gateway's own refusals — is
-//! `published_invoke_socket_front_door`'s, and what the addressing reaches at every front door
-//! is `execute_api_documented_authority`'s.
+//! `published_invoke_socket_front_door`'s, and what the addressing AWS documents reaches at
+//! every front door is `execute_api_documented_authority`'s.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
@@ -42,14 +44,9 @@ const SERVED_AT: &str = "https://127.0.0.1:9297";
 pub(crate) const EMULATOR_HOST: &str = "127.0.0.1:9297";
 const ANOTHER_EMULATOR_HOST: &str = "localhost:19999";
 
-/// The label every `execute-api` endpoint host carries behind the api's own id, which is the
-/// second of the three leading labels the member documents.
-const ENDPOINT_LABEL: &str = "execute-api";
-
-/// The zone this emulator writes a name of its own in: RFC 6761 reserves `localhost` and every
-/// name under it for the loopback interface the core binds its listeners on, so a name written
-/// there leads back to this process.
-const ANNOUNCED_ZONE: &str = "localhost";
+/// The marker the published path names an api's data plane behind, and the label behind it:
+/// `/_aws/execute-api/{api-id}`, the addressing this emulator serves an api's data plane at.
+pub(crate) const LOCAL_MARKER: &str = "/_aws/execute-api";
 
 /// The upstream every row's `HTTP_PROXY` route fronts, and the status that integration answers:
 /// reaching it is what proves a request resolved all the way to the route.
@@ -272,12 +269,13 @@ pub(crate) fn host_of(authority: &str) -> &str {
         .map_or(authority, |(host, _port)| host)
 }
 
-/// RULE: the host of the endpoint an HTTP api publishes carries the api's own id, the
-/// `execute-api` label and the api's Region as its three leading labels, in the zone that leads
-/// back to this emulator, and the value carries no path of its own — whichever Region the api
-/// was created in, whichever operation minted it and whichever operation reports it.
+/// RULE: the endpoint an HTTP api publishes carries, as its authority, an address this
+/// emulator answers on — the address literal and port its data-plane socket landed on, which a
+/// client dials as it stands — and names the api's own id behind the reserved data-plane path,
+/// whichever Region the api was created in, whichever operation minted it and whichever
+/// operation reports it.
 #[tokio::test]
-async fn a_published_endpoint_names_the_api_and_its_region_in_the_leading_host_labels() {
+async fn a_published_endpoint_names_the_api_under_an_address_this_emulator_answers_on() {
     for row in rows() {
         let case = row.case;
         let emulator = emulator_served_on_a_port();
@@ -290,18 +288,21 @@ async fn a_published_endpoint_names_the_api_and_its_region_in_the_leading_host_l
             "case {case:?}: an HTTP api is invoked over https, got {:?}",
             api.api_endpoint
         );
-        assert_eq!(
-            host.split('.').take(3).collect::<Vec<&str>>(),
-            vec![api.api_id.as_str(), ENDPOINT_LABEL, row.region],
-            "case {case:?}: expected the api, the endpoint label and the Region as the leading \
-             host labels, got {:?}",
-            api.api_endpoint
-        );
-        assert_eq!(
-            host.split('.').skip(3).collect::<Vec<&str>>(),
-            vec![ANNOUNCED_ZONE],
-            "case {case:?}: expected the published host in the zone that leads back to this \
-             emulator, got {:?}",
+        // The authority is an ADDRESS, not a name this service minted: a client resolves
+        // nothing to reach it, and the interface is the one the core binds its listeners on.
+        let address: std::net::IpAddr = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "case {case:?}: expected the address the api's socket landed on, got {:?}",
+                    api.api_endpoint
+                )
+            });
+        assert!(
+            address.is_loopback(),
+            "case {case:?}: expected the interface the core binds its listeners on, got {:?}",
             api.api_endpoint
         );
         assert!(
@@ -313,9 +314,10 @@ async fn a_published_endpoint_names_the_api_and_its_region_in_the_leading_host_l
             api.api_endpoint
         );
         assert_eq!(
-            path, "",
-            "case {case:?}: expected no path of its own, so appending the stage name to the \
-             published value is the whole invoke path, got {:?}",
+            path,
+            format!("{LOCAL_MARKER}/{}", api.api_id),
+            "case {case:?}: expected the api's own id behind the reserved data-plane path, so \
+             appending the stage name to the published value is the whole invoke path, got {:?}",
             api.api_endpoint
         );
 
@@ -361,12 +363,13 @@ async fn a_published_endpoint_names_the_api_and_its_region_in_the_leading_host_l
     }
 }
 
-/// RULE: the id and the Region those labels carry are the api's OWN, settled when the api was
-/// minted — so two apis of one account are never published under one host, two Regions differ in
-/// exactly the Region label, and neither a later request's Region and endpoint nor a rename
-/// moves the value.
+/// RULE: the id the published path carries is the api's OWN, settled when the api was minted —
+/// so two apis of one account are never published under one value, the only part that differs
+/// between two of them is the id, the Region the api was created in moves no part of the
+/// address a client dials, and neither a later request's Region and endpoint nor a rename moves
+/// the value.
 #[tokio::test]
-async fn the_published_labels_are_the_apis_own_id_and_region() {
+async fn the_published_path_carries_the_apis_own_id() {
     let case = "two apis in one Region and one in another, on one emulator";
     let emulator = emulator_served_on_a_port();
     let first_region = rows()[0].region;
@@ -402,33 +405,42 @@ async fn the_published_labels_are_the_apis_own_id_and_region() {
     .await;
     let host = |minted: &Minted| host_of(&published_parts(&minted.api_endpoint).0).to_string();
 
-    // Two apis of one account are never published under one host, and the only label that
+    // Two apis of one account are never published under one value, and the only part that
     // differs between two apis of the SAME Region is the one naming the api.
     assert_ne!(
-        host(&first),
-        host(&second),
-        "case {case:?}: expected two apis published under two hosts, got {:?} and {:?}",
+        first.api_endpoint, second.api_endpoint,
+        "case {case:?}: expected two apis published under two values, got {:?} for both",
+        first.api_endpoint
+    );
+    assert_eq!(
+        first.api_endpoint.replacen(&first.api_id, &second.api_id, 1),
+        second.api_endpoint,
+        "case {case:?}: expected the api's id to be the only difference, got {:?} and {:?}",
         first.api_endpoint,
         second.api_endpoint
     );
+    // And the Region the api was created in moves no part of the published value: what a
+    // client dials is the address this emulator serves that api's plane on, which belongs to
+    // this process and not to a Region.
     assert_eq!(
-        host(&first).replacen(&first.api_id, &second.api_id, 1),
-        host(&second),
-        "case {case:?}: expected the id label to be the only difference, got {:?} and {:?}",
-        first.api_endpoint,
-        second.api_endpoint
-    );
-    // And the only label that differs between the same shape in two Regions is the Region's.
-    assert_eq!(
-        host(&first)
-            .replacen(&first.api_id, &other.api_id, 1)
-            .replacen(first_region, second_region, 1),
-        host(&other),
-        "case {case:?}: expected the Region label to carry the api's own Region, got {:?} and \
-         {:?}",
+        first.api_endpoint.replacen(&first.api_id, &other.api_id, 1),
+        other.api_endpoint,
+        "case {case:?}: expected the api's id to be the only difference across Regions, got \
+         {:?} and {:?}",
         first.api_endpoint,
         other.api_endpoint
     );
+    // The authority itself is one address of this emulator, dialable as it stands, for every
+    // api it serves.
+    for (which, minted) in [("first", &first), ("second", &second), ("other", &other)] {
+        assert_eq!(
+            host(minted),
+            host(&first),
+            "case {case:?}: expected the {which} api published on an address of this emulator, \
+             got {:?}",
+            minted.api_endpoint
+        );
+    }
 
     // A later read signed for a THIRD Region, addressed at ANOTHER endpoint of this emulator,
     // reports the value the create settled: the host is the api's, not the reader's.
@@ -452,7 +464,7 @@ async fn the_published_labels_are_the_apis_own_id_and_region() {
          published endpoint, got {read}"
     );
 
-    // Renaming the api moves nothing either: the labels are the api's id and Region, never its
+    // Renaming the api moves nothing either: what the value carries is the api's id, never its
     // name.
     let renamed = "published-endpoint-renamed";
     let (status, updated) = call_at_host(

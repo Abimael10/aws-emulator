@@ -487,9 +487,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(authority), _) => {
                 crate::state::websocket_transport::announced_endpoint(authority)
             }
-            (None, Some(authority)) => crate::state::invoke_plane_transport::announced_endpoint(
-                authority, &api_id, &region,
-            ),
+            (None, Some(authority)) => {
+                crate::state::invoke_plane_transport::announced_endpoint(authority, &api_id)
+            }
             (None, None) => crate::state::emulator_served_api_endpoint(
                 &api_id,
                 &region,

@@ -247,12 +247,11 @@ struct Addressing {
 /// Both addressings a client reaches an HTTP api's data plane at:
 ///
 /// * the endpoint the api itself ANNOUNCED (`Api$ApiEndpoint`) — the one value a client of a
-///   deployed api is handed, which on an emulator served on a port is the api's own
-///   `execute-api` host in the zone RFC 6761 reserves for the loopback interface this
-///   emulator's listeners are bound on, on the port its data plane is served at. The
-///   connection is made to that interface, which is where the name resolves, and the published
-///   authority is what the request NAMES — the address is the api's and the interface is this
-///   emulator's;
+///   deployed api is handed, which on an emulator served on a port is the ADDRESS its data
+///   plane's socket landed on, with the api's own id behind the reserved data-plane path. The
+///   connection is made to that address, which needs no resolver at all, and the published
+///   authority is what the request NAMES — the address is this emulator's and the path is the
+///   api's;
 /// * the api's own documented `execute-api` host
 ///   (`{api-id}.execute-api.{region}.amazonaws.com`) at this emulator's front door, which is
 ///   the addressing a client that resolves AWS's own names uses.
@@ -282,18 +281,23 @@ fn addressings(emulator: &Started, api_id: &str, announced: &str) -> Vec<Address
     ]
 }
 
-/// Assert the endpoint an api announced is the api's OWN `execute-api` host in the zone RFC
-/// 6761 reserves for the loopback interface this emulator's listeners are bound on, carrying
-/// the port the socket it is served on landed on — which is what makes the first addressing
-/// above both the documented form and dialable at all. Read once, before the rows run.
+/// Assert the endpoint an api announced is an ADDRESS this emulator answers on — the address
+/// its data-plane socket landed on, carrying the port the core assigned — with the api's own id
+/// behind the reserved data-plane path, which is what makes the first addressing above dialable
+/// at all. Read once, before the rows run.
 fn assert_announced_is_this_emulators(api_id: &str, announced: &str) {
-    let (authority, _base_path) = announced_parts(announced);
+    let (authority, base_path) = announced_parts(announced);
     let (host, port) = authority.rsplit_once(':').unwrap_or((authority.as_str(), ""));
     assert!(
         announced.starts_with("https://")
-            && host == format!("{api_id}.execute-api.{REGION}.localhost")
-            && port.parse::<u16>().is_ok(),
-        "setup: an api must announce its own execute-api host on an address of this emulator's \
+            && host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+            && port.parse::<u16>().is_ok()
+            && base_path.trim_end_matches('/') == format!("/_aws/execute-api/{api_id}"),
+        "setup: an api must announce its own data plane on an address of this emulator's \
          own, got {announced:?}"
     );
 }
