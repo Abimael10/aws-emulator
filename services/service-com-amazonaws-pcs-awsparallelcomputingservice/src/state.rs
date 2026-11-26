@@ -197,6 +197,13 @@ pub const DEFAULT_PURGE_TIME_IN_DAYS: i32 = -1;
 /// (`SpotOptions$allocationStrategy`), spelled as the enum spells that member.
 pub const DEFAULT_SPOT_ALLOCATION_STRATEGY: &str = "price-capacity-optimized";
 
+/// The `PurchaseOption` a compute node group carries when the request named none: "If you
+/// don't provide this option, it defaults to On-Demand"
+/// (`CreateComputeNodeGroupRequest$purchaseOption`, worded identically on
+/// `UpdateComputeNodeGroupRequest` and on `ComputeNodeGroup`), spelled as `PurchaseOption`
+/// spells that member.
+pub const DEFAULT_PURCHASE_OPTION: &str = "ONDEMAND";
+
 /// The `maxResults` a list operation serves when the request names none: the
 /// `@default(10)` the model declares on `MaxResults`.
 pub const DEFAULT_PAGE_SIZE: usize = 10;
@@ -345,8 +352,10 @@ pub struct ComputeNodeGroupRecord {
     pub ami_id: Option<String>,
     /// The subnets instances are provisioned in.
     pub subnet_ids: Vec<String>,
-    /// A `PurchaseOption` member, when the request named one.
-    pub purchase_option: Option<String>,
+    /// A `PurchaseOption` member. Always set: the member documents the option the service
+    /// applies when the request names none ([`DEFAULT_PURCHASE_OPTION`]), so a stored group
+    /// always carries the purchasing decision it runs on.
+    pub purchase_option: String,
     /// The launch template the request named.
     pub custom_launch_template: CustomLaunchTemplate,
     /// The instance profile the request named.
@@ -638,7 +647,7 @@ impl ComputeNodeGroupRecord {
             status: self.status.clone(),
             ami_id: self.ami_id.clone(),
             subnet_ids: self.subnet_ids.clone(),
-            purchase_option: self.purchase_option.clone(),
+            purchase_option: Some(self.purchase_option.clone()),
             custom_launch_template: self.custom_launch_template.clone(),
             iam_instance_profile_arn: self.iam_instance_profile_arn.clone(),
             scaling_configuration: self.scaling_configuration.clone(),

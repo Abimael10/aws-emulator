@@ -496,7 +496,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             ami_id: input.ami_id,
             subnet_ids: input.subnet_ids,
-            purchase_option: input.purchase_option,
+            // "If you don't provide this option, it defaults to On-Demand"
+            // (`CreateComputeNodeGroupRequest$purchaseOption`, worded the same on the
+            // response member): the group runs on a purchasing option either way, so the
+            // record carries the documented one where the request named none, the way
+            // `mode` carries its own documented value (`crate::state::apply_slurm_update`).
+            purchase_option: input
+                .purchase_option
+                .unwrap_or_else(|| crate::state::DEFAULT_PURCHASE_OPTION.to_string()),
             custom_launch_template: input.custom_launch_template,
             iam_instance_profile_arn: input.iam_instance_profile_arn,
             scaling_configuration: input.scaling_configuration.into(),

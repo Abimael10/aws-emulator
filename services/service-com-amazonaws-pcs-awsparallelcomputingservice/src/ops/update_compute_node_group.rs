@@ -442,7 +442,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
         }
         if let Some(purchase_option) = input.purchase_option {
-            group.purchase_option = Some(purchase_option);
+            group.purchase_option = purchase_option;
             changed = true;
         }
         if let Some(spot_options) = input.spot_options {

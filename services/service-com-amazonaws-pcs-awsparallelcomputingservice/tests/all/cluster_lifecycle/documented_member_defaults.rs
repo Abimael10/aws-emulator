@@ -11,7 +11,8 @@
 //!
 //! The members this model documents that way, and where each sentence lives
 //! (`smithy_query(query="shape",shape="NetworkingRequest,ClusterSlurmConfigurationRequest,
-//! AccountingRequest,SpotOptions")`, worded identically on each response shape):
+//! AccountingRequest,SpotOptions,CreateComputeNodeGroupRequest")`, worded identically on each
+//! response shape):
 //!
 //! * `networkType` — "The IP address version the cluster uses. The default is `IPV4`", which
 //!   is also the address family the cluster's own endpoints are published on, so the two
@@ -19,7 +20,8 @@
 //! * `scaleDownIdleTimeInSeconds` (the CLUSTER's) — "Default: `600`";
 //! * `defaultPurgeTimeInDays` — "The default value for `defaultPurgeTimeInDays` is `-1`";
 //! * `allocationStrategy` — "If you don't provide this option, it defaults to price capacity
-//!   optimized".
+//!   optimized";
+//! * `purchaseOption` — "If you don't provide this option, it defaults to On-Demand".
 //!
 //! A compute node group's `scaleDownIdleTimeInSeconds` documents no value of its own — "If
 //! not specified, the cluster-level setting applies" — so it is the member pinned ABSENT
@@ -62,6 +64,22 @@ const ALLOCATION_STRATEGIES: &[&str] = &[
     "lowest-price",
     "capacity-optimized",
     "price-capacity-optimized",
+];
+
+/// The purchasing option the member documents as its default
+/// (`CreateComputeNodeGroupRequest$purchaseOption`, worded identically on
+/// `UpdateComputeNodeGroupRequest` and on `ComputeNodeGroup`: "If you don't provide this
+/// option, it defaults to On-Demand"), spelled as `PurchaseOption` spells it
+/// (`smithy_query(query="shape",shape="PurchaseOption")`).
+const DOCUMENTED_PURCHASE_OPTION: &str = "ONDEMAND";
+
+/// Every `PurchaseOption` member the model declares, one of which is the documented default
+/// (source: `smithy_query(query="shape",shape="PurchaseOption")`).
+const PURCHASE_OPTIONS: &[&str] = &[
+    "ONDEMAND",
+    "SPOT",
+    "CAPACITY_BLOCK",
+    "INTERRUPTIBLE_CAPACITY_RESERVATION",
 ];
 
 /// The published bounds of the cluster's `scaleDownIdleTimeInSeconds`
@@ -764,4 +782,112 @@ async fn a_compute_node_groups_idle_time_stays_absent_because_its_member_documen
         json!(DOCUMENTED_SCALE_DOWN_SECONDS),
         "expected the cluster to report the idle time its own member documents, got {stored}"
     );
+}
+
+#[tokio::test]
+async fn a_compute_node_group_carries_the_purchase_option_its_member_documents() {
+    let router = emulator();
+    let cluster = "defaults-purchase-cluster";
+    let (status, created) = call(
+        &router,
+        "CreateCluster",
+        &create_request(cluster, &cases()[0]),
+    )
+    .await;
+    assert_eq!(status, 200, "case setup: got {status} with {created}");
+
+    // Row 1: a create that names no purchasing option reports the documented one. The rest:
+    // every member the enum declares is stored exactly as it was sent, including the ones
+    // nothing cited.
+    let mut rows: Vec<(String, Value, &str)> = vec![(
+        "no purchase option named".to_string(),
+        json!({}),
+        DOCUMENTED_PURCHASE_OPTION,
+    )];
+    for option in PURCHASE_OPTIONS {
+        rows.push((
+            format!("the {option} option named"),
+            json!({"purchaseOption": option}),
+            option,
+        ));
+    }
+
+    let mut group_ids: Vec<String> = Vec::new();
+    for (index, (case, members, expected)) in rows.iter().enumerate() {
+        let name = format!("defaults-purchase-{index}");
+        let (status, created) = call(
+            &router,
+            "CreateComputeNodeGroup",
+            &create_group_request(cluster, &name, members),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the create to be served, got {status} with {created}"
+        );
+        group_ids.push(
+            created["computeNodeGroup"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        for (source, group) in [
+            ("CreateComputeNodeGroup", created["computeNodeGroup"].clone()),
+            (
+                "GetComputeNodeGroup",
+                stored_group(&router, case, cluster, &name).await,
+            ),
+        ] {
+            assert_eq!(
+                group["purchaseOption"],
+                json!(expected),
+                "case {case:?} ({source}): expected purchaseOption {expected:?}, got {group}"
+            );
+        }
+    }
+
+    // And over an UPDATE of the group whose create named NO option: one that names another
+    // member replaces the stored option, and one that names none leaves it where it is — the
+    // documented value is carried by the record, not re-derived per call.
+    let group_identifier = group_ids.first().cloned().unwrap_or_default();
+    for (case, patch, expected) in [
+        (
+            "an update that names another option",
+            json!({"purchaseOption": "SPOT"}),
+            "SPOT",
+        ),
+        (
+            "an update that names no option at all",
+            json!({"amiId": "ami-0123456789abcdef0"}),
+            "SPOT",
+        ),
+    ] {
+        let mut body = json!({
+            "clusterIdentifier": cluster,
+            "computeNodeGroupIdentifier": group_identifier,
+        });
+        if let (Some(target), Some(extra)) = (body.as_object_mut(), patch.as_object()) {
+            for (member, value) in extra {
+                target.insert(member.clone(), value.clone());
+            }
+        }
+        let (status, updated) = call(&router, "UpdateComputeNodeGroup", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the update to be served, got {status} with {updated}"
+        );
+        for (source, group) in [
+            ("UpdateComputeNodeGroup", updated["computeNodeGroup"].clone()),
+            (
+                "GetComputeNodeGroup",
+                stored_group(&router, case, cluster, &group_identifier).await,
+            ),
+        ] {
+            assert_eq!(
+                group["purchaseOption"],
+                json!(expected),
+                "case {case:?} ({source}): expected purchaseOption {expected:?}, got {group}"
+            );
+        }
+    }
 }
