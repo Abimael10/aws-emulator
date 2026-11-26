@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelImageLaunchPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelImageLaunchPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the CALLING ACCOUNT's launch permission off one AMI — "removes your
+//! Amazon Web Services account from the launch permissions for the specified AMI" — by
+//! revoking the grant recorded for that account against the image's id in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelImageLaunchPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The permission revoked is the one `ModifyImageAttribute` grants and
+//! `DescribeImageAttribute` reports, written through the crate's one revoker of a launch
+//! permission ([`crate::state::ComAmazonawsEc2Amazonec2State::revoke_image_launch_permissions`]),
+//! so the attribute a later read reports and the grant this call takes away cannot disagree —
+//! and the bytes that grant was charged go back to the store's budget.
+//!
+//! The one grantee it names is the CALLER's own account, never a grantee the request chose:
+//! the request carries no grantee at all, and the sentence above is what says whose
+//! permission comes off. So a permission granted to ANOTHER account stands, and so does one
+//! granted to an organization or an organizational unit, which name no account; the `all`
+//! group is "the value is `true` if this image has public launch permissions"
+//! (`Image$Public`) rather than a permission of any one account, so a public AMI stays
+//! public. An account that holds no grant on the image has nothing to take off, and the call
+//! still succeeds: "returns true if the request succeeds" (`$Return`) is a claim about the
+//! REQUEST, not about a permission having been found.
+//!
+//! The refusals: a value this service cannot read as an AMI id is `InvalidAMIID.Malformed`,
+//! and a readable id the account can see no image for is `InvalidAMIID.NotFound` — the one
+//! reading the attribute operations of an AMI share
+//! ([`crate::state::require_resolvable_image`]). A `DryRun` request that would have gone on
+//! is `DryRunOperation`, answered after everything that would have refused the call and
+//! before the revoke, so a dry run leaves no trace.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +155,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelImageLaunchPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelImageLaunchPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelImageLaunchPermission"))
+        use crate::state::{
+            ImageLaunchPermissionGrantees, dry_run_operation, echoed_resource_id, internal_error,
+            require_resolvable_image, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; nothing about this cancellation depends on it —
+        // the image is named in the request and the account whose permission comes off is the
+        // one this emulator serves. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A `pending` AMI a copy produced reaches `available`, and a recycled one past its
+        // retention period is permanently gone, at instants those calls fixed — owed whether
+        // or not anybody asked, so they are applied before this one resolves the image it is
+        // to change.
+        store.materialize_due_transitions();
+
+        // "The ID of the AMI that was shared with your Amazon Web Services account"
+        // (`$ImageId`): the image is resolved first, through the reading the attribute
+        // operations of an AMI share — a value that is no AMI id this service could have
+        // issued is malformed, and a readable id the account can see no image for does not
+        // exist.
+        require_resolvable_image(&store, &input.image_id)?;
+
+        // The permission question, answered once everything that would have refused this
+        // request has had its say and before the one write, so a dry run of a call that would
+        // have been refused is refused with that reason instead and one that would have
+        // succeeded leaves the store untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // The ONE write: "removes your Amazon Web Services account from the launch
+        // permissions for the specified AMI" — the grant recorded for the CALLING account,
+        // and no other grantee's, through the crate's one revoker of a launch permission.
+        // The group a public image carries is not named, so a public AMI stays public, and an
+        // account the image was never shared with has nothing to take off.
+        let account = ::engine::emulator_account_id().to_string();
+        store.revoke_image_launch_permissions(
+            &input.image_id,
+            &ImageLaunchPermissionGrantees {
+                user_ids: vec![account.clone()],
+                ..ImageLaunchPermissionGrantees::default()
+            },
+        );
+
+        // Read the answer back OUT of the store, through the same derivation
+        // `DescribeImageAttribute` reports the attribute with: "returns true if the request
+        // succeeds" (`$Return`) is a claim about what the store now holds.
+        let still_granted = store
+            .images
+            .get(&input.image_id)
+            .is_some_and(|image| {
+                store
+                    .image_launch_permissions_of(image)
+                    .iter()
+                    .any(|permission| permission.user_id.as_deref() == Some(account.as_str()))
+            });
+        if still_granted {
+            return Err(internal_error(format!(
+                "AMI '{}' still carries a launch permission for account '{account}'",
+                echoed_resource_id(&input.image_id)
+            )));
+        }
+        Ok(CancelImageLaunchPermissionOutput {
+            r#return: Some(true),
+        })
     }
 }
