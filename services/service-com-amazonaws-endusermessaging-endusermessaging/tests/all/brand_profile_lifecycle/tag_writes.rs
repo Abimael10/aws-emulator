@@ -53,7 +53,11 @@ async fn tag_raw(em: &Emulator, resource_arn: &str, tags: Value) -> Reply {
 }
 
 /// A brand profile carrying `tags`, by its ARN.
-async fn tagged_profile(em: &Emulator, name: &str, tags: &[(String, String)]) -> String {
+///
+/// `pub(super)` because the tag-REMOVAL suite beside this one builds its fixtures from
+/// the same two creates, so a tagged resource is set up one way for both halves of the
+/// contract.
+pub(super) async fn tagged_profile(em: &Emulator, name: &str, tags: &[(String, String)]) -> String {
     let created = em
         .create(json!({ "brandProfileName": name, "tags": tag_body(tags) }))
         .await;
@@ -66,8 +70,12 @@ async fn tagged_profile(em: &Emulator, name: &str, tags: &[(String, String)]) ->
 }
 
 /// A notify code configuration carrying `tags`, by its ARN: the other taggable
-/// resource type of this service.
-async fn tagged_configuration(em: &Emulator, name: &str, tags: &[(String, String)]) -> String {
+/// resource type of this service. `pub(super)` for the reason [`tagged_profile`] is.
+pub(super) async fn tagged_configuration(
+    em: &Emulator,
+    name: &str,
+    tags: &[(String, String)],
+) -> String {
     let created = em
         .create_notify_code_configuration(json!({
             "notifyCodeConfigurationName": name,
@@ -101,8 +109,10 @@ fn duplicate_key_message(key: &str) -> String {
     format!("Duplicate tag key: '{key}'")
 }
 
-/// The tags `resource_arn` reports, as a sorted list of pairs.
-async fn listed_tags(em: &Emulator, resource_arn: &str) -> Vec<(String, String)> {
+/// The tags `resource_arn` reports, as a sorted list of pairs. `pub(super)` for the
+/// reason [`tagged_profile`] is: what a resource carries is read back the same way
+/// whichever operation changed it.
+pub(super) async fn listed_tags(em: &Emulator, resource_arn: &str) -> Vec<(String, String)> {
     let listed = em.list_tags(resource_arn).await;
     assert_eq!(
         listed.status, 200,
@@ -121,7 +131,7 @@ struct Merge {
     expected: Vec<(String, String)>,
 }
 
-fn pair(key: &str, value: &str) -> (String, String) {
+pub(super) fn pair(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 

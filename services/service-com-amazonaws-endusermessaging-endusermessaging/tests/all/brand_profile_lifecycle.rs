@@ -28,6 +28,8 @@
 //! * `ListTagsForResource` reports the tags stored on the resource its `resourceArn`
 //!   names — for every tag set a create may carry, and for every taggable resource
 //!   type of this service;
+//! * `UntagResource` takes off the resource exactly the keys its `tagKeys` names and
+//!   leaves every other key alone (the `tag_removal` child suite);
 //! * a `resourceArn` that is not the ARN of a resource of this service's own
 //!   namespace — not an ARN at all, or one of another vendor — and one scoped to
 //!   another partition or Region, are `ValidationException` (400), and an ARN of this
@@ -57,6 +59,12 @@ mod arn_scope;
 /// this file's own directory, as it is in `all.rs`.
 #[path = "brand_profile_lifecycle/tag_writes.rs"]
 mod tag_writes;
+
+/// The tag REMOVAL half of the same tagging contract, driven over the same wire:
+/// `UntagResource`, and what it leaves the resource carrying. A child module of this
+/// suite, declared the way `tag_writes` is.
+#[path = "brand_profile_lifecycle/tag_removal.rs"]
+mod tag_removal;
 
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";

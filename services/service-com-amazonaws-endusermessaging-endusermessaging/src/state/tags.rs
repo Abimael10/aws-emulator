@@ -12,7 +12,10 @@
 //! on a tag write and on every create that takes tags, and the rules a tag set has to
 //! satisfy — the reserved key namespace, one value per key, the per-resource ceiling —
 //! are the same wherever it arrived, so they are stated once ([`requested_tags`],
-//! [`ComAmazonawsEndusermessagingEndusermessagingState::write_tags`]).
+//! [`ComAmazonawsEndusermessagingEndusermessagingState::write_tags`]). What a REMOVAL
+//! does to that stored list is beside it
+//! ([`ComAmazonawsEndusermessagingEndusermessagingState::remove_tags`]), so a write and
+//! a removal agree about which stored pair a key names.
 //!
 //! The ARN itself is read by the workspace's one ARN parse,
 //! [`::service_common::arn`], so this service does not decide for itself what an ARN
@@ -262,6 +265,40 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         }
         Ok(())
     }
+
+    /// Remove from `resource` the tags whose keys `keys` names, leaving every other
+    /// key — and the order the keys that stay were first written in — alone.
+    ///
+    /// A tag key is unique per resource and CASE-SENSITIVE (`TagKey`'s own
+    /// documentation), so a stored key is removed only on an exact match. The removal
+    /// is by key SET, so a key the resource does not carry removes nothing and a key
+    /// named more than once in one request removes the same one tag: asking again for
+    /// a removal already applied is the same state, which is what this operation's
+    /// `@idempotent` says a caller may rely on. No ceiling is involved — a removal
+    /// cannot take a resource past one.
+    pub fn remove_tags(
+        &mut self,
+        resource: &TaggedResource,
+        keys: &[String],
+    ) -> Result<(), TagRemovalRefused> {
+        let Some(stored) = self.tags_of_mut(resource) else {
+            return Err(TagRemovalRefused::Vanished);
+        };
+        stored.retain(|(held, _)| !keys.iter().any(|named| named == held));
+        Ok(())
+    }
+}
+
+/// Why a tag removal a request asked for was not applied.
+///
+/// Its own type rather than [`TagWriteRefused`]'s, because the quota a WRITE can reach
+/// is unreachable here — a removal only ever leaves a resource carrying fewer tags —
+/// and the operation that removes tags models no quota error to answer with.
+#[derive(Debug)]
+pub enum TagRemovalRefused {
+    /// The resource was resolved but holds no record, which the lock the resolution
+    /// and the removal share makes impossible. `InternalServerException`, HTTP 500.
+    Vanished,
 }
 
 /// Why a tag write a request asked for was not applied.

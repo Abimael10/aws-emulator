@@ -49,6 +49,9 @@ emulator-core-build-support = { workspace = true }
 # Encodes an attachment body the way restJson1 carries a blob member, so the tests
 # upload media over the same wire an SDK client does.
 base64 = "0.22"
+# RFC 3986 percent-encoding, so the tag-removal suite can put a tag key carrying a
+# space, a colon, a `+` or a `/` in the `tagKeys` query string the way a client does.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true
