@@ -16,6 +16,12 @@
 //! again mints a SEPARATE registration while leaving the earlier one and its pair
 //! usable.
 //!
+//! RULE, the other half of the same sentence: the secret is one the SERVICE generates
+//! for the registration, so nothing in the request determines it — a registration is
+//! answered with a secret drawn for it alone, no function of the metadata it was
+//! registered with (or of the `clientId` it stands beside) is that secret, and the
+//! form of the value is the same whatever metadata the request carried.
+//!
 //! Every case drives the service through the router the production emulator serves,
 //! using the harness the device-flow suite beside this file builds.
 
@@ -39,6 +45,9 @@ const INVALID_CLIENT_ID_TEXT: &str = "Invalid client ID provided";
 use crate::device_authorization_flow::{
     assert_failure, device_flow_token, start_url, text, Emulator,
 };
+// Every string a request carried, already read off a request body by the
+// error-description suite in this same test binary.
+use crate::error_descriptions::request_strings;
 
 /// One registration's reported pair.
 #[derive(Clone, Debug)]
@@ -306,6 +315,151 @@ async fn the_reported_pair_authenticates_the_grants_that_follow_the_registration
             stored_secret(&emulator, &pair.client_id).as_deref(),
             Some(pair.client_secret.as_str()),
             "case {case:?}: the flow changed the registration's stored secret"
+        );
+    }
+}
+
+/// A digest of `input`, in hex. `sha2` and `hex` are this crate's own
+/// dev-dependencies; they are used here only to BUILD a candidate secret a caller
+/// could compute for itself, never to check one.
+fn digest_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(input.as_bytes()))
+}
+
+/// What a caller holding nothing but the registration's own metadata and the
+/// `clientId` it was answered with could put in `clientSecret`: the metadata
+/// itself, a digest of it, the id standing beside it, and no secret at all.
+fn computed_candidates(body: &Value, pair: &Pair) -> Vec<(&'static str, String)> {
+    let client_name = body["clientName"].as_str().unwrap_or_default().to_string();
+    vec![
+        ("the client name itself", client_name.clone()),
+        ("a digest of the client name", digest_hex(&client_name)),
+        (
+            "a digest of the whole registration metadata",
+            digest_hex(&body.to_string()),
+        ),
+        (
+            "the clientId the secret was answered beside",
+            pair.client_id.clone(),
+        ),
+        ("a digest of that clientId", digest_hex(&pair.client_id)),
+        ("no secret at all", String::new()),
+    ]
+}
+
+/// RULE (above): the secret is GENERATED for the registration, so nothing in the
+/// request determines it — the same metadata registered again and again is answered
+/// with a secret never seen before, the secret is not the `clientId` it stands beside
+/// and carries no part of the metadata, and its form does not vary with the metadata
+/// so it reports nothing about the registration it belongs to.
+#[tokio::test]
+async fn nothing_in_a_registration_request_determines_the_secret_it_is_answered_with() {
+    /// How many times each row of the table is registered: enough that a secret
+    /// computed from the metadata would have to repeat.
+    const ROUNDS: usize = 4;
+    /// A credential nobody can guess is not a handful of characters. The FLOOR is
+    /// asserted, not this emulator's own width: `ClientSecret` is a plain string
+    /// with no `@length` and no `@pattern`
+    /// (`smithy_query(query="shape",shape="ClientSecret")`), so the model states no
+    /// width to pin.
+    const MINIMUM_WIDTH: usize = 32;
+
+    let emulator = Emulator::new();
+    let mut seen_secrets: HashSet<String> = HashSet::new();
+    let mut widths: HashSet<usize> = HashSet::new();
+
+    for (case, body) in registrations() {
+        // Everything about the registration a caller could try to compute its
+        // secret from: every string the request carried.
+        let carried = request_strings(&body);
+        for round in 1..=ROUNDS {
+            let pair = register(&emulator, case, &body).await;
+            let secret = pair.client_secret.clone();
+
+            assert!(
+                seen_secrets.insert(secret.clone()),
+                "case {case:?}: round {round} was answered a clientSecret another registration was already answered with"
+            );
+            assert!(
+                secret.len() >= MINIMUM_WIDTH,
+                "case {case:?}: round {round}: expected a clientSecret of at least {MINIMUM_WIDTH} characters, got {} in {secret:?}",
+                secret.len()
+            );
+            assert_ne!(
+                secret, pair.client_id,
+                "case {case:?}: round {round}: the clientSecret is the clientId it stands beside"
+            );
+            for value in carried.iter().filter(|value| !value.is_empty()) {
+                assert!(
+                    !secret.contains(value.as_str()),
+                    "case {case:?}: round {round}: the clientSecret carries the request's {value:?}: {secret:?}"
+                );
+                assert!(
+                    !value.contains(secret.as_str()),
+                    "case {case:?}: round {round}: the request's {value:?} carries the clientSecret {secret:?}"
+                );
+            }
+            widths.insert(secret.len());
+        }
+    }
+
+    // What is asserted here is that the width does not VARY with the metadata, so the
+    // value reports nothing about the registration it belongs to. That this emulator
+    // draws one fixed width is its own choice — the model states none — so the width
+    // itself is not written out.
+    assert_eq!(
+        widths.len(),
+        1,
+        "expected one clientSecret width whatever metadata a registration carried, got {widths:?}"
+    );
+}
+
+/// RULE (above): only the secret the service drew for the registration authenticates
+/// it, so a secret a caller COMPUTED from that registration is the secret of no
+/// registration at all — refused as the member at fault, and refusing it leaves the
+/// registration's own credential untouched.
+#[tokio::test]
+async fn no_secret_computed_from_a_registration_authenticates_it() {
+    let emulator = Emulator::new();
+
+    for (case, body) in registrations() {
+        let pair = register(&emulator, case, &body).await;
+
+        for (which, candidate) in computed_candidates(&body, &pair) {
+            let computed = Pair {
+                client_id: pair.client_id.clone(),
+                client_secret: candidate,
+            };
+            let (status, response) = authenticate(&emulator, &computed).await;
+            assert_failure(
+                &format!("{case}: {which}"),
+                status,
+                &response,
+                401,
+                "InvalidClientException",
+                "invalid_client",
+            );
+            assert_eq!(
+                response["error_description"].as_str(),
+                Some(INVALID_CLIENT_SECRET_TEXT),
+                "case {case:?}: {which}: expected the fixed text for a secret of no registration, got {response}"
+            );
+        }
+
+        // A refused candidate neither rotates nor consumes the credential: the
+        // registration's own pair still authenticates it, and still is what the
+        // service holds for it.
+        let (status, response) = authenticate(&emulator, &pair).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the registration's own pair was refused after the computed candidates: {response}"
+        );
+        assert_eq!(
+            stored_secret(&emulator, &pair.client_id).as_deref(),
+            Some(pair.client_secret.as_str()),
+            "case {case:?}: a refused candidate changed the registration's stored secret"
         );
     }
 }

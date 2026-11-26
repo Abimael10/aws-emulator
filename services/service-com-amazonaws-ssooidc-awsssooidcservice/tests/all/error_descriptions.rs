@@ -83,8 +83,9 @@ fn row(
 }
 
 /// Every string the request carried, so a refusal's text can be checked against all
-/// of them.
-fn request_strings(body: &Value) -> Vec<String> {
+/// of them — and, for the suite beside this one, so a minted credential can be
+/// checked against all of them too.
+pub(crate) fn request_strings(body: &Value) -> Vec<String> {
     match body {
         Value::String(value) => vec![value.clone()],
         Value::Array(values) => values.iter().flat_map(request_strings).collect(),

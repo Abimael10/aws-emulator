@@ -8,8 +8,28 @@ Issue-Trace-Ids: sso-oidc-register-public-client-basic
 Issue-Shape-Id: com.amazonaws.ssooidc#AWSSSOOIDCService
 Issue-Key: oidc|RegisterClient|2xx->2xx|$.clientSecret
 Issue-Commit: 32b3b13ce09ea200080835375d94fd3da2d5fa49
+Issue-Resolution: DECLINED — a per-run generated credential; the replay key stays still_failing (see "Resolution" below)
 
 # oidc RegisterClient returns a freshly drawn random clientSecret instead of the registration's own secret
+
+## Resolution — the one cause was DECLINED as a per-run generated credential
+
+`$.clientSecret` is a credential the service GENERATES for the registration (`ClientSecret`:
+a `@sensitive` string with no `@length` and no `@pattern`, "A secret string generated for the
+client"), drawn per accepted call independently of the request, persisted on the registration
+and honoured unchanged while it is stored — which is what `RegisterClient` already does. The
+recorded side of this step is that one session's secret, redacted into a corpus variable, so
+no rule of the service can reproduce it; deriving the member from the request metadata (the
+issue's own hypothesis, "stated by neither the model nor the recording") would make a
+registration's only credential computable by anyone holding its public metadata. The replay
+key `oidc|RegisterClient|2xx->2xx|$.clientSecret` therefore remains `still_failing` and no
+handler changed. The rule is now pinned by
+`services/service-com-amazonaws-ssooidc-awsssooidcservice/tests/all/client_secret_binding.rs`
+(`nothing_in_a_registration_request_determines_the_secret_it_is_answered_with`,
+`no_secret_computed_from_a_registration_authenticates_it`), so a future change that makes the
+secret a function of the request fails the suite.
+
+## The report as filed
 
 > _Note: this issue was identified against the code base at commit `32b3b13ce09ea200080835375d94fd3da2d5fa49`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
