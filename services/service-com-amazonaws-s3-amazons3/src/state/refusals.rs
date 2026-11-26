@@ -2287,6 +2287,17 @@ pub const NO_SUCH_TAG_SET_MESSAGE: &str = "The TagSet does not exist";
 /// request is invalid", HTTP 400 (Amazon S3 "Error responses", list of error codes).
 pub const ILLEGAL_VERSIONING_CONFIGURATION_CODE: &str = "IllegalVersioningConfigurationException";
 
+/// The `<Message>` S3 sends beside the 400 [`INVALID_REQUEST_CODE`] of a request that has to
+/// be authenticated with the bucket owner's MFA device and carries no `x-amz-mfa` header:
+/// "Mfa Authentication must be used for this request".
+///
+/// Fixed text naming the authentication the request is missing, which is the condition
+/// itself: nothing of the request — no member path, no bucket name, no device serial — is
+/// interpolated into it. What asks for that authentication is MFA Delete: turning it on, or
+/// changing the versioning state of a bucket it is already in force on.
+pub const MFA_AUTHENTICATION_REQUIRED_MESSAGE: &str =
+    "Mfa Authentication must be used for this request";
+
 /// "The policy must be a valid JSON policy document."
 pub const MALFORMED_POLICY_CODE: &str = "MalformedPolicy";
 /// See [`MALFORMED_POLICY_CODE`].

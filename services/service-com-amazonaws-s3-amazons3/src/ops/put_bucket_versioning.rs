@@ -5,8 +5,10 @@
 //! Sets the versioning state of an existing bucket: the submitted
 //! `VersioningConfiguration` is recorded on the named bucket's state and the operation
 //! answers 200 with an empty body, so `GetBucketVersioning` reports exactly what was
-//! last put. A configuration that names no usable `Status` is refused, and a bucket this
-//! emulator does not hold is `NoSuchBucket` (404).
+//! last put. A configuration that names no usable `Status` is refused, a configuration that
+//! turns MFA Delete on (or changes the state of a bucket MFA Delete is already in force on)
+//! without the `x-amz-mfa` header is refused, and a bucket this emulator does not hold is
+//! `NoSuchBucket` (404).
 //!
 //! Object-level versioning is not performed HERE, but it follows from what this operation
 //! records: a bucket whose `Status` is `Enabled` makes every later `PutObject` store a new
@@ -268,10 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you are the bucket owner and want to enable MFA Delete in the bucket
         // versioning configuration, you must include the x-amz-mfa request header and
         // the Status and the MfaDelete request elements in a request to set the
-        // versioning state of the bucket" (this operation's documentation): a
-        // configuration naming `MfaDelete` without that header, or naming a value
-        // outside `MFADelete`'s pair, is again a configuration that cannot be applied.
-        if let Some(mfa_delete) = configuration.mfa_delete.as_deref() {
+        // versioning state of the bucket" (this operation's documentation): a value
+        // outside `MFADelete`'s pair is again a configuration that cannot be applied.
+        // Whether the x-amz-mfa header is REQUIRED depends on the bucket, so it is
+        // judged below, once the bucket is in hand.
+        let mfa_delete = configuration.mfa_delete.as_deref();
+        if let Some(mfa_delete) = mfa_delete {
             if !M_F_A_DELETE_VALUES.contains(&mfa_delete) {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::ILLEGAL_VERSIONING_CONFIGURATION_CODE,
@@ -282,14 +286,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
-            if input.mfa.is_none() {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::ILLEGAL_VERSIONING_CONFIGURATION_CODE,
-                    400,
-                    "VersioningConfiguration.MfaDelete requires the x-amz-mfa request \
-                     header, which this request does not carry",
-                ));
-            }
         }
 
         // The configuration is judged BEFORE the store is touched, so a refused request
@@ -298,6 +294,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             return Err(PutBucketVersioningErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+
+        // MFA authentication is what MFA Delete itself asks for, and only where it is in
+        // play: the header is required to ENABLE MFA Delete ("you must include the
+        // x-amz-mfa request header and the Status and the MfaDelete request elements", this
+        // operation's documentation) and to change the versioning state of a bucket MFA
+        // Delete is already in force on (Amazon S3 User Guide, *Configuring MFA delete*:
+        // with MFA delete enabled, a request to change the bucket's versioning state must
+        // include the header). Everything else — a configuration naming no MfaDelete, or
+        // naming it `Disabled`, on a bucket it is not in force on — is a configuration the
+        // service applies with no MFA at all. A request that needs the authentication and
+        // carries none is refused for the REQUEST, which is what `InvalidRequest` reports
+        // (HTTP 400); the code is not a shape in this model, so it goes out through the
+        // unmodelled channel.
+        let enabling_mfa_delete = mfa_delete == Some(crate::state::MFA_DELETE_ENABLED_STATUS);
+        if (enabling_mfa_delete || bucket.mfa_delete_in_force()) && input.mfa.is_none() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::MFA_AUTHENTICATION_REQUIRED_MESSAGE,
+            ));
+        }
 
         // "Object Lock works only in versioned buckets" (Amazon S3 User Guide, *Using S3
         // Object Lock*), and a lock is placed for the life of the bucket: a retention is
@@ -316,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        bucket.set_versioning(status, configuration.mfa_delete.as_deref());
+        bucket.set_versioning(status, mfa_delete);
 
         // `Unit` output: success is the 200 and an empty body.
         Ok(PutBucketVersioningOutput)

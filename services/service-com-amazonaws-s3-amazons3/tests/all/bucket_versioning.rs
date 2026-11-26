@@ -22,6 +22,10 @@
 //!    emulator's account is `AccessDenied` (403).
 //! 4. Each bucket carries its own versioning state: setting one bucket's leaves every
 //!    other bucket's alone.
+//!
+//! WHEN the `x-amz-mfa` header is required is its own rule, covered over the whole class of
+//! inputs by [`super::bucket_versioning_mfa_delete`]; the rows here carry the header exactly
+//! where that rule asks for it.
 
 use std::sync::Arc;
 
@@ -186,13 +190,21 @@ async fn a_bucket_versioning_state_round_trips_and_a_put_replaces_it() {
         ));
     }
 
+    // Whether MFA Delete is in force when a row's put arrives: the row before it left the
+    // bucket in that state.
+    let mut mfa_delete_in_force = false;
     for (label, status, mfa_delete) in &rows {
-        // "you must include the x-amz-mfa request header and the Status and the MfaDelete
-        // request elements" — a row carrying `MfaDelete` carries the header too.
-        let headers: Vec<(&str, &str)> = match mfa_delete {
-            Some(_) => vec![("x-amz-mfa", "arn:aws:iam::123456789012:mfa/device 123456")],
-            None => Vec::new(),
+        // The x-amz-mfa header is carried exactly where this operation requires it: to
+        // turn MFA Delete on, and to change the versioning state of a bucket MFA Delete
+        // is already in force on. Every other row goes without it — including the rows
+        // that set `MfaDelete` to `Disabled`.
+        let required = *mfa_delete == Some("Enabled") || mfa_delete_in_force;
+        let headers: Vec<(&str, &str)> = if required {
+            vec![("x-amz-mfa", "arn:aws:iam::123456789012:mfa/device 123456")]
+        } else {
+            Vec::new()
         };
+        mfa_delete_in_force = *mfa_delete == Some("Enabled");
         let answer = send(
             &router,
             "PUT",
@@ -280,11 +292,6 @@ async fn a_versioning_configuration_naming_no_settable_state_is_refused() {
         (
             "a Status differing only in case",
             configuration(Some("enabled"), None),
-            Vec::new(),
-        ),
-        (
-            "MfaDelete without the x-amz-mfa header",
-            configuration(Some("Suspended"), Some("Enabled")),
             Vec::new(),
         ),
     ];

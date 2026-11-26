@@ -549,6 +549,19 @@ impl Bucket {
             .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
     }
 
+    /// Whether MFA Delete is in force on the bucket: its recorded versioning configuration
+    /// carries the `Enabled` MFA Delete status.
+    ///
+    /// A bucket whose versioning state has never been set, or whose configuration names no
+    /// MFA Delete, or names it `Disabled`, has it NOT in force — "Specifies whether MFA
+    /// delete is enabled in the bucket versioning configuration"
+    /// (`GetBucketVersioningOutput$MFADelete`) — so only the `Enabled` value is.
+    pub fn mfa_delete_in_force(&self) -> bool {
+        self.versioning.as_ref().is_some_and(|versioning| {
+            versioning.mfa_delete.as_deref() == Some(MFA_DELETE_ENABLED_STATUS)
+        })
+    }
+
     /// Whether S3 Object Lock is enabled on the bucket — see [`Self::object_lock_enabled`].
     ///
     /// A pure read: a bucket Object Lock was never enabled on carries no configuration,

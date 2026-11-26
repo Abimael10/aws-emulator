@@ -267,6 +267,14 @@ pub const VERSIONING_ENABLED_STATUS: &str = "Enabled";
 /// never versioned at all.
 pub const VERSIONING_SUSPENDED_STATUS: &str = "Suspended";
 
+/// The `MFADelete`/`MFADeleteStatus` value that puts MFA Delete in force on a bucket.
+///
+/// "Specifies whether MFA delete is enabled in the bucket versioning configuration"
+/// (`GetBucketVersioningOutput$MFADelete`), and `Enabled` is one of the two values both
+/// enums take (`M_F_A_DELETE_VALUES`) — the other, `Disabled`, is MFA Delete configured
+/// and OFF, which is not in force.
+pub const MFA_DELETE_ENABLED_STATUS: &str = "Enabled";
+
 /// Who pays for downloads from a bucket whose request payment configuration has never
 /// been set.
 ///
