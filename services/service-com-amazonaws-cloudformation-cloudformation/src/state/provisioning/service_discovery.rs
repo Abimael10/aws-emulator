@@ -151,6 +151,48 @@ const ERROR_CODE_MEMBER: &str = "ErrorCode";
 /// failed. For the failure reason, see `ErrorMessage`").
 const OPERATION_FAILED: &str = "FAIL";
 
+/// The `OperationStatus` value that says the operation was carried out ("SUCCESS: the operation
+/// succeeded"), which is the only state a resource the operation CREATES exists in.
+const OPERATION_SUCCEEDED: &str = "SUCCESS";
+
+/// The `OperationType` a namespace create files, whichever of the three namespace calls made it
+/// (`smithy_query(query="shape",shape="OperationType")`): each of `CreateHttpNamespace`,
+/// `CreatePublicDnsNamespace` and `CreatePrivateDnsNamespace` answers an `OperationId` and
+/// reports the creation's outcome through that one operation.
+const CREATE_NAMESPACE_OPERATION: &str = "CREATE_NAMESPACE";
+
+/// The `ListOperations` members a filtered listing carries: the filter list, the page bound and
+/// the page cursor.
+const FILTERS_MEMBER: &str = "Filters";
+/// See [`FILTERS_MEMBER`].
+const VALUES_MEMBER: &str = "Values";
+/// See [`FILTERS_MEMBER`].
+const MAX_RESULTS_MEMBER: &str = "MaxResults";
+/// See [`FILTERS_MEMBER`].
+const NEXT_TOKEN_MEMBER: &str = "NextToken";
+/// The member `ListOperations` answers the page of operation summaries under.
+const OPERATIONS_MEMBER: &str = "Operations";
+
+/// The `OperationFilterName` values that pick out ONE namespace's operations and ONE kind of
+/// operation ("NAMESPACE_ID: gets operations related to specified namespaces", "TYPE: gets
+/// specified types of operation"), both of which `EQ` — the default condition — supports.
+const NAMESPACE_ID_FILTER: &str = "NAMESPACE_ID";
+/// See [`NAMESPACE_ID_FILTER`].
+const TYPE_FILTER: &str = "TYPE";
+
+/// How many operations one page of the listing asks for: the top of `ListOperations`'
+/// `MaxResults` range (1..100), so the account's operations are read in as few round trips as
+/// they can be.
+const OPERATION_PAGE_SIZE: i64 = 100;
+
+/// How many pages one readiness read walks before it gives up looking.
+///
+/// `ListOperations` "gets MaxResults operations and then filters them based on the specified
+/// criteria", so a page may answer empty while a later one carries the match — and the listing
+/// has to be walked rather than read once. This is the backstop that keeps one readiness read
+/// finite whatever the account holds.
+const MAX_OPERATION_PAGES: usize = 64;
+
 /// The key of `Operation$Targets` naming the NAMESPACE an operation acted on, which is where
 /// the id a namespace create minted reaches the caller.
 const NAMESPACE_TARGET: &str = "NAMESPACE";
@@ -407,15 +449,131 @@ fn register_request(declared: &Value, resource: &StoredResource) -> Result<Value
 
 /// Whether Cloud Map reports the created resource ready.
 ///
-/// Nothing is asked, and nothing waits. Cloud Map holds each of these resources from the moment
-/// the call that makes it has answered — the namespace create's own operation names the
-/// namespace `GetNamespace` then reports, `CreateService` answers the service itself and
-/// `RegisterInstance` leaves the instance registered — and none of `Namespace`, `Service` and
-/// `Instance` publishes a status member at all
+/// A NAMESPACE is created ASYNCHRONOUSLY: each of the three namespace calls answers an
+/// `OperationId` and nothing else, and that operation is the only channel the creation's outcome
+/// reaches a caller on ("SUBMITTED: this is the initial state immediately after you submit a
+/// request", "SUCCESS: the operation succeeded", "FAIL: the operation failed"). So the resource
+/// is held open until that operation is TERMINAL: a namespace whose create has not settled is
+/// not one a client can use, and one whose create lands `FAIL` is a namespace that does not
+/// exist — Cloud Map rolls the staged record back — so the resource fails with that operation's
+/// own reason rather than being reported created.
+///
+/// A SERVICE and an INSTANCE wait for nothing: `CreateService` answers the service itself, and
+/// `RegisterInstance`'s operation records a registration that service already holds. Neither
+/// `Service` nor `Instance` publishes a status member at all
 /// (`smithy_query(query="shape",shape="Namespace,Service")`), so there is no non-terminal state
-/// for a resource of one of these types to settle out of.
-pub(super) fn ready() -> Readiness {
-    Readiness::Ready
+/// for one of them to settle out of.
+pub(super) async fn readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    match kind {
+        Kind::HttpNamespace | Kind::PublicDnsNamespace | Kind::PrivateDnsNamespace => {
+            namespace_readiness(ctx, region, physical_resource_id).await
+        }
+        Kind::Service | Kind::Instance => Ok(Readiness::Ready),
+    }
+}
+
+/// Where the `CREATE_NAMESPACE` operation of ONE namespace has got to.
+///
+/// Cloud Map reports no operation for the namespace only once nothing filed one for it, which
+/// no create this module makes leaves behind: that answer is read as nothing left to wait for,
+/// for the reason every other cross-service pre-flight in this crate fails open — one
+/// unanswered read is no evidence about the resource.
+async fn namespace_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    namespace_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some((operation_id, status)) = namespace_create_operation(ctx, region, namespace_id).await?
+    else {
+        return Ok(Readiness::Ready);
+    };
+    match status.as_str() {
+        OPERATION_SUCCEEDED => Ok(Readiness::Ready),
+        // Cloud Map's own report about the creation, quoted as that service worded it: the
+        // `ErrorMessage` of the operation that failed ("if the value of `Status` is `FAIL`, the
+        // reason that the operation failed"), and the `ErrorCode` beside it where that is all
+        // the operation carries.
+        OPERATION_FAILED => Ok(Readiness::Failed(
+            operation_failure(ctx, region, &operation_id).await?,
+        )),
+        pending => Ok(Readiness::Pending(pending.to_string())),
+    }
+}
+
+/// The id and the status of the `CREATE_NAMESPACE` operation that made the namespace
+/// `namespace_id`, or `None` where Cloud Map reports none.
+///
+/// Found through `ListOperations`, whose `NAMESPACE_ID` and `TYPE` filters name exactly that
+/// operation ("if you specify more than one filter, an operation must match all filters to be
+/// returned by `ListOperations`") — the id the create answered with is not what addresses the
+/// namespace, so it is the namespace that addresses the operation here.
+async fn namespace_create_operation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    namespace_id: &str,
+) -> Result<Option<(String, String)>, Refusal> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_OPERATION_PAGES {
+        let mut request = Map::new();
+        request.insert(
+            FILTERS_MEMBER.to_string(),
+            serde_json::json!([
+                { NAME_MEMBER: NAMESPACE_ID_FILTER, VALUES_MEMBER: [namespace_id] },
+                { NAME_MEMBER: TYPE_FILTER, VALUES_MEMBER: [CREATE_NAMESPACE_OPERATION] },
+            ]),
+        );
+        request.insert(
+            MAX_RESULTS_MEMBER.to_string(),
+            Value::from(OPERATION_PAGE_SIZE),
+        );
+        if let Some(token) = cursor {
+            request.insert(NEXT_TOKEN_MEMBER.to_string(), Value::String(token));
+        }
+        let answered =
+            call_cloud_map(ctx, region, "ListOperations", &Value::Object(request)).await?;
+        let found = answered
+            .get(OPERATIONS_MEMBER)
+            .and_then(Value::as_array)
+            .and_then(|page| {
+                page.iter().find_map(|summary| {
+                    Some((
+                        text_member(summary, ID_MEMBER)?,
+                        text_member(summary, STATUS_MEMBER)?,
+                    ))
+                })
+            });
+        if found.is_some() {
+            return Ok(found);
+        }
+        // A page carrying a cursor has operations beyond it, which the match may be among.
+        match text_member(&answered, NEXT_TOKEN_MEMBER) {
+            Some(token) => cursor = Some(token),
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// What Cloud Map says a FAILED operation failed for: its `ErrorMessage`, which is the sentence
+/// that service worded about the creation, and its `ErrorCode` where it carries no message.
+async fn operation_failure(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation_id: &str,
+) -> Result<String, Refusal> {
+    let request = serde_json::json!({ OPERATION_ID_MEMBER: operation_id });
+    let answered = call_cloud_map(ctx, region, "GetOperation", &request).await?;
+    let operation = answered.get(OPERATION_MEMBER).cloned().unwrap_or(Value::Null);
+    Ok(text_member(&operation, ERROR_MESSAGE_MEMBER)
+        .or_else(|| text_member(&operation, ERROR_CODE_MEMBER))
+        .unwrap_or_else(|| {
+            format!("Cloud Map reports the operation {operation_id} as {OPERATION_FAILED}")
+        }))
 }
 
 /// The values Cloud Map publishes for a resource it now reports up.

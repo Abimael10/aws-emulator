@@ -500,11 +500,15 @@ impl Owner {
                 appsync_event_and_merged_apis::readiness(ctx, region, kind, physical_resource_id)
                     .await
             }
-            // Cloud Map holds a namespace, a service and an instance from the moment the call
-            // that makes it has answered, and none of those shapes publishes a status member at
-            // all, so nothing is asked and nothing waits
-            // ([`service_discovery::ready`]).
-            Self::ServiceDiscovery(_) => Ok(service_discovery::ready()),
+            // A SERVICE and an INSTANCE exist from the moment the call that makes one has
+            // answered; a NAMESPACE is created ASYNCHRONOUSLY — its create answers an
+            // `OperationId` and reports the outcome through that operation alone — so that arm
+            // holds the resource open until Cloud Map reports the operation terminal, and fails
+            // it with the operation's own reason when it lands FAIL
+            // ([`service_discovery::readiness`]).
+            Self::ServiceDiscovery(kind) => {
+                service_discovery::readiness(ctx, region, kind, physical_resource_id).await
+            }
             // A WORKGROUP exists as its create answers and publishes no status at all, and so
             // does a SAVED QUERY; a DATA CATALOG publishes one, and Athena creates a federated
             // catalog asynchronously, so that arm asks ([`athena_resources::readiness`]).
