@@ -514,7 +514,9 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
 /// is not part of the request it ties, and every member the handler NORMALISES
 /// before acting — the accounts an association request names
 /// ([`distinct_account_ids`]), a member read only by membership
-/// ([`canonical_membership`]) — carry the normalised value in the probe. Two
+/// ([`canonical_membership`]), a member a create leaves out and the handler
+/// materialises a value for ([`DEFAULT_RULE_DESCRIPTION`],
+/// [`DEFAULT_RULE_PRIORITY`]) — carry the normalised value in the probe. Two
 /// spellings of one request therefore replay, exactly as two spellings of one
 /// query continue one page walk ([`page_fingerprint`]), while every difference
 /// the service does act on still digests differently and is still refused.

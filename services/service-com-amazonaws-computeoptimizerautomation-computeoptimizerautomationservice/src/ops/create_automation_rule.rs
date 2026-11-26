@@ -236,13 +236,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The three members this create NORMALISES, read here — once — so that
+        // the client-token fingerprint below and the rule stored further down
+        // are taken over one and the same reading of the request. `description`
+        // and `priority` are optional in the request but the service reports
+        // both for every rule it holds, so a create that named neither acts on
+        // the values the service itself materialises (the empty description, and
+        // the bottom of the precedence order) rather than on an absence every
+        // read path would propagate, and an absent `tags` is the empty list.
+        let description = input
+            .description
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_RULE_DESCRIPTION.to_string());
+        let priority = input
+            .priority
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_RULE_PRIORITY.to_string());
+        let tags = input.tags.clone().unwrap_or_default();
+
         // The request as THIS handler reads it, which is what its client token
-        // ties (`crate::state::request_fingerprint`): only the token itself is
-        // left out. Every other member is STORED as sent and reported back in
-        // that spelling, so none is normalised here and any difference in one
-        // is a different request.
+        // ties (`crate::state::request_fingerprint`): the token itself is left
+        // out, and the three members normalised above carry the value this
+        // handler ACTS ON rather than the spelling the request arrived in — a
+        // create that omits one of them and a create that spells it as exactly
+        // the value the service materialises for it mint the identical rule and
+        // answer identically, so they are one request and the second replays.
+        // Every other member is STORED as sent and reported back in that
+        // spelling, so any difference in one of those is a different request.
         let request_fingerprint = crate::state::request_fingerprint(&input, |probe| {
             probe.client_token = None;
+            probe.description = Some(description.clone());
+            probe.priority = Some(priority.clone());
+            probe.tags = Some(tags.clone());
         });
         let client_token = input.client_token.as_deref();
 
@@ -339,27 +364,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule_id,
             account_id,
             name: input.name,
-            // `description` and `priority` are optional in the request but the
-            // service reports both for every rule it holds, so a create that
-            // named neither stores the values the service itself materialises
-            // (the empty description, and the bottom of the precedence order)
-            // rather than an absence every read path would propagate. A rule
-            // that has never been updated was last changed when it was created,
-            // which IS known, so that one is materialised here too.
-            description: input
-                .description
-                .unwrap_or_else(|| crate::state::DEFAULT_RULE_DESCRIPTION.to_string()),
+            // The values read ABOVE, where this handler's one reading of the
+            // request's optional members is made (and which its client token
+            // therefore ties): a rule that has never been updated was last
+            // changed when it was created, which IS known, so that one is
+            // materialised here too.
+            description,
             rule_type: input.rule_type,
             rule_revision: crate::state::INITIAL_RULE_REVISION,
             organization_configuration: input.organization_configuration,
-            priority: input
-                .priority
-                .unwrap_or_else(|| crate::state::DEFAULT_RULE_PRIORITY.to_string()),
+            priority,
             recommended_action_types: input.recommended_action_types,
             criteria: input.criteria,
             schedule: input.schedule,
             status: input.status,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             created_timestamp: created_at,
             last_updated_timestamp: created_at,
         };
