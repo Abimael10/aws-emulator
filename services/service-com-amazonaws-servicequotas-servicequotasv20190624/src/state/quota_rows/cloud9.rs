@@ -13,19 +13,22 @@ use super::*;
 /// which NAMES THE SERVICE ("AWS Cloud9 <kind> development environments") and the plane the
 /// environments are created on. One constructor fills them, so two rows of the class cannot
 /// drift apart and no row loses the service's name out of its text.
+///
+/// The sentence names ONE plane: the plane the row counts on. The account's rows end "that
+/// you can create in this account in the current Region." and the user's rows "that you can
+/// create for this user in the current Region." — the user's rows do not name the account as
+/// well, which is what the recorded listing of this service carries on both of them.
 fn development_environments(code: &str, kind: &str, plane: &str, value: f64) -> QuotaRow {
-    // On the account's plane the sentence is about what the caller's own account holds; on
-    // the user's plane the same sentence names the user the environments are counted for.
-    let per_user = if plane == "this user" {
-        " for each user"
+    let counted_on = if plane == "this user" {
+        "for this user in the current Region"
     } else {
-        ""
+        "in this account in the current Region"
     };
     quota(format!("{kind} development environments for {plane}"), value)
         .code(code)
         .describe(&format!(
             "The maximum number of AWS Cloud9 {kind} development environments that you can \
-             create{per_user} in this account in the current Region."
+             create {counted_on}."
         ))
 }
 

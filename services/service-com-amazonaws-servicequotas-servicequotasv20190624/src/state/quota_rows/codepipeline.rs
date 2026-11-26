@@ -15,6 +15,23 @@ fn the_maximum_number_of(counted: &str) -> String {
     format!("The maximum number of {counted}")
 }
 
+/// One CodePipeline quota description for what a STAGE, a PIPELINE or a CONDITION may
+/// hold: the service states what is "allowed in" that plane, as a sentence.
+///
+/// SOURCE: the recorded default-quota listing of `codepipeline`, which words every row
+/// counted on one of those planes this way (the parallel-execution ceiling among them)
+/// while its ACCOUNT-wide planes are counted "per region in an AWS account". One
+/// constructor fills the class so two rows of it cannot drift apart.
+fn allowed_in(counted: &str, plane: &str) -> String {
+    the_maximum_number_of(&format!("{counted} allowed in a {plane}."))
+}
+
+/// The LOWER bound of what a stage or a pipeline may hold, in the same voice as
+/// [`allowed_in`].
+fn least_allowed_in(counted: &str, plane: &str) -> String {
+    the_minimum_number_of(&format!("{counted} allowed in a {plane}."))
+}
+
 /// One CodePipeline quota description for a LOWER bound: the fewest of something a pipeline
 /// or a stage may hold, which the service publishes beside its upper bounds.
 fn the_minimum_number_of(counted: &str) -> String {
@@ -37,16 +54,14 @@ pub(in crate::state) fn codepipeline_quotas() -> Vec<QuotaRow> {
         quota("Active executions per pipeline", 50.0)
             .code("L-0097A9B4")
             .fixed()
-            .describe(
-                "The maximum number of active executions allowed in a PARALLEL execution \
-                 mode pipeline.",
-            ),
-        quota("Total pipelines", 1000.0)
+            .describe(&allowed_in(
+                "active executions",
+                "PARALLEL execution mode pipeline",
+            )),
+        quota("Total actions per pipeline", 1000.0)
             .code("L-1402209C")
             .fixed()
-            .describe(&the_maximum_number_of(
-                "pipelines per region in an AWS account",
-            )),
+            .describe(&allowed_in("actions", "pipeline")),
         quota("Total V2 type pipelines", 1000.0)
             .code("L-182AE5D8")
             .fixed()
@@ -61,18 +76,18 @@ pub(in crate::state) fn codepipeline_quotas() -> Vec<QuotaRow> {
         quota("Total parallel actions per stage", 100.0)
             .code("L-2B3011E2")
             .fixed()
-            .describe(&the_maximum_number_of("parallel actions per stage")),
+            .describe(&allowed_in("parallel actions", "stage")),
         quota("Total sequential actions per stage", 100.0)
             .code("L-31A751EC")
             .fixed()
-            .describe(&the_maximum_number_of("sequential actions per stage")),
+            .describe(&allowed_in("sequential actions", "stage")),
         quota("Maximum actions per stage", 50.0)
             .code("L-3ECA8567")
             .fixed()
-            .describe(&the_maximum_number_of("actions per stage")),
+            .describe(&allowed_in("actions", "stage")),
         quota("Total variables per pipeline", 50.0)
             .code("L-447DD651")
-            .describe(&the_maximum_number_of("variables per pipeline")),
+            .describe(&allowed_in("variables", "pipeline")),
         quota("Total custom actions", 50.0)
             .code("L-519D5A90")
             .describe(&the_maximum_number_of(
@@ -81,18 +96,20 @@ pub(in crate::state) fn codepipeline_quotas() -> Vec<QuotaRow> {
         quota("Total triggers per pipeline", 50.0)
             .code("L-570F1605")
             .fixed()
-            .describe(&the_maximum_number_of("triggers per pipeline")),
+            .describe(&allowed_in("triggers", "pipeline")),
         quota("Total rules per condition", 5.0)
             .code("L-5AA45A27")
-            .describe(&the_maximum_number_of("rules per condition")),
+            .describe(&allowed_in("rules", "condition")),
         quota("Total conditions per stage", 5.0)
             .code("L-6F95DA01")
             .fixed()
-            .describe(&the_maximum_number_of("conditions per stage")),
-        quota("Maximum artifact size", 5.0)
+            .describe(&allowed_in("conditions", "stage")),
+        quota("Total pipelines", 1000.0)
             .code("L-78D200AD")
-            .unit("Gigabytes")
-            .describe("The maximum size, in gigabytes, of an input or output artifact."),
+            .fixed()
+            .describe(&the_maximum_number_of(
+                "pipelines per region in an AWS account",
+            )),
         quota("Maximum revision size", 5.0)
             .code("L-87C878A5")
             .unit("Megabytes")
@@ -114,7 +131,7 @@ pub(in crate::state) fn codepipeline_quotas() -> Vec<QuotaRow> {
         quota("Total stages per pipeline", 50.0)
             .code("L-A0A99E23")
             .fixed()
-            .describe(&the_maximum_number_of("stages per pipeline")),
+            .describe(&allowed_in("stages", "pipeline")),
         quota("Maximum timeout for test actions", 8.0)
             .code("L-A95CB60D")
             .unit("Hours")
@@ -127,18 +144,25 @@ pub(in crate::state) fn codepipeline_quotas() -> Vec<QuotaRow> {
         quota("Minimum actions", 1.0)
             .code("L-C57FFB43")
             .fixed()
-            .describe(&the_minimum_number_of("actions per stage")),
-        quota("Maximum pipeline executions in the queue", 50.0)
-            .code("L-C5885C1C")
-            .fixed()
-            .describe(&the_maximum_number_of("pipeline executions in the queue")),
+            .describe(&least_allowed_in("actions", "stage")),
+        quota(
+            "Total pipelines with change detection set to periodically checking for source \
+             changes",
+            300.0,
+        )
+        .code("L-C5885C1C")
+        .fixed()
+        .describe(&the_maximum_number_of(
+            "pipelines with change detection set to periodically checking for source changes \
+             per region in an AWS account",
+        )),
         quota("Minimum stages per pipeline", 2.0)
             .code("L-C8CB041B")
             .fixed()
-            .describe(&the_minimum_number_of("stages per pipeline")),
+            .describe(&least_allowed_in("stages", "pipeline")),
         quota("Total tags per pipeline", 50.0)
             .code("L-CE1F2EE9")
-            .describe(&the_maximum_number_of("tags per pipeline")),
+            .describe(&allowed_in("tags", "pipeline")),
         quota("Total action types", 50.0)
             .code("L-DCBA35EE")
             .fixed()

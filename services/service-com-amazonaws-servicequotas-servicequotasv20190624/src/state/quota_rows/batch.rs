@@ -42,6 +42,11 @@ fn transactions_per_second(code: &str, api_name: &str, per_second: f64) -> Quota
 /// Batch publishes its whole default set as NOT adjustable — the recorded listing reports
 /// it so for the account's compute-environment and job-queue limits as much as for its
 /// per-API throttles — so every row here is fixed.
+///
+/// Batch publishes a throttle for only SOME of its operations: the per-job-queue
+/// compute-environment, share-identifier, service-environment and service-job-payload
+/// quotas are published under codes a hand-keyed table had given to throttles of other
+/// operations, and a plane left with no code of its own is published under no row at all.
 pub(in crate::state) fn batch_quotas() -> Vec<QuotaRow> {
     vec![
         // The newer service-job plane's submission throttle, which AWS publishes without
@@ -61,11 +66,13 @@ pub(in crate::state) fn batch_quotas() -> Vec<QuotaRow> {
             .code("L-4CEA37AD")
             .fixed()
             .describe("Maximum number of job queues per account, per region."),
-        quota("Maximum number of compute environments per job queue", 3.0)
+        // The account's service-environment plane, which Batch publishes beside the
+        // per-job-queue one (`L-80D92D24`) under the singular name below.
+        quota("Service environment", 50.0)
             .code("L-61E3E54E")
             .fixed()
-            .describe("Maximum number of compute environments per job queue."),
-        quota("Maximum number of jobs in SUBMITTED state", 1_000_000.0)
+            .describe("Maximum number of service environments per account, per region."),
+        quota("Submitted state jobs limit", 1_000_000.0)
             .code("L-65F8BA2C")
             .fixed()
             .describe("Maximum number of jobs in SUBMITTED state."),
@@ -79,6 +86,9 @@ pub(in crate::state) fn batch_quotas() -> Vec<QuotaRow> {
             .code("L-80D92D24")
             .fixed()
             .describe("Maximum number of service environments per job queue."),
+        // UNSOURCED BINDING: no source names the quota Batch publishes under
+        // `L-A2F30F35`, so the code goes on answering the row it has answered rather than
+        // resolving to nothing. It is replaced the moment that quota can be sourced.
         quota("Scheduling policy limit", 100.0)
             .code("L-A2F30F35")
             .fixed()
@@ -87,11 +97,19 @@ pub(in crate::state) fn batch_quotas() -> Vec<QuotaRow> {
             .code("L-AD075A76")
             .fixed()
             .describe("Maximum number of job dependencies per job."),
-        quota("Consumable resource limit", 50.0)
+        // The service-job plane's payload ceiling, which Batch publishes beside the
+        // SubmitJob one (`L-6B86CF1E`) in the same measured-size voice and at the same KiB.
+        quota("SubmitServiceJob total payload size limit", 30.0)
             .code("L-B15D0E72")
             .fixed()
-            .describe("Maximum number of consumable resources per account, per region."),
-        transactions_per_second("L-C997A649", "RegisterJobDefinition", 50.0),
+            .describe(
+                "Maximum total payload size (for SubmitServiceJob API operations), measured \
+                 in KiB.",
+            ),
+        quota("Share identifiers per job queue limit.", 500.0)
+            .code("L-C997A649")
+            .fixed()
+            .describe("Maximum number of share identifiers per job queue."),
         quota("Job definition size limit", 24.0)
             .code("L-E6A2743D")
             .fixed()
@@ -100,10 +118,13 @@ pub(in crate::state) fn batch_quotas() -> Vec<QuotaRow> {
                  measured in KiB.",
             ),
         transactions_per_second("L-E985971C", "SubmitJob", 50.0),
-        transactions_per_second("L-F8102809", "DescribeJobs", 50.0),
+        quota("Compute environments per job queue limit.", 3.0)
+            .code("L-F8102809")
+            .fixed()
+            .describe("Maximum number of compute environments per job queue."),
         quota("Maximum array size limit", 10_000.0)
             .code("L-F9381E33")
             .fixed()
-            .describe("Maximum array size."),
+            .describe("Maximum array size for array jobs."),
     ]
 }

@@ -46,8 +46,8 @@ fn api_throttle(code: &str, api_name: &str, per_second: f64) -> QuotaRow {
 /// SOURCE: AWS's published Service Quotas data for the `cloudtrail` service code, whose
 /// rows are dominated by this class — one per management API — and the recorded
 /// default-quota listing of that code for which `QuotaCode` names which API's throttle and
-/// for the rate each allows. `LookupEvents` is the one API of the class AWS publishes a
-/// lower rate for.
+/// for the rate each allows. `LookupEvents` and the trail-logging APIs are the ones AWS
+/// publishes a lower rate for.
 const API_THROTTLES: &[(&str, &str, f64)] = &[
     ("L-08F66A51", "AddTags", 10.0),
     ("L-0DE8FCE1", "CancelQuery", 10.0),
@@ -74,7 +74,7 @@ const API_THROTTLES: &[(&str, &str, f64)] = &[
     ("L-694E6530", "GetEventSelectors", 10.0),
     ("L-71DEA5C6", "GetInsightSelectors", 10.0),
     ("L-72996F38", "GetQueryResults", 10.0),
-    ("L-773FB33E", "GetResourcePolicy", 10.0),
+    ("L-773FB33E", "StartLogging", 1.0),
     ("L-7A3F9D4B", "GetTrail", 10.0),
     ("L-8191F390", "GetTrailStatus", 10.0),
     ("L-81CCF560", "ListChannels", 10.0),
@@ -88,6 +88,9 @@ const API_THROTTLES: &[(&str, &str, f64)] = &[
     ("L-9260AF5B", "ListTrails", 10.0),
     ("L-9387CED7", "LookupEvents", 2.0),
     ("L-A4CD5068", "ListImportFailures", 10.0),
+    // The trail-management throttles the service publishes at ONE transaction per second,
+    // rather than at the ten the rest of the class allows.
+    ("L-9552D44E", "StopLogging", 1.0),
     ("L-961309DE", "PutAuditEvents", 10.0),
     ("L-98AA9EBA", "PutEventConfiguration", 10.0),
     ("L-9B1A1B4A", "PutEventSelectors", 10.0),
@@ -100,11 +103,10 @@ const API_THROTTLES: &[(&str, &str, f64)] = &[
     ("L-BEA14027", "StartDashboardRefresh", 10.0),
     ("L-BEC68768", "StartEventDataStoreIngestion", 10.0),
     ("L-C46BC83A", "StartImport", 10.0),
-    ("L-C9DC023A", "StartLogging", 10.0),
+    ("L-C9DC023A", "GetResourcePolicy", 10.0),
     ("L-D0872747", "StartQuery", 10.0),
     ("L-D08C1460", "StopEventDataStoreIngestion", 10.0),
     ("L-E2417ECC", "StopImport", 10.0),
-    ("L-EA524270", "StopLogging", 10.0),
     ("L-EBC99F5D", "UpdateChannel", 10.0),
     ("L-EF071748", "UpdateDashboard", 10.0),
     ("L-F5FAD268", "UpdateEventDataStore", 10.0),
@@ -155,11 +157,13 @@ pub(in crate::state) fn cloudtrail_quotas() -> Vec<QuotaRow> {
                 "The maximum number of queries running at once in this account in the \
                  current Region.",
             ),
+        // SOURCE: the recorded default-quota listing of `cloudtrail`, which states this
+        // limit over one MONTH rather than over a single query.
         quota("Summarized query results size", 3.0)
             .code("L-3BB16389")
             .unit("Megabytes")
             .fixed()
-            .describe("The maximum size, in MB, of the results a query is summarized over."),
+            .describe("The maximum size, in MB, of the query results summarized in a month."),
         quota("Event selectors per trail", 5.0)
             .code("L-46286FE1")
             .fixed()
@@ -179,15 +183,21 @@ pub(in crate::state) fn cloudtrail_quotas() -> Vec<QuotaRow> {
                 "The maximum number of imports in progress at once in this account in the \
                  current Region.",
             ),
+        // UNSOURCED BINDING: no source names the quota CloudTrail publishes under
+        // `L-EA524270`, so the code answers the plane the StopLogging throttle displaced
+        // rather than resolving to nothing.
         quota("Trails per Region", 5.0)
-            .code("L-9552D44E")
+            .code("L-EA524270")
             .fixed()
             .describe("The maximum number of trails in this account in the current Region."),
-        quota("Maximum event size", 256.0)
+        // UNSOURCED MEMBERS: the size this file quota allows, and the unit it is measured
+        // in, are stated by no source, so the row carries the measured size the code
+        // carried before and only its published name and subject are sourced.
+        quota("CloudTrail file size sent to Amazon S3", 256.0)
             .code("L-A0136C1A")
             .unit("Kilobytes")
             .fixed()
-            .describe("The maximum size, in KB, of one event CloudTrail records."),
+            .describe("The maximum size of a CloudTrail file sent to Amazon S3."),
         quota("Query results retention period", 7.0)
             .code("L-CA6CC904")
             .unit("Days")

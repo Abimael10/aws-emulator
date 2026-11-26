@@ -28,6 +28,9 @@ fn maximum_number_of(counted: &str) -> String {
 /// counted on.
 pub(in crate::state) fn codedeploy_quotas() -> Vec<QuotaRow> {
     vec![
+        // UNSOURCED BINDING: no source names the quota CodeDeploy publishes under
+        // `L-0CB3C26F`, so the code goes on answering the row it has answered rather than
+        // resolving to nothing.
         quota("Applications in an AWS account", 1000.0)
             .code("L-0CB3C26F")
             .fixed()
@@ -47,21 +50,35 @@ pub(in crate::state) fn codedeploy_quotas() -> Vec<QuotaRow> {
         quota("Concurrent deployments in an AWS account", 1000.0)
             .code("L-3F19B6A5")
             .describe(&maximum_number_of("concurrent deployments in an AWS account")),
-        quota("Custom deployment configurations in an AWS account", 50.0)
-            .code("L-464411D9")
-            .describe(&maximum_number_of(
-                "custom deployment configurations in an AWS account",
-            )),
+        quota(
+            "Number of instances used by concurrent deployments that are in progress per \
+             account",
+            1000.0,
+        )
+        .code("L-464411D9")
+        .describe(&maximum_number_of(
+            "instances used by concurrent deployments that are in progress per account",
+        )),
         quota("Instances in a single deployment", 1000.0)
             .code("L-5AD34096")
             .fixed()
             .describe(&maximum_number_of("instances in a single deployment")),
-        quota("Instances in all concurrent deployments in an AWS account", 1000.0)
-            .code("L-5FB5F09F")
-            .fixed()
-            .describe(&maximum_number_of(
-                "instances in all concurrent deployments in an AWS account",
-            )),
+        // The traffic an AWS Lambda deployment may shift at once, which CodeDeploy
+        // publishes as a PERCENTAGE of the function's traffic rather than as a count.
+        // UNSOURCED MEMBER: the percentage it allows is stated by no source, so the row
+        // carries the whole of the traffic it may shift in one increment until that number
+        // can be sourced.
+        quota(
+            "Maximum percentage of traffic that can be shifted in one increment of an AWS \
+             Lambda deployment",
+            100.0,
+        )
+        .code("L-5FB5F09F")
+        .fixed()
+        .describe(&maximum_number_of(
+            "percentage points of traffic that can be shifted in one increment of an AWS \
+             Lambda deployment",
+        )),
         quota("On-premises instances registered in an AWS account", 1000.0)
             .code("L-604B54B8")
             .fixed()
@@ -108,7 +125,8 @@ pub(in crate::state) fn codedeploy_quotas() -> Vec<QuotaRow> {
             )),
         // The lifecycle-event start timeout. The recorded listing publishes it as a COUNT
         // (`Unit` `None`) rather than as a measured span, so the minutes are named by the
-        // quota's own text and the unit states none.
+        // quota's own text and the unit states none, and the sentence states the two events
+        // the timeout is counted FROM.
         quota(
             "Minutes until a deployment fails if a lifecycle event doesn't start",
             5.0,
@@ -116,7 +134,9 @@ pub(in crate::state) fn codedeploy_quotas() -> Vec<QuotaRow> {
         .code("L-9231961D")
         .fixed()
         .describe(&maximum_number_of(
-            "minutes until a deployment fails if a lifecycle event doesn't start",
+            "minutes until a deployment fails if a lifecycle event doesn't start after (1) a \
+             deployment is triggered by using the console or the AWS CLI create-deployment \
+             command, or (2) the previous lifecycle event is completed.",
         )),
         quota(
             "Target groups for a traffic route during an Amazon ECS deployment",
@@ -130,11 +150,15 @@ pub(in crate::state) fn codedeploy_quotas() -> Vec<QuotaRow> {
             .code("L-A58C473C")
             .fixed()
             .describe(&maximum_number_of("alarms in a deployment group")),
+        // The per-deployment-group concurrency ceiling, whose published sentence states
+        // what the limit is FOR beside the count itself.
         quota("Concurrent deployments per deployment group", 1.0)
             .code("L-A8B8B32B")
             .fixed()
             .describe(&maximum_number_of(
-                "concurrent deployments in a deployment group",
+                "concurrent deployments in a deployment group. This limit prevents \
+                 concurrent deployments of the same application to the same deployment \
+                 group.",
             )),
         quota("Hours a deployment can run", 8.0)
             .code("L-AB125F0B")
@@ -175,10 +199,12 @@ pub(in crate::state) fn codedeploy_quotas() -> Vec<QuotaRow> {
         .describe(&maximum_number_of(
             "listeners for a traffic route during an Amazon ECS deployment",
         )),
-        quota("Tags in a deployment group", 50.0)
+        quota("Size of deployment group name", 100.0)
             .code("L-D4ED2A8C")
             .fixed()
-            .describe(&maximum_number_of("tags in a deployment group")),
+            .describe(&maximum_number_of(
+                "characters in the name of a deployment group",
+            )),
         quota("Deployment groups associated with a single application", 1000.0)
             .code("L-D9088B77")
             .describe(&maximum_number_of(

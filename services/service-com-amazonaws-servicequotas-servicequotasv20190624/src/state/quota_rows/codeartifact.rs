@@ -35,24 +35,25 @@ fn requests_per_second(code: &str, api_name: &str, per_second: f64) -> QuotaRow 
 /// adjustability. Every row carries the `L-` code AWS publishes the quota under.
 pub(in crate::state) fn codeartifact_quotas() -> Vec<QuotaRow> {
     vec![
-        quota("Repositories per domain", 1000.0)
-            .code("L-0B362111")
-            .describe("The maximum number of repositories that can be created in a domain."),
-        quota("Upstream repositories per repository", 10.0)
-            .code("L-3072382D")
-            .describe(
-                "The maximum number of direct upstream repositories of a repository.",
-            ),
-        quota("Asset size", 5.0)
-            .code("L-308A4050")
-            .unit("Gigabytes")
-            .describe("The maximum size of an asset."),
+        // UNSOURCED BINDING: no source names the quota CodeArtifact publishes under
+        // `L-0B362111`, so the code answers the rate row the repositories-per-domain
+        // binding displaced rather than resolving to nothing.
+        requests_per_second("L-0B362111", "ListRepositories", 100.0),
+        // UNSOURCED BINDING: as above for `L-3072382D`, which answers the rate row the
+        // assets-per-package-version binding displaced.
+        requests_per_second("L-3072382D", "GetPackageVersionAsset", 100.0),
+        // UNSOURCED BINDING: as above for `L-308A4050`, which answers the rate row the
+        // asset-file-size binding displaced.
+        requests_per_second("L-308A4050", "DeletePackageVersions", 10.0),
         // Two rate rows the recorded listing publishes as NOT raisable: the token and
         // asset-download rates are properties of the service rather than ceilings an
         // account can have lifted.
         requests_per_second("L-37894301", "GetAuthorizationToken", 40.0).fixed(),
         requests_per_second("L-3E27C79F", "PublishPackageVersion", 10.0),
-        requests_per_second("L-5B2BD2E1", "GetPackageVersionAsset", 100.0).fixed(),
+        quota("Assets per package version", 350.0)
+            .code("L-5B2BD2E1")
+            .fixed()
+            .describe("The maximum number of assets of a package version."),
         quota("Upstream repositories searched", 25.0)
             .code("L-5D176989")
             .fixed()
@@ -62,9 +63,22 @@ pub(in crate::state) fn codeartifact_quotas() -> Vec<QuotaRow> {
             ),
         requests_per_second("L-6010CAF9", "ListPackages", 200.0),
         requests_per_second("L-6C12FB34", "DescribePackageVersion", 100.0),
-        requests_per_second("L-86608C96", "ListRepositories", 100.0),
-        requests_per_second("L-A649E766", "ListPackageVersionAssets", 100.0),
-        requests_per_second("L-AA0DC56D", "DeletePackageVersions", 10.0),
+        quota("Repositories per domain", 1000.0)
+            .code("L-86608C96")
+            .describe("The maximum number of repositories that can be created in a domain."),
+        // The ACCOUNT's write-request rate: a per-second ceiling on the writes one account
+        // may make, rather than a throttle of one operation, so it is published under its
+        // own name and sentence.
+        quota("Write requests per second from a single AWS account", 100.0)
+            .code("L-A649E766")
+            .period(1, "SECOND")
+            .describe(
+                "The maximum number of write requests per second from a single AWS account.",
+            ),
+        quota("Asset file size", 5.0)
+            .code("L-AA0DC56D")
+            .unit("Gigabytes")
+            .describe("The maximum size of an asset file."),
         // The ANONYMOUS request rate: a per-second ceiling on requests that carry no
         // authentication token, counted per source IP address rather than per account, and
         // published as one a client cannot have raised.
@@ -77,10 +91,9 @@ pub(in crate::state) fn codeartifact_quotas() -> Vec<QuotaRow> {
                  from a single IP address.",
             ),
         requests_per_second("L-CBBCDF5C", "ListPackageVersions", 200.0),
-        quota("Assets per package version", 100.0)
+        quota("Direct upstreams per repository", 10.0)
             .code("L-D42B1EF2")
-            .fixed()
-            .describe("The maximum number of assets of a package version."),
+            .describe("The maximum number of direct upstream repositories of a repository."),
         quota("Domains per AWS account", 10.0)
             .code("L-DD7208D3")
             .describe("The maximum number of domains that can be created per AWS account."),

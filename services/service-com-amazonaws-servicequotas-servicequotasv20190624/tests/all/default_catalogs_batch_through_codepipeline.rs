@@ -241,8 +241,8 @@ const ROWS: &[Row] = &[
     },
     Row {
         service_code: "cloudhsm",
-        quota_code: "L-F847CBBF",
-        quota_name: "Client connections per HSM",
+        quota_code: "L-0B35A0E6",
+        quota_name: "Number of concurrent clients",
         value: 900.0,
         unit: "None",
         adjustable: false,
@@ -744,7 +744,7 @@ const TEXTS: &[Text] = &[
         service_code: "cloudhsm",
         quota_code: "L-36814031",
         quota_name: "Keys per CloudHSM cluster",
-        description: "The maximum number of keys in a cluster of hsm1.medium HSMs.",
+        description: "The maximum number of keys that you can create in a CloudHSM cluster.",
     },
     Text {
         service_code: "cloudhsm",

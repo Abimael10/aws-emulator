@@ -17,6 +17,30 @@ fn with_quotas_reference(limit: &str) -> String {
     format!("{limit} For more information, see {KEYSPACES_QUOTAS_PAGE}")
 }
 
+/// One Amazon Keyspaces THROUGHPUT quota: the throughput one plane may have provisioned.
+///
+/// Keyspaces states a throughput limit PER SECOND and in both of the units a table is
+/// measured in — the capacity units of a provisioned table and the request units of an
+/// on-demand one (`RCUs`/`RRUs` for reads, `WCUs`/`WRUs` for writes) — and then refers the
+/// reader to its quotas page, so one constructor fills the whole class and two throughput
+/// rows cannot drift apart.
+///
+/// `provisioned` is the plane the throughput is provisioned on, as the quota's own text
+/// names it.
+fn throughput(code: &str, quota_name: &str, value: f64, read: bool, provisioned: &str) -> QuotaRow {
+    let (direction, capacity_units, request_units) = if read {
+        ("read", "RCUs", "RRUs")
+    } else {
+        ("write", "WCUs", "WRUs")
+    };
+    quota(quota_name, value)
+        .code(code)
+        .describe(&with_quotas_reference(&format!(
+            "The maximum {direction} throughput, in {capacity_units} and {request_units} per \
+             second, provisioned {provisioned}."
+        )))
+}
+
 /// Amazon Keyspaces (for Apache Cassandra)'s published default-quota catalog.
 ///
 /// SOURCE: AWS's published Service Quotas data for the `cassandra` service code (what `aws
@@ -38,33 +62,39 @@ pub(in crate::state) fn cassandra_quotas() -> Vec<QuotaRow> {
             .unit("Bytes")
             .fixed()
             .describe(&with_quotas_reference(
-                "The maximum combined size of all clustering columns in a row.",
+                "The maximum combined size of all clustering columns in a row. Up to 4 bytes \
+                 of additional storage are added to the raw size of each clustering column \
+                 for metadata.",
             )),
-        quota("Account-level read throughput quota", 80_000.0)
-            .code("L-089904FB")
-            .describe(&with_quotas_reference(
-                "The maximum read throughput, in read capacity units, provisioned across \
-                 all tables in this account in the current Region.",
-            )),
-        quota("Table-level read throughput quota", 40_000.0)
-            .code("L-17766544")
-            .describe(&with_quotas_reference(
-                "The maximum read throughput, in read capacity units, provisioned for a \
-                 single table.",
-            )),
-        quota("Account-level write throughput quota", 80_000.0)
-            .code("L-29E90199")
-            .fixed()
-            .describe(&with_quotas_reference(
-                "The maximum write throughput, in write capacity units, provisioned across \
-                 all tables in this account in the current Region.",
-            )),
-        quota("Table-level write throughput quota", 40_000.0)
-            .code("L-2C5B14BD")
-            .describe(&with_quotas_reference(
-                "The maximum write throughput, in write capacity units, provisioned for a \
-                 single table.",
-            )),
+        throughput(
+            "L-089904FB",
+            "Account-level read throughput quota",
+            80_000.0,
+            true,
+            "across all tables in this account in the current Region",
+        ),
+        throughput(
+            "L-17766544",
+            "Table-level read throughput quota",
+            40_000.0,
+            true,
+            "for a single table",
+        ),
+        throughput(
+            "L-29E90199",
+            "Account-level write throughput quota",
+            80_000.0,
+            false,
+            "across all tables in this account in the current Region",
+        )
+        .fixed(),
+        throughput(
+            "L-2C5B14BD",
+            "Table-level write throughput quota",
+            40_000.0,
+            false,
+            "for a single table",
+        ),
         quota("Max number of keyspaces per AWS Region", 256.0)
             .code("L-2FC1B9A1")
             .describe(
@@ -78,10 +108,16 @@ pub(in crate::state) fn cassandra_quotas() -> Vec<QuotaRow> {
                 "The maximum number of tables that can be created per region in this \
                  account.",
             ),
-        quota("Max row size", 1.0)
+        // UNSOURCED BINDING: no source names the quota Keyspaces publishes under
+        // `L-3D8ED127`, so the code answers the plane the row-size binding below displaced
+        // rather than resolving to nothing.
+        quota("Max number of concurrent restore operations", 4.0)
             .code("L-3D8ED127")
-            .unit("Megabytes")
-            .describe("The maximum size of a row, excluding static column data."),
+            .fixed()
+            .describe(
+                "The maximum number of concurrent table restores in this account in the \
+                 current Region.",
+            ),
         quota("Max partition key size", 2048.0)
             .code("L-4C49F3DB")
             .unit("Bytes")
@@ -94,19 +130,19 @@ pub(in crate::state) fn cassandra_quotas() -> Vec<QuotaRow> {
             .code("L-5823D982")
             .fixed()
             .describe("The maximum number of columns that a table can have."),
-        quota("Max number of concurrent table operations", 10.0)
-            .code("L-6632AD49")
-            .describe(
-                "The maximum number of concurrent table creations, deletions and updates in \
-                 this account in the current Region.",
-            ),
-        quota("Max number of concurrent restore operations", 4.0)
+        // The change-data-capture plane's write ceiling, which Keyspaces publishes beside
+        // the table-level one (`L-2C5B14BD`) in the same throughput voice.
+        throughput(
+            "L-6632AD49",
+            "Max write capacity for a table using change-data-capture (CDC)",
+            40_000.0,
+            false,
+            "for a table using change-data-capture (CDC)",
+        ),
+        quota("Max row size", 1.0)
             .code("L-66AD5703")
-            .fixed()
-            .describe(
-                "The maximum number of concurrent table restores in this account in the \
-                 current Region.",
-            ),
+            .unit("Megabytes")
+            .describe("The maximum size of a row, excluding static column data."),
         quota("Max number of tags per resource", 50.0)
             .code("L-66D0104D")
             .fixed()
