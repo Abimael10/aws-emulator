@@ -245,6 +245,21 @@ fn extension_failed(message: String) -> StartDeploymentError {
     .into()
 }
 
+/// A `BadRequestException` (HTTP 400) refusing the deployment because the READ AppConfig
+/// makes at the configuration's SOURCE, before it records a deployment, did not answer with
+/// the version the request named.
+///
+/// The message is the source's own answer to that read, built by
+/// [`crate::state::configuration_sources::source_version_refusal`].
+fn source_read_failed(message: String) -> StartDeploymentError {
+    StartDeploymentErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
 /// What this call resolved before it ran the configuration profile's validators and
 /// consulted the `PRE_START_DEPLOYMENT` action point: everything the deployment is written
 /// from, the gate the candidate configuration has to pass, plus the actions to invoke and
@@ -610,6 +625,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             event,
         )
         };
+
+        // A deployment of a profile whose configuration lives at a source AppConfig READS
+        // resolves the version it names THERE before anything is written: a version the
+        // source does not hold is refused here, with the source's own answer to that read,
+        // rather than recorded and found missing when a client polls for it. Made with no
+        // guard of this service's store held, like the content read below.
+        if let Some(location_uri) = &prepared.external_location {
+            if let Some(refusal) = crate::state::configuration_sources::source_version_refusal(
+                &*self.engine,
+                location_uri,
+                &input.configuration_version,
+            ) {
+                return Err(source_read_failed(refusal));
+            }
+        }
 
         // The candidate configuration is the content of the version being deployed as held
         // by the store the configuration profile's `LocationUri` names: the hosted version

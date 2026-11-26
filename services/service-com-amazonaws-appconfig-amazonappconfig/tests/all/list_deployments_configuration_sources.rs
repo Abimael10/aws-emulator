@@ -54,7 +54,12 @@ struct Source {
 ///
 /// The rows are deployed in this order into one environment, so the listing's descending
 /// order is asserted across sources, not within one.
-const SOURCES: [Source; 7] = [
+///
+/// Every store whose deployed version AppConfig resolves at the SOURCE as the deployment is
+/// started needs that source's own store to hold the version, which this service's own router
+/// does not mount: an S3 object's listing is asserted where the object store exists, in
+/// `core/router/tests/all/appconfig_s3_sourced_configuration.rs`.
+const SOURCES: [Source; 6] = [
     Source {
         case: "the hosted store",
         location_uri: "hosted",
@@ -83,12 +88,6 @@ const SOURCES: [Source; 7] = [
         case: "a Secrets Manager secret",
         location_uri: "secretsmanager://app-config-secret",
         version: "AWSCURRENT",
-        hosted: false,
-    },
-    Source {
-        case: "an S3 object",
-        location_uri: "s3://amzn-s3-demo-bucket/my-app/us-east-1/my-config.json",
-        version: "2",
         hosted: false,
     },
     Source {

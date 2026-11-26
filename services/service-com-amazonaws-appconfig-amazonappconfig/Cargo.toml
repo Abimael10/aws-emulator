@@ -70,6 +70,11 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # version's value, read through that service's own state accessors rather than from a
 # second copy of them here (`state::configuration_sources`).
 service-com-amazonaws-ssm-amazonssm = { workspace = true }
+# The Amazon S3 store a configuration profile whose `LocationUri` is
+# `s3://<bucket>/<objectKey>` deploys its configuration from: the content a reader of that
+# deployed configuration serves is the named object VERSION's bytes, read through that
+# service's own state accessors (`state::configuration_sources`).
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

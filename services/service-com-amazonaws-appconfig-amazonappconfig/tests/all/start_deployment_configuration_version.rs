@@ -11,9 +11,12 @@
 //! that does not exist. A hosted configuration version is named "either the version number
 //! or version label" (`smithy_query(query="operation", operation="StartDeployment")` for
 //! `ConfigurationVersion`, and `ResourceNotFoundException` among its errors), so both
-//! spellings resolve; a profile whose configuration lives in another store — S3, Parameter
-//! Store, Secrets Manager — holds no version here to resolve against, so this service makes
-//! no such lookup for it.
+//! spellings resolve; a profile whose configuration lives in another store — Parameter Store,
+//! Secrets Manager — holds no version here to resolve against, so this service makes no such
+//! lookup for it. A profile whose configuration is an Amazon S3 object has its version
+//! resolved at the OBJECT STORE as the deployment is started, which needs that store's own
+//! records: that is asserted where they exist
+//! (`core/router/tests/all/appconfig_s3_sourced_configuration.rs`).
 //!
 //! The rows span what the rule generalises over rather than one recorded call: the FORM of
 //! the rejected value (a number past the versions created, a number before the first one, a
@@ -298,11 +301,13 @@ async fn a_configuration_stored_elsewhere_has_no_version_to_resolve() {
     let environment = create_environment(&router, &application, "production").await;
     let strategy = create_instant_strategy(&router, "elsewhere").await;
 
-    // Each location a profile can name whose bytes AppConfig does not store, and a version
-    // of it that this service holds nothing for.
+    // Each location a profile can name whose version AppConfig does not resolve against any
+    // store this router mounts, and a version of it that nothing here holds anything for. An
+    // S3 object's version IS resolved at the source as the deployment is started, so it is
+    // asserted where the object store exists
+    // (`core/router/tests/all/appconfig_s3_sourced_configuration.rs`).
     for (case, location, version) in [
         ("a Parameter Store parameter", "ssm-parameter://probe-parameter", "3"),
-        ("an S3 object", "s3://probe-bucket/probe-key", "11"),
         (
             "a Secrets Manager secret",
             "secretsmanager://probe-secret",
