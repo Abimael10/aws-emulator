@@ -317,8 +317,9 @@ pub const MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE: &str =
 
 /// The same wording class again, for the read set an operation resolves inside a
 /// sequence store. A read set belongs to the store it was created in, so a read set id
-/// presented under another store is "does not exist" too.
-pub const READ_SET_NOT_FOUND_MESSAGE: &str = "The specified read set does not exist.";
+/// presented under another store is "does not exist" too, and so is one whose read set a
+/// delete has already taken away.
+pub const READ_SET_NOT_FOUND_MESSAGE: &str = "The specified readset does not exist.";
 
 /// What a delete answers when the resource it names still has resources of its own
 /// hanging off it — a sequence store that still holds read sets, say.
@@ -947,27 +948,6 @@ impl ReadSet {
             now_ms,
             READ_SET_STATUS_ACTIVE,
         );
-    }
-
-    /// Whether this read set still occupies its sequence store: a deleted one holds
-    /// nothing the store has to keep, so it no longer stands in the way of the store's
-    /// own delete.
-    pub fn is_held(&self) -> bool {
-        self.status != READ_SET_STATUS_DELETED
-    }
-
-    /// Delete this read set: the one move `BatchDeleteReadSet` makes, stated once so the
-    /// store's own delete and every read agree about what a deleted read set is.
-    ///
-    /// The record stays as the tombstone its id resolves to, in the terminal `DELETED`
-    /// status, and the files go with it: their bytes are no longer held by anything, so
-    /// the store stops counting them against its own ceiling and reports no file for the
-    /// read set. Nothing is owed to the clock afterwards — the status it lands on is
-    /// terminal.
-    pub fn delete(&mut self) {
-        self.status = READ_SET_STATUS_DELETED.to_string();
-        self.status_due_at_ms = None;
-        self.sources.clear();
     }
 
     /// The bytes every file of this read set holds together.
@@ -1653,13 +1633,19 @@ impl ComAmazonawsOmicsOmicsState {
             .filter(|read_set| read_set.sequence_store_id == sequence_store_id)
     }
 
-    /// The same record, for an operation that CHANGES the read set. One lookup rule for
-    /// both, so a read and a write cannot disagree about which read set a pair of ids
-    /// names.
-    pub fn read_set_mut(&mut self, sequence_store_id: &str, id: &str) -> Option<&mut ReadSet> {
-        self.read_sets
-            .get_mut(&numeric_id(id)?)
-            .filter(|read_set| read_set.sequence_store_id == sequence_store_id)
+    /// Remove the read set `id` from the store `sequence_store_id`, and answer the record
+    /// that was removed (`None` when that pair names no read set this emulator holds).
+    ///
+    /// A deleted read set is GONE, not a record in a terminal status: nothing resolves its
+    /// id afterwards, so the per-id reads and the listing agree that the store no longer
+    /// holds it, the files it held stop counting against the store's ceiling, and the
+    /// store's own delete is no longer blocked by it.
+    pub fn remove_read_set(&mut self, sequence_store_id: &str, id: &str) -> Option<ReadSet> {
+        let key = numeric_id(id)?;
+        // Resolved by the same rule every other read set lookup uses, so a read set id
+        // presented under another store is not removed from the store that holds it.
+        self.read_set(sequence_store_id, id)?;
+        self.read_sets.remove(&key)
     }
 
     /// Every read set held by `sequence_store_id`, in creation order: the map's own key
@@ -1676,8 +1662,7 @@ impl ComAmazonawsOmicsOmicsState {
     /// Whether `sequence_store_id` still holds a read set, which is what stands in the way
     /// of deleting the store itself.
     pub fn holds_read_sets(&self, sequence_store_id: &str) -> bool {
-        self.read_sets_for(sequence_store_id)
-            .any(|(_, read_set)| read_set.is_held())
+        self.read_sets_for(sequence_store_id).next().is_some()
     }
 
     /// The content bytes every read set of `sequence_store_id` holds together.

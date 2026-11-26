@@ -306,13 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut read_sets = Vec::new();
         let mut next_token = None;
         // The read sets the store still HOLDS, narrowed by the filter the request carried.
-        // A read set whose content the service has released no longer occupies the store —
-        // it is what `DeleteSequenceStore` stops counting as a dependent — so it is no
-        // longer among the store's read sets here either. The walk is the store's own key
-        // order — ascending `readSetId`, so creation order — which makes it stable across
-        // calls and lets a token name the read set the next page resumes at.
+        // A read set a delete took away is held by nothing — its record is gone from the
+        // store's read sets, so it is absent here for the same reason a per-id read of it
+        // is not found. The walk is the store's own key order — ascending `readSetId`, so
+        // creation order — which makes it stable across calls and lets a token name the
+        // read set the next page resumes at.
         for (key, read_set) in registry.read_sets_for(&sequence_store_id) {
-            if *key < start || !read_set.is_held() || !matches(input.filter.as_ref(), read_set) {
+            if *key < start || !matches(input.filter.as_ref(), read_set) {
                 continue;
             }
             // The first read set that does not fit becomes the next page's start, and only

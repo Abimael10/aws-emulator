@@ -148,8 +148,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Every branch below records the call through `crate::state::audit`: a delete
-        // leaves the record it emptied behind as a tombstone, so the log is where the
-        // call itself stays attributable.
+        // takes the record it names away, so the log is where the call itself stays
+        // attributable.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::audit(
                 Self::NAME,
@@ -193,30 +193,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // list. If the operation successfully deletes only a subset of files, it will
         // return an error list for the remaining files that fail to be deleted").
         //
-        // A read set this store holds is deleted where it is held: the record stays as
-        // the tombstone its id resolves to, in the terminal `DELETED` status, and its
-        // files go with it — so the store no longer holds it and the store's own delete
-        // is no longer refused for it. An id that names a read set already deleted is
-        // deleted again without an error, which is what the operation's `@idempotent`
-        // trait asks for; an id this store holds no read set for is the one failure a
-        // delete can report.
+        // Deleting a read set TAKES IT AWAY: the record leaves the store's read sets with
+        // the files it held, so no per-id read resolves its id afterwards, the listing no
+        // longer carries it and the store's own delete is no longer blocked by it. An id
+        // this store holds no read set for is the one failure a delete can report — and an
+        // id THIS call already deleted is not one, because the read set it named was
+        // deleted by the very request that names it again, which is what the operation's
+        // `@idempotent` trait asks of a repeated id.
         let mut errors: Vec<ReadSetBatchError> = Vec::new();
+        let mut deleted: Vec<u64> = Vec::new();
         for id in &input.ids {
-            let Some(read_set) = registry.read_set_mut(&input.sequence_store_id, id) else {
-                crate::state::audit(
-                    Self::NAME,
-                    ctx,
-                    crate::state::AuditOutcome::NotFound,
-                    Some(id),
-                );
-                errors.push(ReadSetBatchError {
-                    id: id.clone(),
-                    code: READ_SET_NOT_FOUND_CODE.to_string(),
-                    message: crate::state::READ_SET_NOT_FOUND_MESSAGE.to_string(),
-                });
+            if registry
+                .remove_read_set(&input.sequence_store_id, id)
+                .is_none()
+            {
+                let already_deleted_here = crate::state::numeric_id(id)
+                    .is_some_and(|key| deleted.contains(&key));
+                if !already_deleted_here {
+                    crate::state::audit(
+                        Self::NAME,
+                        ctx,
+                        crate::state::AuditOutcome::NotFound,
+                        Some(id),
+                    );
+                    errors.push(ReadSetBatchError {
+                        id: id.clone(),
+                        code: READ_SET_NOT_FOUND_CODE.to_string(),
+                        message: crate::state::READ_SET_NOT_FOUND_MESSAGE.to_string(),
+                    });
+                }
                 continue;
-            };
-            read_set.delete();
+            }
+            if let Some(key) = crate::state::numeric_id(id) {
+                deleted.push(key);
+            }
             crate::state::audit(
                 Self::NAME,
                 ctx,

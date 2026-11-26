@@ -33,6 +33,10 @@
 //!   sequence store the request names holds, and reports one error per id it could not
 //!   delete — within the batch length the model publishes, outside which the whole call is
 //!   refused and nothing is deleted;
+//!   * a read set it reports no error for is GONE: no per-id read resolves that id, the
+//!     listing no longer carries it, and the state holds no record for it;
+//! * a per-id read of a read set id the sequence store the request names does not hold is
+//!   the read-set-not-found refusal, whatever the reason the store does not hold it;
 //! * a request naming a sequence store or an upload this emulator does not hold — or
 //!   carrying no content at all — is refused rather than stored.
 
@@ -2612,9 +2616,9 @@ async fn a_read_set_its_store_no_longer_holds_leaves_the_listing() {
     let ids = form_listed_read_sets(&router, &store).await;
     await_all_active(&router, &store, &ids).await;
 
-    // A read set reaches the terminal `DELETED` status through `BatchDeleteReadSet`,
-    // which is the call a client makes, so the status is reached the way a client reaches
-    // it rather than by writing the stored record from the test.
+    // A read set leaves the store through `BatchDeleteReadSet`, which is the call a client
+    // makes, so it leaves the way a client makes it leave rather than by writing the
+    // stored record from the test.
     let released = ids[1].clone();
     let (status, body) = batch_delete_read_set(&router, &store, &[released.as_str()]).await;
     assert_eq!(
@@ -2624,13 +2628,9 @@ async fn a_read_set_its_store_no_longer_holds_leaves_the_listing() {
     {
         let state = service_state(&*engine).expect("the omics service state");
         let registry = state.lock();
-        assert_eq!(
-            registry
-                .read_set(&store, &released)
-                .unwrap_or_else(|| panic!("no read set {released} is stored"))
-                .status,
-            READ_SET_STATUS_DELETED,
-            "the deleted read set must hold the terminal status"
+        assert!(
+            registry.read_set(&store, &released).is_none(),
+            "the deleted read set must be gone from the store's read sets"
         );
     }
 
@@ -3136,18 +3136,22 @@ async fn a_read_set_deleted_in_a_batch_releases_its_store() {
             None => assert_absent(case, &["errors"], &body),
         }
 
-        // Each read set the batch named is in the terminal DELETED status and holds no
-        // file any more, which is what a client reads back.
+        // Each read set the batch named is GONE: its id resolves to nothing, so the
+        // per-id read a client makes is the read-set-not-found refusal.
         for index in &row.named {
             let id = &ids[*index];
             let (status, metadata) = read_set_metadata(&router, &store, id).await;
-            assert_eq!(status, 200, "case {case:?}: expected 200, got {metadata:?}");
+            assert_eq!(status, 404, "case {case:?}: expected 404, got {metadata:?}");
             assert_eq!(
-                metadata.get("status").and_then(Value::as_str),
-                Some(READ_SET_STATUS_DELETED),
-                "case {case:?}: expected a deleted read set, got {metadata:?}"
+                error_code(&metadata),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {metadata:?}"
             );
-            assert_absent(case, &["files"], &metadata);
+            assert_eq!(
+                metadata.get("message").and_then(Value::as_str),
+                Some(READ_SET_NOT_FOUND_MESSAGE),
+                "case {case:?}: expected the read-set-not-found message, got {metadata:?}"
+            );
         }
 
         // And the store no longer holds them: a store whose every read set is deleted is
@@ -3242,11 +3246,14 @@ async fn a_batch_delete_this_emulator_cannot_place_is_refused() {
 
     // And the read set its own store holds survived every refusal.
     let (status, metadata) = read_set_metadata(&router, &store, &read_set_id).await;
-    assert_eq!(status, 200, "expected 200, got {metadata:?}");
-    assert_ne!(
-        metadata.get("status").and_then(Value::as_str),
-        Some(READ_SET_STATUS_DELETED),
+    assert_eq!(
+        status, 200,
         "the read set must survive a batch addressed to another store, got {metadata:?}"
+    );
+    assert_eq!(
+        metadata.get("id").and_then(Value::as_str),
+        Some(read_set_id.as_str()),
+        "expected the surviving read set to be reported, got {metadata:?}"
     );
 }
 
@@ -3324,12 +3331,12 @@ async fn a_batch_delete_is_bounded_by_the_modelled_id_list_length() {
         let (status, metadata) = read_set_metadata(&router, &store, &bystander).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: expected 200 from the bystander's metadata, got {metadata:?}"
-        );
-        assert_ne!(
-            metadata.get("status").and_then(Value::as_str),
-            Some(READ_SET_STATUS_DELETED),
             "case {case:?}: a read set no batch named must survive, got {metadata:?}"
+        );
+        assert_eq!(
+            metadata.get("id").and_then(Value::as_str),
+            Some(bystander.as_str()),
+            "case {case:?}: expected the bystander to be reported, got {metadata:?}"
         );
     }
 }
@@ -3358,38 +3365,272 @@ async fn a_batch_delete_reports_each_id_it_could_not_delete_in_request_order() {
         second.as_str(),
         unheld[2].as_str(),
     ];
-    let expected = Value::Array(
+    let first_pass_errors = Value::Array(
         unheld
             .iter()
             .map(|id| expected_batch_error(id))
             .collect::<Vec<Value>>(),
     );
+    // A second pass names the same ids, and by then the store holds a read set for none
+    // of them: the two the first pass deleted are gone, so every id is reported, in the
+    // order the request listed them.
+    let second_pass_errors = Value::Array(
+        named
+            .iter()
+            .map(|id| expected_batch_error(id))
+            .collect::<Vec<Value>>(),
+    );
 
-    // Twice over: the delete is `@idempotent`, so naming a read set this batch already
-    // deleted is not a failure, and the second pass reports exactly the failures the
-    // first one did.
-    for pass in ["the first pass", "the second pass"] {
+    for (pass, expected) in [
+        ("the first pass", &first_pass_errors),
+        ("the second pass", &second_pass_errors),
+    ] {
         let (status, body) = batch_delete_read_set(&router, &store, &named).await;
         assert_eq!(status, 200, "case {pass:?}: expected 200, got {body:?}");
         assert_eq!(
             body.get("errors"),
-            Some(&expected),
-            "case {pass:?}: expected only the unheld ids to be reported, got {body:?}"
+            Some(expected),
+            "case {pass:?}: expected the ids naming no read set to be reported, got {body:?}"
         );
 
-        // And each id the store did hold is read back deleted, holding no file.
+        // And each id the store did hold is gone: its per-id read is not found.
         for id in [&first, &second] {
             let (status, metadata) = read_set_metadata(&router, &store, id).await;
             assert_eq!(
-                status, 200,
-                "case {pass:?}: expected 200 for read set {id}, got {metadata:?}"
+                status, 404,
+                "case {pass:?}: expected 404 for read set {id}, got {metadata:?}"
             );
             assert_eq!(
-                metadata.get("status").and_then(Value::as_str),
-                Some(READ_SET_STATUS_DELETED),
-                "case {pass:?}: expected read set {id} deleted, got {metadata:?}"
+                error_code(&metadata),
+                "ResourceNotFoundException",
+                "case {pass:?}: expected ResourceNotFoundException for {id}, got {metadata:?}"
             );
-            assert_absent(pass, &["files"], &metadata);
+            assert_eq!(
+                metadata.get("message").and_then(Value::as_str),
+                Some(READ_SET_NOT_FOUND_MESSAGE),
+                "case {pass:?}: expected the read-set-not-found message, got {metadata:?}"
+            );
         }
     }
+}
+
+/// A row of the gone-after-delete table: what the store holds, which of those read sets
+/// the batch names, whether it also names an id no read set carries, and whether the read
+/// sets had settled to their terminal status before the delete.
+struct GoneCase {
+    case: &'static str,
+    held: usize,
+    named: Vec<usize>,
+    also_named: Option<&'static str>,
+    settle_first: bool,
+}
+
+#[tokio::test]
+async fn a_read_set_a_batch_delete_reports_no_error_for_is_gone_from_every_read() {
+    let (router, engine) = emulator_holding_its_engine();
+
+    // One row per way a delete can name read sets, so the rule is asserted over the class
+    // and not over one request: how many read sets the store holds, how many of them the
+    // batch names (one, several, every one of them, the same one twice), whether the batch
+    // also names an id no read set carries — the partial-failure shape, where the only
+    // error reported is that id's — and whether the named read sets had settled to their
+    // terminal status first.
+    for row in [
+        GoneCase {
+            case: "the store's only read set, deleted before it settles",
+            held: 1,
+            named: vec![0],
+            also_named: None,
+            settle_first: false,
+        },
+        GoneCase {
+            case: "one settled read set of three",
+            held: 3,
+            named: vec![1],
+            also_named: None,
+            settle_first: true,
+        },
+        GoneCase {
+            case: "two read sets of three, beside an id no read set carries",
+            held: 3,
+            named: vec![0, 2],
+            also_named: Some("9999999999"),
+            settle_first: true,
+        },
+        GoneCase {
+            case: "every read set the store holds",
+            held: 2,
+            named: vec![0, 1],
+            also_named: None,
+            settle_first: false,
+        },
+        GoneCase {
+            case: "the same read set named twice in one call, which deletes it once",
+            held: 2,
+            named: vec![1, 1],
+            also_named: None,
+            settle_first: true,
+        },
+    ] {
+        let case = row.case;
+        let store = create_store(&router, case).await;
+        let mut ids = Vec::new();
+        for index in 0..row.held {
+            ids.push(form_read_set(&router, &store, &format!("{case} {index}")).await);
+        }
+        if row.settle_first {
+            for id in &ids {
+                await_read_set_status(&router, &store, id, READ_SET_STATUS_ACTIVE).await;
+            }
+        }
+
+        let mut named: Vec<&str> = row.named.iter().map(|index| ids[*index].as_str()).collect();
+        if let Some(also) = row.also_named {
+            named.push(also);
+        }
+        let (status, body) = batch_delete_read_set(&router, &store, &named).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
+        // Only the id no read set carries is reported, so each id the batch did delete was
+        // deleted outright rather than reported as a failure.
+        match row.also_named {
+            Some(also) => assert_eq!(
+                body.get("errors"),
+                Some(&json!([expected_batch_error(also)])),
+                "case {case:?}: expected only the unheld id to be reported, got {body:?}"
+            ),
+            None => assert_absent(case, &["errors"], &body),
+        }
+
+        // Every id the batch deleted resolves to nothing afterwards: the per-id read is
+        // the read-set-not-found refusal, and no record for it is left in the state.
+        let state = service_state(&*engine).expect("the omics service state");
+        for index in &row.named {
+            let id = &ids[*index];
+            let (status, metadata) = read_set_metadata(&router, &store, id).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected 404 for read set {id}, got {metadata:?}"
+            );
+            assert_eq!(
+                error_code(&metadata),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException for {id}, got {metadata:?}"
+            );
+            assert_eq!(
+                metadata.get("message").and_then(Value::as_str),
+                Some(READ_SET_NOT_FOUND_MESSAGE),
+                "case {case:?}: expected the read-set-not-found message, got {metadata:?}"
+            );
+            let registry = state.lock();
+            assert!(
+                registry.read_set(&store, id).is_none(),
+                "case {case:?}: the state must hold no read set {id} any more"
+            );
+        }
+
+        // And the store is exactly the read sets the batch did not name — every one of
+        // them still readable through its own id.
+        let surviving: Vec<String> = (0..row.held)
+            .filter(|index| !row.named.contains(index))
+            .map(|index| ids[index].clone())
+            .collect();
+        let (status, body) = list_read_sets(&router, &store, "", None).await;
+        let items = listed_read_sets(case, status, &body);
+        assert_eq!(
+            listed_ids(case, &items),
+            surviving,
+            "case {case:?}: expected only the read sets no id named, got {body:?}"
+        );
+        for id in &surviving {
+            let (status, metadata) = read_set_metadata(&router, &store, id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 for the surviving read set {id}, got {metadata:?}"
+            );
+            assert_eq!(
+                metadata.get("id").and_then(Value::as_str),
+                Some(id.as_str()),
+                "case {case:?}: expected read set {id} to be reported, got {metadata:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_read_set_id_the_named_store_does_not_hold_is_not_found() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the store the reads name").await;
+    let elsewhere = create_store(&router, "another store").await;
+    let held = form_read_set(&router, &store, "the read set this store holds").await;
+    let deleted = form_read_set(&router, &store, "the read set a delete takes away").await;
+    let (status, body) = batch_delete_read_set(&router, &store, &[deleted.as_str()]).await;
+    assert_eq!(
+        status, 200,
+        "expected 200 from BatchDeleteReadSet, got {body:?}"
+    );
+
+    let (min, max) = READ_SET_ID_WIDTH;
+    // Every way the store the request names can hold no read set for a syntactically valid
+    // `ReadSetId`: an id nothing was ever minted for (at each published width of the id),
+    // one just past the ids this emulator mints, one whose read set another store holds,
+    // and one whose read set a delete took away.
+    for (case, sequence_store_id, id) in [
+        (
+            "an id no read set carries, at the bottom of the modelled width",
+            store.as_str(),
+            "9".repeat(min),
+        ),
+        (
+            "an id no read set carries, at the top of the modelled width",
+            store.as_str(),
+            "9".repeat(max),
+        ),
+        (
+            "an id one digit past the ids this emulator mints",
+            store.as_str(),
+            format!("{}0", FIRST_SEQUENCE_STORE_ID + READ_SET_ID_OFFSET),
+        ),
+        (
+            "a read set addressed through another store",
+            elsewhere.as_str(),
+            held.clone(),
+        ),
+        (
+            "a read set a batch delete took away",
+            store.as_str(),
+            deleted.clone(),
+        ),
+    ] {
+        let (status, body) = read_set_metadata(&router, sequence_store_id, &id).await;
+        assert_eq!(status, 404, "case {case:?}: expected 404, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(READ_SET_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the read-set-not-found message, got {body:?}"
+        );
+        // Nothing of the request is echoed into that sentence: it is fixed text for the
+        // whole class, so neither id appears in it.
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !message.contains(&id) && !message.contains(sequence_store_id),
+            "case {case:?}: the message must carry no id from the request, got {message:?}"
+        );
+    }
+
+    // The read set its own store holds is untouched by every refusal above.
+    let (status, metadata) = read_set_metadata(&router, &store, &held).await;
+    assert_eq!(status, 200, "expected 200 for the held read set, got {metadata:?}");
+    assert_eq!(
+        metadata.get("id").and_then(Value::as_str),
+        Some(held.as_str()),
+        "expected the held read set to be reported, got {metadata:?}"
+    );
 }
