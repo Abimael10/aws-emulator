@@ -320,8 +320,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // judged against is the one the session that token resolves to is over — the
         // identifiers it was started with — and a token resolving to no session at all
         // addresses no configuration this service can name, so the decision is taken on
-        // the action alone. The identifiers are read out and the guard released before
-        // anything else is asked, so no other store is read with this one held.
+        // the action alone, against every resource: a grant scoped to the very
+        // configuration being polled permits such a poll exactly as a grant on every
+        // resource does (`crate::state::identity_authorization::refusal`). The identifiers
+        // are read out and the guard released before anything else is asked, so no other
+        // store is read with this one held.
         let addressed = {
             let store = state.lock();
             store.session(&token).map(|session| {

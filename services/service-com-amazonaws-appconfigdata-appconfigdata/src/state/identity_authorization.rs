@@ -55,6 +55,16 @@
 //! caller what the account holds. A call whose own input names no configuration at all is
 //! judged against [`ANY_RESOURCE`].
 //!
+//! Such a call — one this service cannot name a configuration for — is decided on the ACTION
+//! alone, against every resource: AWS grants a request only through an `Allow` covering both
+//! its action and the resource it addresses, so the one thing a document can settle without a
+//! resource to match is whether it could allow that action at all
+//! ([`::service_common::iam_authorization::identity_may_allow_action`], published for exactly
+//! this question). Demanding instead a grant over the literal `*` would refuse the
+//! least-privilege caller whose statement is scoped to the very configuration it is polling,
+//! while serving only the one spelled `"Resource":"*"`. An explicit `Deny` is still decided
+//! against the resource, and a permissions boundary still caps the grant the same weaker way.
+//!
 //! ## The two callers the decision cannot refuse
 //!
 //! * **The account's own published credential.** A request whose access key id neither STS
@@ -152,6 +162,11 @@ pub fn configuration_addressed(
 /// permissions boundary, since "a permissions boundary sets the maximum permissions that an
 /// identity-based policy can grant" (IAM, permissions boundaries).
 ///
+/// A `resource` of [`ANY_RESOURCE`] is a call this service cannot name a configuration for,
+/// and the grant such a call needs is read on the action alone ([`may_allow`], and the module
+/// docs): a statement scoped to some configuration still permits it, because this gate cannot
+/// establish it is not that one.
+///
 /// Asked with NO store guard of this service held, and before the request's own input is
 /// read.
 #[must_use]
@@ -166,7 +181,8 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     // An identity-based document states no `Principal` element, so the decision rests on
     // the action and the resource the request addressed.
     let request = iam::Request::new(&action, resource, &[]);
-    let said = iam::identity_decision(&caller.documents, &request);
+    let documents = iam::prepare_documents(&caller.documents);
+    let said = iam::identity_decision_prepared(&documents, &request);
     if said == Decision::Denied {
         return Some(iam::not_authorized_by_identity_policy(
             &caller.arn,
@@ -175,7 +191,10 @@ pub fn refusal<Eng: Send + Sync + 'static>(
             iam::IDENTITY_POLICY_EXPLICIT_DENY,
         ));
     }
-    if !(iam::is_allowed(said, Decision::NotStated) || caller.identity_is_unbounded()) {
+    let granted = iam::is_allowed(said, Decision::NotStated)
+        || may_allow(&documents, &action, resource)
+        || caller.identity_is_unbounded();
+    if !granted {
         return Some(iam::not_authorized_by_identity_policy(
             &caller.arn,
             &action,
@@ -184,12 +203,18 @@ pub fn refusal<Eng: Send + Sync + 'static>(
         ));
     }
     let boundary = caller.boundary.as_ref()?;
-    let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+    let boundary = iam::prepare_documents(::std::slice::from_ref(boundary));
+    let reason = match iam::identity_decision_prepared(&boundary, &request) {
         Decision::Allowed => return None,
         // An explicit deny is a fact about the boundary document, so the refusal names it;
         // a boundary that merely states nothing withheld the grant the policies gave.
         Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
-        Decision::NotStated => iam::no_permissions_boundary_allows(&action),
+        Decision::NotStated => {
+            if may_allow(&boundary, &action, resource) {
+                return None;
+            }
+            iam::no_permissions_boundary_allows(&action)
+        }
     };
     Some(iam::not_authorized_by_identity_policy(
         &caller.arn,
@@ -197,6 +222,16 @@ pub fn refusal<Eng: Send + Sync + 'static>(
         resource,
         &reason,
     ))
+}
+
+/// Whether `documents` could allow `action` AT ALL, asked only of a request judged against
+/// [`ANY_RESOURCE`] — one this service cannot name a configuration for, and which may
+/// therefore still be about a configuration a statement is scoped to (see the module docs).
+///
+/// A request that DOES address a configuration is decided against that ARN alone, which is
+/// what AWS matches a statement's resource element on.
+fn may_allow(documents: &[iam::PreparedDocument], action: &str, resource: &str) -> bool {
+    resource == ANY_RESOURCE && iam::identity_may_allow_action(documents, action)
 }
 
 /// The principal a request speaks for, and everything the decision is made from.
@@ -415,6 +450,78 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "case {case:?}: expected allowed == {expected}, got {actual} ({said:?})"
+            );
+        }
+    }
+
+    /// RULE: a call this service cannot name a configuration for — judged against
+    /// [`ANY_RESOURCE`] — needs only a grant of the ACTION: a statement that could allow the
+    /// action on SOME resource permits it, whichever resource that is, while documents in which
+    /// no readable `Allow` names the action permit nothing. A call that DOES address a
+    /// configuration is never read this way: it is matched against its own ARN.
+    #[test]
+    fn a_call_naming_no_configuration_needs_only_a_grant_of_the_action() {
+        let granted = configuration_resource("us-west-2", "app-1", "env-1", "profile-1");
+        let poll = action_for("GetLatestConfiguration");
+        let allow = |actions: &str, resource: &str| {
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":{actions},"Resource":"{resource}"}}]}}"#
+            )
+        };
+        // (case, the documents in force, the resource the call addressed, may allow)
+        let rows: &[(&str, Vec<String>, String, bool)] = &[
+            (
+                "the action granted on one configuration, for a call naming none",
+                vec![allow(r#""appconfig:GetLatestConfiguration""#, &granted)],
+                ANY_RESOURCE.to_string(),
+                true,
+            ),
+            (
+                "the action granted on another configuration, for a call naming none",
+                vec![allow(
+                    r#""appconfig:GetLatestConfiguration""#,
+                    &configuration_resource("us-west-2", "app-2", "env-2", "profile-2"),
+                )],
+                ANY_RESOURCE.to_string(),
+                true,
+            ),
+            (
+                "every AppConfig action granted on every resource",
+                vec![allow(r#""appconfig:*""#, ANY_RESOURCE)],
+                ANY_RESOURCE.to_string(),
+                true,
+            ),
+            (
+                "only the other action of this service granted",
+                vec![allow(r#""appconfig:StartConfigurationSession""#, &granted)],
+                ANY_RESOURCE.to_string(),
+                false,
+            ),
+            (
+                "another service's action granted",
+                vec![allow(r#""s3:GetObject""#, ANY_RESOURCE)],
+                ANY_RESOURCE.to_string(),
+                false,
+            ),
+            (
+                "no document at all",
+                Vec::new(),
+                ANY_RESOURCE.to_string(),
+                false,
+            ),
+            (
+                "the action granted on one configuration, for a call naming that one",
+                vec![allow(r#""appconfig:GetLatestConfiguration""#, &granted)],
+                granted.clone(),
+                false,
+            ),
+        ];
+        for (case, documents, resource, expected) in rows {
+            let actual = may_allow(&iam::prepare_documents(documents), &poll, resource);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected may_allow == {expected}, got {actual}"
             );
         }
     }

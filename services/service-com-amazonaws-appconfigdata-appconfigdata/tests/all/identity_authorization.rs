@@ -859,3 +859,235 @@ async fn an_unresolvable_identifier_and_a_missing_grant_are_different_refusals()
         "case {case:?}: an authorization refusal must report no resource, got {parsed}"
     );
 }
+
+/// A token no session answers to: 64 zeroes, a well-formed `Token` value (the member's
+/// modelled pattern is `^\S{1,8192}$`) this store never minted.
+fn unminted_token() -> String {
+    "0".repeat(64)
+}
+
+/// The code and status the modelled token verdict carries, and the `Reason` it states.
+const BAD_REQUEST: &str = "BadRequestException";
+const BAD_REQUEST_STATUS: u16 = 400;
+const INVALID_PARAMETERS: &str = "InvalidParameters";
+
+/// One row of the table about a poll whose token resolves to NO session: the documents in
+/// force on the caller's role, what such a poll must be told, and what the SAME caller is told
+/// by a poll whose token DOES resolve — the leg where a configuration ARN is matched.
+struct TokenlessRow {
+    case: &'static str,
+    /// The documents the role carries, built from the configuration ARN a resolving poll
+    /// addresses.
+    policies: fn(&str) -> Vec<String>,
+    /// The modelled `InvalidParameterProblem` the poll must report, or `None` when no readable
+    /// statement could allow the action at all, so the caller is refused before any verdict.
+    problem: Option<&'static str>,
+    /// Whether a refusal names an explicit deny rather than an absent grant.
+    explicit_deny: bool,
+    /// Whether the same caller's poll of a token that DOES resolve is served.
+    resolving_poll_served: bool,
+}
+
+/// A configuration of another application entirely — the ARN a statement is scoped to when the
+/// case is "a grant that is about some other configuration".
+const ANOTHER_CONFIGURATION: &str = "arn:aws:appconfig:us-east-1:000000000000:application/other\
+                                     /environment/other/configuration/other";
+
+const TOKENLESS_ROWS: &[TokenlessRow] = &[
+    TokenlessRow {
+        case: "a grant of both actions scoped to the configuration being polled",
+        policies: |arn| {
+            vec![statement(
+                "Allow",
+                &[
+                    "appconfig:StartConfigurationSession",
+                    "appconfig:GetLatestConfiguration",
+                ],
+                arn,
+            )]
+        },
+        problem: Some("Corrupted"),
+        explicit_deny: false,
+        resolving_poll_served: true,
+    },
+    TokenlessRow {
+        case: "a grant of the poll scoped to another configuration",
+        policies: |_arn| vec![statement("Allow", &["appconfig:GetLatestConfiguration"], ANOTHER_CONFIGURATION)],
+        problem: Some("Corrupted"),
+        explicit_deny: false,
+        resolving_poll_served: false,
+    },
+    TokenlessRow {
+        case: "a grant of every AppConfig action on every resource",
+        policies: |_arn| vec![statement("Allow", &["appconfig:*"], "*")],
+        problem: Some("Corrupted"),
+        explicit_deny: false,
+        resolving_poll_served: true,
+    },
+    TokenlessRow {
+        case: "a grant of only the other action, scoped to this configuration",
+        policies: |arn| {
+            vec![statement(
+                "Allow",
+                &["appconfig:StartConfigurationSession"],
+                arn,
+            )]
+        },
+        problem: None,
+        explicit_deny: false,
+        resolving_poll_served: false,
+    },
+    TokenlessRow {
+        case: "a grant of another service's action on every resource",
+        policies: |_arn| vec![statement("Allow", &["s3:GetObject"], "*")],
+        problem: None,
+        explicit_deny: false,
+        resolving_poll_served: false,
+    },
+    TokenlessRow {
+        case: "a role carrying no policy at all",
+        policies: |_arn| Vec::new(),
+        problem: None,
+        explicit_deny: false,
+        resolving_poll_served: false,
+    },
+    TokenlessRow {
+        case: "a grant of every action with the poll explicitly denied",
+        policies: |_arn| {
+            vec![
+                statement("Allow", &["appconfig:*"], "*"),
+                statement("Deny", &["appconfig:GetLatestConfiguration"], "*"),
+            ]
+        },
+        problem: None,
+        explicit_deny: true,
+        resolving_poll_served: false,
+    },
+];
+
+/// RULE: a request this service cannot name a configuration for — a poll whose token resolves
+/// to no session — is decided on the ACTION alone, against every resource: since AWS grants a
+/// request only through an `Allow` covering both its action and the resource it addresses, the
+/// grant such a request needs is that some readable statement could allow the action at all, so
+/// a statement scoped to one configuration permits it just as a grant on every resource does,
+/// while a principal no readable `Allow` names the action in — and one an explicit `Deny` about
+/// the request refuses — still gets `AccessDeniedException`. A caller past that gate reaches the
+/// modelled token verdict: `BadRequestException` (400) with `Reason: InvalidParameters` and
+/// `Details.InvalidParameters.ConfigurationToken.Problem = "Corrupted"`.
+///
+/// The second leg of every row is the SAME caller polling a token that DOES resolve, which
+/// names a configuration and is therefore matched against it — so the weaker reading above is
+/// confined to the request that addresses nothing.
+#[tokio::test]
+async fn a_poll_whose_token_resolves_to_nothing_needs_only_a_grant_of_the_action() {
+    let aws = Emulator::new();
+    let deployed = deploy(&aws).await;
+    let arn = deployed.arn();
+    // The authorized caller every row's resolving leg borrows a fresh token from: which
+    // principal MINTED a session is not what the poll is decided against.
+    let permitted = assumed_role(
+        &aws,
+        "appconfig-tokenless-permitted",
+        &[statement("Allow", &["appconfig:*"], "*")],
+    )
+    .await;
+
+    for (index, row) in TOKENLESS_ROWS.iter().enumerate() {
+        let case = row.case;
+        let caller = assumed_role(
+            &aws,
+            &format!("appconfig-tokenless-{index}"),
+            &(row.policies)(&arn),
+        )
+        .await;
+
+        let (status, _body, parsed, error_type) =
+            aws.poll(&caller.access_key_id, &unminted_token()).await;
+        match row.problem {
+            Some(problem) => {
+                refusal(
+                    status,
+                    &parsed,
+                    &error_type,
+                    case,
+                    BAD_REQUEST,
+                    BAD_REQUEST_STATUS,
+                );
+                assert_eq!(
+                    parsed["Reason"].as_str(),
+                    Some(INVALID_PARAMETERS),
+                    "case {case:?}: expected the {INVALID_PARAMETERS} reason, got {parsed}"
+                );
+                assert_eq!(
+                    parsed["Details"]["InvalidParameters"]["ConfigurationToken"]["Problem"]
+                        .as_str(),
+                    Some(problem),
+                    "case {case:?}: expected the {problem} problem, got {parsed}"
+                );
+            }
+            None => {
+                refusal(
+                    status,
+                    &parsed,
+                    &error_type,
+                    case,
+                    ACCESS_DENIED,
+                    ACCESS_DENIED_STATUS,
+                );
+                assert_eq!(
+                    parsed["Message"].as_str(),
+                    Some(
+                        denial(&caller.arn, GET_CONFIGURATION, "*", row.explicit_deny).as_str()
+                    ),
+                    "case {case:?}: expected IAM's own sentence naming every resource, got \
+                     {parsed}"
+                );
+            }
+        }
+
+        // The other leg: the same caller polling a token that resolves, which addresses the
+        // configuration the session was started over and is decided against THAT ARN.
+        let (status, minted, _error_type) = aws
+            .start_session(
+                &permitted.access_key_id,
+                &deployed.application,
+                &deployed.environment,
+                &deployed.profile,
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: the authorized caller must be served, got {status} {minted}"
+        );
+        let token = minted["InitialConfigurationToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a token, got {minted}"))
+            .to_string();
+        let (status, body, parsed, error_type) = aws.poll(&caller.access_key_id, &token).await;
+        if row.resolving_poll_served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a resolving poll the grant covers must be served, got {status} \
+                 {parsed}"
+            );
+            assert_eq!(
+                body, DEPLOYED,
+                "case {case:?}: expected the deployed document, got {body:?}"
+            );
+        } else {
+            refusal(
+                status,
+                &parsed,
+                &error_type,
+                case,
+                ACCESS_DENIED,
+                ACCESS_DENIED_STATUS,
+            );
+            assert_eq!(
+                parsed["Message"].as_str(),
+                Some(denial(&caller.arn, GET_CONFIGURATION, &arn, row.explicit_deny).as_str()),
+                "case {case:?}: expected IAM's own sentence naming {arn}, got {parsed}"
+            );
+        }
+    }
+}
