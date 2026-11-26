@@ -275,6 +275,11 @@ pub const NOT_ORGANIZATION_MANAGEMENT_ACCOUNT: &str =
 /// [`ComAmazonawsBillingAwsbillingState::insert_credit`] refuses past it.
 pub const MAX_CREDITS: usize = 1024;
 
+/// The one `CreditSharingType` value under which a credit's sharing scope is
+/// controlled by a Cost Category rule — the condition
+/// [`Credit::sharing_scope_is_cost_category_rule`] answers.
+pub const CREDIT_SHARING_TYPE_COST_CATEGORY_RULE: &str = "COST_CATEGORY_RULE";
+
 /// The resource id of the account's default `PRIMARY` billing view.
 const PRIMARY_VIEW_ID: &str = "primary";
 
@@ -682,7 +687,12 @@ pub struct Credit {
     pub credit_console_visibility: Option<String>,
     /// A `CreditSharingType` value, e.g. `DEFAULT`.
     pub credit_sharing_type: Option<String>,
+    /// The Cost Category whose rule controls the credit's sharing scope, read
+    /// only under [`CREDIT_SHARING_TYPE_COST_CATEGORY_RULE`] — the one sharing
+    /// type the model reports it for (see
+    /// [`Credit::sharing_scope_is_cost_category_rule`]).
     pub cost_category_arn: Option<String>,
+    /// The rule within that Cost Category, read under the same one condition.
     pub rule_name: Option<String>,
     /// A `CreditStatus` value: `ENABLED` or `DISABLED`.
     pub credit_status: Option<String>,
@@ -701,6 +711,19 @@ impl Credit {
             && self
                 .end_date
                 .is_none_or(|end| epoch_secs(end) >= start_secs)
+    }
+
+    /// Whether this credit's sharing scope is the one a Cost Category rule
+    /// controls — its `credit_sharing_type` being
+    /// [`CREDIT_SHARING_TYPE_COST_CATEGORY_RULE`].
+    ///
+    /// The condition the modeled `CreditData$costCategoryArn` and
+    /// `CreditData$ruleName` are reported under: both are documented "Present
+    /// only when `creditSharingType` is `COST_CATEGORY_RULE`", so a record that
+    /// carries either under any other sharing type (or under none at all) is
+    /// reported without them.
+    pub fn sharing_scope_is_cost_category_rule(&self) -> bool {
+        self.credit_sharing_type.as_deref() == Some(CREDIT_SHARING_TYPE_COST_CATEGORY_RULE)
     }
 }
 

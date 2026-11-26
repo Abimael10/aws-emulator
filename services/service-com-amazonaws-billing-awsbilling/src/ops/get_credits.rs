@@ -284,6 +284,11 @@ fn field_validation_failed(field: &str, message: &str) -> GetCreditsError {
 /// `purchaseTypeApplications` optional, and "no restriction recorded" is what an
 /// empty one in the store means.
 fn credit_data(credit: &crate::state::Credit) -> CreditData {
+    // "Present only when `creditSharingType` is `COST_CATEGORY_RULE`" —
+    // documented for `costCategoryArn` and `ruleName` alike, so ONE condition
+    // decides both: each is reported only for a credit whose sharing scope that
+    // condition holds for, whatever the record happens to carry.
+    let shared_by_cost_category_rule = credit.sharing_scope_is_cost_category_rule();
     CreditData {
         credit_id: credit.credit_id.clone(),
         account_id: credit.account_id.clone(),
@@ -301,8 +306,14 @@ fn credit_data(credit: &crate::state::Credit) -> CreditData {
         account_has_credit_sharing_enabled: credit.account_has_credit_sharing_enabled,
         credit_console_visibility: credit.credit_console_visibility.clone(),
         credit_sharing_type: credit.credit_sharing_type.clone(),
-        cost_category_arn: credit.cost_category_arn.clone(),
-        rule_name: credit.rule_name.clone(),
+        cost_category_arn: credit
+            .cost_category_arn
+            .clone()
+            .filter(|_| shared_by_cost_category_rule),
+        rule_name: credit
+            .rule_name
+            .clone()
+            .filter(|_| shared_by_cost_category_rule),
         credit_status: credit.credit_status.clone(),
         purchase_type_applications: optional_list(&credit.purchase_type_applications),
     }

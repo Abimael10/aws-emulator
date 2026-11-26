@@ -165,7 +165,7 @@ pub(crate) fn seed(engine: &Arc<engine::InMemoryEngine>, credits: Vec<Credit>) {
 }
 
 /// A `GetCredits` request body for `account_id` over the last `lookback_days`.
-fn request(account_id: &str, lookback_days: u64) -> Value {
+pub(crate) fn request(account_id: &str, lookback_days: u64) -> Value {
     json!({
         "accountId": account_id,
         "startDate": epoch(days_ago(lookback_days)),
@@ -174,7 +174,7 @@ fn request(account_id: &str, lookback_days: u64) -> Value {
 }
 
 /// The reported entry for `credit_id`, or a panic naming the case.
-fn reported<'a>(body: &'a Value, case: &str, credit_id: &str) -> &'a Value {
+pub(crate) fn reported<'a>(body: &'a Value, case: &str, credit_id: &str) -> &'a Value {
     body["credits"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: credits must be a list, got {body:?}"))
@@ -243,13 +243,25 @@ fn assert_reports_stored(case: &str, got: &Value, stored: &Credit) {
         &got["creditSharingType"],
         stored.credit_sharing_type.as_deref(),
     );
+    // Both conditional on the credit's sharing type — "Present only when
+    // `creditSharingType` is `COST_CATEGORY_RULE`". `tests/all/credit_sharing_scope.rs`
+    // spans that condition; here each row is reported under its own sharing type.
+    let cost_category_rule = stored.sharing_scope_is_cost_category_rule();
     assert_optional_string(
         case,
         "costCategoryArn",
         &got["costCategoryArn"],
-        stored.cost_category_arn.as_deref(),
+        stored
+            .cost_category_arn
+            .as_deref()
+            .filter(|_| cost_category_rule),
     );
-    assert_optional_string(case, "ruleName", &got["ruleName"], stored.rule_name.as_deref());
+    assert_optional_string(
+        case,
+        "ruleName",
+        &got["ruleName"],
+        stored.rule_name.as_deref().filter(|_| cost_category_rule),
+    );
     assert_optional_string(
         case,
         "creditStatus",
