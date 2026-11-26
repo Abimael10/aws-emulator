@@ -119,19 +119,13 @@ const ANSWER_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The sentences a refusal carries: the one API Gateway answers a call the returned policy
 /// explicitly DENIES, and the one it answers a call no statement of that policy allows. Both
-/// are fixed text, and the clause naming the document that decided it is what tells them
-/// apart — which is the half of the rule these two rows are here for.
-///
-/// The no-statement sentence is the one this plane serves for that class today, and the one
-/// its sibling suites assert. Its WORDING is the subject of its own open report
-/// (`20261107T191316Z-apigateway-lambda-3-net-new-causes-non-proxy-d346f3.md`, which records
-/// AWS closing that sentence with "because no identity-based policy allows the
-/// execute-api:Invoke action"); this suite is about WHICH answer the decision earns and what
-/// the backend then did, so it asserts the sentence the plane serves rather than settling
-/// that report's cause here.
+/// are fixed text apart from the ACTION the second names, and the clause naming why the
+/// document withheld the grant is what tells them apart — which is the half of the rule these
+/// two rows are here for.
 const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \
                              deny in an identity-based policy";
-const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";
+const NOT_AUTHORIZED: &str = "User is not authorized to access this resource because no \
+                              identity-based policy allows the execute-api:Invoke action";
 
 /// The class a refused call names in `x-amzn-errortype`, and the header it names it in.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";

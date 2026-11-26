@@ -248,26 +248,26 @@ pub(super) enum Judged {
     Published(BTreeMap<String, String>),
     /// The policy does not allow it. This is the sentence API Gateway refuses such a call
     /// with, answered `403` through the `ACCESS_DENIED` gateway response.
-    Refused(&'static str),
+    Refused(String),
 }
 
-/// The sentence a call an authorizer's policy explicitly DENIES is refused with.
-///
-/// IAM's own published sentence for that outcome, whole: the decision rested on a `Deny`
-/// statement of the document the authorizer returned, which is an identity-based policy, and
-/// the clause naming it is what tells this refusal from the one a document that merely fails
-/// to allow the invoke earns ([`NOT_AUTHORIZED_MESSAGE`]). Every word of it is fixed text.
-const EXPLICIT_DENY_MESSAGE: &str =
-    "User is not authorized to access this resource with an explicit deny in an identity-based \
-     policy";
-
-/// The sentence a call no statement of the authorizer's policy allows is refused with.
+/// The sentence every refusal of an authorized-but-not-admitted call OPENS with.
 ///
 /// `pub(super)` because it is the sentence an AUTHORIZER's refusal of a call carries whichever
 /// kind of authorizer took the decision: a `COGNITO_USER_POOLS` authorizer that evaluated the
-/// presented token and does not accept it refuses the call with this same sentence
-/// ([`super::cognito_refusal`]), rather than holding a second copy of it.
+/// presented token and does not accept it refuses the call with this sentence alone
+/// ([`super::cognito_refusal`]) — nothing evaluated a policy there, so there is no document for
+/// a closing clause to name — rather than holding a second copy of it.
 pub(super) const NOT_AUTHORIZED_MESSAGE: &str = "User is not authorized to access this resource";
+
+/// [`NOT_AUTHORIZED_MESSAGE`] closed by the clause IAM publishes for the outcome the policy
+/// evaluation reached, which is what tells one refusal from the other: a `Deny` statement of
+/// the returned document matched, or no statement of it allowed the invoke. The clauses
+/// themselves are IAM's, taken from the one place this tree words them
+/// ([`::service_common::iam_authorization`]) rather than spelled again here.
+fn refused_with(clause: &str) -> String {
+    format!("{NOT_AUTHORIZED_MESSAGE} {clause}")
+}
 
 /// What `held` says about the method `method_arn`.
 ///
@@ -281,8 +281,14 @@ pub(super) fn decided(held: &CachedAuthorizerResult, method_arn: &str) -> Judged
     let documents = [held.policy_document.clone()];
     match iam::identity_decision(&documents, &request) {
         Decision::Allowed => Judged::Published(published(held)),
-        Decision::Denied => Judged::Refused(EXPLICIT_DENY_MESSAGE),
-        Decision::NotStated => Judged::Refused(NOT_AUTHORIZED_MESSAGE),
+        // An authorizer "returns an IAM policy" with no `Principal` of its own, so a `Deny` in
+        // it is an explicit deny in an identity-based policy, and a document that merely names
+        // other methods allows the invoke nowhere: each outcome is refused with IAM's whole
+        // published sentence for it, the second naming the action the evaluation asked about.
+        Decision::Denied => Judged::Refused(refused_with(iam::IDENTITY_POLICY_EXPLICIT_DENY)),
+        Decision::NotStated => {
+            Judged::Refused(refused_with(&iam::no_identity_policy_allows(INVOKE_ACTION)))
+        }
     }
 }
 
@@ -618,6 +624,8 @@ mod tests {
             )
         };
         // Rows differ along what the returned document states about this method.
+        let no_allow = refused_with(&iam::no_identity_policy_allows(INVOKE_ACTION));
+        let explicit_deny = refused_with(iam::IDENTITY_POLICY_EXPLICIT_DENY);
         let rows: &[(&str, String, Option<&str>)] = &[
             ("the method itself", statement("Allow", arn), None),
             ("every method", statement("Allow", "*"), None),
@@ -635,17 +643,17 @@ mod tests {
                     "Allow",
                     "arn:aws:execute-api:us-east-1:000000000000:abc1230000/live/GET/other",
                 ),
-                Some(NOT_AUTHORIZED_MESSAGE),
+                Some(no_allow.as_str()),
             ),
             (
                 "an explicit deny",
                 statement("Deny", "*"),
-                Some(EXPLICIT_DENY_MESSAGE),
+                Some(explicit_deny.as_str()),
             ),
             (
                 "a document stating nothing",
                 "{\"Statement\":[]}".to_string(),
-                Some(NOT_AUTHORIZED_MESSAGE),
+                Some(no_allow.as_str()),
             ),
         ];
         for (case, policy, refused) in rows {

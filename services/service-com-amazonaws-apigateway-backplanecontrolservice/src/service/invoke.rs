@@ -2884,7 +2884,7 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
                 kind = %authorizer.r#type,
                 "refusing an invoke: the authorizer's policy does not allow this method"
             );
-            Authorized::Refused(access_denied(sentence.to_string()))
+            Authorized::Refused(access_denied(sentence))
         }
     }
 }
@@ -2900,9 +2900,12 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
 /// `401` ([`EXPIRED_IDENTITY_TOKEN`]), and a token claiming a pool the authorizer TRUSTS that
 /// does not verify against that pool's published key set is refused as the authorizer DENYING
 /// the call — the same `403` [`access_denied`] a `CUSTOM` authorizer's refusal earns, carrying
-/// the same sentence a call the authorizer allows no statement for is refused with
-/// ([`custom_authorizer::NOT_AUTHORIZED_MESSAGE`]), so a developer's customization of an
-/// authorization failure (`ACCESS_DENIED`) reaches both kinds of authorizer.
+/// the sentence every refusal of this class opens with
+/// ([`custom_authorizer::NOT_AUTHORIZED_MESSAGE`]) and nothing after it: no policy was
+/// evaluated here, so there is no document for a closing clause to name, where a `CUSTOM`
+/// authorizer's refusal closes with the clause for the outcome its returned policy reached. A
+/// developer's customization of an authorization failure (`ACCESS_DENIED`) reaches both kinds
+/// of authorizer.
 fn cognito_refusal(refusal: cognito_user_pools::Refusal) -> GatewayRefusal {
     match refusal {
         cognito_user_pools::Refusal::Unauthorized => UNAUTHORIZED,

@@ -71,8 +71,11 @@ const EXPLICIT_DENY: &str = "User is not authorized to access this resource with
                              deny in an identity-based policy";
 
 /// The sentence a call NO statement of the returned policy allows is refused with — the
-/// outcome the clause above is what distinguishes from an explicit deny.
-const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";
+/// outcome the clause above is what distinguishes from an explicit deny. IAM's published
+/// no-matching-allow wording, which names the action the evaluation asked about; the class it
+/// belongs to is spanned in `tests/all/stage_authorizer_no_matching_allow_sentence.rs`.
+const NOT_AUTHORIZED: &str = "User is not authorized to access this resource because no \
+                              identity-based policy allows the execute-api:Invoke action";
 
 /// The status API Gateway refuses an authorized-but-not-admitted call at.
 const REFUSED_STATUS: u16 = 403;

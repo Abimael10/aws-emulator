@@ -284,7 +284,7 @@ pub(crate) async fn simulated<Eng: Send + Sync + 'static>(
                         name = authorizer.name,
                         action = super::super::resource_policy::INVOKE_ACTION
                     ));
-                    report.refusal = Some(access_denied(sentence.to_string()));
+                    report.refusal = Some(access_denied(sentence));
                 }
             }
         }

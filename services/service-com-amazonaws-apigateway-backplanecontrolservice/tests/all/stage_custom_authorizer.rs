@@ -88,8 +88,10 @@ const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":null}"#);
 const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \
                              deny in an identity-based policy";
 
-/// The sentence a call no statement of the returned policy allows is refused with.
-const NOT_AUTHORIZED: &str = "User is not authorized to access this resource";
+/// The sentence a call no statement of the returned policy allows is refused with: IAM's
+/// published no-matching-allow wording, which names the action the evaluation asked about.
+const NOT_AUTHORIZED: &str = "User is not authorized to access this resource because no \
+                              identity-based policy allows the execute-api:Invoke action";
 
 /// The ONE authorizer every row is decided by: it reads the token out of whichever event it
 /// was handed, chooses what to return from that token, and publishes a value that is
