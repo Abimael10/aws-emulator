@@ -31,11 +31,12 @@ use serde_json::{json, Map, Value};
 
 use crate::email_contacts::{
     activate, call, call_http, create, create_ok, delete, emulator, get, issued_code, label, list,
-    send_code, Emulator,
+    send_code, unknown_arn, Emulator,
 };
 use crate::resource_tag_writes::{query_value, TAG_MUTATION_SUCCESS_STATUS};
 use crate::resource_tags::{
     create_tagged, list_tags, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
+    TAGGING_NOT_FOUND_CODE, TAGGING_NOT_FOUND_STATUS,
 };
 
 /// One row of the status table: the pairs `TagResource` writes onto a contact that
@@ -321,4 +322,133 @@ async fn every_other_operation_keeps_its_own_success_status() {
         body.is_object(),
         "case \"TagResource on a deleted contact\": a refusal carries its error shape, got {body:?}"
     );
+}
+
+/// The error shape a raw response names, from the `x-amzn-errortype` header or the
+/// `__type` the restJson1 envelope carries, with any namespace before it dropped.
+fn reported_shape(response: &http::Response<bytes::Bytes>) -> String {
+    let named = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_slice::<Value>(response.body())
+                .ok()
+                .and_then(|body| {
+                    body.get("__type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| "<no error shape>".to_string());
+    named.rsplit('#').next().unwrap_or(&named).to_string()
+}
+
+/// Every response this service renders — a success and a failure alike — is handed through
+/// the ONE no-content framing the tree owns, at the single protocol seam in `src/service.rs`.
+/// Both of that seam's paths take it, so this drives an operation down each: the bodyless tag
+/// mutations, whose success IS the no-content answer; the successes that carry members, which
+/// the framing must return byte for byte; and the modelled failures of those same mutations,
+/// whose status and error envelope must arrive whole.
+#[tokio::test]
+async fn both_serialization_paths_take_the_one_no_content_framing() {
+    let em = emulator();
+    let arn = create_tagged(
+        &em,
+        "shared-framing",
+        Some(&tag_map([pair("team", "infra")])),
+    )
+    .await;
+
+    // The seam's SUCCESS path, for the answers the framing empties.
+    for (operation, response) in [
+        (
+            "TagResource",
+            tag_http(&em, &arn, &tag_map([pair("env", "prod")])).await,
+        ),
+        (
+            "UntagResource",
+            untag_http(&em, &arn, &keys(&["env"])).await,
+        ),
+    ] {
+        assert_no_content("both framed paths", operation, &response);
+    }
+
+    // Both mutations landed, so the framed answers are about real writes.
+    let reported = tags_ok(&em, &arn).await;
+    assert_eq!(
+        reported,
+        tag_map([pair("team", "infra")]),
+        "case \"both framed paths\": the write and the removal must persist, got {reported:?}"
+    );
+
+    // The same path, for a success that CARRIES content: it is returned exactly as the
+    // protocol rendered it, body bytes included.
+    for (operation, uri) in [
+        ("GetEmailContact", format!("/emailcontacts/{}", label(&arn))),
+        ("ListTagsForResource", format!("/tags/{}", label(&arn))),
+    ] {
+        let response = call_http(&em, "GET", &uri, None).await;
+        let status = response.status().as_u16();
+        let body = response.body().clone();
+        assert_eq!(
+            status,
+            200,
+            "case {operation:?}: an answer carrying members keeps its own status, got \
+             {status} / {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let parsed: Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
+            panic!(
+                "case {operation:?}: an answer carrying members must carry its JSON, got {:?}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        assert!(
+            parsed.as_object().is_some_and(|members| !members.is_empty()),
+            "case {operation:?}: the rendered members must survive the framing, got {parsed:?}"
+        );
+    }
+
+    // The seam's FAILURE path: a modelled refusal keeps its status and its whole envelope.
+    let ghost = unknown_arn('q');
+    for (case, expected_status, expected_shape, response) in [
+        (
+            "TagResource on an arn naming no contact",
+            TAGGING_NOT_FOUND_STATUS,
+            TAGGING_NOT_FOUND_CODE,
+            tag_http(&em, &ghost, &tag_map([pair("team", "ghost")])).await,
+        ),
+        (
+            "UntagResource on an arn naming no contact",
+            TAGGING_NOT_FOUND_STATUS,
+            TAGGING_NOT_FOUND_CODE,
+            untag_http(&em, &ghost, &keys(&["team"])).await,
+        ),
+        (
+            "TagResource on an arn outside the modelled pattern",
+            400,
+            "ValidationException",
+            tag_http(&em, "just-a-name", &tag_map([pair("team", "ghost")])).await,
+        ),
+    ] {
+        let status = response.status().as_u16();
+        let body = response.body().clone();
+        assert_eq!(
+            status,
+            expected_status,
+            "case {case:?}: a refusal keeps its modelled status, got {status} / {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !body.is_empty(),
+            "case {case:?}: a refusal carries its error envelope, got an empty body"
+        );
+        let shape = reported_shape(&response);
+        assert_eq!(
+            shape, expected_shape,
+            "case {case:?}: expected {expected_shape}, got {shape}"
+        );
+    }
 }

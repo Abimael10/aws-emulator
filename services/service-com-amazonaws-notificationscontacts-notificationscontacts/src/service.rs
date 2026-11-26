@@ -57,6 +57,12 @@
 //! as the model's protocol renders it. It is done here, at the one place every response of
 //! this service passes through, rather than per operation.
 //!
+//! The framing itself is NOT written here: it is
+//! [`service_common::no_content_responses::without_content`], the one reading of that rule
+//! for every service whose success answers 204, so a correction to it reaches this service
+//! too. What this file owns is only the composition — that every response this service
+//! renders is handed through it.
+//!
 //! An answer served over HTTP/1.1 reaches the client without the framing header: the HTTP
 //! writer the vendored transport uses drops `content-length` from a `204`, which is below
 //! anything this crate decides.
@@ -83,30 +89,7 @@ pub(crate) mod validation;
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
-
-/// The status whose answer carries NO content, whatever a renderer wrote for it, and the
-/// length such an answer states. See the module docs.
-const NO_CONTENT_STATUS: u16 = 204;
-const NO_CONTENT_LENGTH: &str = "0";
-
-/// How an answer that carries no content is framed: with no body at all, and stating the
-/// length it does have. See the module docs.
-///
-/// A response that carries content is untouched: it keeps the body the protocol rendered
-/// and the framing that body already has. The insert is FALLIBLE and ignored on failure —
-/// a decimal length is always a valid header value, so it cannot fail today, and if it
-/// ever did the answer would go out unframed rather than as a transport failure.
-fn frame_empty_body(response: &mut WireResponse) {
-    if response.status().as_u16() != NO_CONTENT_STATUS {
-        return;
-    }
-    // The empty JSON object the serializer renders for an output structure with no
-    // members goes no further: this status has no content to carry it.
-    *response.body_mut() = aws_smithy_types::body::SdkBody::empty();
-    let _ = response
-        .headers_mut()
-        .try_insert("content-length", NO_CONTENT_LENGTH);
-}
+use service_common::no_content_responses::without_content;
 
 /// The `com-amazonaws-notificationscontacts-notificationscontacts` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -164,7 +147,7 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         operation_name: &str,
         success_status: u16,
     ) -> Result<WireResponse, ProtocolError> {
-        let mut response = self.entry.protocol().serialize_output(
+        let rendered = self.entry.protocol().serialize_output(
             output,
             output_schema,
             operation_name,
@@ -172,8 +155,7 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         )?;
         // The status and every other header are the protocol's: only an answer that
         // carries no content is emptied of the body rendered for it.
-        frame_empty_body(&mut response);
-        Ok(response)
+        Ok(without_content(rendered))
     }
 
     fn serialize_error(
@@ -183,15 +165,14 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         error_code: &str,
         http_status: u16,
     ) -> Result<WireResponse, ProtocolError> {
-        let mut response = self
+        let rendered = self
             .entry
             .protocol()
             .serialize_error(error, error_schema, error_code, http_status)?;
         // Every modelled failure of this service carries a JSON error envelope at a 4xx or
         // 5xx, so nothing here is emptied; the same call is made on both paths rather than
         // leaving one of them to answer differently.
-        frame_empty_body(&mut response);
-        Ok(response)
+        Ok(without_content(rendered))
     }
 
     fn serialize_event_stream_message(
