@@ -8,9 +8,15 @@
 //! naming neither the attribute nor the schema, with nothing appended — whether it names an
 //! attribute the schema declares no key for, carries one beside the key, LEAVES A DECLARED
 //! KEY ATTRIBUTE OUT, carries no attribute at all, or carries exactly that schema's key
-//! attributes while stating one of them in another TYPE than the schema declares. That one
-//! sentence is what every such token earns, on the BASE table and on an INDEX cursor alike,
-//! since an index cursor carries both schemas' key attributes.
+//! attributes while stating one of the TABLE's in another TYPE than the schema declares.
+//! That one sentence is what every such token earns, on the BASE table and on an INDEX
+//! cursor alike, since an index cursor carries both schemas' key attributes.
+//!
+//! The one element of an index cursor stated further is an INDEX KEY attribute carrying
+//! another type than the table's `AttributeDefinitions` declare for it: that element names
+//! the index key it is, in a type the index cannot hold, so it earns the typed
+//! parameter-value sentence naming the key, the declared type, the supplied type and the
+//! index ([`index_key_type_mismatch`]).
 //!
 //! The rows differ along HOW the token fails to be that key, along the SCHEMA being paged
 //! (a single-attribute table, a composite one, a global secondary index and a local one),
@@ -29,10 +35,19 @@ use crate::emulator::{call, describe_when_active, emulator, error_code, message,
 const INVALID: &str = "The provided starting key is invalid";
 
 /// AWS's sentence for a token that carries exactly the key attributes of the schema being
-/// paged while stating one of them in another type than that schema declares: a key element
-/// of another type is no key of that schema either, so it is the same sentence, with the
-/// schema reason NOT appended to it.
+/// paged while stating one of the TABLE's in another type than that schema declares: a key
+/// element of another type is no key of that schema either, so it is the same sentence, with
+/// the schema reason NOT appended to it.
 const TYPE_MISMATCH: &str = INVALID;
+
+/// AWS's sentence for an INDEX key element of an index cursor stated in another type than
+/// the table's `AttributeDefinitions` declare for that attribute.
+fn index_key_type_mismatch(attribute: &str, expected: &str, actual: &str, index: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Type mismatch for Index Key {attribute} \
+         Expected: {expected} Actual: {actual} IndexName: {index}"
+    )
+}
 
 /// A table whose primary key is ONE attribute.
 const SOLO: &str = "ResumeTokenSolo";
@@ -125,7 +140,7 @@ struct Row {
     /// The partition value a `Query`'s key condition selects, named for the schema paged.
     partition: (&'static str, Value),
     token: Value,
-    stated: &'static str,
+    stated: String,
 }
 
 fn rows() -> Vec<Row> {
@@ -139,7 +154,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"nope": {"S": "x"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a single-key table, a spare attribute beside the key",
@@ -147,7 +162,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"pk": {"S": "one"}, "spare": {"S": "x"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a single-key table, no attribute at all",
@@ -155,7 +170,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a single-key table, the key attribute as a number",
@@ -163,7 +178,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"pk": {"N": "1"}}),
-            stated: TYPE_MISMATCH,
+            stated: TYPE_MISMATCH.to_string(),
         },
         Row {
             case: "a single-key table, the key attribute as a string set",
@@ -171,7 +186,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"pk": {"SS": ["one"]}}),
-            stated: TYPE_MISMATCH,
+            stated: TYPE_MISMATCH.to_string(),
         },
         // The COMPOSITE base table.
         Row {
@@ -180,7 +195,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"pk": {"S": "one"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a composite table, a third attribute beside both keys",
@@ -188,7 +203,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"pk": {"S": "one"}, "sk": {"N": "1"}, "spare": {"S": "x"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a composite table, the sort key as a string",
@@ -196,7 +211,7 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: one.clone(),
             token: json!({"pk": {"S": "one"}, "sk": {"S": "1"}}),
-            stated: TYPE_MISMATCH,
+            stated: TYPE_MISMATCH.to_string(),
         },
         // The GLOBAL secondary index: its token carries the index's key AND the table's.
         Row {
@@ -205,7 +220,7 @@ fn rows() -> Vec<Row> {
             index: Some(GLOBAL_INDEX),
             partition: open.clone(),
             token: json!({"tenant": {"S": "OPEN"}, "pk": {"S": "one"}, "sk": {"N": "1"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a global index, an attribute neither schema declares",
@@ -214,7 +229,7 @@ fn rows() -> Vec<Row> {
             partition: open.clone(),
             token: json!({"tenant": {"S": "OPEN"}, "rank": {"N": "2"},
                           "pk": {"S": "one"}, "sk": {"N": "1"}, "spare": {"S": "x"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a global index, the index sort key as a string",
@@ -223,7 +238,7 @@ fn rows() -> Vec<Row> {
             partition: open.clone(),
             token: json!({"tenant": {"S": "OPEN"}, "rank": {"S": "2"},
                           "pk": {"S": "one"}, "sk": {"N": "1"}}),
-            stated: TYPE_MISMATCH,
+            stated: index_key_type_mismatch("rank", "N", "S", GLOBAL_INDEX),
         },
         // The LOCAL secondary index, whose partition key is the table's own.
         Row {
@@ -232,7 +247,7 @@ fn rows() -> Vec<Row> {
             index: Some(LOCAL_INDEX),
             partition: one.clone(),
             token: json!({"pk": {"S": "one"}, "rank": {"N": "2"}}),
-            stated: INVALID,
+            stated: INVALID.to_string(),
         },
         Row {
             case: "a local index, the index sort key as a string",
@@ -240,7 +255,7 @@ fn rows() -> Vec<Row> {
             index: Some(LOCAL_INDEX),
             partition: one,
             token: json!({"pk": {"S": "one"}, "rank": {"S": "2"}, "sk": {"N": "1"}}),
-            stated: TYPE_MISMATCH,
+            stated: index_key_type_mismatch("rank", "N", "S", LOCAL_INDEX),
         },
     ]
 }
@@ -268,7 +283,7 @@ async fn a_resume_token_that_is_no_key_of_the_schema_states_its_own_sentence() {
             let (status, body) = call(&router, operation, request).await;
             assert_eq!(
                 (status, error_code(&body).as_str(), message(&body).as_str()),
-                (400, "ValidationException", row.stated),
+                (400, "ValidationException", row.stated.as_str()),
                 "case {case:?}: expected the refusal {:?}, got {status} with {body}",
                 row.stated
             );

@@ -7,9 +7,12 @@
 //! carries no key of that schema, so the read refuses it with `ValidationException` and the
 //! one fixed invalid-token sentence — "The provided starting key is invalid" — with nothing
 //! appended to it; a token that carries exactly those key attributes while stating one
-//! of them in another TYPE than the schema declares is no key of it either and earns that
-//! same sentence. The sentence is fixed text: it names neither the missing
-//! attribute nor the schema, and echoes nothing the request sent.
+//! of the TABLE's in another TYPE than the schema declares is no key of it either and earns
+//! that same sentence. The sentence is fixed text: it names neither the missing
+//! attribute nor the schema, and echoes nothing the request sent. An INDEX key attribute of
+//! an index cursor stated in another type is the one element told further: it names the
+//! index key it is, so it earns the typed parameter-value sentence
+//! ([`index_key_type_mismatch`]).
 //!
 //! The rows span what the rule generalises over: WHICH schema is being paged (a composite
 //! base table, a global secondary index whose own key is composite, and a local one), WHICH
@@ -34,10 +37,20 @@ use crate::emulator::{call, describe_when_active, emulator, error_code, message,
 /// are held to.
 const START_KEY_INVALID: &str = "The provided starting key is invalid";
 
-/// The sentence a token that carries those key attributes with one of them typed against
-/// the schema earns: the same statement, since such a token is no key of that schema
+/// The sentence a token that carries those key attributes with one of the TABLE's typed
+/// against the schema earns: the same statement, since such a token is no key of that schema
 /// either.
 const START_KEY_TYPE_MISMATCH: &str = START_KEY_INVALID;
+
+/// The sentence an INDEX key element of an index cursor stated in another type than the
+/// table's `AttributeDefinitions` declare for it earns, written out here as a literal for the
+/// same reason as the one above.
+fn index_key_type_mismatch(attribute: &str, expected: &str, actual: &str, index: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Type mismatch for Index Key {attribute} \
+         Expected: {expected} Actual: {actual} IndexName: {index}"
+    )
+}
 
 /// A table whose primary key is composite (`pk` HASH, `sk` RANGE), carrying a global
 /// secondary index of its own composite key and a local one.
@@ -109,7 +122,7 @@ struct Row {
     /// The partition a `Query`'s key condition selects, named for the schema being paged.
     partition: (&'static str, Value),
     token: Value,
-    stated: &'static str,
+    stated: String,
 }
 
 fn rows() -> Vec<Row> {
@@ -122,28 +135,28 @@ fn rows() -> Vec<Row> {
             index: None,
             partition: table_partition.clone(),
             token: json!({"pk": {"S": "one"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "the base table, the partition key left out",
             index: None,
             partition: table_partition.clone(),
             token: json!({"sk": {"N": "1"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "the base table, no attribute at all",
             index: None,
             partition: table_partition.clone(),
             token: json!({}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "the base table, the sort key typed against the schema",
             index: None,
             partition: table_partition.clone(),
             token: json!({"pk": {"S": "one"}, "sk": {"S": "1"}}),
-            stated: START_KEY_TYPE_MISMATCH,
+            stated: START_KEY_TYPE_MISMATCH.to_string(),
         },
         // The GLOBAL secondary index: its cursor carries the index's key AND the table's.
         Row {
@@ -151,21 +164,21 @@ fn rows() -> Vec<Row> {
             index: Some(GLOBAL_INDEX),
             partition: index_partition.clone(),
             token: json!({"tenant": {"S": "OPEN"}, "pk": {"S": "one"}, "sk": {"N": "1"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "a global index, the table sort key left out",
             index: Some(GLOBAL_INDEX),
             partition: index_partition.clone(),
             token: json!({"tenant": {"S": "OPEN"}, "rank": {"N": "2"}, "pk": {"S": "one"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "a global index, only the index key",
             index: Some(GLOBAL_INDEX),
             partition: index_partition.clone(),
             token: json!({"tenant": {"S": "OPEN"}, "rank": {"N": "2"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "a global index, the index sort key typed against the schema",
@@ -173,7 +186,7 @@ fn rows() -> Vec<Row> {
             partition: index_partition,
             token: json!({"tenant": {"S": "OPEN"}, "rank": {"S": "2"},
                           "pk": {"S": "one"}, "sk": {"N": "1"}}),
-            stated: START_KEY_TYPE_MISMATCH,
+            stated: index_key_type_mismatch("rank", "N", "S", GLOBAL_INDEX),
         },
         // The LOCAL secondary index, whose partition key is the table's own.
         Row {
@@ -181,14 +194,14 @@ fn rows() -> Vec<Row> {
             index: Some(LOCAL_INDEX),
             partition: table_partition.clone(),
             token: json!({"pk": {"S": "one"}, "rank": {"N": "2"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
         Row {
             case: "a local index, the index sort key left out",
             index: Some(LOCAL_INDEX),
             partition: table_partition,
             token: json!({"pk": {"S": "one"}, "sk": {"N": "1"}}),
-            stated: START_KEY_INVALID,
+            stated: START_KEY_INVALID.to_string(),
         },
     ]
 }
@@ -229,16 +242,21 @@ async fn a_resume_token_short_of_a_declared_key_element_is_an_invalid_token() {
                 let answered = message(&body);
                 assert_eq!(
                     (status, error_code(&body).as_str(), answered.as_str()),
-                    (400, "ValidationException", row.stated),
+                    (400, "ValidationException", row.stated.as_str()),
                     "case {case:?}: expected the refusal {:?}, got {status} with {body}",
                     row.stated
                 );
-                // The sentence is fixed text, so nothing the token named reaches it.
-                for named in ["pk", "sk", "tenant", "rank", GLOBAL_INDEX, LOCAL_INDEX] {
-                    assert!(
-                        !answered.contains(named),
-                        "case {case:?}: the refusal must not name {named:?}, got {answered:?}"
-                    );
+                // The invalid-token sentence is fixed text, so nothing the token named
+                // reaches it. The typed index-key sentence names its own key, type and
+                // index, which the expectation above already holds it to.
+                if row.stated == START_KEY_INVALID {
+                    for named in ["pk", "sk", "tenant", "rank", GLOBAL_INDEX, LOCAL_INDEX] {
+                        assert!(
+                            !answered.contains(named),
+                            "case {case:?}: the refusal must not name {named:?}, got \
+                             {answered:?}"
+                        );
+                    }
                 }
             }
         }

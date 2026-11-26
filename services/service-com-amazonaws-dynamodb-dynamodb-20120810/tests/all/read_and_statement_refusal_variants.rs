@@ -484,7 +484,10 @@ async fn a_resume_token_that_is_no_key_of_the_schema_states_one_sentence_with_no
     // The rows span HOW the token fails to be a key of the schema it is read through: a
     // key element of another TYPE than the schema declares (the defect that used to be
     // diagnosed further), an element the schema declares no key for, an element left out,
-    // a spare element beside the key, and no element at all.
+    // a spare element beside the key, and no element at all. An element of an INDEX's own
+    // key schema stated in another type is NOT one of them: that element is the index key
+    // it names, so it earns the typed parameter sentence instead (see
+    // [`an_index_cursor_states_a_typed_mismatch_for_an_index_key_element`]).
     let rows: Vec<(&str, Option<&str>, Value)> = vec![
         (
             "the table's partition key as a number",
@@ -500,12 +503,6 @@ async fn a_resume_token_that_is_no_key_of_the_schema_states_one_sentence_with_no
             "the table's partition key as a string set",
             None,
             json!({"pk": {"SS": ["p"]}, "sk": {"S": "s"}}),
-        ),
-        (
-            "an index's own sort key as a number",
-            Some(BY_G),
-            json!({"gpk": {"S": "g"}, "gsk": {"N": "2"},
-                   "pk": {"S": "p"}, "sk": {"S": "s"}}),
         ),
         (
             "a table key attribute of an index cursor, typed against the schema",
@@ -544,6 +541,65 @@ async fn a_resume_token_that_is_no_key_of_the_schema_states_one_sentence_with_no
             assert_eq!(
                 stated, START_KEY_INVALID,
                 "case {case:?}: expected exactly {START_KEY_INVALID:?}, got {stated:?}"
+            );
+        }
+    }
+}
+
+/// AWS's sentence for an index key value whose type is not the one the table's
+/// `AttributeDefinitions` declare for that attribute, which an index cursor's own key
+/// element earns.
+fn index_key_type_mismatch(attribute: &str, expected: &str, actual: &str, index: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Type mismatch for Index Key {attribute} \
+         Expected: {expected} Actual: {actual} IndexName: {index}"
+    )
+}
+
+#[tokio::test]
+async fn an_index_cursor_states_a_typed_mismatch_for_an_index_key_element() {
+    let router = emulator();
+    cursor_table(&router).await;
+
+    // The rows span WHICH element of the index's key schema carries the wrong type and
+    // WHICH type it carries: the sort key of the composite index as a number and as a
+    // string set, and the partition key of the binary index as a string.
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "an index's own sort key as a number",
+            BY_G,
+            json!({"gpk": {"S": "g"}, "gsk": {"N": "2"},
+                   "pk": {"S": "p"}, "sk": {"S": "s"}}),
+            index_key_type_mismatch("gsk", "S", "N", BY_G),
+        ),
+        (
+            "an index's own sort key as a string set",
+            BY_G,
+            json!({"gpk": {"S": "g"}, "gsk": {"SS": ["g2"]},
+                   "pk": {"S": "p"}, "sk": {"S": "s"}}),
+            index_key_type_mismatch("gsk", "S", "SS", BY_G),
+        ),
+        (
+            "an index's own partition key as a string",
+            BY_B,
+            json!({"bpk": {"S": "a"}, "pk": {"S": "p"}, "sk": {"S": "s"}}),
+            index_key_type_mismatch("bpk", "B", "S", BY_B),
+        ),
+    ];
+
+    for (case, index, token, expected) in rows {
+        for operation in ["Query", "Scan"] {
+            let case = format!("{case} on {operation}");
+            let stated = refused(
+                &router,
+                &case,
+                operation,
+                paged_read(operation, Some(index), &token),
+            )
+            .await;
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected exactly {expected:?}, got {stated:?}"
             );
         }
     }

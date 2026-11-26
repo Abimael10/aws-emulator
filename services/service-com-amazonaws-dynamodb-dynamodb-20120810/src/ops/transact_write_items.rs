@@ -965,6 +965,22 @@ fn check_element_shape(
                 .unwrap_or_default()
         )));
     }
+    // The grammar of the condition any of the four actions may state is a fact of the
+    // request: whether it READS as a condition depends on its own text and this element's
+    // substitution tables alone, so it is settled in this pass with every other fact of the
+    // request — which is what makes the element a transaction's refusal names the first
+    // LISTED one that carries a defect, rather than whichever element the preparation below
+    // reached first. Evaluating it still waits for the stored item, which is where
+    // [`crate::state::write_condition_satisfied`] reads it.
+    //
+    // Read BEFORE the update an `Update` states, for the reason the single-item write reads
+    // them in that order: an element states its gate and its change through two expression
+    // members, and the defect reported when both carry one is the CONDITION's.
+    if let Some(condition) = action.condition_expression() {
+        crate::state::ParsedCondition::parse("ConditionExpression", condition, substitutions)
+            .map_err(crate::state::refused_in_element)
+            .map_err(lift)?;
+    }
     // The grammar of the update an `Update` applies is a fact of the request too, so a
     // malformed one is refused here rather than when the element is prepared. It is the
     // ELEMENT's own expression, so what it is refused for is stated outside the request
@@ -978,18 +994,6 @@ fn check_element_shape(
         )
         .map_err(crate::state::refused_in_element)
         .map_err(lift)?;
-    }
-    // And so is the grammar of the condition any of the four actions may state: whether
-    // it READS as a condition depends on its own text and this element's substitution
-    // tables alone, so it is settled in this pass with every other fact of the request —
-    // which is what makes the element a transaction's refusal names the first LISTED one
-    // that carries a defect, rather than whichever element the preparation below reached
-    // first. Evaluating it still waits for the stored item, which is where
-    // [`crate::state::write_condition_satisfied`] reads it.
-    if let Some(condition) = action.condition_expression() {
-        crate::state::ParsedCondition::parse("ConditionExpression", condition, substitutions)
-            .map_err(crate::state::refused_in_element)
-            .map_err(lift)?;
     }
     // The documented ceiling on how deeply a stored value may nest is a QUOTA, and the
     // fixed sentence AWS states for a quota an ELEMENT of a transaction crossed is stated

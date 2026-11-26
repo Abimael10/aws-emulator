@@ -433,6 +433,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ])
             .map_err(lift)?;
 
+        // Every fact of the REQUEST the condition carries is settled before the table is
+        // looked up ([`crate::state::check_write_condition`]) — and BEFORE the update this
+        // request states is read: a write states its gate and its change through two
+        // expression members, and the defect AWS reports when both carry one is the
+        // CONDITION's, so the caller is told about the member whose text decides whether
+        // the write runs at all rather than about the change it was gating.
+        crate::state::check_write_condition(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+        )
+        .map_err(lift)?;
+
         // "This is a legacy parameter. Use UpdateExpression instead"
         // (`UpdateItem$AttributeUpdates`): a request states its update one way or the
         // other, and one that states neither still creates the item from its key.
@@ -459,16 +473,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (None, None) => crate::state::ParsedUpdate::nothing(),
         };
-
-        // Every fact of the REQUEST the condition carries is settled before the table is
-        // looked up ([`crate::state::check_write_condition`]).
-        crate::state::check_write_condition(
-            input.condition_expression.as_deref(),
-            input.expected.as_ref(),
-            input.conditional_operator.as_deref(),
-            substitutions,
-        )
-        .map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).

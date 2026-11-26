@@ -1104,11 +1104,18 @@ impl Table {
     /// The place in `index`'s order an `ExclusiveStartKey` resumes a read from.
     ///
     /// A resume token is read back through the two schemas the read reported it from, so
-    /// a map that names an attribute neither declares, leaves one of them out, or states
-    /// one of them in a type other than the table declared is the INVALID RESUME TOKEN it
-    /// is ([`START_KEY_INVALID_MESSAGE`]) — as a base-table token is
-    /// ([`Self::key_of_start_key`]). An index cursor carries both schemas' key
+    /// a map that names an attribute neither declares, or leaves one of them out, is the
+    /// INVALID RESUME TOKEN it is ([`START_KEY_INVALID_MESSAGE`]) — as a base-table token
+    /// is ([`Self::key_of_start_key`]). An index cursor carries both schemas' key
     /// attributes, so one it does not carry in full is not that cursor at all.
+    ///
+    /// A token that DOES name this cursor's key attributes while carrying one of them in
+    /// another type than the table declares for it is a different defect: the element is
+    /// the index key it names, stated in a type that index cannot hold, so it is refused as
+    /// the invalid parameter value it is — naming the key attribute, the type the table's
+    /// `AttributeDefinitions` declare for it, the type the token supplied and the index
+    /// being read ([`index_key_type_mismatch`]), which is the one wording this service
+    /// states that mismatch in wherever a request carries an index key value.
     ///
     /// Those sentences are about the token's SHAPE. Each element it does carry is then
     /// held to the rules every key attribute's value is held to — the documented numeric
@@ -1158,11 +1165,10 @@ impl Table {
         for element in Self::index_key_elements(index.key_schema) {
             let name = element.attribute_name.as_str();
             let value = key.get(name).ok_or_else(|| KeySource::StartKey.mismatch())?;
-            if self
-                .declared_type(name)
-                .is_some_and(|declared| declared != attribute_value_type(value))
+            let actual = attribute_value_type(value);
+            if let Some(declared) = self.declared_type(name).filter(|declared| *declared != actual)
             {
-                return Err(KeySource::StartKey.mismatch());
+                return Err(index_key_type_mismatch(name, declared, actual, index.name));
             }
             values.push(self.key_value_worded(name, value, empty_element)?);
         }
